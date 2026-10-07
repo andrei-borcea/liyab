@@ -61,6 +61,7 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
     private String query = "";
     private final List<HuggingFace.Repo> repos = new ArrayList<>();
     private String openRepo;
+    private String openRepoArch;  // general.architecture read from a file header, or null
     private final List<HuggingFace.GgufFile> repoFiles = new ArrayList<>();
     private String hfMessage = "Most downloaded GGUF repositories";
 
@@ -351,8 +352,13 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         if (openRepo != null) {
             LinearLayout header = Ui.card(this);
             header.addView(Ui.bold(this, openRepo, 15));
-            header.addView(Ui.text(this, "Only formats Liyab runs are listed. RAM fit is based on currently free memory.",
-                    12, Ui.MUTED));
+            if (openRepoArch != null && !HuggingFace.SUPPORTED_ARCHS.contains(openRepoArch)) {
+                header.addView(Ui.text(this, "✗ Architecture '" + openRepoArch + "' is not supported yet (supported: "
+                        + "llama, mistral, qwen2, qwen3). None of these files can run.", 13, Ui.BAD));
+            } else {
+                header.addView(Ui.text(this, (openRepoArch != null ? "✓ Architecture " + openRepoArch + " · " : "")
+                        + "RAM fit is based on currently free memory.", 12, openRepoArch != null ? Ui.GOOD : Ui.MUTED));
+            }
             header.addView(Ui.buttonRow(this, Ui.pill(this, "← Back to results", v -> {
                 openRepo = null;
                 repoFiles.clear();
@@ -383,7 +389,8 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
             Downloads.start(this, f);
             render();
         });
-        download.setEnabled(!present && !Downloads.running()
+        boolean archOk = openRepoArch == null || HuggingFace.SUPPORTED_ARCHS.contains(openRepoArch);
+        download.setEnabled(archOk && !present && !Downloads.running()
                 && EngineHolder.modelsDir().getUsableSpace() > f.size);
         download.setAlpha(download.isEnabled() ? 1f : 0.4f);
         card.addView(Ui.buttonRow(this, download));
@@ -423,14 +430,16 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
                 List<HuggingFace.GgufFile> files = HuggingFace.files(repo);
                 List<HuggingFace.GgufFile> supported = new ArrayList<>();
                 for (HuggingFace.GgufFile f : files) if (f.compat == HuggingFace.Compat.OK) supported.add(f);
+                final String arch = supported.isEmpty() ? null : HuggingFace.architecture(supported.get(0));
+                DebugLog.add("Repository " + repo + ": architecture " + (arch != null ? arch : "unknown"));
                 ui.post(() -> {
                     openRepo = repo;
+                    openRepoArch = arch;
                     repoFiles.clear();
                     repoFiles.addAll(supported);
-                    int split = 0;
-                    for (HuggingFace.GgufFile f : files) if (f.split) split++;
-                    hfMessage = supported.size() + " of " + files.size() + " GGUF files can run"
-                            + (split > 0 ? " (" + split + " multi-part shards hidden: not supported yet)" : "");
+                    int hidden = files.size() - supported.size();
+                    hfMessage = supported.size() + " model files" + (hidden > 0 ? " (" + hidden
+                            + " hidden: multi-part shards, vision projectors, imatrix or unsupported formats)" : "");
                     render();
                 });
             } catch (Exception e) {

@@ -26,6 +26,9 @@ import java.util.regex.Pattern;
 final class HuggingFace {
     private static final String API = "https://huggingface.co";
     private static final String USER_AGENT = "LiyabChat/0.1 (Android)";
+    /** Architectures the engine runs (keep in sync with src/core/transformer.cpp). */
+    static final java.util.Set<String> SUPPORTED_ARCHS =
+            new java.util.HashSet<>(java.util.Arrays.asList("llama", "mistral", "qwen2", "qwen3"));
     // Multi-file (split) GGUF shards: the loader maps single files only for now.
     private static final Pattern SPLIT = Pattern.compile("-\\d{5}-of-\\d{5}\\.gguf$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUANT = Pattern.compile(
@@ -63,6 +66,7 @@ final class HuggingFace {
         final String quant;
         final Compat compat;
         final boolean split;  // one shard of a multi-file GGUF (-00001-of-00003.gguf)
+        final boolean auxiliary;  // not a language model: mmproj (vision), imatrix, MTP heads
 
         GgufFile(String repo, String path, long size) {
             this(repo, path, size, null);
@@ -74,11 +78,14 @@ final class HuggingFace {
             this.size = size;
             this.sha256 = sha256;
             this.split = SPLIT.matcher(path).find();
+            String lower = path.toLowerCase(Locale.US);
+            this.auxiliary = lower.contains("mmproj") || lower.contains("imatrix") || lower.startsWith("mtp/")
+                    || lower.contains("/mtp-");
             Matcher m = QUANT.matcher(path);
             String q = null;
             while (m.find()) q = m.group(1).toUpperCase(Locale.US);  // last match: the suffix
             this.quant = q != null ? q : "?";
-            this.compat = split ? Compat.UNSUPPORTED : compatOf(this.quant);
+            this.compat = split || auxiliary ? Compat.UNSUPPORTED : compatOf(this.quant);
         }
 
         String fileName() {
@@ -125,6 +132,66 @@ final class HuggingFace {
         } catch (org.json.JSONException e) {
             throw new IOException("unexpected Hugging Face response: " + e.getMessage());
         }
+    }
+
+    /**
+     * Reads `general.architecture` from the start of `file` with an HTTP range request (it is
+     * among the first metadata keys), so unsupported models are flagged before downloading GBs.
+     * Returns null when it cannot be determined.
+     */
+    static String architecture(GgufFile file) {
+        try {
+            HttpURLConnection c = open(API + "/" + file.repo + "/resolve/main/" + encodePath(file.path));
+            c.setRequestProperty("Range", "bytes=0-65535");
+            try (InputStream in = c.getInputStream()) {
+                byte[] head = readAll(in);
+                java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(head).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                if (b.getInt() != 0x46554747) return null;  // "GGUF"
+                b.getInt();   // version
+                b.getLong();  // tensor count
+                long kvs = b.getLong();
+                for (long i = 0; i < kvs && b.remaining() > 12; i++) {
+                    String key = readString(b);
+                    int type = b.getInt();
+                    if (key.equals("general.architecture") && type == 8) return readString(b);
+                    if (!skipValue(b, type)) return null;
+                }
+            } finally {
+                c.disconnect();
+            }
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+        return null;
+    }
+
+    private static String readString(java.nio.ByteBuffer b) {
+        int n = (int) b.getLong();
+        byte[] s = new byte[n];
+        b.get(s);
+        return new String(s, StandardCharsets.UTF_8);
+    }
+
+    // Skips one metadata value of GGUF type `type`; false if it does not fit in the buffer.
+    private static boolean skipValue(java.nio.ByteBuffer b, int type) {
+        final int[] sizes = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+        if (type == 8) {
+            long n = b.getLong();
+            if (n > b.remaining()) return false;
+            b.position(b.position() + (int) n);
+            return true;
+        }
+        if (type == 9) {
+            int elem = b.getInt();
+            long count = b.getLong();
+            for (long i = 0; i < count; i++) {
+                if (b.remaining() < 8 || !skipValue(b, elem)) return false;
+            }
+            return true;
+        }
+        if (type < 0 || type >= sizes.length || sizes[type] == 0 || b.remaining() < sizes[type]) return false;
+        b.position(b.position() + sizes[type]);
+        return true;
     }
 
     /** The .gguf files of `repo` with their sizes, smallest first. */

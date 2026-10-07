@@ -39,11 +39,22 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     ModelConfig& c = model->config_;
 
     const auto arch = f.get_string("general.architecture");
-    if (!arch) return Status(ErrorCode::InvalidModel, "missing general.architecture");
+    if (!arch) {
+        const auto split_no = f.get_int("split.no");
+        const auto split_count = f.get_int("split.count");
+        if (split_no && split_count) {
+            return Status(ErrorCode::Unsupported,
+                          "this file is part " + std::to_string(*split_no + 1) + " of " + std::to_string(*split_count) +
+                              " of a split GGUF model; the model description lives in part 1 and Liyab loads "
+                              "single-file models only (download a single-file quantization instead)");
+        }
+        return Status(ErrorCode::InvalidModel, "not a model file: missing general.architecture");
+    }
     c.arch = std::string(*arch);
     if (c.arch == "llama" || c.arch == "mistral") c.rope_neox = false;
     else if (c.arch == "qwen2" || c.arch == "qwen3") c.rope_neox = true;
-    else return Status(ErrorCode::Unsupported, "architecture '" + c.arch + "' is not supported (llama, mistral, qwen2, qwen3)");
+    else return Status(ErrorCode::Unsupported, "architecture '" + c.arch + "' is not supported yet (supported: llama, "
+                                              "mistral, qwen2, qwen3 — dense transformers)");
 
     auto key = [&](const char* suffix) { return c.arch + "." + suffix; };
     auto require_int = [&](const char* suffix, int32_t& out) -> Status {

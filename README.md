@@ -358,7 +358,10 @@ final class LiyabEngine {
     resumed or deleted. Any `.gguf` can be opened with the system picker (mapped through `/proc/self/fd`, so no copy
     and no storage permission).
   * *Hugging Face:* search GGUF repositories, then open one to list only the files Liyab can run, with size,
-    quantization and a RAM-fit hint. Multi-part shards are hidden; split GGUF is not supported yet.
+    quantization and a RAM-fit hint. Multi-part shards, vision projectors (`mmproj`) and imatrix files are hidden;
+    split GGUF is not supported yet. The repository's `general.architecture` is read from the first 64 KB of a file
+    (HTTP range request), so a model with an unsupported architecture is flagged and its downloads are disabled
+    before any gigabytes are fetched. Loading a split shard reports "part N of M of a split GGUF model".
   * A live download card stays at the top. Downloads use 4 parallel range connections with per-segment state
     persisted, so they resume after a pause, a kill or a network loss. Retries use exponential backoff, and the file
     is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
@@ -524,8 +527,10 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Quantization kernels.** Q2_K, Q3_K, the I-quants and FP4 use a generic decode + SDOT path on the CPU (correct,
   but slower than the dedicated kernels). On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
 * **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
-* **Architectures.** MoE models (e.g. Qwen3-30B-A3B), Gemma, Phi and YaRN RoPE scaling are not supported.
+* **Architectures.** MoE models (e.g. Qwen3-30B-A3B), hybrid SSM/attention models (`qwen35`, e.g. Qwen3.8-27B,
+  which also uses the `qwen35` pre-tokenizer), Gemma, Phi and YaRN RoPE scaling are not supported.
   Dense Qwen2/Qwen2.5/Qwen3 and Llama/Mistral are.
+* **Split GGUF.** Multi-part models (`-00001-of-0000N.gguf`) are not loaded; use a single-file quantization.
 * **Dense 30–35B models on phones** are bandwidth-bound. Each generated token reads every weight once: a 32B model
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
   streamed from flash (~2.8 GB/s measured). Speculative decoding, MoE models, and smaller dense models are the
