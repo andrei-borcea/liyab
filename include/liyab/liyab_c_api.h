@@ -150,6 +150,14 @@ LIYAB_C_API liyab_status liyab_engine_generate_tokens(liyab_engine* engine, cons
                                                       liyab_token_callback callback, void* user_data,
                                                       liyab_generation_stats* stats);
 
+/*
+ * Tokenizes `text` (UTF-8). Writes up to `capacity` ids into `out` (may be
+ * NULL with capacity 0) and returns the total number of tokens, or -1 on
+ * error (see liyab_last_error()).
+ */
+LIYAB_C_API int32_t liyab_engine_tokenize(const liyab_engine* engine, const char* text, int32_t add_bos, int32_t* out,
+                                          int32_t capacity);
+
 /* Thread-safe; stops an in-flight generation at the next token boundary. */
 LIYAB_C_API void liyab_engine_cancel(liyab_engine* engine);
 

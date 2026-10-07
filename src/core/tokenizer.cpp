@@ -148,6 +148,13 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         }
     }
 
+    for (size_t i = 0; i < n; ++i) {
+        if (tok.types_[i] == kControl && !tok.texts_[i].empty()) tok.control_.push_back(static_cast<int32_t>(i));
+    }
+    std::sort(tok.control_.begin(), tok.control_.end(), [&](int32_t a, int32_t b) {
+        return tok.texts_[static_cast<size_t>(a)].size() > tok.texts_[static_cast<size_t>(b)].size();
+    });
+
     // End-of-generation set: EOS/EOT ids plus well-known chat terminators.
     auto add_eog = [&](int32_t id) {
         if (id >= 0 && std::find(tok.end_of_generation_.begin(), tok.end_of_generation_.end(), id) ==
@@ -182,11 +189,41 @@ Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_b
     }
     std::vector<int32_t> out;
     if (add_bos && bos_ >= 0) out.push_back(bos_);
-    if (text.empty()) return out;
+    // Split around control-token texts; plain segments go through SPM. As in
+    // llama.cpp, a segment gets the space prefix when it starts the text or
+    // follows a control token.
+    bool prev_control = true;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t best = std::string_view::npos;
+        int32_t best_id = -1;
+        for (const int32_t id : control_) {
+            const size_t at = text.find(texts_[static_cast<size_t>(id)], pos);
+            if (at < best) {  // earliest match; longest wins ties (control_ is sorted by length)
+                best = at;
+                best_id = id;
+            }
+        }
+        const std::string_view plain = text.substr(pos, best == std::string_view::npos ? std::string_view::npos : best - pos);
+        if (!plain.empty()) {
+            encode_plain(plain, prev_control && add_space_prefix_, out);
+            prev_control = false;
+        }
+        if (best == std::string_view::npos) break;
+        out.push_back(best_id);
+        prev_control = true;
+        pos = best + texts_[static_cast<size_t>(best_id)].size();
+    }
+    if (std::find(out.begin(), out.end(), unk_) != out.end() && unk_ < 0) {
+        return Status(ErrorCode::InvalidArgument, "text contains bytes the vocabulary cannot represent");
+    }
+    return out;
+}
 
+void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const {
     std::string normalized;
     normalized.reserve(text.size() * 2 + kSpmSpace.size());
-    if (add_space_prefix_) normalized += kSpmSpace;
+    if (space_prefix) normalized += kSpmSpace;
     for (const char c : text) {
         if (c == ' ') normalized += kSpmSpace;
         else normalized += c;
@@ -255,11 +292,9 @@ Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_b
             std::snprintf(byte_text, sizeof byte_text, "<0x%02X>", static_cast<unsigned char>(s.text[k]));
             const auto byte_it = lookup_.find(byte_text);
             if (byte_it != lookup_.end()) out.push_back(byte_it->second);
-            else if (unk_ >= 0) out.push_back(unk_);
-            else return Status(ErrorCode::InvalidArgument, "text contains bytes the vocabulary cannot represent");
+            else out.push_back(unk_);  // -1 when the vocabulary has no <unk>: reported by encode()
         }
     }
-    return out;
 }
 
 }  // namespace liyab

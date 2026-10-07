@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "liyab/liyab_c_api.h"
 
@@ -34,6 +35,7 @@ void usage() {
                  "usage: liyab-cli --device\n"
                  "       liyab-cli -m MODEL.gguf -p PROMPT [options]\n"
                  "options:\n"
+                 "  --tokenize         print the prompt's token ids and exit\n"
                  "  -n N               max new tokens (default 128)\n"
                  "  --temp T           temperature, 0 = greedy (default 0.8)\n"
                  "  --top-k K          (default 40)    --top-p P (default 0.95)\n"
@@ -67,6 +69,7 @@ int main(int argc, char** argv) {
     params.max_tokens = 128;
     std::string prompt;
     bool device_only = false;
+    bool tokenize_only = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -78,6 +81,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--device") device_only = true;
+        else if (arg == "--tokenize") tokenize_only = true;
         else if (arg == "-m" || arg == "--model") config.model_path = next();
         else if (arg == "-p" || arg == "--prompt") prompt = next();
         else if (arg == "-n") params.max_tokens = std::atoi(next());
@@ -153,6 +157,15 @@ int main(int argc, char** argv) {
     if (liyab_engine_create(&config, &g_engine) != LIYAB_OK) {
         std::fprintf(stderr, "error: %s\n", liyab_last_error());
         return 1;
+    }
+    if (tokenize_only) {
+        const int32_t n = liyab_engine_tokenize(g_engine, prompt.c_str(), params.add_bos, nullptr, 0);
+        std::vector<int32_t> ids(static_cast<size_t>(std::max(0, n)));
+        liyab_engine_tokenize(g_engine, prompt.c_str(), params.add_bos, ids.data(), n);
+        for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? " " : "", ids[i]);
+        std::printf("\n");
+        liyab_engine_destroy(g_engine);
+        return n < 0 ? 1 : 0;
     }
     std::string info(liyab_engine_describe(g_engine, nullptr, 0) + 1, '\0');
     liyab_engine_describe(g_engine, info.data(), info.size());

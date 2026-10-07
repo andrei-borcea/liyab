@@ -21,7 +21,8 @@ public:
     // Text → token ids. Implemented for SentencePiece vocabularies ("llama":
     // Llama 2, Mistral, TinyLlama...). Byte-level BPE vocabularies ("gpt2":
     // Llama 3, Qwen) return Unsupported — tokenize on the app side and use
-    // the token-id generation API.
+    // the token-id generation API. Control tokens written in the text (e.g.
+    // "</s>" in a chat template) map to their ids, as llama.cpp does.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
 
     // Raw bytes for one token; control tokens decode to "". A multi-byte
@@ -43,6 +44,9 @@ private:
     std::vector<std::string> pieces_;  // decoded bytes per token
     std::unordered_map<std::string_view, int32_t> lookup_;
     std::vector<int32_t> end_of_generation_;
+    std::vector<int32_t> control_;  // control tokens with text, longest first
+
+    void encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const;
     int32_t bos_ = -1;
     int32_t eos_ = -1;
     int32_t unk_ = -1;

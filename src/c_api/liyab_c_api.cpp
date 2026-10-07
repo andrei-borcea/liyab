@@ -2,6 +2,7 @@
 // sure no exception or C++ type escapes across the boundary.
 #include "liyab/liyab_c_api.h"
 
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <new>
@@ -190,6 +191,27 @@ liyab_status liyab_engine_generate_tokens(liyab_engine* engine, const int32_t* t
                                                                  to_cpp(params), wrap(callback, user_data)),
                                  stats);
     });
+}
+
+int32_t liyab_engine_tokenize(const liyab_engine* engine, const char* text, int32_t add_bos, int32_t* out,
+                              int32_t capacity) {
+    if (engine == nullptr || text == nullptr || capacity < 0 || (out == nullptr && capacity > 0)) {
+        fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and text are required");
+        return -1;
+    }
+    try {
+        auto ids = engine->engine->tokenize(text, add_bos != 0);
+        if (!ids) {
+            fail(ids.status());
+            return -1;
+        }
+        const auto n = static_cast<int32_t>(ids->size());
+        std::copy_n(ids->begin(), std::min(n, capacity), out);
+        return n;
+    } catch (...) {
+        fail(LIYAB_ERR_INTERNAL, "internal error");
+        return -1;
+    }
 }
 
 void liyab_engine_cancel(liyab_engine* engine) {

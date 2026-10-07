@@ -340,6 +340,13 @@ TEST_CASE("SPM tokenizer merges by score and falls back to bytes") {
     for (const int32_t id : accented.value()) decoded += t.piece(id);
     CHECK(decoded == " h\xC3\xA9");
     CHECK(t.piece(1).empty());  // control tokens produce no text
+
+    // Control tokens written in the text map to their ids (chat templates).
+    auto templated = t.encode("hello</s>world", false);
+    REQUIRE(templated.has_value());
+    const std::vector<int32_t> expected_ids = {test::tiny_token("\xE2\x96\x81hello"), 2,
+                                               test::tiny_token("\xE2\x96\x81world")};
+    CHECK(templated.value() == expected_ids);
 }
 
 // ---------------------------------------------------------------------------
