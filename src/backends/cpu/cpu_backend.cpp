@@ -48,6 +48,12 @@ public:
             for (int32_t t = 0; t < n; ++t) {
                 quant::quantize_row_q8_0(x + t * cols, xq_.data() + t * blocks, cols);
             }
+            if (quant::is_k_quant(w.type) || w.type == DType::Q5_1) {  // minimums need the activation block sums
+                xsums_.resize(xq_.size());
+                quant::block_sums(xq_.data(), xsums_.data(), cols * n);
+            } else {
+                xsums_.clear();
+            }
         }
 
         const size_t row_bytes = w.row_bytes();
@@ -56,18 +62,16 @@ public:
                 const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
                 for (int32_t t = 0; t < n; ++t) {
                     float v = 0.0f;
-                    switch (w.type) {
-                        case DType::Q4_0:
-                        case DType::Q4_1:
-                        case DType::Q8_0:
-                            v = quant::dot_quantized(w.type, row, xq_.data() + t * blocks, cols);
-                            break;
-                        case DType::F16:
-                            v = quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(row), x + t * cols, cols);
-                            break;
-                        case DType::F32:
-                            v = quant::dot_f32(reinterpret_cast<const float*>(row), x + t * cols, cols);
-                            break;
+                    if (quantized) {
+                        // K-quants and Q5_1 also read the activation block sums.
+                        v = quant::dot_quantized(w.type, row, xq_.data() + t * blocks,
+                                                 xsums_.empty() ? nullptr : xsums_.data() + t * blocks, cols);
+                    } else if (w.type == DType::F16) {
+                        v = quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(row), x + t * cols, cols);
+                    } else if (w.type == DType::BF16) {
+                        v = quant::dot_bf16_f32(reinterpret_cast<const uint16_t*>(row), x + t * cols, cols);
+                    } else {
+                        v = quant::dot_f32(reinterpret_cast<const float*>(row), x + t * cols, cols);
                     }
                     y[t * rows + r] = v;
                 }
@@ -79,6 +83,7 @@ public:
 private:
     ThreadPool& pool_;
     std::vector<quant::BlockQ8_0> xq_;
+    std::vector<int32_t> xsums_;
 };
 
 }  // namespace

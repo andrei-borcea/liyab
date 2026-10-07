@@ -155,7 +155,10 @@ int pipeline_index(DType type) {
         case DType::F16: return 1;
         case DType::Q4_0: return 2;
         case DType::Q4_1: return 3;
+        case DType::Q4_K: return 3;  // repacked exactly into the Q4_1 layout (scale + min per 32 values)
         case DType::Q8_0: return 4;
+        case DType::Q5_0: return 4;  // repacked exactly into the Q8_0 layout (q - 16 in int8)
+        default: break;  // not on the GPU yet (CPU fallback)
     }
     return 0;
 }
@@ -515,6 +518,10 @@ Result<VulkanBackend::Weights*> VulkanBackend::upload(const TensorView& w) {
         case DType::Q4_0: scale_bytes = blocks * 4; quant_bytes = blocks * 16; break;
         case DType::Q4_1: scale_bytes = blocks * 8; quant_bytes = blocks * 16; break;
         case DType::Q8_0: scale_bytes = blocks * 4; quant_bytes = blocks * 32; break;
+        case DType::Q4_K: scale_bytes = blocks * 8; quant_bytes = blocks * 16; break;  // as Q4_1
+        case DType::Q5_0: scale_bytes = blocks * 4; quant_bytes = blocks * 32; break;  // as Q8_0
+        default:
+            return Status(ErrorCode::Unsupported, std::string(dtype_traits(w.type).name) + " runs on the CPU for now");
     }
     const VkDeviceSize limit = props_.limits.maxStorageBufferRange;
     if (quant_bytes > limit || scale_bytes > limit) {
@@ -559,6 +566,37 @@ Result<VulkanBackend::Weights*> VulkanBackend::upload(const TensorView& w) {
             }
             break;
         }
+        case DType::Q4_K: {
+            // Each 32-value sub-block is x = d*sc*q - dmin*m with q in 0..15: the
+            // Q4_1 form (scale, min, 4-bit q). Repack nibbles to Q4_1 order.
+            const auto* b = reinterpret_cast<const quant::BlockQ4_K*>(w.data);
+            int8_t q[quant::kSuperBlock];
+            float scale16[16];
+            float min32[8];
+            for (size_t sb = 0; sb < blocks / 8; ++sb) {
+                quant::unpack_k_block(DType::Q4_K, &b[sb], q, scale16, min32);
+                for (size_t j = 0; j < 8; ++j) {
+                    const size_t blk = sb * 8 + j;
+                    scales[2 * blk] = scale16[2 * j];
+                    scales[2 * blk + 1] = -min32[j];
+                    for (size_t k = 0; k < 16; ++k) {
+                        quants[blk * 16 + k] =
+                            static_cast<uint8_t>(q[32 * j + k] | (q[32 * j + k + 16] << 4));
+                    }
+                }
+            }
+            break;
+        }
+        case DType::Q5_0: {
+            const auto* b = reinterpret_cast<const quant::BlockQ5_0*>(w.data);
+            for (size_t i = 0; i < blocks; ++i) {
+                scales[i] = quant::fp16_to_fp32(b[i].d);
+                quant::unpack_q5_block(b[i].qh, b[i].qs, true, reinterpret_cast<int8_t*>(quants + i * 32));
+            }
+            break;
+        }
+        default:
+            break;
     }
     flush(out.scales);
     flush(out.quants);

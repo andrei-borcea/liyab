@@ -555,12 +555,25 @@ public final class MainActivity extends Activity {
                                 .setPositiveButton("OK", null).show();
                         return;
                     }
-                    String[] labels = new String[files.size()];
-                    for (int i = 0; i < files.size(); i++) {
-                        HuggingFace.GgufFile f = files.get(i);
-                        labels[i] = String.format(Locale.US, "%s\n%.2f GB · %s · %s", f.fileName(), f.size / 1e9,
-                                f.quant, f.compat.label);
+                    // Only formats Liyab can run are offered.
+                    List<HuggingFace.GgufFile> supported = new ArrayList<>();
+                    for (HuggingFace.GgufFile f : files) {
+                        if (f.compat == HuggingFace.Compat.OK) supported.add(f);
                     }
+                    if (supported.isEmpty()) {
+                        new AlertDialog.Builder(this).setTitle(repo)
+                                .setMessage("None of the " + files.size() + " GGUF files uses a format Liyab supports.")
+                                .setPositiveButton("OK", null).show();
+                        return;
+                    }
+                    String[] labels = new String[supported.size()];
+                    for (int i = 0; i < supported.size(); i++) {
+                        HuggingFace.GgufFile f = supported.get(i);
+                        labels[i] = String.format(Locale.US, "%s\n%.2f GB · %s · fits in RAM: %s", f.fileName(),
+                                f.size / 1e9, f.quant, fitsInRam(f.size) ? "yes" : "no (streamed from flash, slow)");
+                    }
+                    files.clear();
+                    files.addAll(supported);
                     new AlertDialog.Builder(this)
                             .setTitle(repo)
                             .setItems(labels, (d, which) -> confirmDownload(files.get(which)))
@@ -576,14 +589,20 @@ public final class MainActivity extends Activity {
         });
     }
 
+    /** Rough check: the model should leave ~1.5 GB of headroom in currently available memory. */
+    private boolean fitsInRam(long bytes) {
+        android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        android.app.ActivityManager.MemoryInfo info = new android.app.ActivityManager.MemoryInfo();
+        am.getMemoryInfo(info);
+        return bytes + 1_500_000_000L < info.availMem;
+    }
+
     private void confirmDownload(HuggingFace.GgufFile f) {
         String message = String.format(Locale.US, "%s\n%.2f GB, free space %.1f GB\n\n%s", f.fileName(),
                 f.size / 1e9, modelsDir().getUsableSpace() / 1e9,
-                f.compat == HuggingFace.Compat.OK ? "Liyab can run this format."
-                        : f.compat == HuggingFace.Compat.MAYBE
-                        ? "Q4_0/Q4_1 files usually keep the output head in Q6_K, which Liyab does not run yet. "
-                        + "Q8_0 is the safe choice today."
-                        : "Liyab cannot run " + f.quant + " yet (K-quants / IQ formats). Pick a Q8_0 or F16 file.");
+                fitsInRam(f.size) ? "Fits in memory."
+                        : "Larger than the free RAM: it will run, but weights are re-read from flash for every "
+                        + "token, so expect well under 1 token/s.");
         new AlertDialog.Builder(this)
                 .setTitle("Download model?")
                 .setMessage(message)

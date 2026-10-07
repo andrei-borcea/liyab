@@ -18,11 +18,12 @@ public:
 
     static Result<Tokenizer> load(const MmapLoader& model);
 
-    // Text → token ids. Implemented for SentencePiece vocabularies ("llama":
-    // Llama 2, Mistral, TinyLlama...). Byte-level BPE vocabularies ("gpt2":
-    // Llama 3, Qwen) return Unsupported — tokenize on the app side and use
-    // the token-id generation API. Control tokens written in the text (e.g.
-    // "</s>" in a chat template) map to their ids, as llama.cpp does.
+    // Text → token ids, matching llama.cpp. SentencePiece vocabularies
+    // ("llama": Llama 2, Mistral, TinyLlama) and byte-level BPE ("gpt2") with
+    // the Qwen2 / Llama 3 pre-tokenizers (tokenizer.ggml.pre = qwen2,
+    // deepseek-r1-qwen, llama-bpe, llama3); other BPE pre-tokenizers return
+    // Unsupported. Special tokens written in the text (e.g. "</s>",
+    // "<|im_start|>") map to their ids.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
 
     // Raw bytes for one token; control tokens decode to "". A multi-byte
@@ -46,7 +47,14 @@ private:
     std::vector<int32_t> end_of_generation_;
     std::vector<int32_t> control_;  // control tokens with text, longest first
 
+    enum class PreTokenizer { None, Qwen2, Llama3 };
+    PreTokenizer pre_ = PreTokenizer::None;
+    std::string pre_name_;
+    std::unordered_map<std::string, int32_t> merge_rank_;  // "left right" -> rank (BPE)
+
     void encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const;
+    void encode_bpe(std::string_view text, std::vector<int32_t>& out) const;
+    void bpe_word(std::string_view word, std::vector<int32_t>& out) const;
     int32_t bos_ = -1;
     int32_t eos_ = -1;
     int32_t unk_ = -1;

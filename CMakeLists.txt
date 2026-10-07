@@ -64,6 +64,7 @@ add_library(liyab_core OBJECT
   src/core/types.cpp
   src/core/log.cpp
   src/core/quant.cpp
+  src/core/quant_ext.cpp
   src/core/thread_pool.cpp
   src/core/mmap_loader.cpp
   src/core/device_detect.cpp
@@ -238,6 +239,7 @@ if(LIYAB_BUILD_TESTS)
     # Tests use internal headers, so they link the object library directly.
     target_link_libraries(${name} PRIVATE liyab_core)
     target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests)
+    target_compile_definitions(${name} PRIVATE LIYAB_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
     add_test(NAME ${name} COMMAND ${name})
   endforeach()
 endif()

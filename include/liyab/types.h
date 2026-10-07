@@ -99,7 +99,30 @@ enum class DType : uint32_t {
     F16 = 1,
     Q4_0 = 2,   // 32-element blocks: fp16 scale + 16 bytes of 4-bit values (symmetric)
     Q4_1 = 3,   // 32-element blocks: fp16 scale + fp16 min + 16 bytes (asymmetric)
+    Q5_0 = 6,   // 32-element blocks: fp16 scale + 5-bit values (high bits packed), symmetric
+    Q5_1 = 7,   // 32-element blocks: fp16 scale + fp16 min + 5-bit values
     Q8_0 = 8,   // 32-element blocks: fp16 scale + 32 int8 values
+    // K-quants: 256-element super-blocks with 6/8-bit sub-block scales.
+    Q4_K = 12,  // 8 x 32: 4-bit values, scale + min per sub-block (4.5 bits/weight)
+    Q5_K = 13,  // 8 x 32: 5-bit values, scale + min per sub-block (5.5 bits/weight)
+    Q6_K = 14,  // 16 x 16: 6-bit signed values, int8 scale per sub-block (6.56 bits/weight)
+    Q2_K = 10,  // 2-bit values, 4-bit scale + min per 16
+    Q3_K = 11,  // 3-bit values, 6-bit scale per 16
+    // I-quants: lattice codebooks (grids) + signs, 1.6 to 4.25 bits/weight.
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ3_XXS = 18,
+    IQ1_S = 19,
+    IQ4_NL = 20,  // 32-value blocks, non-linear 4-bit codebook
+    IQ3_S = 21,
+    IQ2_S = 22,
+    IQ4_XS = 23,
+    IQ1_M = 29,
+    BF16 = 30,    // bfloat16
+    TQ1_0 = 34,   // ternary {-1, 0, 1}, 1.69 bits/weight
+    TQ2_0 = 35,   // ternary, 2.06 bits/weight
+    MXFP4 = 39,   // OCP microscaling FP4 (e2m1) with e8m0 scale per 32
+    NVFP4 = 40,   // FP4 (e2m1) with ue4m3 scale per 16
 };
 
 struct DTypeTraits {

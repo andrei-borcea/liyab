@@ -175,10 +175,16 @@ public:
     [[nodiscard]] std::string description() const override {
         return std::string("metal (") + device_.name.UTF8String + ", zero-copy weights)";
     }
-    [[nodiscard]] bool supports(DType) const noexcept override { return true; }
+    [[nodiscard]] bool supports(DType type) const noexcept override {
+        return type == DType::F32 || type == DType::F16 || type == DType::Q4_0 || type == DType::Q4_1 ||
+               type == DType::Q8_0;
+    }
 
     Status matmul(const TensorView& w, const float* x, float* y, int32_t n) override {
         if (n <= 0) return Status::ok();
+        if (!supports(w.type)) {  // K-quant kernels not written for Metal yet: CPU fallback
+            return Status(ErrorCode::Unsupported, std::string(dtype_traits(w.type).name) + " runs on the CPU for now");
+        }
         @autoreleasepool {
             NSUInteger weight_offset = 0;
             id<MTLBuffer> weights = weight_buffer(w, weight_offset);
@@ -226,6 +232,7 @@ private:
             case DType::Q4_0: return pipelines_[2];
             case DType::Q8_0: return pipelines_[3];
             case DType::Q4_1: return pipelines_[4];
+            default: break;
         }
         return pipelines_[0];
     }

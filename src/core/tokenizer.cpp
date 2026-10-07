@@ -1,6 +1,7 @@
 #include "core/tokenizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -46,6 +47,55 @@ const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
             m[printable ? b : 256 + extra++] = static_cast<uint8_t>(b);
         }
         return m;
+    }();
+    return table;
+}
+
+// --- Unicode categories for the BPE pre-tokenizer --------------------------
+struct CodepointRange {
+    uint32_t first;
+    uint32_t last;
+};
+#include "core/unicode_tables.inc"
+
+template <size_t N>
+bool in_ranges(const CodepointRange (&ranges)[N], uint32_t cp) noexcept {
+    size_t lo = 0, hi = N;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < ranges[mid].first) hi = mid;
+        else if (cp > ranges[mid].last) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+bool is_letter(uint32_t cp) noexcept { return in_ranges(kLetterRanges, cp); }
+bool is_number(uint32_t cp) noexcept { return in_ranges(kNumberRanges, cp); }
+bool is_whitespace(uint32_t cp) noexcept {  // Unicode White_Space property
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 || cp == 0xA0 || cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+// GPT-2 bytes_to_unicode(): byte -> UTF-8 of its printable stand-in.
+const std::array<std::string, 256>& gpt2_byte_encoder() {
+    static const std::array<std::string, 256> table = [] {
+        std::array<std::string, 256> t;
+        int32_t extra = 0;
+        for (int32_t b = 0; b < 256; ++b) {
+            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+            const uint32_t cp = printable ? static_cast<uint32_t>(b) : static_cast<uint32_t>(256 + extra++);
+            std::string utf8;
+            if (cp < 0x80) {
+                utf8 += static_cast<char>(cp);
+            } else {
+                utf8 += static_cast<char>(0xC0 | (cp >> 6));
+                utf8 += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            t[static_cast<size_t>(b)] = utf8;
+        }
+        return t;
     }();
     return table;
 }
@@ -148,8 +198,25 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         }
     }
 
+    // Special tokens recognised in raw text: control and user-defined ones.
     for (size_t i = 0; i < n; ++i) {
-        if (tok.types_[i] == kControl && !tok.texts_[i].empty()) tok.control_.push_back(static_cast<int32_t>(i));
+        if ((tok.types_[i] == kControl || tok.types_[i] == kUserDefined) && !tok.texts_[i].empty()) {
+            tok.control_.push_back(static_cast<int32_t>(i));
+        }
+    }
+    if (tok.kind_ == Kind::Gpt2) {
+        const auto pre = model.get_string("tokenizer.ggml.pre");
+        tok.pre_name_ = pre ? std::string(*pre) : "default";
+        if (tok.pre_name_ == "qwen2" || tok.pre_name_ == "deepseek-r1-qwen") tok.pre_ = PreTokenizer::Qwen2;
+        else if (tok.pre_name_ == "llama-bpe" || tok.pre_name_ == "llama3") tok.pre_ = PreTokenizer::Llama3;
+        const GgufValue* merges = model.metadata("tokenizer.ggml.merges");
+        if (merges == nullptr || merges->array_type != GgufValue::Type::String) {
+            return Status(ErrorCode::InvalidModel, "BPE vocabulary without tokenizer.ggml.merges");
+        }
+        tok.merge_rank_.reserve(merges->strings.size());
+        for (size_t r = 0; r < merges->strings.size(); ++r) {
+            tok.merge_rank_.emplace(std::string(merges->strings[r]), static_cast<int32_t>(r));
+        }
     }
     std::sort(tok.control_.begin(), tok.control_.end(), [&](int32_t a, int32_t b) {
         return tok.texts_[static_cast<size_t>(a)].size() > tok.texts_[static_cast<size_t>(b)].size();
@@ -182,10 +249,9 @@ const std::string& Tokenizer::piece(int32_t id) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
-    if (kind_ != Kind::Spm) {
-        return Status(ErrorCode::Unsupported,
-                      "text encoding for byte-level BPE (gpt2) vocabularies is not implemented; "
-                      "pass token ids instead");
+    if (kind_ == Kind::Gpt2 && pre_ == PreTokenizer::None) {
+        return Status(ErrorCode::Unsupported, "BPE pre-tokenizer '" + pre_name_ +
+                                                  "' is not supported yet (qwen2 and llama3 are); pass token ids instead");
     }
     std::vector<int32_t> out;
     if (add_bos && bos_ >= 0) out.push_back(bos_);
@@ -206,7 +272,8 @@ Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_b
         }
         const std::string_view plain = text.substr(pos, best == std::string_view::npos ? std::string_view::npos : best - pos);
         if (!plain.empty()) {
-            encode_plain(plain, prev_control && add_space_prefix_, out);
+            if (kind_ == Kind::Gpt2) encode_bpe(plain, out);
+            else encode_plain(plain, prev_control && add_space_prefix_, out);
             prev_control = false;
         }
         if (best == std::string_view::npos) break;
@@ -293,6 +360,138 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
             const auto byte_it = lookup_.find(byte_text);
             if (byte_it != lookup_.end()) out.push_back(byte_it->second);
             else out.push_back(unk_);  // -1 when the vocabulary has no <unk>: reported by encode()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Byte-level BPE (GPT-2 family: Qwen2, Llama 3)
+// ---------------------------------------------------------------------------
+void Tokenizer::encode_bpe(std::string_view text, std::vector<int32_t>& out) const {
+    // Decode to code points, remembering byte offsets for slicing.
+    std::vector<uint32_t> cps;
+    std::vector<size_t> offsets;
+    for (size_t i = 0; i < text.size();) {
+        offsets.push_back(i);
+        const int32_t cp = next_codepoint(text, i);
+        cps.push_back(cp < 0 ? 0xFFFD : static_cast<uint32_t>(cp));
+    }
+    offsets.push_back(text.size());
+    const size_t n = cps.size();
+    constexpr uint32_t kEnd = 0xFFFFFFFF;
+    auto cp_at = [&](size_t i) { return i < n ? cps[i] : kEnd; };
+    auto letter = [&](size_t i) { return i < n && is_letter(cps[i]); };
+    auto number = [&](size_t i) { return i < n && is_number(cps[i]); };
+    auto space = [&](size_t i) { return i < n && is_whitespace(cps[i]); };
+    auto lower = [](uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+
+    // Hand-written equivalent of the Qwen2 / Llama 3 pre-tokenizer regex
+    // (same structure as llama.cpp's unicode_regex_split_custom_llama3):
+    //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}  (Qwen2: \p{N})
+    //   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+    const size_t max_digits = pre_ == PreTokenizer::Llama3 ? 3 : 1;
+    size_t start = 0;
+    size_t pos = 0;
+    auto emit = [&](size_t end) {
+        if (end > start) bpe_word(text.substr(offsets[start], offsets[end] - offsets[start]), out);
+        start = pos = end;
+    };
+    while (pos < n) {
+        const uint32_t cp = cps[pos];
+        if (cp == '\'' && pos + 1 < n) {  // contractions
+            const uint32_t c1 = lower(cp_at(pos + 1));
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                emit(pos + 2);
+                continue;
+            }
+            if (pos + 2 < n) {
+                const uint32_t c2 = lower(cp_at(pos + 2));
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                    emit(pos + 3);
+                    continue;
+                }
+            }
+        }
+        if (!(cp == '\r' || cp == '\n' || number(pos)) && (letter(pos) || letter(pos + 1))) {  // [^\r\n\p{L}\p{N}]?\p{L}+
+            size_t end = pos + 1;
+            while (letter(end)) ++end;
+            emit(end);
+            continue;
+        }
+        if (number(pos)) {  // digits, grouped by at most max_digits
+            size_t end = pos;
+            while (number(end) && end - pos < max_digits) ++end;
+            emit(end);
+            continue;
+        }
+        const size_t sym = cp == ' ' ? pos + 1 : pos;  //  ?[^\s\p{L}\p{N}]+[\r\n]*
+        if (sym < n && !space(sym) && !letter(sym) && !number(sym)) {
+            size_t end = sym;
+            while (end < n && !space(end) && !letter(end) && !number(end)) ++end;
+            while (cp_at(end) == '\r' || cp_at(end) == '\n') ++end;
+            emit(end);
+            continue;
+        }
+        size_t spaces = 0;
+        size_t last_newline_end = 0;
+        while (space(pos + spaces)) {
+            const uint32_t c = cps[pos + spaces];
+            if (c == '\r' || c == '\n') last_newline_end = pos + spaces + 1;
+            ++spaces;
+        }
+        if (last_newline_end > 0) {  // \s*[\r\n]+
+            emit(last_newline_end);
+            continue;
+        }
+        if (spaces > 1 && pos + spaces < n) {  // \s+(?!\S): leave one space for the next word
+            emit(pos + spaces - 1);
+            continue;
+        }
+        if (spaces > 0) {  // \s+
+            emit(pos + spaces);
+            continue;
+        }
+        emit(pos + 1);  // anything else: a single code point
+    }
+}
+
+void Tokenizer::bpe_word(std::string_view word, std::vector<int32_t>& out) const {
+    // Byte-level mapping, then merges by rank (lowest first, leftmost on ties).
+    const auto& encoder = gpt2_byte_encoder();
+    std::vector<std::string> symbols;
+    symbols.reserve(word.size());
+    for (const char c : word) symbols.push_back(encoder[static_cast<unsigned char>(c)]);
+    if (symbols.size() > 1) {
+        std::string key;
+        for (;;) {
+            int32_t best_rank = INT32_MAX;
+            size_t best = 0;
+            for (size_t i = 0; i + 1 < symbols.size(); ++i) {
+                key.assign(symbols[i]).append(" ").append(symbols[i + 1]);
+                const auto it = merge_rank_.find(key);
+                if (it != merge_rank_.end() && it->second < best_rank) {
+                    best_rank = it->second;
+                    best = i;
+                }
+            }
+            if (best_rank == INT32_MAX) break;
+            symbols[best] += symbols[best + 1];
+            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best) + 1);
+        }
+    }
+    for (const std::string& sym : symbols) {
+        const auto it = lookup_.find(sym);
+        if (it != lookup_.end()) {
+            out.push_back(it->second);
+            continue;
+        }
+        // Not in the vocabulary (should not happen for byte-level BPE): fall back to its bytes.
+        size_t i = 0;
+        while (i < sym.size()) {
+            const size_t len = std::min(utf8_len(static_cast<unsigned char>(sym[i])), sym.size() - i);
+            const auto byte_it = lookup_.find(std::string_view(sym).substr(i, len));
+            out.push_back(byte_it != lookup_.end() ? byte_it->second : unk_);
+            i += len;
         }
     }
 }

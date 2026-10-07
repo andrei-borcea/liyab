@@ -269,6 +269,124 @@ TEST_CASE("Q4_0 / Q8_0 dot kernels match the float dot product") {
     }
 }
 
+TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") {
+    std::mt19937 rng(17);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t n = 512;  // two 256-value super-blocks
+    std::vector<float> x(static_cast<size_t>(n));
+    for (auto& v : x) v = normal(rng);
+    std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(n / 32));
+    std::vector<int32_t> xs(xq.size());
+    quant::quantize_row_q8_0(x.data(), xq.data(), n);
+    quant::block_sums(xq.data(), xs.data(), n);
+    std::vector<float> xd(static_cast<size_t>(n));
+    quant::dequantize_row(DType::Q8_0, xq.data(), xd.data(), n);
+
+    for (const DType type : {DType::Q4_K, DType::Q5_K, DType::Q6_K, DType::Q5_0, DType::Q5_1}) {
+        // Random payload with sane fp16 scales (random bits could be inf/NaN).
+        std::vector<uint8_t> row(dtype_row_bytes(type, n));
+        for (auto& b : row) b = static_cast<uint8_t>(rng());
+        const size_t block = dtype_row_bytes(type, dtype_traits(type).block_size);
+        for (size_t off = 0; off < row.size(); off += block) {
+            const uint16_t d = quant::fp32_to_fp16(0.01f + 0.001f * static_cast<float>(rng() % 16));
+            const uint16_t m = quant::fp32_to_fp16(0.005f);
+            if (type == DType::Q6_K) {
+                std::memcpy(&row[off + 208], &d, 2);  // d is the last field
+            } else {
+                std::memcpy(&row[off], &d, 2);
+                if (type != DType::Q5_0) std::memcpy(&row[off + 2], &m, 2);  // dmin / m
+            }
+        }
+        std::vector<float> w(static_cast<size_t>(n));
+        quant::dequantize_row(type, row.data(), w.data(), n);
+        double expected = 0.0;
+        for (int64_t i = 0; i < n; ++i) expected += static_cast<double>(w[i]) * xd[i];
+        const float got = quant::dot_quantized(type, row.data(), xq.data(), xs.data(), n);
+        double scale = 0.0;
+        for (int64_t i = 0; i < n; ++i) scale += std::fabs(static_cast<double>(w[i]) * xd[i]);
+        if (std::fabs(got - expected) > 1e-4 * std::max(1.0, scale)) {
+            std::printf("  %s: kernel %f vs reference %f\n", std::string(dtype_traits(type).name).c_str(), got, expected);
+        }
+        CHECK_NEAR(got, expected, 1e-4 * std::max(1.0, scale));
+    }
+}
+
+TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
+    std::string dir = LIYAB_TEST_DATA_DIR;
+    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
+    std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
+    if (f == nullptr) {
+        std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
+        return;
+    }
+    std::vector<uint8_t> file;
+    uint8_t chunk[4096];
+    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
+    std::fclose(f);
+    REQUIRE(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
+    size_t pos = 12;
+    uint32_t count = 0;
+    std::memcpy(&count, file.data() + 8, 4);
+    std::mt19937 rng(23);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    int checked = 0;
+    for (uint32_t e = 0; e < count; ++e) {
+        uint32_t ggml = 0, n_blocks = 0;
+        std::memcpy(&ggml, file.data() + pos, 4);
+        std::memcpy(&n_blocks, file.data() + pos + 4, 4);
+        pos += 8;
+        DType type{};
+        REQUIRE(dtype_from_ggml(ggml, type));
+        const DTypeTraits t = dtype_traits(type);
+        const int64_t n = static_cast<int64_t>(n_blocks) * t.block_size;
+        const uint8_t* blocks = file.data() + pos;
+        pos += static_cast<size_t>(n_blocks) * t.block_bytes;
+        std::vector<float> expected(static_cast<size_t>(n));
+        std::memcpy(expected.data(), file.data() + pos, expected.size() * 4);
+        pos += expected.size() * 4;
+
+        // 1. Decoding: bit-exact, except IQ1 (reference rounds dl*(g+delta), we compute dl*g + dl*delta).
+        std::vector<float> got(static_cast<size_t>(n));
+        quant::dequantize_row(type, blocks, got.data(), n);
+        const bool iq1 = type == DType::IQ1_S || type == DType::IQ1_M;
+        double max_err = 0.0, scale = 1e-6;
+        for (int64_t i = 0; i < n; ++i) {
+            max_err = std::max(max_err, std::fabs(static_cast<double>(got[i]) - expected[i]));
+            scale = std::max(scale, std::fabs(static_cast<double>(expected[i])));
+        }
+        const bool decode_ok = iq1 ? max_err <= 1e-6 * scale : max_err == 0.0;
+        CHECK(decode_ok);
+
+        // 2. Dot kernel against the float dot of the decoded weights (block-aligned length).
+        const int64_t m = n / 256 * 256 > 0 ? n / 256 * 256 : n / 32 * 32;
+        std::vector<float> x(static_cast<size_t>(m));
+        for (auto& v : x) v = normal(rng);
+        float kernel = 0.0f;
+        double reference = 0.0;
+        if (type == DType::BF16) {
+            kernel = quant::dot_bf16_f32(reinterpret_cast<const uint16_t*>(blocks), x.data(), m);
+            for (int64_t i = 0; i < m; ++i) reference += static_cast<double>(expected[i]) * x[i];
+        } else {
+            std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(m / 32));
+            std::vector<int32_t> xs(xq.size());
+            quant::quantize_row_q8_0(x.data(), xq.data(), m);
+            quant::block_sums(xq.data(), xs.data(), m);
+            std::vector<float> xd(static_cast<size_t>(m));
+            quant::dequantize_row(DType::Q8_0, xq.data(), xd.data(), m);
+            kernel = quant::dot_quantized(type, blocks, xq.data(), xs.data(), m);
+            for (int64_t i = 0; i < m; ++i) reference += static_cast<double>(expected[i]) * xd[i];
+        }
+        double mag = 1e-3;
+        for (int64_t i = 0; i < m; ++i) mag += std::fabs(static_cast<double>(expected[i]) * x[i]);
+        const bool dot_ok = std::fabs(kernel - reference) <= 1e-4 * mag;
+        CHECK(dot_ok);
+        std::printf("  %-8s decode %s (max err %.1e)  dot %s\n", std::string(t.name).c_str(),
+                    decode_ok ? "exact" : "MISMATCH", max_err, dot_ok ? "ok" : "MISMATCH");
+        ++checked;
+    }
+    CHECK(checked == static_cast<int>(count));
+}
+
 TEST_CASE("CPU backend batched matmul equals per-row dots") {
     const auto path = mixed_model();
     auto loader = MmapLoader::open(path);

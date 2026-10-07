@@ -302,7 +302,7 @@ void Transformer::attention(int32_t layer, int32_t n, ThreadPool& pool, const ui
             float max_score = -INFINITY;
             for (int32_t i = 0; i < n_visible; ++i) {
                 const uint8_t* k = kv_->k_row(layer, position(i), g);
-                const float s = (quantized_kv ? quant::dot_quantized(kv_type, k, q8.data(), hd)
+                const float s = (quantized_kv ? quant::dot_quantized(kv_type, k, q8.data(), nullptr, hd)
                                               : quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(k), q, hd)) *
                                 scale;
                 scores[static_cast<size_t>(i)] = s;

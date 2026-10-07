@@ -322,7 +322,8 @@ const DeviceInfo& Engine::device() const noexcept { return impl_->device; }
 PowerManager& Engine::power() noexcept { return *impl_->power; }
 
 Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bos) const {
-    return impl_->tokenizer->encode(text, add_bos);
+    // BOS only when requested *and* the model uses one (Qwen does not).
+    return impl_->tokenizer->encode(text, add_bos && impl_->tokenizer->add_bos_default());
 }
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
@@ -363,7 +364,7 @@ std::string Engine::describe() const {
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
-    auto tokens = tokenize(prompt, params.add_bos && impl_->tokenizer->add_bos_default());
+    auto tokens = tokenize(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     return generate_tokens(*tokens, params, on_token);
 }

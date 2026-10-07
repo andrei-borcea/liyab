@@ -35,7 +35,7 @@ This README describes what the code does today. Anything not implemented is list
 | Streaming mode for models larger than RAM (triple-window `madvise` prefetch) | ✅ implemented |
 | Triple-buffered block loader (fetch → prepare → execute) | ✅ implemented, opt-in (models larger than RAM) |
 | Transformer: llama / mistral / qwen2 / qwen3 layouts, GQA, RoPE (normal & NeoX), QKV bias, Q/K norm | ✅ implemented, cross-checked against llama.cpp |
-| Mixed precision per tensor: F32, F16, Q8_0, Q4_0, Q4_1 | ✅ implemented |
+| Every GGML tensor format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0/TQ2_0, MXFP4, NVFP4 (all mixes such as Q4_K_M, IQ3_M) | ✅ implemented, bit-exact vs llama.cpp's reference decoder |
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model, batched verification) | ✅ implemented |
@@ -45,7 +45,7 @@ This README describes what the code does today. Anything not implemented is list
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
-| Text encoding for byte-level BPE vocabularies (Llama 3, Qwen) | 🟡 decode only. Pass token ids instead |
+| Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
 | Experimental: early exit, head pruning, `O_DIRECT` / io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
@@ -109,11 +109,18 @@ This README describes what the code does today. Anything not implemented is list
 * **Format:** GGUF v2/v3.
 * **Architectures:** `llama` (Llama 1/2, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3` (dense).
   Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
-* **Tensor types:** F32, F16, Q8_0, Q4_0, Q4_1, mixed freely per tensor. K-quants and IQ-quants (Q4_K_M, IQ3_M,
-  …) are rejected at load with a message. Convert them with llama.cpp:
-  `llama-quantize --pure model.gguf model-q4_0.gguf Q4_0`
-* **Tokenizers:** SentencePiece (`tokenizer.ggml.model = llama`) encodes and decodes. Byte-level BPE (`gpt2`:
-  Llama 3, Qwen) decodes only, so pass token ids via `generate_tokens` / `liyab_engine_generate_tokens`.
+* **Tensor types:** every format llama.cpp writes, mixed freely per tensor. That covers F32, F16, BF16, the legacy
+  Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-quants Q2_K…Q6_K (and their Q*_K_S/M/L mixes), the I-quants IQ1_S, IQ1_M,
+  IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL, IQ4_XS, the ternary TQ1_0/TQ2_0 and the FP4 formats MXFP4/NVFP4. Q1_0 is
+  rejected with a clear error. Decoders are ported from llama.cpp's gguf-py reference. `tests/data/quant_vectors.bin`
+  (written by `tools/gen_quant_vectors.py`) holds reference outputs, and `test_engine` checks all 24 formats
+  bit-exactly. I-quant grids are extracted from gguf-py by `tools/gen_quant_tables.py`.
+* **Kernels:** Q4_0/Q4_1/Q8_0, Q5_0/Q5_1 and Q4_K/Q5_K/Q6_K have dedicated NEON + SDOT kernels that unpack bits in
+  registers. The other formats decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, Q4_K
+  and Q5_0 are repacked exactly into the Q4_1/Q8_0 layouts. Other formats fall back to the CPU per matmul.
+* **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`,
+  `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp's tokenization token for token, including special
+  tokens, contractions, digits, accents, CJK and emoji. BOS is added only when the model asks for it.
 * Prompts are used as given: apply the model's chat template in the app.
 
 ---
@@ -416,6 +423,17 @@ throttle threshold raised to 60 °C so the comparison is not distorted by therma
 | Q4_0, `balanced` profile (12 tok/s pacing) | 12.05 tok/s, SoC idle 49% of the decode time |
 | Q4_0, `--triple-buffer` (`O_DIRECT`) | 5.5 tok/s, 2814 weight stalls |
 
+K-quants and Qwen on the same phone (CPU NEON + SDOT, 4 threads; GPU = Vulkan):
+
+| Model | CPU | GPU |
+| :--- | ---: | ---: |
+| TinyLlama-1.1B Q4_K_M | 24.7 tok/s | 20.7 tok/s |
+| Qwen2.5-0.5B-Instruct Q4_K_M (Q4_K + Q5_0 + Q6_K + Q8_0) | 35.2 tok/s | 27.9 tok/s |
+
+On these models the GPU is slower because Q6_K and other tensors fall back to the CPU. Compared with llama.cpp on
+identical GGUF files, the logits of Qwen2.5-0.5B (Q8_0, Q4_K_M, Q5_K_M) and TinyLlama (Q4_K_M, Q8_0) have the same
+argmax at ≥ 95% of positions and a mean correlation ≥ 0.998.
+
 Same model and prompt, Vulkan GPU vs CPU (`--backend vulkan|cpu`, 4 threads):
 
 | Backend | Decode | Prefill (37 tokens) |
@@ -502,9 +520,11 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   needs `VK_EXT_external_memory_host` or AHardwareBuffer imports.
 * **Core ML / Apple Neural Engine.** Not used: the ANE is only reachable through compiled Core ML models, not
   per-layer kernels over mmap'd weights. Metal is the Apple accelerator path.
-* **Quantization formats.** K-quants (Q4_K, Q6_K…) and IQ formats are not implemented yet.
-* **Tokenizer.** Byte-level BPE (Llama 3, Qwen) text encoding is missing; pass token ids.
+* **Quantization kernels.** Q2_K, Q3_K, the I-quants and FP4 use a generic decode + SDOT path on the CPU (correct,
+  but slower than the dedicated kernels). On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
+* **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
 * **Architectures.** MoE models (e.g. Qwen3-30B-A3B), Gemma, Phi and YaRN RoPE scaling are not supported.
+  Dense Qwen2/Qwen2.5/Qwen3 and Llama/Mistral are.
 * **Dense 30–35B models on phones** are bandwidth-bound. Each generated token reads every weight once: a 32B model
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
   streamed from flash (~2.8 GB/s measured). Speculative decoding, MoE models, and smaller dense models are the

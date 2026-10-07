@@ -82,6 +82,7 @@ public:
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
 
+    // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token).
     [[nodiscard]] Result<std::vector<int32_t>> tokenize(std::string_view text, bool add_bos) const;
     [[nodiscard]] std::string token_to_piece(int32_t token) const;
 

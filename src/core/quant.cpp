@@ -145,6 +145,98 @@ void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept {
         case DType::Q4_1:
             quantize_row_q4_1(x, static_cast<BlockQ4_1*>(dst), n);
             break;
+        default:
+            break;  // weight-only formats are never produced at runtime; callers do not request them
+    }
+}
+
+namespace {
+
+// GGML get_scale_min_k4: 6-bit scale and min of sub-block j (0..7).
+inline void scale_min_k4(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) noexcept {
+    if (j < 4) {
+        sc = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        sc = static_cast<uint8_t>((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        m = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+}  // namespace
+
+void unpack_q5_block(const uint8_t* qh_bytes, const uint8_t* qs, bool symmetric, int8_t* q) noexcept {
+    uint32_t qh;
+    std::memcpy(&qh, qh_bytes, 4);
+    const int offset = symmetric ? 16 : 0;
+    for (int j = 0; j < kBlock / 2; ++j) {
+        q[j] = static_cast<int8_t>(((qs[j] & 0x0F) | (((qh >> j) & 1u) << 4)) - offset);
+        q[j + 16] = static_cast<int8_t>(((qs[j] >> 4) | (((qh >> (j + 16)) & 1u) << 4)) - offset);
+    }
+}
+
+void unpack_k_block(DType type, const void* block, int8_t* q, float* scale16, float* min32) noexcept {
+    switch (type) {
+        case DType::Q4_K: {
+            const auto* b = static_cast<const BlockQ4_K*>(block);
+            const float d = fp16_to_fp32(b->d);
+            const float dmin = fp16_to_fp32(b->dmin);
+            for (int c = 0; c < 4; ++c) {
+                const uint8_t* qs = b->qs + 32 * c;
+                for (int half = 0; half < 2; ++half) {
+                    const int j = 2 * c + half;
+                    uint8_t sc, m;
+                    scale_min_k4(j, b->scales, sc, m);
+                    scale16[2 * j] = scale16[2 * j + 1] = d * sc;
+                    min32[j] = dmin * m;
+                    for (int l = 0; l < 32; ++l) {
+                        q[32 * j + l] = static_cast<int8_t>(half ? (qs[l] >> 4) : (qs[l] & 0x0F));
+                    }
+                }
+            }
+            break;
+        }
+        case DType::Q5_K: {
+            const auto* b = static_cast<const BlockQ5_K*>(block);
+            const float d = fp16_to_fp32(b->d);
+            const float dmin = fp16_to_fp32(b->dmin);
+            for (int c = 0; c < 4; ++c) {
+                const uint8_t* qs = b->qs + 32 * c;
+                for (int half = 0; half < 2; ++half) {
+                    const int j = 2 * c + half;
+                    uint8_t sc, m;
+                    scale_min_k4(j, b->scales, sc, m);
+                    scale16[2 * j] = scale16[2 * j + 1] = d * sc;
+                    min32[j] = dmin * m;
+                    const uint8_t bit = static_cast<uint8_t>(1u << j);  // u1 = 1 << 2c, u2 = 2 << 2c
+                    for (int l = 0; l < 32; ++l) {
+                        const int lo = half ? (qs[l] >> 4) : (qs[l] & 0x0F);
+                        q[32 * j + l] = static_cast<int8_t>(lo + ((b->qh[l] & bit) ? 16 : 0));
+                    }
+                }
+            }
+            break;
+        }
+        case DType::Q6_K: {
+            const auto* b = static_cast<const BlockQ6_K*>(block);
+            const float d = fp16_to_fp32(b->d);
+            for (int h = 0; h < 2; ++h) {  // two halves of 128 values
+                const uint8_t* ql = b->ql + 64 * h;
+                const uint8_t* qh = b->qh + 32 * h;
+                int8_t* out = q + 128 * h;
+                for (int l = 0; l < 32; ++l) {
+                    out[l] = static_cast<int8_t>(((ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32);
+                    out[l + 32] = static_cast<int8_t>(((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                    out[l + 64] = static_cast<int8_t>(((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+                    out[l + 96] = static_cast<int8_t>(((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+                }
+                for (int i = 0; i < 8; ++i) scale16[8 * h + i] = d * b->scales[8 * h + i];
+            }
+            for (int j = 0; j < 8; ++j) min32[j] = 0.0f;
+            break;
+        }
+        default:
+            break;
     }
 }
 
@@ -175,6 +267,47 @@ void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept {
                     yb[j] = d * static_cast<float>((b[i].qs[j] & 0x0F) - 8);
                     yb[j + kBlock / 2] = d * static_cast<float>((b[i].qs[j] >> 4) - 8);
                 }
+            }
+            break;
+        }
+        case DType::Q5_0:
+        case DType::Q5_1: {
+            const size_t block_bytes = dtype_row_bytes(type, kBlock);
+            int8_t q[kBlock];
+            for (int64_t i = 0; i < n / kBlock; ++i) {
+                const uint8_t* blk = static_cast<const uint8_t*>(src) + i * block_bytes;
+                uint16_t dh, mh = 0;
+                std::memcpy(&dh, blk, 2);
+                if (type == DType::Q5_1) std::memcpy(&mh, blk + 2, 2);
+                const uint8_t* qh = blk + (type == DType::Q5_1 ? 4 : 2);
+                unpack_q5_block(qh, qh + 4, type == DType::Q5_0, q);
+                const float d = fp16_to_fp32(dh);
+                const float m = type == DType::Q5_1 ? fp16_to_fp32(mh) : 0.0f;
+                for (int j = 0; j < kBlock; ++j) y[i * kBlock + j] = d * q[j] + m;
+            }
+            break;
+        }
+        case DType::BF16: {
+            const auto* h = static_cast<const uint16_t*>(src);
+            for (int64_t i = 0; i < n; ++i) y[i] = bf16_to_fp32(h[i]);
+            break;
+        }
+        case DType::Q2_K: case DType::Q3_K: case DType::IQ2_XXS: case DType::IQ2_XS: case DType::IQ2_S:
+        case DType::IQ3_XXS: case DType::IQ3_S: case DType::IQ1_S: case DType::IQ1_M: case DType::IQ4_NL:
+        case DType::IQ4_XS: case DType::TQ1_0: case DType::TQ2_0: case DType::MXFP4: case DType::NVFP4:
+            dequantize_ext_row(type, src, y, n);
+            break;
+        case DType::Q4_K:
+        case DType::Q5_K:
+        case DType::Q6_K: {
+            const size_t block_bytes = dtype_row_bytes(type, kSuperBlock);
+            int8_t q[kSuperBlock];
+            float scale16[16];
+            float min32[8];
+            for (int64_t i = 0; i < n / kSuperBlock; ++i) {
+                unpack_k_block(type, static_cast<const uint8_t*>(src) + i * block_bytes, q, scale16, min32);
+                float* yb = y + i * kSuperBlock;
+                for (int k = 0; k < kSuperBlock; ++k) yb[k] = scale16[k / 16] * q[k] - min32[k / 32];
             }
             break;
         }
@@ -281,12 +414,242 @@ float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, int64_t n) noexcept 
     return sum;
 }
 
-float dot_quantized(DType type, const void* row, const BlockQ8_0* x, int64_t n) noexcept {
+void block_sums(const BlockQ8_0* x, int32_t* xsums, int64_t n) noexcept {
+    for (int64_t i = 0; i < n / kBlock; ++i) {
+        int32_t sum = 0;
+        for (int j = 0; j < kBlock; ++j) sum += x[i].qs[j];
+        xsums[i] = sum;
+    }
+}
+
+namespace {
+
+// Sum of 16 int8 products.
+inline int32_t dot16(const int8_t* a, const int8_t* b) noexcept {
+#if defined(LIYAB_NEON)
+    return vaddvq_s32(dot_i8x16(vdupq_n_s32(0), vld1q_s8(a), vld1q_s8(b)));
+#else
+    int32_t s = 0;
+    for (int i = 0; i < 16; ++i) s += a[i] * b[i];
+    return s;
+#endif
+}
+
+#if defined(LIYAB_NEON)
+// --- NEON kernels: bits are extracted in registers and fed to SDOT ---------
+
+inline int32_t hsum(int32x4_t v) noexcept { return vaddvq_s32(v); }
+
+// 32 int8 weights (two vectors) · one Q8_0 activation block.
+inline int32_t dot32(int8x16_t w0, int8x16_t w1, const BlockQ8_0& x) noexcept {
+    return hsum(dot_i8x16(dot_i8x16(vdupq_n_s32(0), w0, vld1q_s8(x.qs)), w1, vld1q_s8(x.qs + 16)));
+}
+
+// Two 16-value halves of one Q8_0 block, kept apart (Q6_K has a scale per 16).
+inline void dot16x2(int8x16_t w0, int8x16_t w1, const BlockQ8_0& x, int32_t& a, int32_t& b) noexcept {
+    a = hsum(dot_i8x16(vdupq_n_s32(0), w0, vld1q_s8(x.qs)));
+    b = hsum(dot_i8x16(vdupq_n_s32(0), w1, vld1q_s8(x.qs + 16)));
+}
+
+float dot_q4_k_neon(const BlockQ4_K* w, const BlockQ8_0* x, const int32_t* xs, int64_t n) noexcept {
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n / kSuperBlock; ++i) {
+        const BlockQ4_K& b = w[i];
+        const float d = fp16_to_fp32(b.d);
+        const float dmin = fp16_to_fp32(b.dmin);
+        const BlockQ8_0* xb = x + i * 8;
+        const int32_t* s = xs + i * 8;
+        for (int c = 0; c < 4; ++c) {  // 64 values: low nibbles = sub-block 2c, high = 2c+1
+            const uint8x16_t q0 = vld1q_u8(b.qs + 32 * c);
+            const uint8x16_t q1 = vld1q_u8(b.qs + 32 * c + 16);
+            const int32_t lo = dot32(vreinterpretq_s8_u8(vandq_u8(q0, mask)), vreinterpretq_s8_u8(vandq_u8(q1, mask)),
+                                     xb[2 * c]);
+            const int32_t hi = dot32(vreinterpretq_s8_u8(vshrq_n_u8(q0, 4)), vreinterpretq_s8_u8(vshrq_n_u8(q1, 4)),
+                                     xb[2 * c + 1]);
+            uint8_t sc0, m0, sc1, m1;
+            scale_min_k4(2 * c, b.scales, sc0, m0);
+            scale_min_k4(2 * c + 1, b.scales, sc1, m1);
+            sum += fp16_to_fp32(xb[2 * c].d) * (d * sc0 * static_cast<float>(lo) - dmin * m0 * static_cast<float>(s[2 * c]));
+            sum += fp16_to_fp32(xb[2 * c + 1].d) *
+                   (d * sc1 * static_cast<float>(hi) - dmin * m1 * static_cast<float>(s[2 * c + 1]));
+        }
+    }
+    return sum;
+}
+
+float dot_q5_k_neon(const BlockQ5_K* w, const BlockQ8_0* x, const int32_t* xs, int64_t n) noexcept {
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const uint8x16_t sixteen = vdupq_n_u8(16);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n / kSuperBlock; ++i) {
+        const BlockQ5_K& b = w[i];
+        const float d = fp16_to_fp32(b.d);
+        const float dmin = fp16_to_fp32(b.dmin);
+        const BlockQ8_0* xb = x + i * 8;
+        const int32_t* s = xs + i * 8;
+        const uint8x16_t h0 = vld1q_u8(b.qh);
+        const uint8x16_t h1 = vld1q_u8(b.qh + 16);
+        for (int c = 0; c < 4; ++c) {
+            const uint8x16_t q0 = vld1q_u8(b.qs + 32 * c);
+            const uint8x16_t q1 = vld1q_u8(b.qs + 32 * c + 16);
+            const uint8x16_t bit_lo = vdupq_n_u8(static_cast<uint8_t>(1u << (2 * c)));
+            const uint8x16_t bit_hi = vdupq_n_u8(static_cast<uint8_t>(2u << (2 * c)));
+            // 5th bit set -> +16 (vtst gives 0xFF lanes, masked to 16).
+            const uint8x16_t l0 = vorrq_u8(vandq_u8(q0, mask), vandq_u8(vtstq_u8(h0, bit_lo), sixteen));
+            const uint8x16_t l1 = vorrq_u8(vandq_u8(q1, mask), vandq_u8(vtstq_u8(h1, bit_lo), sixteen));
+            const uint8x16_t u0 = vorrq_u8(vshrq_n_u8(q0, 4), vandq_u8(vtstq_u8(h0, bit_hi), sixteen));
+            const uint8x16_t u1 = vorrq_u8(vshrq_n_u8(q1, 4), vandq_u8(vtstq_u8(h1, bit_hi), sixteen));
+            const int32_t lo = dot32(vreinterpretq_s8_u8(l0), vreinterpretq_s8_u8(l1), xb[2 * c]);
+            const int32_t hi = dot32(vreinterpretq_s8_u8(u0), vreinterpretq_s8_u8(u1), xb[2 * c + 1]);
+            uint8_t sc0, m0, sc1, m1;
+            scale_min_k4(2 * c, b.scales, sc0, m0);
+            scale_min_k4(2 * c + 1, b.scales, sc1, m1);
+            sum += fp16_to_fp32(xb[2 * c].d) * (d * sc0 * static_cast<float>(lo) - dmin * m0 * static_cast<float>(s[2 * c]));
+            sum += fp16_to_fp32(xb[2 * c + 1].d) *
+                   (d * sc1 * static_cast<float>(hi) - dmin * m1 * static_cast<float>(s[2 * c + 1]));
+        }
+    }
+    return sum;
+}
+
+float dot_q6_k_neon(const BlockQ6_K* w, const BlockQ8_0* x, int64_t n) noexcept {
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    const uint8x16_t mask2 = vdupq_n_u8(0x03);
+    const int8x16_t m32 = vdupq_n_s8(32);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n / kSuperBlock; ++i) {
+        const BlockQ6_K& b = w[i];
+        const float d = fp16_to_fp32(b.d);
+        for (int h = 0; h < 2; ++h) {  // 128 values = 4 activation blocks
+            const uint8_t* ql = b.ql + 64 * h;
+            const uint8_t* qh = b.qh + 32 * h;
+            const int8_t* sc = b.scales + 8 * h;
+            const BlockQ8_0* xb = x + i * 8 + 4 * h;
+            const uint8x16_t ql0 = vld1q_u8(ql), ql1 = vld1q_u8(ql + 16), ql2 = vld1q_u8(ql + 32), ql3 = vld1q_u8(ql + 48);
+            const uint8x16_t qh0 = vld1q_u8(qh), qh1 = vld1q_u8(qh + 16);
+            auto make = [&](uint8x16_t low, uint8x16_t high_bits) {
+                return vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(low, vshlq_n_u8(high_bits, 4))), m32);
+            };
+            // Runs of 32 values, each with two per-16 scales.
+            const int8x16_t r[8] = {
+                make(vandq_u8(ql0, mask4), vandq_u8(qh0, mask2)),
+                make(vandq_u8(ql1, mask4), vandq_u8(qh1, mask2)),
+                make(vandq_u8(ql2, mask4), vandq_u8(vshrq_n_u8(qh0, 2), mask2)),
+                make(vandq_u8(ql3, mask4), vandq_u8(vshrq_n_u8(qh1, 2), mask2)),
+                make(vshrq_n_u8(ql0, 4), vandq_u8(vshrq_n_u8(qh0, 4), mask2)),
+                make(vshrq_n_u8(ql1, 4), vandq_u8(vshrq_n_u8(qh1, 4), mask2)),
+                make(vshrq_n_u8(ql2, 4), vshrq_n_u8(qh0, 6)),
+                make(vshrq_n_u8(ql3, 4), vshrq_n_u8(qh1, 6)),
+            };
+            for (int k = 0; k < 4; ++k) {
+                int32_t a, c;
+                dot16x2(r[2 * k], r[2 * k + 1], xb[k], a, c);
+                sum += fp16_to_fp32(xb[k].d) * d * (static_cast<float>(sc[2 * k]) * a + static_cast<float>(sc[2 * k + 1]) * c);
+            }
+        }
+    }
+    return sum;
+}
+
+// 32 qh bits -> two byte vectors with 0x10 where the 5th bit is set.
+inline void q5_high_bits(const uint8_t* qh_bytes, uint8x16_t& lo, uint8x16_t& hi) noexcept {
+    static const uint8_t kSelLo[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+    static const uint8_t kSelHi[16] = {2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+    static const uint8_t kBits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    uint32_t qh;
+    std::memcpy(&qh, qh_bytes, 4);
+    const uint8x16_t bytes = vreinterpretq_u8_u32(vdupq_n_u32(qh));
+    const uint8x16_t bits = vld1q_u8(kBits);
+    const uint8x16_t sixteen = vdupq_n_u8(16);
+    lo = vandq_u8(vtstq_u8(vqtbl1q_u8(bytes, vld1q_u8(kSelLo)), bits), sixteen);
+    hi = vandq_u8(vtstq_u8(vqtbl1q_u8(bytes, vld1q_u8(kSelHi)), bits), sixteen);
+}
+#endif
+
+// K-quant row · Q8_0 activations, portable path: per 32-value activation block b,
+//   dx * (scale16[2b] * q·x[0:16] + scale16[2b+1] * q·x[16:32] - min32[b] * sum(x)).
+float dot_k_q8_0(DType type, const void* row, const BlockQ8_0* x, const int32_t* xsums, int64_t n) noexcept {
+#if defined(LIYAB_NEON)
+    switch (type) {
+        case DType::Q4_K: return dot_q4_k_neon(static_cast<const BlockQ4_K*>(row), x, xsums, n);
+        case DType::Q5_K: return dot_q5_k_neon(static_cast<const BlockQ5_K*>(row), x, xsums, n);
+        case DType::Q6_K: return dot_q6_k_neon(static_cast<const BlockQ6_K*>(row), x, n);
+        default: break;
+    }
+#endif
+    const size_t block_bytes = dtype_row_bytes(type, kSuperBlock);
+    alignas(16) int8_t q[kSuperBlock];
+    float scale16[16];
+    float min32[8];
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n / kSuperBlock; ++i) {
+        unpack_k_block(type, static_cast<const uint8_t*>(row) + i * block_bytes, q, scale16, min32);
+        const BlockQ8_0* xb = x + i * 8;
+        const int32_t* xs = xsums + i * 8;
+        for (int b = 0; b < 8; ++b) {
+            const float acc = scale16[2 * b] * static_cast<float>(dot16(q + 32 * b, xb[b].qs)) +
+                              scale16[2 * b + 1] * static_cast<float>(dot16(q + 32 * b + 16, xb[b].qs + 16)) -
+                              min32[b] * static_cast<float>(xs[b]);
+            sum += fp16_to_fp32(xb[b].d) * acc;
+        }
+    }
+    return sum;
+}
+
+// Q5_0 / Q5_1 row · Q8_0 activations (Q5_1 also needs the block sums for its min).
+float dot_q5_q8_0(DType type, const void* row, const BlockQ8_0* x, const int32_t* xsums, int64_t n) noexcept {
+    const bool symmetric = type == DType::Q5_0;
+    const size_t block_bytes = symmetric ? sizeof(BlockQ5_0) : sizeof(BlockQ5_1);
+    float sum = 0.0f;
+#if defined(LIYAB_NEON)
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t offset = vdupq_n_s8(symmetric ? 16 : 0);
+    for (int64_t i = 0; i < n / kBlock; ++i) {
+        const uint8_t* blk = static_cast<const uint8_t*>(row) + i * block_bytes;
+        uint16_t dh, mh = 0;
+        std::memcpy(&dh, blk, 2);
+        if (!symmetric) std::memcpy(&mh, blk + 2, 2);
+        const uint8_t* qh = blk + (symmetric ? 2 : 4);
+        uint8x16_t hlo, hhi;
+        q5_high_bits(qh, hlo, hhi);
+        const uint8x16_t qs = vld1q_u8(qh + 4);
+        const int8x16_t w0 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qs, mask), hlo)), offset);
+        const int8x16_t w1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(qs, 4), hhi)), offset);
+        const float dot = static_cast<float>(dot32(w0, w1, x[i]));
+        sum += fp16_to_fp32(x[i].d) *
+               (fp16_to_fp32(dh) * dot + (symmetric ? 0.0f : fp16_to_fp32(mh) * static_cast<float>(xsums[i])));
+    }
+#else
+    alignas(16) int8_t q[kBlock];
+    for (int64_t i = 0; i < n / kBlock; ++i) {
+        const uint8_t* blk = static_cast<const uint8_t*>(row) + i * block_bytes;
+        uint16_t dh, mh = 0;
+        std::memcpy(&dh, blk, 2);
+        if (!symmetric) std::memcpy(&mh, blk + 2, 2);
+        const uint8_t* qh = blk + (symmetric ? 2 : 4);
+        unpack_q5_block(qh, qh + 4, symmetric, q);
+        const float dot = static_cast<float>(dot16(q, x[i].qs) + dot16(q + 16, x[i].qs + 16));
+        sum += fp16_to_fp32(x[i].d) *
+               (fp16_to_fp32(dh) * dot + (symmetric ? 0.0f : fp16_to_fp32(mh) * static_cast<float>(xsums[i])));
+    }
+#endif
+    return sum;
+}
+
+}  // namespace
+
+float dot_quantized(DType type, const void* row, const BlockQ8_0* x, const int32_t* xsums, int64_t n) noexcept {
     switch (type) {
         case DType::Q4_0: return dot_q4_0_q8_0(static_cast<const BlockQ4_0*>(row), x, n);
         case DType::Q4_1: return dot_q4_1_q8_0(static_cast<const BlockQ4_1*>(row), x, n);
         case DType::Q8_0: return dot_q8_0_q8_0(static_cast<const BlockQ8_0*>(row), x, n);
-        default: return 0.0f;
+        case DType::Q5_0:
+        case DType::Q5_1: return dot_q5_q8_0(type, row, x, xsums, n);
+        case DType::Q4_K:
+        case DType::Q5_K:
+        case DType::Q6_K: return dot_k_q8_0(type, row, x, xsums, n);
+        default: return is_extended(type) ? dot_ext_q8_0(type, row, x, n) : 0.0f;
     }
 }
 
@@ -360,6 +723,8 @@ void axpy_row(DType type, const void* row, float a, float* y, int64_t n) noexcep
             for (int64_t i = 0; i < n; ++i) y[i] += a * fp16_to_fp32(r[i]);
             break;
         }
+        default:
+            break;  // KV caches never use weight-only formats
         case DType::Q8_0:
         case DType::Q4_0:
         case DType::Q4_1: {

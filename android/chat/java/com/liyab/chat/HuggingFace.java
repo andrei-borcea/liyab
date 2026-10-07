@@ -27,13 +27,12 @@ final class HuggingFace {
     private static final String API = "https://huggingface.co";
     private static final String USER_AGENT = "LiyabChat/0.1 (Android)";
     private static final Pattern QUANT = Pattern.compile(
-            "(IQ\\d_[A-Z]+|Q\\d_K(?:_[SML])?|Q\\d_\\d|BF16|F16|F32|MXFP4)", Pattern.CASE_INSENSITIVE);
+            "(IQ\\d_[A-Z]+|Q\\d_K(?:_[SML])?|Q\\d_\\d|TQ\\d_\\d|BF16|F16|F32|MXFP4|NVFP4)", Pattern.CASE_INSENSITIVE);
 
     /** Whether Liyab can load a file, judged from its quantization name. */
     enum Compat {
-        OK("✓ compatible"),
-        MAYBE("? output head may be Q6_K"),
-        UNSUPPORTED("✗ format not supported yet");
+        OK("✓ supported"),
+        UNSUPPORTED("✗ format not supported");
 
         final String label;
 
@@ -98,19 +97,13 @@ final class HuggingFace {
 
     private HuggingFace() {}
 
+    /**
+     * Liyab decodes every GGML tensor format llama.cpp ships (F32/F16/BF16, Q4_0..Q8_0, Q2_K..Q6_K and
+     * their _S/_M/_L mixes, all IQ formats, TQ1_0/TQ2_0, MXFP4, NVFP4) except Q1_0. Unrecognised names
+     * (no quantization in the file name) are listed as supported; the loader reports exact errors.
+     */
     static Compat compatOf(String quant) {
-        switch (quant) {
-            case "Q8_0":
-            case "F16":
-            case "F32":
-                return Compat.OK;
-            case "Q4_0":
-            case "Q4_1":
-                // llama-quantize keeps output.weight in Q6_K for these presets unless --pure was used.
-                return Compat.MAYBE;
-            default:
-                return Compat.UNSUPPORTED;
-        }
+        return quant.equals("Q1_0") ? Compat.UNSUPPORTED : Compat.OK;
     }
 
     /** GGUF repositories matching `query` (empty: most downloaded), best first. */
