@@ -52,7 +52,8 @@ void usage() {
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
                  "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
-                 "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n");
+                 "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
+                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n");
 }
 
 }  // namespace
@@ -98,6 +99,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--egls") {
             config.egls = 1;
             config.egls_threshold = static_cast<float>(std::atof(next()));
+        } else if (arg == "--tdss") {
+            const std::string v = next();
+            config.tdss = v == "always" ? 2 : 1;
         } else if (arg == "--prune-heads") {
             config.head_pruning = 1;
             config.head_keep_ratio = static_cast<float>(std::atof(next()));
@@ -182,6 +186,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "EGLS: %d FFN blocks skipped (%.1f per token)\n", stats.ffn_blocks_skipped,
                          static_cast<double>(stats.ffn_blocks_skipped) / std::max(1, stats.generated_tokens));
         }
+        if (stats.sparse_ffn_steps > 0) std::fprintf(stderr, "TDSS: %d steps on 2:4 sparse FFN\n", stats.sparse_ffn_steps);
         if (stats.head_pruned_steps > 0) std::fprintf(stderr, "head pruning: %d steps\n", stats.head_pruned_steps);
     }
     liyab_engine_destroy(g_engine);

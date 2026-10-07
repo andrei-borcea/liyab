@@ -380,6 +380,12 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         hooks != nullptr && n == 1 && logits == Logits::Last ? hooks->early_exit : nullptr;
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
     FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;
+    FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
+    // FFN projections: an experimental override first, else the routed backend.
+    auto ffn_matmul = [&](int32_t layer, FfnProjection p, const TensorView& w, const float* x, float* y) -> Status {
+        if (ffn_hook != nullptr && ffn_hook->ffn_matmul(layer, p, x, y, n)) return Status::ok();
+        return matmul(route, route.ffn, w, x, y, n);
+    };
     last_ffn_skips_ = 0;
 
     const size_t d = static_cast<size_t>(c.n_embd);
@@ -447,13 +453,13 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
-            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.gate(), xb_.data(), hb_.data(), n));
-            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.up(), xb_.data(), hb2_.data(), n));
+            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w.gate(), xb_.data(), hb_.data()));
+            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w.up(), xb_.data(), hb2_.data()));
             for (size_t i = 0; i < hb_.size(); ++i) {
                 const float g = hb_[i];
                 hb_[i] = g / (1.0f + std::exp(-g)) * hb2_[i];
             }
-            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.down(), hb_.data(), xb_.data(), n));
+            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Down, w.down(), hb_.data(), xb_.data()));
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 

@@ -43,10 +43,22 @@ public:
                           std::span<const float> after) = 0;
 };
 
+enum class FfnProjection : int32_t { Gate = 0, Up = 1, Down = 2 };
+
+// Replaces an FFN matmul with an alternative implementation (e.g. sparse
+// weights). Same contract as Backend::matmul; return false to run the
+// regular backend instead.
+class FfnMatmulHook {
+public:
+    virtual ~FfnMatmulHook() = default;
+    virtual bool ffn_matmul(int32_t layer, FfnProjection projection, const float* x, float* y, int32_t n) = 0;
+};
+
 struct ForwardHooks {
     EarlyExitHook* early_exit = nullptr;
     const HeadMaskHook* head_mask = nullptr;
     FfnSkipHook* ffn_skip = nullptr;
+    FfnMatmulHook* ffn_matmul = nullptr;
 };
 
 }  // namespace liyab

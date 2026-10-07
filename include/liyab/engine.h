@@ -29,6 +29,8 @@ struct ExperimentalConfig {
     float head_keep_ratio = 0.75f;        // heads kept per block while pruning
     bool egls = false;                    // entropy-guided FFN skipping (lossy)
     float egls_threshold = 0.002f;        // skip a block's FFN when its entropy delta is below this
+    bool tdss = false;                    // 2:4 sparse FFN weights while thermally throttled (lossy)
+    bool tdss_force = false;              // use the sparse FFN even when cool (benchmarks)
 };
 
 struct EngineConfig {

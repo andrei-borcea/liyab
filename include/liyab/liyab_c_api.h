@@ -87,6 +87,7 @@ typedef struct liyab_engine_config {
     float head_keep_ratio;        /* default 0.75 */
     int32_t egls;                 /* nonzero: entropy-guided FFN skipping (lossy) */
     float egls_threshold;         /* default 0.002 */
+    int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -116,6 +117,7 @@ typedef struct liyab_generation_stats {
     double weight_wait_ms;
     uint64_t kv_cache_bytes;
     int32_t ffn_blocks_skipped;
+    int32_t sparse_ffn_steps;
 } liyab_generation_stats;
 
 /*

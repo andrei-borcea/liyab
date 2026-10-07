@@ -31,6 +31,7 @@
 #include "liyab/experimental/early_exit.h"
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/jit_unpacker.h"
+#include "liyab/experimental/tdss.h"
 #include "core/quant.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
@@ -439,6 +440,98 @@ TEST_CASE("[bench] JIT unpacker vs NEON intrinsics vs scalar") {
 }
 
 // ---------------------------------------------------------------------------
+// TDSS (2:4 sparsity)
+// ---------------------------------------------------------------------------
+TEST_CASE("Sparse24Matrix keeps the 2 largest of every 4 weights and its kernel matches the reference") {
+    test::TinyModelSpec spec;
+    spec.ffn_type = DType::F32;  // exact source weights for the structural check
+    const std::string path = temp_path("tdss.gguf");
+    test::write_tiny_model(path, spec);
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    const TensorView& w = *file.value()->tensor("blk.0.ffn_up.weight");
+    auto sparse = Sparse24Matrix::build(w);
+    REQUIRE(sparse.has_value());
+    const Sparse24Matrix& m = sparse.value();
+    CHECK(m.bytes() * 32 == static_cast<size_t>(w.rows() * w.cols()) * Sparse24Matrix::kBlockBytes);
+
+    std::vector<float> dense(static_cast<size_t>(w.cols())), pruned(dense.size());
+    bool structure = true;
+    for (int64_t r = 0; r < w.rows(); ++r) {
+        quant::dequantize_row(w.type, w.row(r), dense.data(), w.cols());
+        m.dense_row(r, pruned.data());
+        for (int64_t g = 0; g < w.cols(); g += 4) {
+            int nonzero = 0;
+            float kept_min = 1e30f, dropped_max = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                if (pruned[g + i] != 0.0f) {
+                    ++nonzero;
+                    kept_min = std::min(kept_min, std::fabs(dense[g + i]));
+                } else {
+                    dropped_max = std::max(dropped_max, std::fabs(dense[g + i]));
+                }
+            }
+            structure = structure && nonzero <= 2 && kept_min >= dropped_max;
+        }
+    }
+    CHECK(structure);
+
+    // NEON/scalar kernel == float dot with the pruned rows (up to activation quantization).
+    Rig rig;
+    const int n = 2;
+    std::vector<float> x(static_cast<size_t>(n * w.cols())), y(static_cast<size_t>(n * w.rows()));
+    std::mt19937 rng(8);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (auto& v : x) v = normal(rng);
+    m.matmul(x.data(), y.data(), n, rig.pool);
+    double max_err = 0.0, scale = 0.0;
+    for (int t = 0; t < n; ++t) {
+        for (int64_t r = 0; r < w.rows(); ++r) {
+            m.dense_row(r, pruned.data());
+            double ref = 0.0;
+            for (int64_t c = 0; c < w.cols(); ++c) ref += static_cast<double>(pruned[c]) * x[t * w.cols() + c];
+            max_err = std::max(max_err, std::fabs(ref - y[t * w.rows() + r]));
+            scale = std::max(scale, std::fabs(ref));
+        }
+    }
+    CHECK(max_err < 0.02 * std::max(1.0, scale));
+    std::remove(path.c_str());
+}
+
+TEST_CASE("TDSS follows the power policy and changes FFN outputs only while active") {
+    Rig rig;
+    auto model = load(tiny_model());
+    REQUIRE(model != nullptr);
+    std::vector<std::array<const TensorView*, 3>> ffn;
+    for (int32_t l = 0; l < model->config().n_layers; ++l) ffn.push_back(model->ffn_weights(l));
+    auto tdss = Tdss::create(ffn, rig.pool);
+    REQUIRE(tdss.has_value());
+    Tdss& t = *tdss.value();
+    CHECK(!t.active());
+    CHECK(t.sparse_bytes() < t.dense_bytes());  // 3.5 bits vs Q4_0's 4.5 bits per weight
+    PowerPolicy hot;
+    hot.throttled = true;
+    CHECK(t.update(hot));
+    CHECK(!t.update(PowerPolicy{}));
+
+    ForwardHooks hooks;
+    hooks.ffn_matmul = &t;
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    auto plain = model->forward(tokens, Transformer::Logits::Last, rig.route, rig.pool, &hooks);  // inactive
+    const std::vector<float> a(plain->begin(), plain->end());
+    model->reset();
+    auto base = model->forward(tokens, Transformer::Logits::Last, rig.route, rig.pool);
+    CHECK(a == std::vector<float>(base->begin(), base->end()));
+    model->reset();
+    t.set_active(true);
+    auto sparse = model->forward(tokens, Transformer::Logits::Last, rig.route, rig.pool, &hooks);
+    REQUIRE(sparse.has_value());
+    double diff = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) diff = std::max(diff, std::fabs(static_cast<double>(a[i]) - (*sparse)[i]));
+    CHECK(diff > 1e-4);
+}
+
+// ---------------------------------------------------------------------------
 // Real-model benchmark helpers (LIYAB_BENCH_MODEL=<SentencePiece GGUF>)
 // ---------------------------------------------------------------------------
 namespace {
@@ -576,6 +669,36 @@ DecodeResult bench_decode(Transformer& model, Rig& rig, int32_t prefill, int32_t
 }
 
 }  // namespace
+
+TEST_CASE("[bench] TDSS on a real model: speed, memory and agreement") {
+    const auto rm = real_model();
+    if (!rm) {
+        std::printf("  skipped: set LIYAB_BENCH_MODEL\n");
+        return;
+    }
+    Rig rig;
+    auto model = load(rm->path, 1024);
+    REQUIRE(model != nullptr);
+    std::vector<std::array<const TensorView*, 3>> ffn;
+    for (int32_t l = 0; l < model->config().n_layers; ++l) ffn.push_back(model->ffn_weights(l));
+    const auto t0 = Clock::now();
+    auto tdss = Tdss::create(ffn, rig.pool, {true});
+    REQUIRE(tdss.has_value());
+    const double build_ms = ms_since(t0);
+    ForwardHooks hooks;
+    hooks.ffn_matmul = tdss.value().get();
+    const int32_t steps = 64;
+    const GreedyRun base = greedy_run(*model, rig, rm->prompt, steps, nullptr);
+    const GreedyRun sparse = greedy_run(*model, rig, rm->prompt, steps, &hooks);
+    size_t same = 0;
+    for (size_t i = 0; i < std::min(base.tokens.size(), sparse.tokens.size()); ++i) same += base.tokens[i] == sparse.tokens[i];
+    std::printf("  FFN weights: dense %.1f MiB -> 2:4 sparse %.1f MiB (built in %.0f ms)\n",
+                static_cast<double>(tdss.value()->dense_bytes()) / (1 << 20),
+                static_cast<double>(tdss.value()->sparse_bytes()) / (1 << 20), build_ms);
+    std::printf("  decode: dense %.1f tok/s, 2:4 sparse FFN %.1f tok/s (%+.0f%%); same prefix %zu/%d, same tokens %.0f%%\n",
+                base.tps, sparse.tps, 100.0 * (sparse.tps / base.tps - 1.0), common_prefix(base.tokens, sparse.tokens),
+                steps, 100.0 * static_cast<double>(same) / steps);
+}
 
 TEST_CASE("[bench] early exit and head pruning: decode throughput") {
     if (!benchmarks_enabled()) return;

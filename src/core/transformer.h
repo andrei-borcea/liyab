@@ -8,6 +8,7 @@
 #define LIYAB_CORE_TRANSFORMER_H
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <span>
 #include <string>
@@ -80,6 +81,11 @@ public:
     [[nodiscard]] int32_t last_ffn_skips() const noexcept { return last_ffn_skips_; }
     // Attention output projection of block `layer` (used by the head pruner).
     [[nodiscard]] const TensorView& attn_output(int32_t layer) const { return *layers_[static_cast<size_t>(layer)].wo; }
+    // FFN projections {gate, up, down} of block `layer` (experimental sparsification).
+    [[nodiscard]] std::array<const TensorView*, 3> ffn_weights(int32_t layer) const {
+        const Layer& L = layers_[static_cast<size_t>(layer)];
+        return {L.w_gate, L.w_up, L.w_down};
+    }
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
 
     // Discards cached positions >= n (speculative-decoding rollback).

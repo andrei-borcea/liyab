@@ -86,6 +86,7 @@ if(LIYAB_ENABLE_EXPERIMENTAL)
     src/experimental/early_exit.cpp
     src/experimental/egls.cpp
     src/experimental/jit_unpacker.cpp
+    src/experimental/tdss.cpp
     src/experimental/head_pruner.cpp
     src/experimental/io_uring_loader.cpp)
   target_compile_definitions(liyab_core PUBLIC LIYAB_ENABLE_EXPERIMENTAL=1)
