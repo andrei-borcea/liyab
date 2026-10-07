@@ -2,6 +2,9 @@
 //
 // MmapLoader maps a GGUF file read-only and exposes its metadata and tensors
 // as views into the mapping: no weight byte is ever copied by the loader.
+// Split models (gguf-split: NAME-00001-of-0000N.gguf) are opened from part 1;
+// the other parts are found next to it and mapped too. Metadata comes from
+// part 1, tensors from every part.
 //
 // For models larger than available RAM it switches to streaming mode: the
 // mapping is advised MADV_SEQUENTIAL and a background prefetcher keeps a
@@ -101,9 +104,14 @@ public:
     MmapLoader& operator=(const MmapLoader&) = delete;
 
     [[nodiscard]] uint32_t gguf_version() const noexcept { return version_; }
-    [[nodiscard]] size_t file_size() const noexcept { return file_->size(); }
+    // Total bytes over all parts.
+    [[nodiscard]] size_t file_size() const noexcept;
     [[nodiscard]] bool streaming() const noexcept { return streaming_; }
-    [[nodiscard]] const MappedFile& file() const noexcept { return *file_; }
+    // The first (or only) file; it holds the metadata.
+    [[nodiscard]] const MappedFile& file() const noexcept { return *files_.front(); }
+    // Files of a split model (1 for a single-file model); TensorView::shard indexes them.
+    [[nodiscard]] size_t shard_count() const noexcept { return files_.size(); }
+    [[nodiscard]] const MappedFile& shard(size_t i) const noexcept { return *files_[i]; }
 
     [[nodiscard]] const GgufValue* metadata(std::string_view key) const;
     [[nodiscard]] std::optional<int64_t> get_int(std::string_view key) const;
@@ -122,7 +130,8 @@ public:
     // layer+1 and layer+2 (wrapping to the next token) and releases layer-1.
     void begin_layer(int32_t layer);
     // Byte range [first, second) of the file covering block `slot`'s tensors
-    // (slot n_layers = output head). Requires configure_layers().
+    // (slot n_layers = output head). Requires configure_layers() and a
+    // single-file model (a split model's block may span files: {0, 0}).
     [[nodiscard]] std::pair<size_t, size_t> layer_range(int32_t slot) const;
     // Blocks until all queued prefetches completed (tests, benchmarks).
     void wait_prefetch_idle();
@@ -142,18 +151,21 @@ public:
 
 private:
     MmapLoader() = default;
-    Status parse();
+    // Parses part `shard` (already appended to files_). Metadata is kept for
+    // part 0 only; the other parts contribute tensors.
+    Status parse(uint32_t shard);
+    Status open_other_parts();
     void prefetch_loop();
 
-    std::unique_ptr<MappedFile> file_;
+    std::vector<std::unique_ptr<MappedFile>> files_;
     uint32_t version_ = 0;
     bool streaming_ = false;
     std::unordered_map<std::string_view, GgufValue> metadata_;
     std::vector<TensorView> tensors_;
     std::unordered_map<std::string_view, size_t> tensor_index_;
 
-    struct Range { size_t begin = 0; size_t end = 0; };
-    std::vector<Range> layer_ranges_;
+    struct Range { uint32_t shard = 0; size_t begin = 0; size_t end = 0; };
+    std::vector<std::vector<Range>> layer_ranges_;  // per slot, one range per file it touches
 
     std::thread prefetch_thread_;
     std::mutex prefetch_mutex_;

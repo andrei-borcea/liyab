@@ -72,6 +72,7 @@ bool in_ranges(const CodepointRange (&ranges)[N], uint32_t cp) noexcept {
 
 bool is_letter(uint32_t cp) noexcept { return in_ranges(kLetterRanges, cp); }
 bool is_number(uint32_t cp) noexcept { return in_ranges(kNumberRanges, cp); }
+bool is_mark(uint32_t cp) noexcept { return in_ranges(kMarkRanges, cp); }
 bool is_whitespace(uint32_t cp) noexcept {  // Unicode White_Space property
     return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 || cp == 0xA0 || cp == 0x1680 ||
            (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
@@ -208,6 +209,7 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         const auto pre = model.get_string("tokenizer.ggml.pre");
         tok.pre_name_ = pre ? std::string(*pre) : "default";
         if (tok.pre_name_ == "qwen2" || tok.pre_name_ == "deepseek-r1-qwen") tok.pre_ = PreTokenizer::Qwen2;
+        else if (tok.pre_name_ == "qwen35") tok.pre_ = PreTokenizer::Qwen35;
         else if (tok.pre_name_ == "llama-bpe" || tok.pre_name_ == "llama3") tok.pre_ = PreTokenizer::Llama3;
         const GgufValue* merges = model.metadata("tokenizer.ggml.merges");
         if (merges == nullptr || merges->array_type != GgufValue::Type::String) {
@@ -251,7 +253,7 @@ const std::string& Tokenizer::piece(int32_t id) const {
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
     if (kind_ == Kind::Gpt2 && pre_ == PreTokenizer::None) {
         return Status(ErrorCode::Unsupported, "BPE pre-tokenizer '" + pre_name_ +
-                                                  "' is not supported yet (qwen2 and llama3 are); pass token ids instead");
+                                                  "' is not supported yet (qwen2, qwen35 and llama3 are); pass token ids instead");
     }
     std::vector<int32_t> out;
     if (add_bos && bos_ >= 0) out.push_back(bos_);
@@ -380,15 +382,18 @@ void Tokenizer::encode_bpe(std::string_view text, std::vector<int32_t>& out) con
     const size_t n = cps.size();
     constexpr uint32_t kEnd = 0xFFFFFFFF;
     auto cp_at = [&](size_t i) { return i < n ? cps[i] : kEnd; };
-    auto letter = [&](size_t i) { return i < n && is_letter(cps[i]); };
+    // Word characters: letters, plus combining marks for Qwen3.5 ([\p{L}\p{M}]+).
+    const bool marks_in_words = pre_ == PreTokenizer::Qwen35;
+    auto letter = [&](size_t i) { return i < n && (is_letter(cps[i]) || (marks_in_words && is_mark(cps[i]))); };
     auto number = [&](size_t i) { return i < n && is_number(cps[i]); };
     auto space = [&](size_t i) { return i < n && is_whitespace(cps[i]); };
     auto lower = [](uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
 
-    // Hand-written equivalent of the Qwen2 / Llama 3 pre-tokenizer regex
+    // Hand-written equivalent of the Qwen2 / Qwen3.5 / Llama 3 pre-tokenizer regex
     // (same structure as llama.cpp's unicode_regex_split_custom_llama3):
-    //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}  (Qwen2: \p{N})
+    //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}  (Qwen2/3.5: \p{N})
     //   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+    // Qwen3.5 reads \p{L} as [\p{L}\p{M}] in the word and symbol alternatives.
     const size_t max_digits = pre_ == PreTokenizer::Llama3 ? 3 : 1;
     size_t start = 0;
     size_t pos = 0;

@@ -187,6 +187,47 @@ TEST_CASE("MmapLoader rejects malformed files") {
     std::remove(bad.c_str());
 }
 
+TEST_CASE("MmapLoader opens split models from part 1 and maps every part") {
+    // Part 1: metadata + one tensor; part 2: split bookkeeping + one tensor.
+    const std::string prefix = temp_path("split");
+    const std::string part1 = prefix + "-00001-of-00002.gguf";
+    const std::string part2 = prefix + "-00002-of-00002.gguf";
+    test::GgufWriter w1;
+    w1.add_string("general.architecture", "llama");
+    w1.add_u32("split.no", 0);
+    w1.add_u32("split.count", 2);
+    w1.add_tensor("token_embd.weight", {32, 4}, DType::F32, std::vector<float>(128, 1.0f));
+    w1.write(part1);
+    test::GgufWriter w2;
+    w2.add_u32("split.no", 1);
+    w2.add_u32("split.count", 2);
+    w2.add_tensor("output.weight", {32, 4}, DType::F32, std::vector<float>(128, 2.0f));
+    w2.write(part2);
+
+    auto loader = MmapLoader::open(part1);
+    REQUIRE(loader.has_value());
+    const MmapLoader& m = *loader.value();
+    CHECK(m.shard_count() == 2);
+    CHECK(m.get_string("general.architecture") == std::optional<std::string_view>("llama"));
+    const TensorView* out = m.tensor("output.weight");
+    REQUIRE(out != nullptr);
+    CHECK(out->shard == 1);
+    CHECK(out->data >= m.shard(1).data() && out->data + out->nbytes <= m.shard(1).data() + m.shard(1).size());
+    float first = 0.0f;
+    std::memcpy(&first, out->data, sizeof first);
+    CHECK(first == 2.0f);
+    CHECK(m.file_size() == m.shard(0).size() + m.shard(1).size());
+
+    // Opening a later part explains what to open instead.
+    auto later = MmapLoader::open(part2);
+    CHECK(!later.has_value() && later.status().code() == ErrorCode::Unsupported);
+    // A missing part is an I/O error naming the part.
+    std::remove(part2.c_str());
+    auto missing = MmapLoader::open(part1);
+    CHECK(!missing.has_value() && missing.status().code() == ErrorCode::IoError);
+    std::remove(part1.c_str());
+}
+
 TEST_CASE("Streaming prefetcher pages in the next layers and releases old ones") {
     const std::string path = temp_path("stream.gguf");
     test::TinyModelSpec spec;

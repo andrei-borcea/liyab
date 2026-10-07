@@ -70,7 +70,7 @@ final class Downloads {
             File result = null;
             String error = null;
             try {
-                result = HuggingFace.download(f, EngineHolder.modelsDir(), s);
+                result = HuggingFace.downloadModel(f, EngineHolder.modelsDir(), s);
             } catch (Exception e) {
                 error = e.getMessage();
             }
@@ -83,7 +83,9 @@ final class Downloads {
                         s.retries.get(), f.sha256 != null ? ", SHA-256 verified" : ""));
                 EngineHolder.load(result, null);
             } else if (discardRequested) {
-                HuggingFace.discard(EngineHolder.modelsDir(), f);
+                for (HuggingFace.GgufFile part : f.parts.isEmpty() ? java.util.Collections.singletonList(f) : f.parts) {
+                    HuggingFace.discard(EngineHolder.modelsDir(), part);
+                }
                 lastMessage = "Download cancelled";
                 DebugLog.add("Download cancelled, partial file deleted: " + f.fileName());
             } else {

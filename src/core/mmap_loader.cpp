@@ -282,20 +282,67 @@ Result<std::unique_ptr<MmapLoader>> MmapLoader::open(const std::string& path, co
     if (!file) return file.status();
 
     std::unique_ptr<MmapLoader> loader(new MmapLoader());
-    loader->file_ = std::move(file).value();
-    LIYAB_RETURN_IF_ERROR(loader->parse());
+    loader->files_.push_back(std::move(file).value());
+    LIYAB_RETURN_IF_ERROR(loader->parse(0));
+    LIYAB_RETURN_IF_ERROR(loader->open_other_parts());
 
     const uint64_t available = available_memory_bytes();
     loader->streaming_ = options.streaming.value_or(
         available > 0 && static_cast<double>(loader->file_size()) > 0.8 * static_cast<double>(available));
 
-    const auto& f = *loader->file_;
-    if (loader->streaming_) f.advise_sequential();
-    else f.advise_willneed(0, f.size());  // fits in RAM: warm the page cache once
-    LIYAB_LOG_INFO("mapped %s: %.2f GiB, %zu tensors, gguf v%u, %s mode", path.c_str(),
-                   static_cast<double>(f.size()) / (1024.0 * 1024.0 * 1024.0), loader->tensors_.size(),
+    for (const auto& f : loader->files_) {
+        if (loader->streaming_) f->advise_sequential();
+        else f->advise_willneed(0, f->size());  // fits in RAM: warm the page cache once
+    }
+    LIYAB_LOG_INFO("mapped %s%s: %.2f GiB, %zu tensors, gguf v%u, %s mode", path.c_str(),
+                   loader->files_.size() > 1 ? (" + " + std::to_string(loader->files_.size() - 1) + " parts").c_str() : "",
+                   static_cast<double>(loader->file_size()) / (1024.0 * 1024.0 * 1024.0), loader->tensors_.size(),
                    loader->version_, loader->streaming_ ? "streaming" : "resident");
     return loader;
+}
+
+size_t MmapLoader::file_size() const noexcept {
+    size_t total = 0;
+    for (const auto& f : files_) total += f->size();
+    return total;
+}
+
+Status MmapLoader::open_other_parts() {
+    const auto count = get_int("split.count").value_or(1);
+    if (count <= 1) return Status::ok();
+    const auto part = get_int("split.no").value_or(0);
+    const std::string& path = files_.front()->path();
+    if (count > 9999 || part < 0 || part >= count) return invalid(path, "invalid split.no / split.count");
+    if (part != 0) {
+        return Status(ErrorCode::Unsupported, "this file is part " + std::to_string(part + 1) + " of " +
+                                                  std::to_string(count) +
+                                                  " of a split GGUF model: open part 1 (-00001-of-...), with the "
+                                                  "other parts in the same folder");
+    }
+    // gguf-split naming: <prefix>-00001-of-0000N.gguf
+    char suffix[32];
+    std::snprintf(suffix, sizeof suffix, "-00001-of-%05lld.gguf", static_cast<long long>(count));
+    const std::string_view first_suffix(suffix);
+    if (path.size() <= first_suffix.size() || path.compare(path.size() - first_suffix.size(), first_suffix.size(),
+                                                           first_suffix) != 0) {
+        return Status(ErrorCode::Unsupported, "split GGUF model (" + std::to_string(count) +
+                                                  " parts) opened without its file name, so the other parts cannot "
+                                                  "be found: open part 1 by path from the folder holding every part");
+    }
+    const std::string prefix = path.substr(0, path.size() - first_suffix.size());
+    for (int64_t i = 1; i < count; ++i) {
+        std::snprintf(suffix, sizeof suffix, "-%05lld-of-%05lld.gguf", static_cast<long long>(i + 1),
+                      static_cast<long long>(count));
+        auto part_file = MappedFile::open(prefix + suffix);
+        if (!part_file) {
+            return Status(ErrorCode::IoError, "split model part " + std::to_string(i + 1) + " of " +
+                                                  std::to_string(count) + " is missing: " +
+                                                  part_file.status().message());
+        }
+        files_.push_back(std::move(part_file).value());
+        LIYAB_RETURN_IF_ERROR(parse(static_cast<uint32_t>(i)));
+    }
+    return Status::ok();
 }
 
 MmapLoader::~MmapLoader() {
@@ -307,15 +354,18 @@ MmapLoader::~MmapLoader() {
     if (prefetch_thread_.joinable()) prefetch_thread_.join();
 }
 
-Status MmapLoader::parse() {
-    const std::string& path = file_->path();
-    Reader r(file_->data(), file_->size());
+Status MmapLoader::parse(uint32_t shard) {
+    const MappedFile& file = *files_[shard];
+    const std::string& path = file.path();
+    Reader r(file.data(), file.size());
 
     uint32_t magic = 0;
     if (!r.get(magic) || magic != kGgufMagic) return invalid(path, "not a GGUF file (bad magic)");
-    if (!r.get(version_) || (version_ != 2 && version_ != 3)) {
-        return invalid(path, "unsupported GGUF version " + std::to_string(version_) + " (need 2 or 3)");
+    uint32_t version = 0;
+    if (!r.get(version) || (version != 2 && version != 3)) {
+        return invalid(path, "unsupported GGUF version " + std::to_string(version) + " (need 2 or 3)");
     }
+    if (shard == 0) version_ = version;
     uint64_t n_tensors = 0;
     uint64_t n_kv = 0;
     if (!r.get(n_tensors) || !r.get(n_kv)) return invalid(path, "truncated header");
@@ -324,20 +374,30 @@ Status MmapLoader::parse() {
         return invalid(path, "header counts exceed file size");
     }
 
-    metadata_.reserve(static_cast<size_t>(n_kv));
+    // Later parts carry only split bookkeeping: validated, checked, dropped.
+    std::unordered_map<std::string_view, GgufValue> part_metadata;
+    auto& meta = shard == 0 ? metadata_ : part_metadata;
+    meta.reserve(static_cast<size_t>(n_kv));
     for (uint64_t i = 0; i < n_kv; ++i) {
         std::string_view key;
         if (!r.get_string(key)) return invalid(path, "truncated metadata key");
         GgufValue value;
         std::string error;
         if (!read_value(r, value, error)) return invalid(path, "metadata '" + std::string(key) + "': " + error);
-        if (!metadata_.emplace(key, std::move(value)).second) {
+        if (!meta.emplace(key, std::move(value)).second) {
             return invalid(path, "duplicate metadata key '" + std::string(key) + "'");
+        }
+    }
+    if (shard > 0) {
+        const auto it = part_metadata.find("split.no");
+        if (it == part_metadata.end() || it->second.as_int() != int64_t{shard}) {
+            return invalid(path, "not part " + std::to_string(shard + 1) + " of this split model");
         }
     }
 
     uint64_t alignment = 32;
-    if (const GgufValue* a = metadata("general.alignment")) {
+    const auto align_it = meta.find("general.alignment");
+    if (const GgufValue* a = align_it == meta.end() ? nullptr : &align_it->second) {
         const auto v = a->as_int();
         if (!v || *v <= 0 || (*v & (*v - 1)) != 0) return invalid(path, "general.alignment must be a power of two");
         alignment = static_cast<uint64_t>(*v);
@@ -345,9 +405,10 @@ Status MmapLoader::parse() {
 
     struct RawInfo { uint32_t ggml_type; uint64_t offset; };
     std::vector<RawInfo> raw(static_cast<size_t>(n_tensors));
-    tensors_.resize(static_cast<size_t>(n_tensors));
+    const size_t first = tensors_.size();
+    tensors_.resize(first + static_cast<size_t>(n_tensors));
     for (uint64_t i = 0; i < n_tensors; ++i) {
-        TensorView& t = tensors_[i];
+        TensorView& t = tensors_[first + i];
         uint32_t n_dims = 0;
         if (!r.get_string(t.name) || !r.get(n_dims)) return invalid(path, "truncated tensor info");
         if (n_dims == 0 || n_dims > 4) return invalid(path, "tensor '" + std::string(t.name) + "' has unsupported rank");
@@ -362,12 +423,12 @@ Status MmapLoader::parse() {
     }
 
     const uint64_t data_start = (static_cast<uint64_t>(r.pos()) + alignment - 1) / alignment * alignment;
-    if (data_start > file_->size()) return invalid(path, "tensor data section starts past end of file");
-    const uint64_t data_size = file_->size() - data_start;
+    if (data_start > file.size()) return invalid(path, "tensor data section starts past end of file");
+    const uint64_t data_size = file.size() - data_start;
 
     tensor_index_.reserve(tensors_.size());
-    for (size_t i = 0; i < tensors_.size(); ++i) {
-        TensorView& t = tensors_[i];
+    for (size_t i = 0; i < static_cast<size_t>(n_tensors); ++i) {
+        TensorView& t = tensors_[first + i];
         const std::string name(t.name);
         if (!dtype_from_ggml(raw[i].ggml_type, t.type)) {
             return Status(ErrorCode::Unsupported,
@@ -390,9 +451,10 @@ Status MmapLoader::parse() {
             return invalid(path, "tensor '" + name + "' data lies outside the file");
         }
         t.file_offset = data_start + raw[i].offset;
-        t.data = file_->data() + t.file_offset;
+        t.shard = shard;
+        t.data = file.data() + t.file_offset;
         t.nbytes = static_cast<size_t>(nbytes);
-        if (!tensor_index_.emplace(t.name, i).second) return invalid(path, "duplicate tensor '" + name + "'");
+        if (!tensor_index_.emplace(t.name, first + i).second) return invalid(path, "duplicate tensor '" + name + "'");
     }
     return Status::ok();
 }
@@ -429,10 +491,15 @@ void MmapLoader::configure_layers(int32_t n_layers) {
     if (n_layers <= 0 || !layer_ranges_.empty()) return;
     // Slots 0..n-1 are transformer blocks; slot n holds the output head, which
     // is read after the last block of every token.
-    layer_ranges_.assign(static_cast<size_t>(n_layers) + 1, Range{std::numeric_limits<size_t>::max(), 0});
-    auto extend = [](Range& range, const TensorView& t) {
-        range.begin = std::min(range.begin, static_cast<size_t>(t.file_offset));
-        range.end = std::max(range.end, static_cast<size_t>(t.file_offset) + t.nbytes);
+    layer_ranges_.assign(static_cast<size_t>(n_layers) + 1, {});
+    auto extend = [](std::vector<Range>& ranges, const TensorView& t) {
+        auto it = std::find_if(ranges.begin(), ranges.end(), [&](const Range& r) { return r.shard == t.shard; });
+        if (it == ranges.end()) {
+            ranges.push_back(Range{t.shard, static_cast<size_t>(t.file_offset), static_cast<size_t>(t.file_offset) + t.nbytes});
+            return;
+        }
+        it->begin = std::min(it->begin, static_cast<size_t>(t.file_offset));
+        it->end = std::max(it->end, static_cast<size_t>(t.file_offset) + t.nbytes);
     };
     for (const TensorView& t : tensors_) {
         if (t.name.substr(0, 4) == "blk.") {
@@ -449,9 +516,6 @@ void MmapLoader::configure_layers(int32_t n_layers) {
     }
     if (tensor("output.weight") == nullptr) {
         if (const TensorView* emb = tensor("token_embd.weight")) extend(layer_ranges_.back(), *emb);
-    }
-    for (Range& range : layer_ranges_) {
-        if (range.begin > range.end) range = Range{};
     }
     if (streaming_) prefetch_thread_ = std::thread([this] { prefetch_loop(); });
 }
@@ -470,8 +534,9 @@ void MmapLoader::begin_layer(int32_t layer) {
         // Release slots that fell behind the compute cursor.
         for (auto it = resident_.begin(); it != resident_.end();) {
             if (!in_window(*it)) {
-                const Range& r = layer_ranges_[static_cast<size_t>(*it)];
-                file_->advise_dontneed(r.begin, r.end - r.begin);
+                for (const Range& r : layer_ranges_[static_cast<size_t>(*it)]) {
+                    files_[r.shard]->advise_dontneed(r.begin, r.end - r.begin);
+                }
                 prefetch_queue_.erase(std::remove(prefetch_queue_.begin(), prefetch_queue_.end(), *it),
                                       prefetch_queue_.end());
                 it = resident_.erase(it);
@@ -495,8 +560,9 @@ void MmapLoader::begin_layer(int32_t layer) {
 
 std::pair<size_t, size_t> MmapLoader::layer_range(int32_t slot) const {
     if (slot < 0 || static_cast<size_t>(slot) >= layer_ranges_.size()) return {0, 0};
-    const Range& r = layer_ranges_[static_cast<size_t>(slot)];
-    return {r.begin, r.end};
+    const std::vector<Range>& ranges = layer_ranges_[static_cast<size_t>(slot)];
+    if (ranges.size() != 1 || files_.size() != 1) return {0, 0};
+    return {ranges.front().begin, ranges.front().end};
 }
 
 void MmapLoader::wait_prefetch_idle() {
@@ -515,10 +581,10 @@ void MmapLoader::prefetch_loop() {
             prefetch_queue_.pop_front();
             prefetch_busy_ = true;
         }
-        const Range& r = layer_ranges_[static_cast<size_t>(layer)];
-        if (r.end > r.begin) {
-            file_->advise_willneed(r.begin, r.end - r.begin);
-            file_->touch(r.begin, r.end - r.begin);
+        for (const Range& r : layer_ranges_[static_cast<size_t>(layer)]) {
+            const MappedFile& f = *files_[r.shard];
+            f.advise_willneed(r.begin, r.end - r.begin);
+            f.touch(r.begin, r.end - r.begin);
             prefetched_bytes_.fetch_add(r.end - r.begin, std::memory_order_relaxed);
         }
         {

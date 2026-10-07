@@ -25,6 +25,34 @@ std::string layer_name(int32_t layer, const char* suffix) {
     return buf;
 }
 
+float silu(float x) { return x / (1.0f + std::exp(-x)); }
+float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }  // ggml's threshold
+
+// x / sqrt(sum(x^2) + eps): the L2 normalization of DeltaNet queries and keys.
+void l2norm(float* x, int32_t n, float eps) {
+    double ss = 0.0;
+    for (int32_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
+    const auto scale = static_cast<float>(1.0 / std::sqrt(ss + eps));
+    for (int32_t i = 0; i < n; ++i) x[i] *= scale;
+}
+
+// Per-architecture facts that the tensors cannot tell. Everything else
+// (block mixers, gates, biases, norms) is discovered from the file.
+struct ArchTraits {
+    std::string_view name;
+    bool rope_neox;  // rotate pairs (i, i + rope_dim/2) instead of (2i, 2i + 1)
+};
+constexpr ArchTraits kArchs[] = {
+    {"llama", false}, {"mistral", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true},
+};
+
+std::string supported_archs() {
+    std::string out;
+    for (const ArchTraits& a : kArchs) out += (out.empty() ? "" : ", ") + std::string(a.name);
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -39,22 +67,17 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     ModelConfig& c = model->config_;
 
     const auto arch = f.get_string("general.architecture");
-    if (!arch) {
-        const auto split_no = f.get_int("split.no");
-        const auto split_count = f.get_int("split.count");
-        if (split_no && split_count) {
-            return Status(ErrorCode::Unsupported,
-                          "this file is part " + std::to_string(*split_no + 1) + " of " + std::to_string(*split_count) +
-                              " of a split GGUF model; the model description lives in part 1 and Liyab loads "
-                              "single-file models only (download a single-file quantization instead)");
-        }
-        return Status(ErrorCode::InvalidModel, "not a model file: missing general.architecture");
-    }
+    if (!arch) return Status(ErrorCode::InvalidModel, "not a model file: missing general.architecture");
     c.arch = std::string(*arch);
-    if (c.arch == "llama" || c.arch == "mistral") c.rope_neox = false;
-    else if (c.arch == "qwen2" || c.arch == "qwen3") c.rope_neox = true;
-    else return Status(ErrorCode::Unsupported, "architecture '" + c.arch + "' is not supported yet (supported: llama, "
-                                              "mistral, qwen2, qwen3 — dense transformers)");
+    const ArchTraits* traits = nullptr;
+    for (const ArchTraits& a : kArchs) {
+        if (a.name == c.arch) traits = &a;
+    }
+    if (traits == nullptr) {
+        return Status(ErrorCode::Unsupported,
+                      "architecture '" + c.arch + "' is not supported yet (supported: " + supported_archs() + ")");
+    }
+    c.rope_neox = traits->rope_neox;
 
     auto key = [&](const char* suffix) { return c.arch + "." + suffix; };
     auto require_int = [&](const char* suffix, int32_t& out) -> Status {
@@ -66,6 +89,9 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         return Status::ok();
     };
     LIYAB_RETURN_IF_ERROR(require_int("block_count", c.n_layers));
+    // Multi-token-prediction heads are stored as trailing blocks; the main pass skips them.
+    c.n_layers -= static_cast<int32_t>(f.get_int(key("nextn_predict_layers")).value_or(0));
+    if (c.n_layers <= 0) return Status(ErrorCode::InvalidModel, "invalid nextn_predict_layers");
     LIYAB_RETURN_IF_ERROR(require_int("embedding_length", c.n_embd));
     LIYAB_RETURN_IF_ERROR(require_int("feed_forward_length", c.n_ff));
     LIYAB_RETURN_IF_ERROR(require_int("attention.head_count", c.n_head));
@@ -93,9 +119,30 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
     }
 
+    // Block mixers, from the tensors present: a block with a DeltaNet
+    // convolution is recurrent, every other block is attention.
+    c.mixers.resize(static_cast<size_t>(c.n_layers));
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        const bool recurrent = f.tensor(layer_name(l, "ssm_conv1d.weight")) != nullptr;
+        c.mixers[static_cast<size_t>(l)] = recurrent ? MixerKind::DeltaNet : MixerKind::Attention;
+        if (!recurrent) ++c.n_attn_layers;
+    }
+    if (c.n_attn_layers < c.n_layers) {
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", c.ssm_conv_kernel));
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.state_size", c.ssm_head_dim));
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.group_count", c.ssm_k_heads));
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.time_step_rank", c.ssm_v_heads));
+        int32_t inner = 0;
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.inner_size", inner));
+        if (inner != c.ssm_v_heads * c.ssm_head_dim || c.ssm_v_heads % c.ssm_k_heads != 0 || c.ssm_conv_kernel < 2) {
+            return Status(ErrorCode::InvalidModel, "inconsistent DeltaNet (ssm.*) dimensions");
+        }
+    }
+
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
-    LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d)", c.n_layers,
-                   std::string(dtype_traits(model->layers_[0].w_up->type).name).c_str(), c.arch.c_str(), c.head_dim);
+    LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d, %d attention + %d DeltaNet blocks)", c.n_layers,
+                   std::string(dtype_traits(model->layers_[0].w[kUp]->type).name).c_str(), c.arch.c_str(), c.head_dim,
+                   c.n_attn_layers, c.n_layers - c.n_attn_layers);
 
     // Context and KV cache.
     model->context_length_ = options.context_length > 0
@@ -106,7 +153,9 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     }
     model->max_batch_ = std::max(1, options.max_batch);
     KvCacheConfig kv;
-    kv.n_layers = c.n_layers;
+    // Only attention blocks have keys and values (at least one slot keeps the
+    // cache well-formed for purely recurrent stacks).
+    kv.n_layers = std::max(c.n_attn_layers, 1);
     kv.n_head_kv = c.n_head_kv;
     kv.head_dim = c.head_dim;
     kv.type = options.kv_type;
@@ -140,7 +189,12 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                    c.arch.c_str(), c.n_layers, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab,
                    model->context_length_, kv.window ? " (sliding)" : "",
                    std::string(dtype_traits(model->kv_->dtype()).name).c_str(),
-                   static_cast<double>(KvCache::bytes_per_token(c.n_layers, c.n_head_kv, c.head_dim, kv.type)) / 1024.0);
+                   static_cast<double>(KvCache::bytes_per_token(kv.n_layers, c.n_head_kv, c.head_dim, kv.type)) / 1024.0);
+    if (c.hybrid()) {
+        LIYAB_LOG_INFO("DeltaNet: %d recurrent blocks, %d/%d heads x %d, conv %d, state %.1f MiB", c.n_layers - c.n_attn_layers,
+                       c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
+                       static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
+    }
     return model;
 }
 
@@ -184,25 +238,67 @@ Status Transformer::bind_weights() {
     }
     LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, true, output_norm_));
 
+    const int64_t dn_key = int64_t{c.ssm_k_heads} * c.ssm_head_dim;
+    const int64_t dn_value = int64_t{c.ssm_v_heads} * c.ssm_head_dim;
+    const int64_t conv_dim = 2 * dn_key + dn_value;
+
     layers_.resize(static_cast<size_t>(c.n_layers));
+    int32_t kv_slots = 0;
+    int32_t state_slots = 0;
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = layers_[static_cast<size_t>(l)];
+        L.mixer = c.mixers[static_cast<size_t>(l)];
         LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_q.weight"), c.n_embd, q_dim, L.wq));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_k.weight"), c.n_embd, kv_dim, L.wk));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_v.weight"), c.n_embd, kv_dim, L.wv));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_output.weight"), q_dim, c.n_embd, L.wo));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_q.bias"), q_dim, false, L.bq));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_k.bias"), kv_dim, false, L.bk));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_v.bias"), kv_dim, false, L.bv));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
-        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ffn_norm.weight"), c.n_embd, true, L.ffn_norm));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w_gate));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w_up));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w_down));
+        if (L.mixer == MixerKind::Attention) {
+            L.kv_slot = kv_slots++;
+            // A query projection twice as tall carries a per-head output gate: [q | gate].
+            const TensorView* wq = f.tensor(layer_name(l, "attn_q.weight"));
+            L.attn_gate = wq != nullptr && wq->rows() == 2 * q_dim;
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_q.weight"), c.n_embd, L.attn_gate ? 2 * q_dim : q_dim, L.w[kQ]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_k.weight"), c.n_embd, kv_dim, L.w[kK]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_v.weight"), c.n_embd, kv_dim, L.w[kV]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_q.bias"), q_dim, false, L.bq));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_k.bias"), kv_dim, false, L.bk));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_v.bias"), kv_dim, false, L.bv));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
+        } else {
+            L.state_slot = state_slots++;
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "attn_gate.weight"), c.n_embd, dn_value, L.w[kZ]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ssm_alpha.weight"), c.n_embd, c.ssm_v_heads, L.w[kAlpha]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ssm_beta.weight"), c.n_embd, c.ssm_v_heads, L.w[kBeta]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ssm_out.weight"), dn_value, c.n_embd, L.w[kSsmOut]));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ssm_conv1d.weight"), conv_dim * c.ssm_conv_kernel, true, L.conv1d));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ssm_a"), c.ssm_v_heads, true, L.ssm_a));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ssm_dt.bias"), c.ssm_v_heads, true, L.ssm_dt));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
+        }
+        // The pre-FFN norm is named after the attention it follows in some families.
+        const std::string ffn_norm = f.tensor(layer_name(l, "ffn_norm.weight")) != nullptr
+                                         ? layer_name(l, "ffn_norm.weight")
+                                         : layer_name(l, "post_attention_norm.weight");
+        LIYAB_RETURN_IF_ERROR(vec(ffn_norm, c.n_embd, true, L.ffn_norm));
+        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
+        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
+    }
+
+    states_.resize(static_cast<size_t>(state_slots));
+    for (RecurrentState& st : states_) {
+        st.conv.assign(static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1), 0.0f);
+        st.ssm.assign(static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) *
+                          static_cast<size_t>(c.ssm_head_dim),
+                      0.0f);
     }
     return Status::ok();
+}
+
+size_t Transformer::recurrent_state_bytes() const noexcept {
+    size_t bytes = 0;
+    for (const RecurrentState& st : states_) bytes += (st.conv.size() + st.ssm.size()) * sizeof(float);
+    return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +308,9 @@ class Transformer::BlockWeights {
 public:
     BlockWeights(Transformer& model, int32_t layer) : model_(model), layer_(layer) {
         const Layer& L = model.layers_[static_cast<size_t>(layer)];
-        const TensorView* src[] = {L.wq, L.wk, L.wv, L.wo, L.w_gate, L.w_up, L.w_down};
-        for (size_t i = 0; i < 7; ++i) views_[i] = *src[i];
+        for (size_t i = 0; i < kWeightRoles; ++i) {
+            if (L.w[i] != nullptr) views_[i] = *L.w[i];
+        }
         if (model.layer_source_ == nullptr) {
             model.file_->begin_layer(layer);  // mmap path: advance the prefetch window
             return;
@@ -227,7 +324,9 @@ public:
         // Every block tensor lies inside the block's byte range, so its slot
         // address is the slot base plus its offset within that range.
         const size_t range_begin = model.file_->layer_range(layer).first;
-        for (TensorView& v : views_) v.data = base.value() + (v.file_offset - range_begin);
+        for (size_t i = 0; i < kWeightRoles; ++i) {
+            if (L.w[i] != nullptr) views_[i].data = base.value() + (views_[i].file_offset - range_begin);
+        }
     }
     ~BlockWeights() {
         if (acquired_) model_.layer_source_->release(layer_);
@@ -236,24 +335,23 @@ public:
     BlockWeights& operator=(const BlockWeights&) = delete;
 
     [[nodiscard]] const Status& status() const noexcept { return status_; }
-    const TensorView& wq() const { return views_[0]; }
-    const TensorView& wk() const { return views_[1]; }
-    const TensorView& wv() const { return views_[2]; }
-    const TensorView& wo() const { return views_[3]; }
-    const TensorView& gate() const { return views_[4]; }
-    const TensorView& up() const { return views_[5]; }
-    const TensorView& down() const { return views_[6]; }
+    // The block's matrix with role `role` (only roles the block has).
+    const TensorView& operator[](WeightRole role) const { return views_[role]; }
 
 private:
     Transformer& model_;
     int32_t layer_;
     bool acquired_ = false;
     Status status_;
-    TensorView views_[7];
+    TensorView views_[kWeightRoles];
 };
 
 void Transformer::reset() noexcept {
     kv_->clear();
+    for (RecurrentState& st : states_) {
+        std::fill(st.conv.begin(), st.conv.end(), 0.0f);
+        std::fill(st.ssm.begin(), st.ssm.end(), 0.0f);
+    }
     n_past_ = 0;
 }
 void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
@@ -275,7 +373,7 @@ void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
     }
 }
 
-void Transformer::attention(int32_t layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
+void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
@@ -312,7 +410,7 @@ void Transformer::attention(int32_t layer, int32_t n, ThreadPool& pool, const ui
             scores.resize(static_cast<size_t>(n_visible));
             float max_score = -INFINITY;
             for (int32_t i = 0; i < n_visible; ++i) {
-                const uint8_t* k = kv_->k_row(layer, position(i), g);
+                const uint8_t* k = kv_->k_row(kv_slot, position(i), g);
                 const float s = (quantized_kv ? quant::dot_quantized(kv_type, k, q8.data(), nullptr, hd)
                                               : quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(k), q, hd)) *
                                 scale;
@@ -327,7 +425,7 @@ void Transformer::attention(int32_t layer, int32_t n, ThreadPool& pool, const ui
             std::fill(out, out + hd, 0.0f);
             const float inv_sum = 1.0f / sum;
             for (int32_t i = 0; i < n_visible; ++i) {
-                quant::axpy_row(kv_type, kv_->v_row(layer, position(i), g), scores[static_cast<size_t>(i)] * inv_sum,
+                quant::axpy_row(kv_type, kv_->v_row(kv_slot, position(i), g), scores[static_cast<size_t>(i)] * inv_sum,
                                 out, hd);
             }
         }
@@ -362,13 +460,14 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
 
 Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) {
     const ModelConfig& c = config_;
+    // Only reached for attention-only stacks: early exit is disabled for hybrid models.
     for (int32_t l = from; l < c.n_layers; ++l) {
         const Layer& L = layers_[static_cast<size_t>(l)];
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
         rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wk(), xb_.data(), k_.data(), 1));
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wv(), xb_.data(), v_.data(), 1));
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kK], xb_.data(), k_.data(), 1));
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kV], xb_.data(), v_.data(), 1));
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         if (!L.k_norm.empty()) {
@@ -378,9 +477,153 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
             }
         }
         rope(k_.data(), c.n_head_kv, pos);
-        kv_->store(l, pos, k_.data(), v_.data());
+        kv_->store(L.kv_slot, pos, k_.data(), v_.data());
     }
     return Status::ok();
+}
+
+Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                    ThreadPool& pool, const uint8_t* head_mask) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
+    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const size_t hd = static_cast<size_t>(c.head_dim);
+
+    // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
+    if (L.attn_gate) qg_.resize(un * 2 * q_dim);
+    {
+        const TensorView* qkv[] = {&w[kQ], &w[kK], &w[kV]};
+        float* outs[] = {L.attn_gate ? qg_.data() : q_.data(), k_.data(), v_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, qkv, xb_.data(), outs, n));
+    }
+    if (L.attn_gate) {
+        gate_.resize(un * q_dim);
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
+                const float* src = qg_.data() + (t * static_cast<size_t>(c.n_head) + h) * 2 * hd;
+                std::copy(src, src + hd, q_.data() + t * q_dim + h * hd);
+                std::copy(src + hd, src + 2 * hd, gate_.data() + t * q_dim + h * hd);
+            }
+        }
+    }
+    for (size_t t = 0; t < un; ++t) {
+        float* q = q_.data() + t * q_dim;
+        float* k = k_.data() + t * kv_dim;
+        float* v = v_.data() + t * kv_dim;
+        for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
+        for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
+        for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
+        if (!L.q_norm.empty()) {
+            for (int32_t h = 0; h < c.n_head; ++h) {
+                float* qh = q + static_cast<size_t>(h) * hd;
+                rmsnorm(qh, L.q_norm.data(), qh, c.head_dim, c.rms_eps);
+            }
+        }
+        if (!L.k_norm.empty()) {
+            for (int32_t h = 0; h < c.n_head_kv; ++h) {
+                float* kh = k + static_cast<size_t>(h) * hd;
+                rmsnorm(kh, L.k_norm.data(), kh, c.head_dim, c.rms_eps);
+            }
+        }
+        const int32_t pos = n_past_ + static_cast<int32_t>(t);
+        rope(q, c.n_head, pos);
+        rope(k, c.n_head_kv, pos);
+        kv_->store(L.kv_slot, pos, k, v);
+    }
+    attention(L.kv_slot, n, pool, head_mask);
+    if (L.attn_gate) {
+        for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
+    }
+    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+}
+
+// Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention), token by token:
+//   [q|k|v] = SiLU(causal_conv1d(W_qkv x)),  q, k L2-normalized, q scaled by 1/sqrt(d)
+//   decay = exp(softplus(W_a x + dt_bias) * A),  b = sigmoid(W_b x)
+//   S = decay * S;  S += b * (v - S k) k^T;  o = S q
+//   out = W_out (RMSNorm(o) * SiLU(W_z x))      (per value head)
+// Key/query heads are shared by value heads modulo their count (ggml's layout).
+Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                    ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    RecurrentState& st = states_[static_cast<size_t>(L.state_slot)];
+    const auto un = static_cast<size_t>(n);
+    const auto hd = static_cast<size_t>(c.ssm_head_dim);
+    const auto hk = static_cast<size_t>(c.ssm_k_heads);
+    const auto hv = static_cast<size_t>(c.ssm_v_heads);
+    const size_t key_dim = hk * hd;
+    const size_t value_dim = hv * hd;
+    const size_t conv_dim = 2 * key_dim + value_dim;
+    const auto taps = static_cast<size_t>(c.ssm_conv_kernel);
+    const size_t history = taps - 1;
+
+    mix_.resize(un * conv_dim);
+    z_.resize(un * value_dim);
+    alpha_.resize(un * hv);
+    beta_.resize(un * hv);
+    dn_.resize(un * value_dim);
+    {
+        const TensorView* proj[] = {&w[kQkv], &w[kZ], &w[kAlpha], &w[kBeta]};
+        float* outs[] = {mix_.data(), z_.data(), alpha_.data(), beta_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
+    }
+
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    for (size_t t = 0; t < un; ++t) {
+        float* m = mix_.data() + t * conv_dim;
+        // Causal depthwise convolution over [history, current], then SiLU; the
+        // history shifts by one input.
+        for (size_t ch = 0; ch < conv_dim; ++ch) {
+            float* hist = st.conv.data() + ch * history;
+            const float* tap = L.conv1d.data() + ch * taps;
+            float acc = m[ch] * tap[history];
+            for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
+            for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
+            hist[history - 1] = m[ch];
+            m[ch] = silu(acc);
+        }
+        for (size_t h = 0; h < 2 * hk; ++h) l2norm(m + h * hd, static_cast<int32_t>(hd), c.rms_eps);
+
+        const float* a = alpha_.data() + t * hv;
+        const float* b = beta_.data() + t * hv;
+        float* out = dn_.data() + t * value_dim;
+        pool.parallel_for(static_cast<int64_t>(hv), [&](int64_t begin, int64_t end) {
+            for (auto h = static_cast<size_t>(begin); h < static_cast<size_t>(end); ++h) {
+                const float* q = m + (h % hk) * hd;
+                const float* k = m + key_dim + (h % hk) * hd;
+                const float* v = m + 2 * key_dim + h * hd;
+                const float decay = std::exp(softplus(a[h] + L.ssm_dt[h]) * L.ssm_a[h]);
+                const float strength = sigmoid(b[h]);
+                float* S = st.ssm.data() + h * hd * hd;
+                float* o = out + h * hd;
+                // Row j of S maps keys to value component j, so each row is
+                // decayed, corrected and read independently in two passes.
+                for (size_t j = 0; j < hd; ++j) {
+                    float* row = S + j * hd;
+                    float sk = 0.0f;
+                    for (size_t i = 0; i < hd; ++i) {
+                        row[i] *= decay;
+                        sk += row[i] * k[i];
+                    }
+                    const float delta = (v[j] - sk) * strength;
+                    float oq = 0.0f;
+                    for (size_t i = 0; i < hd; ++i) {
+                        row[i] += k[i] * delta;
+                        oq += row[i] * q[i];
+                    }
+                    o[j] = oq * q_scale;
+                }
+                // Gated RMSNorm of the head output.
+                const float* z = z_.data() + t * value_dim + h * hd;
+                rmsnorm(o, L.ssm_norm.data(), o, static_cast<int32_t>(hd), c.rms_eps);
+                for (size_t j = 0; j < hd; ++j) o[j] *= silu(z[j]);
+            }
+        });
+    }
+    return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
 
 Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tokens, Logits logits,
@@ -396,8 +639,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         if (id < 0 || id >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "token id out of range");
     }
     LIYAB_RETURN_IF_ERROR(kv_->reserve(n_past_ + n));  // maps KV pages; ContextFull past the limit
+    // Early exit would leave the skipped blocks' recurrent states behind: attention-only stacks.
     EarlyExitHook* early_exit =
-        hooks != nullptr && n == 1 && logits == Logits::Last ? hooks->early_exit : nullptr;
+        hooks != nullptr && n == 1 && logits == Logits::Last && !c.hybrid() ? hooks->early_exit : nullptr;
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
     FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;
     FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
@@ -430,42 +674,17 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
 
-        // --- attention block ---
+        // --- token mixer (attention or DeltaNet) ---
         if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
         for (size_t t = 0; t < un; ++t) {
             rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
         }
-        {
-            const TensorView* qkv[] = {&w.wq(), &w.wk(), &w.wv()};
-            float* outs[] = {q_.data(), k_.data(), v_.data()};
-            LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, qkv, xb_.data(), outs, n));
+        if (L.mixer == MixerKind::DeltaNet) {
+            LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, route, pool));
+        } else {
+            LIYAB_RETURN_IF_ERROR(
+                attention_mixer(l, w, n, route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
         }
-        for (size_t t = 0; t < un; ++t) {
-            float* q = q_.data() + t * q_dim;
-            float* k = k_.data() + t * kv_dim;
-            float* v = v_.data() + t * kv_dim;
-            for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
-            for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
-            for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
-            if (!L.q_norm.empty()) {
-                for (int32_t h = 0; h < c.n_head; ++h) {
-                    float* qh = q + static_cast<size_t>(h) * c.head_dim;
-                    rmsnorm(qh, L.q_norm.data(), qh, c.head_dim, c.rms_eps);
-                }
-            }
-            if (!L.k_norm.empty()) {
-                for (int32_t h = 0; h < c.n_head_kv; ++h) {
-                    float* kh = k + static_cast<size_t>(h) * c.head_dim;
-                    rmsnorm(kh, L.k_norm.data(), kh, c.head_dim, c.rms_eps);
-                }
-            }
-            const int32_t pos = n_past_ + static_cast<int32_t>(t);
-            rope(q, c.n_head, pos);
-            rope(k, c.n_head_kv, pos);
-            kv_->store(l, pos, k, v);
-        }
-        attention(l, n, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr);
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wo(), att_.data(), xb_.data(), n));
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
 
         // --- SwiGLU FFN block (skippable by an experimental hook) ---
@@ -476,18 +695,15 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
             if (ffn_hook != nullptr) {  // experimental per-projection override
-                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w.gate(), xb_.data(), hb_.data()));
-                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w.up(), xb_.data(), hb2_.data()));
+                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w[kGate], xb_.data(), hb_.data()));
+                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w[kUp], xb_.data(), hb2_.data()));
             } else {
-                const TensorView* gate_up[] = {&w.gate(), &w.up()};
+                const TensorView* gate_up[] = {&w[kGate], &w[kUp]};
                 float* outs[] = {hb_.data(), hb2_.data()};
                 LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
             }
-            for (size_t i = 0; i < hb_.size(); ++i) {
-                const float g = hb_[i];
-                hb_[i] = g / (1.0f + std::exp(-g)) * hb2_[i];
-            }
-            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Down, w.down(), hb_.data(), xb_.data()));
+            for (size_t i = 0; i < hb_.size(); ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 
@@ -518,6 +734,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
 }
 
 Status Transformer::adopt_cached_prefix(int32_t n) {
+    if (config_.hybrid()) {
+        return Status(ErrorCode::Unsupported, "cached KV prefixes do not include recurrent (DeltaNet) states");
+    }
     if (n_past_ != 0 || n < 0 || n > context_length_) {
         return Status(ErrorCode::InvalidArgument, "a cached prefix can only be adopted by an empty context");
     }
@@ -530,6 +749,14 @@ Status Transformer::adopt_cached_prefix(int32_t n) {
 
 Status Transformer::truncate(int32_t n) {
     if (n < 0 || n > n_past_) return Status(ErrorCode::InvalidArgument, "truncate beyond cached positions");
+    if (n == n_past_) return Status::ok();
+    if (n == 0) {
+        reset();
+        return Status::ok();
+    }
+    if (config_.hybrid()) {
+        return Status(ErrorCode::Unsupported, "recurrent (DeltaNet) states cannot be rolled back to an earlier position");
+    }
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
     n_past_ = n;
     return Status::ok();

@@ -47,7 +47,7 @@ private:
     std::vector<int32_t> end_of_generation_;
     std::vector<int32_t> control_;  // control tokens with text, longest first
 
-    enum class PreTokenizer { None, Qwen2, Llama3 };
+    enum class PreTokenizer { None, Qwen2, Qwen35, Llama3 };
     PreTokenizer pre_ = PreTokenizer::None;
     std::string pre_name_;
     std::unordered_map<std::string, int32_t> merge_rank_;  // "left right" -> rank (BPE)

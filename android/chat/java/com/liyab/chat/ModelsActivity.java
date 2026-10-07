@@ -219,10 +219,12 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
 
     private void renderLocal() {
         File dir = EngineHolder.modelsDir();
-        File[] local = dir.listFiles((d, name) -> name.endsWith(".gguf"));
+        // Split models are listed once, through part 1; a part without its part 1 stays visible so it can be deleted.
+        File[] local = dir.listFiles((d, name) -> name.endsWith(".gguf")
+                && (!HuggingFace.isLaterPart(name) || !new File(d, HuggingFace.firstPart(name)).exists()));
         List<HuggingFace.Partial> partials = HuggingFace.partials(dir);
         long used = 0;
-        if (local != null) for (File f : local) used += f.length();
+        if (local != null) for (File f : local) used += EngineHolder.sizeOf(f);
         TextView summary = Ui.text(this, String.format(Locale.US, "%s used · %s free", Ui.gb(used),
                 Ui.gb(dir.getUsableSpace())), 12, Ui.MUTED);
         summary.setPadding(Ui.dp(this, 16), Ui.dp(this, 6), Ui.dp(this, 16), 0);
@@ -239,7 +241,8 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
             for (File f : local) content.addView(localCard(f));
         }
         for (HuggingFace.Partial p : partials) {
-            if (Downloads.running() && Downloads.file != null && Downloads.file.fileName().equals(p.file.fileName())) continue;
+            if (Downloads.running() && Downloads.file != null
+                    && HuggingFace.firstPart(Downloads.file.path).equals(HuggingFace.firstPart(p.file.path))) continue;
             content.addView(partialCard(p));
         }
         LinearLayout pick = Ui.card(this);
@@ -258,7 +261,12 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         boolean loaded = EngineHolder.isLoaded(f);
         LinearLayout card = Ui.card(this);
         card.addView(Ui.bold(this, f.getName(), 14));
-        TextView meta = Ui.text(this, Ui.gb(f.length()) + (loaded ? " · ● loaded on "
+        List<File> parts = HuggingFace.localParts(f);
+        int missing = 0;
+        for (File part : parts) if (!part.exists()) missing++;
+        TextView meta = Ui.text(this, Ui.gb(EngineHolder.sizeOf(f))
+                + (parts.size() > 1 ? " · " + parts.size() + " parts" + (missing > 0 ? ", " + missing + " missing" : "") : "")
+                + (loaded ? " · ● loaded on "
                 + (EngineHolder.useGpu() ? "GPU" : "CPU") : ""), 12, loaded ? Ui.GOOD : Ui.MUTED);
         card.addView(meta);
         Button load = Ui.primary(this, loaded ? "Loaded" : "Load", v -> {
@@ -270,8 +278,9 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         Button chat = Ui.pill(this, "Chat", v -> startActivity(new Intent(this, ChatActivity.class)));
         chat.setEnabled(loaded && !EngineHolder.busy);
         chat.setAlpha(chat.isEnabled() ? 1f : 0.4f);
-        Button delete = Ui.pill(this, "Delete", v -> confirmDelete(f.getName(), f.length(), () -> {
-            boolean ok = f.delete();
+        Button delete = Ui.pill(this, "Delete", v -> confirmDelete(f.getName(), EngineHolder.sizeOf(f), () -> {
+            boolean ok = true;
+            for (File part : parts) ok &= !part.exists() || part.delete();
             if (ok && f.getAbsolutePath().equals(EngineHolder.prefs().getString("model", ""))) {
                 EngineHolder.prefs().edit().remove("model").apply();
             }
@@ -288,7 +297,11 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         card.addView(Ui.bold(this, "⏸ " + p.file.fileName(), 14));
         card.addView(Ui.text(this, String.format(Locale.US, "%.0f%% of %s downloaded · %s", 100.0 * p.done / Math.max(1, p.file.size),
                 Ui.gb(p.file.size), p.file.repo), 12, Ui.MUTED));
-        Button resume = Ui.primary(this, "Resume", v -> Downloads.start(this, p.file));
+        // A part of a split model resumes the whole set (finished parts are skipped).
+        Button resume = Ui.primary(this, "Resume", v -> {
+            if (p.file.split) Downloads.startByName(this, p.file.repo, HuggingFace.firstPart(p.file.path));
+            else Downloads.start(this, p.file);
+        });
         resume.setEnabled(!Downloads.running());
         resume.setAlpha(resume.isEnabled() ? 1f : 0.4f);
         Button delete = Ui.pill(this, "Delete", v -> confirmDelete(p.file.fileName() + " (partial)",
@@ -354,7 +367,7 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
             header.addView(Ui.bold(this, openRepo, 15));
             if (openRepoArch != null && !HuggingFace.SUPPORTED_ARCHS.contains(openRepoArch)) {
                 header.addView(Ui.text(this, "✗ Architecture '" + openRepoArch + "' is not supported yet (supported: "
-                        + "llama, mistral, qwen2, qwen3). None of these files can run.", 13, Ui.BAD));
+                        + String.join(", ", HuggingFace.SUPPORTED_ARCHS) + "). None of these files can run.", 13, Ui.BAD));
             } else {
                 header.addView(Ui.text(this, (openRepoArch != null ? "✓ Architecture " + openRepoArch + " · " : "")
                         + "RAM fit is based on currently free memory.", 12, openRepoArch != null ? Ui.GOOD : Ui.MUTED));
@@ -381,10 +394,11 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         boolean fits = fitsInRam(f.size);
         LinearLayout card = Ui.card(this);
         card.addView(Ui.bold(this, f.fileName(), 14));
-        card.addView(Ui.text(this, Ui.gb(f.size) + " · " + f.quant, 12, Ui.MUTED));
+        card.addView(Ui.text(this, Ui.gb(f.size) + " · " + f.quant
+                + (f.parts.isEmpty() ? "" : " · " + f.parts.size() + " parts"), 12, Ui.MUTED));
         card.addView(Ui.text(this, fits ? "Fits in memory" : "Larger than free RAM: runs from flash, well under 1 token/s",
                 12, fits ? Ui.GOOD : Ui.BAD));
-        boolean present = new File(EngineHolder.modelsDir(), f.fileName()).length() == f.size;
+        boolean present = f.presentIn(EngineHolder.modelsDir());
         Button download = Ui.primary(this, present ? "Downloaded" : "Download", v -> {
             Downloads.start(this, f);
             render();
@@ -439,7 +453,7 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
                     repoFiles.addAll(supported);
                     int hidden = files.size() - supported.size();
                     hfMessage = supported.size() + " model files" + (hidden > 0 ? " (" + hidden
-                            + " hidden: multi-part shards, vision projectors, imatrix or unsupported formats)" : "");
+                            + " hidden: single parts of split models, vision projectors, imatrix or unsupported formats)" : "");
                     render();
                 });
             } catch (Exception e) {

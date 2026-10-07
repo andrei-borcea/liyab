@@ -28,9 +28,9 @@ final class HuggingFace {
     private static final String USER_AGENT = "LiyabChat/0.1 (Android)";
     /** Architectures the engine runs (keep in sync with src/core/transformer.cpp). */
     static final java.util.Set<String> SUPPORTED_ARCHS =
-            new java.util.HashSet<>(java.util.Arrays.asList("llama", "mistral", "qwen2", "qwen3"));
-    // Multi-file (split) GGUF shards: the loader maps single files only for now.
-    private static final Pattern SPLIT = Pattern.compile("-\\d{5}-of-\\d{5}\\.gguf$", Pattern.CASE_INSENSITIVE);
+            new java.util.TreeSet<>(java.util.Arrays.asList("llama", "mistral", "qwen2", "qwen3", "qwen35"));
+    // One part of a split GGUF model (gguf-split): <prefix>-00002-of-00005.gguf
+    private static final Pattern SPLIT = Pattern.compile("-(\\d{5})-of-(\\d{5})\\.gguf$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUANT = Pattern.compile(
             "(IQ\\d_[A-Z]+|Q\\d_K(?:_[SML])?|Q\\d_\\d|TQ\\d_\\d|BF16|F16|F32|MXFP4|NVFP4)", Pattern.CASE_INSENSITIVE);
 
@@ -65,19 +65,26 @@ final class HuggingFace {
         final String sha256;  // from the LFS pointer; null when unknown
         final String quant;
         final Compat compat;
-        final boolean split;  // one shard of a multi-file GGUF (-00001-of-00003.gguf)
+        final boolean split;  // one part of a multi-file GGUF (-00001-of-00003.gguf)
         final boolean auxiliary;  // not a language model: mmproj (vision), imatrix, MTP heads
+        // A split model as a whole: its parts in order (path = part 1, size = total); empty otherwise.
+        final List<GgufFile> parts;
 
         GgufFile(String repo, String path, long size) {
             this(repo, path, size, null);
         }
 
         GgufFile(String repo, String path, long size, String sha256) {
+            this(repo, path, size, sha256, java.util.Collections.emptyList());
+        }
+
+        private GgufFile(String repo, String path, long size, String sha256, List<GgufFile> parts) {
             this.repo = repo;
             this.path = path;
             this.size = size;
             this.sha256 = sha256;
-            this.split = SPLIT.matcher(path).find();
+            this.parts = parts;
+            this.split = parts.isEmpty() && SPLIT.matcher(path).find();
             String lower = path.toLowerCase(Locale.US);
             this.auxiliary = lower.contains("mmproj") || lower.contains("imatrix") || lower.startsWith("mtp/")
                     || lower.contains("/mtp-");
@@ -88,10 +95,51 @@ final class HuggingFace {
             this.compat = split || auxiliary ? Compat.UNSUPPORTED : compatOf(this.quant);
         }
 
+        /** The whole model made of `parts` (all parts of one split set, in order). */
+        static GgufFile splitModel(List<GgufFile> parts) {
+            long total = 0;
+            for (GgufFile p : parts) total += p.size;
+            GgufFile first = parts.get(0);
+            return new GgufFile(first.repo, first.path, total, null, parts);
+        }
+
         String fileName() {
             int slash = path.lastIndexOf('/');
             return slash >= 0 ? path.substring(slash + 1) : path;
         }
+
+        /** Whether every byte of this model (all parts) is in `dir`. */
+        boolean presentIn(File dir) {
+            if (parts.isEmpty()) return new File(dir, fileName()).length() == size;
+            for (GgufFile p : parts) if (!p.presentIn(dir)) return false;
+            return true;
+        }
+    }
+
+    /** Path of part 1 of the split set `path` belongs to, or `path` itself for a single file. */
+    static String firstPart(String path) {
+        Matcher m = SPLIT.matcher(path);
+        if (!m.find()) return path;
+        return path.substring(0, m.start()) + "-00001-of-" + m.group(2) + ".gguf";
+    }
+
+    /** The files of the model whose first (or only) file is `first`, in order; just `first` if not split. */
+    static List<File> localParts(File first) {
+        Matcher m = SPLIT.matcher(first.getName());
+        if (!m.find() || !m.group(1).equals("00001")) return java.util.Collections.singletonList(first);
+        int count = Integer.parseInt(m.group(2));
+        String prefix = first.getName().substring(0, m.start());
+        List<File> out = new ArrayList<>();
+        for (int i = 1; i <= count; i++) {
+            out.add(new File(first.getParentFile(), String.format(Locale.US, "%s-%05d-of-%05d.gguf", prefix, i, count)));
+        }
+        return out;
+    }
+
+    /** Whether `name` is part 2+ of a split model (listed through its part 1). */
+    static boolean isLaterPart(String name) {
+        Matcher m = SPLIT.matcher(name);
+        return m.find() && !m.group(1).equals("00001");
     }
 
     /** Live download state, polled by the UI. All fields are updated by download threads. */
@@ -104,6 +152,7 @@ final class HuggingFace {
         volatile boolean verifying;      // SHA-256 check after the last byte arrived
         final java.util.concurrent.atomic.AtomicLong verified = new java.util.concurrent.atomic.AtomicLong();
         volatile boolean cancelled;      // set by the UI: stop and keep the partial file
+        volatile long base;              // bytes of earlier parts already counted in `done` (split models)
     }
 
     private HuggingFace() {}
@@ -211,6 +260,14 @@ final class HuggingFace {
         } catch (org.json.JSONException e) {
             throw new IOException("unexpected Hugging Face response: " + e.getMessage());
         }
+        // Split sets become one entry once every part is listed; their parts are not shown alone.
+        java.util.Map<String, List<GgufFile>> sets = new java.util.TreeMap<>();
+        for (GgufFile f : files) if (f.split) sets.computeIfAbsent(firstPart(f.path), k -> new ArrayList<>()).add(f);
+        for (List<GgufFile> set : sets.values()) {
+            set.sort((a, b) -> a.path.compareTo(b.path));
+            Matcher m = SPLIT.matcher(set.get(0).path);
+            if (m.find() && set.size() == Integer.parseInt(m.group(2))) files.add(GgufFile.splitModel(set));
+        }
         files.sort((a, b) -> Long.compare(a.size, b.size));
         return files;
     }
@@ -225,9 +282,25 @@ final class HuggingFace {
      * losing received bytes. Returns the finished file; throws on cancellation or when a segment keeps
      * failing (the partial file and its state are kept for the next attempt).
      */
+    static File downloadModel(GgufFile model, File dir, DownloadState state) throws IOException {
+        if (model.parts.isEmpty()) return download(model, dir, state);
+        state.total = model.size;
+        long base = 0;
+        for (GgufFile part : model.parts) {
+            state.base = base;
+            download(part, dir, state);
+            base += part.size;
+        }
+        return new File(dir, model.fileName());  // part 1: the engine opens the others next to it
+    }
+
+    /** Downloads one file (a model, or one part of a split model; see downloadModel). */
     static File download(GgufFile file, File dir, DownloadState state) throws IOException {
         File target = new File(dir, file.fileName());
-        if (target.exists() && target.length() == file.size) return target;
+        if (target.exists() && target.length() == file.size) {
+            state.done.set(state.base + file.size);
+            return target;
+        }
         File part = new File(dir, file.fileName() + ".part");
         File stateFile = new File(dir, file.fileName() + ".part.state");
         final long size = file.size;
@@ -258,8 +331,8 @@ final class HuggingFace {
         writeSource(new File(dir, file.fileName() + ".part.src"), file);
         long already = 0;
         for (long p : progress) already += p;
-        state.total = size;
-        state.done.set(already);
+        if (state.total == 0) state.total = size;
+        state.done.set(state.base + already);
 
         final String url = API + "/" + file.repo + "/resolve/main/" + encodePath(file.path);
         final IOException[] failure = new IOException[1];

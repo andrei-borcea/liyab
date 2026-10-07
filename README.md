@@ -31,10 +31,10 @@ This README describes what the code does today. Anything not implemented is list
 
 | Area | Status |
 | :--- | :--- |
-| GGUF loader (`mmap`, zero-copy, validated against malformed files) | ✅ implemented |
+| GGUF loader (`mmap`, zero-copy, validated against malformed files), split models (`-00001-of-0000N.gguf`) | ✅ implemented |
 | Streaming mode for models larger than RAM (triple-window `madvise` prefetch) | ✅ implemented |
 | Triple-buffered block loader (fetch → prepare → execute) | ✅ implemented, opt-in (models larger than RAM) |
-| Transformer: llama / mistral / qwen2 / qwen3 layouts, GQA, RoPE (normal & NeoX), QKV bias, Q/K norm | ✅ implemented, cross-checked against llama.cpp |
+| Transformer with per-block mixers resolved from the file: softmax attention (GQA, RoPE normal & NeoX, QKV bias, Q/K norm, output gate) or Gated DeltaNet linear attention; llama / mistral / qwen2 / qwen3 / qwen35 (Qwen3.5 hybrid) | ✅ implemented, cross-checked against llama.cpp |
 | Every GGML tensor format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0/TQ2_0, MXFP4, NVFP4 (all mixes such as Q4_K_M, IQ3_M) | ✅ implemented, bit-exact vs llama.cpp's reference decoder |
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
@@ -45,7 +45,7 @@ This README describes what the code does today. Anything not implemented is list
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
-| Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
+| Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
 | Experimental: early exit, head pruning, `O_DIRECT` / io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
@@ -106,9 +106,18 @@ This README describes what the code does today. Anything not implemented is list
 
 ## Supported models
 
-* **Format:** GGUF v2/v3.
-* **Architectures:** `llama` (Llama 1/2, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3` (dense).
-  Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
+* **Format:** GGUF v2/v3, single file or split with `gguf-split` (open part 1; the other parts must sit next to it
+  with their original names).
+* **Architectures:** `llama` (Llama 1/2, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3` (dense) and `qwen35`
+  (Qwen3.5 / Qwen3.8 hybrids: three Gated DeltaNet blocks per gated-attention block; the multi-token-prediction head
+  is skipped). Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
+* **How a model is mapped:** the forward pass is not written per model. For every block the loader picks the token
+  mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, otherwise softmax attention), detects optional
+  pieces (QKV biases, Q/K norms, an attention output gate when `attn_q` is twice as tall, the pre-FFN norm name),
+  and only the KV cache of attention blocks is allocated. An architecture adds a one-line traits row (RoPE style).
+  DeltaNet blocks keep a recurrent state (conv history + one 128×128 matrix per value head, 19 MiB for Qwen3.5-2B):
+  such models cannot roll back, so speculative decoding, early exit, head pruning and the KV prefix cache are
+  disabled for them with a clear message.
 * **Tensor types:** every format llama.cpp writes, mixed freely per tensor. That covers F32, F16, BF16, the legacy
   Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-quants Q2_K…Q6_K (and their Q*_K_S/M/L mixes), the I-quants IQ1_S, IQ1_M,
   IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL, IQ4_XS, the ternary TQ1_0/TQ2_0 and the FP4 formats MXFP4/NVFP4. Q1_0 is
@@ -119,7 +128,7 @@ This README describes what the code does today. Anything not implemented is list
   registers. The other formats decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, Q4_K
   and Q5_0 are repacked exactly into the Q4_1/Q8_0 layouts. Other formats fall back to the CPU per matmul.
 * **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`,
-  `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp's tokenization token for token, including special
+  `qwen35` (letters include combining marks, `\p{M}`), `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp's tokenization token for token, including special
   tokens, contractions, digits, accents, CJK and emoji. BOS is added only when the model asks for it.
 * Prompts are used as given: apply the model's chat template in the app.
 
@@ -358,10 +367,13 @@ final class LiyabEngine {
     resumed or deleted. Any `.gguf` can be opened with the system picker (mapped through `/proc/self/fd`, so no copy
     and no storage permission).
   * *Hugging Face:* search GGUF repositories, then open one to list only the files Liyab can run, with size,
-    quantization and a RAM-fit hint. Multi-part shards, vision projectors (`mmproj`) and imatrix files are hidden;
-    split GGUF is not supported yet. The repository's `general.architecture` is read from the first 64 KB of a file
-    (HTTP range request), so a model with an unsupported architecture is flagged and its downloads are disabled
-    before any gigabytes are fetched. Loading a split shard reports "part N of M of a split GGUF model".
+    quantization and a RAM-fit hint. A split model is one entry ("N parts") whose download fetches every part in
+    turn, with one progress bar; vision projectors (`mmproj`) and imatrix files are hidden. The repository's
+    `general.architecture` is read from the first 64 KB of a file (HTTP range request), so a model with an
+    unsupported architecture is flagged and its downloads are disabled before any gigabytes are fetched.
+  * On the phone a split model is listed once (through part 1, with its total size), and deleting it deletes every
+    part. A lone later part (part 1 missing) stays listed so it can be deleted; loading it explains which file to
+    open.
   * A live download card stays at the top. Downloads use 4 parallel range connections with per-segment state
     persisted, so they resume after a pause, a kill or a network loss. Retries use exponential backoff, and the file
     is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
@@ -434,9 +446,15 @@ K-quants and Qwen on the same phone (CPU NEON + SDOT, 4 threads; GPU = Vulkan):
 | TinyLlama-1.1B Q4_K_M | 24.7 tok/s | 20.7 tok/s |
 | Qwen2.5-0.5B-Instruct Q4_K_M (Q4_K + Q5_0 + Q6_K + Q8_0) | 35.2 tok/s | 27.9 tok/s |
 
-On these models the GPU is slower because Q6_K and other tensors fall back to the CPU. Compared with llama.cpp on
-identical GGUF files, the logits of Qwen2.5-0.5B (Q8_0, Q4_K_M, Q5_K_M) and TinyLlama (Q4_K_M, Q8_0) have the same
-argmax at ≥ 95% of positions and a mean correlation ≥ 0.998.
+| Qwen3.5-0.8B Q4_K_M (hybrid DeltaNet) | 22.6 tok/s | — |
+| Qwen3.5-2B Q4_K_M (hybrid DeltaNet) | 11.8 tok/s | 12.3 tok/s |
+
+On these models the GPU is slower or level because Q6_K and other tensors fall back to the CPU. Compared with
+llama.cpp on identical GGUF files, the logits of Qwen2.5-0.5B (Q8_0, Q4_K_M, Q5_K_M) and TinyLlama (Q4_K_M, Q8_0)
+have the same argmax at ≥ 95% of positions and a mean correlation ≥ 0.998. Qwen3.5 (90-token multilingual prompt,
+token-identical tokenization): 0.8B Q8_0 98.9% argmax / 0.9992 correlation, 2B Q4_K_M 98.9% / 0.996, 0.8B Q4_K_M
+92.2% / 0.996 (every mismatch is llama.cpp's second choice; llama.cpp's own Q8_0 and Q4_K_M agree on 90%). Batched
+and token-by-token prefill give identical logits.
 
 Same model and prompt, Vulkan GPU vs CPU (`--backend vulkan|cpu`, 4 threads):
 
@@ -527,10 +545,12 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Quantization kernels.** Q2_K, Q3_K, the I-quants and FP4 use a generic decode + SDOT path on the CPU (correct,
   but slower than the dedicated kernels). On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
 * **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
-* **Architectures.** MoE models (e.g. Qwen3-30B-A3B), hybrid SSM/attention models (`qwen35`, e.g. Qwen3.8-27B,
-  which also uses the `qwen35` pre-tokenizer), Gemma, Phi and YaRN RoPE scaling are not supported.
-  Dense Qwen2/Qwen2.5/Qwen3 and Llama/Mistral are.
-* **Split GGUF.** Multi-part models (`-00001-of-0000N.gguf`) are not loaded; use a single-file quantization.
+* **Architectures.** MoE models (e.g. Qwen3-30B-A3B, Qwen3.5-35B-A3B), DeepSeek V4 (`deepseek4`), Gemma, Phi and
+  YaRN RoPE scaling are not supported yet.
+* **DeltaNet speed.** The recurrence runs token by token on the CPU (also during prefill) and its projections use
+  the normal matmul path; a chunked (parallel-scan) prefill and a GPU kernel are not implemented.
+* **Split GGUF** is not supported by the triple-buffer loader, and a split model opened through the system picker
+  cannot find its other parts (open it from the models folder).
 * **Dense 30–35B models on phones** are bandwidth-bound. Each generated token reads every weight once: a 32B model
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
   streamed from flash (~2.8 GB/s measured). Speculative decoding, MoE models, and smaller dense models are the

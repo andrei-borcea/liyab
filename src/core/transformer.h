@@ -1,9 +1,14 @@
 // Liyab — decoder-only transformer over memory-mapped GGUF weights (internal).
 //
-// Supports the Llama family layout (llama, mistral, qwen2, qwen3): RMSNorm,
-// GQA attention with RoPE (normal or NeoX, optional QKV bias and per-head
-// Q/K norm), SwiGLU FFN. Tensor precision is per tensor, so mixed-precision
-// files (e.g. Q8_0 attention + Q4_0 FFN) run without conversion.
+// The block structure is resolved per layer from the file, not hard-coded per
+// model: each block has a token mixer — softmax attention (GQA, RoPE normal or
+// NeoX, optional QKV bias, per-head Q/K norm, optional sigmoid output gate) or a
+// Gated DeltaNet linear-attention recurrence — followed by a SwiGLU FFN. Which
+// mixer a block uses, and which optional tensors it has, is decided by the
+// tensors present, so hybrid models (Qwen3.5: three DeltaNet blocks per
+// attention block) and plain transformers (Llama, Mistral, Qwen2/3) share one
+// forward pass. Architectures only contribute a small traits row (RoPE style).
+// Tensor precision is per tensor, so mixed-precision files run unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
 
@@ -24,9 +29,16 @@ namespace liyab {
 
 class ThreadPool;
 
+// Token mixer of one block.
+enum class MixerKind : uint8_t {
+    Attention,  // softmax attention over the KV cache
+    DeltaNet,   // Gated DeltaNet: causal conv + delta-rule recurrent state, no KV cache
+};
+
 struct ModelConfig {
     std::string arch;
-    int32_t n_layers = 0;
+    int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
+    int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention (they own the KV cache)
     int32_t n_embd = 0;
     int32_t n_ff = 0;
     int32_t n_head = 0;
@@ -39,6 +51,17 @@ struct ModelConfig {
     float rope_base = 10000.0f;
     float rope_scale = 1.0f;  // linear position scaling
     bool rope_neox = false;
+    std::vector<MixerKind> mixers;  // per block
+
+    // Gated DeltaNet geometry (zero when every block is attention).
+    int32_t ssm_conv_kernel = 0;  // causal depthwise conv width
+    int32_t ssm_head_dim = 0;     // key and value head size (ssm.state_size)
+    int32_t ssm_k_heads = 0;      // query/key heads (ssm.group_count)
+    int32_t ssm_v_heads = 0;      // value heads = recurrent states per block (ssm.time_step_rank)
+
+    // True when some block keeps a recurrent state: such models cannot roll
+    // back to an arbitrary earlier position (only to 0 or the current one).
+    [[nodiscard]] bool hybrid() const noexcept { return ssm_v_heads > 0; }
 };
 
 // Which backend runs which matmuls for one forward pass. `cpu` is the
@@ -79,19 +102,27 @@ public:
     [[nodiscard]] int32_t last_exit_layer() const noexcept { return last_exit_layer_; }
     // FFN blocks skipped by ForwardHooks::ffn_skip during the last forward().
     [[nodiscard]] int32_t last_ffn_skips() const noexcept { return last_ffn_skips_; }
-    // Attention output projection of block `layer` (used by the head pruner).
-    [[nodiscard]] const TensorView& attn_output(int32_t layer) const { return *layers_[static_cast<size_t>(layer)].wo; }
+    // Attention output projection of block `layer` (used by the head pruner);
+    // nullptr for blocks whose mixer is not attention.
+    [[nodiscard]] const TensorView* attn_output(int32_t layer) const {
+        return layers_[static_cast<size_t>(layer)].w[kO];
+    }
     // FFN projections {gate, up, down} of block `layer` (experimental sparsification).
     [[nodiscard]] std::array<const TensorView*, 3> ffn_weights(int32_t layer) const {
         const Layer& L = layers_[static_cast<size_t>(layer)];
-        return {L.w_gate, L.w_up, L.w_down};
+        return {L.w[kGate], L.w[kUp], L.w[kDown]};
     }
+    // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
+    [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
 
-    // Discards cached positions >= n (speculative-decoding rollback).
+    // Discards cached positions >= n (speculative-decoding rollback). Hybrid
+    // models only accept n == 0 or n == n_past(): a recurrent state cannot be
+    // rewound (Unsupported otherwise).
     Status truncate(int32_t n);
     // Declares positions [0, n) cached after their KV pages were attached
     // externally (KvCache::attach_external_pages). Requires an empty context.
+    // Unsupported for hybrid models (KV pages do not carry recurrent states).
     Status adopt_cached_prefix(int32_t n);
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
@@ -102,15 +133,29 @@ public:
     void set_layer_source(TripleBufferLoader* source) noexcept { layer_source_ = source; }
 
 private:
+    // Matrices of one block, by role; unused roles stay nullptr.
+    enum WeightRole : size_t {
+        kQ, kK, kV, kO,              // attention (kQ yields [q | gate] per head when gated)
+        kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
+        kGate, kUp, kDown,           // SwiGLU FFN
+        kWeightRoles
+    };
     struct Layer {
-        const TensorView* wq = nullptr;
-        const TensorView* wk = nullptr;
-        const TensorView* wv = nullptr;
-        const TensorView* wo = nullptr;
-        const TensorView* w_gate = nullptr;
-        const TensorView* w_up = nullptr;
-        const TensorView* w_down = nullptr;
+        MixerKind mixer = MixerKind::Attention;
+        int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
+        int32_t state_slot = -1;  // index into states_ (DeltaNet)
+        bool attn_gate = false;   // attention output multiplied by sigmoid(gate)
+        std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
+        std::vector<float> conv1d;   // [channel][kernel] taps
+        std::vector<float> ssm_a;    // per value head: -exp(A_log)
+        std::vector<float> ssm_dt;   // per value head: decay bias
+        std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
+    };
+    // Recurrent memory of one DeltaNet block.
+    struct RecurrentState {
+        std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
+        std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
     };
 
     // Weight views of one block, rebased into a triple-buffer slot when a
@@ -120,7 +165,12 @@ private:
     Transformer() = default;
     Status bind_weights();
     void rope(float* vec, int32_t n_heads, int32_t pos) const;
-    void attention(int32_t layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    // Mixers: read the normalized input from xb_, leave the block output (before
+    // the residual add) in xb_.
+    Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                           const uint8_t* head_mask);
+    Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
@@ -145,10 +195,13 @@ private:
     const TensorView* output_ = nullptr;
     std::vector<float> output_norm_;
     std::vector<Layer> layers_;
+    std::vector<RecurrentState> states_;
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
+    std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
+    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
 };
 

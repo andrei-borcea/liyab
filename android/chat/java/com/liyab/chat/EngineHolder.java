@@ -119,7 +119,14 @@ final class EngineHolder {
     }
 
     static String labelOf(File f) {
-        return String.format(Locale.US, "%s (%.2f GB)", f.getName(), f.length() / 1e9);
+        return String.format(Locale.US, "%s (%.2f GB)", f.getName(), sizeOf(f) / 1e9);
+    }
+
+    /** Bytes of the model whose first file is `f` (all parts of a split model). */
+    static long sizeOf(File f) {
+        long total = 0;
+        for (File part : HuggingFace.localParts(f)) total += part.length();
+        return total;
     }
 
     /** Loads `file` or the document `uri` (exactly one non-null), unloading the current model first. */

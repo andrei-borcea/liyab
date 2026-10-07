@@ -138,7 +138,8 @@ LIYAB_API std::string_view ggml_type_name(uint32_t ggml_type) noexcept;
 // Bytes needed to store `n_elements` (must be a multiple of the block size).
 LIYAB_API size_t dtype_row_bytes(DType type, int64_t n_elements) noexcept;
 
-// Non-owning view of a tensor that lives in the memory-mapped model file.
+// Non-owning view of a tensor that lives in the memory-mapped model file
+// (`shard` selects the file of a split model; offsets are within that file).
 // Shape follows GGUF order: ne[0] is the innermost (contiguous) dimension,
 // so a weight matrix has ne[0] = input features (cols), ne[1] = outputs (rows).
 struct TensorView {
@@ -149,6 +150,7 @@ struct TensorView {
     const uint8_t* data = nullptr;
     size_t nbytes = 0;
     uint64_t file_offset = 0;
+    uint32_t shard = 0;
 
     [[nodiscard]] int64_t cols() const noexcept { return ne[0]; }
     [[nodiscard]] int64_t rows() const noexcept { return ne[1] * ne[2] * ne[3]; }

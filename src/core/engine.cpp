@@ -178,6 +178,9 @@ struct Engine::Impl {
     // Builds the 3-stage weight pipeline for the target model's blocks.
     Status attach_weight_loader() {
         const MmapLoader& file = target->file();
+        if (file.shard_count() > 1) {
+            return Status(ErrorCode::Unsupported, "triple-buffer loading needs a single-file model (this one is split)");
+        }
         if (!file.streaming()) {
             // Fits in RAM: in-place mmap reads hit the page cache, while the
             // triple buffer re-fetches every block for every token.
@@ -267,6 +270,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
+        if (impl->target->config().hybrid() || draft.value()->config().hybrid()) {
+            return Status(ErrorCode::Unsupported,
+                          "speculative decoding rolls back rejected tokens, which recurrent (DeltaNet) models cannot do");
+        }
         impl->draft = std::move(draft).value();
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
     }
@@ -295,8 +302,11 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     }
     if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
     if (x.head_pruning) {
+        if (impl->target->config().hybrid()) {
+            return Status(ErrorCode::Unsupported, "head pruning needs attention in every block (not a hybrid model)");
+        }
         std::vector<const TensorView*> wo;
-        for (int32_t l = 0; l < impl->target->config().n_layers; ++l) wo.push_back(&impl->target->attn_output(l));
+        for (int32_t l = 0; l < impl->target->config().n_layers; ++l) wo.push_back(impl->target->attn_output(l));
         auto pruner = experimental::HeadPruner::create(wo, impl->target->config().n_head,
                                                         impl->target->config().head_dim, {x.head_keep_ratio});
         if (!pruner) return pruner.status();
@@ -344,7 +354,7 @@ std::string Engine::describe() const {
                   static_cast<double>(impl_->target->file().file_size()) / (1024.0 * 1024.0 * 1024.0),
                   impl_->target->file().streaming() ? "streaming" : "resident", impl_->target->context_length(),
                   window.c_str(), std::string(dtype_traits(kv.dtype()).name).c_str(), kv.config().page_tokens,
-                  static_cast<double>(KvCache::bytes_per_token(c.n_layers, c.n_head_kv, c.head_dim, kv.config().type)) /
+                  static_cast<double>(KvCache::bytes_per_token(kv.config().n_layers, c.n_head_kv, c.head_dim, kv.config().type)) /
                       1024.0,
                   impl_->weight_loader
                       ? ("triple-buffered blocks, 3 x " +
@@ -355,6 +365,13 @@ std::string Engine::describe() const {
     std::string out = describe_device(impl_->device) + buf;
     out += "Attention:  " + route.attention->description() + "\n";
     out += "FFN:        " + route.ffn->description() + "\n";
+    if (c.hybrid()) {
+        char mix[160];
+        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
+                      c.n_attn_layers, c.n_layers - c.n_attn_layers,
+                      static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
+        out += mix;
+    }
     if (impl_->draft) {
         out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
                " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
@@ -395,7 +412,9 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     // Persistent prefix cache: attach snapshotted KV pages for the longest
     // known prefix (full attention, no draft model).
-    const bool use_dedup = s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0;
+    // (Not for hybrid models: the snapshots hold KV pages, not recurrent states.)
+    const bool use_dedup =
+        s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0 && !s.target->config().hybrid();
     if (use_dedup) {
         const int32_t restored = s.kv_dedup->restore(prompt, static_cast<int32_t>(prompt.size()) - 1,
                                                      s.target->mutable_kv_cache());
