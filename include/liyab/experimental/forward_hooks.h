@@ -32,9 +32,21 @@ public:
     [[nodiscard]] virtual const uint8_t* mask(int32_t layer) const = 0;
 };
 
+// Decides whether a block's FFN can be skipped for the current token.
+class FfnSkipHook {
+public:
+    virtual ~FfnSkipHook() = default;
+    // Called for single-token decode steps after the attention residual
+    // update. `before` / `after` are the residual stream (n_embd floats)
+    // entering block `layer` and after its attention. True = skip the FFN.
+    virtual bool skip_ffn(int32_t layer, int32_t n_layers, std::span<const float> before,
+                          std::span<const float> after) = 0;
+};
+
 struct ForwardHooks {
     EarlyExitHook* early_exit = nullptr;
     const HeadMaskHook* head_mask = nullptr;
+    FfnSkipHook* ffn_skip = nullptr;
 };
 
 }  // namespace liyab

@@ -20,6 +20,7 @@
 
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
 #include "liyab/experimental/early_exit.h"
+#include "liyab/experimental/egls.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
 #endif
@@ -88,6 +89,7 @@ struct Engine::Impl {
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     std::unique_ptr<experimental::EarlyExit> early_exit;
     std::optional<experimental::HeadPruner> head_pruner;
+    std::unique_ptr<experimental::Egls> egls;
 #endif
 
     // Experimental hooks for one forward pass given the current power policy.
@@ -95,6 +97,7 @@ struct Engine::Impl {
         ForwardHooks h;
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
         if (decoding && early_exit) h.early_exit = early_exit.get();
+        if (decoding && egls) h.ffn_skip = egls.get();
         if (head_pruner && head_pruner->update(policy, power->profile())) h.head_mask = &*head_pruner;
 #else
         (void)policy;
@@ -213,7 +216,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         return Status(ErrorCode::InvalidArgument, "negative size in EngineConfig");
     }
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
-    if (config.experimental.early_exit || config.experimental.head_pruning) {
+    if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
 #endif
@@ -253,6 +256,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         impl->early_exit = std::make_unique<experimental::EarlyExit>(
             experimental::EarlyExitConfig{x.early_exit_threshold, x.early_exit_min_layer, x.early_exit_interval});
     }
+    if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
     if (x.head_pruning) {
         std::vector<const TensorView*> wo;
         for (int32_t l = 0; l < impl->target->config().n_layers; ++l) wo.push_back(&impl->target->attn_output(l));
@@ -394,6 +398,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
                 s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
             if (!logits) return logits.status();
             if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+            stats.ffn_blocks_skipped += s.target->last_ffn_skips();
             if (const int32_t exit_layer = s.target->last_exit_layer(); exit_layer >= 0) {
                 ++stats.early_exits;
                 stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - exit_layer;

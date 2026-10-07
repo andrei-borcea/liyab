@@ -76,6 +76,8 @@ public:
                                            ThreadPool& pool, const ForwardHooks* hooks = nullptr);
     // Block after which the last forward() exited early, or -1.
     [[nodiscard]] int32_t last_exit_layer() const noexcept { return last_exit_layer_; }
+    // FFN blocks skipped by ForwardHooks::ffn_skip during the last forward().
+    [[nodiscard]] int32_t last_ffn_skips() const noexcept { return last_ffn_skips_; }
     // Attention output projection of block `layer` (used by the head pruner).
     [[nodiscard]] const TensorView& attn_output(int32_t layer) const { return *layers_[static_cast<size_t>(layer)].wo; }
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
@@ -122,6 +124,7 @@ private:
     int32_t max_batch_ = 0;
     int32_t n_past_ = 0;
     int32_t last_exit_layer_ = -1;
+    int32_t last_ffn_skips_ = 0;
     std::unique_ptr<KvCache> kv_;
     TripleBufferLoader* layer_source_ = nullptr;
 
@@ -133,6 +136,7 @@ private:
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
+    std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
 };
 
 }  // namespace liyab

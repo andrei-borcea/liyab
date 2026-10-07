@@ -425,14 +425,15 @@ savings are 86% / 84%. On key vectors with a channel offset, Q4_1's relative RMS
 ## Experimental modules
 
 Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON` (or `scripts/build_android.sh --experimental`). They are enabled through
-`EngineConfig::experimental` / the C config / `liyab-cli --early-exit P --prune-heads R`. They currently apply to
-non-speculative decoding. The numbers below come from `test_experimental` on the Snapdragon 8 Elite, using a
-12-block, d=512 model with random weights.
+`EngineConfig::experimental` / the C config / `liyab-cli --early-exit P --prune-heads R --egls T`. They currently apply to
+non-speculative decoding. The numbers below come from `test_experimental` on the Snapdragon 8 Elite: synthetic
+12-block, d=512 model with random weights, or real TinyLlama when `LIYAB_BENCH_MODEL` points to a GGUF.
 
 | Module | What it does | Measured | Caveat |
 | :--- | :--- | :--- | :--- |
 | **Early exit** (`early_exit.h`) | After probed blocks, projects the hidden state through the final norm + LM head. If the top-token probability > 0.98, it skips the remaining blocks and writes their K/V from the exited state (state propagation) | forced exit at block 6: 159 → 243 tok/s (+53%) | Lossy for models not trained for early exit. Random weights never reach 0.98, so real gains depend on the model. Each probe costs one LM-head matmul |
 | **Head pruning** (`head_pruner.h`) | Ranks query heads by the Frobenius norm of their `Wo` columns. While throttled (≥ 40 °C) or in LowPower, skips the QK·softmax·V work of the least important heads | 50% heads: +12% at 1536 context, +3% at 64 | Lossy. K/V and the Q/O projections still run at full width |
+| **EGLS: entropy-guided layer skipping** (`egls.h`) | Per decode step and block, computes the change dH in normalized energy entropy of the residual stream across attention. If dH < threshold, skips the block's FFN (identity shortcut; first/last 2 blocks protected) | TinyLlama-1.1B Q4_0 on the phone: 34.3 → 36.2 tok/s skipping 12% of FFNs, 50.6 tok/s at 64% | **Not viable without a model trained for it**: even at 12% skip the greedy output diverges from the full model at token 4 (9% of tokens match). A learned low-rank substitute would need offline calibration |
 | **Direct I/O loader** (`io_uring_loader.h`) | `O_DIRECT` reads into page-aligned buffers via raw io_uring syscalls (no liburing), with fallbacks. `read_into()` is the triple buffer's DMA stage | `O_DIRECT` +23% vs mmap (table above) | Android blocks `io_uring_setup` for apps *and* for `adb shell` (`EACCES`), so phones use the `O_DIRECT` pread fallback. macOS uses `F_NOCACHE`. DMA-BUF heaps are not app-accessible, so buffers are `posix_memalign` |
 
 ---

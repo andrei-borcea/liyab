@@ -27,6 +27,8 @@ struct ExperimentalConfig {
     int32_t early_exit_interval = 4;      // probe every N blocks
     bool head_pruning = false;            // mask low-importance heads when hot / LowPower (lossy)
     float head_keep_ratio = 0.75f;        // heads kept per block while pruning
+    bool egls = false;                    // entropy-guided FFN skipping (lossy)
+    float egls_threshold = 0.002f;        // skip a block's FFN when its entropy delta is below this
 };
 
 struct EngineConfig {

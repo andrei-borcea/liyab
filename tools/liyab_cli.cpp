@@ -6,6 +6,7 @@
 //             [--draft draft.gguf] [--profile performance|balanced|low_power]
 //             [--backend auto|cpu|metal] [--kv f16|q8_0|q4_0|q4_1] [--ctx N]
 //             [--window N] [--threads N] [--seed N]
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +51,8 @@ void usage() {
                  "  --threads N        worker threads (default: performance cores)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
-                 "  --prune-heads R    keep ratio R of attention heads when hot / low power\n");
+                 "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
+                 "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n");
 }
 
 }  // namespace
@@ -93,6 +95,9 @@ int main(int argc, char** argv) {
         else if (arg == "--early-exit") {
             config.early_exit = 1;
             config.early_exit_threshold = static_cast<float>(std::atof(next()));
+        } else if (arg == "--egls") {
+            config.egls = 1;
+            config.egls_threshold = static_cast<float>(std::atof(next()));
         } else if (arg == "--prune-heads") {
             config.head_pruning = 1;
             config.head_keep_ratio = static_cast<float>(std::atof(next()));
@@ -172,6 +177,10 @@ int main(int argc, char** argv) {
         if (stats.weight_stalls > 0) {
             std::fprintf(stderr, "weight stalls: %d (%.1f ms waiting for storage)\n", stats.weight_stalls,
                          stats.weight_wait_ms);
+        }
+        if (stats.ffn_blocks_skipped > 0) {
+            std::fprintf(stderr, "EGLS: %d FFN blocks skipped (%.1f per token)\n", stats.ffn_blocks_skipped,
+                         static_cast<double>(stats.ffn_blocks_skipped) / std::max(1, stats.generated_tokens));
         }
         if (stats.head_pruned_steps > 0) std::fprintf(stderr, "head pruning: %d steps\n", stats.head_pruned_steps);
     }

@@ -85,6 +85,8 @@ typedef struct liyab_engine_config {
     float early_exit_threshold;   /* default 0.98 */
     int32_t head_pruning;         /* nonzero: prune attention heads when hot / low power (lossy) */
     float head_keep_ratio;        /* default 0.75 */
+    int32_t egls;                 /* nonzero: entropy-guided FFN skipping (lossy) */
+    float egls_threshold;         /* default 0.002 */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -113,6 +115,7 @@ typedef struct liyab_generation_stats {
     int32_t weight_stalls;
     double weight_wait_ms;
     uint64_t kv_cache_bytes;
+    int32_t ffn_blocks_skipped;
 } liyab_generation_stats;
 
 /*

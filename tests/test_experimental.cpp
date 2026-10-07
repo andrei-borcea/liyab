@@ -4,6 +4,7 @@
 //   ./test_experimental                 # tests + benchmarks (small sizes)
 //   LIYAB_BENCH=0 ./test_experimental   # tests only
 //   LIYAB_BENCH_MB=512 ./test_experimental   # larger I/O benchmark file
+//   LIYAB_BENCH_MODEL=tinyllama-q4_0.gguf ./test_experimental   # real-model benchmarks
 //
 // Benchmarks never fail the run: their numbers depend on the device, the
 // filesystem and the (random-weight) benchmark model, so read them as
@@ -19,13 +20,16 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <optional>
 #include <vector>
 
 #include "core/sampling.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
 #include "liyab/engine.h"
+#include "core/tokenizer.h"
 #include "liyab/experimental/early_exit.h"
+#include "liyab/experimental/egls.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
 #include "test_model.h"
@@ -291,6 +295,174 @@ TEST_CASE("Engine reports early exits and pruned steps") {
     CHECK(stats->early_exits > 0);
     CHECK(stats->early_exit_layers_skipped == stats->early_exits);  // 2 blocks: exits after block 0
     CHECK(stats->head_pruned_steps > 0);
+}
+
+// ---------------------------------------------------------------------------
+// EGLS
+// ---------------------------------------------------------------------------
+TEST_CASE("EGLS energy entropy is normalized and scale-free") {
+    std::vector<float> flat(64, 0.3f);
+    CHECK_NEAR(Egls::energy_entropy(flat), 1.0, 1e-5);
+    std::vector<float> spike(64, 0.0f);
+    spike[3] = 5.0f;
+    CHECK_NEAR(Egls::energy_entropy(spike), 0.0, 1e-6);
+    std::vector<float> scaled = flat;
+    for (float& v : scaled) v *= 1000.0f;
+    CHECK_NEAR(Egls::energy_entropy(scaled), Egls::energy_entropy(flat), 1e-5);
+    CHECK(Egls::energy_entropy(std::vector<float>(8, 0.0f)) == 0.0f);
+}
+
+TEST_CASE("EGLS protects edge blocks and skips below the threshold") {
+    Egls egls({0.05f, 1, 1});
+    std::vector<float> a(32, 1.0f), b(32, 1.0f);
+    b[0] = 1.2f;  // tiny entropy change
+    CHECK(!egls.skip_ffn(0, 4, a, b));  // protected first block
+    CHECK(!egls.skip_ffn(3, 4, a, b));  // protected last block
+    CHECK(egls.skip_ffn(1, 4, a, b));
+    std::vector<float> c(32, 0.0f);
+    c[0] = 10.0f;  // large entropy change
+    CHECK(!egls.skip_ffn(2, 4, a, c));
+    CHECK(egls.decisions() == 2);
+    CHECK(egls.skips() == 1);
+}
+
+TEST_CASE("EGLS hook skips FFN blocks in decode only and never when the threshold is 0") {
+    Rig rig;
+    test::TinyModelSpec spec;
+    spec.n_layers = 6;
+    const std::string path = temp_path("egls.gguf");
+    test::write_tiny_model(path, spec);
+    auto a = load(path);
+    auto b = load(path);
+    REQUIRE(a && b);
+    Egls never({0.0f, 1, 1});
+    Egls always({2.0f, 1, 1});  // dH is in [0, 1]: always below 2
+    ForwardHooks never_hooks;
+    never_hooks.ffn_skip = &never;
+    ForwardHooks always_hooks;
+    always_hooks.ffn_skip = &always;
+
+    const std::vector<int32_t> prompt = {1, 270, 300};
+    REQUIRE(a->forward(prompt, Transformer::Logits::None, rig.route, rig.pool, &always_hooks).has_value());
+    CHECK(a->last_ffn_skips() == 0);  // batched prefill is never skipped
+    REQUIRE(b->forward(prompt, Transformer::Logits::None, rig.route, rig.pool).has_value());
+
+    const int32_t tok = 290;
+    auto ra = a->forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool, &never_hooks);
+    const std::vector<float> la(ra->begin(), ra->end());
+    auto rb = b->forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool);
+    CHECK(la == std::vector<float>(rb->begin(), rb->end()));
+    CHECK(a->last_ffn_skips() == 0);
+
+    auto rc = a->forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool, &always_hooks);
+    REQUIRE(rc.has_value());
+    CHECK(a->last_ffn_skips() == 4);  // 6 blocks minus the protected first and last
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Real-model benchmark helpers (LIYAB_BENCH_MODEL=<SentencePiece GGUF>)
+// ---------------------------------------------------------------------------
+namespace {
+
+struct RealModel {
+    std::string path;
+    std::vector<int32_t> prompt;
+};
+
+std::optional<RealModel> real_model() {
+    const char* path = std::getenv("LIYAB_BENCH_MODEL");
+    if (path == nullptr || !benchmarks_enabled()) return std::nullopt;
+    auto file = MmapLoader::open(path);
+    if (!file) return std::nullopt;
+    auto tok = Tokenizer::load(*file.value());
+    if (!tok) return std::nullopt;
+    auto ids = tok->encode("<|user|>\nExplain why the sky is blue to a ten year old.</s>\n<|assistant|>\n", true);
+    if (!ids) return std::nullopt;
+    return RealModel{path, ids.value()};
+}
+
+struct GreedyRun {
+    std::vector<int32_t> tokens;
+    double tps = 0.0;
+};
+
+GreedyRun greedy_run(Transformer& model, Rig& rig, const std::vector<int32_t>& prompt, int32_t steps,
+                     const ForwardHooks* hooks) {
+    model.reset();
+    GreedyRun run;
+    if (!model.forward(std::span<const int32_t>(prompt).first(prompt.size() - 1), Transformer::Logits::None,
+                       rig.route, rig.pool)) {
+        return run;
+    }
+    int32_t tok = prompt.back();
+    const auto t0 = Clock::now();
+    for (int32_t i = 0; i < steps; ++i) {
+        auto logits = model.forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool, hooks);
+        if (!logits) break;
+        tok = Sampler::argmax(logits.value());
+        run.tokens.push_back(tok);
+    }
+    run.tps = static_cast<double>(run.tokens.size()) * 1000.0 / ms_since(t0);
+    return run;
+}
+
+// Tokens identical to the reference before the first divergence.
+size_t common_prefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+    size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == b[i]) ++i;
+    return i;
+}
+
+// Records every dH without skipping, for threshold calibration.
+struct DeltaRecorder final : FfnSkipHook {
+    std::vector<float> deltas;
+    bool skip_ffn(int32_t layer, int32_t n_layers, std::span<const float> before, std::span<const float> after) override {
+        if (layer >= 2 && layer < n_layers - 2) {
+            deltas.push_back(std::fabs(Egls::energy_entropy(after) - Egls::energy_entropy(before)));
+        }
+        return false;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("[bench] EGLS on a real model: threshold sensitivity, speed, agreement") {
+    const auto rm = real_model();
+    if (!rm) {
+        std::printf("  skipped: set LIYAB_BENCH_MODEL to a SentencePiece GGUF (e.g. TinyLlama Q4_0)\n");
+        return;
+    }
+    Rig rig;
+    auto model = load(rm->path, 1024);
+    REQUIRE(model != nullptr);
+    const int32_t steps = 64;
+    const GreedyRun base = greedy_run(*model, rig, rm->prompt, steps, nullptr);
+
+    DeltaRecorder recorder;
+    ForwardHooks rec_hooks;
+    rec_hooks.ffn_skip = &recorder;
+    greedy_run(*model, rig, rm->prompt, steps, &rec_hooks);
+    std::vector<float> sorted = recorder.deltas;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double p) { return sorted[static_cast<size_t>(p * static_cast<double>(sorted.size() - 1))]; };
+    std::printf("  dH distribution over %zu decisions: p10 %.5f  p25 %.5f  p50 %.5f  p75 %.5f  p90 %.5f\n",
+                sorted.size(), pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90));
+    std::printf("  %-22s %8s %10s %14s %12s\n", "threshold", "tok/s", "FFN skip", "same prefix", "same tokens");
+    std::printf("  %-22s %8.1f %9.0f%% %11zu/%d %11.0f%%\n", "off (baseline)", base.tps, 0.0, base.tokens.size(), steps, 100.0);
+    for (const double p : {0.10, 0.25, 0.50, 0.75}) {
+        Egls egls({pct(p), 2, 2});
+        ForwardHooks hooks;
+        hooks.ffn_skip = &egls;
+        const GreedyRun r = greedy_run(*model, rig, rm->prompt, steps, &hooks);
+        size_t same = 0;
+        for (size_t i = 0; i < std::min(r.tokens.size(), base.tokens.size()); ++i) same += r.tokens[i] == base.tokens[i];
+        char label[64];
+        std::snprintf(label, sizeof label, "p%.0f = %.5f", p * 100, pct(p));
+        std::printf("  %-22s %8.1f %9.0f%% %11zu/%d %11.0f%%\n", label, r.tps,
+                    100.0 * static_cast<double>(egls.skips()) / std::max<int64_t>(1, egls.decisions()),
+                    common_prefix(r.tokens, base.tokens), steps, 100.0 * static_cast<double>(same) / steps);
+    }
 }
 
 // ---------------------------------------------------------------------------

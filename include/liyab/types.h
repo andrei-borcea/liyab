@@ -185,6 +185,7 @@ struct GenerationStats {
     int32_t early_exits = 0;        // experimental: decode steps that exited early
     int32_t early_exit_layers_skipped = 0;
     int32_t head_pruned_steps = 0;  // experimental: decode steps with pruned heads
+    int32_t ffn_blocks_skipped = 0; // experimental (EGLS): FFN blocks bypassed during decode
     int32_t weight_stalls = 0;      // triple-buffer: block fetches the executor had to wait for
     double weight_wait_ms = 0.0;
     uint64_t kv_cache_bytes = 0;    // KV pages in use at the end of generation

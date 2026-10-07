@@ -379,6 +379,8 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     EarlyExitHook* early_exit =
         hooks != nullptr && n == 1 && logits == Logits::Last ? hooks->early_exit : nullptr;
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
+    FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;
+    last_ffn_skips_ = 0;
 
     const size_t d = static_cast<size_t>(c.n_embd);
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
@@ -403,6 +405,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         LIYAB_RETURN_IF_ERROR(w.status());
 
         // --- attention block ---
+        if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
         for (size_t t = 0; t < un; ++t) {
             rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
         }
@@ -437,18 +440,22 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wo(), att_.data(), xb_.data(), n));
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
 
-        // --- SwiGLU FFN block ---
-        for (size_t t = 0; t < un; ++t) {
-            rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+        // --- SwiGLU FFN block (skippable by an experimental hook) ---
+        if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
+            ++last_ffn_skips_;
+        } else {
+            for (size_t t = 0; t < un; ++t) {
+                rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+            }
+            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.gate(), xb_.data(), hb_.data(), n));
+            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.up(), xb_.data(), hb2_.data(), n));
+            for (size_t i = 0; i < hb_.size(); ++i) {
+                const float g = hb_[i];
+                hb_[i] = g / (1.0f + std::exp(-g)) * hb2_[i];
+            }
+            LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.down(), hb_.data(), xb_.data(), n));
+            for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.gate(), xb_.data(), hb_.data(), n));
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.up(), xb_.data(), hb2_.data(), n));
-        for (size_t i = 0; i < hb_.size(); ++i) {
-            const float g = hb_[i];
-            hb_[i] = g / (1.0f + std::exp(-g)) * hb2_[i];
-        }
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w.down(), hb_.data(), xb_.data(), n));
-        for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
 
         // --- early-exit probe (experimental) ---
         if (early_exit != nullptr && early_exit->probe_after(l, c.n_layers)) {

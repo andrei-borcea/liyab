@@ -16,6 +16,16 @@ The repository owner is the only author. Never add Claude (or any AI) as an
 author or co-author: no `Co-Authored-By: Claude ...` trailers, no
 "Generated with Claude Code" lines in commit messages or PR descriptions.
 
+## Branches and identity (mandatory)
+
+- Branch names follow `feat/<short-topic>` (e.g. `feat/vulkan-backend`); never
+  tool-generated prefixes such as `emdash/...`.
+- This is a personal repository: commit as
+  `Andrei Borcea <72470237+andrei-borcea@users.noreply.github.com>` (set in the
+  repo-local git config) and push through the personal SSH alias
+  `git@github.com-andrei:andrei-borcea/liyab.git`. Never use the work
+  (Smartpricing) email or key here.
+
 ## Language and in-code documentation (mandatory)
 
 - Code, identifiers, comments and documentation are always written in English.

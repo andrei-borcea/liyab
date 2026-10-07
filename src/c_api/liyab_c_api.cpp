@@ -71,7 +71,7 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.draft_tokens_accepted, s.thermal_reroutes,      s.paced_idle_ms,
                                         s.cancelled ? 1 : 0,     s.early_exits,           s.early_exit_layers_skipped,
                                         s.head_pruned_steps,     s.weight_stalls,         s.weight_wait_ms,
-                                        s.kv_cache_bytes};
+                                        s.kv_cache_bytes,        s.ffn_blocks_skipped};
     }
     return LIYAB_OK;
 }
@@ -111,6 +111,8 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
     config->head_keep_ratio = d.experimental.head_keep_ratio;
+    config->egls = d.experimental.egls ? 1 : 0;
+    config->egls_threshold = d.experimental.egls_threshold;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -149,6 +151,8 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.experimental.early_exit_threshold = config->early_exit_threshold;
         c.experimental.head_pruning = config->head_pruning != 0;
         c.experimental.head_keep_ratio = config->head_keep_ratio;
+        c.experimental.egls = config->egls != 0;
+        c.experimental.egls_threshold = config->egls_threshold;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());
