@@ -338,6 +338,20 @@ Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bo
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
 
+std::optional<std::string> Engine::model_metadata(std::string_view key) const {
+    const GgufValue* v = impl_->target->file().metadata(key);
+    if (v == nullptr) return std::nullopt;
+    if (const auto s = v->as_string()) return std::string(*s);
+    if (const auto b = v->as_bool()) return std::string(*b ? "true" : "false");
+    if (const auto i = v->as_int()) return std::to_string(*i);
+    if (const auto d = v->as_float()) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.9g", *d);
+        return std::string(buf);
+    }
+    return std::nullopt;
+}
+
 std::string Engine::describe() const {
     const ModelConfig& c = impl_->target->config();
     const KvCache& kv = impl_->target->kv_cache();

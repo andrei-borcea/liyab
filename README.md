@@ -263,7 +263,9 @@ liyab_engine_destroy(engine);
 ```
 
 No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with the message available from
-`liyab_last_error()` (thread-local).
+`liyab_last_error()` (thread-local). `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
+scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
+the key is absent; `Engine::model_metadata()` is the C++ equivalent.
 
 ### Android (Kotlin)
 
@@ -354,14 +356,21 @@ final class LiyabEngine {
 
 ### Demo app: Liyab Chat (Android)
 
-`android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with three screens:
+`android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with four screens:
 
 * **Home.** Shows the model status (name, backend, SoC, running download) and quick actions: open chat, Models,
-  switch CPU/GPU, unload. The debug log stays visible here, with timestamped app events plus the engine's own log
+  switch CPU/GPU, unload, model settings. The debug log stays visible here, with timestamped app events plus the engine's own log
   lines (via `liyab_set_log_callback`), and can be copied or cleared.
 * **Chat.** Replies stream token by token; Stop cancels. Leaving the screen keeps the conversation. The prompt
   format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). Earlier turns
-  are reused through the KV dedup prefix cache.
+  are reused through the KV dedup prefix cache (attention-only models). With thinking on, the reasoning streams
+  into a dimmed panel above the answer, folds away when the answer starts ("Thought for N s") and opens on tap;
+  only answers are kept in the history. The header shows the active settings.
+* **Model settings (⚙ in Chat and on Home).** Per model file: thinking on/off (models whose vocabulary has
+  `<think>`/`</think>`, e.g. Qwen3 and Qwen3.5: on opens the reasoning block, off sends the empty block their
+  templates use to skip it), temperature, top-p, top-k, max reply tokens, context length (reloads the model) and the
+  system prompt. Defaults come from the GGUF's `general.sampling.*` recommendations when present, else 0.7 / 0.9 /
+  40, 1024 reply tokens, 4096 context; "Reset" fills them in.
 * **Models (a full page, two tabs).**
   * *On this phone:* load, chat, or delete each model (the loaded one is protected). Partial downloads can be
     resumed or deleted. Any `.gguf` can be opened with the system picker (mapped through `/proc/self/fd`, so no copy

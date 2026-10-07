@@ -19,16 +19,16 @@ import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
 /**
- * Chat with the loaded model. The conversation lives in EngineHolder.history, so leaving and
- * re-opening the chat keeps it. Leaving while a reply streams stops that reply.
+ * Chat with the loaded model, using its ModelSettings (sampling, reply length, system prompt,
+ * thinking). The conversation lives in EngineHolder.history, so leaving and re-opening the chat
+ * keeps it. Leaving while a reply streams stops that reply.
+ *
+ * Reasoning (the text a thinking model writes before "</think>") streams into a separate, dimmed
+ * panel above the answer; it collapses once the answer starts and a tap toggles it. Only the answer
+ * is kept in the history, as the Qwen templates expect.
  */
 public final class ChatActivity extends Activity implements EngineHolder.Listener {
-    private static final String SYSTEM_PROMPT =
-            "You are Liyab, a helpful assistant running entirely on this phone, without internet. "
-                    + "Answer clearly and concisely.";
-    private static final int MAX_TOKENS = 384;
-    private static final float TEMPERATURE = 0.7f;
-    private static final int MAX_TURNS = 6;   // history kept in the prompt (2048-token context)
+    private static final int MAX_TURNS = 6;   // history kept in the prompt
     private static final long FRAME_MS = 33;  // streaming redraw interval (~30 fps)
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -42,7 +42,9 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         LinearLayout root = Ui.screen(this);
-        root.addView(Ui.topBar(this, "Chat", true, Ui.pill(this, "New", v -> newChat())));
+        root.addView(Ui.topBar(this, "Chat", true,
+                Ui.pill(this, "⚙", v -> startActivity(new android.content.Intent(this, SettingsActivity.class))),
+                Ui.pill(this, "New", v -> newChat())));
         status = Ui.text(this, "", 12, Ui.MUTED);
         status.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), Ui.dp(this, 6));
         root.addView(status);
@@ -114,7 +116,8 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
     @Override
     public void onEngineChanged() {
         status.setText(EngineHolder.handle != 0 ? EngineHolder.modelLabel + " · " + (EngineHolder.useGpu() ? "GPU" : "CPU")
-                + " · " + EngineHolder.template.label : EngineHolder.status);
+                + " · " + EngineHolder.template.label + "\n" + EngineHolder.settings.summary(EngineHolder.thinkingSupported)
+                : EngineHolder.status);
         send.setEnabled(EngineHolder.handle != 0 && !EngineHolder.busy);
         send.setAlpha(send.isEnabled() ? 1f : 0.4f);
     }
@@ -149,6 +152,47 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
         return bubble;
     }
 
+    // Dimmed, collapsible panel for a reply's reasoning; hidden until reasoning text arrives.
+    private TextView addReasoning() {
+        TextView r = Ui.text(this, "", 13, Ui.MUTED);
+        r.setTypeface(null, android.graphics.Typeface.ITALIC);
+        r.setPadding(Ui.dp(this, 12), Ui.dp(this, 8), Ui.dp(this, 12), Ui.dp(this, 8));
+        r.setBackground(Ui.rounded(this, Ui.CARD_HI, 12));
+        r.setVisibility(View.GONE);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.topMargin = Ui.dp(this, 8);
+        p.rightMargin = Ui.dp(this, 24);
+        messages.addView(r, p);
+        return r;
+    }
+
+    /** Splits raw model output into {reasoning, answer, finished-thinking}. */
+    static String[] splitReasoning(String raw, boolean startsInReasoning) {
+        String text = raw;
+        boolean inReasoning = startsInReasoning;
+        String trimmed = text.replaceFirst("^\\s+", "");
+        if (trimmed.startsWith("<think>")) {  // models that open the block themselves
+            text = trimmed.substring("<think>".length());
+            inReasoning = true;
+        }
+        if (!inReasoning) return new String[] {"", text, ""};
+        int end = text.indexOf("</think>");
+        if (end < 0) return new String[] {text.trim(), "", null};
+        return new String[] {text.substring(0, end).trim(), text.substring(end + "</think>".length()), ""};
+    }
+
+    private void renderReasoning(TextView view, String reasoning, double seconds, boolean expanded) {
+        if (reasoning == null) return;
+        view.setVisibility(View.VISIBLE);
+        String header = seconds < 0 ? "💭 Thinking…" : String.format(Locale.US, "💭 Thought for %.1f s", seconds);
+        if (!expanded) {
+            view.setText(header + "  ▸ tap to show");
+            return;
+        }
+        view.setText(header + (seconds < 0 ? "" : "  ▾") + "\n" + reasoning);
+    }
+
     private TextView addNote(String text) {
         TextView note = Ui.text(this, text, 11, Ui.MUTED);
         note.setPadding(Ui.dp(this, 4), Ui.dp(this, 2), Ui.dp(this, 4), 0);
@@ -176,6 +220,9 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
         if (message.isEmpty() || engine == 0) return;
         input.setText("");
         addBubble(message, true);
+        final ModelSettings settings = EngineHolder.settings;
+        final boolean thinking = EngineHolder.thinkingSupported && settings.thinking;
+        final TextView reasoning = addReasoning();
         TextView reply = addBubble("…", false);
         TextView note = addNote("");
         scrollToBottom(true);
@@ -184,24 +231,46 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
 
         final String prompt;
         synchronized (EngineHolder.history) {
-            prompt = EngineHolder.template.build(SYSTEM_PROMPT, EngineHolder.history, message);
+            ChatTemplate.Thinking mode = !EngineHolder.thinkingSupported ? ChatTemplate.Thinking.NONE
+                    : thinking ? ChatTemplate.Thinking.ON : ChatTemplate.Thinking.OFF;
+            prompt = EngineHolder.template.build(settings.systemPrompt, EngineHolder.history, message, mode);
         }
         final StringBuilder text = new StringBuilder();
+        final long started = System.nanoTime();
+        final double[] thoughtSeconds = {-1};
+        final boolean[] expanded = {true};  // reasoning panel open while it streams
+        final String[] reasoningText = {null};
+        reasoning.setOnClickListener(v -> {
+            expanded[0] = !expanded[0];
+            renderReasoning(reasoning, reasoningText[0], thoughtSeconds[0], expanded[0]);
+        });
         // Tokens arrive faster than the screen refreshes: redraw at most every FRAME_MS.
         final boolean[] pending = {false};
         final Runnable render = () -> {
             boolean follow = atBottom();
+            String[] parts;
             synchronized (text) {
                 pending[0] = false;
-                reply.setText(text.toString().replaceFirst("^\\s+", ""));
+                parts = splitReasoning(text.toString(), thinking);
             }
+            if (!parts[0].isEmpty()) {
+                if (parts[2] != null && thoughtSeconds[0] < 0) {  // reasoning just ended: fold it away
+                    thoughtSeconds[0] = (System.nanoTime() - started) / 1e9;
+                    expanded[0] = false;
+                }
+                reasoningText[0] = parts[0];
+                renderReasoning(reasoning, parts[0], thoughtSeconds[0], expanded[0]);
+            }
+            String answer = parts[1].replaceFirst("^\\s+", "");
+            reply.setText(answer.isEmpty() ? (parts[2] == null ? "💭 thinking…" : "…") : answer);
             if (follow) scrollToBottom(true);
         };
         EngineHolder.worker.execute(() -> {
             String error = null;
             double[] stats = null;
             try {
-                stats = LiyabNative.generate(engine, prompt, MAX_TOKENS, TEMPERATURE, bytes -> {
+                stats = LiyabNative.generate(engine, prompt, settings.maxTokens, settings.temperature, settings.topP,
+                        settings.topK, bytes -> {
                     String piece = new String(bytes, StandardCharsets.UTF_8);
                     synchronized (text) {
                         text.append(piece);
@@ -220,7 +289,7 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
             final String err = error;
             final String answer;
             synchronized (text) {
-                answer = text.toString().trim();
+                answer = splitReasoning(text.toString(), thinking)[1].trim();
             }
             if (s != null) {
                 synchronized (EngineHolder.history) {
@@ -240,7 +309,10 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
                     reply.setText("Error: " + err);
                     return;
                 }
-                if (answer.isEmpty()) reply.setText("(no answer)");
+                if (answer.isEmpty()) {
+                    reply.setText(thinking ? "(no answer yet: the reasoning used the whole reply budget; raise "
+                            + "\"Max reply tokens\" in ⚙ settings)" : "(no answer)");
+                }
                 if (s != null) {
                     note.setText(String.format(Locale.US,
                             "%d tokens · %.1f tok/s · first token %.2fs · prompt %d tok (%d reused)%s%s",

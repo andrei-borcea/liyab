@@ -77,7 +77,8 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_takeLogs(JNIEnv* env, 
 }
 
 JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jclass, jstring model_path,
-                                                               jstring cache_dir, jint threads, jint backend) {
+                                                               jstring cache_dir, jint threads, jint backend,
+                                                               jint context_length) {
     const std::string model = to_string(env, model_path);
     const std::string cache = to_string(env, cache_dir);
     liyab_engine_config config;
@@ -87,7 +88,7 @@ JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jcla
     config.backend = static_cast<liyab_backend>(backend);  // LIYAB_BACKEND_CPU or LIYAB_BACKEND_VULKAN
     config.power_profile = LIYAB_POWER_PERFORMANCE;  // a chat UI wants full speed; thermal guard still applies
     config.skin_threshold_c = 45.0f;
-    config.context_length = 2048;
+    config.context_length = context_length;  // 0: the engine's default
     config.kv_dedup_dir = cache.empty() ? nullptr : cache.c_str();  // multi-turn: reuse earlier turns' KV
 
     liyab_engine* engine = nullptr;
@@ -102,7 +103,7 @@ JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jcla
 //          cached_prefix_tokens, decode_ms, thermal_reroutes, cancelled}.
 JNIEXPORT jdoubleArray JNICALL Java_com_liyab_chat_LiyabNative_generate(JNIEnv* env, jclass, jlong h, jstring prompt,
                                                                        jint max_tokens, jfloat temperature,
-                                                                       jobject callback) {
+                                                                       jfloat top_p, jint top_k, jobject callback) {
     if (h == 0 || callback == nullptr) {
         throw_runtime(env, "engine not created");
         return nullptr;
@@ -115,8 +116,8 @@ JNIEXPORT jdoubleArray JNICALL Java_com_liyab_chat_LiyabNative_generate(JNIEnv* 
     liyab_sampling_params_default(&params);
     params.max_tokens = max_tokens;
     params.temperature = temperature;
-    params.top_k = 40;
-    params.top_p = 0.95f;
+    params.top_k = top_k;
+    params.top_p = top_p;
 
     const std::string text = to_string(env, prompt);
     liyab_generation_stats stats{};
@@ -151,6 +152,16 @@ JNIEXPORT jint JNICALL Java_com_liyab_chat_LiyabNative_countTokens(JNIEnv* env, 
     if (h == 0) return -1;
     const std::string s = to_string(env, text);
     return liyab_engine_tokenize(handle(h), s.c_str(), 0, nullptr, 0);
+}
+
+JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_metadata(JNIEnv* env, jclass, jlong h, jstring key) {
+    if (h == 0) return nullptr;
+    const std::string k = to_string(env, key);
+    const int64_t n = liyab_engine_metadata(handle(h), k.c_str(), nullptr, 0);
+    if (n < 0) return nullptr;
+    std::string value(static_cast<size_t>(n) + 1, '\0');
+    liyab_engine_metadata(handle(h), k.c_str(), value.data(), value.size());
+    return env->NewStringUTF(value.c_str());
 }
 
 JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_describe(JNIEnv* env, jclass, jlong h) {

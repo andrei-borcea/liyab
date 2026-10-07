@@ -23,14 +23,18 @@ final class LiyabNative {
     static final int BACKEND_CPU = 0;     // LIYAB_BACKEND_CPU
     static final int BACKEND_VULKAN = 2;  // LIYAB_BACKEND_VULKAN
 
-    /** Loads the model on `backend`; throws RuntimeException with Liyab's error message on failure. */
-    static native long create(String modelPath, String cacheDir, int threads, int backend);
+    /**
+     * Loads the model on `backend` with a `contextLength`-token context (0: engine default); throws
+     * RuntimeException with Liyab's error message on failure.
+     */
+    static native long create(String modelPath, String cacheDir, int threads, int backend, int contextLength);
 
     /**
      * Blocking generation on the calling thread. Returns {prompt_tokens, generated_tokens,
      * tokens_per_second, ttft_ms, cached_prefix_tokens, decode_ms, thermal_reroutes, cancelled}.
      */
-    static native double[] generate(long engine, String prompt, int maxTokens, float temperature, PieceCallback cb);
+    static native double[] generate(long engine, String prompt, int maxTokens, float temperature, float topP, int topK,
+                                    PieceCallback cb);
 
     /** Thread-safe: stops an in-flight generate() at the next token. */
     static native void cancel(long engine);
@@ -38,6 +42,9 @@ final class LiyabNative {
     static native void destroy(long engine);
 
     static native String describe(long engine);
+
+    /** A scalar GGUF metadata value of the loaded model as text (e.g. "general.sampling.temp"), or null. */
+    static native String metadata(long engine, String key);
 
     /** Number of tokens `text` encodes to (no BOS), or -1 on error. */
     static native int countTokens(long engine, String text);

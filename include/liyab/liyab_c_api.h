@@ -178,7 +178,14 @@ LIYAB_C_API liyab_status liyab_engine_set_power_profile(liyab_engine* engine, li
  * (truncated to `size`). Returns the length the full text needs, excluding NUL.
  */
 LIYAB_C_API size_t liyab_engine_describe(const liyab_engine* engine, char* buffer, size_t size);
-/* Same for the device only; no engine required. */
+/*
+ * Copies the loaded model's GGUF metadata value `key` as NUL-terminated text
+ * (strings as-is, numbers in decimal, booleans "true"/"false") into `buffer`
+ * (truncated to `size`). Returns the length the full text needs, excluding
+ * NUL, or -1 when the key is absent or holds an array.
+ */
+LIYAB_C_API int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size);
+/* Same as liyab_engine_describe for the device only; no engine required. */
 LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
 
 #ifdef __cplusplus

@@ -90,6 +90,10 @@ public:
     [[nodiscard]] PowerManager& power() noexcept;
     // Model, backends and memory summary for logs / UIs.
     [[nodiscard]] std::string describe() const;
+    // A scalar GGUF metadata value of the loaded model as text (strings as-is,
+    // numbers in decimal, booleans as "true"/"false"), e.g. the publisher's
+    // recommended "general.sampling.temp". nullopt when absent or an array.
+    [[nodiscard]] std::optional<std::string> model_metadata(std::string_view key) const;
 
 private:
     struct Impl;

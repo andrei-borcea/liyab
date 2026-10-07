@@ -244,6 +244,17 @@ size_t liyab_engine_describe(const liyab_engine* engine, char* buffer, size_t si
     }
 }
 
+int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size) {
+    if (engine == nullptr || key == nullptr) return -1;
+    try {
+        const auto value = engine->engine->model_metadata(key);
+        if (!value) return -1;
+        return static_cast<int64_t>(copy_out(*value, buffer, size));
+    } catch (...) {
+        return -1;
+    }
+}
+
 size_t liyab_describe_device(char* buffer, size_t size) {
     try {
         return copy_out(liyab::describe_device(liyab::detect_device()), buffer, size);

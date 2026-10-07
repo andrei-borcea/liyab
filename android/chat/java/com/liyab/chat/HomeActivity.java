@@ -24,7 +24,7 @@ import java.util.Locale;
  * Scriptable entry points (tests / automation / deep links):
  *   adb shell am start -n com.liyab.chat/.HomeActivity --es download "owner/repo|file.gguf"
  *   adb shell am start -n com.liyab.chat/.HomeActivity --es load model.gguf     (file in the models folder)
- *   adb shell am start -n com.liyab.chat/.HomeActivity --es open models|hf|chat
+ *   adb shell am start -n com.liyab.chat/.HomeActivity --es open models|hf|chat|settings
  */
 public final class HomeActivity extends Activity
         implements EngineHolder.Listener, Downloads.Listener, DebugLog.Listener {
@@ -36,6 +36,7 @@ public final class HomeActivity extends Activity
     private Button chatButton;
     private Button backendButton;
     private Button unloadButton;
+    private Button settingsButton;
     private TextView log;
     private ScrollView logScroll;
     private final Runnable tick = new Runnable() {
@@ -76,6 +77,7 @@ public final class HomeActivity extends Activity
         if ("models".equals(open)) startActivity(new Intent(this, ModelsActivity.class));
         else if ("hf".equals(open)) startActivity(new Intent(this, ModelsActivity.class).putExtra("hf", true));
         else if ("chat".equals(open)) startActivity(new Intent(this, ChatActivity.class));
+        else if ("settings".equals(open)) startActivity(new Intent(this, SettingsActivity.class));
     }
 
     @Override
@@ -124,6 +126,8 @@ public final class HomeActivity extends Activity
         backendButton = Ui.pill(this, "", v -> EngineHolder.setGpu(!EngineHolder.useGpu()));
         unloadButton = Ui.pill(this, "⏏  Unload", v -> EngineHolder.unload());
         actions.addView(Ui.buttonRow(this, backendButton, unloadButton));
+        settingsButton = Ui.pill(this, "⚙  Model settings", v -> startActivity(new Intent(this, SettingsActivity.class)));
+        actions.addView(Ui.buttonRow(this, settingsButton));
         root.addView(actions);
 
         LinearLayout debug = Ui.card(this);
@@ -172,6 +176,8 @@ public final class HomeActivity extends Activity
         chatButton.setAlpha(chatButton.isEnabled() ? 1f : 0.4f);
         unloadButton.setEnabled(loaded && !EngineHolder.busy);
         unloadButton.setAlpha(unloadButton.isEnabled() ? 1f : 0.4f);
+        settingsButton.setEnabled(loaded && !EngineHolder.busy);
+        settingsButton.setAlpha(settingsButton.isEnabled() ? 1f : 0.4f);
         backendButton.setText(EngineHolder.useGpu() ? "⚡  Backend: GPU" : "🧠  Backend: CPU");
         backendButton.setEnabled(!EngineHolder.busy);
         refreshDownload();

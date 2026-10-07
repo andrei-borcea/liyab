@@ -37,6 +37,9 @@ final class EngineHolder {
     static Uri modelUri;
     static String description = "";
     static volatile ChatTemplate template = ChatTemplate.ZEPHYR;
+    static volatile boolean thinkingSupported;  // the vocabulary has <think> / </think> tokens
+    static volatile ModelSettings settings = ModelSettings.defaults(0);
+    static String modelKey = "";  // settings key: the model's file name
     static final List<String[]> history = new ArrayList<>();  // chat turns {user, assistant}
 
     private static final List<Listener> listeners = new CopyOnWriteArrayList<>();
@@ -133,6 +136,8 @@ final class EngineHolder {
     static void load(File file, Uri uri) {
         final boolean gpu = useGpu();
         final String label = file != null ? labelOf(file) : String.valueOf(uri.getLastPathSegment());
+        final String key = file != null ? file.getName() : String.valueOf(uri.getLastPathSegment());
+        final int context = ModelSettings.contextFor(key);
         busy = true;
         status = "Loading " + label + "…";
         changed();
@@ -156,10 +161,10 @@ final class EngineHolder {
                 DebugLog.add("Creating engine on " + (gpu ? "GPU (Vulkan)" : "CPU") + "…");
                 long t0 = System.nanoTime();
                 long h = LiyabNative.create(path, cache.getAbsolutePath(), THREADS,
-                        gpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU);
+                        gpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU, context);
                 if (gpu) {
                     DebugLog.add("Uploading weights to GPU memory (one-time warm-up)…");
-                    LiyabNative.generate(h, "Hi", 1, 0f, bytes -> true);
+                    LiyabNative.generate(h, "Hi", 1, 0f, 1f, 0, bytes -> true);
                 }
                 double seconds = (System.nanoTime() - t0) / 1e9;
                 DebugLog.drainNative();
@@ -167,7 +172,12 @@ final class EngineHolder {
                 for (String line : description.split("\n")) DebugLog.add("  " + line);
                 DebugLog.add(String.format(Locale.US, "Ready in %.2f s", seconds));
                 template = ChatTemplate.detect(h);
-                DebugLog.add("Chat template: " + template.label);
+                thinkingSupported = template == ChatTemplate.CHATML && LiyabNative.countTokens(h, "<think>") == 1
+                        && LiyabNative.countTokens(h, "</think>") == 1;
+                settings = ModelSettings.load(key, h);
+                modelKey = key;
+                DebugLog.add("Chat template: " + template.label + (thinkingSupported ? " (with thinking mode)" : ""));
+                DebugLog.add("Settings: " + settings.summary(thinkingSupported) + ", context " + context);
                 handle = h;
                 modelLabel = label;
                 modelFile = file;
