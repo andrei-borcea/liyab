@@ -88,6 +88,7 @@ typedef struct liyab_engine_config {
     int32_t egls;                 /* nonzero: entropy-guided FFN skipping (lossy) */
     float egls_threshold;         /* default 0.002 */
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
+    const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -118,6 +119,8 @@ typedef struct liyab_generation_stats {
     uint64_t kv_cache_bytes;
     int32_t ffn_blocks_skipped;
     int32_t sparse_ffn_steps;
+    double ttft_ms;
+    int32_t cached_prefix_tokens;
 } liyab_generation_stats;
 
 /*

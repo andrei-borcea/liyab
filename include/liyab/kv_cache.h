@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "liyab/types.h"
@@ -78,6 +79,16 @@ public:
     void release_unreachable(int32_t n_past, int32_t keep_back);
     void clear() noexcept;
 
+    // --- Prefix sharing (used by the experimental KV dedup) ---------------
+    // Bytes of logical page `logical` (all layers, K then V), or nullptr.
+    [[nodiscard]] const uint8_t* page_data(int32_t logical) const noexcept;
+    // Maps logical pages 0..n-1 to caller-owned read-only memory (e.g. an
+    // mmap'd snapshot), without copying. The cache must be empty and use full
+    // attention; the memory must outlive the mapping (until clear()). New
+    // positions are written to owned pages only, so the prefix length must be
+    // pages.size() * page_tokens.
+    Status attach_external_pages(std::span<const uint8_t* const> pages);
+
     [[nodiscard]] int32_t pages_in_use() const noexcept;
     [[nodiscard]] int32_t pages_allocated() const noexcept { return static_cast<int32_t>(pool_.size()); }
     [[nodiscard]] size_t page_bytes() const noexcept { return page_bytes_; }
@@ -89,6 +100,12 @@ private:
     [[nodiscard]] uint8_t* row(int32_t layer, int32_t pos, int32_t kv_head, bool value) const noexcept;
     void free_page(size_t logical) noexcept;
     [[nodiscard]] int32_t sink_page_count() const noexcept;
+    [[nodiscard]] uint8_t* page_ptr(size_t logical) const noexcept;
+
+    // table_ entries: >= 0 owned pool page, kUnmapped, or <= kExternalBase
+    // for external page (kExternalBase - entry).
+    static constexpr int32_t kUnmapped = -1;
+    static constexpr int32_t kExternalBase = -2;
 
     KvCacheConfig config_;
     DType dtype_ = DType::Q8_0;
@@ -96,7 +113,8 @@ private:
     size_t page_bytes_ = 0;
     std::vector<std::unique_ptr<uint8_t[]>> pool_;  // physical pages (never shrinks; reused)
     std::vector<int32_t> free_;                     // free physical page ids
-    std::vector<int32_t> table_;                    // logical page -> physical id, -1 = unmapped
+    std::vector<int32_t> table_;                    // logical page -> physical id (see kUnmapped)
+    std::vector<const uint8_t*> external_;          // attached read-only pages
     int32_t released_below_ = 0;                    // logical pages < this (beyond sinks) were released
 };
 

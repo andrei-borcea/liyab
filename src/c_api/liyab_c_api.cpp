@@ -71,7 +71,8 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.draft_tokens_accepted, s.thermal_reroutes,      s.paced_idle_ms,
                                         s.cancelled ? 1 : 0,     s.early_exits,           s.early_exit_layers_skipped,
                                         s.head_pruned_steps,     s.weight_stalls,         s.weight_wait_ms,
-                                        s.kv_cache_bytes,        s.ffn_blocks_skipped,    s.sparse_ffn_steps};
+                                        s.kv_cache_bytes,        s.ffn_blocks_skipped,    s.sparse_ffn_steps,
+                                        s.ttft_ms,               s.cached_prefix_tokens};
     }
     return LIYAB_OK;
 }
@@ -156,6 +157,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.experimental.egls_threshold = config->egls_threshold;
         c.experimental.tdss = config->tdss != 0;
         c.experimental.tdss_force = config->tdss == 2;
+        if (config->kv_dedup_dir != nullptr) c.experimental.kv_dedup_dir = config->kv_dedup_dir;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

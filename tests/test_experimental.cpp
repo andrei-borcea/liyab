@@ -10,6 +10,7 @@
 // filesystem and the (random-weight) benchmark model, so read them as
 // relative costs, not as quality claims.
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <optional>
@@ -32,6 +34,7 @@
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/jit_unpacker.h"
 #include "liyab/experimental/tdss.h"
+#include "liyab/experimental/kv_dedup.h"
 #include "core/quant.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
@@ -532,6 +535,102 @@ TEST_CASE("TDSS follows the power policy and changes FFN outputs only while acti
 }
 
 // ---------------------------------------------------------------------------
+// KV dedup
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string fresh_dir(const std::string& name) {
+    const std::string dir = temp_path(name);
+    std::system(("rm -rf '" + dir + "'").c_str());
+    mkdir(dir.c_str(), 0755);
+    return dir;
+}
+
+}  // namespace
+
+TEST_CASE("xxhash64 matches the reference test vectors") {
+    CHECK(xxhash64("", 0) == 0xEF46DB3751D8E999ULL);
+    CHECK(xxhash64("abc", 3) == 0x44BC2CF5AD770999ULL);
+    const std::string long_input(100, 'x');  // exercises the 32-byte stripe loop
+    CHECK(xxhash64(long_input.data(), long_input.size()) != xxhash64(long_input.data(), long_input.size(), 1));
+    CHECK(xxhash64(long_input.data(), long_input.size()) == xxhash64(long_input.data(), long_input.size()));
+}
+
+TEST_CASE("KV dedup: restored prefix gives bit-identical logits to a full prefill") {
+    Rig rig;
+    const std::string dir = fresh_dir("dedup");
+    auto a = load(tiny_model());
+    auto b = load(tiny_model());
+    REQUIRE(a && b);
+    auto dedup = KvDedup::create(dir, model_fingerprint(a->file().file()));
+    REQUIRE(dedup.has_value());
+
+    std::vector<int32_t> prompt;
+    std::mt19937 rng(77);
+    for (int i = 0; i < 150; ++i) prompt.push_back(3 + static_cast<int32_t>(rng() % 300));
+    const auto head = std::span<const int32_t>(prompt).first(149);
+    const int32_t last = prompt.back();
+
+    // Session 1: full prefill, then snapshot (2 full pages of 64).
+    REQUIRE(a->forward(head, Transformer::Logits::None, rig.route, rig.pool).has_value());
+    auto saved = dedup.value()->save(prompt, 149, a->kv_cache());
+    REQUIRE(saved.has_value());
+    CHECK(saved.value() == 128);
+    CHECK(dedup.value()->save(prompt, 149, a->kv_cache()).value() == 0);  // already stored
+    auto la = a->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, rig.route, rig.pool);
+    const std::vector<float> expected(la->begin(), la->end());
+
+    // Session 2: restore 128 positions from the mmap'd snapshot, prefill 21.
+    const int32_t restored = dedup.value()->restore(prompt, 149, b->mutable_kv_cache());
+    CHECK(restored == 128);
+    REQUIRE(b->adopt_cached_prefix(restored).is_ok());
+    CHECK(b->kv_cache().pages_allocated() == 0);  // zero-copy: no owned pages for the prefix
+    REQUIRE(b->forward(head.subspan(128), Transformer::Logits::None, rig.route, rig.pool).has_value());
+    auto lb = b->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, rig.route, rig.pool);
+    CHECK(std::vector<float>(lb->begin(), lb->end()) == expected);
+
+    // A different prefix (one token changed) must not match.
+    std::vector<int32_t> other = prompt;
+    other[5] ^= 1;
+    b->reset();
+    CHECK(dedup.value()->restore(other, 149, b->mutable_kv_cache()) == 0);
+    // A different KV format must not match either.
+    TransformerOptions q4;
+    q4.kv_type = KvCacheType::Q4_0;
+    auto file = MmapLoader::open(tiny_model());
+    auto c = Transformer::load(std::move(file).value(), q4);
+    REQUIRE(c.has_value());
+    CHECK(dedup.value()->restore(prompt, 149, c.value()->mutable_kv_cache()) == 0);
+    std::system(("rm -rf '" + dir + "'").c_str());
+}
+
+TEST_CASE("Engine with KV dedup reuses the prompt prefix across sessions") {
+    const std::string dir = fresh_dir("dedup_engine");
+    EngineConfig config;
+    config.model_path = tiny_model();
+    config.backend = BackendKind::Cpu;
+    config.thermal_polling = false;
+    config.power.profile = PowerProfile::Performance;
+    config.experimental.kv_dedup_dir = dir;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    std::vector<int32_t> prompt = {1};
+    for (int i = 0; i < 140; ++i) prompt.push_back(3 + (i * 37) % 300);
+    SamplingParams p;
+    p.temperature = 0.0f;
+    p.max_tokens = 16;
+    std::vector<int32_t> first, second;
+    auto s1 = engine.value()->generate_tokens(prompt, p, [&](std::string_view, int32_t t) { first.push_back(t); return true; });
+    auto s2 = engine.value()->generate_tokens(prompt, p, [&](std::string_view, int32_t t) { second.push_back(t); return true; });
+    REQUIRE(s1.has_value() && s2.has_value());
+    CHECK(s1->cached_prefix_tokens == 0);
+    CHECK(s2->cached_prefix_tokens == 128);
+    CHECK(first == second);
+    CHECK(s2->ttft_ms > 0.0);
+    std::system(("rm -rf '" + dir + "'").c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Real-model benchmark helpers (LIYAB_BENCH_MODEL=<SentencePiece GGUF>)
 // ---------------------------------------------------------------------------
 namespace {
@@ -698,6 +797,50 @@ TEST_CASE("[bench] TDSS on a real model: speed, memory and agreement") {
     std::printf("  decode: dense %.1f tok/s, 2:4 sparse FFN %.1f tok/s (%+.0f%%); same prefix %zu/%d, same tokens %.0f%%\n",
                 base.tps, sparse.tps, 100.0 * (sparse.tps / base.tps - 1.0), common_prefix(base.tokens, sparse.tokens),
                 steps, 100.0 * static_cast<double>(same) / steps);
+}
+
+TEST_CASE("[bench] KV dedup on a real model: time to first token across sessions") {
+    const auto rm = real_model();
+    if (!rm) {
+        std::printf("  skipped: set LIYAB_BENCH_MODEL\n");
+        return;
+    }
+    const std::string dir = fresh_dir("dedup_bench");
+    auto file = MmapLoader::open(rm->path);
+    auto tok = Tokenizer::load(*file.value());
+    REQUIRE(tok.has_value());
+    std::string system_prompt = "<|system|>\nYou are Liyab, a careful on-device assistant. ";
+    for (int i = 0; i < 12; ++i) {
+        system_prompt += "Rule " + std::to_string(i + 1) +
+                         ": answer precisely, cite the relevant facts, keep answers short, never invent data, "
+                         "and ask for clarification when a request is ambiguous. ";
+    }
+    system_prompt += "</s>\n";
+    EngineConfig config;
+    config.model_path = rm->path;
+    config.backend = BackendKind::Cpu;
+    config.thermal_polling = false;
+    config.power.profile = PowerProfile::Performance;
+    config.experimental.kv_dedup_dir = dir;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    SamplingParams p;
+    p.temperature = 0.0f;
+    p.max_tokens = 8;
+    const char* questions[] = {"What is the capital of France?", "Name three primary colors.",
+                               "How many legs does a spider have?"};
+    std::printf("  %-38s %8s %10s %12s\n", "session", "prompt", "restored", "TTFT ms");
+    for (int i = 0; i < 3; ++i) {
+        const std::string prompt = system_prompt + "<|user|>\n" + questions[i] + "</s>\n<|assistant|>\n";
+        auto stats = engine.value()->generate(prompt, p, {});
+        REQUIRE(stats.has_value());
+        std::printf("  %-38s %8d %10d %12.1f\n", questions[i], stats->prompt_tokens, stats->cached_prefix_tokens,
+                    stats->ttft_ms);
+    }
+    size_t snapshot_bytes = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) snapshot_bytes += std::filesystem::file_size(e);
+    std::printf("  snapshot directory: %.2f MiB\n", static_cast<double>(snapshot_bytes) / (1 << 20));
+    std::system(("rm -rf '" + dir + "'").c_str());
 }
 
 TEST_CASE("[bench] early exit and head pruning: decode throughput") {

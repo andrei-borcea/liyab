@@ -489,6 +489,17 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     return std::span<const float>(logits_.data(), logits_.size());
 }
 
+Status Transformer::adopt_cached_prefix(int32_t n) {
+    if (n_past_ != 0 || n < 0 || n > context_length_) {
+        return Status(ErrorCode::InvalidArgument, "a cached prefix can only be adopted by an empty context");
+    }
+    for (int32_t p = 0; p * kv_->config().page_tokens < n; ++p) {
+        if (kv_->page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "cached prefix pages are not mapped");
+    }
+    n_past_ = n;
+    return Status::ok();
+}
+
 Status Transformer::truncate(int32_t n) {
     if (n < 0 || n > n_past_) return Status(ErrorCode::InvalidArgument, "truncate beyond cached positions");
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n));

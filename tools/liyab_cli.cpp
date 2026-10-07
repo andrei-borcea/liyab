@@ -53,7 +53,8 @@ void usage() {
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
                  "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
                  "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
-                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n");
+                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n"
+                 "  --kv-dedup DIR     persistent prefix KV cache (reuse system-prompt KV across runs)\n");
 }
 
 }  // namespace
@@ -99,6 +100,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--egls") {
             config.egls = 1;
             config.egls_threshold = static_cast<float>(std::atof(next()));
+        } else if (arg == "--kv-dedup") {
+            config.kv_dedup_dir = next();
         } else if (arg == "--tdss") {
             const std::string v = next();
             config.tdss = v == "always" ? 2 : 1;
@@ -164,8 +167,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: %s\n", liyab_last_error());
     } else {
         std::fprintf(stderr,
-                     "\nprompt %d tok in %.1f ms | %d tok in %.1f ms = %.2f tok/s | paced idle %.1f ms%s\n",
-                     stats.prompt_tokens, stats.prefill_ms, stats.generated_tokens, stats.decode_ms,
+                     "\nprompt %d tok in %.1f ms (TTFT %.1f ms) | %d tok in %.1f ms = %.2f tok/s | paced idle %.1f ms%s\n",
+                     stats.prompt_tokens, stats.prefill_ms, stats.ttft_ms, stats.generated_tokens, stats.decode_ms,
                      stats.tokens_per_second, stats.paced_idle_ms, stats.cancelled ? " | cancelled" : "");
         if (stats.draft_tokens_proposed > 0) {
             std::fprintf(stderr, "speculative: %d/%d draft tokens accepted (%.0f%%)\n", stats.draft_tokens_accepted,
@@ -185,6 +188,9 @@ int main(int argc, char** argv) {
         if (stats.ffn_blocks_skipped > 0) {
             std::fprintf(stderr, "EGLS: %d FFN blocks skipped (%.1f per token)\n", stats.ffn_blocks_skipped,
                          static_cast<double>(stats.ffn_blocks_skipped) / std::max(1, stats.generated_tokens));
+        }
+        if (stats.cached_prefix_tokens > 0) {
+            std::fprintf(stderr, "KV dedup: %d prompt tokens restored from snapshot\n", stats.cached_prefix_tokens);
         }
         if (stats.sparse_ffn_steps > 0) std::fprintf(stderr, "TDSS: %d steps on 2:4 sparse FFN\n", stats.sparse_ffn_steps);
         if (stats.head_pruned_steps > 0) std::fprintf(stderr, "head pruning: %d steps\n", stats.head_pruned_steps);

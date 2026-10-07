@@ -90,6 +90,10 @@ public:
 
     // Discards cached positions >= n (speculative-decoding rollback).
     Status truncate(int32_t n);
+    // Declares positions [0, n) cached after their KV pages were attached
+    // externally (KvCache::attach_external_pages). Requires an empty context.
+    Status adopt_cached_prefix(int32_t n);
+    [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
     // Streams transformer blocks through `source` (item i = block i, laid out

@@ -22,6 +22,7 @@
 #include "liyab/experimental/early_exit.h"
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/tdss.h"
+#include "liyab/experimental/kv_dedup.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
 #endif
@@ -92,6 +93,7 @@ struct Engine::Impl {
     std::optional<experimental::HeadPruner> head_pruner;
     std::unique_ptr<experimental::Egls> egls;
     std::unique_ptr<experimental::Tdss> tdss;
+    std::unique_ptr<experimental::KvDedup> kv_dedup;
 #endif
 
     // Experimental hooks for one forward pass given the current power policy.
@@ -220,7 +222,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     }
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
-        config.experimental.tdss) {
+        config.experimental.tdss || !config.experimental.kv_dedup_dir.empty()) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
 #endif
@@ -269,6 +271,12 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         LIYAB_LOG_INFO("TDSS: 2:4 sparse FFN copy %.1f MiB (dense %.1f MiB)",
                        static_cast<double>(impl->tdss->sparse_bytes()) / (1024.0 * 1024.0),
                        static_cast<double>(impl->tdss->dense_bytes()) / (1024.0 * 1024.0));
+    }
+    if (!x.kv_dedup_dir.empty()) {
+        auto dedup = experimental::KvDedup::create(
+            x.kv_dedup_dir, experimental::model_fingerprint(impl->target->file().file()));
+        if (!dedup) return dedup.status();
+        impl->kv_dedup = std::move(dedup).value();
     }
     if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
     if (x.head_pruning) {
@@ -363,12 +371,28 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     // Prefill everything but the last prompt token, which seeds the decode
     // loop (the speculative decoder expects it uncached).
     const auto t_prefill = Clock::now();
+    size_t first_uncached = 0;
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    // Persistent prefix cache: attach snapshotted KV pages for the longest
+    // known prefix (full attention, no draft model).
+    const bool use_dedup = s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0;
+    if (use_dedup) {
+        const int32_t restored = s.kv_dedup->restore(prompt, static_cast<int32_t>(prompt.size()) - 1,
+                                                     s.target->mutable_kv_cache());
+        if (restored > 0 && s.target->adopt_cached_prefix(restored).is_ok()) {
+            first_uncached = static_cast<size_t>(restored);
+            stats.cached_prefix_tokens = restored;
+        } else {
+            s.target->reset();
+        }
+    }
+#endif
     const PowerPolicy prefill_policy = s.power->policy();
     s.apply_policy(prefill_policy);
     const Route prefill_route = prefill_policy.throttled ? s.throttled_route() : s.normal_route();
     const ForwardHooks prefill_hooks = s.hooks(prefill_policy, false);
     const auto chunk = static_cast<size_t>(s.target->max_batch());
-    const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1);
+    const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1).subspan(first_uncached);
     for (size_t i = 0; i < prefix.size(); i += chunk) {
         if (s.cancel.load(std::memory_order_relaxed)) {
             stats.cancelled = true;
@@ -383,6 +407,12 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         }
     }
     stats.prefill_ms = ms_since(t_prefill);
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    if (use_dedup) {
+        auto saved = s.kv_dedup->save(prompt, static_cast<int32_t>(prompt.size()) - 1, s.target->kv_cache());
+        if (!saved) LIYAB_LOG_WARN("KV snapshot not saved: %s", saved.status().to_string().c_str());
+    }
+#endif
 
     const auto t_decode = Clock::now();
     std::string pending_utf8;
@@ -422,6 +452,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
             next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
         }
 
+        if (stats.ttft_ms == 0.0) stats.ttft_ms = ms_since(t_prefill);
         for (const int32_t token : next) {
             if (s.tokenizer->is_end_of_generation(token)) {
                 stop = true;

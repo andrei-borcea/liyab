@@ -63,7 +63,7 @@ Status KvCache::reserve(int32_t end) {
     const auto sink_pages = static_cast<size_t>(sink_page_count());
     for (size_t p = 0; p < pages; ++p) {
         // Released pages stay unmapped: no query can see them any more.
-        if (table_[p] >= 0 || (p >= sink_pages && p < static_cast<size_t>(released_below_))) continue;
+        if (table_[p] != kUnmapped || (p >= sink_pages && p < static_cast<size_t>(released_below_))) continue;
         if (free_.empty()) {
             // Uninitialized on purpose: every row is written before it is read.
             uint8_t* page = new (std::nothrow) uint8_t[page_bytes_];
@@ -77,10 +77,39 @@ Status KvCache::reserve(int32_t end) {
     return Status::ok();
 }
 
+uint8_t* KvCache::page_ptr(size_t logical) const noexcept {
+    const int32_t entry = table_[logical];
+    // External pages are read-only file mappings; only positions beyond the
+    // attached prefix are ever written, and those live in owned pages.
+    return entry >= 0 ? pool_[static_cast<size_t>(entry)].get()
+                      : const_cast<uint8_t*>(external_[static_cast<size_t>(kExternalBase - entry)]);
+}
+
+const uint8_t* KvCache::page_data(int32_t logical) const noexcept {
+    if (logical < 0 || static_cast<size_t>(logical) >= table_.size() || table_[static_cast<size_t>(logical)] == kUnmapped) {
+        return nullptr;
+    }
+    return page_ptr(static_cast<size_t>(logical));
+}
+
+Status KvCache::attach_external_pages(std::span<const uint8_t* const> pages) {
+    for (const int32_t entry : table_) {
+        if (entry != kUnmapped) return Status(ErrorCode::InvalidArgument, "external pages need an empty cache");
+    }
+    if (config_.window > 0) return Status(ErrorCode::Unsupported, "external pages need full attention (no window)");
+    if (static_cast<int64_t>(pages.size()) * config_.page_tokens > config_.max_positions) {
+        return Status(ErrorCode::ContextFull, "attached prefix exceeds the context");
+    }
+    external_.assign(pages.begin(), pages.end());
+    if (table_.size() < pages.size()) table_.resize(pages.size(), kUnmapped);
+    for (size_t p = 0; p < pages.size(); ++p) table_[p] = kExternalBase - static_cast<int32_t>(p);
+    return Status::ok();
+}
+
 uint8_t* KvCache::row(int32_t layer, int32_t pos, int32_t kv_head, bool value) const noexcept {
     const auto logical = static_cast<size_t>(pos / config_.page_tokens);
     const auto slot = static_cast<size_t>(pos % config_.page_tokens);
-    uint8_t* page = pool_[static_cast<size_t>(table_[logical])].get();
+    uint8_t* page = page_ptr(logical);
     // Page layout: [K | V], each [layer][slot][kv_head][row].
     const size_t half = page_bytes_ / 2;
     const size_t index = (static_cast<size_t>(layer) * static_cast<size_t>(config_.page_tokens) + slot) *
@@ -104,10 +133,9 @@ const uint8_t* KvCache::v_row(int32_t layer, int32_t pos, int32_t kv_head) const
 }
 
 void KvCache::free_page(size_t logical) noexcept {
-    if (logical < table_.size() && table_[logical] >= 0) {
-        free_.push_back(table_[logical]);
-        table_[logical] = -1;
-    }
+    if (logical >= table_.size() || table_[logical] == kUnmapped) return;
+    if (table_[logical] >= 0) free_.push_back(table_[logical]);  // external pages are just unmapped
+    table_[logical] = kUnmapped;
 }
 
 Status KvCache::truncate(int32_t n) {
@@ -144,6 +172,7 @@ int32_t KvCache::sink_page_count() const noexcept {
 
 void KvCache::clear() noexcept {
     for (size_t p = 0; p < table_.size(); ++p) free_page(p);
+    external_.clear();
     released_below_ = 0;
 }
 

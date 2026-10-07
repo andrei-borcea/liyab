@@ -176,6 +176,8 @@ struct GenerationStats {
     int32_t prompt_tokens = 0;
     int32_t generated_tokens = 0;
     double prefill_ms = 0.0;
+    double ttft_ms = 0.0;           // time to first token (prefill + first decode step)
+    int32_t cached_prefix_tokens = 0;  // experimental (KV dedup): prompt tokens restored from a snapshot
     double decode_ms = 0.0;
     double tokens_per_second = 0.0;
     int32_t draft_tokens_proposed = 0;
