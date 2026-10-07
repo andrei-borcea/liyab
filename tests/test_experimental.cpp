@@ -30,6 +30,8 @@
 #include "core/tokenizer.h"
 #include "liyab/experimental/early_exit.h"
 #include "liyab/experimental/egls.h"
+#include "liyab/experimental/jit_unpacker.h"
+#include "core/quant.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
 #include "test_model.h"
@@ -358,6 +360,82 @@ TEST_CASE("EGLS hook skips FFN blocks in decode only and never when the threshol
     REQUIRE(rc.has_value());
     CHECK(a->last_ffn_skips() == 4);  // 6 blocks minus the protected first and last
     std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// JIT unpacker
+// ---------------------------------------------------------------------------
+TEST_CASE("JIT unpacker: generated code matches the reference for both layouts") {
+    if (!JitUnpacker::supported()) {
+        std::printf("  skipped: no runtime code generation on this platform\n");
+        CHECK(!JitUnpacker::compile(JitUnpacker::Layout::Interleaved, 64).has_value());
+        return;
+    }
+    CHECK(!JitUnpacker::compile(JitUnpacker::Layout::Interleaved, 33).has_value());
+    CHECK(!JitUnpacker::compile(JitUnpacker::Layout::Interleaved, 0).has_value());
+    std::mt19937 rng(41);
+    for (const size_t n : {size_t{32}, size_t{64}, size_t{4096}, size_t{11008}}) {
+        // Interleaved: same contract as MmapLoader::unpack_int4_to_int8_neon.
+        auto jit = JitUnpacker::compile(JitUnpacker::Layout::Interleaved, n);
+        REQUIRE(jit.has_value());
+        CHECK(jit.value()->code_bytes() == (2 + n / 32 * 9 + 1) * 4);
+        std::vector<uint8_t> packed(n / 2);
+        for (auto& b : packed) b = static_cast<uint8_t>(rng());
+        std::vector<int8_t> expected(n), got(n + 32, 0x55);
+        MmapLoader::unpack_int4_to_int8_neon(packed.data(), expected.data(), n);
+        jit.value()->run(packed.data(), got.data());
+        CHECK(std::memcmp(expected.data(), got.data(), n) == 0);
+        CHECK(std::all_of(got.begin() + static_cast<std::ptrdiff_t>(n), got.end(), [](int8_t v) { return v == 0x55; }));
+
+        // Q4_0: compare with the dequantizer (scale 1.0 makes values = nibble - 8).
+        auto q4 = JitUnpacker::compile(JitUnpacker::Layout::Q4_0, n);
+        REQUIRE(q4.has_value());
+        std::vector<quant::BlockQ4_0> blocks(n / 32);
+        for (auto& blk : blocks) {
+            blk.d = quant::fp32_to_fp16(1.0f);
+            for (auto& q : blk.qs) q = static_cast<uint8_t>(rng());
+        }
+        std::vector<float> ref(n);
+        quant::dequantize_row(DType::Q4_0, blocks.data(), ref.data(), static_cast<int64_t>(n));
+        std::vector<int8_t> out(n);
+        q4.value()->run(reinterpret_cast<const uint8_t*>(blocks.data()), out.data());
+        bool same = true;
+        for (size_t i = 0; i < n; ++i) same = same && static_cast<float>(out[i]) == ref[i];
+        CHECK(same);
+    }
+}
+
+TEST_CASE("[bench] JIT unpacker vs NEON intrinsics vs scalar") {
+    if (!benchmarks_enabled() || !JitUnpacker::supported()) return;
+    std::mt19937 rng(43);
+    std::printf("  %-28s %12s %12s %12s\n", "elements (iterations)", "scalar GB/s", "NEON GB/s", "JIT GB/s");
+    for (const auto [n, iters] : std::vector<std::pair<size_t, int>>{{4096, 20000}, {11008, 8000}, {1 << 20, 100}}) {
+        std::vector<uint8_t> packed(n / 2);
+        for (auto& b : packed) b = static_cast<uint8_t>(rng());
+        std::vector<int8_t> out(n);
+        auto jit = JitUnpacker::compile(JitUnpacker::Layout::Interleaved, n);
+        REQUIRE(jit.has_value());
+        auto measure = [&](auto&& fn) {
+            fn();  // warm-up
+            const auto t0 = Clock::now();
+            for (int i = 0; i < iters; ++i) fn();
+            const double s = ms_since(t0) / 1000.0;
+            return static_cast<double>(n / 2 + n) * iters / s / 1e9;  // bytes read + written
+        };
+        const double scalar = measure([&] {
+            for (size_t i = 0; i < n; i += 2) {
+                const uint8_t b = packed[i / 2];
+                out[i] = static_cast<int8_t>((b & 0x0F) - 8);
+                out[i + 1] = static_cast<int8_t>((b >> 4) - 8);
+            }
+            asm volatile("" ::"r"(out.data()) : "memory");  // keep the loop from being elided
+        });
+        const double neon = measure([&] { MmapLoader::unpack_int4_to_int8_neon(packed.data(), out.data(), n); });
+        const double jitted = measure([&] { jit.value()->run(packed.data(), out.data()); });
+        char label[64];
+        std::snprintf(label, sizeof label, "%zu (%d), %zu KiB code", n, iters, jit.value()->code_bytes() / 1024);
+        std::printf("  %-28s %12.1f %12.1f %12.1f\n", label, scalar, neon, jitted);
+    }
 }
 
 // ---------------------------------------------------------------------------
