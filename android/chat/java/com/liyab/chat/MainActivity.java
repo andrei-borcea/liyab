@@ -73,6 +73,10 @@ public final class MainActivity extends Activity {
     private final SimpleDateFormat clock = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private volatile long engine;
+    private boolean useGpu;        // Vulkan backend instead of CPU; persisted
+    private File loadedFile;       // current model source, to reload on a backend switch
+    private Uri loadedUri;
+    private Button modeButton;
     private volatile boolean generating;
     private String modelName = "";
     private LinearLayout messages;
@@ -87,7 +91,9 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         LiyabNative.enableLogs(1);  // info and above into the debug panel
+        useGpu = getPreferences(MODE_PRIVATE).getBoolean("gpu", false);
         buildUi();
+        modeButton.setText(useGpu ? "GPU" : "CPU");
         log("Liyab Chat started; models folder: " + modelsDir());
         restoreLastModelOrAsk();
     }
@@ -130,6 +136,8 @@ public final class MainActivity extends Activity {
         title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        modeButton = smallButton("CPU", v -> toggleBackend());
+        header.addView(modeButton);
         header.addView(smallButton("Model", v -> showModelPicker()));
         header.addView(smallButton("Debug", v -> toggleDebug()));
         header.addView(smallButton("New", v -> newChat()));
@@ -262,6 +270,16 @@ public final class MainActivity extends Activity {
     private void toggleDebug() {
         debugScroll.setVisibility(debugScroll.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
         drainNativeLogs();
+    }
+
+    /** Switches between the CPU and the Vulkan GPU backend and reloads the current model. */
+    private void toggleBackend() {
+        if (generating) return;
+        useGpu = !useGpu;
+        modeButton.setText(useGpu ? "GPU" : "CPU");
+        getPreferences(MODE_PRIVATE).edit().putBoolean("gpu", useGpu).apply();
+        log("Backend switched to " + (useGpu ? "GPU (Vulkan)" : "CPU (NEON)"));
+        if (loadedFile != null || loadedUri != null) loadModel(loadedFile, loadedUri);
     }
 
     private void newChat() {
@@ -416,9 +434,18 @@ public final class MainActivity extends Activity {
                     path = "/proc/self/fd/" + pfd.getFd();
                     log("Opened document as " + path);
                 }
-                log("Creating engine: mmap + GGUF parse + device detection + backend selection…");
+                log("Creating engine on " + (useGpu ? "GPU (Vulkan)" : "CPU")
+                        + ": mmap + GGUF parse + device detection + backend selection…");
                 long t0 = System.nanoTime();
-                long handle = LiyabNative.create(path, cache.getAbsolutePath(), THREADS);
+                long handle = LiyabNative.create(path, cache.getAbsolutePath(), THREADS,
+                        useGpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU);
+                if (useGpu) {
+                    // Vulkan copies and repacks weights on first use: do it now, not on the first message.
+                    log("Uploading weights to GPU memory (one-time warm-up)…");
+                    long tw = System.nanoTime();
+                    LiyabNative.generate(handle, "Hi", 1, 0f, bytes -> true);
+                    log(String.format(Locale.US, "GPU warm-up done in %.2f s", (System.nanoTime() - tw) / 1e9));
+                }
                 double seconds = (System.nanoTime() - t0) / 1e9;
                 drainNativeLogs();
                 String info = LiyabNative.describe(handle);
@@ -426,13 +453,17 @@ public final class MainActivity extends Activity {
                 log(String.format(Locale.US, "Ready in %.2f s", seconds));
                 engine = handle;
                 modelName = label;
+                loadedFile = file;
+                loadedUri = uri;
                 getPreferences(MODE_PRIVATE).edit()
                         .putString("model", file != null ? file.getAbsolutePath() : uri.toString()).apply();
                 ui.post(() -> {
                     history.clear();
-                    status.setText(String.format(Locale.US, "%s · ready in %.1fs", label, seconds));
+                    status.setText(String.format(Locale.US, "%s · %s · ready in %.1fs", label,
+                            useGpu ? "GPU" : "CPU", seconds));
                     send.setEnabled(true);
-                    addNote("Model loaded: " + label);
+                    addNote("Model loaded on " + (useGpu ? "GPU (Vulkan)" : "CPU") + ": " + label
+                            + (useGpu ? " — weights are copied to GPU memory on the first message" : ""));
                 });
             } catch (Exception e) {
                 drainNativeLogs();

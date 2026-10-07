@@ -20,8 +20,11 @@ final class LiyabNative {
     /** Returns and clears the buffered engine log lines ("I message\n"). */
     static native String takeLogs();
 
-    /** Loads the model; throws RuntimeException with Liyab's error message on failure. */
-    static native long create(String modelPath, String cacheDir, int threads);
+    static final int BACKEND_CPU = 0;     // LIYAB_BACKEND_CPU
+    static final int BACKEND_VULKAN = 2;  // LIYAB_BACKEND_VULKAN
+
+    /** Loads the model on `backend`; throws RuntimeException with Liyab's error message on failure. */
+    static native long create(String modelPath, String cacheDir, int threads, int backend);
 
     /**
      * Blocking generation on the calling thread. Returns {prompt_tokens, generated_tokens,

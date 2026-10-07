@@ -4,7 +4,7 @@
 //   liyab-cli --device
 //   liyab-cli -m model.gguf -p "Once upon a time" [-n 128] [--temp 0.8]
 //             [--draft draft.gguf] [--profile performance|balanced|low_power]
-//             [--backend auto|cpu|metal] [--kv f16|q8_0|q4_0|q4_1] [--ctx N]
+//             [--backend auto|cpu|metal|vulkan] [--kv f16|q8_0|q4_0|q4_1] [--ctx N]
 //             [--window N] [--threads N] [--seed N]
 #include <algorithm>
 #include <csignal>
@@ -45,7 +45,7 @@ void usage() {
                  "  --profile P        performance | balanced | low_power (default balanced)\n"
                  "  --tps R            override the paced token rate\n"
                  "  --skin-threshold C thermal throttle threshold in °C (default 40)\n"
-                 "  --backend B        auto | cpu | metal (default auto)\n"
+                 "  --backend B        auto | cpu | metal | vulkan (default auto)\n"
                  "  --kv T             f16 | q8_0 | q4_0 | q4_1 (default q8_0)\n"
                  "  --ctx N            context length    --window N  sliding window\n"
                  "  --sinks N          attention-sink tokens kept with --window (default 8)\n"
@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
             if (v == "auto") config.backend = LIYAB_BACKEND_AUTO;
             else if (v == "cpu") config.backend = LIYAB_BACKEND_CPU;
             else if (v == "metal") config.backend = LIYAB_BACKEND_METAL;
+            else if (v == "vulkan") config.backend = LIYAB_BACKEND_VULKAN;
             else return usage(), 2;
         } else if (arg == "--kv") {
             const std::string v = next();

@@ -1,0 +1,121 @@
+// Liyab — Vulkan matrix-vector kernels, y[t][row] = dot(W[row], x[t]).
+//
+// Compiled once per weight type (-DTYPE_F32, TYPE_F16, TYPE_Q8_0, TYPE_Q4_0,
+// TYPE_Q4_1). Weights are repacked at upload into a GPU-friendly layout:
+//   scales[]  float per 32-value block (Q4_1: {d, m} pairs)
+//   quants[]  16-byte aligned payload: Q4_x one uvec4 per block, Q8_0 two,
+//             F16 two halves per uint, F32 raw bits
+//
+// Quantized kernels: a 64-lane workgroup computes 4 rows (16 lanes per row);
+// each lane takes whole 32-value blocks with one 16-byte load and vec4 dot
+// products, then the 16 partial sums of a row are reduced in shared memory.
+// F32/F16 kernels: one row per workgroup.
+#version 450
+
+layout(local_size_x = 64) in;
+
+#if defined(TYPE_F32) || defined(TYPE_F16)
+layout(std430, set = 0, binding = 1) readonly buffer Quants { uint quants[]; };
+layout(std430, set = 0, binding = 2) readonly buffer X { float x[]; };
+#else
+layout(std430, set = 0, binding = 0) readonly buffer Scales { float scales[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Quants { uvec4 quants[]; };
+layout(std430, set = 0, binding = 2) readonly buffer X { vec4 x4[]; };
+#endif
+layout(std430, set = 0, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint n;
+} p;
+
+shared float partial[64];
+
+#if !defined(TYPE_F32) && !defined(TYPE_F16)
+// Nibble k of each byte of `q` as a vec4 (k = 0: low nibbles, 1: high).
+vec4 nibbles(uint q, uint shift) {
+    return vec4(float((q >> shift) & 15u), float((q >> (shift + 8u)) & 15u), float((q >> (shift + 16u)) & 15u),
+                float((q >> (shift + 24u)) & 15u));
+}
+// Bytes of `q` as signed int8 values.
+vec4 int8s(uint q) {
+    const int v = int(q);
+    return vec4((v << 24) >> 24, (v << 16) >> 24, (v << 8) >> 24, v >> 24);
+}
+#endif
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint group = gl_WorkGroupID.z * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    float sum = 0.0;
+
+#if defined(TYPE_F32) || defined(TYPE_F16)
+    // Rows beyond the matrix exit uniformly (whole workgroup shares the row).
+    const uint row = group;
+    if (row >= p.rows) return;
+    const uint xo = t * p.cols;
+#if defined(TYPE_F32)
+    const uint base = row * p.cols;
+    for (uint i = lid; i < p.cols; i += 64u) sum += uintBitsToFloat(quants[base + i]) * x[xo + i];
+#else
+    const uint half_cols = p.cols / 2u;
+    const uint base = row * half_cols;
+    for (uint i = lid; i < half_cols; i += 64u) {
+        const vec2 w = unpackHalf2x16(quants[base + i]);
+        sum += w.x * x[xo + 2u * i] + w.y * x[xo + 2u * i + 1u];
+    }
+#endif
+    partial[lid] = sum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lid < s) partial[lid] += partial[lid + s];
+        barrier();
+    }
+    if (lid == 0u) y[t * p.rows + row] = partial[0];
+#else
+    const uint sub = lid >> 4u;    // row within the workgroup (0..3)
+    const uint lane = lid & 15u;   // lane within the row (0..15)
+    const uint row = group * 4u + sub;
+    const uint nb = p.cols / 32u;
+    if (row < p.rows) {
+        const uint x_base = t * (p.cols / 4u);  // vec4 index of x[t][0]
+        for (uint b = lane; b < nb; b += 16u) {
+            const uint blk = row * nb + b;
+            const uint xb = x_base + b * 8u;       // 8 vec4 per block
+#if defined(TYPE_Q8_0)
+            const uvec4 q0 = quants[2u * blk];
+            const uvec4 q1 = quants[2u * blk + 1u];
+            const float acc = dot(int8s(q0.x), x4[xb]) + dot(int8s(q0.y), x4[xb + 1u]) +
+                              dot(int8s(q0.z), x4[xb + 2u]) + dot(int8s(q0.w), x4[xb + 3u]) +
+                              dot(int8s(q1.x), x4[xb + 4u]) + dot(int8s(q1.y), x4[xb + 5u]) +
+                              dot(int8s(q1.z), x4[xb + 6u]) + dot(int8s(q1.w), x4[xb + 7u]);
+            sum += scales[blk] * acc;
+#else
+            // Byte j: element j (low nibble) and element j + 16 (high nibble).
+            const uvec4 q = quants[blk];
+            const vec4 xa = x4[xb], xc = x4[xb + 1u], xe = x4[xb + 2u], xg = x4[xb + 3u];  // elements 0..15
+            const vec4 xi = x4[xb + 4u], xk = x4[xb + 5u], xm = x4[xb + 6u], xo = x4[xb + 7u];  // 16..31
+            float acc = dot(nibbles(q.x, 0u), xa) + dot(nibbles(q.y, 0u), xc) + dot(nibbles(q.z, 0u), xe) +
+                        dot(nibbles(q.w, 0u), xg) + dot(nibbles(q.x, 4u), xi) + dot(nibbles(q.y, 4u), xk) +
+                        dot(nibbles(q.z, 4u), xm) + dot(nibbles(q.w, 4u), xo);
+            const vec4 ones = vec4(1.0);
+            const float xs = dot(xa + xc + xe + xg + xi + xk + xm + xo, ones);
+#if defined(TYPE_Q4_1)
+            sum += scales[2u * blk] * acc + scales[2u * blk + 1u] * xs;
+#else
+            sum += scales[blk] * (acc - 8.0 * xs);  // q - 8 folded out of the dot products
+#endif
+#endif
+        }
+    }
+    partial[lid] = sum;
+    barrier();
+    for (uint s = 8u; s > 0u; s >>= 1u) {  // reduce 16 lanes per row
+        if (lane < s) partial[lid] += partial[lid + s];
+        barrier();
+    }
+    if (lane == 0u && row < p.rows) y[t * p.rows + row] = partial[lid];
+#endif
+}

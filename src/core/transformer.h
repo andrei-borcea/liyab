@@ -122,6 +122,9 @@ private:
     void rope(float* vec, int32_t n_heads, int32_t pos) const;
     void attention(int32_t layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
+    // Grouped variant (shared input); falls back to the CPU as a whole group.
+    Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
+                        std::span<float* const> ys, int32_t n);
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of x_.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows);
     // Early exit: writes K/V for blocks [from, n_layers) of the single token

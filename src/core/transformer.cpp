@@ -330,6 +330,13 @@ Status Transformer::matmul(const Route& route, Backend* backend, const TensorVie
     return s;
 }
 
+Status Transformer::matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws,
+                                 const float* x, std::span<float* const> ys, int32_t n) {
+    Status s = backend->matmul_group(ws, x, ys, n);
+    if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul_group(ws, x, ys, n);
+    return s;
+}
+
 Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t rows) {
     const ModelConfig& c = config_;
     const size_t d = static_cast<size_t>(c.n_embd);
@@ -417,9 +424,11 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         for (size_t t = 0; t < un; ++t) {
             rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
         }
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wq(), xb_.data(), q_.data(), n));
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wk(), xb_.data(), k_.data(), n));
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w.wv(), xb_.data(), v_.data(), n));
+        {
+            const TensorView* qkv[] = {&w.wq(), &w.wk(), &w.wv()};
+            float* outs[] = {q_.data(), k_.data(), v_.data()};
+            LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, qkv, xb_.data(), outs, n));
+        }
         for (size_t t = 0; t < un; ++t) {
             float* q = q_.data() + t * q_dim;
             float* k = k_.data() + t * kv_dim;
@@ -455,8 +464,14 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
-            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w.gate(), xb_.data(), hb_.data()));
-            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w.up(), xb_.data(), hb2_.data()));
+            if (ffn_hook != nullptr) {  // experimental per-projection override
+                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w.gate(), xb_.data(), hb_.data()));
+                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w.up(), xb_.data(), hb2_.data()));
+            } else {
+                const TensorView* gate_up[] = {&w.gate(), &w.up()};
+                float* outs[] = {hb_.data(), hb2_.data()};
+                LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
+            }
             for (size_t i = 0; i < hb_.size(); ++i) {
                 const float g = hb_[i];
                 hb_[i] = g / (1.0f + std::exp(-g)) * hb2_[i];

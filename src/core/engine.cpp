@@ -147,7 +147,18 @@ struct Engine::Impl {
                     }
                     break;
                 }
-                case BackendKind::Vulkan:
+                case BackendKind::Vulkan: {
+                    if (gpu) break;
+                    auto vulkan = make_vulkan_backend();
+                    if (vulkan) {
+                        gpu = std::move(vulkan).value();
+                    } else if (config.backend == BackendKind::Vulkan) {
+                        return vulkan.status();
+                    } else {
+                        LIYAB_LOG_WARN("vulkan unavailable: %s", vulkan.status().to_string().c_str());
+                    }
+                    break;
+                }
                 case BackendKind::Qnn:
                 case BackendKind::NeuroPilot:
                     // Runtime present (probe succeeded) but Liyab has no compute

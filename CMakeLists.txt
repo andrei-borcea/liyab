@@ -144,6 +144,33 @@ if(APPLE)
 endif()
 
 if(LIYAB_USE_VULKAN)
+  # Compute shaders: one SPIR-V module per weight type, embedded at build time.
+  file(GLOB _liyab_glslc_hints "${ANDROID_NDK}/shader-tools/*")
+  find_program(LIYAB_GLSLC glslc HINTS ${_liyab_glslc_hints} $ENV{VULKAN_SDK}/bin)
+  if(NOT LIYAB_GLSLC)
+    message(FATAL_ERROR "LIYAB_USE_VULKAN=ON needs glslc (NDK shader-tools or the Vulkan SDK)")
+  endif()
+  set(_liyab_shader_src ${PROJECT_SOURCE_DIR}/src/backends/vulkan/shaders/matvec.comp)
+  set(_liyab_spv_names)
+  set(_liyab_spv_files)
+  foreach(type F32 F16 Q4_0 Q4_1 Q8_0)
+    string(TOLOWER ${type} name)
+    set(spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/matvec_${name}.spv)
+    add_custom_command(OUTPUT ${spv}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+      COMMAND ${LIYAB_GLSLC} -fshader-stage=compute --target-env=vulkan1.1 -O -DTYPE_${type} ${_liyab_shader_src} -o ${spv}
+      DEPENDS ${_liyab_shader_src} VERBATIM)
+    list(APPEND _liyab_spv_names ${name})
+    list(APPEND _liyab_spv_files ${spv})
+  endforeach()
+  set(_liyab_shader_header ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_shaders.h)
+  add_custom_command(OUTPUT ${_liyab_shader_header}
+    COMMAND ${CMAKE_COMMAND} -DOUT=${_liyab_shader_header} "-DNAMES=${_liyab_spv_names}" "-DINPUTS=${_liyab_spv_files}"
+            -P ${PROJECT_SOURCE_DIR}/cmake/embed_spirv.cmake
+    DEPENDS ${_liyab_spv_files} ${PROJECT_SOURCE_DIR}/cmake/embed_spirv.cmake VERBATIM)
+  target_sources(liyab_core PRIVATE ${_liyab_shader_header})
+  target_include_directories(liyab_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
   # Headers only: the loader is opened with dlopen at runtime. The NDK ships
   # <vulkan/vulkan.h> in its sysroot; elsewhere use the Vulkan-Headers package.
   include(CheckIncludeFileCXX)
@@ -202,7 +229,7 @@ endif()
 
 if(LIYAB_BUILD_TESTS)
   enable_testing()
-  set(_liyab_tests test_mmap test_device_detect test_engine test_kv_cache)
+  set(_liyab_tests test_mmap test_device_detect test_engine test_kv_cache test_backends)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()

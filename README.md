@@ -41,9 +41,10 @@ This README describes what the code does today. Anything not implemented is list
 | Speculative decoding (draft model, batched verification) | ✅ implemented |
 | CPU backend: ARM NEON + dot-product (SDOT), multithreaded | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
+| Android GPU backend: Vulkan compute (Adreno / Mali), weights repacked in GPU memory | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
-| Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot, Vulkan | 🟡 runtime detection only. Compute falls back to the next backend |
+| Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
 | Text encoding for byte-level BPE vocabularies (Llama 3, Qwen) | 🟡 decode only. Pass token ids instead |
 | Experimental: early exit, head pruning, `O_DIRECT` / io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
@@ -67,8 +68,8 @@ This README describes what the code does today. Anything not implemented is list
    ┌───────▼──────────────────────┐   ┌───────▼─────────────────────────┐
    │ MmapLoader (zero-copy GGUF)  │   │ attention → GPU, FFN → NPU,     │
    │  or TripleBufferLoader       │   │ fallback chain NPU → GPU → CPU  │
-   │  (fetch | prepare | execute) │   │  Metal ✅  CPU NEON ✅          │
-   └──────────────────────────────┘   │  Vulkan / QNN / NeuroPilot 🟡   │
+   │  (fetch | prepare | execute) │   │  Metal ✅ Vulkan ✅ CPU NEON ✅  │
+   └──────────────────────────────┘   │  QNN / NeuroPilot 🟡            │
                                       └─────────────────────────────────┘
 ```
 
@@ -82,6 +83,12 @@ This README describes what the code does today. Anything not implemented is list
   fetch thread (stage 1), a transform thread (stage 2), and the executing layer (stage 3). Weight memory is bounded
   at 3 × the largest block. Stage 2 is a pass-through in the engine because the kernels consume packed INT4
   directly; an INT4→INT8 pass would double the bytes read. Stalls are counted in `GenerationStats::weight_stalls`.
+* **Vulkan backend (Android GPUs).** Mobile drivers lack `VK_EXT_external_memory_host` (Adreno 830 included), so
+  each tensor is copied once into host-visible GPU memory on first use and repacked into an aligned layout: float
+  scales plus 16-byte quant words. Kernels (`src/backends/vulkan/shaders/matvec.comp`, one SPIR-V module per weight
+  type, compiled with the NDK's `glslc` and embedded at build time) compute 4 rows per 64-lane workgroup with
+  16-byte loads and `vec4` dot products. Matmuls that share an input (Q/K/V, gate/up) go out in one submission, and
+  completion is polled briefly before the driver wait. A per-call dispatch costs 0.055 ms.
 * **Heterogeneous routing.** Attention projections go to the GPU, while the FFN and output head go to the NPU.
   Any backend that reports `Unsupported` falls back to the CPU per matmul.
 * **Paged KV cache.** Fixed 64-token pages (all layers per page) come from a pool on demand through a page table.
@@ -152,7 +159,7 @@ auto-links Metal, Foundation and libc++. If `xcodebuild` reports missing compone
 | `LIYAB_USE_NEON` | ON on arm64 | NEON intrinsics kernels |
 | `LIYAB_ARM_DOTPROD` | ON on arm64 | `-march=armv8.2-a+dotprod+fp16` on Android/iOS/Linux (SDOT). AArch64 needs no `-mfpu`: NEON is part of the base ISA |
 | `LIYAB_USE_METAL` | ON on Apple | Metal GPU backend |
-| `LIYAB_USE_VULKAN` | ON on Android | Vulkan runtime probe (headers only, loader opened with `dlopen`) |
+| `LIYAB_USE_VULKAN` | ON on Android | Vulkan GPU backend + probe (loader opened with `dlopen`; shaders need `glslc` from the NDK or Vulkan SDK) |
 | `LIYAB_USE_QNN` | ON on Android | QNN HTP runtime probe (no SDK needed) |
 | `LIYAB_USE_NEUROPILOT` | ON on Android | NeuroPilot runtime probe |
 | `LIYAB_ENABLE_EXPERIMENTAL` | OFF | Early exit, head pruning, direct-I/O loader, `test_experimental` |
@@ -172,6 +179,7 @@ needed.
 | `test_device_detect` | SoC classification, backend ranking, live detection, sysfs thermal parsing, power policy, pacing |
 | `test_engine` | quant kernels, tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
 | `test_kv_cache` | memory per token, on-demand paging and reuse, sinks and page recycling over 5000 positions, quantization accuracy, engine KV memory |
+| `test_backends` | per-matmul latency of each backend on a model's shapes, grouped submissions, dispatch overhead |
 | `test_experimental` | early exit, head pruning, direct I/O correctness, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them, `LIYAB_BENCH_MB=N` sizes the I/O file) |
 
 On a device (USB debugging enabled):
@@ -332,6 +340,8 @@ final class LiyabEngine {
 
 `android/chat` is a single-screen chat app in plain Java (no Gradle, no AndroidX) over the C ABI:
 
+* **CPU / GPU switch.** Reloads the model on the CPU (NEON) or the GPU (Vulkan). In GPU mode the weights are
+  uploaded at load time, not on the first message.
 * **Model picker.** Lists the `*.gguf` files in the app folder, or picks any file with the system picker. Picked
   files are mapped through `/proc/self/fd`, so there is no copy and no storage permission. Loading a model first
   unloads the previous one.
@@ -394,6 +404,16 @@ throttle threshold raised to 60 °C so the comparison is not distorted by therma
 | Q8_0 weights, Q8_0 KV | 27.5 tok/s |
 | Q4_0, `balanced` profile (12 tok/s pacing) | 12.05 tok/s, SoC idle 49% of the decode time |
 | Q4_0, `--triple-buffer` (`O_DIRECT`) | 5.5 tok/s, 2814 weight stalls |
+
+Same model and prompt, Vulkan GPU vs CPU (`--backend vulkan|cpu`, 4 threads):
+
+| Backend | Decode | Prefill (37 tokens) |
+| :--- | ---: | ---: |
+| CPU NEON + SDOT | 31.0 tok/s | 0.76 s |
+| Vulkan, Adreno 830 | **38.6 tok/s (+25%)** | 1.00 s |
+
+Per-matmul latencies come from `test_backends` (`LIYAB_BENCH_MODEL=...`), after a 0.5 s warm-up. Mobile GPU clocks
+ramp up under load, and cold measurements vary by up to 10×.
 
 Reading the table:
 * **Thermal guard.** With the default 40 °C threshold, this device's board thermistor (`xo-therm`, no dedicated skin
@@ -464,9 +484,11 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 
 ## Limitations and roadmap
 
-* **NPU / Vulkan compute.** QNN, NeuroPilot and Vulkan are detected at runtime and ranked, but no compute kernels
-  exist yet, so their work runs on the CPU. Next steps: QNN HTP graphs for the FFN with rpcmem-registered weights,
-  and Vulkan compute shaders for the Q4_0 matvec.
+* **NPU compute.** QNN and NeuroPilot are detected at runtime and ranked, but no compute kernels exist yet, so
+  their work runs on the GPU/CPU. Next step: QNN HTP graphs for the FFN with rpcmem-registered weights.
+* **Vulkan.** Batched prefill runs the matvec kernel once per token (no weight reuse across the batch); a tiled
+  GEMM kernel is the next step. Weights are copied into GPU memory, so models must fit in RAM twice over; zero-copy
+  needs `VK_EXT_external_memory_host` or AHardwareBuffer imports.
 * **Core ML / Apple Neural Engine.** Not used: the ANE is only reachable through compiled Core ML models, not
   per-layer kernels over mmap'd weights. Metal is the Apple accelerator path.
 * **Quantization formats.** K-quants (Q4_K, Q6_K…) and IQ formats are not implemented yet.
@@ -489,7 +511,7 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 ```
 include/liyab/          public headers (C++ API, C ABI, experimental/)
 src/core/               engine, loader, KV cache, triple buffer, transformer, tokenizer, sampling, power, detection
-src/backends/           cpu/ (NEON), metal/ (Metal), qnn/, neuropilot/, vulkan/ (runtime probes)
+src/backends/           cpu/ (NEON), metal/ (Metal), vulkan/ (Vulkan compute + shaders/), qnn/, neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, direct-I/O loader
 src/c_api/              C ABI implementation
 tools/liyab_cli.cpp     command-line front end over the C ABI

@@ -77,13 +77,14 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_takeLogs(JNIEnv* env, 
 }
 
 JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jclass, jstring model_path,
-                                                               jstring cache_dir, jint threads) {
+                                                               jstring cache_dir, jint threads, jint backend) {
     const std::string model = to_string(env, model_path);
     const std::string cache = to_string(env, cache_dir);
     liyab_engine_config config;
     liyab_engine_config_default(&config);
     config.model_path = model.c_str();
     config.n_threads = threads;
+    config.backend = static_cast<liyab_backend>(backend);  // LIYAB_BACKEND_CPU or LIYAB_BACKEND_VULKAN
     config.power_profile = LIYAB_POWER_PERFORMANCE;  // a chat UI wants full speed; thermal guard still applies
     config.skin_threshold_c = 45.0f;
     config.context_length = 2048;

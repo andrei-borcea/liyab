@@ -291,12 +291,14 @@ TEST_CASE("CPU backend batched matmul equals per-row dots") {
     }
 }
 
-TEST_CASE("Metal backend agrees with the CPU backend") {
-    auto metal = make_metal_backend();
+TEST_CASE("GPU backends (Metal / Vulkan) agree with the CPU backend") {
+  for (auto make : {make_metal_backend, make_vulkan_backend}) {
+    auto metal = make();
     if (!metal) {
         std::printf("  skipped: %s\n", metal.status().to_string().c_str());
-        return;
+        continue;
     }
+    std::printf("  %s\n", metal.value()->description().c_str());
     auto loader = MmapLoader::open(mixed_model());
     REQUIRE(loader.has_value());
     ThreadPool pool(4);
@@ -314,6 +316,7 @@ TEST_CASE("Metal backend agrees with the CPU backend") {
         for (const float v : a) scale = std::max(scale, std::fabs(static_cast<double>(v)));
         CHECK(max_abs_diff(b, a) <= 0.02 * std::max(1.0, scale));  // CPU quantizes activations
     }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +522,7 @@ TEST_CASE("Engine routes to CPU when forced and matches the default route") {
 
 TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place mmap reads") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
-    for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal}) {
+    for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal, BackendKind::Vulkan}) {
         EngineConfig config = engine_config(mixed_model());
         config.backend = backend;
         auto in_place = Engine::create(config);
@@ -537,7 +540,7 @@ TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place 
 
 TEST_CASE("Speculative decoding with greedy sampling reproduces plain greedy output") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
-    for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal}) {
+    for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal, BackendKind::Vulkan}) {
         EngineConfig plain = engine_config(mixed_model());
         plain.backend = backend;
         auto base_engine = Engine::create(plain);
