@@ -131,6 +131,16 @@ typedef struct liyab_generation_stats {
 typedef int32_t (*liyab_token_callback)(const char* piece, size_t piece_len, int32_t token, void* user_data);
 
 LIYAB_C_API const char* liyab_version(void);
+
+/*
+ * Diagnostics. Levels: 0 debug, 1 info, 2 warn (default), 3 error, 4 off.
+ * The callback receives every message at or above the level, from any thread
+ * (load, prefetch and worker threads included); NULL removes it. Messages also
+ * go to logcat (Android) or stderr.
+ */
+typedef void (*liyab_log_callback)(int32_t level, const char* message, void* user_data);
+LIYAB_C_API void liyab_set_log_level(int32_t level);
+LIYAB_C_API void liyab_set_log_callback(liyab_log_callback callback, void* user_data);
 LIYAB_C_API const char* liyab_last_error(void);
 
 LIYAB_C_API void liyab_engine_config_default(liyab_engine_config* config);

@@ -83,6 +83,8 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     }
 
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
+    LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d)", c.n_layers,
+                   std::string(dtype_traits(model->layers_[0].w_up->type).name).c_str(), c.arch.c_str(), c.head_dim);
 
     // Context and KV cache.
     model->context_length_ = options.context_length > 0

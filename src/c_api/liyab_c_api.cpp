@@ -8,6 +8,7 @@
 #include <new>
 #include <string>
 
+#include "core/log.h"
 #include "liyab/liyab.h"
 
 struct liyab_engine {
@@ -92,6 +93,14 @@ extern "C" {
 const char* liyab_version(void) { return LIYAB_VERSION_STRING; }
 
 const char* liyab_last_error(void) { return g_last_error.c_str(); }
+
+void liyab_set_log_level(int32_t level) {
+    liyab::log::set_level(static_cast<liyab::log::Level>(std::clamp(level, 0, 4)));
+}
+
+void liyab_set_log_callback(liyab_log_callback callback, void* user_data) {
+    liyab::log::set_sink(reinterpret_cast<liyab::log::Sink>(callback), user_data);
+}
 
 void liyab_engine_config_default(liyab_engine_config* config) {
     if (config == nullptr) return;

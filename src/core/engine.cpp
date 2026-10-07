@@ -229,7 +229,11 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 
     auto impl = std::make_unique<Impl>();
     impl->config = config;
+    const auto t_create = Clock::now();
     impl->device = detect_device();
+    LIYAB_LOG_INFO("device: %s (%s), %d cores, %.1f GiB available", impl->device.soc.name.c_str(),
+                   soc_vendor_name(impl->device.soc.vendor), impl->device.cpu.cores,
+                   static_cast<double>(impl->device.available_memory) / (1024.0 * 1024.0 * 1024.0));
     impl->pool = std::make_unique<ThreadPool>(config.n_threads);
     impl->cpu = make_cpu_backend(*impl->pool);
     LIYAB_RETURN_IF_ERROR(impl->select_backends());
@@ -292,6 +296,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     impl->power = std::make_unique<PowerManager>(config.power);
     impl->power->poll_once();
     if (config.thermal_polling) impl->power->start();
+    const Route route = impl->normal_route();
+    LIYAB_LOG_INFO("engine ready in %.0f ms: attention on %s, FFN on %s, %d threads%s", ms_since(t_create),
+                   route.attention->description().c_str(), route.ffn->description().c_str(),
+                   impl->pool->max_threads(), impl->speculative ? ", speculative decoding" : "");
 
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
 }

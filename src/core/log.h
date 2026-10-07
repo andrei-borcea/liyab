@@ -6,7 +6,11 @@ namespace liyab::log {
 
 enum class Level : int { Debug = 0, Info = 1, Warn = 2, Error = 3, Off = 4 };
 
+using Sink = void (*)(int level, const char* message, void* user_data);
+
 void set_level(Level level) noexcept;
+// Additional sink (e.g. an app's debug console). Called from any thread.
+void set_sink(Sink sink, void* user_data) noexcept;
 bool enabled(Level level) noexcept;
 void write(Level level, const char* fmt, ...) noexcept __attribute__((format(printf, 2, 3)));
 

@@ -328,6 +328,26 @@ final class LiyabEngine {
 }
 ```
 
+### Demo app: Liyab Chat (Android)
+
+`android/chat` is a single-screen chat app in plain Java (no Gradle, no AndroidX) over the C ABI:
+
+* **Model picker.** Lists the `*.gguf` files in the app folder, or picks any file with the system picker. Picked
+  files are mapped through `/proc/self/fd`, so there is no copy and no storage permission. Loading a model first
+  unloads the previous one.
+* **Debug panel.** Shows timestamped load steps plus Liyab's own log lines (via `liyab_set_log_callback`), with
+  per-message stats: tok/s, time to first token, reused prompt tokens.
+* **Streaming and multi-turn.** Replies stream token by token, with Stop to cancel. Earlier turns are reused through
+  the KV dedup prefix cache.
+
+```bash
+scripts/build_android_app.sh --install                            # builds build/android-app/liyab-chat.apk
+adb push tinyllama-q4_0.gguf /sdcard/Android/data/com.liyab.chat/files/   # after the first launch
+```
+
+The app uses the Zephyr / TinyLlama chat template. Launch it once before pushing, so that Android creates the
+folder with the app as its owner.
+
 ### Command line
 
 ```bash
@@ -337,6 +357,7 @@ liyab-cli -m model.gguf -p "..." --draft draft.gguf   # speculative decoding
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --profile low_power --skin-threshold 45
 liyab-cli -m big-model.gguf -p "..." --triple-buffer      # only for models larger than RAM
+liyab-cli -m model.gguf -p "..." --tokenize               # print token ids
 liyab-cli --help
 ```
 
@@ -472,6 +493,7 @@ src/backends/           cpu/ (NEON), metal/ (Metal), qnn/, neuropilot/, vulkan/ 
 src/experimental/       early exit, head pruning, direct-I/O loader
 src/c_api/              C ABI implementation
 tools/liyab_cli.cpp     command-line front end over the C ABI
+android/chat/           demo chat app (Java + JNI), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
 scripts/                build_android.sh, build_ios.sh
 ```

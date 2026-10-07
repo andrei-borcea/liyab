@@ -29,7 +29,22 @@ std::atomic<int>& level_ref() noexcept {
     return level;
 }
 
+struct SinkSlot {
+    std::atomic<Sink> sink{nullptr};
+    std::atomic<void*> user{nullptr};
+};
+
+SinkSlot& sink_slot() noexcept {
+    static SinkSlot slot;
+    return slot;
+}
+
 }  // namespace
+
+void set_sink(Sink sink, void* user_data) noexcept {
+    sink_slot().user.store(user_data, std::memory_order_relaxed);
+    sink_slot().sink.store(sink, std::memory_order_release);
+}
 
 void set_level(Level level) noexcept { level_ref().store(static_cast<int>(level), std::memory_order_relaxed); }
 
@@ -43,6 +58,9 @@ void write(Level level, const char* fmt, ...) noexcept {
     va_start(args, fmt);
     std::vsnprintf(buffer, sizeof buffer, fmt, args);
     va_end(args);
+    if (Sink sink = sink_slot().sink.load(std::memory_order_acquire)) {
+        sink(static_cast<int>(level), buffer, sink_slot().user.load(std::memory_order_relaxed));
+    }
 #if defined(__ANDROID__)
     static constexpr int kPriority[] = {ANDROID_LOG_DEBUG, ANDROID_LOG_INFO, ANDROID_LOG_WARN, ANDROID_LOG_ERROR,
                                         ANDROID_LOG_SILENT};
