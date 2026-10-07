@@ -345,6 +345,15 @@ final class LiyabEngine {
 * **Model picker.** Lists the `*.gguf` files in the app folder, or picks any file with the system picker. Picked
   files are mapped through `/proc/self/fd`, so there is no copy and no storage permission. Loading a model first
   unloads the previous one.
+* **Hugging Face downloads.** Searches GGUF repositories (sorted by downloads) and lists each file with its size,
+  quantization and a compatibility badge (Q8_0/F16 run today; Q4_0/Q4_1 presets usually keep a Q6_K output head).
+  Downloads use 4 parallel HTTP range connections. Per-segment progress is persisted, so a paused, killed or
+  disconnected download resumes where it stopped. Each segment retries with exponential backoff, and the file is
+  checked against the SHA-256 published by Hugging Face before it is loaded. Verified on the phone: a download
+  killed mid-way, then resumed, matches the published SHA-256. The live loader shows progress, GB, smoothed
+  MB/s, connections, elapsed time, ETA and retries, with Pause and Cancel.
+* **Model management.** Lists downloaded and partial models with their disk usage. Any of them can be deleted,
+  except the one currently loaded (it is memory-mapped).
 * **Debug panel.** Shows timestamped load steps plus Liyab's own log lines (via `liyab_set_log_callback`), with
   per-message stats: tok/s, time to first token, reused prompt tokens.
 * **Streaming and multi-turn.** Replies stream token by token, with Stop to cancel. Earlier turns are reused through
@@ -352,7 +361,9 @@ final class LiyabEngine {
 
 ```bash
 scripts/build_android_app.sh --install                            # builds build/android-app/liyab-chat.apk
-adb push tinyllama-q4_0.gguf /sdcard/Android/data/com.liyab.chat/files/   # after the first launch
+adb push tinyllama-q4_0.gguf /sdcard/Android/data/com.liyab.chat/files/   # optional, after the first launch
+# scripted download (tests / automation):
+adb shell am start -n com.liyab.chat/.MainActivity --es download "'ggml-org/tiny-llamas|stories15M.gguf'"
 ```
 
 The app uses the Zephyr / TinyLlama chat template. Launch it once before pushing, so that Android creates the

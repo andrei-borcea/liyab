@@ -23,7 +23,10 @@ import android.view.WindowInsets;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ArrayAdapter;
 import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -69,6 +72,7 @@ public final class MainActivity extends Activity {
     private static final int DEBUG_FG = Color.rgb(120, 220, 140);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService net = Executors.newSingleThreadExecutor();  // Hugging Face API + downloads
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final List<String[]> history = new ArrayList<>();  // {user, assistant}
     private final SimpleDateFormat clock = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
@@ -96,7 +100,15 @@ public final class MainActivity extends Activity {
         buildUi();
         modeButton.setText(useGpu ? "GPU" : "CPU");
         log("Liyab Chat started; models folder: " + modelsDir());
-        restoreLastModelOrAsk();
+        // Scriptable download (testing / automation):
+        //   adb shell am start -n com.liyab.chat/.MainActivity --es download "owner/repo|file.gguf"
+        String request = getIntent().getStringExtra("download");
+        if (request != null && request.contains("|")) {
+            String[] parts = request.split("\\|", 2);
+            downloadByName(parts[0], parts[1]);
+        } else {
+            restoreLastModelOrAsk();
+        }
     }
 
     @Override
@@ -105,6 +117,8 @@ public final class MainActivity extends Activity {
         if (engine != 0) LiyabNative.cancel(engine);
         worker.execute(this::unloadOnWorker);
         worker.shutdown();
+        if (download != null) download.cancelled = true;
+        net.shutdownNow();
     }
 
     // ------------------------------------------------------------------ UI
@@ -132,7 +146,7 @@ public final class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setPadding(dp(16), dp(10), dp(8), 0);
         TextView title = new TextView(this);
-        title.setText("🔥 Liyab Chat");
+        title.setText("🔥 Liyab");
         title.setTextColor(Color.WHITE);
         title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -359,25 +373,388 @@ public final class MainActivity extends Activity {
     private void showModelPicker() {
         if (generating) return;
         File[] local = localModels();
+        List<HuggingFace.Partial> partials = HuggingFace.partials(modelsDir());
         List<String> labels = new ArrayList<>();
-        for (File f : local) labels.add(String.format(Locale.US, "%s  (%.2f GB)", f.getName(), f.length() / 1e9));
+        List<Runnable> actions = new ArrayList<>();
+        for (File f : local) {
+            labels.add(String.format(Locale.US, "%s  (%.2f GB)", f.getName(), f.length() / 1e9));
+            actions.add(() -> loadModel(f, null));
+        }
+        for (HuggingFace.Partial p : partials) {
+            labels.add(String.format(Locale.US, "⏸ %s — %.0f%% downloaded, tap to resume", p.file.fileName(),
+                    100.0 * p.done / Math.max(1, p.file.size)));
+            actions.add(() -> startDownload(p.file));
+        }
+        labels.add("⬇ Download from Hugging Face…");
+        actions.add(this::showHuggingFaceSearch);
+        if (local.length > 0 || !partials.isEmpty()) {
+            labels.add("🗑 Manage downloaded models…");
+            actions.add(this::showManageModels);
+        }
         labels.add("Browse phone storage…");
-        if (engine != 0) labels.add("Unload current model");
+        actions.add(() -> {
+            Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            pick.addCategory(Intent.CATEGORY_OPENABLE);
+            pick.setType("*/*");
+            startActivityForResult(pick, PICK_MODEL);
+        });
+        if (engine != 0) {
+            labels.add("Unload current model");
+            actions.add(this::unload);
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Choose a model")
-                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
-                    if (which < local.length) {
-                        loadModel(local[which], null);
-                    } else if (which == local.length) {
-                        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                        pick.addCategory(Intent.CATEGORY_OPENABLE);
-                        pick.setType("*/*");
-                        startActivityForResult(pick, PICK_MODEL);
-                    } else {
-                        unload();
-                    }
-                })
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> actions.get(which).run())
                 .show();
+    }
+
+    /** True when `f` is the model currently loaded (it is memory-mapped and cannot be deleted). */
+    private boolean inUse(File f) {
+        return engine != 0 && loadedFile != null && loadedFile.getAbsolutePath().equals(f.getAbsolutePath());
+    }
+
+    /** Lists downloaded and partial models with their sizes; tap one to delete it. */
+    private void showManageModels() {
+        File[] local = localModels();
+        List<HuggingFace.Partial> partials = HuggingFace.partials(modelsDir());
+        List<String> labels = new ArrayList<>();
+        List<Runnable> actions = new ArrayList<>();
+        long total = 0;
+        for (File f : local) {
+            total += f.length();
+            boolean used = inUse(f);
+            labels.add(String.format(Locale.US, "%s%s\n%.2f GB%s", used ? "● " : "", f.getName(), f.length() / 1e9,
+                    used ? " · in use (unload or load another model to delete)" : " · tap to delete"));
+            actions.add(() -> {
+                if (inUse(f)) {
+                    addNote(f.getName() + " is in use: unload it or load another model first.");
+                    return;
+                }
+                confirmDelete(f.getName(), f.length(), () -> {
+                    boolean ok = f.delete();
+                    if (ok && f.getAbsolutePath().equals(getPreferences(MODE_PRIVATE).getString("model", ""))) {
+                        getPreferences(MODE_PRIVATE).edit().remove("model").apply();
+                    }
+                    log((ok ? "Deleted " : "Could not delete ") + f.getName());
+                });
+            });
+        }
+        for (HuggingFace.Partial p : partials) {
+            File part = new File(modelsDir(), p.file.fileName() + ".part");
+            total += part.length();
+            labels.add(String.format(Locale.US, "⏸ %s (partial, %.0f%%)\n%.2f GB on disk · tap to delete",
+                    p.file.fileName(), 100.0 * p.done / Math.max(1, p.file.size), part.length() / 1e9));
+            actions.add(() -> {
+                if (download != null) {
+                    addNote("Stop the running download before deleting partial files.");
+                    return;
+                }
+                confirmDelete(p.file.fileName() + " (partial)", part.length(), () -> {
+                    HuggingFace.discard(modelsDir(), p.file);
+                    log("Deleted partial download " + p.file.fileName());
+                });
+            });
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(String.format(Locale.US, "Models · %.2f GB used · %.1f GB free", total / 1e9,
+                        modelsDir().getUsableSpace() / 1e9))
+                .setItems(labels.toArray(new String[0]), (d, which) -> actions.get(which).run())
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void confirmDelete(String name, long bytes, Runnable delete) {
+        new AlertDialog.Builder(this)
+                .setTitle("Delete model?")
+                .setMessage(String.format(Locale.US, "%s\n\nThis frees %.2f GB. You can download it again later.", name,
+                        bytes / 1e9))
+                .setPositiveButton("Delete", (d, w) -> {
+                    delete.run();
+                    showManageModels();  // refreshed list
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ---------------------------------------------------------- Hugging Face
+
+    private void showHuggingFaceSearch() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(8), dp(16), 0);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        EditText query = new EditText(this);
+        query.setHint("Search GGUF models (e.g. tinyllama, mistral 7b)");
+        query.setSingleLine(true);
+        query.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        row.addView(query, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button go = new Button(this);
+        go.setText("Search");
+        go.setAllCaps(false);
+        row.addView(go);
+        box.addView(row);
+        TextView hint = new TextView(this);
+        hint.setTextColor(MUTED);
+        hint.setTextSize(12);
+        hint.setText("Most downloaded GGUF repositories");
+        box.addView(hint);
+        ListView list = new ListView(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
+        list.setAdapter(adapter);
+        box.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(380)));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Hugging Face")
+                .setView(box)
+                .setNegativeButton("Close", null)
+                .show();
+        final List<HuggingFace.Repo> results = new ArrayList<>();
+        Runnable search = () -> {
+            String q = query.getText().toString().trim();
+            hint.setText("Searching…");
+            net.execute(() -> {
+                try {
+                    List<HuggingFace.Repo> repos = HuggingFace.search(q);
+                    ui.post(() -> {
+                        results.clear();
+                        results.addAll(repos);
+                        adapter.clear();
+                        for (HuggingFace.Repo r : repos) {
+                            adapter.add(String.format(Locale.US, "%s\n⬇ %s   ♥ %d", r.id, compact(r.downloads), r.likes));
+                        }
+                        hint.setText(repos.isEmpty() ? "No GGUF repositories found"
+                                : repos.size() + " repositories · tap one to see its files");
+                    });
+                } catch (Exception e) {
+                    ui.post(() -> hint.setText("Search failed: " + e.getMessage()));
+                }
+            });
+        };
+        go.setOnClickListener(v -> search.run());
+        query.setOnEditorActionListener((v, actionId, event) -> {
+            search.run();
+            return true;
+        });
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            dialog.dismiss();
+            showHuggingFaceFiles(results.get(position).id);
+        });
+        search.run();
+    }
+
+    private void showHuggingFaceFiles(String repo) {
+        AlertDialog loading = new AlertDialog.Builder(this).setTitle(repo).setMessage("Listing files…").show();
+        net.execute(() -> {
+            try {
+                List<HuggingFace.GgufFile> files = HuggingFace.files(repo);
+                ui.post(() -> {
+                    loading.dismiss();
+                    if (files.isEmpty()) {
+                        new AlertDialog.Builder(this).setTitle(repo).setMessage("No .gguf files in this repository.")
+                                .setPositiveButton("OK", null).show();
+                        return;
+                    }
+                    String[] labels = new String[files.size()];
+                    for (int i = 0; i < files.size(); i++) {
+                        HuggingFace.GgufFile f = files.get(i);
+                        labels[i] = String.format(Locale.US, "%s\n%.2f GB · %s · %s", f.fileName(), f.size / 1e9,
+                                f.quant, f.compat.label);
+                    }
+                    new AlertDialog.Builder(this)
+                            .setTitle(repo)
+                            .setItems(labels, (d, which) -> confirmDownload(files.get(which)))
+                            .setNegativeButton("Back", (d, w) -> showHuggingFaceSearch())
+                            .show();
+                });
+            } catch (Exception e) {
+                ui.post(() -> {
+                    loading.dismiss();
+                    addNote("Could not list " + repo + ": " + e.getMessage());
+                });
+            }
+        });
+    }
+
+    private void confirmDownload(HuggingFace.GgufFile f) {
+        String message = String.format(Locale.US, "%s\n%.2f GB, free space %.1f GB\n\n%s", f.fileName(),
+                f.size / 1e9, modelsDir().getUsableSpace() / 1e9,
+                f.compat == HuggingFace.Compat.OK ? "Liyab can run this format."
+                        : f.compat == HuggingFace.Compat.MAYBE
+                        ? "Q4_0/Q4_1 files usually keep the output head in Q6_K, which Liyab does not run yet. "
+                        + "Q8_0 is the safe choice today."
+                        : "Liyab cannot run " + f.quant + " yet (K-quants / IQ formats). Pick a Q8_0 or F16 file.");
+        new AlertDialog.Builder(this)
+                .setTitle("Download model?")
+                .setMessage(message)
+                .setPositiveButton("Download", (d, w) -> startDownload(f))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Looks the file up in the repository listing (for its size) and downloads it. */
+    private void downloadByName(String repo, String path) {
+        log("Requested download " + repo + "/" + path);
+        net.execute(() -> {
+            try {
+                for (HuggingFace.GgufFile f : HuggingFace.files(repo)) {
+                    if (f.path.equals(path)) {
+                        ui.post(() -> startDownload(f));
+                        return;
+                    }
+                }
+                log("ERROR: " + path + " not found in " + repo);
+            } catch (Exception e) {
+                log("ERROR: " + e.getMessage());
+            }
+        });
+    }
+
+    private static String compact(long n) {
+        if (n >= 1_000_000) return String.format(Locale.US, "%.1fM", n / 1e6);
+        if (n >= 1_000) return String.format(Locale.US, "%.1fk", n / 1e3);
+        return Long.toString(n);
+    }
+
+    private static String duration(double seconds) {
+        if (Double.isNaN(seconds) || Double.isInfinite(seconds) || seconds < 0) return "--:--";
+        long s = Math.round(seconds);
+        return s >= 3600 ? String.format(Locale.US, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+                : String.format(Locale.US, "%d:%02d", s / 60, s % 60);
+    }
+
+    private volatile HuggingFace.DownloadState download;
+
+    /** Runs (or resumes) a download with a live progress dialog, then loads the model. */
+    private void startDownload(HuggingFace.GgufFile f) {
+        if (download != null) {
+            addNote("A download is already running.");
+            return;
+        }
+        final HuggingFace.DownloadState state = new HuggingFace.DownloadState();
+        download = state;
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(12), dp(20), dp(4));
+        TextView name = new TextView(this);
+        name.setText(f.repo + "\n" + f.fileName());
+        name.setTextSize(13);
+        box.addView(name);
+        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        bar.setMax(1000);
+        LinearLayout.LayoutParams barParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(18));
+        barParams.topMargin = dp(12);
+        box.addView(bar, barParams);
+        TextView percent = new TextView(this);
+        percent.setTextSize(22);
+        percent.setTypeface(Typeface.DEFAULT_BOLD);
+        box.addView(percent);
+        TextView details = new TextView(this);
+        details.setTypeface(Typeface.MONOSPACE);
+        details.setTextSize(12);
+        box.addView(details);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Downloading model")
+                .setView(box)
+                .setCancelable(false)
+                .setPositiveButton("Pause", null)
+                .setNegativeButton("Cancel", null)
+                .show();
+        android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        android.os.PowerManager.WakeLock wake = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "liyab:download");
+        wake.acquire(6 * 60 * 60 * 1000L);  // safety timeout: 6 h
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        final boolean[] discard = {false};
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            state.cancelled = true;  // keeps the partial file; resume from the model picker
+            ((Button) v).setEnabled(false);
+            details.append("\nPausing…");
+        });
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+            discard[0] = true;
+            state.cancelled = true;
+        });
+
+        // Live stats: progress, smoothed speed, elapsed time and ETA, refreshed 4x per second.
+        final long startNanos = System.nanoTime();
+        final long[] last = {-1, startNanos};
+        final double[] speed = {0};
+        final Runnable[] ticker = new Runnable[1];
+        ticker[0] = () -> {
+            long done = state.done.get();
+            long total = Math.max(1, state.total);
+            long now = System.nanoTime();
+            if (last[0] >= 0) {
+                double dt = (now - last[1]) / 1e9;
+                if (dt > 0) {
+                    double instant = (done - last[0]) / dt;
+                    speed[0] = speed[0] == 0 ? instant : 0.8 * speed[0] + 0.2 * instant;  // moving average
+                }
+            }
+            last[0] = done;
+            last[1] = now;
+            if (state.verifying) {
+                long checked = state.verified.get();
+                bar.setProgress((int) (1000 * checked / total));
+                percent.setText(String.format(Locale.US, "Verifying %.0f%%", 100.0 * checked / total));
+                details.setText("Checking SHA-256 against Hugging Face…");
+                if (download == state) ui.postDelayed(ticker[0], 250);
+                return;
+            }
+            bar.setProgress((int) (1000 * done / total));
+            percent.setText(String.format(Locale.US, "%.1f%%", 100.0 * done / total));
+            double elapsed = (now - startNanos) / 1e9;
+            double eta = speed[0] > 1 ? (total - done) / speed[0] : Double.NaN;
+            StringBuilder sb = new StringBuilder(String.format(Locale.US,
+                    "%.2f / %.2f GB\n%.1f MB/s · %d connections\nelapsed %s · remaining %s",
+                    done / 1e9, total / 1e9, speed[0] / 1e6, state.activeConnections.get(), duration(elapsed),
+                    duration(eta)));
+            if (state.retries.get() > 0) {
+                sb.append(String.format(Locale.US, "\nretries: %d (last: %s)", state.retries.get(), state.lastError));
+            }
+            details.setText(sb.toString());
+            if (download == state) ui.postDelayed(ticker[0], 250);
+        };
+        ui.post(ticker[0]);
+        log("Download started: " + f.repo + "/" + f.path + String.format(Locale.US, " (%.2f GB)", f.size / 1e9));
+
+        net.execute(() -> {
+            File result = null;
+            String error = null;
+            try {
+                result = HuggingFace.download(f, modelsDir(), state);
+            } catch (Exception e) {
+                error = e.getMessage();
+            }
+            final File done = result;
+            final String err = error;
+            final double seconds = (System.nanoTime() - startNanos) / 1e9;
+            ui.post(() -> {
+                download = null;
+                if (wake.isHeld()) wake.release();
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                dialog.dismiss();
+                if (done != null) {
+                    log(String.format(Locale.US, "Downloaded %s in %s (%.1f MB/s avg, %d retries)%s", done.getName(),
+                            duration(seconds), f.size / 1e6 / Math.max(seconds, 0.001), state.retries.get(),
+                            f.sha256 != null ? ", SHA-256 verified" : ""));
+                    loadModel(done, null);
+                } else if (discard[0]) {
+                    HuggingFace.discard(modelsDir(), f);
+                    log("Download cancelled and partial file deleted: " + f.fileName());
+                } else {
+                    log("Download stopped: " + err + " — resume it from the Model menu");
+                    addNote("Download of " + f.fileName() + " paused at "
+                            + String.format(Locale.US, "%.0f%%", 100.0 * state.done.get() / Math.max(1, state.total))
+                            + (err != null && !err.contains("paused") ? " (" + err + ")" : "")
+                            + ". Open Model to resume.");
+                }
+            });
+        });
     }
 
     @Override
@@ -478,8 +855,7 @@ public final class MainActivity extends Activity {
                     status.setText(String.format(Locale.US, "%s · %s · ready in %.1fs", label,
                             useGpu ? "GPU" : "CPU", seconds));
                     send.setEnabled(true);
-                    addNote("Model loaded on " + (useGpu ? "GPU (Vulkan)" : "CPU") + ": " + label
-                            + (useGpu ? " — weights are copied to GPU memory on the first message" : ""));
+                    addNote("Model loaded on " + (useGpu ? "GPU (Vulkan)" : "CPU") + ": " + label);
                 });
             } catch (Exception e) {
                 drainNativeLogs();

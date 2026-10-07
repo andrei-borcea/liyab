@@ -7,6 +7,11 @@
 
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
 
+    <!-- Model downloads from Hugging Face. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Keep the CPU awake while a multi-GB download runs with the screen off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application
         android:label="Liyab Chat"
         android:extractNativeLibs="true"
