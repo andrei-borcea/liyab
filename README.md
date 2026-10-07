@@ -2,40 +2,40 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android_%7C_iOS-brightgreen.svg)]()
-[![Backend](https://img.shields.io/badge/Accelerators-Qualcomm_QNN_%7C_MediaTek_%7C_CoreML_%7C_Vulkan-orange.svg)]()
+[![Accelerators](https://img.shields.io/badge/Accelerators-Qualcomm_QNN_%7C_MediaTek_%7C_CoreML_%7C_Vulkan-orange.svg)]()
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
 
-> **Liyab** (*Tagalog per "Fiamma"*): Un motore d'inferenza bare-metal, ultra-ottimizzato e cross-platform, progettato per far girare modelli LLM e Generativi di grandi dimensioni (fino a 35B+ parametri) direttamente sull'hardware locale di smartphone Android e iOS, con zero dipendenze dal Cloud.
+> **Liyab** (*Tagalog for "Flame"*): A bare-metal, ultra-optimized, cross-platform inference engine designed to run large LLMs and Generative models (up to 35B+ parameters) directly on consumer Android and iOS hardware with zero Cloud dependencies.
 
 ---
 
-## 📋 Indice delle Sezioni
+## 📋 Table of Contents
 
-- [Caratteristiche Principali](#-caratteristiche-principali)
-- [Architettura del Sistema](#-architettura-del-sistema)
-- [Hardware e Backend Supportati](#-hardware-e-backend-supportati)
-- [Requisiti di Sistema](#-requisiti-di-sistema)
-- [Guida all'Installazione e Compilazione](#-guida-allinstallazione-e-compilazione)
-- [Esempi di Codice (Usage)](#-esempi-di-codice-usage)
-  - [C++ Native API](#c-native-api)
-  - [Android Integration (Kotlin / JNI)](#android-integration-kotlin--jni)
-  - [iOS Integration (Swift / C Interop)](#ios-integration-swift--c-interop)
-- [Benchmark Prestazionali](#-benchmark-prestazionali)
-- [Roadmap del Progetto](#-roadmap-del-progetto)
-- [Licenza e Contributi](#-licenza-e-contributi)
-
----
-
-## 🔥 Caratteristiche Principali
-
-* **Zero-Copy Memory-Mapped Streaming (`mmap`):** Bypassa i limiti di RAM imposti dai sistemi operativi mobili eseguendo lo streaming dei pesi in tempo reale dalla memoria di archiviazione veloce (UFS 4.1 / NVMe) ai buffer GPU/NPU.
-* **Routing Hardware Eterogeneo Automatico:** Rileva a runtime il System-on-Chip (SoC) del dispositivo e indirizza i grafi di calcolo al miglior acceleratore hardware disponibile.
-* **Supporto Quantizzazione Sub-Byte:** Piena compatibilità con modelli quantizzati in formato **AWQ**, **GPTQ** e **GGUF** (IQ2_XXS, IQ3_M, INT4, INT8) ottimizzati per pipeline integer NPU.
-* **Gestione Termica e Dynamic Context Window:** Ridimensionamento dinamico della cache KV (*PagedAttention* / *Sliding Window*) per prevenire il throttling termico e prolungare la durata della batteria durante sessioni di generazione lunghe.
+* [Key Features](#-key-features)
+* [System Architecture](#-system-architecture)
+* [Supported Hardware & Backends](#-supported-hardware--backends)
+* [System Requirements](#-system-requirements)
+* [Installation & Build Guide](#-installation--build-guide)
+* [Code Examples (Usage)](#-code-examples-usage)
+  * [C++ Native API](#c-native-api)
+  * [Android Integration (Kotlin / JNI)](#android-integration-kotlin--jni)
+  * [iOS Integration (Swift / C Interop)](#ios-integration-swift--c-interop)
+* [Performance Benchmarks](#-performance-benchmarks)
+* [Project Roadmap](#-project-roadmap)
+* [License & Contributions](#-license--contributions)
 
 ---
 
-## 🏛️ Architettura del Sistema
+## 🔥 Key Features
+
+* **Zero-Copy Memory-Mapped Streaming (`mmap`):** Bypasses mobile OS RAM allocation limits by streaming model weights in real time from fast storage (UFS 4.1 / NVMe) directly into GPU/NPU buffers.
+* **Heterogeneous Automatic Hardware Routing:** Detects the device System-on-Chip (SoC) at runtime and dynamically routes computation graphs to the best available hardware accelerator.
+* **Sub-Byte Quantization Support:** Full compatibility with **AWQ**, **GPTQ**, and **GGUF** (IQ2_XXS, IQ3_M, INT4, INT8) quantized models optimized for integer-heavy NPU pipelines.
+* **Thermal Management & Dynamic Context Window:** Dynamic KV-cache scaling (*PagedAttention* / *Sliding Window*) to prevent thermal throttling and maximize battery efficiency during long generation runs.
+
+---
+
+## 🏛️ System Architecture
 
 ```
                          +-----------------------------------------+
@@ -55,7 +55,7 @@
 +---------------------+            +---------------------+            +---------------------+
            |                                  |                                  |
            +----------------------------------+----------------------------------+
-                                              | (Fallback Universale)
+                                              | (Universal Fallback)
                                   +-----------v----------+
                                   | Vulkan / ARM NEON    |
                                   |  (Adreno / Mali GPU) |
@@ -64,9 +64,9 @@
 
 ---
 
-## 💻 Hardware e Backend Supportati
+## 💻 Supported Hardware & Backends
 
-| Produttore | Famiglia Chip | Backend Primario | Fallback Hardware |
+| Manufacturer | Chipset Family | Primary Backend | Hardware Fallback |
 | :--- | :--- | :--- | :--- |
 | **Qualcomm** | Snapdragon 8 Elite / Gen 3 / Gen 2 | Qualcomm QNN (Hexagon NPU) | Vulkan Compute (Adreno GPU) |
 | **MediaTek** | Dimensity 9400 / 9300 / 8300 | MediaTek NeuroPilot (APU) | Vulkan Compute (Mali GPU) |
@@ -76,27 +76,27 @@
 
 ---
 
-## 🛠️ Requisiti di Sistema
+## 🛠️ System Requirements
 
-### Per lo sviluppo e la compilazione:
-* **Host Build OS:** Linux (Ubuntu 22.04+), macOS (14.0+) o Windows tramite WSL2.
-* **CMake:** v3.22 o superiore.
-* **Android NDK:** r26b o superiore.
-* **Xcode:** v15.0+ (per iOS).
-* **Python:** v3.10+ (utilizzato per gli script di conversione dei pesi).
+### For Development & Compilation:
+* **Host Build OS:** Linux (Ubuntu 22.04+), macOS (14.0+), or Windows via WSL2.
+* **CMake:** v3.22 or higher.
+* **Android NDK:** r26b or higher.
+* **Xcode:** v15.0+ (for iOS builds).
+* **Python:** v3.10+ (used for weight conversion scripts).
 
 ---
 
-## 📦 Guida all'Installazione e Compilazione
+## 📦 Installation & Build Guide
 
-### 1. Clona il Repository con le Dipendenze
+### 1. Clone the Repository with Submodules
 ```bash
 git clone --recursive https://github.com/your-username/liyab.git
 cd liyab
 ```
 
-### 2. Compilazione per Android (Shared Object `.so`)
-Per compilare la libreria C++ nativa con supporto completo a Qualcomm QNN e Vulkan:
+### 2. Building for Android (Shared Object `.so`)
+To build the native C++ shared library with full support for Qualcomm QNN and Vulkan:
 
 ```bash
 chmod +x scripts/build_android.sh
@@ -106,10 +106,10 @@ chmod +x scripts/build_android.sh
     --enable-qnn \
     --build-type Release
 ```
-I file compilati `.so` saranno disponibili all'interno della cartella `build_android/libs/`.
+The compiled `.so` files will be output to `build_android/libs/`.
 
-### 3. Compilazione per iOS (Framework)
-Per generare il framework `.xcframework` universale per dispositivi iOS:
+### 3. Building for iOS (Framework)
+To generate the universal `.xcframework` for iOS devices:
 
 ```bash
 chmod +x scripts/build_ios.sh
@@ -120,7 +120,7 @@ chmod +x scripts/build_ios.sh
 
 ---
 
-## 💻 Esempi di Codice (Usage)
+## 💻 Code Examples (Usage)
 
 ### C++ Native API
 
@@ -129,27 +129,27 @@ chmod +x scripts/build_ios.sh
 #include <iostream>
 
 int main() {
-    // 1. Inizializzazione della configurazione
+    // 1. Initialize configuration
     liyab::EngineConfig config;
-    config.enable_mmap = true;                           // Attiva lo streaming zero-copy da UFS/NVMe
-    config.preferred_backend = liyab::Backend::AUTO;    // Auto-detect tra QNN, NeuroPilot, CoreML o Vulkan
+    config.enable_mmap = true;                           // Enable zero-copy streaming from UFS/NVMe
+    config.preferred_backend = liyab::Backend::AUTO;    // Auto-detect QNN, NeuroPilot, CoreML, or Vulkan
     config.max_context_length = 4096;
 
-    // 2. Istanziazione del motore
+    // 2. Instantiate engine
     liyab::Engine engine(config);
 
-    // 3. Caricamento del modello quantizzato (.liyab / .gguf)
+    // 3. Load quantized model (.liyab / .gguf)
     if (!engine.load_model("models/qwen-2.5-32b-iq3.liyab")) {
-        std::cerr << "Errore durante il caricamento del modello." << std::endl;
+        std::cerr << "Failed to load model." << std::endl;
         return -1;
     }
 
-    // 4. Invocazione dell'inferenza con callback per streaming dei token
-    std::string prompt = "Spiega il concetto di memoria unificata nei SoC moderni.";
+    // 4. Run inference with token streaming callback
+    std::string prompt = "Explain unified memory architecture in modern SoCs.";
     
     engine.generate(prompt, [](const std::string& token) {
         std::cout << token << std::flush;
-        return true; // Restituisci false per interrompere la generazione
+        return true; // Return false to halt generation
     });
 
     return 0;
@@ -168,7 +168,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Configura il motore nativo
+        // Configure native engine
         val config = LiyabConfig(
             enableMmap = true,
             useNpuAcceleration = true,
@@ -178,8 +178,8 @@ class MainActivity : AppCompatActivity() {
         liyabEngine = LiyabEngine(config)
         liyabEngine.initialize()
 
-        // Esegui la generazione in streaming
-        liyabEngine.generateStream("Scrivi una poesia sulla velocità del silicio.") { token ->
+        // Execute streaming inference
+        liyabEngine.generateStream("Write a short poem about silicon speed.") { token ->
             runOnUiThread {
                 binding.textViewOutput.append(token)
             }
@@ -222,11 +222,11 @@ class AIInferenceService {
 
 ---
 
-## 📊 Benchmark Prestazionali
+## 📊 Performance Benchmarks
 
-I seguenti benchmark sono stati rilevati eseguendo modelli di classe **32B - 35B parametri** (quantizzazione 3-bit `IQ3_M`) in locale su dispositivi di serie:
+*Benchmarked on **32B - 35B parameter** class models (`IQ3_M` 3-bit quantization) running locally on retail devices:*
 
-| Dispositivo | SoC | RAM | Backend Attivo | Velocità Generazione | Latenza Primo Token (TTFT) |
+| Device | SoC | RAM | Active Backend | Generation Throughput | Time To First Token (TTFT) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Xiaomi 15 Ultra** | Snapdragon 8 Elite | 16 GB | Qualcomm QNN + Vulkan | **12 - 16 t/s** | ~240 ms |
 | **iPhone 15 Pro Max** | Apple A17 Pro | 8 GB | Metal MPSGraph + mmap | **8 - 11 t/s** | ~380 ms |
@@ -235,28 +235,28 @@ I seguenti benchmark sono stati rilevati eseguendo modelli di classe **32B - 35B
 
 ---
 
-## 🗺️ Roadmap del Progetto
+## 🗺️ Project Roadmap
 
-- [x] **Fase 1:** Motore C++ nativo con supporto `mmap` e backend Vulkan universale.
-- [x] **Fase 2:** Integrazione SDK Qualcomm QNN per NPU Hexagon e CoreML per iOS.
-- [ ] **Fase 3:** Supporto completo per l'SDK MediaTek NeuroPilot.
-- [ ] **Fase 4:** Modulo di quantizzazione custom `LiyabQuant` per il caricamento ultra-veloce di pesi sub-2bit.
-- [ ] **Fase 5:** Supporto Multi-Modal (Vision-Language Models come LLaVA e Phi-3-Vision).
+- [x] **Phase 1:** Bare-metal C++ engine with `mmap` support and universal Vulkan backend.
+- [x] **Phase 2:** Integration with Qualcomm QNN SDK (Hexagon NPU) and CoreML for iOS.
+- [ ] **Phase 3:** Full native support for MediaTek NeuroPilot SDK.
+- [ ] **Phase 4:** Custom `LiyabQuant` module for ultra-fast sub-2bit weight loading.
+- [ ] **Phase 5:** Multi-modal support (Vision-Language Models like LLaVA and Phi-3-Vision).
 
 ---
 
-## 🤝 Licenza e Contributi
+## 🤝 License & Contributions
 
-### Licenza
-Questo progetto è distribuito sotto la licenza **Apache 2.0**. Per maggiori dettagli, consultare il file [LICENSE](LICENSE).
+### License
+This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LICENSE) file for more details.
 
-### Contributi
-I contributi della community sono i benvenuti! Se desideri aggiungere un nuovo backend per un chipset specifico, correggere un bug o ottimizzare i kernel di calcolo:
-1. Consulta le nostre [Linee Guida per i Contributi](CONTRIBUTING.md).
-2. Apri un'issue per discutere la modifica proposta prima di inviare una Pull Request.
+### Contributions
+Community contributions are welcome! If you would like to add a new backend for a specific SoC, fix a bug, or optimize math kernels:
+1. Review our [Contribution Guidelines](CONTRIBUTING.md).
+2. Open an issue to discuss your proposed changes before submitting a Pull Request.
 
 ---
 
 <p align="center">
-  Sviluppato con ❤️ per spingere i limiti dell'AI Edge su dispositivi mobili.
+  Built with ❤️ to push the boundaries of Edge AI on mobile hardware.
 </p>
