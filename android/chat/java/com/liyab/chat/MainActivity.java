@@ -58,6 +58,7 @@ public final class MainActivity extends Activity {
     private static final int THREADS = 4;    // fastest setting measured on Snapdragon 8 Elite
     private static final int MAX_TURNS = 6;  // history kept in the prompt (2048-token context)
     private static final int PICK_MODEL = 1;
+    private static final long FRAME_MS = 33;  // streaming redraw interval (~30 fps)
 
     private static final int BG = Color.rgb(16, 17, 20);
     private static final int USER_BG = Color.rgb(46, 86, 160);
@@ -241,14 +242,18 @@ public final class MainActivity extends Activity {
         bubble.setTextIsSelectable(true);
         bubble.setPadding(dp(14), dp(10), dp(14), dp(10));
         bubble.setBackground(rounded(user ? USER_BG : BOT_BG, 16));
-        LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        // Model replies grow while streaming: give them a fixed (full) width so
+        // only the height changes; user messages are static and wrap their text.
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                user ? ViewGroup.LayoutParams.WRAP_CONTENT : ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
         params.gravity = user ? Gravity.END : Gravity.START;
         params.topMargin = dp(8);
         if (user) params.leftMargin = dp(48);
-        else params.rightMargin = dp(48);
+        else params.rightMargin = dp(24);
+        if (!user) bubble.setMinHeight(dp(40));
         messages.addView(bubble, params);
-        scrollToBottom();
+        scrollToBottom(true);
         return bubble;
     }
 
@@ -259,12 +264,23 @@ public final class MainActivity extends Activity {
         note.setTextSize(11);
         note.setPadding(dp(4), dp(2), dp(4), 0);
         messages.addView(note);
-        scrollToBottom();
+        scrollToBottom(true);
         return note;
     }
 
-    private void scrollToBottom() {
-        scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+    /** True when the conversation is scrolled (almost) to the end. */
+    private boolean atBottom() {
+        View content = scroll.getChildAt(0);
+        return content == null || content.getBottom() - (scroll.getScrollY() + scroll.getHeight()) < dp(48);
+    }
+
+    /**
+     * Scrolls to the end without moving focus (fullScroll(FOCUS_DOWN) steals focus from the input and makes the
+     * view jump). While streaming, only follow the text if the user has not scrolled up to read.
+     */
+    private void scrollToBottom(boolean force) {
+        if (!force && !atBottom()) return;
+        scroll.post(() -> scroll.scrollTo(0, Math.max(0, messages.getBottom() - scroll.getHeight())));
     }
 
     private void toggleDebug() {
@@ -296,7 +312,7 @@ public final class MainActivity extends Activity {
         final String stamped = clock.format(new Date()) + "  " + line + "\n";
         ui.post(() -> {
             debugLog.append(stamped);
-            debugScroll.post(() -> debugScroll.fullScroll(View.FOCUS_DOWN));
+            debugScroll.post(() -> debugScroll.scrollTo(0, debugLog.getBottom()));
         });
     }
 
@@ -516,6 +532,17 @@ public final class MainActivity extends Activity {
 
         final String prompt = buildPrompt(message);
         final StringBuilder text = new StringBuilder();
+        // Tokens arrive faster than the screen refreshes: render at most every
+        // FRAME_MS, so the bubble re-lays out ~30 times per second, not per token.
+        final boolean[] renderPending = {false};
+        final Runnable render = () -> {
+            boolean follow = atBottom();
+            synchronized (text) {
+                renderPending[0] = false;
+                reply.setText(text.toString().replaceFirst("^\\s+", ""));
+            }
+            if (follow) scrollToBottom(true);
+        };
         worker.execute(() -> {
             String error = null;
             double[] stats = null;
@@ -524,13 +551,11 @@ public final class MainActivity extends Activity {
                     String piece = new String(bytes, StandardCharsets.UTF_8);
                     synchronized (text) {
                         text.append(piece);
-                    }
-                    ui.post(() -> {
-                        synchronized (text) {
-                            reply.setText(text.toString().replaceFirst("^\\s+", ""));
+                        if (!renderPending[0]) {
+                            renderPending[0] = true;
+                            ui.postDelayed(render, FRAME_MS);
                         }
-                        scrollToBottom();
-                    });
+                    }
                     return true;
                 });
             } catch (RuntimeException e) {
@@ -546,6 +571,8 @@ public final class MainActivity extends Activity {
                 log("ERROR: " + err);
             }
             ui.post(() -> {
+                ui.removeCallbacks(render);
+                render.run();  // final text, even if a frame was pending
                 generating = false;
                 send.setText("Send");
                 String answer;
@@ -565,7 +592,7 @@ public final class MainActivity extends Activity {
                             (int) s[1], s[2], s[3] / 1000.0, (int) s[0], (int) s[4],
                             s[6] > 0 ? " · thermal throttle" : "", s[7] > 0 ? " · stopped" : ""));
                 }
-                scrollToBottom();
+                scrollToBottom(false);
             });
         });
     }
