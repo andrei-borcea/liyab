@@ -26,6 +26,8 @@ import java.util.regex.Pattern;
 final class HuggingFace {
     private static final String API = "https://huggingface.co";
     private static final String USER_AGENT = "LiyabChat/0.1 (Android)";
+    // Multi-file (split) GGUF shards: the loader maps single files only for now.
+    private static final Pattern SPLIT = Pattern.compile("-\\d{5}-of-\\d{5}\\.gguf$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUANT = Pattern.compile(
             "(IQ\\d_[A-Z]+|Q\\d_K(?:_[SML])?|Q\\d_\\d|TQ\\d_\\d|BF16|F16|F32|MXFP4|NVFP4)", Pattern.CASE_INSENSITIVE);
 
@@ -60,6 +62,7 @@ final class HuggingFace {
         final String sha256;  // from the LFS pointer; null when unknown
         final String quant;
         final Compat compat;
+        final boolean split;  // one shard of a multi-file GGUF (-00001-of-00003.gguf)
 
         GgufFile(String repo, String path, long size) {
             this(repo, path, size, null);
@@ -70,11 +73,12 @@ final class HuggingFace {
             this.path = path;
             this.size = size;
             this.sha256 = sha256;
+            this.split = SPLIT.matcher(path).find();
             Matcher m = QUANT.matcher(path);
             String q = null;
             while (m.find()) q = m.group(1).toUpperCase(Locale.US);  // last match: the suffix
             this.quant = q != null ? q : "?";
-            this.compat = compatOf(this.quant);
+            this.compat = split ? Compat.UNSUPPORTED : compatOf(this.quant);
         }
 
         String fileName() {

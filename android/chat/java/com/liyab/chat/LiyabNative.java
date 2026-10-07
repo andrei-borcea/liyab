@@ -38,4 +38,7 @@ final class LiyabNative {
     static native void destroy(long engine);
 
     static native String describe(long engine);
+
+    /** Number of tokens `text` encodes to (no BOS), or -1 on error. */
+    static native int countTokens(long engine, String text);
 }

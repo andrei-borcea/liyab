@@ -78,6 +78,6 @@ if [[ "$INSTALL" == 1 ]]; then
     adb shell mkdir -p "$DEST"
     adb push "$MODEL" "$DEST/"
   fi
-  adb shell am start -n com.liyab.chat/.MainActivity >/dev/null
+  adb shell am start -n com.liyab.chat/.HomeActivity >/dev/null
   echo "==> Installed and launched com.liyab.chat"
 fi

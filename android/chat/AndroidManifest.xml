@@ -13,19 +13,30 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
+        android:name=".LiyabApp"
         android:label="Liyab Chat"
         android:extractNativeLibs="true"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <!-- Home: status, quick actions, debug log. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".HomeActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
-            android:windowSoftInputMode="adjustResize">
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".ChatActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ModelsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize" />
     </application>
 </manifest>

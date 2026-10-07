@@ -147,6 +147,12 @@ JNIEXPORT void JNICALL Java_com_liyab_chat_LiyabNative_destroy(JNIEnv*, jclass, 
     if (h != 0) liyab_engine_destroy(handle(h));
 }
 
+JNIEXPORT jint JNICALL Java_com_liyab_chat_LiyabNative_countTokens(JNIEnv* env, jclass, jlong h, jstring text) {
+    if (h == 0) return -1;
+    const std::string s = to_string(env, text);
+    return liyab_engine_tokenize(handle(h), s.c_str(), 0, nullptr, 0);
+}
+
 JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_describe(JNIEnv* env, jclass, jlong h) {
     if (h == 0) return env->NewStringUTF("");
     std::string text(liyab_engine_describe(handle(h), nullptr, 0) + 1, '\0');

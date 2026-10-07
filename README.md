@@ -345,36 +345,37 @@ final class LiyabEngine {
 
 ### Demo app: Liyab Chat (Android)
 
-`android/chat` is a single-screen chat app in plain Java (no Gradle, no AndroidX) over the C ABI:
+`android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with three screens:
 
-* **CPU / GPU switch.** Reloads the model on the CPU (NEON) or the GPU (Vulkan). In GPU mode the weights are
-  uploaded at load time, not on the first message.
-* **Model picker.** Lists the `*.gguf` files in the app folder, or picks any file with the system picker. Picked
-  files are mapped through `/proc/self/fd`, so there is no copy and no storage permission. Loading a model first
-  unloads the previous one.
-* **Hugging Face downloads.** Searches GGUF repositories (sorted by downloads) and lists each file with its size,
-  quantization and a compatibility badge (Q8_0/F16 run today; Q4_0/Q4_1 presets usually keep a Q6_K output head).
-  Downloads use 4 parallel HTTP range connections. Per-segment progress is persisted, so a paused, killed or
-  disconnected download resumes where it stopped. Each segment retries with exponential backoff, and the file is
-  checked against the SHA-256 published by Hugging Face before it is loaded. Verified on the phone: a download
-  killed mid-way, then resumed, matches the published SHA-256. The live loader shows progress, GB, smoothed
-  MB/s, connections, elapsed time, ETA and retries, with Pause and Cancel.
-* **Model management.** Lists downloaded and partial models with their disk usage. Any of them can be deleted,
-  except the one currently loaded (it is memory-mapped).
-* **Debug panel.** Shows timestamped load steps plus Liyab's own log lines (via `liyab_set_log_callback`), with
-  per-message stats: tok/s, time to first token, reused prompt tokens.
-* **Streaming and multi-turn.** Replies stream token by token, with Stop to cancel. Earlier turns are reused through
-  the KV dedup prefix cache.
+* **Home.** Shows the model status (name, backend, SoC, running download) and quick actions: open chat, Models,
+  switch CPU/GPU, unload. The debug log stays visible here, with timestamped app events plus the engine's own log
+  lines (via `liyab_set_log_callback`), and can be copied or cleared.
+* **Chat.** Replies stream token by token; Stop cancels. Leaving the screen keeps the conversation. The prompt
+  format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). Earlier turns
+  are reused through the KV dedup prefix cache.
+* **Models (a full page, two tabs).**
+  * *On this phone:* load, chat, or delete each model (the loaded one is protected). Partial downloads can be
+    resumed or deleted. Any `.gguf` can be opened with the system picker (mapped through `/proc/self/fd`, so no copy
+    and no storage permission).
+  * *Hugging Face:* search GGUF repositories, then open one to list only the files Liyab can run, with size,
+    quantization and a RAM-fit hint. Multi-part shards are hidden; split GGUF is not supported yet.
+  * A live download card stays at the top. Downloads use 4 parallel range connections with per-segment state
+    persisted, so they resume after a pause, a kill or a network loss. Retries use exponential backoff, and the file
+    is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
+    you leave the page.
+
+Engine, log and download state live in process-wide holders (`EngineHolder`, `DebugLog`, `Downloads`), so moving
+between screens never interrupts them.
 
 ```bash
-scripts/build_android_app.sh --install                            # builds build/android-app/liyab-chat.apk
-adb push tinyllama-q4_0.gguf /sdcard/Android/data/com.liyab.chat/files/   # optional, after the first launch
-# scripted download (tests / automation):
-adb shell am start -n com.liyab.chat/.MainActivity --es download "'ggml-org/tiny-llamas|stories15M.gguf'"
+scripts/build_android_app.sh --install
+# scriptable entry points (tests / automation / deep links):
+adb shell am start -n com.liyab.chat/.HomeActivity --es download "'ggml-org/tiny-llamas|stories15M.gguf'"
+adb shell am start -n com.liyab.chat/.HomeActivity --es load qwen2.5-0.5b-q4_k_m.gguf --es open chat
 ```
 
-The app uses the Zephyr / TinyLlama chat template. Launch it once before pushing, so that Android creates the
-folder with the app as its owner.
+Models pushed with `adb` go to `/sdcard/Android/data/com.liyab.chat/files/`. Launch the app once first so the
+folder belongs to the app, and make pushed files readable (`chmod 666`).
 
 ### Command line
 
@@ -546,7 +547,7 @@ src/backends/           cpu/ (NEON), metal/ (Metal), vulkan/ (Vulkan compute + s
 src/experimental/       early exit, head pruning, direct-I/O loader
 src/c_api/              C ABI implementation
 tools/liyab_cli.cpp     command-line front end over the C ABI
-android/chat/           demo chat app (Java + JNI), built by scripts/build_android_app.sh
+android/chat/           demo app (Home / Chat / Models screens, Java + JNI), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
 scripts/                build_android.sh, build_ios.sh
 ```
