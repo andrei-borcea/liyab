@@ -408,6 +408,10 @@ public:
     BlockWeights& operator=(const BlockWeights&) = delete;
 
     [[nodiscard]] const Status& status() const noexcept { return status_; }
+    // True when the views point into a reused streaming slot rather than the
+    // mapping. Backends that keep per-tensor device copies (keyed by address)
+    // must not see such views: the next block reuses the same address.
+    [[nodiscard]] bool streamed() const noexcept { return item_ >= 0; }
     // The block's matrix with role `role` (only roles the block has).
     const TensorView& operator[](WeightRole role) const { return views_[role]; }
 
@@ -538,9 +542,10 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         const Layer& L = layers_[static_cast<size_t>(l)];
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
+        Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
         rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kK], xb_.data(), k_.data(), 1));
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kV], xb_.data(), v_.data(), 1));
+        LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kK], xb_.data(), k_.data(), 1));
+        LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kV], xb_.data(), v_.data(), 1));
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         if (!L.k_norm.empty()) {
@@ -963,6 +968,8 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const Layer& L = layers_[static_cast<size_t>(l)];
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
+        const Route cpu_route{route.cpu, route.cpu, route.cpu};
+        const Route& block_route = w.streamed() ? cpu_route : route;
 
         // --- expert prefetch: this block's router and the next one's, applied
         // to the hidden state entering the block, guess the experts ahead of
@@ -978,10 +985,10 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
         }
         if (L.mixer == MixerKind::DeltaNet) {
-            LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, route, pool));
+            LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
         } else {
             LIYAB_RETURN_IF_ERROR(
-                attention_mixer(l, w, n, route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
+                attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
         }
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
 
@@ -992,8 +999,8 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
-            if (L.moe) LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, route));
-            else LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, route, ffn_hook));
+            if (L.moe) LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
+            else LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 
