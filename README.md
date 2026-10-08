@@ -547,11 +547,13 @@ CPU backend, 8 threads, a 9-token prompt and 64 greedy tokens from a cold expert
 | + freshly loaded experts kept until used | 5.54 tok/s | 181 | 309 MiB |
 | + a block's experts in one batched pass | 5.93 tok/s | 169 | 309 MiB |
 | + Q4_K/Q5_K/Q6_K × Q8_K kernels (A/B reference) | 6.15 tok/s | 163 | 308 MiB |
-| + next block's experts predicted after the mixer | **6.44 tok/s** | 155 | 283 MiB |
+| + next block's experts predicted after the mixer | 6.44 tok/s | 155 | 283 MiB |
+| + 7 threads (one core left for I/O), chunks claimed on demand | **7.83 tok/s** | 128 | 283 MiB |
 
-The last two rows are means of 4 alternating A/B rounds in one session (the new build won every round). The new
-prediction is chosen by the router 83% of the time (77% before) and reads 31 experts per token for nothing instead
-of 44.
+The last three rows come from alternating A/B runs (4 rounds each, the new build won every round): means for the
+prediction step, medians for the thread step (6.30 → 7.83 tok/s in that session). The new prediction is chosen by
+the router 83% of the time (77% before) and reads 31 experts per token for nothing instead of 44; with 7 threads
+the routed experts take ~69 ms per token instead of ~87.
 
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident

@@ -173,6 +173,11 @@
     "label": "+ next block predicted after the mixer",
     "decode_tps": 6.44,
     "ms_per_token": 155.3
+   },
+   {
+    "label": "+ 7 threads, chunks claimed on demand",
+    "decode_tps": 7.83,
+    "ms_per_token": 127.7
    }
   ],
   "phases_ms_per_token": {
