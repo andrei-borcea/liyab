@@ -806,6 +806,8 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     std::sort(picks.begin(), picks.end());
     picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
     expert_store_->prefetch(layer, picks, true);
+    predicted_ = std::move(picks);
+    predicted_layer_ = layer;
 }
 
 Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
@@ -886,11 +888,21 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         if (!assigned[e].empty()) chosen.push_back(static_cast<int32_t>(e));
     }
     if (expert_store_ != nullptr) {
+        if (predicted_layer_ == layer) {  // both lists are sorted
+            predictions_.predicted += predicted_.size();
+            for (size_t i = 0, j = 0; i < predicted_.size() && j < chosen.size();) {
+                if (predicted_[i] == chosen[j]) ++predictions_.used;
+                if (predicted_[i] <= chosen[j]) ++i; else ++j;
+            }
+            predicted_layer_ = -1;
+        }
         expert_store_->prefetch(layer, chosen, false);
         std::stable_partition(chosen.begin(), chosen.end(),
                               [&](int32_t e) { return expert_store_->ready(layer, e); });
     }
     router_timer.stop();
+    // The next block's guess goes behind this block's own reads in the queue.
+    if (expert_store_ != nullptr) predict_experts(layer + 1, n, route);
 
     PhaseTimer experts_timer(phases_.experts);
     moe_out_.assign(un * d, 0.0f);
@@ -1010,6 +1022,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     const ModelConfig& c = config_;
     const auto n = static_cast<int32_t>(tokens.size());
     last_exit_layer_ = -1;
+    predicted_layer_ = -1;  // an early exit can leave a guess for a block that never ran
     if (n == 0) return Status(ErrorCode::InvalidArgument, "forward() needs at least one token");
     if (route.attention == nullptr || route.ffn == nullptr || route.cpu == nullptr) {
         return Status(ErrorCode::InvalidArgument, "incomplete backend route");
@@ -1047,13 +1060,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const Route cpu_route{route.cpu, route.cpu, route.cpu};
         const Route& block_route = w.streamed() ? cpu_route : route;
 
-        // --- expert prefetch: this block's router and the next one's, applied
-        // to the hidden state entering the block, guess the experts ahead of
-        // the mixer so their reads overlap it ---
-        if (expert_store_ != nullptr) {
-            if (l == 0) predict_experts(0, n, route);
-            predict_experts(l + 1, n, route);
-        }
+        // --- expert prefetch for the first block (the others are predicted
+        // one block ahead, see predict_experts) ---
+        if (expert_store_ != nullptr && l == 0) predict_experts(0, n, route);
 
         // --- token mixer (attention or DeltaNet) ---
         if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
@@ -1069,10 +1078,13 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
                 attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
         }
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+        // A MoE block predicts the next one once its own experts are queued (moe_ffn).
+        if (expert_store_ != nullptr && !L.moe) predict_experts(l + 1, n, route);
 
         // --- FFN block: dense SwiGLU or mixture of experts (skippable by an experimental hook) ---
         if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
             ++last_ffn_skips_;
+            if (expert_store_ != nullptr && L.moe) predict_experts(l + 1, n, route);
         } else {
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);

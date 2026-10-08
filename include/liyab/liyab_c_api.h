@@ -139,6 +139,9 @@ typedef struct liyab_generation_stats {
     double shared_expert_ms;      /* MoE shared experts */
     double dense_ffn_ms;          /* dense FFNs */
     double lm_head_ms;            /* output projection */
+    /* MoE expert prediction (one block ahead): precision = used / predicted */
+    int32_t expert_predicted;     /* experts guessed ahead of the router, cached ones included */
+    int32_t expert_predicted_used; /* guesses the router then chose */
 } liyab_generation_stats;
 
 /*

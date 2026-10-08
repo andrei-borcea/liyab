@@ -622,6 +622,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     stats.prompt_tokens = static_cast<int32_t>(prompt.size());
     const ExpertStore::Stats experts_before =
         s.target->expert_store() != nullptr ? s.target->expert_store()->stats() : ExpertStore::Stats{};
+    const Transformer::ExpertPredictions predictions_before = s.target->expert_predictions();
 
     // Prefill everything but the last prompt token, which seeds the decode
     // loop (the speculative decoder expects it uncached).
@@ -773,6 +774,9 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
         stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
         stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
+        const Transformer::ExpertPredictions& predictions = s.target->expert_predictions();
+        stats.expert_predicted = static_cast<int32_t>(predictions.predicted - predictions_before.predicted);
+        stats.expert_predicted_used = static_cast<int32_t>(predictions.used - predictions_before.used);
     }
     const Transformer::PhaseTimes& phases = s.target->phase_times();
     stats.decode_phases = {phases.attention - phases_before.attention,

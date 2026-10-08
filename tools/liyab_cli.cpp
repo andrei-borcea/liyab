@@ -217,8 +217,15 @@ int main(int argc, char** argv) {
                              std::max(1, stats.prompt_tokens + stats.generated_tokens),
                          stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
         }
+        if (stats.expert_predicted > 0) {
+            std::fprintf(stderr, "experts: prediction precision %.0f%% (%d of %d guesses chosen)\n",
+                         100.0 * stats.expert_predicted_used / stats.expert_predicted, stats.expert_predicted_used,
+                         stats.expert_predicted);
+        }
         if (stats.expert_unused > 0) {
-            std::fprintf(stderr, "experts: %d prefetched and evicted unused\n", stats.expert_unused);
+            std::fprintf(stderr, "experts: %d prefetched and evicted unused (%.1f per token)\n", stats.expert_unused,
+                         static_cast<double>(stats.expert_unused) /
+                             std::max(1, stats.prompt_tokens + stats.generated_tokens));
         }
         if (stats.generated_tokens > 0 && stats.decode_ms > 0.0) {
             // Decode time per token by phase; "other" is norms, residuals, sampling and callbacks.

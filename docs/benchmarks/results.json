@@ -142,7 +142,7 @@
  },
  "moe_35b": {
   "title": "Qwen3.6-35B-A3B UD-Q4_K_M (22.1 GB MoE) with a 5500 MiB memory budget",
-  "setup": "liyab-cli, CPU backend, 8 threads, 9-token prompt, 64 greedy tokens, cold expert cache (new process); runs vary by about 10% with heat",
+  "setup": "liyab-cli, CPU backend, 8 threads, 9-token prompt, 64 greedy tokens, cold expert cache (new process); runs vary by about 10% with heat, so the last rows are means of alternating A/B runs",
   "runs": [
    {
     "label": "Before (condition-variable thread pool)",
@@ -163,6 +163,16 @@
     "label": "+ a block's experts in one batched pass",
     "decode_tps": 5.93,
     "ms_per_token": 168.6
+   },
+   {
+    "label": "+ K-quant x Q8_K kernels (A/B reference)",
+    "decode_tps": 6.15,
+    "ms_per_token": 162.6
+   },
+   {
+    "label": "+ next block predicted after the mixer",
+    "decode_tps": 6.44,
+    "ms_per_token": 155.3
    }
   ],
   "phases_ms_per_token": {

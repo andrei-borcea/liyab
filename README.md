@@ -308,9 +308,10 @@ build runs, so front ends can filter downloads without a copy of the list. `liya
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off); `memory_budget_mb` caps the
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
 OS counters do not show (`liyab-cli --memory-budget MB`); and `liyab_generation_stats`
-reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms` and
-`expert_unused` (experts read and evicted again without being used), plus where decode time went: `attention_ms`,
-`delta_net_ms`, `router_ms`, `experts_ms`, `shared_expert_ms`, `dense_ffn_ms` and `lm_head_ms` (C++:
+reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
+`expert_unused` (experts read and evicted again without being used), `expert_predicted` and
+`expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), plus where decode
+time went: `attention_ms`, `delta_net_ms`, `router_ms`, `experts_ms`, `shared_expert_ms`, `dense_ffn_ms` and `lm_head_ms` (C++:
 `GenerationStats::decode_phases`; `liyab-cli` prints them per token).
 `liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU
 busy time spent on the engine's work, bytes streamed from storage, tokens generated); it is safe to call while a
@@ -500,13 +501,16 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
   reads them and the native kernels decode them in place (no copy, nothing cached per tensor).
 * **Mixture-of-experts models.** Everything but the routed experts stays resident (with a Vulkan GPU, in
   GPU-shared memory, so the GPU reads it in place instead of keeping a second copy); experts are read by 4 threads
-  into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Before each block the
-  engine applies that block's router and the next one's to the current hidden state and prefetches the experts they
-  pick, so reads overlap the attention/DeltaNet work. A freshly loaded expert is not evicted before the block it was
+  into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Once a block's own
+  experts are queued, the engine applies the next block's router to the residual stream after this block's mixer and
+  prefetches the experts it picks, so reads overlap this block's experts and the next block's attention/DeltaNet work
+  (on Qwen3.6-35B-A3B 83% of these guesses are chosen, against 77% when guessing from the residual entering the
+  block, and ~28% fewer experts are read for nothing). A freshly loaded expert is not evicted before the block it was
   loaded for has used it (plain LFU would pick it first: it has no uses yet, and the cache then read it twice). The
   experts a token really uses run in waves: every expert already in RAM in one batched CPU pass (gate and up for all
   of them, then down), then the ones still loading. `GenerationStats` (and `liyab-cli`) report hits, late
-  prefetches, misses, bytes read, unused reads, time spent waiting, and decode time by phase.
+  prefetches, misses, bytes read, unused reads, prediction precision (`expert_predicted_used` / `expert_predicted`),
+  time spent waiting, and decode time by phase.
 * **Correctness.** Streamed experts (with evictions) and streamed blocks give bit-identical logits to in-place
   reads (`test_engine`).
 
@@ -541,7 +545,13 @@ CPU backend, 8 threads, a 9-token prompt and 64 greedy tokens from a cold expert
 | Condition-variable thread pool (before) | 3.06 tok/s | 327 | 596 MiB |
 | + spinning thread pool | 3.24 tok/s | 308 | 480 MiB |
 | + freshly loaded experts kept until used | 5.54 tok/s | 181 | 309 MiB |
-| + a block's experts in one batched pass | **5.93 tok/s** | 169 | 309 MiB |
+| + a block's experts in one batched pass | 5.93 tok/s | 169 | 309 MiB |
+| + Q4_K/Q5_K/Q6_K × Q8_K kernels (A/B reference) | 6.15 tok/s | 163 | 308 MiB |
+| + next block's experts predicted after the mixer | **6.44 tok/s** | 155 | 283 MiB |
+
+The last two rows are means of 4 alternating A/B rounds in one session (the new build won every round). The new
+prediction is chosen by the router 83% of the time (77% before) and reads 31 experts per token for nothing instead
+of 44.
 
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident

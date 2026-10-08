@@ -155,6 +155,16 @@ public:
     };
     [[nodiscard]] const PhaseTimes& phase_times() const noexcept { return phases_; }
 
+    // Expert prediction accuracy (expert streaming only), cumulative like
+    // PhaseTimes: per MoE block, the experts predicted ahead of time and how
+    // many of them the router then chose. used / predicted is the precision;
+    // the rest are reads that only cost flash bandwidth and cache space.
+    struct ExpertPredictions {
+        uint64_t predicted = 0;
+        uint64_t used = 0;
+    };
+    [[nodiscard]] const ExpertPredictions& expert_predictions() const noexcept { return predictions_; }
+
     // Discards cached positions >= n (speculative-decoding rollback). Hybrid
     // models only accept n == 0 or n == n_past(): a recurrent state cannot be
     // rewound (Unsupported otherwise).
@@ -226,8 +236,12 @@ private:
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
-    // Expert prefetch: applies block `layer`'s router to the current hidden
-    // states (x_) and queues the top-k experts it picks in the ExpertStore.
+    // Expert prefetch: applies block `layer`'s router (and FFN norm) to the
+    // current residual stream (x_) and queues the top-k experts it picks in
+    // the ExpertStore. forward() calls it for block l + 1 once block l's mixer
+    // ran: that residual predicts block l + 1's choice better than the one
+    // entering block l (83% vs 77% of the top-8 on Qwen3.6-35B-A3B), while the
+    // reads still overlap block l's experts and block l + 1's mixer.
     void predict_experts(int32_t layer, int32_t n, const Route& route);
     Status attach_expert_store(int64_t budget_option, uint64_t memory_budget);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
@@ -261,6 +275,9 @@ private:
     std::unique_ptr<ExpertStore> expert_store_;
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
+    ExpertPredictions predictions_;
+    std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
+    int32_t predicted_layer_ = -1;
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 
     // Scratch, sized for the current batch.
