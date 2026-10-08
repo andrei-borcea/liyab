@@ -161,6 +161,32 @@ private:
         const int32_t n = job.item->n;
         const float* x = job.item->x;
         float* y = job.item->y;
+        // Several activation rows: Q8_K and Q8_0 kernels decode each weight
+        // row once for all of them (speculative verification, prefill).
+        if (n > 1 && (job.format == ActFormat::Q8_K || (job.format == ActFormat::Q8_0 && w.type == DType::Q8_0))) {
+            thread_local std::vector<const quant::BlockQ8_K*> q8k_rows;
+            thread_local std::vector<const quant::BlockQ8_0*> q8_rows;
+            thread_local std::vector<float> dots;
+            dots.resize(static_cast<size_t>(n));
+            if (job.format == ActFormat::Q8_K) {
+                q8k_rows.resize(static_cast<size_t>(n));
+                for (int32_t t = 0; t < n; ++t) q8k_rows[static_cast<size_t>(t)] = a.q8k.data() + t * super_blocks;
+            } else {
+                q8_rows.resize(static_cast<size_t>(n));
+                for (int32_t t = 0; t < n; ++t) q8_rows[static_cast<size_t>(t)] = a.q8.data() + t * blocks;
+            }
+            for (int64_t r = r0; r < r1; ++r) {
+                const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
+                if (job.format == ActFormat::Q8_K) {
+                    quant::dot_lowbit_q8_K_rows(w.type, row, q8k_rows.data(), n, cols, dots.data());
+                } else {
+                    quant::dot_q8_0_q8_0_rows(reinterpret_cast<const quant::BlockQ8_0*>(row), q8_rows.data(), n, cols,
+                                              dots.data());
+                }
+                for (int32_t t = 0; t < n; ++t) y[t * rows + r] = dots[static_cast<size_t>(t)];
+            }
+            return;
+        }
         for (int64_t r = r0; r < r1; ++r) {
             const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
             for (int32_t t = 0; t < n; ++t) {

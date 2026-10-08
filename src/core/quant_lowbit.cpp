@@ -493,6 +493,146 @@ float dot_q6_k(const BlockQ6_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
     return sum;
 }
 
+// Multi-row variants: the same weight row against NR activation rows (a
+// speculative verification batch, a prefill chunk). Each super-block is
+// decoded once into int8 vectors and dotted with every row; sub-block scales
+// are applied right away, so a row needs one int32 accumulator and NR <= 4
+// fits the 32 NEON registers. Results equal NR calls of the single-row
+// kernel up to float summation order.
+template <int NR>
+void dot_q4_k_rows(const BlockQ4_K* x, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
+    const int32x4_t vzero = vdupq_n_s32(0);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        uint8x8_t scales, mins;
+        unpack_k4_scales(x[i].scales, scales, mins);
+        uint8_t sc[8];
+        vst1_u8(sc, scales);
+        int32x4_t acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = vzero;
+        const uint8_t* q4 = x[i].qs;
+        for (int j = 0; j < 4; ++j) {
+            const uint8x16x2_t bits = vld1q_u8_x2(q4 + 32 * j);
+            const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(bits.val[0], m4));
+            const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(bits.val[1], m4));
+            const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[0], 4));
+            const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[1], 4));
+            for (int r = 0; r < NR; ++r) {
+                const int8x16x4_t q8 = vld1q_s8_x4(y[r][i].qs + 64 * j);
+                acc[r] = vmlaq_n_s32(acc[r], vdot(vdot(vzero, lo0, q8.val[0]), lo1, q8.val[1]), sc[2 * j]);
+                acc[r] = vmlaq_n_s32(acc[r], vdot(vdot(vzero, hi0, q8.val[2]), hi1, q8.val[3]), sc[2 * j + 1]);
+            }
+        }
+        const float d = h2f(x[i].d);
+        const float dmin = h2f(x[i].dmin);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] += y[r][i].d * (d * static_cast<float>(vaddvq_s32(acc[r])) -
+                                   dmin * static_cast<float>(k4_min_sum(mins, y[r][i].bsums)));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+template <int NR>
+void dot_q5_k_rows(const BlockQ5_K* x, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
+    const uint8x16_t mone = vdupq_n_u8(1);
+    const uint8x16_t mtwo = vdupq_n_u8(2);
+    const int32x4_t vzero = vdupq_n_s32(0);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        uint8x8_t scales, mins;
+        unpack_k4_scales(x[i].scales, scales, mins);
+        uint8_t sc[8];
+        vst1_u8(sc, scales);
+        int32x4_t acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = vzero;
+        const uint8_t* q5 = x[i].qs;
+        uint8x16x2_t qh = vld1q_u8_x2(x[i].qh);
+        for (int j = 0; j < 4; ++j) {
+            const uint8x16x2_t bits = vld1q_u8_x2(q5 + 32 * j);
+            const int8x16_t lo0 =
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(bits.val[0], m4), vshlq_n_u8(vandq_u8(mone, qh.val[0]), 4)));
+            const int8x16_t lo1 =
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(bits.val[1], m4), vshlq_n_u8(vandq_u8(mone, qh.val[1]), 4)));
+            const int8x16_t hi0 =
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(bits.val[0], 4), vshlq_n_u8(vandq_u8(mtwo, qh.val[0]), 3)));
+            const int8x16_t hi1 =
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(bits.val[1], 4), vshlq_n_u8(vandq_u8(mtwo, qh.val[1]), 3)));
+            qh.val[0] = vshrq_n_u8(qh.val[0], 2);
+            qh.val[1] = vshrq_n_u8(qh.val[1], 2);
+            for (int r = 0; r < NR; ++r) {
+                const int8x16x4_t q8 = vld1q_s8_x4(y[r][i].qs + 64 * j);
+                acc[r] = vmlaq_n_s32(acc[r], vdot(vdot(vzero, lo0, q8.val[0]), lo1, q8.val[1]), sc[2 * j]);
+                acc[r] = vmlaq_n_s32(acc[r], vdot(vdot(vzero, hi0, q8.val[2]), hi1, q8.val[3]), sc[2 * j + 1]);
+            }
+        }
+        const float d = h2f(x[i].d);
+        const float dmin = h2f(x[i].dmin);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] += y[r][i].d * (d * static_cast<float>(vaddvq_s32(acc[r])) -
+                                   dmin * static_cast<float>(k4_min_sum(mins, y[r][i].bsums)));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+template <int NR>
+void dot_q6_k_rows(const BlockQ6_K* x, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    const int32x4_t vzero = vdupq_n_s32(0);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        const int8_t* sc = x[i].scales;  // one signed scale per 16 values
+        int32x4_t acc[NR];
+        int32_t mins[NR];
+        for (int r = 0; r < NR; ++r) {
+            acc[r] = vzero;
+            // Values are stored as q + 32: 32 * sum(scale * activation sum) is subtracted.
+            const int16x8x2_t q8sums = vld1q_s16_x2(y[r][i].bsums);
+            const int8x16_t s8 = vld1q_s8(sc);
+            const int16x8_t sc_lo = vmovl_s8(vget_low_s8(s8));
+            const int16x8_t sc_hi = vmovl_s8(vget_high_s8(s8));
+            mins[r] = vaddvq_s32(vaddq_s32(vaddq_s32(vmull_s16(vget_low_s16(q8sums.val[0]), vget_low_s16(sc_lo)),
+                                                     vmull_s16(vget_high_s16(q8sums.val[0]), vget_high_s16(sc_lo))),
+                                           vaddq_s32(vmull_s16(vget_low_s16(q8sums.val[1]), vget_low_s16(sc_hi)),
+                                                     vmull_s16(vget_high_s16(q8sums.val[1]), vget_high_s16(sc_hi)))));
+        }
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        for (int j = 0; j < 2; ++j) {  // 128 values: 8 vectors of 16, one scale each
+            const uint8x16x2_t hb = vld1q_u8_x2(qh + 32 * j);
+            const uint8x16x4_t lb = vld1q_u8_x4(ql + 64 * j);
+            int8x16_t w[8];
+            w[0] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(lb.val[0], m4), vshlq_n_u8(vandq_u8(hb.val[0], m3), 4)));
+            w[1] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(lb.val[1], m4), vshlq_n_u8(vandq_u8(hb.val[1], m3), 4)));
+            w[2] = vreinterpretq_s8_u8(
+                vorrq_u8(vandq_u8(lb.val[2], m4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hb.val[0], 2), m3), 4)));
+            w[3] = vreinterpretq_s8_u8(
+                vorrq_u8(vandq_u8(lb.val[3], m4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hb.val[1], 2), m3), 4)));
+            w[4] = vreinterpretq_s8_u8(
+                vorrq_u8(vshrq_n_u8(lb.val[0], 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hb.val[0], 4), m3), 4)));
+            w[5] = vreinterpretq_s8_u8(
+                vorrq_u8(vshrq_n_u8(lb.val[1], 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hb.val[1], 4), m3), 4)));
+            w[6] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(lb.val[2], 4), vshlq_n_u8(vshrq_n_u8(hb.val[0], 6), 4)));
+            w[7] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(lb.val[3], 4), vshlq_n_u8(vshrq_n_u8(hb.val[1], 6), 4)));
+            for (int r = 0; r < NR; ++r) {
+                const int8_t* q8 = y[r][i].qs + 128 * j;
+                for (int k = 0; k < 8; ++k) {
+                    acc[r] = vmlaq_n_s32(acc[r], vdot(vzero, w[k], vld1q_s8(q8 + 16 * k)), sc[8 * j + k]);
+                }
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] += y[r][i].d * d * static_cast<float>(vaddvq_s32(acc[r]) - 32 * mins[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
 float dot_q3_k(const BlockQ3K* x, const BlockQ8_K* y, int64_t nb) noexcept {
     constexpr uint32_t kmask1 = 0x03030303;
     constexpr uint32_t kmask2 = 0x0f0f0f0f;
@@ -1131,6 +1271,53 @@ float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n
         default:
             return 0.0f;
     }
+}
+
+void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x, int32_t rows, int64_t n,
+                          float* out) noexcept {
+    const int64_t nb = n / kSuperBlock;
+#if defined(LIYAB_LOWBIT_NEON)
+    // Up to 4 rows per weight decode; longer batches go 4 at a time.
+    auto run = [&](auto kernel4, auto kernel3, auto kernel2, auto kernel1) {
+        int32_t r = 0;
+        for (; r + 4 <= rows; r += 4) kernel4(x + r, out + r);
+        switch (rows - r) {
+            case 3: kernel3(x + r, out + r); break;
+            case 2: kernel2(x + r, out + r); break;
+            case 1: kernel1(x + r, out + r); break;
+            default: break;
+        }
+    };
+    switch (type) {
+        case DType::Q4_K: {
+            const auto* w = static_cast<const BlockQ4_K*>(row);
+            run([&](const BlockQ8_K* const* y, float* o) { dot_q4_k_rows<4>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q4_k_rows<3>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q4_k_rows<2>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { o[0] = dot_q4_k(w, y[0], nb); });
+            return;
+        }
+        case DType::Q5_K: {
+            const auto* w = static_cast<const BlockQ5_K*>(row);
+            run([&](const BlockQ8_K* const* y, float* o) { dot_q5_k_rows<4>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q5_k_rows<3>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q5_k_rows<2>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { o[0] = dot_q5_k(w, y[0], nb); });
+            return;
+        }
+        case DType::Q6_K: {
+            const auto* w = static_cast<const BlockQ6_K*>(row);
+            run([&](const BlockQ8_K* const* y, float* o) { dot_q6_k_rows<4>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q6_k_rows<3>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { dot_q6_k_rows<2>(w, y, nb, o); },
+                [&](const BlockQ8_K* const* y, float* o) { o[0] = dot_q6_k(w, y[0], nb); });
+            return;
+        }
+        default:
+            break;
+    }
+#endif
+    for (int32_t r = 0; r < rows; ++r) out[r] = dot_lowbit_q8_K(type, row, x[r], n);
 }
 
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {

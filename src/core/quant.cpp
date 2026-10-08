@@ -847,6 +847,45 @@ float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept 
 #endif
 }
 
+#if defined(LIYAB_NEON)
+namespace {
+
+// dot_q8_0_q8_0 for NR activation rows: each weight block is loaded and its
+// scale converted once.
+template <int NR>
+void dot_q8_0_rows_neon(const BlockQ8_0* w, const BlockQ8_0* const* x, int64_t nb, float* out) noexcept {
+    float32x4_t acc[NR];
+    for (int r = 0; r < NR; ++r) acc[r] = vdupq_n_f32(0.0f);
+    for (int64_t i = 0; i < nb; ++i) {
+        const int8x16_t lo = vld1q_s8(w[i].qs);
+        const int8x16_t hi = vld1q_s8(w[i].qs + 16);
+        const float dw = fp16_to_fp32(w[i].d);
+        for (int r = 0; r < NR; ++r) {
+            const int32x4_t s =
+                dot_i8x16(dot_i8x16(vdupq_n_s32(0), lo, vld1q_s8(x[r][i].qs)), hi, vld1q_s8(x[r][i].qs + 16));
+            acc[r] = vmlaq_n_f32(acc[r], vcvtq_f32_s32(s), dw * fp16_to_fp32(x[r][i].d));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = vaddvq_f32(acc[r]);
+}
+
+}  // namespace
+#endif
+
+void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept {
+    int32_t r = 0;
+#if defined(LIYAB_NEON)
+    const int64_t nb = n / kBlock;
+    for (; r + 4 <= rows; r += 4) dot_q8_0_rows_neon<4>(w, x + r, nb, out + r);
+    switch (rows - r) {
+        case 3: dot_q8_0_rows_neon<3>(w, x + r, nb, out + r); return;
+        case 2: dot_q8_0_rows_neon<2>(w, x + r, nb, out + r); return;
+        default: break;
+    }
+#endif
+    for (; r < rows; ++r) out[r] = dot_q8_0_q8_0(w, x[r], n);
+}
+
 float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept {
     int64_t i = 0;
     float sum = 0.0f;

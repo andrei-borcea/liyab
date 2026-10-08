@@ -95,6 +95,9 @@ void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept;
 float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept;
+// The same Q8_0 weight row against `rows` activation rows (x[r] = row r's
+// blocks): out[r] = dot_q8_0_q8_0(w, x[r], n), up to float summation order.
+void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
 float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept;
 float dot_f32(const float* a, const float* b, int64_t n) noexcept;
 
@@ -172,6 +175,12 @@ bool uses_q8_K(DType type) noexcept;
 // NEON it decodes through unpack_ext_block (correct, not fast). Thread-safe
 // (pure function of its inputs). Returns 0 for unsupported types.
 float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n) noexcept;
+// The same weight row against `rows` activation rows (x[r] = row r's
+// blocks): out[r] = dot_lowbit_q8_K(type, row, x[r], n), up to float
+// summation order. Q4_K / Q5_K / Q6_K decode each super-block once for up to
+// four rows (speculative verification, prefill); other types loop.
+void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x, int32_t rows, int64_t n,
+                          float* out) noexcept;
 
 // NEON kernels for the 32-value I-quant / FP4 formats against Q8_0 activations
 // (dispatched by dot_quantized). `n` is a multiple of 32.

@@ -237,7 +237,8 @@ needed.
 
 `liyab-bench` (built with the tests) measures CPU matvec throughput on a MoE model's decode shapes (Q8_0 projections,
 F32 routers, Q6_K LM head, Q4_K/Q5_K/Q6_K experts) in GB/s, next to the RAM read ceiling, for several thread counts:
-`liyab-bench --threads 1,4,8 --seconds 1`.
+`liyab-bench --threads 1,4,8 --seconds 1`. A last table times one matmul over 1, 2, 4 and 5 activation rows (the shape
+of speculative verification and prefill).
 
 `liyab-kl` (also built with the tests) measures what a lossy option costs: it saves the teacher-forced next-token
 distributions of a model over a text from the lossless path (`--save ref.bin`), then compares a lossy run against them
@@ -846,8 +847,13 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Drafters for hybrid models.** Hybrid models now roll back rejected tokens, but Qwen3.5/3.8's
   multi-token-prediction head and DeepSeek V4's dedicated draft model are not used yet; a draft has to be a separate
   GGUF with the same vocabulary.
-* **CPU prefill** reuses the matvec kernel; a tiled GEMM is the next CPU step. MoE prefill reads the union of the
-  batch's experts, so it runs at about decode speed.
+* **CPU batches** (prefill, speculative verification): Q8_0, Q4_K, Q5_K and Q6_K weights are decoded once per
+  row for up to four activation rows. On the Snapdragon 8 Elite a 2048×8192 matmul over 4 rows takes 509–561 µs
+  instead of 707–791 (Q8_0), 648–678 instead of 884–930 (Q5_K), 754–783 instead of 959–1013 (Q6_K); Q4_K is
+  unchanged (~620–690). Four rows still cost 2.2–3.3× one row, so speculative decoding does not pay on the CPU
+  yet (Qwen3.5-4B: 10.6 tok/s plain, 9.0 with lookup drafts at 83% acceptance): the per-row `sdot` work, not
+  memory, is the limit. 2×2 tiles with the i8mm `smmla` instruction are the next step. MoE prefill reads the
+  union of the batch's experts, so it runs at about decode speed.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.

@@ -10,6 +10,9 @@
 //
 //   liyab-bench [--threads 1,2,4,8] [--seconds 1.0]
 //
+// A last table times one matmul over 1, 2, 4 and 5 activation rows (the
+// shape of speculative verification and prefill) on every thread.
+//
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS).
 #include <algorithm>
 #include <atomic>
@@ -169,6 +172,40 @@ int main(int argc, char** argv) {
                 },
                 bytes, seconds);
             std::printf(" | %8.1f (%6.0f)", gbs, us);
+        }
+        std::printf("\n");
+    }
+
+    // Batched rows (speculative verification, prefill): one pass over the
+    // weights for n activation rows. Cost per row should fall as n grows.
+    const int32_t all = pool.max_threads();
+    pool.set_active_threads(all);
+    std::printf("\n%-28s | %d threads, us per pass for n activation rows (us per row)\n", "batched rows", all);
+    const Case batched[] = {
+        {"Q8_0 2048x8192", liyab::DType::Q8_0, 2048, 8192},
+        {"Q4_K 2048x8192", liyab::DType::Q4_K, 2048, 8192},
+        {"Q5_K 2048x8192", liyab::DType::Q5_K, 2048, 8192},
+        {"Q6_K 2048x8192", liyab::DType::Q6_K, 2048, 8192},
+    };
+    for (const Case& c : batched) {
+        liyab::TensorView w;
+        w.type = c.type;
+        w.n_dims = 2;
+        w.ne = {c.cols, c.rows, 1, 1};
+        const size_t bytes = w.row_bytes() * static_cast<size_t>(c.rows);
+        w.nbytes = bytes;
+        const size_t copies = std::max<size_t>(1, kWorkingSet / bytes);
+        std::printf("%-28s", c.name);
+        for (const int32_t n : {1, 2, 4, 5}) {
+            const auto [gbs, us] = measure(
+                [&](size_t i) {
+                    liyab::TensorView v = w;
+                    v.data = buffer.data() + (i % copies) * bytes;
+                    (void)cpu->matmul(v, x.data(), y.data(), n);
+                },
+                bytes, seconds);
+            (void)gbs;
+            std::printf(" | n=%d %6.0f (%4.0f)", n, us, us / n);
         }
         std::printf("\n");
     }

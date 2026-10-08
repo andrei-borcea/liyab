@@ -474,6 +474,58 @@ TEST_CASE("Q8_K activation quantization matches llama.cpp's semantics") {
     }
 }
 
+TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
+    std::mt19937 rng(21);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t n = 512;
+    std::vector<float> w(static_cast<size_t>(n));
+    for (float& v : w) v = normal(rng);
+    for (const int32_t rows : {1, 2, 3, 4, 5, 6, 9}) {
+        std::vector<std::vector<quant::BlockQ8_K>> xk(static_cast<size_t>(rows));
+        std::vector<std::vector<quant::BlockQ8_0>> x0(static_cast<size_t>(rows));
+        std::vector<const quant::BlockQ8_K*> pk;
+        std::vector<const quant::BlockQ8_0*> p0;
+        for (int32_t r = 0; r < rows; ++r) {
+            std::vector<float> x(static_cast<size_t>(n));
+            for (float& v : x) v = normal(rng);
+            xk[static_cast<size_t>(r)].resize(static_cast<size_t>(n / 256));
+            x0[static_cast<size_t>(r)].resize(static_cast<size_t>(n / 32));
+            quant::quantize_row_q8_K(x.data(), xk[static_cast<size_t>(r)].data(), n);
+            quant::quantize_row_q8_0(x.data(), x0[static_cast<size_t>(r)].data(), n);
+            pk.push_back(xk[static_cast<size_t>(r)].data());
+            p0.push_back(x0[static_cast<size_t>(r)].data());
+        }
+        std::vector<float> out(static_cast<size_t>(rows));
+        for (const DType type : {DType::Q4_K, DType::Q5_K, DType::Q6_K}) {
+            const size_t block = type == DType::Q4_K ? sizeof(quant::BlockQ4_K)
+                                 : type == DType::Q5_K ? sizeof(quant::BlockQ5_K)
+                                                       : sizeof(quant::BlockQ6_K);
+            std::vector<uint8_t> q(static_cast<size_t>(n / 256) * block);
+            if (type == DType::Q6_K) {  // no Q6_K quantizer: random bytes are valid blocks (fp16 d kept finite)
+                for (uint8_t& b : q) b = static_cast<uint8_t>(rng());
+                for (size_t i = 0; i < q.size(); i += block) {
+                    const uint16_t d = quant::fp32_to_fp16(0.01f);
+                    std::memcpy(q.data() + i + block - 2, &d, 2);
+                }
+            } else {
+                quant::quantize_row(type, w.data(), q.data(), n);
+            }
+            quant::dot_lowbit_q8_K_rows(type, q.data(), pk.data(), rows, n, out.data());
+            for (int32_t r = 0; r < rows; ++r) {
+                const float single = quant::dot_lowbit_q8_K(type, q.data(), pk[static_cast<size_t>(r)], n);
+                CHECK_NEAR(out[static_cast<size_t>(r)], single, 1e-4f * (1.0f + std::fabs(single)));
+            }
+        }
+        std::vector<quant::BlockQ8_0> w0(static_cast<size_t>(n / 32));
+        quant::quantize_row_q8_0(w.data(), w0.data(), n);
+        quant::dot_q8_0_q8_0_rows(w0.data(), p0.data(), rows, n, out.data());
+        for (int32_t r = 0; r < rows; ++r) {
+            const float single = quant::dot_q8_0_q8_0(w0.data(), p0[static_cast<size_t>(r)], n);
+            CHECK_NEAR(out[static_cast<size_t>(r)], single, 1e-4f * (1.0f + std::fabs(single)));
+        }
+    }
+}
+
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
     std::vector<QuantVector> vectors;
     if (!load_quant_vectors(vectors)) return;
