@@ -491,6 +491,22 @@ The phone throttles as it heats up; numbers vary by ±30% between runs.
 
 ## Measured results
 
+### Charts
+
+All on the Snapdragon 8 Elite phone described [below](#phone-xiaomi-25010pn30g-snapdragon-8-elite-sm8750-15-gb-ram).
+The numbers live in [`docs/benchmarks/results.json`](docs/benchmarks/results.json); after adding a measurement, run
+`python3 tools/gen_bench_charts.py` to redraw the SVGs. The same numbers appear as tables in this README.
+
+![Qwen3.8-27B UD-IQ2_S decode speed by engine version](docs/benchmarks/dense_27b_decode.svg)
+
+![Qwen3.8-27B UD-IQ2_S prompt time by engine version](docs/benchmarks/dense_27b_prompt.svg)
+
+![Direct random read throughput by request size and thread count](docs/benchmarks/flash_reads.svg)
+
+![Matrix-vector throughput by weight format: CPU before, CPU NEON, GPU native](docs/benchmarks/matvec_formats.svg)
+
+![Decode speed of models that fit in RAM, CPU vs GPU](docs/benchmarks/in_ram_decode.svg)
+
 ### Correctness against llama.cpp
 
 The same GGUF files were evaluated by Liyab and by llama.cpp (via `llama-cpp-python`), and the logits were
@@ -664,14 +680,17 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 
 ```
 include/liyab/          public headers (C++ API, C ABI, experimental/)
-src/core/               engine, loader, KV cache, triple buffer, transformer, tokenizer, sampling, power, detection
+src/core/               engine, loader, KV cache, triple buffer, expert store, direct I/O, transformer, quant kernels,
+                        tokenizer, sampling, power, detection
 src/backends/           cpu/ (NEON), metal/ (Metal), vulkan/ (Vulkan compute + shaders/), qnn/, neuropilot/ (runtime probes)
-src/experimental/       early exit, head pruning, direct-I/O loader
+src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/liyab_cli.cpp     command-line front end over the C ABI
-android/chat/           demo app (Home / Chat / Models screens, Java + JNI), built by scripts/build_android_app.sh
+tools/                  liyab_cli.cpp (command-line front end over the C ABI), table/vector generators,
+                        gen_bench_charts.py (README charts)
+docs/benchmarks/        benchmark data (results.json) and the charts drawn from it
+android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
-scripts/                build_android.sh, build_ios.sh
+scripts/                build_android.sh, build_android_app.sh, build_ios.sh
 ```
 
 ## License
