@@ -1,8 +1,12 @@
 // Liyab — portable CPU backend (ARM NEON / dot-product, scalar elsewhere).
 //
-// Activations are quantized to Q8_0 once per call, then every weight row is
-// streamed exactly once and dotted against all `n` activation rows, so batched
+// Activations are quantized once per call, then every weight row is streamed
+// exactly once and dotted against all `n` activation rows, so batched
 // verification (speculative decoding) and prefill cost one pass over weights.
+// The activation format follows the weight type: Q8_0 (32-value blocks) for
+// most formats, Q8_K (256-value super-blocks with 16-value sums) for the 2/3-bit
+// K-quants, TQ2_0 and the 256-value I-quants, whose NEON kernels need it
+// (quant::uses_q8_K).
 #include <string>
 #include <vector>
 
@@ -40,10 +44,19 @@ public:
         if (n <= 0) return Status::ok();
         const int64_t rows = w.rows();
         const int64_t cols = w.cols();
-        const bool quantized = quant::is_block_quantized(w.type);
+        // Row lengths of 256-value formats are always multiples of 256; the
+        // check only guards against malformed tensors.
+        const bool q8k = quant::uses_q8_K(w.type) && cols % quant::kSuperBlock == 0;
+        const bool quantized = !q8k && quant::is_block_quantized(w.type);
         const int64_t blocks = cols / quant::kBlock;
+        const int64_t super_blocks = cols / quant::kSuperBlock;
 
-        if (quantized) {
+        if (q8k) {
+            xk_.resize(static_cast<size_t>(super_blocks * n));
+            for (int32_t t = 0; t < n; ++t) {
+                quant::quantize_row_q8_K(x + t * cols, xk_.data() + t * super_blocks, cols);
+            }
+        } else if (quantized) {
             xq_.resize(static_cast<size_t>(blocks * n));
             for (int32_t t = 0; t < n; ++t) {
                 quant::quantize_row_q8_0(x + t * cols, xq_.data() + t * blocks, cols);
@@ -62,7 +75,9 @@ public:
                 const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
                 for (int32_t t = 0; t < n; ++t) {
                     float v = 0.0f;
-                    if (quantized) {
+                    if (q8k) {
+                        v = quant::dot_lowbit_q8_K(w.type, row, xk_.data() + t * super_blocks, cols);
+                    } else if (quantized) {
                         // K-quants and Q5_1 also read the activation block sums.
                         v = quant::dot_quantized(w.type, row, xq_.data() + t * blocks,
                                                  xsums_.empty() ? nullptr : xsums_.data() + t * blocks, cols);
@@ -83,6 +98,7 @@ public:
 private:
     ThreadPool& pool_;
     std::vector<quant::BlockQ8_0> xq_;
+    std::vector<quant::BlockQ8_K> xk_;
     std::vector<int32_t> xsums_;
 };
 

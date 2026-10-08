@@ -122,6 +122,51 @@ struct ExtBlock {
 bool unpack_ext_block(DType type, const uint8_t* block, ExtBlock& out) noexcept;
 void dequantize_ext_row(DType type, const void* src, float* y, int64_t n) noexcept;
 float dot_ext_q8_0(DType type, const void* row, const BlockQ8_0* x, int64_t n) noexcept;
+// MXFP4 block scale: 2^(e - 127) / 2 (the e2m1 grid in kMxfp4Values is doubled).
+float e8m0_to_fp32_half(uint8_t e) noexcept;
+
+// ---------------------------------------------------------------------------
+// Q8_K activations and the low-bit dot kernels (quant_lowbit.cpp).
+//
+// The 2/3-bit K-quants and the 256-value I-quants pack their values in ways
+// that cost more to decode than to multiply, so their fast kernels (ported
+// from llama.cpp's ARM NEON code) consume activations quantized per 256-value
+// super-block instead of per 32 values: one float scale, so all 8 sub-blocks
+// of a weight super-block accumulate in int32 and are scaled once, plus int16
+// sums per 16 values that fold the sub-block minimums / IQ1 deltas in without
+// touching the weights.
+// ---------------------------------------------------------------------------
+
+// Bit-identical to GGML's block_q8_K: x[e] ~= d * qs[e]; bsums[j] = sum of qs[16j .. 16j+15].
+struct BlockQ8_K {
+    float d;
+    int8_t qs[kSuperBlock];
+    int16_t bsums[kSuperBlock / 16];
+};
+static_assert(sizeof(BlockQ8_K) == 292, "Q8_K block must match GGML layout");
+
+// Quantizes `n` floats (a multiple of 256) like llama.cpp's quantize_row_q8_K_ref:
+// d = -max/127 where max is the signed value of largest magnitude, values are
+// rounded to nearest-even and clamped to [-127, 127]. An all-zero block gets
+// d = 0, zero values and zero sums.
+void quantize_row_q8_K(const float* x, BlockQ8_K* y, int64_t n) noexcept;
+
+// True when `type` has a dedicated Q8_K dot kernel on this build (AArch64 NEON):
+// Q2_K, Q3_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and
+// TQ2_0. Callers should then quantize activations with quantize_row_q8_K and
+// call dot_lowbit_q8_K; other types keep the Q8_0 path (dot_quantized).
+bool uses_q8_K(DType type) noexcept;
+
+// Dot of one weight row of `type` (any type listed for uses_q8_K) with a Q8_K
+// activation row; `n` is a multiple of 256. Available on every target: without
+// NEON it decodes through unpack_ext_block (correct, not fast). Thread-safe
+// (pure function of its inputs). Returns 0 for unsupported types.
+float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n) noexcept;
+
+// NEON kernels for the 32-value I-quant / FP4 formats against Q8_0 activations
+// (dispatched by dot_quantized). `n` is a multiple of 32.
+float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
+float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 
 float bf16_to_fp32(uint16_t h) noexcept;
 float dot_bf16_f32(const uint16_t* w, const float* x, int64_t n) noexcept;

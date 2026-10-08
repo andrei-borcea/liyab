@@ -125,7 +125,10 @@ This README describes what the code does today. Anything not implemented is list
   (written by `tools/gen_quant_vectors.py`) holds reference outputs, and `test_engine` checks all 24 formats
   bit-exactly. I-quant grids are extracted from gguf-py by `tools/gen_quant_tables.py`.
 * **Kernels:** Q4_0/Q4_1/Q8_0, Q5_0/Q5_1 and Q4_K/Q5_K/Q6_K have dedicated NEON + SDOT kernels that unpack bits in
-  registers. The other formats decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, Q4_K
+  registers. Q2_K, Q3_K, TQ2_0, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S and IQ4_XS use NEON kernels adapted from llama.cpp
+  (`src/core/quant_lowbit.cpp`) against Q8_K activations (one scale per 256 values plus 16-value sums, quantized
+  once per matmul); IQ4_NL and MXFP4 use table-lookup kernels against Q8_0. TQ1_0 and NVFP4 (and every format on
+  non-NEON targets) decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, Q4_K
   and Q5_0 are repacked exactly into the Q4_1/Q8_0 layouts. Other formats fall back to the CPU per matmul.
 * **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`,
   `qwen35` (letters include combining marks, `\p{M}`), `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp's tokenization token for token, including special
@@ -193,7 +196,7 @@ needed.
 | :--- | :--- |
 | `test_mmap` | mapping, `madvise` hints, NEON INT4→INT8 unpacking, GGUF parsing and malformed-file rejection, prefetcher, triple-buffer pipeline (ordering, resync, unpack stage, stall accounting, errors) |
 | `test_device_detect` | SoC classification, backend ranking, live detection, sysfs thermal parsing, power policy, pacing |
-| `test_engine` | quant kernels, tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
+| `test_engine` | quant kernels (including the Q8_K low-bit kernels against llama.cpp-encoded blocks), tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
 | `test_kv_cache` | memory per token, on-demand paging and reuse, sinks and page recycling over 5000 positions, quantization accuracy, engine KV memory |
 | `test_backends` | per-matmul latency of each backend on a model's shapes, grouped submissions, dispatch overhead |
 | `test_experimental` | early exit, head pruning, direct I/O correctness, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them, `LIYAB_BENCH_MB=N` sizes the I/O file) |
@@ -551,8 +554,10 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   needs `VK_EXT_external_memory_host` or AHardwareBuffer imports.
 * **Core ML / Apple Neural Engine.** Not used: the ANE is only reachable through compiled Core ML models, not
   per-layer kernels over mmap'd weights. Metal is the Apple accelerator path.
-* **Quantization kernels.** Q2_K, Q3_K, the I-quants and FP4 use a generic decode + SDOT path on the CPU (correct,
-  but slower than the dedicated kernels). On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
+* **Quantization kernels.** On the CPU, TQ1_0 and NVFP4 still use the generic decode + SDOT path (correct, about
+  3–7 GB/s matvec on 4 Apple M4 Pro cores versus 45–80 GB/s for Q2_K/Q3_K/Q4_K/IQ4_XS/TQ2_0), and the
+  lattice-grid I-quants (IQ1/IQ2/IQ3, 20–30 GB/s) stay 2–3× slower than Q4_K because every 4–8 values cost a table
+  lookup. There are no i8mm (SMMLA) paths yet. On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
 * **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
 * **Architectures.** MoE models (e.g. Qwen3-30B-A3B, Qwen3.5-35B-A3B), DeepSeek V4 (`deepseek4`), Gemma, Phi and
   YaRN RoPE scaling are not supported yet.
@@ -588,4 +593,5 @@ scripts/                build_android.sh, build_ios.sh
 
 ## License
 
-Apache 2.0 (see `LICENSE`).
+Apache 2.0 (see `LICENSE`). Third-party code: the low-bit NEON dot kernels are adapted from llama.cpp / ggml (MIT);
+see `THIRD_PARTY_NOTICES.md`.

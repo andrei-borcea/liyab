@@ -649,6 +649,8 @@ float dot_quantized(DType type, const void* row, const BlockQ8_0* x, const int32
         case DType::Q4_K:
         case DType::Q5_K:
         case DType::Q6_K: return dot_k_q8_0(type, row, x, xsums, n);
+        case DType::IQ4_NL: return dot_iq4_nl_q8_0(row, x, n);
+        case DType::MXFP4: return dot_mxfp4_q8_0(row, x, n);
         default: return is_extended(type) ? dot_ext_q8_0(type, row, x, n) : 0.0f;
     }
 }

@@ -311,39 +311,66 @@ TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") 
     }
 }
 
-TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
+// One entry of tests/data/quant_vectors.bin (written by tools/gen_quant_vectors.py):
+// encoded blocks of a GGML format and the values llama.cpp's reference decodes.
+struct QuantVector {
+    DType type{};
+    int64_t n = 0;  // values
+    std::vector<uint8_t> blocks;
+    std::vector<float> expected;
+};
+
+// Reads every entry; false (with a "skipped" note) when the file is absent.
+bool load_quant_vectors(std::vector<QuantVector>& out) {
     std::string dir = LIYAB_TEST_DATA_DIR;
     if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
     std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
     if (f == nullptr) {
         std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
-        return;
+        return false;
     }
     std::vector<uint8_t> file;
     uint8_t chunk[4096];
     for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
     std::fclose(f);
-    REQUIRE(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
+    CHECK(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
+    if (file.size() <= 12) return false;
     size_t pos = 12;
     uint32_t count = 0;
     std::memcpy(&count, file.data() + 8, 4);
-    std::mt19937 rng(23);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    int checked = 0;
     for (uint32_t e = 0; e < count; ++e) {
         uint32_t ggml = 0, n_blocks = 0;
         std::memcpy(&ggml, file.data() + pos, 4);
         std::memcpy(&n_blocks, file.data() + pos + 4, 4);
         pos += 8;
-        DType type{};
-        REQUIRE(dtype_from_ggml(ggml, type));
+        QuantVector v;
+        const bool known = dtype_from_ggml(ggml, v.type);
+        CHECK(known);
+        if (!known) return false;
+        const DTypeTraits t = dtype_traits(v.type);
+        v.n = static_cast<int64_t>(n_blocks) * t.block_size;
+        v.blocks.assign(file.data() + pos, file.data() + pos + static_cast<size_t>(n_blocks) * t.block_bytes);
+        pos += v.blocks.size();
+        v.expected.resize(static_cast<size_t>(v.n));
+        std::memcpy(v.expected.data(), file.data() + pos, v.expected.size() * 4);
+        pos += v.expected.size() * 4;
+        out.push_back(std::move(v));
+    }
+    return true;
+}
+
+TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
+    std::vector<QuantVector> vectors;
+    if (!load_quant_vectors(vectors)) return;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    int checked = 0;
+    for (const QuantVector& qv : vectors) {
+        const DType type = qv.type;
         const DTypeTraits t = dtype_traits(type);
-        const int64_t n = static_cast<int64_t>(n_blocks) * t.block_size;
-        const uint8_t* blocks = file.data() + pos;
-        pos += static_cast<size_t>(n_blocks) * t.block_bytes;
-        std::vector<float> expected(static_cast<size_t>(n));
-        std::memcpy(expected.data(), file.data() + pos, expected.size() * 4);
-        pos += expected.size() * 4;
+        const int64_t n = qv.n;
+        const uint8_t* blocks = qv.blocks.data();
+        const std::vector<float>& expected = qv.expected;
 
         // 1. Decoding: bit-exact, except IQ1 (reference rounds dl*(g+delta), we compute dl*g + dl*delta).
         std::vector<float> got(static_cast<size_t>(n));
@@ -384,7 +411,109 @@ TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/d
                     decode_ok ? "exact" : "MISMATCH", max_err, dot_ok ? "ok" : "MISMATCH");
         ++checked;
     }
-    CHECK(checked == static_cast<int>(count));
+    CHECK(checked == static_cast<int>(vectors.size()));
+}
+
+TEST_CASE("Q8_K activation quantization matches llama.cpp's semantics") {
+    std::mt19937 rng(41);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t n = 1024;
+    std::vector<float> x(static_cast<size_t>(n));
+    for (auto& v : x) v = normal(rng);
+    x[300] = 9.0f;                         // positive extreme: d < 0 and x[300] -> -127
+    for (int j = 512; j < 768; ++j) x[j] = 0.0f;  // all-zero super-block
+    std::vector<quant::BlockQ8_K> q(static_cast<size_t>(n / 256));
+    quant::quantize_row_q8_K(x.data(), q.data(), n);
+    CHECK(q[1].qs[300 - 256] == -127);
+    CHECK(q[1].d < 0.0f);
+    CHECK(q[2].d == 0.0f);
+    for (size_t b = 0; b < q.size(); ++b) {
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int e = 0; e < 16; ++e) sum += q[b].qs[16 * j + e];
+            CHECK(q[b].bsums[j] == sum);
+        }
+        for (int e = 0; e < 256; ++e) {
+            const float xv = x[b * 256 + e];
+            // Round-to-nearest: the reconstruction error is at most half a step.
+            CHECK(std::fabs(q[b].d * q[b].qs[e] - xv) <= 0.5f * std::fabs(q[b].d) + 1e-6f);
+            CHECK(q[b].qs[e] >= -127);
+        }
+    }
+}
+
+TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
+    std::vector<QuantVector> vectors;
+    if (!load_quant_vectors(vectors)) return;
+    const DType lowbit[] = {DType::Q2_K,   DType::Q3_K,    DType::TQ2_0,  DType::IQ1_S,
+                            DType::IQ1_M,  DType::IQ2_XXS, DType::IQ2_XS, DType::IQ2_S,
+                            DType::IQ3_XXS, DType::IQ3_S,  DType::IQ4_XS};
+    std::mt19937 rng(29);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    int checked = 0;
+    for (const QuantVector& qv : vectors) {
+        if (std::find(std::begin(lowbit), std::end(lowbit), qv.type) == std::end(lowbit)) continue;
+        const int64_t n = qv.n;  // 4 super-blocks of llama.cpp-encoded weights
+        REQUIRE(n % 256 == 0);
+        // Activations with a heavy tail (as in real hidden states) so the
+        // per-256 scale differs from the per-32 one.
+        std::vector<float> x(static_cast<size_t>(n));
+        for (auto& v : x) v = normal(rng) * (rng() % 64 == 0 ? 8.0f : 1.0f);
+        std::vector<quant::BlockQ8_K> xk(static_cast<size_t>(n / 256));
+        quant::quantize_row_q8_K(x.data(), xk.data(), n);
+        std::vector<float> w(static_cast<size_t>(n));
+        quant::dequantize_row(qv.type, qv.blocks.data(), w.data(), n);
+
+        // 1. Kernel == float dot of the dequantized weights and the dequantized Q8_K activations.
+        double reference = 0.0, mag = 1e-6, exact = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const double xd = static_cast<double>(xk[i / 256].d) * xk[i / 256].qs[i % 256];
+            reference += static_cast<double>(w[i]) * xd;
+            exact += static_cast<double>(w[i]) * x[i];
+            mag += std::fabs(static_cast<double>(w[i]) * x[i]);
+        }
+        const float kernel = quant::dot_lowbit_q8_K(qv.type, qv.blocks.data(), xk.data(), n);
+        const bool exact_ok = std::fabs(kernel - reference) <= 1e-5 * mag;
+        CHECK(exact_ok);
+
+        // 2. Loosely equal to the Q8_0 path and to the unquantized activations
+        //    (only activation-quantization error separates them).
+        std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(n / 32));
+        quant::quantize_row_q8_0(x.data(), xq.data(), n);
+        const float old_path = quant::dot_ext_q8_0(qv.type, qv.blocks.data(), xq.data(), n);
+        const bool old_ok = std::fabs(kernel - old_path) <= 2e-2 * mag;
+        const bool float_ok = std::fabs(kernel - exact) <= 2e-2 * mag;
+        CHECK(old_ok);
+        CHECK(float_ok);
+
+        // 3. The CPU backend routes the type through the same kernel (2 activation rows).
+        TensorView view;
+        view.name = "lowbit";
+        view.type = qv.type;
+        view.n_dims = 2;
+        view.ne = {n, 1, 1, 1};
+        view.data = qv.blocks.data();
+        view.nbytes = qv.blocks.size();
+        std::vector<float> x2(x);
+        for (int64_t i = 0; i < n; ++i) x2.push_back(-0.5f * x[n - 1 - i]);
+        float y[2] = {0.0f, 0.0f};
+        REQUIRE(cpu->matmul(view, x2.data(), y, 2).is_ok());
+        quant::quantize_row_q8_K(x2.data() + n, xk.data(), n);
+        const float second = quant::dot_lowbit_q8_K(qv.type, qv.blocks.data(), xk.data(), n);
+        if (quant::uses_q8_K(qv.type)) {
+            CHECK(y[0] == kernel);
+            CHECK(y[1] == second);
+        } else {
+            CHECK(y[0] == quant::dot_quantized(qv.type, qv.blocks.data(), xq.data(), nullptr, n));
+        }
+        std::printf("  %-8s kernel-vs-dequant %.1e  vs Q8_0 path %.1e  vs float %.1e  (of %.2f)\n",
+                    std::string(dtype_traits(qv.type).name).c_str(), std::fabs(kernel - reference) / mag,
+                    std::fabs(kernel - old_path) / mag, std::fabs(kernel - exact) / mag, mag);
+        ++checked;
+    }
+    CHECK(checked == static_cast<int>(std::size(lowbit)));
 }
 
 TEST_CASE("CPU backend batched matmul equals per-row dots") {

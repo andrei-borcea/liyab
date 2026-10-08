@@ -9,10 +9,16 @@
 // llama.cpp's gguf-py (quants.py); tests/data/quant_vectors.bin holds blocks
 // and expected values produced by that reference, checked bit-exactly by
 // tests/test_engine.cpp. Lookup grids come from tools/gen_quant_tables.py.
+//
+// This path is the reference and the portable fallback. On AArch64 NEON the
+// CPU backend runs most of these formats through the faster kernels in
+// quant_lowbit.cpp (Q8_K activations for the 256-value formats, see
+// quant::uses_q8_K; dot_quantized dispatches IQ4_NL and MXFP4 there too).
 #include <cmath>
 #include <cstring>
 
 #include "core/quant.h"
+#include "core/quant_tables.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -22,8 +28,6 @@
 namespace liyab::quant {
 
 namespace {
-
-#include "core/quant_tables.inc"
 
 inline float half_at(const uint8_t* p) noexcept {
     uint16_t h;
@@ -49,13 +53,6 @@ inline void signed8(const uint8_t* grid, uint8_t signs, int8_t* out) noexcept {
     }
 }
 
-float e8m0_to_fp32_half(uint8_t e) noexcept {
-    const uint32_t bits = e < 2 ? (0x00200000u << e) : (static_cast<uint32_t>(e - 1) << 23);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
 float ue4m3_to_fp32_half(uint8_t x) noexcept {
     if (x == 0 || x == 0x7F) return 0.0f;
     const int exp = (x >> 3) & 0xF;
@@ -65,6 +62,13 @@ float ue4m3_to_fp32_half(uint8_t x) noexcept {
 }
 
 }  // namespace
+
+float e8m0_to_fp32_half(uint8_t e) noexcept {
+    const uint32_t bits = e < 2 ? (0x00200000u << e) : (static_cast<uint32_t>(e - 1) << 23);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
 
 bool is_extended(DType type) noexcept {
     switch (type) {

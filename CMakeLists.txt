@@ -65,6 +65,7 @@ add_library(liyab_core OBJECT
   src/core/log.cpp
   src/core/quant.cpp
   src/core/quant_ext.cpp
+  src/core/quant_lowbit.cpp
   src/core/thread_pool.cpp
   src/core/mmap_loader.cpp
   src/core/device_detect.cpp
