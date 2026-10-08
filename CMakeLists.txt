@@ -78,6 +78,7 @@ add_library(liyab_core OBJECT
   src/core/expert_store.cpp
   src/core/direct_io.cpp
   src/core/speculative_decoder.cpp
+  src/core/draft_budget.cpp
   src/core/engine.cpp
   src/backends/cpu/cpu_backend.cpp
   src/backends/qnn/qnn_backend.cpp

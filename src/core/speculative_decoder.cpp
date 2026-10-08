@@ -1,7 +1,9 @@
 #include "liyab/speculative_decoder.h"
 
 #include <algorithm>
+#include <chrono>
 
+#include "core/draft_budget.h"
 #include "core/sampling.h"
 #include "core/transformer.h"
 
@@ -17,10 +19,17 @@ constexpr int32_t kLookupMinMatch = 2;
 }  // namespace
 
 SpeculativeDecoder::SpeculativeDecoder(Transformer& target, Transformer& draft, int32_t draft_tokens)
-    : target_(target), draft_(&draft), draft_tokens_(std::max(1, draft_tokens)) {}
+    : target_(target), draft_(&draft), draft_tokens_(std::max(1, draft_tokens)),
+      budget_(std::make_unique<DraftBudget>(draft_tokens_)) {}
 
 SpeculativeDecoder::SpeculativeDecoder(Transformer& target, int32_t draft_tokens)
-    : target_(target), draft_tokens_(std::max(1, draft_tokens)) {}
+    : target_(target), draft_tokens_(std::max(1, draft_tokens)), budget_(std::make_unique<DraftBudget>(draft_tokens_)) {}
+
+SpeculativeDecoder::~SpeculativeDecoder() = default;
+
+void SpeculativeDecoder::set_adaptive(bool adaptive) {
+    budget_ = adaptive ? std::make_unique<DraftBudget>(draft_tokens_) : nullptr;
+}
 
 void SpeculativeDecoder::lookup(std::span<const int32_t> history, int32_t k, std::vector<int32_t>& out) {
     out.clear();
@@ -39,6 +48,7 @@ void SpeculativeDecoder::lookup(std::span<const int32_t> history, int32_t k, std
 Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<const int32_t> context, Sampler& sampler,
                                                       const Route& target_route, const Route& draft_route,
                                                       ThreadPool& pool) {
+    const auto t0 = std::chrono::steady_clock::now();
     const int32_t base = target_.n_past();
     if (draft_ != nullptr && draft_->n_past() != base) {
         return Status(ErrorCode::Internal, "draft and target caches diverged");
@@ -48,6 +58,7 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     int32_t k = std::min(draft_tokens_, target_.max_batch() - 1);
     if (target_.kv_cache().window() == 0) k = std::min(k, target_.context_length() - base - 1);
     if (draft_ != nullptr && draft_->kv_cache().window() == 0) k = std::min(k, draft_->context_length() - base - 1);
+    if (budget_ != nullptr) k = std::min(k, budget_->choose());
 
     // 1. Draft up to k tokens: from the draft model (with its distributions),
     // or by looking the recent tokens up in the context (deterministic).
@@ -73,6 +84,9 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     proposed_ += k;
 
     // 2. Verify every draft with one batched target pass (k + 1 logit rows).
+    // Only a pass with drafts can be rolled back: a plain step skips the
+    // recurrent-state checkpoints.
+    target_.set_checkpointing(k > 0);
     auto logits = target_.forward(verify, k > 0 ? Transformer::Logits::All : Transformer::Logits::Last, target_route, pool);
     if (!logits) return logits.status();
     auto row = [&](int32_t i) {
@@ -135,6 +149,10 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     const int32_t keep = base + 1 + n_accepted;
     LIYAB_RETURN_IF_ERROR(target_.truncate(keep));
     if (draft_ != nullptr) LIYAB_RETURN_IF_ERROR(draft_->truncate(keep));
+    if (budget_ != nullptr) {
+        budget_->record(k, static_cast<int32_t>(out.size()),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     return out;
 }
 

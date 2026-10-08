@@ -738,7 +738,9 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                 for (size_t j = 0; j < hd; ++j) o[j] *= silu(z[j]);
             }
         });
-        if (rollback_window_ > 0) {  // the state after this token, for truncate()
+        // The state after this token, for truncate(); in a longer batch only
+        // the last rollback_window_ tokens' copies would survive in the ring.
+        if (rollback_window_ > 0 && checkpointing_ && t + static_cast<size_t>(rollback_window_) >= un) {
             const size_t per_state = st.conv.size() + st.ssm.size();
             float* slot = st.checkpoints.data() +
                           static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
@@ -1127,7 +1129,8 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     LIYAB_RETURN_IF_ERROR(kv_->reserve(n_past_ + n));  // maps KV pages; ContextFull past the limit
     // The DeltaNet mixers overwrite these rollback slots; they become valid
     // only once every block has run (a failed pass leaves no half-written checkpoint).
-    for (int32_t i = 0; i < std::min(n, rollback_window_); ++i) {
+    const int32_t recorded = checkpointing_ ? std::min(n, rollback_window_) : 0;
+    for (int32_t i = 0; i < recorded; ++i) {
         checkpoint_pos_[static_cast<size_t>((n_past_ + n - 1 - i) % rollback_window_)] = -1;
     }
     // Early exit would leave the skipped blocks' recurrent states behind: attention-only stacks.
@@ -1210,7 +1213,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         }
     }
 
-    for (int32_t i = 0; i < std::min(n, rollback_window_); ++i) {
+    for (int32_t i = 0; i < recorded; ++i) {
         const int32_t pos = n_past_ + n - 1 - i;
         checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
     }

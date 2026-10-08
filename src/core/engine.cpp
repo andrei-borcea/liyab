@@ -443,6 +443,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         impl->target->set_rollback_window(config.draft_tokens + 1);
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, config.draft_tokens);
     }
+    if (impl->speculative) impl->speculative->set_adaptive(config.adaptive_drafts);
 
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     const ExperimentalConfig& x = config.experimental;

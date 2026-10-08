@@ -82,6 +82,10 @@ struct EngineConfig {
     // repeats its context and on models that verify k tokens for about the
     // cost of one (dense models in RAM).
     bool lookup_drafts = false;
+    // Learn on the device how many drafts per step pay off (0..draft_tokens;
+    // see SpeculativeDecoder). false: always draft_tokens, which keeps sampled
+    // output reproducible for a fixed seed.
+    bool adaptive_drafts = true;
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing

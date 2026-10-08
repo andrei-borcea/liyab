@@ -191,6 +191,10 @@ public:
     // without recurrent blocks. Discards existing checkpoints.
     void set_rollback_window(int32_t positions);
     [[nodiscard]] int32_t rollback_window() const noexcept { return rollback_window_; }
+    // Whether forward() records checkpoints (default true). Callers that know
+    // a pass will never be rolled back (a plain decoding step) turn it off to
+    // skip the state copies; positions processed meanwhile cannot be returned to.
+    void set_checkpointing(bool on) noexcept { checkpointing_ = on; }
     // Declares positions [0, n) cached after their KV pages were attached
     // externally (KvCache::attach_external_pages). Requires an empty context.
     // Unsupported for hybrid models (KV pages do not carry recurrent states).
@@ -307,6 +311,7 @@ private:
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
     int32_t rollback_window_ = 0;
+    bool checkpointing_ = true;
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_

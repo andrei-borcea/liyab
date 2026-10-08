@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "core/draft_budget.h"
 #include "core/quant.h"
 #include "core/sampling.h"
 #include "core/thread_pool.h"
@@ -1131,6 +1132,7 @@ TEST_CASE("Speculative decoding with greedy sampling reproduces plain greedy out
         EngineConfig same = plain;
         same.draft_model_path = mixed_model();
         same.draft_tokens = 4;
+        same.adaptive_drafts = false;  // exercise every draft, not the learned count
         auto same_engine = Engine::create(same);
         REQUIRE(same_engine.has_value());
         GenerationStats stats;
@@ -1145,11 +1147,42 @@ TEST_CASE("Speculative decoding with greedy sampling reproduces plain greedy out
         EngineConfig different = plain;
         different.draft_model_path = model_path("draft", other);
         different.draft_tokens = 3;
+        different.adaptive_drafts = false;  // exercise every draft, not the learned count
         auto diff_engine = Engine::create(different);
         REQUIRE(diff_engine.has_value());
         CHECK(run(*diff_engine.value(), prompt, greedy(24), &stats) == expected);
         CHECK(stats.draft_tokens_accepted < stats.draft_tokens_proposed);
     }
+}
+
+TEST_CASE("DraftBudget tries every draft count, then keeps the fastest and still explores") {
+    DraftBudget budget(3);
+    // First the counts never measured, in order.
+    for (int32_t expected = 0; expected <= 3; ++expected) {
+        const int32_t arm = budget.choose();
+        CHECK(arm == expected);
+        // Verification that costs a token's time per draft: plain decoding is fastest.
+        budget.record(arm, arm == 0 ? 1 : 1 + arm / 2, 10.0 * (1 + arm));
+    }
+    // Losing counts are retried with a doubling wait: a few tries in 1000 steps.
+    int32_t plain = 0, explored = 0;
+    for (int32_t i = 0; i < 1000; ++i) {
+        const int32_t arm = budget.choose();
+        (arm == 0 ? plain : explored) += 1;
+        budget.record(arm, arm == 0 ? 1 : 1 + arm / 2, 10.0 * (1 + arm));
+    }
+    CHECK(explored > 0);
+    CHECK(explored < 30);
+    // Cheap verification with good acceptance: drafting wins.
+    DraftBudget cheap(3);
+    for (int32_t i = 0; i < 64; ++i) {
+        const int32_t arm = cheap.choose();
+        cheap.record(arm, 1 + arm, 10.0 + arm);
+    }
+    CHECK(cheap.rate(3) > cheap.rate(0));
+    int32_t next = cheap.choose();
+    if (next != 3) next = cheap.choose();  // that one was an exploration step
+    CHECK(next == 3);
 }
 
 TEST_CASE("Context lookup drafts the tokens that followed the longest repeated suffix") {
@@ -1186,6 +1219,7 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
         EngineConfig lookup = plain;
         lookup.lookup_drafts = true;
         lookup.draft_tokens = 3;
+        lookup.adaptive_drafts = false;  // exercise every draft, not the learned count
         auto engine = Engine::create(lookup);
         REQUIRE(engine.has_value());
         GenerationStats stats;
@@ -1195,6 +1229,22 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
         auto again = run(*engine.value(), prompt, greedy(32), &stats);
         CHECK(again == expected);
     }
+}
+
+TEST_CASE("Adaptive draft counts keep greedy output identical") {
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    EngineConfig plain = engine_config(mixed_model());
+    plain.backend = BackendKind::Cpu;
+    auto base_engine = Engine::create(plain);
+    REQUIRE(base_engine.has_value());
+    const auto expected = run(*base_engine.value(), prompt, greedy(48));
+    EngineConfig adaptive = plain;
+    adaptive.lookup_drafts = true;
+    adaptive.draft_tokens = 4;  // adaptive_drafts is the default
+    auto engine = Engine::create(adaptive);
+    REQUIRE(engine.has_value());
+    CHECK(run(*engine.value(), prompt, greedy(48)) == expected);
 }
 
 TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft models") {
@@ -1217,6 +1267,7 @@ TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft mode
     EngineConfig spec = plain;
     spec.draft_model_path = model_path("hybrid_draft", draft_spec);
     spec.draft_tokens = 3;
+    spec.adaptive_drafts = false;  // exercise every draft, not the learned count
     auto engine = Engine::create(spec);
     if (!engine) std::printf("  %s\n", engine.status().to_string().c_str());
     REQUIRE(engine.has_value());
@@ -1229,6 +1280,7 @@ TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft mode
 TEST_CASE("Speculative sampling at temperature > 0 is reproducible for a fixed seed") {
     EngineConfig config = engine_config(mixed_model());
     config.backend = BackendKind::Cpu;
+    config.adaptive_drafts = false;  // a learned draft count would follow timing
     config.draft_model_path = model_path("draft", [] {
         test::TinyModelSpec s;
         s.seed = 99;

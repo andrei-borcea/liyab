@@ -121,9 +121,12 @@ This README describes what the code does today. Anything not implemented is list
   last *k*+1 tokens (`Transformer::set_rollback_window`), so rejected tokens roll back exactly (tested). That costs
   (*k*+1) × the recurrent state in memory (62.8 MiB per position for Qwen3.6-35B-A3B) and one state copy per token
   and DeltaNet block. On a MoE whose experts stream from flash the gain is small: a pass over *n* tokens reads
-  the union of their experts (35B on the phone: 1.55× the cost of one token for 2, 2.5× for 3). Lookup drafts on
-  the 35B writing a WebGL game (256 tokens, single runs): 6.33 tok/s without, 6.19 with *k* = 2 (31% of drafts
-  accepted), 6.48 with *k* = 4 (20%).
+  the union of their experts (35B on the phone: 1.55× the cost of one token for 2, 2.5× for 3). How many drafts to
+  verify is learned on the device (`adaptive_drafts`, default; `liyab-cli --fixed-drafts` turns it off): per draft
+  count the tokens produced per ms, the best one used, losing counts retried with a doubling wait. Plain steps skip
+  the recurrent-state checkpoints. On the 35B writing a WebGL game (256 tokens, `--lookup --draft-tokens 4`, hot
+  phone, 2 alternating rounds): 7.57 / 6.49 tok/s without speculation, 6.67 / 6.10 adaptive, 6.87 / 5.44 with a
+  fixed *k*. There, speculation does not pay and is better left off (the default).
 
 ---
 

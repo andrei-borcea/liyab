@@ -15,6 +15,14 @@
 // reduces to "keep while the target's argmax agrees", so the output is
 // token-for-token identical to plain greedy decoding of the target.
 //
+// How many drafts a step verifies (at most draft_tokens) is learned at run
+// time when adaptive (the default): see core/draft_budget.h. On a model whose
+// verification costs about as much per token as decoding (a MoE streaming its
+// experts from flash) it settles on plain decoding; where verification is
+// cheap it drafts. With sampling, the tokens drawn then depend on that choice
+// (their distribution does not); set_adaptive(false) keeps k fixed and the
+// output reproducible for a fixed seed.
+//
 // Rejected tokens are rolled back with Transformer::truncate(): recurrent
 // (hybrid) models need a rollback window of at least k + 1
 // (Transformer::set_rollback_window), which Engine sets.
@@ -25,6 +33,7 @@
 #define LIYAB_SPECULATIVE_DECODER_H
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -32,6 +41,7 @@
 
 namespace liyab {
 
+class DraftBudget;
 class Transformer;
 class Sampler;
 class ThreadPool;
@@ -43,6 +53,12 @@ public:
     SpeculativeDecoder(Transformer& target, Transformer& draft, int32_t draft_tokens);
     // Drafts by context lookup (no draft model).
     SpeculativeDecoder(Transformer& target, int32_t draft_tokens);
+    ~SpeculativeDecoder();
+    SpeculativeDecoder(const SpeculativeDecoder&) = delete;
+    SpeculativeDecoder& operator=(const SpeculativeDecoder&) = delete;
+
+    // Learn how many drafts to verify per step (default) or always draft_tokens.
+    void set_adaptive(bool adaptive);
 
     // Precondition: the models cached the same prefix and `last` (the most
     // recent token) is not yet cached. `context` is that cached prefix's
@@ -70,6 +86,7 @@ private:
     std::vector<std::vector<float>> q_;  // draft distributions, reused
     std::vector<float> p_;
     std::vector<int32_t> history_, drafts_;  // lookup scratch
+    std::unique_ptr<DraftBudget> budget_;    // null: fixed draft_tokens_
 };
 
 }  // namespace liyab
