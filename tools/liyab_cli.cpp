@@ -54,6 +54,8 @@ void usage() {
                  "  --memory-budget MB cap on resident memory (weights + caches); default: free RAM\n"
                  "  --requant 4|5      MoE expert streaming: resident Q8_0 matrices to Q4_K / Q5_K at\n"
                  "                     load (lossy, fewer bytes per token; default off)\n"
+                 "  --expert-mass P    MoE: run only the top experts covering router mass P\n"
+                 "                     (lossy, e.g. 0.9; default 1 = all top-k)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
         else if (arg == "--expert-cache") config.expert_cache_mb = std::atoll(next());
         else if (arg == "--memory-budget") config.memory_budget_mb = std::atoll(next());
         else if (arg == "--requant") config.requant_bits = std::atoi(next());
+        else if (arg == "--expert-mass") config.moe_expert_mass = static_cast<float>(std::atof(next()));
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;

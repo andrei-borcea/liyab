@@ -314,7 +314,8 @@ build runs, so front ends can filter downloads without a copy of the list. `liya
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
 OS counters do not show (`liyab-cli --memory-budget MB`); `requant_bits` (4 or 5, default 0 = off; `liyab-cli
 --requant 4|5`) converts the resident Q8_0 matrices of a MoE model with streamed experts to Q4_K or Q5_K at load
-(lossy, see the 35B results below); and `liyab_generation_stats`
+(lossy, see the 35B results below); `moe_expert_mass` (`liyab-cli --expert-mass P`, default 1 = off) runs, per token,
+only the top experts covering a fraction P of the router weight (lossy, see below); and `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
 `expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), plus where decode
@@ -525,6 +526,9 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
 * **Fewer resident bytes (opt-in, lossy).** `requant_bits` converts the resident Q8_0 matrices (attention and
   DeltaNet projections, shared experts; not the token embedding) to Q4_K or Q5_K at load, with llama.cpp's reference
   quantizer, before the expert cache is sized, so the memory saved goes to the cache.
+* **Fewer experts per token (opt-in, lossy).** `moe_expert_mass` keeps, per token, the fewest top-ranked experts of
+  the top-k whose router probabilities cover that fraction of the top-k's total, renormalized over the kept ones;
+  the prediction applies the same cut, so fewer experts are read and computed.
 
 Measured on the phone (Qwen3.8-27B UD-IQ2_S, 8.4 GB, 64 blocks of which 48 Gated DeltaNet; 8.2 GB free RAM; decode
 of a short Italian answer, greedy):
@@ -580,6 +584,25 @@ answer) against the lossless path:
 Q4_K saves ~10 ms per token on the projections and gives the expert cache ~0.6 GB more, but changes about one
 next-token choice in ten; Q5_K is not measurably faster. It stays off by default. The conversion runs on every core at
 load and barely shows (1.4 s to load the 35B and answer one token with it, 1.1–2.0 s without).
+
+Running fewer of each token's 8 experts (`--expert-mass`, opt-in) cuts reads and compute together (same setup, 3
+alternating rounds, medians; quality on the same text):
+
+| Experts per token | Decode | Expert reads per token | KL (mean / median) | Top-1 agreement |
+| :--- | ---: | ---: | ---: | ---: |
+| all 8 (default) | 7.41 tok/s | 284 MiB | — | — |
+| covering 95% of the router weight | 7.64 tok/s | 273 MiB | 0.027 / 0.007 | 94.9% |
+| covering 90% (~6.5 experts) | 8.19 tok/s | 234 MiB | 0.039 / 0.012 | 92.0% |
+| covering 80% (~5.5 experts) | 9.49 tok/s | 164 MiB | 0.092 / 0.034 | 90.1% |
+| covering 70% | — | — | 0.139 / 0.052 | 85.8% |
+
+At 0.9 the cost in quality is half that of `--requant 5` for a 10% gain; 0.8 costs about as much as `--requant 4`
+for 28%.
+
+A larger memory budget helps without any quality cost, where the platform allows it: with `--memory-budget 7000`
+instead of 5500 the expert cache grows by 1.5 GB, expert reads drop from 284 to 208 MiB per token and decode goes
+from 8.29 to 9.50 tok/s (medians of 3 rounds); 8500 reads 165 MiB but is not faster (9.20), the phone's free RAM
+runs short. Whether HyperOS lets a foreground app keep 7 GB is still to be checked in the app.
 
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident

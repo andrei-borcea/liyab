@@ -689,6 +689,53 @@ TEST_CASE("Mixture of experts with identical experts equals its dense twin (rout
         stepwise.insert(stepwise.end(), r->begin(), r->end());
     }
     CHECK(max_abs_diff(stepwise, dense_logits) < 1e-3);
+
+    // expert_mass < 1 runs a renormalized subset of each token's top-3; with
+    // identical experts any subset still equals the dense twin. Unstreamed
+    // and streamed (prediction applies the same cut).
+    for (const int64_t cache : {int64_t{0}, int64_t{1}}) {
+        TransformerOptions fewer = options;
+        fewer.expert_mass = 0.4f;
+        fewer.expert_cache_bytes = cache;
+        auto c = load_transformer(model_path("moe_twin", moe), fewer);
+        REQUIRE(c != nullptr);
+        auto lc = c->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(lc.has_value());
+        CHECK(max_abs_diff(*lc, dense_logits) < 1e-3);
+    }
+}
+
+TEST_CASE("MoE expert_mass runs fewer experts per token") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen3moe";
+    spec.n_layers = 2;
+    spec.n_expert = 16;
+    spec.n_expert_used = 4;
+    spec.identical_experts = false;
+    const std::string& path = model_path("moe_mass", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 16; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto uses = [&](float mass) {
+        TransformerOptions options;
+        options.expert_cache_bytes = 1;  // streamed: the store counts expert uses
+        options.expert_mass = mass;
+        auto model = load_transformer(path, options);
+        if (model == nullptr || model->expert_store() == nullptr) return uint64_t{0};
+        for (const int32_t t : tokens) {
+            if (!model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool)) return uint64_t{0};
+        }
+        const ExpertStore::Stats st = model->expert_store()->stats();
+        return st.hits + st.late + st.misses;
+    };
+    const uint64_t all = uses(1.0f);
+    const uint64_t top1 = uses(1e-6f);  // the first expert alone covers it
+    CHECK(all == tokens.size() * 2 * 4);
+    CHECK(top1 == tokens.size() * 2);
+    const uint64_t half = uses(0.5f);
+    CHECK(half >= top1 && half <= all);
 }
 
 TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O) equals in-place expert reads") {

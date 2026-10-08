@@ -102,6 +102,11 @@ struct TransformerOptions {
     // With expert streaming: convert the resident Q8_0 matrices to Q4_K (4)
     // or Q5_K (5) at load, before the expert cache is sized (lossy; 0: off).
     int32_t requant_bits = 0;
+    // MoE: per token, run only the fewest top-ranked experts of the top-k
+    // whose router probabilities cover this fraction of the top-k's total
+    // (renormalized over the kept ones when the model normalizes its top-k).
+    // Lossy; >= 1 runs all top-k (default).
+    float expert_mass = 1.0f;
 };
 
 class Transformer {
@@ -239,6 +244,11 @@ private:
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
+    // How many of a token's top-k experts run under expert_mass_: `order`
+    // starts with the top-k by selection score, `probs` are their router
+    // probabilities and `top_sum` their total.
+    [[nodiscard]] size_t experts_to_run(std::span<const float> probs, std::span<const int32_t> order,
+                                        float top_sum) const;
     // Expert prefetch: applies block `layer`'s router (and FFN norm) to the
     // current residual stream (x_) and queues the top-k experts it picks in
     // the ExpertStore. forward() calls it for block l + 1 once block l's mixer
@@ -281,6 +291,8 @@ private:
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;
+    float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
+    std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 
     // Scratch, sized for the current batch.

@@ -132,6 +132,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->expert_cache_mb = d.expert_cache_mb;
     config->memory_budget_mb = d.memory_budget_mb;
     config->requant_bits = d.requant_bits;
+    config->moe_expert_mass = d.moe_expert_mass;
     config->early_exit = d.experimental.early_exit ? 1 : 0;
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
@@ -176,6 +177,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.expert_cache_mb = config->expert_cache_mb;
         c.memory_budget_mb = config->memory_budget_mb;
         c.requant_bits = config->requant_bits;
+        c.moe_expert_mass = config->moe_expert_mass;
         c.experimental.early_exit = config->early_exit != 0;
         c.experimental.early_exit_threshold = config->early_exit_threshold;
         c.experimental.head_pruning = config->head_pruning != 0;

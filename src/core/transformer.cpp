@@ -130,6 +130,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     LIYAB_RETURN_IF_ERROR(require_int("embedding_length", c.n_embd));
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
+    model->expert_mass_ = options.expert_mass;
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
@@ -815,6 +816,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
     std::vector<int32_t> picks;
+    std::vector<float> probs(expert_mass_ < 1.0f ? E : 0);
     for (size_t t = 0; t < un; ++t) {
         const float* logits = pred_logits_.data() + t * E;
         auto score = [&](int32_t e) {  // softmax and sigmoid are monotonic; the selection bias is added on top
@@ -825,7 +827,17 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
         const auto k = static_cast<std::ptrdiff_t>(c.n_expert_used);
         std::partial_sort(order.begin(), order.begin() + k, order.end(),
                           [&](int32_t a, int32_t b) { return score(a) > score(b); });
-        picks.insert(picks.end(), order.begin(), order.begin() + k);
+        size_t kept = static_cast<size_t>(k);
+        if (expert_mass_ < 1.0f) {  // guess only the experts the router would keep (unnormalized: ratios suffice)
+            float sum = 0.0f;
+            const float top = logits[order[0]];
+            for (std::ptrdiff_t i = 0; i < k; ++i) {
+                const auto e = static_cast<size_t>(order[static_cast<size_t>(i)]);
+                sum += probs[e] = c.moe_gating == MoeGating::Softmax ? std::exp(logits[e] - top) : sigmoid(logits[e]);
+            }
+            kept = experts_to_run(probs, order, sum);
+        }
+        picks.insert(picks.end(), order.begin(), order.begin() + static_cast<std::ptrdiff_t>(kept));
     }
     std::sort(picks.begin(), picks.end());
     picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
@@ -857,6 +869,17 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
     return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
 }
 
+size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const int32_t> order, float top_sum) const {
+    const auto K = static_cast<size_t>(config_.n_expert_used);
+    if (expert_mass_ >= 1.0f) return K;
+    float covered = 0.0f;
+    for (size_t k = 0; k < K; ++k) {
+        covered += probs[static_cast<size_t>(order[k])];
+        if (covered >= expert_mass_ * top_sum) return k + 1;
+    }
+    return K;
+}
+
 // Mixture of experts, as llama.cpp's build_moe_ffn: router probabilities
 // (softmax or sigmoid), top-k selection (optionally on probability + bias),
 // optional renormalization and scale; each selected expert is a SwiGLU FFN.
@@ -885,6 +908,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     std::vector<std::vector<Use>> assigned(E);
     std::vector<float> probs(E);
     std::vector<int32_t> order(E);
+    experts_kept_.assign(un, static_cast<int32_t>(K));
     for (size_t t = 0; t < un; ++t) {
         const float* logits = router_.data() + t * E;
         if (c.moe_gating == MoeGating::Softmax) {
@@ -903,8 +927,14 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
                           [&](int32_t a, int32_t b) { return selection(a) > selection(b) || (selection(a) == selection(b) && a < b); });
         float sum = 0.0f;
         for (size_t k = 0; k < K; ++k) sum += probs[static_cast<size_t>(order[k])];
+        const size_t kept = experts_to_run(probs, order, sum);
+        experts_kept_[t] = static_cast<int32_t>(kept);
+        if (kept < K) {
+            sum = 0.0f;
+            for (size_t k = 0; k < kept; ++k) sum += probs[static_cast<size_t>(order[k])];
+        }
         const float norm = c.moe_norm_weights ? 1.0f / std::max(sum, 6.103515625e-5f) : 1.0f;
-        for (size_t k = 0; k < K; ++k) {
+        for (size_t k = 0; k < kept; ++k) {
             const auto e = static_cast<size_t>(order[k]);
             assigned[e].push_back(
                 {static_cast<int32_t>(t), static_cast<int32_t>(k), probs[e] * norm * c.moe_weights_scale});
@@ -1028,7 +1058,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     // whole rounding steps: run-to-run perplexity varied by ~10%).
     for (size_t t = 0; t < un; ++t) {
         float* dst = moe_out_.data() + t * d;
-        for (size_t k = 0; k < K; ++k) {
+        for (size_t k = 0; k < static_cast<size_t>(experts_kept_[t]); ++k) {
             const float* src = ranked_out_.data() + (t * K + k) * d;
             for (size_t j = 0; j < d; ++j) dst[j] += src[j];
         }

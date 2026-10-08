@@ -67,6 +67,11 @@ struct EngineConfig {
     // saved goes to the expert cache. Converted on every core at load;
     // ignored when experts are not streamed. 0: off.
     int32_t requant_bits = 0;
+    // MoE: per token, run only the fewest top-ranked experts of the top-k
+    // whose router probabilities cover this fraction of the top-k's total
+    // (e.g. 0.9), renormalized over the kept ones. Lossy, opt-in: fewer
+    // expert reads and less compute per token. >= 1: all top-k (default).
+    float moe_expert_mass = 1.0f;
     int32_t draft_tokens = 4;         // k for speculative decoding
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM

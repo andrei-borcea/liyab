@@ -71,6 +71,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
     options.requant_bits = config.requant_bits;
+    options.expert_mass = config.moe_expert_mass;
     return Transformer::load(std::move(file).value(), options);
 }
 
