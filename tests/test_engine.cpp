@@ -1002,6 +1002,10 @@ TEST_CASE("C API: create, generate, describe, errors") {
     CHECK(liyab_engine_generate(engine, "hello world", &params, callback, &text, &stats) == LIYAB_OK);
     CHECK(stats.prompt_tokens == 3);
     CHECK(stats.generated_tokens > 0);
+    liyab_engine_counters counters{};
+    CHECK(liyab_engine_get_counters(engine, &counters) == LIYAB_OK);
+    CHECK(counters.tokens_generated == static_cast<uint64_t>(stats.generated_tokens));
+    CHECK(liyab_engine_get_counters(nullptr, &counters) == LIYAB_ERR_INVALID_ARGUMENT);
 
     const int32_t tokens[] = {1, 270, 300};
     CHECK(liyab_engine_generate_tokens(engine, tokens, 3, &params, nullptr, nullptr, &stats) == LIYAB_OK);

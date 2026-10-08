@@ -37,6 +37,7 @@ public final class HomeActivity extends Activity
     private Button backendButton;
     private Button unloadButton;
     private Button settingsButton;
+    private Button overlayButton;
     private TextView log;
     private ScrollView logScroll;
     private final Runnable tick = new Runnable() {
@@ -127,7 +128,13 @@ public final class HomeActivity extends Activity
         unloadButton = Ui.pill(this, "⏏  Unload", v -> EngineHolder.unload());
         actions.addView(Ui.buttonRow(this, backendButton, unloadButton));
         settingsButton = Ui.pill(this, "⚙  Model settings", v -> startActivity(new Intent(this, SettingsActivity.class)));
-        actions.addView(Ui.buttonRow(this, settingsButton));
+        overlayButton = Ui.pill(this, "", v -> {
+            PerfOverlay.setEnabled(this, !PerfOverlay.enabled());
+            if (PerfOverlay.enabled()) PerfOverlay.attach(this);
+            else PerfOverlay.detach(this);
+            refresh();
+        });
+        actions.addView(Ui.buttonRow(this, settingsButton, overlayButton));
         root.addView(actions);
 
         LinearLayout debug = Ui.card(this);
@@ -178,6 +185,7 @@ public final class HomeActivity extends Activity
         unloadButton.setAlpha(unloadButton.isEnabled() ? 1f : 0.4f);
         settingsButton.setEnabled(loaded && !EngineHolder.busy);
         settingsButton.setAlpha(settingsButton.isEnabled() ? 1f : 0.4f);
+        overlayButton.setText(PerfOverlay.enabled() ? "📈  Overlay: on" : "📈  Overlay: off");
         backendButton.setText(EngineHolder.useGpu() ? "⚡  Backend: GPU" : "🧠  Backend: CPU");
         backendButton.setEnabled(!EngineHolder.busy);
         refreshDownload();

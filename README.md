@@ -294,6 +294,9 @@ the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supp
 build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off), and `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read` and `expert_stall_ms`.
+`liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU
+busy time spent on the engine's work, bytes streamed from storage, tokens generated); it is safe to call while a
+generation runs.
 
 ### Android (Kotlin)
 
@@ -387,7 +390,7 @@ final class LiyabEngine {
 `android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with four screens:
 
 * **Home.** Shows the model status (name, backend, SoC, running download) and quick actions: open chat, Models,
-  switch CPU/GPU, unload, model settings. The debug log stays visible here, with timestamped app events plus the engine's own log
+  switch CPU/GPU, unload, model settings, performance overlay. The debug log stays visible here, with timestamped app events plus the engine's own log
   lines (via `liyab_set_log_callback`), and can be copied or cleared.
 * **Chat.** Replies stream token by token; Stop cancels. Leaving the screen keeps the conversation. The prompt
   format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). Earlier turns
@@ -415,6 +418,13 @@ final class LiyabEngine {
     persisted, so they resume after a pause, a kill or a network loss. Retries use exponential backoff, and the file
     is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
     you leave the page.
+
+* **Performance overlay (Home → "Overlay").** A draggable panel over every screen with 60-second charts, sampled
+  twice a second: process CPU (share of all cores, `/proc/self/stat`), GPU (time the GPU spends on Liyab's work,
+  from the engine counters: Android blocks the GPU's own load counters for apps), power drawn from the battery
+  (`BatteryManager` current × voltage; while charging this is the net battery flow, and the panel says so),
+  tokens per second and flash read MB/s, plus battery level, temperature, thermal status and joules per token.
+  Tap its header to fold it into one line.
 
 Engine, log and download state live in process-wide holders (`EngineHolder`, `DebugLog`, `Downloads`), so moving
 between screens never interrupts them.

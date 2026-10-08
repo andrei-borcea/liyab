@@ -55,6 +55,7 @@ public:
 
     struct Stats {
         uint64_t items_fetched = 0;
+        uint64_t bytes_fetched = 0;     // stage-1 bytes read from storage
         double fetch_ms = 0.0;
         double transform_ms = 0.0;
         double consumer_wait_ms = 0.0;  // time stage 3 spent blocked in acquire()

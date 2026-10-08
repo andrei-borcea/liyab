@@ -194,6 +194,15 @@ LIYAB_C_API size_t liyab_engine_describe(const liyab_engine* engine, char* buffe
 LIYAB_C_API int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size);
 /* Same as liyab_engine_describe for the device only; no engine required. */
 LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
+/* Live counters for monitoring UIs, cumulative since creation: sample them
+ * periodically and divide deltas by the elapsed time. Thread-safe (may be
+ * called while a generation runs). */
+typedef struct liyab_engine_counters {
+    double accelerator_busy_ms;  /* GPU time spent on this engine's work (0: none / not tracked) */
+    uint64_t storage_bytes_read; /* weights streamed from storage */
+    uint64_t tokens_generated;   /* decoded tokens, all generations */
+} liyab_engine_counters;
+LIYAB_C_API liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_counters* out);
 /* GGUF `general.architecture` values this build runs, comma-separated; same
  * buffer contract as liyab_engine_describe. */
 LIYAB_C_API size_t liyab_supported_architectures(char* buffer, size_t size);

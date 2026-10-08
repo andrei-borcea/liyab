@@ -164,6 +164,17 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_metadata(JNIEnv* env, 
     return env->NewStringUTF(value.c_str());
 }
 
+// Returns {accelerator_busy_ms, storage_bytes_read, tokens_generated}, or null.
+JNIEXPORT jdoubleArray JNICALL Java_com_liyab_chat_LiyabNative_counters(JNIEnv* env, jclass, jlong h) {
+    liyab_engine_counters c{};
+    if (h == 0 || liyab_engine_get_counters(handle(h), &c) != LIYAB_OK) return nullptr;
+    const jdouble values[] = {c.accelerator_busy_ms, static_cast<jdouble>(c.storage_bytes_read),
+                              static_cast<jdouble>(c.tokens_generated)};
+    jdoubleArray out = env->NewDoubleArray(3);
+    if (out != nullptr) env->SetDoubleArrayRegion(out, 0, 3, values);
+    return out;
+}
+
 JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_supportedArchitectures(JNIEnv* env, jclass) {
     std::string text(liyab_supported_architectures(nullptr, 0) + 1, '\0');
     liyab_supported_architectures(text.data(), text.size());

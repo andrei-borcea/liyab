@@ -29,6 +29,8 @@ final class EngineHolder {
     static final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     static volatile long handle;
+    /** Held while an engine is created or destroyed; monitors take it to read a live engine safely. */
+    static final Object LIFECYCLE = new Object();
     static volatile boolean busy;        // loading or unloading
     static volatile boolean generating;
     static volatile String status = "No model loaded";
@@ -115,9 +117,11 @@ final class EngineHolder {
     private static void unloadOnWorker() {
         long old = handle;
         if (old == 0) return;
-        handle = 0;
         long t0 = System.nanoTime();
-        LiyabNative.destroy(old);
+        synchronized (LIFECYCLE) {
+            handle = 0;
+            LiyabNative.destroy(old);
+        }
         DebugLog.add(String.format(Locale.US, "Unloaded %s in %.0f ms", modelLabel, (System.nanoTime() - t0) / 1e6));
     }
 

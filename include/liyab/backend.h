@@ -43,6 +43,11 @@ public:
     }
     virtual void free_shared(uint8_t* data) noexcept { (void)data; }
 
+    // Cumulative time this backend's device spent on submitted work, in
+    // milliseconds (accelerators: from submission to completion). 0 when not
+    // tracked (the CPU backend: use process CPU time instead). Thread-safe.
+    [[nodiscard]] virtual double busy_ms() const noexcept { return 0.0; }
+
     // Several matmuls over the same input (Q/K/V, or FFN gate/up): ys[i] =
     // x · ws[i]ᵀ. Accelerators submit them together to pay the dispatch and
     // synchronization cost once; the default runs them one by one.

@@ -116,6 +116,7 @@ void TripleBufferLoader::fetch_loop() {
 
         stats_.fetch_ms += dt;
         ++stats_.items_fetched;
+        if (status.is_ok()) stats_.bytes_fetched += length;
         if (slot->generation != generation_) {  // resynchronized meanwhile: stale
             slot->state = State::Empty;
             slot->item = -1;

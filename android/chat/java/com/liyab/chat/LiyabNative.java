@@ -43,6 +43,12 @@ final class LiyabNative {
 
     static native String describe(long engine);
 
+    /**
+     * Live cumulative counters {gpu_busy_ms, storage_bytes_read, tokens_generated}, or null. Safe while a
+     * generation runs; the caller must keep the engine alive (EngineHolder.LIFECYCLE).
+     */
+    static native double[] counters(long engine);
+
     /** GGUF architectures the engine runs, comma-separated (e.g. "llama,qwen2,..."). */
     static native String supportedArchitectures();
 

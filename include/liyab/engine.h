@@ -100,6 +100,16 @@ public:
     [[nodiscard]] PowerManager& power() noexcept;
     // Model, backends and memory summary for logs / UIs.
     [[nodiscard]] std::string describe() const;
+
+    // Live counters for monitoring UIs; cumulative since creation, so callers
+    // sample them periodically and divide the deltas by the elapsed time.
+    // Thread-safe: may be read while a generation runs on another thread.
+    struct Counters {
+        double accelerator_busy_ms = 0.0;  // time the GPU spent on this engine's work (0: none / not tracked)
+        uint64_t storage_bytes_read = 0;   // weights streamed from storage (expert cache + block streaming)
+        uint64_t tokens_generated = 0;     // decoded tokens, all generations
+    };
+    [[nodiscard]] Counters counters() const;
     // A scalar GGUF metadata value of the loaded model as text (strings as-is,
     // numbers in decimal, booleans as "true"/"false"), e.g. the publisher's
     // recommended "general.sampling.temp". nullopt when absent or an array.

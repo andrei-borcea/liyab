@@ -259,6 +259,17 @@ int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char*
     }
 }
 
+liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_counters* out) {
+    if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Engine::Counters c = engine->engine->counters();
+        *out = liyab_engine_counters{c.accelerator_busy_ms, c.storage_bytes_read, c.tokens_generated};
+        return LIYAB_OK;
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
 size_t liyab_supported_architectures(char* buffer, size_t size) {
     try {
         return copy_out(liyab::supported_architectures(), buffer, size);

@@ -25,6 +25,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -259,6 +260,7 @@ public:
                         int32_t n) override;
     uint8_t* allocate_shared(size_t bytes) override;
     void free_shared(uint8_t* data) noexcept override;
+    [[nodiscard]] double busy_ms() const noexcept override { return busy_ns_.load(std::memory_order_relaxed) / 1e6; }
 
 private:
     struct Buffer {
@@ -311,6 +313,7 @@ private:
     int32_t shared_type_ = -1;  // memory type for shared regions (prefers cached + coherent)
     std::vector<Region> regions_;
     Buffer tables_;
+    std::atomic<uint64_t> busy_ns_{0};  // submit-to-fence time of every submission
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     static constexpr uint32_t kSlots = 4;  // matmuls per submission
     VkDescriptorSet sets_[kSlots] = {};
@@ -875,6 +878,7 @@ Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const 
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd_;
+    const auto submitted = std::chrono::steady_clock::now();
     if (VkResult r = f_.vkQueueSubmit(queue_, 1, &submit, fence_); r != VK_SUCCESS) return vk_error("vkQueueSubmit", r);
     // Kernels take tens to hundreds of microseconds: poll briefly before
     // falling back to the driver's (sleeping) wait, which adds wake-up latency.
@@ -884,6 +888,10 @@ Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const 
            std::chrono::steady_clock::now() < spin_until) {
     }
     if (wait == VK_NOT_READY) wait = f_.vkWaitForFences(device_, 1, &fence_, VK_TRUE, 10'000'000'000ULL);
+    busy_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - submitted)
+                                                .count()),
+                       std::memory_order_relaxed);
     f_.vkResetFences(device_, 1, &fence_);
     if (wait != VK_SUCCESS) return vk_error("vkWaitForFences", wait);
 

@@ -82,6 +82,7 @@ struct Engine::Impl {
     std::unique_ptr<Transformer> target;
     std::unique_ptr<Transformer> draft;
     std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
+    std::atomic<uint64_t> tokens_generated{0};  // Engine::counters()
     std::unique_ptr<TripleBufferLoader> weight_loader;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
@@ -464,6 +465,15 @@ Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bo
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
 
+Engine::Counters Engine::counters() const {
+    Counters c;
+    if (impl_->gpu) c.accelerator_busy_ms = impl_->gpu->busy_ms();
+    if (const ExpertStore* store = impl_->target->expert_store()) c.storage_bytes_read += store->stats().bytes_read;
+    if (impl_->weight_loader) c.storage_bytes_read += impl_->weight_loader->stats().bytes_fetched;
+    c.tokens_generated = impl_->tokens_generated.load(std::memory_order_relaxed);
+    return c;
+}
+
 std::optional<std::string> Engine::model_metadata(std::string_view key) const {
     const GgufValue* v = impl_->target->file().metadata(key);
     if (v == nullptr) return std::nullopt;
@@ -643,6 +653,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
             // rate; the SoC idles in between instead of racing ahead.
             idle += s.power->pace_token();
             ++stats.generated_tokens;
+            s.tokens_generated.fetch_add(1, std::memory_order_relaxed);
             pending_utf8 += s.tokenizer->piece(token);
             const size_t ready = complete_utf8_prefix(pending_utf8);
             if (ready > 0) {
