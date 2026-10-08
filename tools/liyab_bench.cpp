@@ -127,6 +127,13 @@ int main(int argc, char** argv) {
 
     const Case cases[] = {
         {"Q8_0 attn_qkv 2048x8192", liyab::DType::Q8_0, 2048, 8192},
+        // Candidate formats for requantizing the Q8_0 projections (fewer bytes per token):
+        {"Q4_0 attn_qkv 2048x8192", liyab::DType::Q4_0, 2048, 8192},
+        {"Q4_1 attn_qkv 2048x8192", liyab::DType::Q4_1, 2048, 8192},
+        {"Q5_0 attn_qkv 2048x8192", liyab::DType::Q5_0, 2048, 8192},
+        {"Q4_K attn_qkv 2048x8192", liyab::DType::Q4_K, 2048, 8192},
+        {"Q5_K attn_qkv 2048x8192", liyab::DType::Q5_K, 2048, 8192},
+        {"Q6_K attn_qkv 2048x8192", liyab::DType::Q6_K, 2048, 8192},
         {"Q8_0 ssm_out 4096x2048", liyab::DType::Q8_0, 4096, 2048},
         {"Q8_0 shared down 512x2048", liyab::DType::Q8_0, 512, 2048},
         {"F32 router 2048x256", liyab::DType::F32, 2048, 256},
