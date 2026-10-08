@@ -7,7 +7,10 @@
 //  * Experts are read with direct I/O (O_DIRECT on Linux/Android, F_NOCACHE
 //    on Apple) by background threads, one large aligned read per matrix, so
 //    the kernel neither duplicates them in the page cache nor evicts the
-//    resident (non-expert) weights to make room for them.
+//    resident (non-expert) weights to make room for them. The thread that
+//    starts an expert reads its first matrix and hands the other two to idle
+//    threads, which take them before any new expert: an expert the forward
+//    pass waits for arrives after one matrix's latency, not three.
 //  * A cache entry is one (block, expert): its gate, up and down matrices.
 //    Eviction is LFU with periodic halving (frequency + recency), skipping
 //    entries in use.
@@ -28,6 +31,7 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/direct_io.h"
@@ -85,6 +89,8 @@ private:
         int32_t slot = -1;
         int32_t pins = 0;
         bool on_demand = false;  // queued after the router chose it (a miss, even if it arrives in time)
+        int8_t parts_left = 0;   // Loading: matrices not read yet
+        bool part_failed = false;
         bool failed = false;     // the last read failed (reported to the waiting acquire())
         bool untouched = false;  // loaded, not acquired since (evicting it wasted the read)
         float uses = 0.0f;
@@ -102,7 +108,9 @@ private:
     ExpertStore() = default;
     void io_loop();
     int32_t take_slot_locked(std::unique_lock<std::mutex>& lock);  // evicts if needed; may wait
-    Status read_entry(int32_t key, uint8_t* dst);
+    // Reads matrix `m` of entry `key` (Loading, slot assigned) without the
+    // lock, then marks the entry Ready (or Empty on failure) after its last part.
+    void read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m);
     [[nodiscard]] Segment segment(int32_t key, int32_t matrix) const;
 
     const MmapLoader* file_ = nullptr;
@@ -119,9 +127,10 @@ private:
     std::vector<Entry> entries_;
 
     mutable std::mutex mutex_;
-    std::condition_variable work_cv_;   // I/O threads: queue not empty / stop
+    std::condition_variable work_cv_;   // I/O threads: queue or parts not empty / stop
     std::condition_variable ready_cv_;  // consumers: an entry became Ready or a slot freed
-    std::deque<int32_t> queue_;
+    std::deque<int32_t> queue_;                   // entries to load, by priority
+    std::deque<std::pair<int32_t, int32_t>> parts_;  // {entry, matrix} of entries being loaded
     bool stop_ = false;
     uint64_t clock_ = 0;
     Stats stats_;

@@ -523,7 +523,9 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
   reads them and the native kernels decode them in place (no copy, nothing cached per tensor).
 * **Mixture-of-experts models.** Everything but the routed experts stays resident (with a Vulkan GPU, in
   GPU-shared memory, so the GPU reads it in place instead of keeping a second copy); experts are read by 4 threads
-  into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Once a block's own
+  into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). The thread that starts
+  an expert reads its gate matrix and hands up and down to idle threads, which finish started experts before
+  starting new ones, so an expert the forward pass waits for arrives after one matrix's read instead of three. Once a block's own
   experts are queued, the engine applies the next block's router to the residual stream after this block's mixer and
   prefetches the experts it picks, so reads overlap this block's experts and the next block's attention/DeltaNet work
   (on Qwen3.6-35B-A3B 83% of these guesses are chosen, against 77% when guessing from the residual entering the
@@ -578,10 +580,13 @@ CPU backend, 8 threads, a 9-token prompt and 64 greedy tokens from a cold expert
 | + a block's experts in one batched pass | 5.93 tok/s | 169 | 309 MiB |
 | + Q4_K/Q5_K/Q6_K × Q8_K kernels (A/B reference) | 6.15 tok/s | 163 | 308 MiB |
 | + next block's experts predicted after the mixer | 6.44 tok/s | 155 | 283 MiB |
-| + 7 threads (one core left for I/O), chunks claimed on demand | **7.83 tok/s** | 128 | 283 MiB |
+| + 7 threads (one core left for I/O), chunks claimed on demand | 7.83 tok/s | 128 | 283 MiB |
+| + an expert's three matrices read in parallel | **8.89 tok/s** | 112 | 280–311 MiB |
 
-The last three rows come from alternating A/B runs (4 rounds each, the new build won every round): means for the
-prediction step, medians for the thread step (6.30 → 7.83 tok/s in that session). The new prediction is chosen by
+The last four rows come from alternating A/B runs (3–4 rounds each, the new build won every round): means for the
+prediction and parallel-read steps, medians for the thread step (6.30 → 7.83 tok/s in that session). Parallel
+matrix reads cut the time spent waiting for flash by about a third (5.3 → 3.3 s over 105 tokens) and the routed
+experts from ~68 to ~48 ms per token; that A/B ran with the 3-block prediction described below in both builds. The new prediction is chosen by
 the router 83% of the time (77% before) and reads 31 experts per token for nothing instead of 44; with 7 threads
 the routed experts take ~69 ms per token instead of ~87.
 
@@ -745,6 +750,13 @@ Reading the table:
   core (flash waits grew by a third). The default is therefore the performance cores minus one on CPUs without an
   efficiency cluster, and the pool hands out 4 chunks per thread on demand, so a preempted or slower core (the
   prime cores are ~20% faster) no longer holds up a whole matmul.
+* **Predicting experts more than one block ahead did not pay off.** Guessing blocks l + 2 and l + 3 as well (each
+  with its own router on the residual after block l's mixer, later guesses replacing earlier ones still queued)
+  halved the late prefetches (11% → 5% of the experts used) but read ~11% more and spent ~4 ms more per token on
+  routers; with parallel matrix reads it tied with one block ahead (7.58 vs 7.72 tok/s, 4 alternating rounds).
+  Guessing 2 extra experts per block cut misses from 9% to 6% but read 17% more and was slower (8.3 vs 8.9
+  tok/s); 8 I/O threads instead of 4, or splitting each matrix into 2 or 4 reads, were slower too (split in 4:
+  ~5 tok/s, small reads cost the flash more than the concurrency saves).
 * **The kernel page cache as a second expert cache did not pay off** (tried on branch `feat/page-cache-tier`).
   HyperOS stops apps by PSS (`persist.sys.stability.pss_highest_line`, 6 GiB), and pages read with plain `pread`
   are not in the PSS, so the free RAM could cache experts evicted from the engine's own cache. Copies from the page

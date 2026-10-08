@@ -101,16 +101,35 @@ ExpertStore::Segment ExpertStore::segment(int32_t key, int32_t matrix) const {
     return {t.shard, t.file_offset + static_cast<uint64_t>(key % n_expert_) * bytes, bytes};
 }
 
-Status ExpertStore::read_entry(int32_t key, uint8_t* dst) {
-    for (int32_t m = 0; m < 3; ++m) {
-        const Segment seg = segment(key, m);
-        const uint64_t begin = seg.offset / kAlign * kAlign;
-        const size_t length = align_up(static_cast<size_t>(seg.offset - begin) + seg.bytes);
-        LIYAB_RETURN_IF_ERROR(files_[seg.shard]->read(begin, length, dst + slot_offsets_[static_cast<size_t>(m)]));
-        std::lock_guard<std::mutex> lock(mutex_);
-        stats_.bytes_read += length;
+void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m) {
+    Entry& e = entries_[static_cast<size_t>(key)];
+    const Segment seg = segment(key, m);
+    const uint64_t begin = seg.offset / kAlign * kAlign;
+    const size_t length = align_up(static_cast<size_t>(seg.offset - begin) + seg.bytes);
+    uint8_t* dst = arena_ + static_cast<size_t>(e.slot) * slot_bytes_ + slot_offsets_[static_cast<size_t>(m)];
+    lock.unlock();
+    // One read per matrix: smaller parts (tried: 2 and 4 per matrix) cost
+    // the flash more than the extra concurrency saves.
+    const Status status = files_[seg.shard]->read(begin, length, dst);
+    lock.lock();
+    stats_.bytes_read += length;
+    if (!status.is_ok()) {
+        LIYAB_LOG_ERROR("%s", status.to_string().c_str());
+        e.part_failed = true;
     }
-    return Status::ok();
+    if (--e.parts_left > 0) return;
+    if (e.part_failed) {
+        e.failed = true;
+        e.state = State::Empty;
+        slots_[static_cast<size_t>(e.slot)].entry = -1;
+        e.slot = -1;
+    } else {
+        e.state = State::Ready;
+        e.untouched = true;
+        e.last_use = clock_;
+        ++stats_.loads;
+    }
+    ready_cv_.notify_all();
 }
 
 int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock) {
@@ -153,34 +172,31 @@ int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock) {
 void ExpertStore::io_loop() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
-        work_cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        work_cv_.wait(lock, [this] { return stop_ || !queue_.empty() || !parts_.empty(); });
         if (stop_) return;
+        if (!parts_.empty()) {  // finish started experts first
+            const auto [key, m] = parts_.front();
+            parts_.pop_front();
+            read_part(lock, key, m);
+            continue;
+        }
         const int32_t key = queue_.front();
         queue_.pop_front();
         Entry& e = entries_[static_cast<size_t>(key)];
         if (e.state != State::Queued) continue;
+        // Loading from here on: taking a slot may wait (unlocked), and the
+        // entry must not be queued or dropped again meanwhile.
+        e.state = State::Loading;
         const int32_t slot = take_slot_locked(lock);
         if (slot < 0) return;
-        e.state = State::Loading;
         e.slot = slot;
+        e.parts_left = 3;
+        e.part_failed = false;
         slots_[static_cast<size_t>(slot)].entry = key;
-        uint8_t* dst = arena_ + static_cast<size_t>(slot) * slot_bytes_;
-        lock.unlock();
-        const Status status = read_entry(key, dst);
-        lock.lock();
-        if (!status.is_ok()) {
-            LIYAB_LOG_ERROR("%s", status.to_string().c_str());
-            e.failed = true;
-            e.state = State::Empty;
-            e.slot = -1;
-            slots_[static_cast<size_t>(slot)].entry = -1;
-        } else {
-            e.state = State::Ready;
-            e.untouched = true;
-            e.last_use = clock_;
-            ++stats_.loads;
-        }
-        ready_cv_.notify_all();
+        parts_.emplace_back(key, 1);
+        parts_.emplace_back(key, 2);
+        work_cv_.notify_all();
+        read_part(lock, key, 0);
     }
 }
 
