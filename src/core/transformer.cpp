@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -28,6 +29,28 @@ std::string layer_name(int32_t layer, const char* suffix) {
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+// ---- TEMP prerouter study (LIYAB_PRER_TRACE) ----
+struct PrerTrace {
+    bool on = std::getenv("LIYAB_PRER_TRACE") != nullptr;
+    int32_t L = 0, E = 0;
+    std::vector<std::vector<float>> co;      // [l] E x E: chosen at l -> chosen at l+1
+    std::vector<std::vector<float>> cnt;     // [l] E: times chosen at l
+    std::vector<std::vector<int32_t>> prev;  // [l] previous token's experts
+    std::vector<std::vector<int32_t>> cur;   // [l] this token's experts
+    std::vector<std::vector<float>> logits;  // [l] predicted router logits for l
+    static constexpr int kCand = 7;
+    double hits[kCand] = {}, evals = 0;
+    int tokens = 0;
+    void init(int32_t layers, int32_t experts) {
+        if (L) return;
+        L = layers; E = experts;
+        co.assign(L, std::vector<float>(size_t(E) * E, 0.0f));
+        cnt.assign(L, std::vector<float>(E, 0.0f));
+        prev.assign(L, {}); cur.assign(L, {}); logits.assign(L, {});
+    }
+};
+PrerTrace g_prer;
 float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }  // ggml's threshold
 
 // x / sqrt(sum(x^2) + eps): the L2 normalization of DeltaNet queries and keys.
@@ -859,6 +882,10 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
             kept = experts_to_run(probs, order, sum);
         }
         picks.insert(picks.end(), order.begin(), order.begin() + static_cast<std::ptrdiff_t>(kept));
+        if (g_prer.on && n == 1) {
+            g_prer.init(c.n_layers, c.n_expert);
+            g_prer.logits[static_cast<size_t>(layer)].assign(logits, logits + E);
+        }
     }
     std::sort(picks.begin(), picks.end());
     picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
@@ -969,6 +996,50 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     std::vector<int32_t> chosen;
     for (size_t e = 0; e < E; ++e) {
         if (!assigned[e].empty()) chosen.push_back(static_cast<int32_t>(e));
+    }
+    if (g_prer.on && n == 1 && !g_prer.logits.empty() && !g_prer.logits[static_cast<size_t>(layer)].empty()) {
+        auto& g = g_prer;
+        const auto l = static_cast<size_t>(layer);
+        const std::vector<float>& z = g.logits[l];
+        std::vector<float> prior(E, 0.0f);
+        const bool have_prior = layer > 0 && !g.cur[l - 1].empty();
+        if (have_prior) {
+            float denom = 0.1f * static_cast<float>(E);
+            for (int32_t a : g.cur[l - 1]) denom += g.cnt[l - 1][static_cast<size_t>(a)];
+            for (size_t e = 0; e < E; ++e) {
+                float num = 0.1f;
+                for (int32_t a : g.cur[l - 1]) num += g.co[l - 1][static_cast<size_t>(a) * E + e];
+                prior[e] = std::log(num / denom);
+            }
+        }
+        std::vector<char> was_prev(E, 0);
+        for (int32_t e : g.prev[l]) was_prev[static_cast<size_t>(e)] = 1;
+        const float betas[PrerTrace::kCand] = {0, 0.5f, 1, 2, 0, 0, 1};
+        const float gammas[PrerTrace::kCand] = {0, 0, 0, 0, 1, 2, 1};
+        std::vector<int32_t> ord(E);
+        for (int ci = 0; ci < PrerTrace::kCand; ++ci) {
+            auto score = [&](size_t e) { return z[e] + (have_prior ? betas[ci] * prior[e] : 0.0f) + gammas[ci] * was_prev[e]; };
+            for (size_t e = 0; e < E; ++e) ord[e] = static_cast<int32_t>(e);
+            std::partial_sort(ord.begin(), ord.begin() + static_cast<std::ptrdiff_t>(K), ord.end(),
+                              [&](int32_t x, int32_t y) { return score(static_cast<size_t>(x)) > score(static_cast<size_t>(y)); });
+            for (size_t k = 0; k < K; ++k) g.hits[ci] += std::binary_search(chosen.begin(), chosen.end(), ord[k]);
+        }
+        g.evals += static_cast<double>(K);
+        // learn, then remember this token's experts
+        if (layer > 0) {
+            for (int32_t a : g.cur[l - 1]) {
+                for (int32_t b : chosen) g.co[l - 1][static_cast<size_t>(a) * E + static_cast<size_t>(b)] += 1.0f;
+            }
+        }
+        for (int32_t a : chosen) g.cnt[l][static_cast<size_t>(a)] += 1.0f;
+        g.cur[l] = chosen;
+        g.prev[l] = chosen;
+        if (layer == config_.n_layers - 1 && ++g.tokens % 64 == 0) {
+            const char* names[PrerTrace::kCand] = {"A router", "B b=.5", "B b=1", "B b=2", "C g=1", "C g=2", "B1+C1"};
+            std::fprintf(stderr, "PRER tokens=%d precision@8:", g.tokens);
+            for (int ci = 0; ci < PrerTrace::kCand; ++ci) std::fprintf(stderr, " %s %.1f%% |", names[ci], 100.0 * g.hits[ci] / g.evals);
+            std::fprintf(stderr, "\n");
+        }
     }
     if (expert_store_ != nullptr) {
         if (predicted_layer_ == layer) {  // both lists are sorted
