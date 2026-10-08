@@ -17,7 +17,8 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 }  // namespace
 
 Result<std::unique_ptr<TripleBufferLoader>> TripleBufferLoader::create(std::vector<Item> items, FetchFn fetch,
-                                                                       TransformFn transform, size_t alignment) {
+                                                                       TransformFn transform, size_t alignment,
+                                                                       SlotMemory memory) {
     if (items.empty() || !fetch) return Status(ErrorCode::InvalidArgument, "triple buffer needs items and a fetch stage");
     // Page alignment satisfies O_DIRECT (4 KiB blocks) and zero-copy GPU
     // wrapping (Metal requires page-aligned host memory; 16 KiB on Apple).
@@ -33,7 +34,15 @@ Result<std::unique_ptr<TripleBufferLoader>> TripleBufferLoader::create(std::vect
         const uint64_t span = (head + item.length + alignment - 1) / alignment * alignment;
         loader->slot_bytes_ = std::max<size_t>(loader->slot_bytes_, static_cast<size_t>(span));
     }
+    loader->memory_ = std::move(memory);
     for (Slot& slot : loader->slots_) {
+        if (loader->memory_.allocate) {
+            slot.buffer = loader->memory_.allocate(loader->slot_bytes_);
+            if (slot.buffer == nullptr || reinterpret_cast<uintptr_t>(slot.buffer) % alignment != 0) {
+                return Status(ErrorCode::OutOfMemory, "cannot allocate triple-buffer slots in the provided memory");
+            }
+            continue;
+        }
         void* p = nullptr;
         if (posix_memalign(&p, alignment, loader->slot_bytes_) != 0) {
             return Status(ErrorCode::OutOfMemory, "cannot allocate triple-buffer slots");
@@ -56,7 +65,11 @@ TripleBufferLoader::~TripleBufferLoader() {
     cv_.notify_all();
     if (fetch_thread_.joinable()) fetch_thread_.join();
     if (transform_thread_.joinable()) transform_thread_.join();
-    for (Slot& slot : slots_) std::free(slot.buffer);
+    for (Slot& slot : slots_) {
+        if (slot.buffer == nullptr) continue;
+        if (memory_.release) memory_.release(slot.buffer);
+        else std::free(slot.buffer);
+    }
 }
 
 TripleBufferLoader::Slot* TripleBufferLoader::find(int32_t item) {

@@ -20,6 +20,7 @@ This README describes what the code does today. Anything not implemented is list
 * [Building](#building)
 * [Testing](#testing)
 * [Using Liyab](#using-liyab)
+* [Models larger than RAM](#models-larger-than-ram)
 * [Measured results](#measured-results)
 * [Experimental modules](#experimental-modules)
 * [Limitations and roadmap](#limitations-and-roadmap)
@@ -32,16 +33,16 @@ This README describes what the code does today. Anything not implemented is list
 | Area | Status |
 | :--- | :--- |
 | GGUF loader (`mmap`, zero-copy, validated against malformed files), split models (`-00001-of-0000N.gguf`) | ✅ implemented |
-| Streaming mode for models larger than RAM (triple-window `madvise` prefetch) | ✅ implemented |
-| Triple-buffered block loader (fetch → prepare → execute) | ✅ implemented, opt-in (models larger than RAM) |
-| Transformer with per-block mixers resolved from the file: softmax attention (GQA, RoPE normal & NeoX, QKV bias, Q/K norm, output gate) or Gated DeltaNet linear attention; llama / mistral / qwen2 / qwen3 / qwen35 (Qwen3.5 hybrid) | ✅ implemented, cross-checked against llama.cpp |
+| Models larger than RAM: dense blocks streamed with parallel `O_DIRECT` reads (resident and streamed blocks interleaved), MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ implemented, automatic (see [Models larger than RAM](#models-larger-than-ram)) |
+| Triple-buffered block loader (fetch → prepare → execute) | ✅ implemented (used by block streaming; `--triple-buffer` streams every block) |
+| Transformer with per-block mixers and FFNs resolved from the file: softmax attention (GQA, RoPE normal & NeoX, QKV bias, Q/K norm, output gate) or Gated DeltaNet linear attention; dense SwiGLU or mixture of experts (softmax/sigmoid router, top-k, shared expert); llama / mistral / qwen2 / qwen3 / qwen35 / qwen3moe / qwen35moe | ✅ implemented, cross-checked against llama.cpp |
 | Every GGML tensor format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0/TQ2_0, MXFP4, NVFP4 (all mixes such as Q4_K_M, IQ3_M) | ✅ implemented, bit-exact vs llama.cpp's reference decoder |
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model, batched verification) | ✅ implemented |
 | CPU backend: ARM NEON + dot-product (SDOT), multithreaded | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
-| Android GPU backend: Vulkan compute (Adreno / Mali), weights repacked in GPU memory | ✅ implemented, +25% decode vs CPU on Adreno 830 |
+| Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
@@ -108,13 +109,17 @@ This README describes what the code does today. Anything not implemented is list
 
 * **Format:** GGUF v2/v3, single file or split with `gguf-split` (open part 1; the other parts must sit next to it
   with their original names).
-* **Architectures:** `llama` (Llama 1/2, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3` (dense) and `qwen35`
+* **Architectures:** `llama` (Llama 1/2, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3` (dense), `qwen35`
   (Qwen3.5 / Qwen3.8 hybrids: three Gated DeltaNet blocks per gated-attention block; the multi-token-prediction head
-  is skipped). Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
+  is skipped), and the mixture-of-experts `qwen3moe` (Qwen3-30B-A3B…) and `qwen35moe` (Qwen3.5-35B-A3B…). Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
 * **How a model is mapped:** the forward pass is not written per model. For every block the loader picks the token
   mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, otherwise softmax attention), detects optional
   pieces (QKV biases, Q/K norms, an attention output gate when `attn_q` is twice as tall, the pre-FFN norm name),
-  and only the KV cache of attention blocks is allocated. An architecture adds a one-line traits row (RoPE style).
+  and only the KV cache of attention blocks is allocated. The FFN is a mixture of experts when the block has a
+  router (`ffn_gate_inp`): softmax or sigmoid gating (`expert_gating_func`), optional selection bias, top-k,
+  renormalization and scale from the metadata, plus an optional shared expert with a sigmoid gate; tokens of a
+  batch are grouped per expert so each expert is read once. An architecture adds a one-line traits row (RoPE
+  style, MoE weight renormalization default).
   DeltaNet blocks keep a recurrent state (conv history + one 128×128 matrix per value head, 19 MiB for Qwen3.5-2B):
   such models cannot roll back, so speculative decoding, early exit, head pruning and the KV prefix cache are
   disabled for them with a clear message.
@@ -128,8 +133,11 @@ This README describes what the code does today. Anything not implemented is list
   registers. Q2_K, Q3_K, TQ2_0, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S and IQ4_XS use NEON kernels adapted from llama.cpp
   (`src/core/quant_lowbit.cpp`) against Q8_K activations (one scale per 256 values plus 16-value sums, quantized
   once per matmul); IQ4_NL and MXFP4 use table-lookup kernels against Q8_0. TQ1_0 and NVFP4 (and every format on
-  non-NEON targets) decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, Q4_K
-  and Q5_0 are repacked exactly into the Q4_1/Q8_0 layouts. Other formats fall back to the CPU per matmul.
+  non-NEON targets) decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, weights in
+  ordinary memory are copied once (Q4_K and Q5_0 repacked exactly into the Q4_1/Q8_0 layouts; other formats fall
+  back to the CPU per matmul); weights in GPU-shared memory (`Backend::allocate_shared`) are read in place by
+  native-layout kernels (`shaders/matvec_native.comp`) for F32, F16, Q4_0/1, Q5_0/1, Q8_0, Q2_K–Q6_K, IQ1_S/M,
+  IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ2_0 and MXFP4, decoding the GGUF blocks with the CPU decoders' bit layouts.
 * **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`,
   `qwen35` (letters include combining marks, `\p{M}`), `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp's tokenization token for token, including special
   tokens, contractions, digits, accents, CJK and emoji. BOS is added only when the model asks for it.
@@ -268,7 +276,9 @@ liyab_engine_destroy(engine);
 No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with the message available from
 `liyab_last_error()` (thread-local). `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
-the key is absent; `Engine::model_metadata()` is the C++ equivalent.
+the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_engine_config.expert_cache_mb`
+(`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off), and `liyab_generation_stats`
+reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read` and `expert_stall_ms`.
 
 ### Android (Kotlin)
 
@@ -412,10 +422,55 @@ liyab-cli -m model.gguf -p "Once upon a time" -n 128 --temp 0.8
 liyab-cli -m model.gguf -p "..." --draft draft.gguf   # speculative decoding
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --profile low_power --skin-threshold 45
-liyab-cli -m big-model.gguf -p "..." --triple-buffer      # only for models larger than RAM
+liyab-cli -m big-model.gguf -p "..." --triple-buffer      # stream every block (automatic streaming picks a mix)
+liyab-cli -m moe-model.gguf -p "..." --expert-cache 3000  # MoE: stream experts through a 3000 MiB cache (-1 auto)
 liyab-cli -m model.gguf -p "..." --tokenize               # print token ids
 liyab-cli --help
 ```
+
+---
+
+## Models larger than RAM
+
+Streaming is automatic when a model does not fit (file larger than 80% of the available memory).
+
+* **Storage.** UFS reads are fast only when large and concurrent: on the Snapdragon 8 Elite phone below, direct
+  reads reach ~4.4 GB/s with 2–4 requests ≥ 256 KiB in flight, random or sequential alike, but stay under
+  1.2 GB/s at 16 KiB. `DirectFile` reads with `O_DIRECT` (no page-cache copy, no eviction of resident weights) and
+  splits large reads into concurrent 4 MiB requests.
+* **Dense models.** As many blocks as fit stay resident; the others are streamed through the 3-slot pipeline. The
+  streamed blocks are spread evenly through the stack, so storage keeps reading while resident blocks compute.
+  With a Vulkan GPU the slots and the resident blocks live in GPU-shared memory: direct reads land where the GPU
+  reads them and the native kernels decode them in place (no copy, nothing cached per tensor).
+* **Mixture-of-experts models.** Everything but the routed experts stays resident; experts are read by 4 threads
+  into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Before each block the
+  engine applies that block's router and the next one's to the current hidden state and prefetches the experts they
+  pick, so reads overlap the attention/DeltaNet work; the experts a token really uses are computed cached-first.
+  `GenerationStats` (and `liyab-cli`) report hits, late prefetches, misses, bytes read and time spent waiting.
+* **Correctness.** Streamed experts (with evictions) and streamed blocks give bit-identical logits to in-place
+  reads (`test_engine`).
+
+Measured on the phone (Qwen3.8-27B UD-IQ2_S, 8.4 GB, 64 blocks of which 48 Gated DeltaNet; 8.2 GB free RAM; decode
+of a short Italian answer, greedy):
+
+| Engine | Prompt (18 tokens) | Decode |
+| :--- | ---: | ---: |
+| `mmap` streaming window, CPU kernels (before) | 71 s | 0.14 tok/s |
+| Block streaming, CPU (generic I-quant kernels) | 71 s | 0.17 tok/s |
+| Block streaming + GPU-shared memory + native Vulkan kernels | 8.7 s | **0.94 tok/s** |
+
+Matvec throughput on that model's real tensors (GB/s of weights, 4 CPU threads vs Adreno 830):
+
+| Format | CPU generic (before) | CPU NEON (now) | Vulkan native |
+| :--- | ---: | ---: | ---: |
+| Q2_K | 0.24 | ~11–12 | ~8–15 |
+| IQ2_XXS | 0.70 | ~8 | ~16 |
+| IQ2_S | 0.79 | ~7 | ~20 |
+| IQ3_S | 2.07 | ~6–7 | ~21 |
+| IQ4_XS | 0.99 | ~21 | ~24 |
+| Q4_K | 16.8 | 16.8 | ~17 |
+
+The phone throttles as it heats up; numbers vary by ±30% between runs.
 
 ---
 
@@ -550,24 +605,29 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **NPU compute.** QNN and NeuroPilot are detected at runtime and ranked, but no compute kernels exist yet, so
   their work runs on the GPU/CPU. Next step: QNN HTP graphs for the FFN with rpcmem-registered weights.
 * **Vulkan.** Batched prefill runs the matvec kernel once per token (no weight reuse across the batch); a tiled
-  GEMM kernel is the next step. Weights are copied into GPU memory, so models must fit in RAM twice over; zero-copy
-  needs `VK_EXT_external_memory_host` or AHardwareBuffer imports.
+  GEMM kernel is the next step. Weights of models that fit in RAM are still copied into GPU memory (so they must fit
+  twice over); only streamed models use the zero-copy shared-memory path so far. MoE experts always run on the CPU
+  (one small matmul per expert; batching them into one GPU submission is the next step). The native kernels read
+  bytes one at a time for most formats and are slower than the repacked Q4_x kernels for Q4_K.
 * **Core ML / Apple Neural Engine.** Not used: the ANE is only reachable through compiled Core ML models, not
   per-layer kernels over mmap'd weights. Metal is the Apple accelerator path.
 * **Quantization kernels.** On the CPU, TQ1_0 and NVFP4 still use the generic decode + SDOT path (correct, about
   3–7 GB/s matvec on 4 Apple M4 Pro cores versus 45–80 GB/s for Q2_K/Q3_K/Q4_K/IQ4_XS/TQ2_0), and the
   lattice-grid I-quants (IQ1/IQ2/IQ3, 20–30 GB/s) stay 2–3× slower than Q4_K because every 4–8 values cost a table
-  lookup. There are no i8mm (SMMLA) paths yet. On the GPU only Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32 run natively.
+  lookup. There are no i8mm (SMMLA) paths yet. On the GPU, TQ1_0, NVFP4 and BF16 have no kernel (CPU fallback).
 * **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
-* **Architectures.** MoE models (e.g. Qwen3-30B-A3B, Qwen3.5-35B-A3B), DeepSeek V4 (`deepseek4`), Gemma, Phi and
-  YaRN RoPE scaling are not supported yet.
+* **Architectures.** DeepSeek V4 (`deepseek4`: hyper-connections, compressed sparse attention, hash routing),
+  fused `ffn_gate_up_exps` tensors, Gemma, Phi and YaRN RoPE scaling are not supported yet.
 * **DeltaNet speed.** The recurrence runs token by token on the CPU (also during prefill) and its projections use
   the normal matmul path; a chunked (parallel-scan) prefill and a GPU kernel are not implemented.
-* **Split GGUF** is not supported by the triple-buffer loader, and a split model opened through the system picker
-  cannot find its other parts (open it from the models folder).
+* **Split GGUF.** Dense split models keep the older `mmap` streaming window instead of block streaming, and a split
+  model opened through the system picker cannot find its other parts (open it from the models folder).
+* **Streaming limits.** Expert prediction uses the routers on the hidden state entering the block, not a trained
+  predictor; the expert cache is not shared with the KV prefix cache and resets with the process; Android may still
+  swap the expert cache (it is `mlock`ed only when RLIMIT_MEMLOCK allows).
 * **Dense 30–35B models on phones** are bandwidth-bound. Each generated token reads every weight once: a 32B model
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
-  streamed from flash (~2.8 GB/s measured). Speculative decoding, MoE models, and smaller dense models are the
+  streamed from flash (~4.4 GB/s with parallel direct reads). Speculative decoding, MoE models, and smaller dense models are the
   practical routes to interactive speeds.
 * **CPU threading / prefill.** The thread pool synchronizes with condition variables (4 threads beat 8 on the
   phone), and prefill reuses the matvec kernel. A spinning pool and a tiled GEMM are the next CPU steps.

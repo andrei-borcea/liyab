@@ -167,6 +167,19 @@ if(LIYAB_USE_VULKAN)
     list(APPEND _liyab_spv_names ${name})
     list(APPEND _liyab_spv_files ${spv})
   endforeach()
+  # Native-layout kernels (weights read in place from shared memory).
+  set(_liyab_native_src ${PROJECT_SOURCE_DIR}/src/backends/vulkan/shaders/matvec_native.comp)
+  foreach(type F32 F16 Q8_0 Q4_0 Q4_1 Q5_0 Q5_1 IQ4_NL MXFP4 Q4_K Q5_K Q6_K Q2_K Q3_K IQ4_XS IQ2_XXS IQ2_XS IQ2_S
+               IQ3_XXS IQ3_S IQ1_S IQ1_M TQ2_0)
+    string(TOLOWER ${type} name)
+    set(spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/native_${name}.spv)
+    add_custom_command(OUTPUT ${spv}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+      COMMAND ${LIYAB_GLSLC} -fshader-stage=compute --target-env=vulkan1.1 -O -DTYPE_${type} ${_liyab_native_src} -o ${spv}
+      DEPENDS ${_liyab_native_src} VERBATIM)
+    list(APPEND _liyab_spv_names native_${name})
+    list(APPEND _liyab_spv_files ${spv})
+  endforeach()
   set(_liyab_shader_header ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_shaders.h)
   add_custom_command(OUTPUT ${_liyab_shader_header}
     COMMAND ${CMAKE_COMMAND} -DOUT=${_liyab_shader_header} "-DNAMES=${_liyab_spv_names}" "-DINPUTS=${_liyab_spv_files}"

@@ -8,6 +8,14 @@
 // into an aligned layout (float scales + 4-byte-aligned quants) so the shader
 // reads whole words instead of 18-byte GGML blocks. On unified-memory SoCs
 // this costs RAM, not a PCIe transfer.
+//
+// Shared memory (allocate_shared) avoids that copy: the engine places
+// weights in host-visible device memory it fills itself (direct reads from
+// storage land there), and matmuls on tensors inside such a region bind it
+// at the tensor's offset and decode the native GGUF blocks in the shader
+// (shaders/matvec_native.comp, every common format incl. K- and I-quants).
+// Nothing is cached per tensor for those, so a region may be refilled with
+// other weights between calls (streaming slots, expert caches).
 #include "backends/probes.h"
 #include "liyab/backend.h"
 
@@ -25,6 +33,7 @@
 
 #include "core/log.h"
 #include "core/quant.h"
+#include "core/quant_tables.h"
 #include "vulkan_shaders.h"  // generated: SPIR-V of shaders/matvec.comp per weight type
 #define LIYAB_VULKAN_BACKEND 1
 #endif
@@ -167,7 +176,69 @@ struct Params {
     uint32_t rows;
     uint32_t cols;
     uint32_t n;
+    uint32_t offset;     // native kernels: byte offset of row 0 in the bound range
+    uint32_t row_bytes;  // native kernels: bytes per row
 };
+
+// Native-layout kernels, in embedding order (CMakeLists.txt).
+struct NativeKernel {
+    DType type;
+    const unsigned char* spv;
+    size_t size;
+};
+const NativeKernel kNativeKernels[] = {
+    {DType::F32, kSpv_native_f32, kSpv_native_f32_size},
+    {DType::F16, kSpv_native_f16, kSpv_native_f16_size},
+    {DType::Q8_0, kSpv_native_q8_0, kSpv_native_q8_0_size},
+    {DType::Q4_0, kSpv_native_q4_0, kSpv_native_q4_0_size},
+    {DType::Q4_1, kSpv_native_q4_1, kSpv_native_q4_1_size},
+    {DType::Q5_0, kSpv_native_q5_0, kSpv_native_q5_0_size},
+    {DType::Q5_1, kSpv_native_q5_1, kSpv_native_q5_1_size},
+    {DType::IQ4_NL, kSpv_native_iq4_nl, kSpv_native_iq4_nl_size},
+    {DType::MXFP4, kSpv_native_mxfp4, kSpv_native_mxfp4_size},
+    {DType::Q4_K, kSpv_native_q4_k, kSpv_native_q4_k_size},
+    {DType::Q5_K, kSpv_native_q5_k, kSpv_native_q5_k_size},
+    {DType::Q6_K, kSpv_native_q6_k, kSpv_native_q6_k_size},
+    {DType::Q2_K, kSpv_native_q2_k, kSpv_native_q2_k_size},
+    {DType::Q3_K, kSpv_native_q3_k, kSpv_native_q3_k_size},
+    {DType::IQ4_XS, kSpv_native_iq4_xs, kSpv_native_iq4_xs_size},
+    {DType::IQ2_XXS, kSpv_native_iq2_xxs, kSpv_native_iq2_xxs_size},
+    {DType::IQ2_XS, kSpv_native_iq2_xs, kSpv_native_iq2_xs_size},
+    {DType::IQ2_S, kSpv_native_iq2_s, kSpv_native_iq2_s_size},
+    {DType::IQ3_XXS, kSpv_native_iq3_xxs, kSpv_native_iq3_xxs_size},
+    {DType::IQ3_S, kSpv_native_iq3_s, kSpv_native_iq3_s_size},
+    {DType::IQ1_S, kSpv_native_iq1_s, kSpv_native_iq1_s_size},
+    {DType::IQ1_M, kSpv_native_iq1_m, kSpv_native_iq1_m_size},
+    {DType::TQ2_0, kSpv_native_tq2_0, kSpv_native_tq2_0_size},
+};
+constexpr size_t kNativeCount = sizeof(kNativeKernels) / sizeof(kNativeKernels[0]);
+
+int native_index(DType type) {
+    for (size_t i = 0; i < kNativeCount; ++i) {
+        if (kNativeKernels[i].type == type) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Lookup tables of the native I-quant kernels, at the byte offsets the shader
+// expects (T_* constants in matvec_native.comp).
+std::vector<uint8_t> native_tables() {
+    std::vector<uint8_t> t;
+    auto append = [&](const void* data, size_t bytes) {
+        const auto* b = static_cast<const uint8_t*>(data);
+        t.insert(t.end(), b, b + bytes);
+    };
+    append(quant::kKSigns, sizeof quant::kKSigns);          // 0
+    append(quant::kIq2xxsGrid, sizeof quant::kIq2xxsGrid);  // 128
+    append(quant::kIq2xsGrid, sizeof quant::kIq2xsGrid);    // 2176
+    append(quant::kIq2sGrid, sizeof quant::kIq2sGrid);      // 6272
+    append(quant::kIq3xxsGrid, sizeof quant::kIq3xxsGrid);  // 14464
+    append(quant::kIq3sGrid, sizeof quant::kIq3sGrid);      // 15488
+    append(quant::kIq1sGrid, sizeof quant::kIq1sGrid);      // 17536
+    append(quant::kIq4nlValues, sizeof quant::kIq4nlValues);  // 33920
+    append(quant::kMxfp4Values, sizeof quant::kMxfp4Values);  // 33936
+    return t;
+}
 
 class VulkanBackend final : public Backend {
 public:
@@ -186,6 +257,8 @@ public:
     }
     Status matmul_group(std::span<const TensorView* const> ws, const float* x, std::span<float* const> ys,
                         int32_t n) override;
+    uint8_t* allocate_shared(size_t bytes) override;
+    void free_shared(uint8_t* data) noexcept override;
 
 private:
     struct Buffer {
@@ -199,9 +272,20 @@ private:
         Buffer quants;
     };
 
+    // A shared-memory allocation: one buffer over the whole region.
+    struct Region {
+        uint8_t* data = nullptr;
+        size_t size = 0;
+        Buffer buffer;
+    };
+
     VulkanBackend() = default;
     Status init();
     Status create_buffer(VkDeviceSize size, Buffer& out);
+    // `memory_type` < 0: the backend's default (scratch) type.
+    Status create_buffer_typed(VkDeviceSize size, int32_t memory_type, Buffer& out);
+    // The region holding [w.data, w.data + w.nbytes), or nullptr.
+    const Region* region_of(const TensorView& w) const noexcept;
     void destroy(Buffer& b) noexcept;
     Status ensure(Buffer& b, VkDeviceSize size);
     void flush(const Buffer& b) const noexcept;
@@ -223,6 +307,10 @@ private:
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipelines_[5] = {};
+    VkPipeline native_[kNativeCount] = {};
+    int32_t shared_type_ = -1;  // memory type for shared regions (prefers cached + coherent)
+    std::vector<Region> regions_;
+    Buffer tables_;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     static constexpr uint32_t kSlots = 4;  // matmuls per submission
     VkDescriptorSet sets_[kSlots] = {};
@@ -369,6 +457,29 @@ Status VulkanBackend::init() {
         if (r != VK_SUCCESS) return vk_error("vkCreateComputePipelines", r);
     }
 
+    for (size_t i = 0; i < kNativeCount; ++i) {
+        std::vector<uint32_t> code(kNativeKernels[i].size / 4);
+        std::memcpy(code.data(), kNativeKernels[i].spv, kNativeKernels[i].size);
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = kNativeKernels[i].size;
+        smci.pCode = code.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (VkResult r = f_.vkCreateShaderModule(device_, &smci, nullptr, &module); r != VK_SUCCESS) {
+            return vk_error("vkCreateShaderModule", r);
+        }
+        VkComputePipelineCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = module;
+        cpci.stage.pName = "main";
+        cpci.layout = pipeline_layout_;
+        const VkResult r = f_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &native_[i]);
+        f_.vkDestroyShaderModule(device_, module, nullptr);
+        if (r != VK_SUCCESS) return vk_error("vkCreateComputePipelines (native)", r);
+    }
+
     VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * kSlots};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -407,6 +518,10 @@ Status VulkanBackend::init() {
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (VkResult r = f_.vkCreateFence(device_, &fci, nullptr, &fence_); r != VK_SUCCESS) return vk_error("vkCreateFence", r);
+    const std::vector<uint8_t> tables = native_tables();
+    LIYAB_RETURN_IF_ERROR(create_buffer(tables.size(), tables_));
+    std::memcpy(tables_.mapped, tables.data(), tables.size());
+    flush(tables_);
     return create_buffer(16, dummy_);
 }
 
@@ -419,6 +534,11 @@ VulkanBackend::~VulkanBackend() {
         destroy(x_);
         for (Buffer& y : y_) destroy(y);
         destroy(dummy_);
+        destroy(tables_);
+        for (Region& region : regions_) destroy(region.buffer);
+        for (VkPipeline p : native_) {
+            if (p) f_.vkDestroyPipeline(device_, p, nullptr);
+        }
         if (fence_) f_.vkDestroyFence(device_, fence_, nullptr);
         if (command_pool_) f_.vkDestroyCommandPool(device_, command_pool_, nullptr);
         if (descriptor_pool_) f_.vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
@@ -433,7 +553,9 @@ VulkanBackend::~VulkanBackend() {
     if (lib_ != nullptr) dlclose(lib_);
 }
 
-Status VulkanBackend::create_buffer(VkDeviceSize size, Buffer& out) {
+Status VulkanBackend::create_buffer(VkDeviceSize size, Buffer& out) { return create_buffer_typed(size, -1, out); }
+
+Status VulkanBackend::create_buffer_typed(VkDeviceSize size, int32_t memory_type, Buffer& out) {
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = std::max<VkDeviceSize>(size, 16);
@@ -463,7 +585,7 @@ Status VulkanBackend::create_buffer(VkDeviceSize size, Buffer& out) {
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
-    mai.memoryTypeIndex = static_cast<uint32_t>(memory_type_);
+    mai.memoryTypeIndex = static_cast<uint32_t>(memory_type >= 0 ? memory_type : memory_type_);
     if (VkResult r = f_.vkAllocateMemory(device_, &mai, nullptr, &out.memory); r != VK_SUCCESS) {
         f_.vkDestroyBuffer(device_, out.buffer, nullptr);
         out.buffer = VK_NULL_HANDLE;
@@ -604,14 +726,70 @@ Result<VulkanBackend::Weights*> VulkanBackend::upload(const TensorView& w) {
     return &weights_.emplace(key, out).first->second;
 }
 
+uint8_t* VulkanBackend::allocate_shared(size_t bytes) {
+    if (shared_type_ < 0) {
+        // Shared weights are written by direct I/O and the CPU and read by both
+        // processors: prefer memory that is coherent (no flushes) and cached
+        // (fast CPU reads), then coherent, then the scratch type.
+        const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags wanted[] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, host};
+        for (const VkMemoryPropertyFlags flags : wanted) {
+            for (uint32_t i = 0; i < memory_.memoryTypeCount && shared_type_ < 0; ++i) {
+                if ((memory_.memoryTypes[i].propertyFlags & flags) == flags) shared_type_ = static_cast<int32_t>(i);
+            }
+            if (shared_type_ >= 0) break;
+        }
+        if (shared_type_ < 0) return nullptr;
+    }
+    Region region;
+    if (Status st = create_buffer_typed(bytes, shared_type_, region.buffer); !st.is_ok()) {
+        LIYAB_LOG_WARN("vulkan: shared allocation of %.0f MiB failed: %s", static_cast<double>(bytes) / (1024.0 * 1024.0),
+                       st.to_string().c_str());
+        return nullptr;
+    }
+    region.data = static_cast<uint8_t*>(region.buffer.mapped);
+    region.size = bytes;
+    regions_.push_back(region);
+    return region.data;
+}
+
+void VulkanBackend::free_shared(uint8_t* data) noexcept {
+    for (auto it = regions_.begin(); it != regions_.end(); ++it) {
+        if (it->data == data) {
+            destroy(it->buffer);
+            regions_.erase(it);
+            return;
+        }
+    }
+}
+
+const VulkanBackend::Region* VulkanBackend::region_of(const TensorView& w) const noexcept {
+    for (const Region& r : regions_) {
+        if (w.data >= r.data && w.data + w.nbytes <= r.data + r.size) return &r;
+    }
+    return nullptr;
+}
+
 Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const float* x,
                                    std::span<float* const> ys, int32_t n) {
     if (n <= 0 || ws.empty()) return Status::ok();
     if (ws.size() > kSlots) return Backend::matmul_group(ws, x, ys, n);
     const auto cols = static_cast<uint32_t>(ws[0]->cols());
     Weights* weights[kSlots] = {};
+    const Region* regions[kSlots] = {};
     for (size_t i = 0; i < ws.size(); ++i) {
         if (ws[i]->cols() != cols) return Status(ErrorCode::InvalidArgument, "grouped matmuls need equal widths");
+        regions[i] = region_of(*ws[i]);
+        if (regions[i] != nullptr) {
+            // In shared memory: read in place by a native kernel, never copied
+            // (the region may hold other weights on the next call).
+            if (native_index(ws[i]->type) < 0 || cols % 32 != 0) {
+                return Status(ErrorCode::Unsupported, std::string(dtype_traits(ws[i]->type).name) +
+                                                          " has no native Vulkan kernel; runs on the CPU");
+            }
+            continue;
+        }
         auto uploaded = upload(*ws[i]);
         if (!uploaded) return uploaded.status();
         weights[i] = uploaded.value();
@@ -632,11 +810,31 @@ Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const 
         const VkDeviceSize y_bytes = static_cast<VkDeviceSize>(n) * rows * sizeof(float);
         LIYAB_RETURN_IF_ERROR(ensure(y_[i], y_bytes));
 
+        const bool native = regions[i] != nullptr;
         const bool has_scales = w.type != DType::F32 && w.type != DType::F16;
-        const VkDescriptorBufferInfo infos[4] = {{has_scales ? weights[i]->scales.buffer : dummy_.buffer, 0, VK_WHOLE_SIZE},
-                                                 {weights[i]->quants.buffer, 0, VK_WHOLE_SIZE},
-                                                 {x_.buffer, 0, VK_WHOLE_SIZE},
-                                                 {y_[i].buffer, 0, VK_WHOLE_SIZE}};
+        Params params{rows, cols, static_cast<uint32_t>(n), 0, 0};
+        VkDescriptorBufferInfo infos[4] = {};
+        if (native) {
+            // Bind the region from the tensor's start rounded down to the
+            // storage-buffer offset alignment; the shader adds the remainder.
+            const VkDeviceSize align = std::max<VkDeviceSize>(props_.limits.minStorageBufferOffsetAlignment, 4);
+            const auto start = static_cast<VkDeviceSize>(w.data - regions[i]->data);
+            const VkDeviceSize base = start / align * align;
+            const VkDeviceSize range = (start - base + w.nbytes + 3) / 4 * 4;
+            if (range > props_.limits.maxStorageBufferRange) {
+                f_.vkEndCommandBuffer(cmd_);
+                return Status(ErrorCode::Unsupported, "tensor exceeds maxStorageBufferRange");
+            }
+            params.offset = static_cast<uint32_t>(start - base);
+            params.row_bytes = static_cast<uint32_t>(w.row_bytes());
+            infos[0] = {regions[i]->buffer.buffer, base, std::min<VkDeviceSize>(range, regions[i]->buffer.size - base)};
+            infos[1] = {tables_.buffer, 0, VK_WHOLE_SIZE};
+        } else {
+            infos[0] = {has_scales ? weights[i]->scales.buffer : dummy_.buffer, 0, VK_WHOLE_SIZE};
+            infos[1] = {weights[i]->quants.buffer, 0, VK_WHOLE_SIZE};
+        }
+        infos[2] = {x_.buffer, 0, VK_WHOLE_SIZE};
+        infos[3] = {y_[i].buffer, 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet writes[4] = {};
         for (uint32_t b = 0; b < 4; ++b) {
             writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -649,7 +847,7 @@ Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const 
         f_.vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
 
         // Quantized kernels cover kRowsPerGroup rows per workgroup.
-        const uint32_t rows_per_group = has_scales ? 4u : 1u;
+        const uint32_t rows_per_group = native || has_scales ? 4u : 1u;
         const uint32_t groups = (rows + rows_per_group - 1) / rows_per_group;
         const uint32_t groups_x = std::min(groups, props_.limits.maxComputeWorkGroupCount[0]);
         const uint32_t groups_z = (groups + groups_x - 1) / groups_x;
@@ -658,8 +856,8 @@ Status VulkanBackend::matmul_group(std::span<const TensorView* const> ws, const 
             f_.vkEndCommandBuffer(cmd_);
             return Status(ErrorCode::Unsupported, "matmul shape exceeds Vulkan dispatch limits");
         }
-        const Params params{rows, cols, static_cast<uint32_t>(n)};
-        f_.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[pipeline_index(w.type)]);
+        f_.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             native ? native_[native_index(w.type)] : pipelines_[pipeline_index(w.type)]);
         f_.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &sets_[i], 0, nullptr);
         f_.vkCmdPushConstants(cmd_, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         f_.vkCmdDispatch(cmd_, groups_x, static_cast<uint32_t>(n), groups_z);

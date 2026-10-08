@@ -62,8 +62,17 @@ public:
         uint64_t resyncs = 0;           // out-of-order requests
     };
 
+    // Where slot memory comes from (default: aligned heap). Lets slots live in
+    // memory an accelerator reads in place (Backend::allocate_shared); must
+    // return `alignment`-aligned memory or nullptr.
+    struct SlotMemory {
+        std::function<uint8_t*(size_t bytes)> allocate;
+        std::function<void(uint8_t*)> release;
+    };
+
     static Result<std::unique_ptr<TripleBufferLoader>> create(std::vector<Item> items, FetchFn fetch,
-                                                              TransformFn transform = {}, size_t alignment = 0);
+                                                              TransformFn transform = {}, size_t alignment = 0,
+                                                              SlotMemory memory = {});
     ~TripleBufferLoader();
     TripleBufferLoader(const TripleBufferLoader&) = delete;
     TripleBufferLoader& operator=(const TripleBufferLoader&) = delete;
@@ -99,6 +108,7 @@ private:
     FetchFn fetch_;
     TransformFn transform_;
     size_t alignment_ = 4096;
+    SlotMemory memory_;
     size_t slot_bytes_ = 0;
     Slot slots_[kSlots];
 

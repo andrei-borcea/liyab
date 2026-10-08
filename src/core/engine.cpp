@@ -234,24 +234,69 @@ struct Engine::Impl {
         TripleBufferLoader::FetchFn fetch = [f = direct_file.get()](uint64_t offset, size_t length, uint8_t* dst) {
             return f->read_parallel(offset, length, dst, 4);
         };
+        // With a GPU that can share memory, the slots and every resident
+        // block live in that memory: direct reads land where the GPU reads,
+        // nothing is copied or cached per tensor, and streamed blocks run on
+        // the GPU like resident ones.
+        Backend* shared = nullptr;
+        if (gpu) {
+            if (uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign)) {
+                gpu->free_shared(probe);
+                shared = gpu.get();
+            }
+        }
+        TripleBufferLoader::SlotMemory slot_memory;
+        if (shared != nullptr) {
+            slot_memory.allocate = [shared](size_t bytes) { return shared->allocate_shared(bytes); };
+            slot_memory.release = [shared](uint8_t* p) { shared->free_shared(p); };
+        }
         // Stage 2 is a pass-through: the kernels consume packed blocks directly.
-        auto loader = TripleBufferLoader::create(std::move(ranges), std::move(fetch));
+        auto loader = TripleBufferLoader::create(ranges, fetch, {}, 0, slot_memory);  // copies: retried below
+        if (!loader && shared != nullptr) {
+            LIYAB_LOG_WARN("streaming slots in GPU-shared memory failed (%s); using host memory",
+                           loader.status().to_string().c_str());
+            shared = nullptr;
+            loader = TripleBufferLoader::create(std::move(ranges), std::move(fetch));
+        }
         if (!loader) return loader.status();
         weight_loader = std::move(loader).value();
-        // Resident blocks and the other weights stay paged in; streamed blocks
-        // are dropped from the page cache and never read through the mapping.
-        const size_t resident_bytes = target->mutable_file().keep_resident([&](const TensorView& t) {
-            for (int32_t l = 0; l < c.n_layers; ++l) {
-                if (items[static_cast<size_t>(l)] < 0) continue;
-                const auto [begin, end] = file.layer_range(l);
-                if (t.file_offset >= begin && t.file_offset < end) return false;
+        std::vector<std::pair<size_t, size_t>> relocated;
+        if (shared != nullptr) {
+            for (int32_t l = 0; l <= c.n_layers; ++l) {  // resident blocks + the output head slot
+                if (l < c.n_layers && items[static_cast<size_t>(l)] >= 0) continue;
+                relocated.push_back(file.layer_range(l));
             }
-            return true;
-        });
-        target->set_layer_source(weight_loader.get(), std::move(items));
-        LIYAB_LOG_INFO("block streaming: %d of %d blocks streamed (%s direct reads, 3 x %.0f MiB slots), %.2f GiB resident",
+            auto moved = target->mutable_file().relocate(
+                relocated, [shared](size_t bytes) { return shared->allocate_shared(bytes); });
+            if (!moved) return moved.status();
+            LIYAB_LOG_INFO("block streaming: %.2f GiB of resident weights placed in GPU-shared memory",
+                           static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0));
+        }
+        auto in_ranges = [&](const TensorView& t, bool streamed_ranges) {
+            if (streamed_ranges) {
+                for (int32_t l = 0; l < c.n_layers; ++l) {
+                    if (items[static_cast<size_t>(l)] < 0) continue;
+                    const auto [begin, end] = file.layer_range(l);
+                    if (t.file_offset >= begin && t.file_offset < end) return true;
+                }
+                return false;
+            }
+            for (const auto& [begin, end] : relocated) {
+                if (t.file_offset >= begin && t.file_offset < end) return true;
+            }
+            return false;
+        };
+        // What still lives in the mapping (e.g. the embedding table, read a row
+        // at a time) stays paged in; streamed and relocated bytes are dropped
+        // from the page cache and never read through the mapping.
+        const size_t resident_bytes = target->mutable_file().keep_resident(
+            [&](const TensorView& t) { return !in_ranges(t, true) && !in_ranges(t, false); });
+        target->set_layer_source(weight_loader.get(), std::move(items), shared != nullptr);
+        LIYAB_LOG_INFO("block streaming: %d of %d blocks streamed (%s direct reads, 3 x %.0f MiB slots%s), %.2f GiB "
+                       "left in the mapping",
                        streamed, c.n_layers, direct_file->direct() ? "O_DIRECT" : "buffered",
                        static_cast<double>(weight_loader->slot_bytes()) / (1024.0 * 1024.0),
+                       shared != nullptr ? " in GPU-shared memory" : "",
                        static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0));
         return Status::ok();
     }

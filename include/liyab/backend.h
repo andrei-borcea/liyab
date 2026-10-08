@@ -29,6 +29,20 @@ public:
     // `x` and `y` must not alias. Thread-compatible: one call at a time.
     virtual Status matmul(const TensorView& w, const float* x, float* y, int32_t n) = 0;
 
+    // Unified memory (optional). Returns `bytes` of host memory that this
+    // backend reads in place: a matmul whose weights lie inside such an
+    // allocation runs without any copy, whatever wrote them (a direct read
+    // from storage, the CPU). nullptr when unsupported (the caller then uses
+    // ordinary memory). Release with free_shared(). Weights placed here
+    // (streaming slots, expert caches, resident tensors) reach the
+    // accelerator with zero copies and may be reused for other tensors at
+    // any time, unlike ordinary weights, which backends may copy once.
+    virtual uint8_t* allocate_shared(size_t bytes) {
+        (void)bytes;
+        return nullptr;
+    }
+    virtual void free_shared(uint8_t* data) noexcept { (void)data; }
+
     // Several matmuls over the same input (Q/K/V, or FFN gate/up): ys[i] =
     // x · ws[i]ᵀ. Accelerators submit them together to pay the dispatch and
     // synchronization cost once; the default runs them one by one.

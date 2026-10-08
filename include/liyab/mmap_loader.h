@@ -140,6 +140,14 @@ public:
     // another path. Turns off the streaming window (call before
     // configure_layers). Returns the resident bytes.
     size_t keep_resident(const std::function<bool(const TensorView&)>& resident);
+    // Moves the tensors inside each byte range [first, second) of the first
+    // file into memory obtained from `allocate` (one call per range), read
+    // with direct I/O, and drops their mapped pages: TensorView::data then
+    // points into that memory. Used to place weights in memory an
+    // accelerator reads in place (Backend::allocate_shared). Returns the
+    // bytes moved; on failure no tensor of the failing range was moved.
+    Result<size_t> relocate(const std::vector<std::pair<size_t, size_t>>& ranges,
+                            const std::function<uint8_t*(size_t bytes)>& allocate);
     // Blocks until all queued prefetches completed (tests, benchmarks).
     void wait_prefetch_idle();
     [[nodiscard]] uint64_t prefetched_bytes() const noexcept { return prefetched_bytes_.load(); }

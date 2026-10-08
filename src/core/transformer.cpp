@@ -411,7 +411,7 @@ public:
     // True when the views point into a reused streaming slot rather than the
     // mapping. Backends that keep per-tensor device copies (keyed by address)
     // must not see such views: the next block reuses the same address.
-    [[nodiscard]] bool streamed() const noexcept { return item_ >= 0; }
+    [[nodiscard]] bool streamed() const noexcept { return item_ >= 0 && !model_.layer_shared_; }
     // The block's matrix with role `role` (only roles the block has).
     const TensorView& operator[](WeightRole role) const { return views_[role]; }
 

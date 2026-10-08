@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 
+#include "core/direct_io.h"
 #include "core/log.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
@@ -518,6 +519,35 @@ void MmapLoader::configure_layers(int32_t n_layers) {
         if (const TensorView* emb = tensor("token_embd.weight")) extend(layer_ranges_.back(), *emb);
     }
     if (streaming_) prefetch_thread_ = std::thread([this] { prefetch_loop(); });
+}
+
+Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>& ranges,
+                                    const std::function<uint8_t*(size_t bytes)>& allocate) {
+    auto reader = DirectFile::open(files_.front()->path());
+    if (!reader) return reader.status();
+    constexpr size_t kAlign = DirectFile::kAlign;
+    size_t moved = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const size_t aligned = begin / kAlign * kAlign;
+        const size_t length = (end - aligned + kAlign - 1) / kAlign * kAlign;
+        uint8_t* dst = allocate(length);
+        if (dst == nullptr) return Status(ErrorCode::OutOfMemory, "cannot allocate memory for relocated weights");
+        if (reinterpret_cast<uintptr_t>(dst) % kAlign == 0) {
+            LIYAB_RETURN_IF_ERROR(reader.value()->read_parallel(aligned, length, dst, 4));
+        } else {  // not aligned for direct I/O: copy from the mapping instead
+            const MappedFile& f = *files_.front();
+            std::memcpy(dst, f.data() + aligned, std::min(length, f.size() - aligned));
+        }
+        for (TensorView& t : tensors_) {
+            if (t.shard == 0 && t.file_offset >= begin && t.file_offset + t.nbytes <= end) {
+                t.data = dst + (t.file_offset - aligned);
+            }
+        }
+        files_.front()->advise_dontneed(begin, end - begin);
+        moved += end - begin;
+    }
+    return moved;
 }
 
 size_t MmapLoader::keep_resident(const std::function<bool(const TensorView&)>& resident) {

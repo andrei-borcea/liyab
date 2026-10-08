@@ -1,0 +1,397 @@
+// Liyab — Vulkan matrix-vector kernels over weights in their native GGUF
+// layout: y[t][row] = dot(W[row], x[t]).
+//
+// Used for weights that live in shared (unified) memory the backend can read
+// in place: no copy, no repacking, so streamed blocks, expert caches and
+// resident weights are all read where the CPU wrote them. Compiled once per
+// weight type (-DTYPE_<name>). Byte-addressed reads (8/16-bit storage) decode
+// the blocks with the same bit layouts as the CPU decoders (core/quant*.cpp,
+// themselves checked bit-exactly against llama.cpp's reference); I-quant
+// lattices come from a small read-only table buffer (binding 1, layout in
+// vulkan_backend.cpp: kTable*).
+//
+// Work split: a 64-lane workgroup computes 4 rows, 16 lanes per row; a lane
+// takes whole 32-value sub-blocks (one sub-block of a 256-value super-block,
+// or one 32-value block), decodes it and dots it with x in float.
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 64) in;
+
+// The same weight buffer viewed as bytes and as 16-bit words (aliased binding).
+layout(std430, set = 0, binding = 0) readonly buffer W8 { uint8_t w8[]; };
+layout(std430, set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Tables { uint8_t tables[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Tables32 { uint tables32[]; };  // same tables, 4-byte words
+layout(std430, set = 0, binding = 2) readonly buffer X { vec4 x4[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint n;
+    uint offset;     // byte offset of row 0 inside the bound range
+    uint row_bytes;  // bytes per weight row
+} p;
+
+// Table layout (bytes), mirrored by kTable* in vulkan_backend.cpp.
+const uint T_KSIGNS = 0u;       // 128 sign masks
+const uint T_IQ2XXS = 128u;     // 256 x 8
+const uint T_IQ2XS = 2176u;     // 512 x 8
+const uint T_IQ2S = 6272u;      // 1024 x 8
+const uint T_IQ3XXS = 14464u;   // 256 x 4
+const uint T_IQ3S = 15488u;     // 512 x 4
+const uint T_IQ1S = 17536u;     // 2048 x 8 (int8)
+const uint T_IQ4NL = 33920u;    // 16 int8
+const uint T_MXFP4 = 33936u;    // 16 int8 (doubled e2m1)
+
+#if defined(TYPE_F32)
+const uint BLOCK_BYTES = 128u; const uint SUBS = 1u;
+#elif defined(TYPE_F16)
+const uint BLOCK_BYTES = 64u; const uint SUBS = 1u;
+#elif defined(TYPE_Q8_0)
+const uint BLOCK_BYTES = 34u; const uint SUBS = 1u;
+#elif defined(TYPE_Q4_0)
+const uint BLOCK_BYTES = 18u; const uint SUBS = 1u;
+#elif defined(TYPE_Q4_1)
+const uint BLOCK_BYTES = 20u; const uint SUBS = 1u;
+#elif defined(TYPE_Q5_0)
+const uint BLOCK_BYTES = 22u; const uint SUBS = 1u;
+#elif defined(TYPE_Q5_1)
+const uint BLOCK_BYTES = 24u; const uint SUBS = 1u;
+#elif defined(TYPE_IQ4_NL)
+const uint BLOCK_BYTES = 18u; const uint SUBS = 1u;
+#elif defined(TYPE_MXFP4)
+const uint BLOCK_BYTES = 17u; const uint SUBS = 1u;
+#elif defined(TYPE_Q4_K)
+const uint BLOCK_BYTES = 144u; const uint SUBS = 8u;
+#elif defined(TYPE_Q5_K)
+const uint BLOCK_BYTES = 176u; const uint SUBS = 8u;
+#elif defined(TYPE_Q6_K)
+const uint BLOCK_BYTES = 210u; const uint SUBS = 8u;
+#elif defined(TYPE_Q2_K)
+const uint BLOCK_BYTES = 84u; const uint SUBS = 8u;
+#elif defined(TYPE_Q3_K)
+const uint BLOCK_BYTES = 110u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ4_XS)
+const uint BLOCK_BYTES = 136u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ2_XXS)
+const uint BLOCK_BYTES = 66u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ2_XS)
+const uint BLOCK_BYTES = 74u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ2_S)
+const uint BLOCK_BYTES = 82u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ3_XXS)
+const uint BLOCK_BYTES = 98u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ3_S)
+const uint BLOCK_BYTES = 110u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ1_S)
+const uint BLOCK_BYTES = 50u; const uint SUBS = 8u;
+#elif defined(TYPE_IQ1_M)
+const uint BLOCK_BYTES = 56u; const uint SUBS = 8u;
+#elif defined(TYPE_TQ2_0)
+const uint BLOCK_BYTES = 66u; const uint SUBS = 8u;
+#else
+#error "unknown weight type"
+#endif
+
+float xs[32];  // the 32 activations of the current sub-block
+
+uint B(uint o) { return uint(w8[o]); }
+float S8(uint o) { return float(int(int8_t(w8[o]))); }
+uint U16(uint o) { return uint(w16[o >> 1u]); }  // o is even for every 16-bit field
+uint U32(uint o) { return U16(o) | (U16(o + 2u) << 16u); }
+float H(uint o) { return unpackHalf2x16(U16(o)).x; }
+float T8(uint o) { return float(uint(tables[o])); }
+// Dot of the 8 signed bytes of table row at byte offset g (4-aligned) with xs[base..].
+float sgrid8(uint g, uint base) {
+    const ivec4 a = ivec4(int(tables32[g >> 2u]) << 24, int(tables32[g >> 2u]) << 16, int(tables32[g >> 2u]) << 8,
+                          int(tables32[g >> 2u])) >> 24;
+    const ivec4 b = ivec4(int(tables32[(g >> 2u) + 1u]) << 24, int(tables32[(g >> 2u) + 1u]) << 16,
+                          int(tables32[(g >> 2u) + 1u]) << 8, int(tables32[(g >> 2u) + 1u])) >> 24;
+    return dot(vec4(a), vec4(xs[base], xs[base + 1u], xs[base + 2u], xs[base + 3u])) +
+           dot(vec4(b), vec4(xs[base + 4u], xs[base + 5u], xs[base + 6u], xs[base + 7u]));
+}
+float TS8(uint o) { return float(int(int8_t(tables[o]))); }
+
+// Dot of 4 unsigned bytes packed in `w` with xs[base..base+3], each negated
+// where its bit in `signs` (bits 0..3) is set; branch-free.
+float dot4(uint w, uint signs, uint base) {
+    const vec4 v = vec4(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u), float(w >> 24u));
+    const vec4 sg = vec4(1.0) - 2.0 * vec4(float(signs & 1u), float((signs >> 1u) & 1u), float((signs >> 2u) & 1u),
+                                           float((signs >> 3u) & 1u));
+    return dot(v * sg, vec4(xs[base], xs[base + 1u], xs[base + 2u], xs[base + 3u]));
+}
+
+// Dot of 8 grid magnitudes (the 8-byte table row at byte offset g, 4-aligned)
+// with xs[base..base+7], negated where `signs` has a bit set.
+float grid8(uint g, uint signs, uint base) {
+    return dot4(tables32[g >> 2u], signs, base) + dot4(tables32[(g >> 2u) + 1u], signs >> 4u, base + 4u);
+}
+
+#if defined(TYPE_Q4_K) || defined(TYPE_Q5_K)
+// 6-bit scale and min of sub-block j from the 12 packed bytes at `o`.
+void scale_min_k4(uint o, uint j, out float sc, out float m) {
+    if (j < 4u) {
+        sc = float(B(o + j) & 63u);
+        m = float(B(o + j + 4u) & 63u);
+    } else {
+        sc = float((B(o + j + 4u) & 15u) | ((B(o + j - 4u) >> 6u) << 4u));
+        m = float((B(o + j + 4u) >> 4u) | ((B(o + j) >> 6u) << 4u));
+    }
+}
+#endif
+
+// Dot of sub-block j (32 values) of the block at byte `o` with xs[].
+float sub_dot(uint o, uint j) {
+    float acc = 0.0;
+    float sx = 0.0;
+    for (uint l = 0u; l < 32u; ++l) sx += xs[l];
+#if defined(TYPE_F32)
+    for (uint l = 0u; l < 32u; ++l) acc += uintBitsToFloat(U32(o + 4u * l)) * xs[l];
+    return acc;
+#elif defined(TYPE_F16)
+    for (uint l = 0u; l < 32u; ++l) acc += H(o + 2u * l) * xs[l];
+    return acc;
+#elif defined(TYPE_Q8_0)
+    for (uint l = 0u; l < 32u; ++l) acc += S8(o + 2u + l) * xs[l];
+    return H(o) * acc;
+#elif defined(TYPE_Q4_0) || defined(TYPE_Q4_1) || defined(TYPE_IQ4_NL)
+#if defined(TYPE_Q4_1)
+    const uint qs = o + 4u;
+#else
+    const uint qs = o + 2u;
+#endif
+    for (uint l = 0u; l < 16u; ++l) {
+        const uint b = B(qs + l);
+#if defined(TYPE_IQ4_NL)
+        acc += TS8(T_IQ4NL + (b & 15u)) * xs[l] + TS8(T_IQ4NL + (b >> 4u)) * xs[l + 16u];
+#else
+        acc += float(b & 15u) * xs[l] + float(b >> 4u) * xs[l + 16u];
+#endif
+    }
+#if defined(TYPE_Q4_0)
+    return H(o) * (acc - 8.0 * sx);
+#elif defined(TYPE_Q4_1)
+    return H(o) * acc + H(o + 2u) * sx;
+#else
+    return H(o) * acc;
+#endif
+#elif defined(TYPE_MXFP4)
+    const uint e = B(o);
+    const float d = uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23u));
+    for (uint l = 0u; l < 16u; ++l) {
+        const uint b = B(o + 1u + l);
+        acc += TS8(T_MXFP4 + (b & 15u)) * xs[l] + TS8(T_MXFP4 + (b >> 4u)) * xs[l + 16u];
+    }
+    return d * acc;
+#elif defined(TYPE_Q5_0) || defined(TYPE_Q5_1)
+#if defined(TYPE_Q5_1)
+    const uint qh = U32(o + 4u);
+    const uint qs = o + 8u;
+#else
+    const uint qh = U32(o + 2u);
+    const uint qs = o + 6u;
+#endif
+    for (uint l = 0u; l < 16u; ++l) {
+        const uint b = B(qs + l);
+        acc += float((b & 15u) | (((qh >> l) & 1u) << 4u)) * xs[l] +
+               float((b >> 4u) | (((qh >> (l + 16u)) & 1u) << 4u)) * xs[l + 16u];
+    }
+#if defined(TYPE_Q5_1)
+    return H(o) * acc + H(o + 2u) * sx;
+#else
+    return H(o) * (acc - 16.0 * sx);
+#endif
+#elif defined(TYPE_Q4_K) || defined(TYPE_Q5_K)
+    float sc, m;
+    scale_min_k4(o + 4u, j, sc, m);
+#if defined(TYPE_Q4_K)
+    const uint qs = o + 16u + 32u * (j >> 1u);
+#else
+    const uint qs = o + 48u + 32u * (j >> 1u);
+#endif
+    const uint shift = (j & 1u) * 4u;
+    for (uint l = 0u; l < 32u; ++l) {
+        uint q = (B(qs + l) >> shift) & 15u;
+#if defined(TYPE_Q5_K)
+        q += ((B(o + 16u + l) >> j) & 1u) << 4u;
+#endif
+        acc += float(q) * xs[l];
+    }
+    return H(o) * sc * acc - H(o + 2u) * m * sx;
+#elif defined(TYPE_Q6_K)
+    const uint h = j >> 2u, qq = j & 3u;
+    const uint ql = o + 64u * h + (qq & 1u) * 32u;
+    const uint qshift = (qq >> 1u) * 4u;
+    const uint qh = o + 128u + 32u * h;
+    float acc0 = 0.0, acc1 = 0.0;
+    for (uint l = 0u; l < 32u; ++l) {
+        const float q = float(int(((B(ql + l) >> qshift) & 15u) | (((B(qh + l) >> (2u * qq)) & 3u) << 4u)) - 32);
+        if (l < 16u) acc0 += q * xs[l]; else acc1 += q * xs[l];
+    }
+    const uint sc = o + 192u + 8u * h + 2u * qq;
+    return H(o + 208u) * (S8(sc) * acc0 + S8(sc + 1u) * acc1);
+#elif defined(TYPE_Q2_K)
+    const uint qs = o + 16u + 32u * (j >> 2u);
+    const uint shift = 2u * (j & 3u);
+    const float d = H(o + 80u), dmin = H(o + 82u);
+    float result = 0.0;
+    for (uint half_ = 0u; half_ < 2u; ++half_) {
+        const uint s = B(o + 2u * j + half_);
+        float a = 0.0, sxh = 0.0;
+        for (uint l = 16u * half_; l < 16u * half_ + 16u; ++l) {
+            a += float((B(qs + l) >> shift) & 3u) * xs[l];
+            sxh += xs[l];
+        }
+        result += d * float(s & 15u) * a - dmin * float(s >> 4u) * sxh;
+    }
+    return result;
+#elif defined(TYPE_Q3_K)
+    const uint qs = o + 32u + 32u * (j >> 2u);
+    const uint shift = 2u * (j & 3u);
+    const float d = H(o + 108u);
+    float result = 0.0;
+    for (uint half_ = 0u; half_ < 2u; ++half_) {
+        const uint j16 = 2u * j + half_;
+        const uint lo = j16 < 8u ? (B(o + 96u + j16) & 15u) : (B(o + 96u + j16 - 8u) >> 4u);
+        const uint hi = (B(o + 104u + (j16 & 3u)) >> (2u * (j16 >> 2u))) & 3u;
+        float a = 0.0;
+        for (uint l = 16u * half_; l < 16u * half_ + 16u; ++l) {
+            const int ql = int((B(qs + l) >> shift) & 3u);
+            const int hb = int((B(o + l) >> j) & 1u);
+            a += float(ql - (hb != 0 ? 0 : 4)) * xs[l];
+        }
+        result += d * float(int(lo | (hi << 4u)) - 32) * a;
+    }
+    return result;
+#elif defined(TYPE_IQ4_XS)
+    const uint lo = (B(o + 4u + (j >> 1u)) >> (4u * (j & 1u))) & 15u;
+    const uint hi = (U16(o + 2u) >> (2u * j)) & 3u;
+    const uint qs = o + 8u + 16u * j;
+    for (uint l = 0u; l < 16u; ++l) {
+        const uint b = B(qs + l);
+        acc += TS8(T_IQ4NL + (b & 15u)) * xs[l] + TS8(T_IQ4NL + (b >> 4u)) * xs[l + 16u];
+    }
+    return H(o) * float(int(lo | (hi << 4u)) - 32) * acc;
+#elif defined(TYPE_IQ2_XXS)
+    const uint aux0 = U32(o + 2u + 8u * j);
+    const uint aux1 = U32(o + 6u + 8u * j);
+    for (uint k = 0u; k < 4u; ++k) {
+        acc += grid8(T_IQ2XXS + 8u * ((aux0 >> (8u * k)) & 255u), uint(tables[T_KSIGNS + ((aux1 >> (7u * k)) & 127u)]), 8u * k);
+    }
+    return H(o) * (0.5 + float(aux1 >> 28u)) * 0.25 * acc;
+#elif defined(TYPE_IQ2_XS) || defined(TYPE_IQ2_S)
+    float result = 0.0;
+    for (uint half_ = 0u; half_ < 2u; ++half_) {
+        float a = 0.0;
+        for (uint k = 2u * half_; k < 2u * half_ + 2u; ++k) {
+            const uint g = 4u * j + k;
+#if defined(TYPE_IQ2_XS)
+            const uint v = U16(o + 2u + 2u * g);
+            a += grid8(T_IQ2XS + 8u * (v & 511u), uint(tables[T_KSIGNS + (v >> 9u)]), 8u * k);
+#else
+            const uint idx = B(o + 2u + g) | (((B(o + 66u + (g >> 2u)) >> (2u * (g & 3u))) & 3u) << 8u);
+            a += grid8(T_IQ2S + 8u * idx, B(o + 34u + g), 8u * k);
+#endif
+        }
+        const uint s16 = 2u * j + half_;
+#if defined(TYPE_IQ2_XS)
+        const uint sc = (B(o + 66u + (s16 >> 1u)) >> (4u * (s16 & 1u))) & 15u;
+#else
+        const uint sc = (B(o + 74u + (s16 >> 1u)) >> (4u * (s16 & 1u))) & 15u;
+#endif
+        result += (0.5 + float(sc)) * 0.25 * a;
+    }
+    return H(o) * result;
+#elif defined(TYPE_IQ3_XXS)
+    const uint aux = U32(o + 66u + 4u * j);
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint signs = uint(tables[T_KSIGNS + ((aux >> (7u * k)) & 127u)]);
+        acc += dot4(tables32[(T_IQ3XXS >> 2u) + B(o + 2u + 8u * j + 2u * k)], signs, 8u * k) +
+               dot4(tables32[(T_IQ3XXS >> 2u) + B(o + 3u + 8u * j + 2u * k)], signs >> 4u, 8u * k + 4u);
+    }
+    return H(o) * (0.5 + float(aux >> 28u)) * 0.5 * acc;
+#elif defined(TYPE_IQ3_S)
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint g = 4u * j + k;
+        const uint signs = B(o + 74u + g);
+        for (uint h = 0u; h < 2u; ++h) {
+            const uint kk = 2u * g + h;
+            const uint idx = B(o + 2u + kk) | (((B(o + 66u + (kk >> 3u)) >> (kk & 7u)) & 1u) << 8u);
+            acc += dot4(tables32[(T_IQ3S >> 2u) + idx], signs >> (4u * h), 8u * k + 4u * h);
+        }
+    }
+    return H(o) * (1.0 + 2.0 * float((B(o + 106u + (j >> 1u)) >> (4u * (j & 1u))) & 15u)) * acc;
+#elif defined(TYPE_IQ1_S)
+    const uint h = U16(o + 34u + 2u * j);
+    const float dl = H(o) * float(2u * ((h >> 12u) & 7u) + 1u);
+    const float delta = (h & 0x8000u) != 0u ? -0.125 : 0.125;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint idx = B(o + 2u + 4u * j + k) | (((h >> (3u * k)) & 7u) << 8u);
+        acc += sgrid8(T_IQ1S + 8u * idx, 8u * k);
+    }
+    return dl * (acc + delta * sx);
+#elif defined(TYPE_IQ1_M)
+    const uint s0 = U16(o + 48u), s1 = U16(o + 50u), s2 = U16(o + 52u), s3 = U16(o + 54u);
+    const uint dh = ((s0 & 0xF000u) >> 12u) | ((s1 & 0xF000u) >> 8u) | ((s2 & 0xF000u) >> 4u) | (s3 & 0xF000u);
+    const float d = unpackHalf2x16(dh).x;
+    float result = 0.0;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint g = 4u * j + k;
+        const uint j16 = g >> 1u;
+        const uint sw = U16(o + 48u + 2u * (j16 >> 2u));
+        const float s = d * float(2u * ((sw >> (3u * (j16 & 3u))) & 7u) + 1u);
+        const uint v = (B(o + 32u + (g >> 1u)) >> (4u * (g & 1u))) & 15u;
+        const uint idx = B(o + g) | ((v & 7u) << 8u);
+        const float a = sgrid8(T_IQ1S + 8u * idx, 8u * k);
+        float sxg = 0.0;
+        for (uint i = 0u; i < 8u; ++i) sxg += xs[8u * k + i];
+        result += s * (a + ((v & 8u) != 0u ? -0.125 : 0.125) * sxg);
+    }
+    return result;
+#elif defined(TYPE_TQ2_0)
+    const uint qs = o + 32u * (j >> 2u);
+    const uint shift = 2u * (j & 3u);
+    for (uint l = 0u; l < 32u; ++l) acc += float(int((B(qs + l) >> shift) & 3u) - 1) * xs[l];
+    return H(o + 64u) * acc;
+#endif
+}
+
+shared float partial[64];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint group = gl_WorkGroupID.z * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint sub = lid >> 4u;   // row within the workgroup (0..3)
+    const uint lane = lid & 15u;  // lane within the row (0..15)
+    const uint row = group * 4u + sub;
+    const uint nsub = p.cols / 32u;
+    float sum = 0.0;
+    if (row < p.rows) {
+        const uint row_base = p.offset + row * p.row_bytes;
+        const uint x_base = t * (p.cols / 4u);
+        for (uint sb = lane; sb < nsub; sb += 16u) {
+            const uint xi = x_base + sb * 8u;
+            for (uint v = 0u; v < 8u; ++v) {
+                const vec4 xv = x4[xi + v];
+                xs[4u * v] = xv.x;
+                xs[4u * v + 1u] = xv.y;
+                xs[4u * v + 2u] = xv.z;
+                xs[4u * v + 3u] = xv.w;
+            }
+            sum += sub_dot(row_base + (sb / SUBS) * BLOCK_BYTES, sb % SUBS);
+        }
+    }
+    partial[lid] = sum;
+    barrier();
+    for (uint s = 8u; s > 0u; s >>= 1u) {  // reduce 16 lanes per row
+        if (lane < s) partial[lid] += partial[lid + s];
+        barrier();
+    }
+    if (lane == 0u && row < p.rows) y[t * p.rows + row] = partial[lid];
+}

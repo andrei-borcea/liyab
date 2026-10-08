@@ -155,9 +155,13 @@ public:
     // MmapLoader::layer_range(l)), or read in place when items[l] < 0; an
     // empty `items` streams every block (item i = block i). nullptr restores
     // in-place reads. `source` must outlive its use here.
-    void set_layer_source(TripleBufferLoader* source, std::vector<int32_t> items = {}) {
+    // `shared`: the source's slots are accelerator-shared memory
+    // (Backend::allocate_shared), so streamed blocks may use the normal route;
+    // otherwise they run on the CPU (see BlockWeights::streamed()).
+    void set_layer_source(TripleBufferLoader* source, std::vector<int32_t> items = {}, bool shared = false) {
         layer_source_ = source;
         layer_items_ = std::move(items);
+        layer_shared_ = shared;
     }
 
 private:
@@ -231,6 +235,7 @@ private:
     std::unique_ptr<KvCache> kv_;
     TripleBufferLoader* layer_source_ = nullptr;
     std::vector<int32_t> layer_items_;
+    bool layer_shared_ = false;
 
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
