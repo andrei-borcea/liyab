@@ -72,6 +72,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
     options.requant_bits = config.requant_bits;
     options.expert_mass = config.moe_expert_mass;
+    options.max_experts = config.moe_max_experts;
     return Transformer::load(std::move(file).value(), options);
 }
 

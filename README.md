@@ -315,7 +315,9 @@ memory the engine keeps resident (weights, expert cache, streaming slots), for p
 OS counters do not show (`liyab-cli --memory-budget MB`); `requant_bits` (4 or 5, default 0 = off; `liyab-cli
 --requant 4|5`) converts the resident Q8_0 matrices of a MoE model with streamed experts to Q4_K or Q5_K at load
 (lossy, see the 35B results below); `moe_expert_mass` (`liyab-cli --expert-mass P`, default 1 = off) runs, per token,
-only the top experts covering a fraction P of the router weight (lossy, see below); and `liyab_generation_stats`
+only the top experts covering a fraction P of the router weight (lossy, see below); `moe_max_experts` (`liyab-cli
+--experts N`, default 0 = the model's top-k) caps the experts per token (lossy when below the model's count); and
+`liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
 `expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), plus where decode

@@ -84,6 +84,7 @@ typedef struct liyab_engine_config {
     int64_t memory_budget_mb;     /* > 0: cap on resident memory in MiB (e.g. per-app OS limits); 0: free RAM only */
     int32_t requant_bits;         /* MoE expert streaming: resident Q8_0 matrices -> Q4_K (4) / Q5_K (5) at load (lossy); 0 off */
     float moe_expert_mass;        /* MoE: run the fewest top experts covering this router mass (lossy, e.g. 0.9); >= 1 all (default 1) */
+    int32_t moe_max_experts;      /* MoE: at most this many experts per token (lossy); 0: the model's top-k */
     /* Experimental (build with LIYAB_ENABLE_EXPERIMENTAL=ON, else LIYAB_ERR_UNSUPPORTED). */
     int32_t early_exit;           /* nonzero: confidence-based early exit (lossy) */
     float early_exit_threshold;   /* default 0.98 */

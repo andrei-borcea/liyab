@@ -47,7 +47,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: liyab-kl -m model.gguf -f text.txt (--save REF | --compare REF)\n"
                  "                [--requant 4|5] [--expert-mass P] [--memory-budget MB] [--expert-cache MB]\n"
-                 "                [--threads N] [--max-tokens N (default 512)]\n");
+                 "                [--experts N] [--threads N] [--max-tokens N (default 512)]\n");
     return 2;
 }
 
@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
     std::string model_path, text_path, save_path, compare_path;
     int32_t requant = 0, threads = 0, max_tokens = 512;
     float expert_mass = 1.0f;
+    int32_t max_experts = 0;
     int64_t budget_mb = 0, expert_cache_mb = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
         else if (arg == "--compare") compare_path = next();
         else if (arg == "--requant") requant = std::atoi(next());
         else if (arg == "--expert-mass") expert_mass = static_cast<float>(std::atof(next()));
+        else if (arg == "--experts") max_experts = std::atoi(next());
         else if (arg == "--memory-budget") budget_mb = std::atoll(next());
         else if (arg == "--expert-cache") expert_cache_mb = std::atoll(next());
         else if (arg == "--threads") threads = std::atoi(next());
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
     options.requant_bits = requant;
     options.expert_mass = expert_mass;
+    options.max_experts = max_experts;
     options.expert_cache_bytes = expert_cache_mb > 0 ? expert_cache_mb << 20 : expert_cache_mb;
     auto loaded = liyab::Transformer::load(std::move(file).value(), options);
     if (!loaded) {

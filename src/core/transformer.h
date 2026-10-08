@@ -107,6 +107,10 @@ struct TransformerOptions {
     // (renormalized over the kept ones when the model normalizes its top-k).
     // Lossy; >= 1 runs all top-k (default).
     float expert_mass = 1.0f;
+    // MoE: at most this many experts per token (the top ones by router
+    // score, renormalized like the model's top-k); 0 or >= the model's top-k:
+    // the model's own count. Lossy when it cuts.
+    int32_t max_experts = 0;
 };
 
 class Transformer {
@@ -244,7 +248,8 @@ private:
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
-    // How many of a token's top-k experts run under expert_mass_: `order`
+    // How many of a token's top-k experts run under expert_mass_ and
+    // max_experts_: `order`
     // starts with the top-k by selection score, `probs` are their router
     // probabilities and `top_sum` their total.
     [[nodiscard]] size_t experts_to_run(std::span<const float> probs, std::span<const int32_t> order,
@@ -292,6 +297,7 @@ private:
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;
     float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
+    int32_t max_experts_ = 0;           // TransformerOptions::max_experts
     std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 

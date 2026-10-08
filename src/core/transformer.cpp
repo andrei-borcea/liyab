@@ -131,6 +131,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     model->expert_mass_ = options.expert_mass;
+    model->max_experts_ = options.max_experts;
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
@@ -816,7 +817,8 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
     std::vector<int32_t> picks;
-    std::vector<float> probs(expert_mass_ < 1.0f ? E : 0);
+    const bool cut = expert_mass_ < 1.0f || (max_experts_ > 0 && max_experts_ < c.n_expert_used);
+    std::vector<float> probs(cut ? E : 0);
     for (size_t t = 0; t < un; ++t) {
         const float* logits = pred_logits_.data() + t * E;
         auto score = [&](int32_t e) {  // softmax and sigmoid are monotonic; the selection bias is added on top
@@ -828,7 +830,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
         std::partial_sort(order.begin(), order.begin() + k, order.end(),
                           [&](int32_t a, int32_t b) { return score(a) > score(b); });
         size_t kept = static_cast<size_t>(k);
-        if (expert_mass_ < 1.0f) {  // guess only the experts the router would keep (unnormalized: ratios suffice)
+        if (cut) {  // guess only the experts the router would keep (unnormalized: ratios suffice)
             float sum = 0.0f;
             const float top = logits[order[0]];
             for (std::ptrdiff_t i = 0; i < k; ++i) {
@@ -871,13 +873,14 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
 
 size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const int32_t> order, float top_sum) const {
     const auto K = static_cast<size_t>(config_.n_expert_used);
-    if (expert_mass_ >= 1.0f) return K;
+    const size_t cap = max_experts_ > 0 ? std::min(K, static_cast<size_t>(max_experts_)) : K;
+    if (expert_mass_ >= 1.0f) return cap;
     float covered = 0.0f;
-    for (size_t k = 0; k < K; ++k) {
+    for (size_t k = 0; k < cap; ++k) {
         covered += probs[static_cast<size_t>(order[k])];
         if (covered >= expert_mass_ * top_sum) return k + 1;
     }
-    return K;
+    return cap;
 }
 
 // Mixture of experts, as llama.cpp's build_moe_ffn: router probabilities

@@ -72,6 +72,9 @@ struct EngineConfig {
     // (e.g. 0.9), renormalized over the kept ones. Lossy, opt-in: fewer
     // expert reads and less compute per token. >= 1: all top-k (default).
     float moe_expert_mass = 1.0f;
+    // MoE: at most this many experts per token (the top ones, renormalized);
+    // 0: the model's own top-k. Lossy when below it.
+    int32_t moe_max_experts = 0;
     int32_t draft_tokens = 4;         // k for speculative decoding
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM

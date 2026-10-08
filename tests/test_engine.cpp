@@ -705,7 +705,7 @@ TEST_CASE("Mixture of experts with identical experts equals its dense twin (rout
     }
 }
 
-TEST_CASE("MoE expert_mass runs fewer experts per token") {
+TEST_CASE("MoE expert_mass and max_experts run fewer experts per token") {
     test::TinyModelSpec spec;
     spec.arch = "qwen3moe";
     spec.n_layers = 2;
@@ -718,10 +718,11 @@ TEST_CASE("MoE expert_mass runs fewer experts per token") {
     const Route route{cpu.get(), cpu.get(), cpu.get()};
     std::vector<int32_t> tokens;
     for (int32_t i = 0; i < 16; ++i) tokens.push_back(3 + (i * 37) % 250);
-    auto uses = [&](float mass) {
+    auto uses = [&](float mass, int32_t max_experts = 0) {
         TransformerOptions options;
         options.expert_cache_bytes = 1;  // streamed: the store counts expert uses
         options.expert_mass = mass;
+        options.max_experts = max_experts;
         auto model = load_transformer(path, options);
         if (model == nullptr || model->expert_store() == nullptr) return uint64_t{0};
         for (const int32_t t : tokens) {
@@ -736,6 +737,8 @@ TEST_CASE("MoE expert_mass runs fewer experts per token") {
     CHECK(top1 == tokens.size() * 2);
     const uint64_t half = uses(0.5f);
     CHECK(half >= top1 && half <= all);
+    CHECK(uses(1.0f, 2) == tokens.size() * 2 * 2);  // a cap of 2 of the model's 4
+    CHECK(uses(1.0f, 9) == all);                    // a cap above the model's top-k changes nothing
 }
 
 TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O) equals in-place expert reads") {
