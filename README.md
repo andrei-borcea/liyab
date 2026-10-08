@@ -617,6 +617,21 @@ with 48 GB the macOS file cache still held the model, so streamed reads were par
 backend is slower here (6.8 tok/s: one command buffer per matmul). The phone is ~6x slower than this Mac mostly
 because of memory bandwidth (~55 vs ~273 GB/s) and UFS instead of RAM for the experts.
 
+Against edge0 on the same phone (their Edge0-35B-A3B-preview: Qwen3.6-35B-A3B at 4 bits with 4 experts per token,
+converted with their tools and run with their patched llama.cpp `llama-completion` and the settings of their app's
+35B tier: 6144 MiB expert pool + 3072 MiB blob, 4 I/O threads; 4 and 7 compute threads), same prompt, greedy,
+alternating runs:
+
+| Engine | 64 tokens (median of 3) | 256 tokens (1 run) |
+| :--- | ---: | ---: |
+| edge0, 4 threads (their app) | 4.45 tok/s | 5.55 tok/s |
+| edge0, 7 threads | 4.43 tok/s | 5.12 tok/s |
+| Liyab, 8 experts, `--memory-budget 5500` | 7.82 tok/s | 7.47 tok/s |
+| Liyab, 8 experts, `--memory-budget 7000` | 9.45 tok/s | 8.84 tok/s |
+
+edge0 publishes 6–9 tok/s in its app and 9.46 sustained from a CLI on a 16 GB Snapdragon 8 Elite tablet; on this
+phone (15 GB, ~8 GB free) its ~9 GB pool had to trim under memory pressure.
+
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident
 weights (the UD quant keeps attention and DeltaNet projections in Q8_0, the LM head in Q6_K) plus ~0.6 GB of
