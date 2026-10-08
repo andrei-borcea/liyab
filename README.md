@@ -228,6 +228,11 @@ needed.
 F32 routers, Q6_K LM head, Q4_K/Q5_K/Q6_K experts) in GB/s, next to the RAM read ceiling, for several thread counts:
 `liyab-bench --threads 1,4,8 --seconds 1`.
 
+`liyab-kl` (also built with the tests) measures what a lossy option costs: it saves the teacher-forced next-token
+distributions of a model over a text from the lossless path (`--save ref.bin`), then compares a lossy run against them
+(`--compare ref.bin --requant 4`): KL divergence over the reference's top 32 tokens plus the remaining mass, top-1
+agreement and both perplexities. The two runs are separate processes, so a model that fills the RAM fits once.
+
 On a device (USB debugging enabled):
 
 ```bash
@@ -307,7 +312,9 @@ the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supp
 build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off); `memory_budget_mb` caps the
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
-OS counters do not show (`liyab-cli --memory-budget MB`); and `liyab_generation_stats`
+OS counters do not show (`liyab-cli --memory-budget MB`); `requant_bits` (4 or 5, default 0 = off; `liyab-cli
+--requant 4|5`) converts the resident Q8_0 matrices of a MoE model with streamed experts to Q4_K or Q5_K at load
+(lossy, see the 35B results below); and `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
 `expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), plus where decode
@@ -512,7 +519,12 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
   prefetches, misses, bytes read, unused reads, prediction precision (`expert_predicted_used` / `expert_predicted`),
   time spent waiting, and decode time by phase.
 * **Correctness.** Streamed experts (with evictions) and streamed blocks give bit-identical logits to in-place
-  reads (`test_engine`).
+  reads (`test_engine`). Each token's expert outputs are added in router order, whatever order the experts ran in,
+  so results do not depend on I/O timing: added in arrival order, the last-bit differences grew into whole int8
+  rounding steps downstream, and the 35B's perplexity on the same text varied by ~10% between runs.
+* **Fewer resident bytes (opt-in, lossy).** `requant_bits` converts the resident Q8_0 matrices (attention and
+  DeltaNet projections, shared experts; not the token embedding) to Q4_K or Q5_K at load, with llama.cpp's reference
+  quantizer, before the expert cache is sized, so the memory saved goes to the cache.
 
 Measured on the phone (Qwen3.8-27B UD-IQ2_S, 8.4 GB, 64 blocks of which 48 Gated DeltaNet; 8.2 GB free RAM; decode
 of a short Italian answer, greedy):
@@ -554,6 +566,20 @@ The last three rows come from alternating A/B runs (4 rounds each, the new build
 prediction step, medians for the thread step (6.30 → 7.83 tok/s in that session). The new prediction is chosen by
 the router 83% of the time (77% before) and reads 31 experts per token for nothing instead of 44; with 7 threads
 the routed experts take ~69 ms per token instead of ~87.
+
+Requantizing the resident Q8_0 matrices (`--requant`, opt-in) trades quality for speed. Speed is the median of 4
+alternating A/B rounds; quality is measured with `liyab-kl` on a 473-token mixed text (prose, code, Italian, a math
+answer) against the lossless path:
+
+| Resident Q8_0 matrices | Decode | Expert reads per token | KL (mean / median) | Top-1 agreement |
+| :--- | ---: | ---: | ---: | ---: |
+| kept (default) | 8.08 tok/s | 283 MiB | — | — |
+| → Q5_K (`--requant 5`) | 7.88 tok/s | 255 MiB | 0.055 / 0.014 | 91.1% |
+| → Q4_K (`--requant 4`) | 8.61 tok/s | 246 MiB | 0.082 / 0.023 | 89.6% |
+
+Q4_K saves ~10 ms per token on the projections and gives the expert cache ~0.6 GB more, but changes about one
+next-token choice in ten; Q5_K is not measurably faster. It stays off by default. The conversion runs on every core at
+load and barely shows (1.4 s to load the 35B and answer one token with it, 1.1–2.0 s without).
 
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident

@@ -82,6 +82,7 @@ typedef struct liyab_engine_config {
     int32_t triple_buffer_loading; /* nonzero: stream blocks through 3 rotating buffers */
     int64_t expert_cache_mb;      /* MoE: -1 auto (default), 0 never stream experts, > 0 cache size in MiB */
     int64_t memory_budget_mb;     /* > 0: cap on resident memory in MiB (e.g. per-app OS limits); 0: free RAM only */
+    int32_t requant_bits;         /* MoE expert streaming: resident Q8_0 matrices -> Q4_K (4) / Q5_K (5) at load (lossy); 0 off */
     /* Experimental (build with LIYAB_ENABLE_EXPERIMENTAL=ON, else LIYAB_ERR_UNSUPPORTED). */
     int32_t early_exit;           /* nonzero: confidence-based early exit (lossy) */
     float early_exit_threshold;   /* default 0.98 */

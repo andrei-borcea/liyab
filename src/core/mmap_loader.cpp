@@ -14,6 +14,7 @@
 
 #include "core/direct_io.h"
 #include "core/log.h"
+#include "core/quant.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -353,6 +354,7 @@ MmapLoader::~MmapLoader() {
     }
     prefetch_cv_.notify_all();
     if (prefetch_thread_.joinable()) prefetch_thread_.join();
+    for (const auto& [p, bytes] : converted_) munmap(p, bytes);
 }
 
 Status MmapLoader::parse(uint32_t shard) {
@@ -548,6 +550,58 @@ Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>
         moved += end - begin;
     }
     return moved;
+}
+
+Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&)>& select, DType target) {
+    if (target != DType::Q4_K && target != DType::Q5_K) {
+        return Status(ErrorCode::InvalidArgument, "requantize() converts to Q4_K or Q5_K only");
+    }
+    size_t saved = 0;
+    for (TensorView& t : tensors_) {
+        if (!select(t)) continue;
+        if (t.type != DType::Q8_0 || t.cols() % quant::kSuperBlock != 0) {
+            return Status(ErrorCode::InvalidArgument, "cannot requantize " + std::string(t.name));
+        }
+        TensorView out = t;
+        out.type = target;
+        const size_t row_in = t.row_bytes();
+        const size_t row_out = out.row_bytes();
+        const auto rows = static_cast<size_t>(t.rows());
+        const size_t bytes = row_out * rows;
+        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return Status(ErrorCode::OutOfMemory, "cannot allocate requantized weights");
+        converted_.emplace_back(p, bytes);
+        auto* dst = static_cast<uint8_t*>(p);
+        // Rows are independent; the reference quantizer is slow (a weighted
+        // search per 32 values), so every core takes a share.
+        const auto n_threads = static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> workers;
+        for (size_t w = 0; w < n_threads; ++w) {
+            workers.emplace_back([&, w] {
+                std::vector<float> row(static_cast<size_t>(t.cols()));
+                for (size_t r = rows * w / n_threads; r < rows * (w + 1) / n_threads; ++r) {
+                    quant::dequantize_row(DType::Q8_0, t.data + r * row_in, row.data(), t.cols());
+                    quant::quantize_row(target, row.data(), dst + r * row_out, t.cols());
+                }
+            });
+        }
+        for (std::thread& w : workers) w.join();
+        if (t.data >= files_[t.shard]->data() && t.data < files_[t.shard]->data() + files_[t.shard]->size()) {
+            files_[t.shard]->advise_dontneed(t.file_offset, t.nbytes);
+        }
+        saved += t.nbytes - bytes;
+        t.type = target;
+        t.data = dst;
+        t.nbytes = bytes;
+    }
+    return saved;
+}
+
+bool MmapLoader::converted(const TensorView& t) const noexcept {
+    return std::any_of(converted_.begin(), converted_.end(), [&](const auto& region) {
+        const auto* begin = static_cast<const uint8_t*>(region.first);
+        return t.data >= begin && t.data < begin + region.second;
+    });
 }
 
 size_t MmapLoader::keep_resident(const std::function<bool(const TensorView&)>& resident) {

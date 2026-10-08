@@ -70,6 +70,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.max_batch = max_batch;
     options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
+    options.requant_bits = config.requant_bits;
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -355,7 +356,8 @@ struct Engine::Impl {
         // range each (gaps under 1 MiB are read along).
         std::vector<const TensorView*> resident;
         for (const TensorView& t : target->file().tensors()) {
-            if (t.shard == 0 && !is_expert(t)) resident.push_back(&t);
+            // requantize()d tensors already live in memory of their own.
+            if (t.shard == 0 && !is_expert(t) && !target->file().converted(t)) resident.push_back(&t);
         }
         std::sort(resident.begin(), resident.end(),
                   [](const TensorView* a, const TensorView* b) { return a->file_offset < b->file_offset; });

@@ -61,6 +61,12 @@ struct EngineConfig {
     // decisions use min(free RAM, budget). Set it on platforms with per-app
     // caps the OS counters do not show (HyperOS stops apps above 6 GiB PSS).
     int64_t memory_budget_mb = 0;
+    // With expert streaming (MoE): convert the resident Q8_0 matrices
+    // (attention / DeltaNet projections, shared experts) to Q4_K (4) or Q5_K
+    // (5) at load. Lossy, opt-in: fewer bytes read per token, and the memory
+    // saved goes to the expert cache. Converted on every core at load;
+    // ignored when experts are not streamed. 0: off.
+    int32_t requant_bits = 0;
     int32_t draft_tokens = 4;         // k for speculative decoding
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM

@@ -745,6 +745,76 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
     CHECK(st.hits + st.late > 0);                     // predictions were used
 }
 
+TEST_CASE("Expert streaming with requant_bits converts the resident Q8_0 matrices and stays close") {
+    test::TinyModelSpec spec;  // Q8_0 attention and output, 256 columns: eligible for Q4_K / Q5_K
+    spec.arch = "qwen3moe";
+    spec.n_layers = 2;
+    spec.n_embd = 256;
+    spec.n_expert = 8;
+    spec.n_expert_used = 2;
+    spec.identical_experts = false;
+    const std::string& path = model_path("moe_requant", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 24; ++i) tokens.push_back(3 + (i * 37) % 250);
+    // Logits of the whole prompt, or empty if loading or the forward pass failed.
+    auto run = [&](int32_t bits, DType expected_type) -> std::vector<float> {
+        TransformerOptions options;
+        options.expert_cache_bytes = 1;
+        options.requant_bits = bits;
+        auto model = load_transformer(path, options);
+        if (model == nullptr || model->expert_store() == nullptr) return {};
+        CHECK(model->file().tensor("blk.0.attn_q.weight")->type == expected_type);
+        CHECK(model->file().tensor("blk.1.attn_output.weight")->type == expected_type);
+        CHECK(model->file().tensor("blk.0.ffn_gate_exps.weight")->type == spec.ffn_type);  // experts untouched
+        {  // one converted matrix against its Q8_0 original, within the format's error
+            auto original = MmapLoader::open(path);
+            if (!original) return {};
+            const TensorView& w0 = *original.value()->tensor("blk.0.attn_q.weight");
+            const TensorView& w1 = *model->file().tensor("blk.0.attn_q.weight");
+            std::vector<float> x(static_cast<size_t>(w0.cols())), y0(static_cast<size_t>(w0.rows())), y1(y0.size());
+            for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(0.37f * static_cast<float>(i));
+            CHECK(cpu->matmul(w0, x.data(), y0.data(), 1).is_ok());
+            CHECK(cpu->matmul(w1, x.data(), y1.data(), 1).is_ok());
+            double err = 0, power = 0;
+            for (size_t i = 0; i < y0.size(); ++i) {
+                err += (static_cast<double>(y1[i]) - y0[i]) * (static_cast<double>(y1[i]) - y0[i]);
+                power += static_cast<double>(y0[i]) * y0[i];
+            }
+            const double bound = bits == 0 ? 0.0 : bits == 4 ? 0.1 : 0.06;  // measured: 0.071 and 0.041
+            CHECK(std::sqrt(err / power) <= bound);
+        }
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        if (!logits) return {};
+        return std::vector<float>(logits->begin(), logits->end());
+    };
+    const std::vector<float> exact = run(0, DType::Q8_0);
+    REQUIRE(!exact.empty());
+    auto relative_rms = [&](const std::vector<float>& v) {
+        if (v.size() != exact.size()) return 1e9;
+        double err = 0, power = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            err += (static_cast<double>(v[i]) - exact[i]) * (static_cast<double>(v[i]) - exact[i]);
+            power += static_cast<double>(exact[i]) * exact[i];
+        }
+        return std::sqrt(err / power);
+    };
+    const double e4 = relative_rms(run(4, DType::Q4_K));
+    const double e5 = relative_rms(run(5, DType::Q5_K));
+    // A random two-block model amplifies the weight error (measured 0.43 and
+    // 0.26); the real model's quality is measured on its own outputs.
+    std::printf("  logits relative RMS error: Q4_K %.4f, Q5_K %.4f\n", e4, e5);
+    CHECK(e4 > 0.0);
+    CHECK(e4 < 1.0);
+    CHECK(e5 < e4);
+    TransformerOptions invalid;
+    invalid.expert_cache_bytes = 1;
+    invalid.requant_bits = 3;
+    CHECK(load_transformer(path, invalid) == nullptr);
+}
+
 TEST_CASE("Transformer with mixed Q4_0/Q8_0 weights and Q8_0 KV stays close to the reference") {
     auto model = load_transformer(mixed_model());
     REQUIRE(model != nullptr);

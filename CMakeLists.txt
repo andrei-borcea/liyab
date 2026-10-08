@@ -262,4 +262,8 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-bench tools/liyab_bench.cpp)
   target_link_libraries(liyab-bench PRIVATE liyab_core)
   target_include_directories(liyab-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Quality cost of lossy options: KL / top-1 / perplexity against a saved reference.
+  add_executable(liyab-kl tools/liyab_kl.cpp)
+  target_link_libraries(liyab-kl PRIVATE liyab_core)
+  target_include_directories(liyab-kl PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
