@@ -456,7 +456,17 @@ void Transformer::reset() noexcept {
         std::fill(st.conv.begin(), st.conv.end(), 0.0f);
         std::fill(st.ssm.begin(), st.ssm.end(), 0.0f);
     }
+    std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
     n_past_ = 0;
+}
+
+void Transformer::set_rollback_window(int32_t positions) {
+    rollback_window_ = states_.empty() ? 0 : std::max(0, positions);
+    checkpoint_pos_.assign(static_cast<size_t>(rollback_window_), -1);
+    for (RecurrentState& st : states_) {
+        st.checkpoints.assign(static_cast<size_t>(rollback_window_) * (st.conv.size() + st.ssm.size()), 0.0f);
+        st.checkpoints.shrink_to_fit();
+    }
 }
 void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
     const int32_t half = config_.rope_dim / 2;
@@ -728,6 +738,13 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                 for (size_t j = 0; j < hd; ++j) o[j] *= silu(z[j]);
             }
         });
+        if (rollback_window_ > 0) {  // the state after this token, for truncate()
+            const size_t per_state = st.conv.size() + st.ssm.size();
+            float* slot = st.checkpoints.data() +
+                          static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
+            std::copy(st.conv.begin(), st.conv.end(), slot);
+            std::copy(st.ssm.begin(), st.ssm.end(), slot + st.conv.size());
+        }
     }
     return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
@@ -1108,6 +1125,11 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         if (id < 0 || id >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "token id out of range");
     }
     LIYAB_RETURN_IF_ERROR(kv_->reserve(n_past_ + n));  // maps KV pages; ContextFull past the limit
+    // The DeltaNet mixers overwrite these rollback slots; they become valid
+    // only once every block has run (a failed pass leaves no half-written checkpoint).
+    for (int32_t i = 0; i < std::min(n, rollback_window_); ++i) {
+        checkpoint_pos_[static_cast<size_t>((n_past_ + n - 1 - i) % rollback_window_)] = -1;
+    }
     // Early exit would leave the skipped blocks' recurrent states behind: attention-only stacks.
     EarlyExitHook* early_exit =
         hooks != nullptr && n == 1 && logits == Logits::Last && !c.hybrid() ? hooks->early_exit : nullptr;
@@ -1188,6 +1210,10 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         }
     }
 
+    for (int32_t i = 0; i < std::min(n, rollback_window_); ++i) {
+        const int32_t pos = n_past_ + n - 1 - i;
+        checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
+    }
     n_past_ += n;
     kv_->release_unreachable(n_past_, max_batch_);  // recycle pages that left the window
     if (expert_store_ != nullptr && ++decode_steps_ % 16 == 0) expert_store_->age();
@@ -1224,7 +1250,23 @@ Status Transformer::truncate(int32_t n) {
         return Status::ok();
     }
     if (config_.hybrid()) {
-        return Status(ErrorCode::Unsupported, "recurrent (DeltaNet) states cannot be rolled back to an earlier position");
+        const int32_t slot = rollback_window_ > 0 ? (n - 1) % rollback_window_ : -1;
+        if (slot < 0 || checkpoint_pos_[static_cast<size_t>(slot)] != n - 1) {
+            return Status(ErrorCode::Unsupported,
+                          "recurrent (DeltaNet) states can only be rolled back inside the rollback window");
+        }
+        LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
+        for (RecurrentState& st : states_) {
+            const float* saved = st.checkpoints.data() + static_cast<size_t>(slot) * (st.conv.size() + st.ssm.size());
+            std::copy_n(saved, st.conv.size(), st.conv.begin());
+            std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+        }
+        // Checkpoints of the discarded positions describe a future that no longer exists.
+        for (int32_t& p : checkpoint_pos_) {
+            if (p >= n) p = -1;
+        }
+        n_past_ = n;
+        return Status::ok();
     }
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
     n_past_ = n;

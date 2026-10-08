@@ -912,6 +912,56 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
     CHECK(!batched->truncate(11).is_ok());
 }
 
+TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactly") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;  // DeltaNet, attention, DeltaNet, attention
+    const std::string& path = model_path("hybrid", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99};
+
+    auto model = load_transformer(path);
+    auto reference = load_transformer(path);
+    REQUIRE(model && reference);
+    REQUIRE(model->config().hybrid());
+    CHECK(model->recurrent_state_bytes() > 0);
+    const auto vocab = static_cast<size_t>(model->config().n_vocab);
+    auto all = reference->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(all.has_value());
+    const std::vector<float> expected(all->begin(), all->end());
+    auto rows = [&](size_t from) { return std::vector<float>(expected.begin() + from * vocab, expected.end()); };
+
+    // Without a window only the trivial rollbacks work.
+    REQUIRE(model->forward(tokens, Transformer::Logits::None, route, pool).has_value());
+    CHECK(model->truncate(6).code() == ErrorCode::Unsupported);
+    CHECK(model->truncate(10).is_ok());
+
+    // One batched pass (speculative verification), then back to any of its last 5 positions.
+    model->reset();
+    model->set_rollback_window(5);
+    REQUIRE(model->forward(tokens, Transformer::Logits::None, route, pool).has_value());
+    CHECK(model->truncate(4).code() == ErrorCode::Unsupported);  // position 3 left the window
+    REQUIRE(model->truncate(6).is_ok());
+    auto replay = model->forward(std::span<const int32_t>(tokens).subspan(6), Transformer::Logits::All, route, pool);
+    REQUIRE(replay.has_value());
+    CHECK(max_abs_diff(*replay, rows(6)) < 1e-4);
+
+    // Token by token (a draft model), rolled back twice in a row.
+    model->reset();
+    for (size_t t = 0; t < 8; ++t) {
+        REQUIRE(model->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::None, route, pool));
+    }
+    REQUIRE(model->truncate(7).is_ok());
+    REQUIRE(model->truncate(5).is_ok());
+    CHECK(model->truncate(6).code() == ErrorCode::InvalidArgument);  // beyond n_past
+    auto again = model->forward(std::span<const int32_t>(tokens).subspan(5), Transformer::Logits::All, route, pool);
+    REQUIRE(again.has_value());
+    CHECK(max_abs_diff(*again, rows(5)) < 1e-4);
+}
+
 TEST_CASE("Context limit is enforced") {
     TransformerOptions options;
     options.context_length = 8;
@@ -1099,6 +1149,35 @@ TEST_CASE("Speculative decoding with greedy sampling reproduces plain greedy out
         CHECK(run(*diff_engine.value(), prompt, greedy(24), &stats) == expected);
         CHECK(stats.draft_tokens_accepted < stats.draft_tokens_proposed);
     }
+}
+
+TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft models") {
+    const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
+    test::TinyModelSpec target_spec;
+    target_spec.arch = "qwen35";
+    target_spec.n_layers = 4;
+    target_spec.delta_net_interval = 2;
+    EngineConfig plain = engine_config(model_path("hybrid", target_spec));
+    plain.backend = BackendKind::Cpu;
+    auto base_engine = Engine::create(plain);
+    REQUIRE(base_engine.has_value());
+    const auto expected = run(*base_engine.value(), prompt, greedy(24));
+    REQUIRE(!expected.empty());
+
+    // A smaller hybrid draft rejects tokens, so both models roll back their recurrent states.
+    test::TinyModelSpec draft_spec = target_spec;
+    draft_spec.n_layers = 2;
+    draft_spec.seed = 99;
+    EngineConfig spec = plain;
+    spec.draft_model_path = model_path("hybrid_draft", draft_spec);
+    spec.draft_tokens = 3;
+    auto engine = Engine::create(spec);
+    if (!engine) std::printf("  %s\n", engine.status().to_string().c_str());
+    REQUIRE(engine.has_value());
+    GenerationStats stats;
+    CHECK(run(*engine.value(), prompt, greedy(24), &stats) == expected);
+    CHECK(stats.draft_tokens_proposed > 0);
+    CHECK(stats.draft_tokens_accepted < stats.draft_tokens_proposed);
 }
 
 TEST_CASE("Speculative sampling at temperature > 0 is reproducible for a fixed seed") {

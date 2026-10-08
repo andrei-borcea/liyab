@@ -114,8 +114,12 @@ This README describes what the code does today. Anything not implemented is list
   status, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the token rate.
 * **Speculative decoding.** A small draft model proposes *k* tokens, and the target verifies them in one batched
   pass, reading its weights once for *k*+1 tokens. Acceptance follows Leviathan et al. (2023), so output matches the
-  target's distribution. With greedy sampling it is token-for-token identical to plain decoding (tested). Not
-  available for hybrid (DeltaNet) models yet: rejected tokens would need recurrent-state checkpoints.
+  target's distribution. With greedy sampling it is token-for-token identical to plain decoding (tested). Hybrid
+  (DeltaNet) models take part too: with a draft model both keep a copy of their recurrent states after each of the
+  last *k*+1 tokens (`Transformer::set_rollback_window`), so rejected tokens roll back exactly (tested). That costs
+  (*k*+1) × the recurrent state in memory (62.8 MiB per position for Qwen3.6-35B-A3B) and one state copy per token
+  and DeltaNet block. On a MoE whose experts stream from flash the gain is small: a pass over *n* tokens reads
+  the union of their experts (35B on the phone: 1.55× the cost of one token for 2, 2.5× for 3).
 
 ---
 
@@ -135,8 +139,8 @@ This README describes what the code does today. Anything not implemented is list
   batch are grouped per expert so each expert is read once. An architecture adds a one-line traits row (RoPE
   style, MoE weight renormalization default).
   DeltaNet blocks keep a recurrent state (conv history + one 128×128 matrix per value head, 19 MiB for Qwen3.5-2B):
-  such models cannot roll back, so speculative decoding, early exit, head pruning and the KV prefix cache are
-  disabled for them with a clear message.
+  such models roll back only inside a rollback window of recurrent-state checkpoints (used by speculative decoding),
+  so early exit, head pruning and the KV prefix cache are disabled for them with a clear message.
 * **Tensor types:** every format llama.cpp writes, mixed freely per tensor. That covers F32, F16, BF16, the legacy
   Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-quants Q2_K…Q6_K (and their Q*_K_S/M/L mixes), the I-quants IQ1_S, IQ1_M,
   IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL, IQ4_XS, the ternary TQ1_0/TQ2_0 and the FP4 formats MXFP4/NVFP4. Q1_0 is
@@ -832,10 +836,9 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
   streamed from flash (~4.4 GB/s with parallel direct reads; Qwen3.8-27B UD-IQ2_S reaches 0.94 tok/s). Speculative
   decoding, MoE models, and smaller dense models are the practical routes to interactive speeds.
-* **Speculative decoding for hybrid models.** Qwen3.5/3.8 ship a multi-token-prediction head and DeepSeek V4 a
-  dedicated draft model; neither is used yet, and DeltaNet blocks would need recurrent-state checkpoints to roll
-  back rejected tokens. For weight streaming this is the largest remaining multiplier (each streamed byte would
-  serve several tokens).
+* **Drafters for hybrid models.** Hybrid models now roll back rejected tokens, but Qwen3.5/3.8's
+  multi-token-prediction head and DeepSeek V4's dedicated draft model are not used yet; a draft has to be a separate
+  GGUF with the same vocabulary.
 * **CPU prefill** reuses the matvec kernel; a tiled GEMM is the next CPU step. MoE prefill reads the union of the
   batch's experts, so it runs at about decode speed.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next

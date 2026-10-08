@@ -432,10 +432,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
-        if (impl->target->config().hybrid() || draft.value()->config().hybrid()) {
-            return Status(ErrorCode::Unsupported,
-                          "speculative decoding rolls back rejected tokens, which recurrent (DeltaNet) models cannot do");
-        }
+        // Rejected drafts are rolled back; recurrent (DeltaNet) states need a
+        // checkpoint per position of a verification batch (k + 1).
+        impl->target->set_rollback_window(config.draft_tokens + 1);
+        draft.value()->set_rollback_window(config.draft_tokens + 1);
         impl->draft = std::move(draft).value();
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
     }

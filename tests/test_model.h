@@ -62,6 +62,10 @@ struct TinyModelSpec {
     int32_t n_expert_used = 0;
     // false: every expert gets its own random weights (no dense twin).
     bool identical_experts = true;
+    // > 0 (arch "qwen35"): a hybrid stack in which every delta_net_interval-th
+    // block is attention and the others are Gated DeltaNet (2 key heads, 4
+    // value heads of 16, convolution kernel 4).
+    int32_t delta_net_interval = 0;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

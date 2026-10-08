@@ -1,6 +1,7 @@
 #include "test_model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -205,6 +206,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
         w.add_bool(a + ".expert_weights_norm", true);
     }
+    const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
+    if (s.delta_net_interval > 0) {
+        w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(ssm_kernel));
+        w.add_u32(a + ".ssm.state_size", static_cast<uint32_t>(ssm_hd));
+        w.add_u32(a + ".ssm.group_count", static_cast<uint32_t>(ssm_hk));
+        w.add_u32(a + ".ssm.time_step_rank", static_cast<uint32_t>(ssm_hv));
+        w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(ssm_hv * ssm_hd));
+    }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
     w.add_f32(a + ".rope.freq_base", 10000.0f);
     w.add_string("tokenizer.ggml.model", "llama");
@@ -239,10 +248,27 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
         w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
-        w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
-        w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
-        w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
-        w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+        if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
+            const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
+            const int64_t conv_dim = 2 * key_dim + value_dim;
+            w.add_tensor(p + "attn_qkv.weight", {d, conv_dim}, s.attn_type, random(d * conv_dim, s.weight_scale));
+            w.add_tensor(p + "attn_gate.weight", {d, value_dim}, s.attn_type, random(d * value_dim, s.weight_scale));
+            w.add_tensor(p + "ssm_alpha.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
+            w.add_tensor(p + "ssm_beta.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
+            w.add_tensor(p + "ssm_out.weight", {value_dim, d}, s.attn_type, random(value_dim * d, s.weight_scale));
+            w.add_tensor(p + "ssm_conv1d.weight", {ssm_kernel, conv_dim}, DType::F32,
+                         random(ssm_kernel * conv_dim, 0.3f));
+            std::vector<float> a_neg = random(ssm_hv, 0.5f);
+            for (float& x : a_neg) x = -std::exp(x);  // A = -exp(A_log)
+            w.add_tensor(p + "ssm_a", {ssm_hv}, DType::F32, a_neg);
+            w.add_tensor(p + "ssm_dt.bias", {ssm_hv}, DType::F32, random(ssm_hv, 0.5f));
+            w.add_tensor(p + "ssm_norm.weight", {ssm_hd}, DType::F32, norm_weights(ssm_hd));
+        } else {
+            w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+            w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+            w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+        }
         if (a == "qwen2") {
             w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
             w.add_tensor(p + "attn_k.bias", {kv}, DType::F32, random(kv, 0.1f));

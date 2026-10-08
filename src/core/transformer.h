@@ -177,10 +177,20 @@ public:
     };
     [[nodiscard]] const ExpertPredictions& expert_predictions() const noexcept { return predictions_; }
 
-    // Discards cached positions >= n (speculative-decoding rollback). Hybrid
-    // models only accept n == 0 or n == n_past(): a recurrent state cannot be
-    // rewound (Unsupported otherwise).
+    // Discards cached positions >= n (speculative-decoding rollback). KV
+    // caches simply drop positions. Recurrent (DeltaNet) states cannot be
+    // rewound, so hybrid models restore a checkpoint instead: they accept
+    // n == 0, n == n_past(), or any n whose position n - 1 is still inside the
+    // rollback window (Unsupported otherwise).
     Status truncate(int32_t n);
+    // Keeps a copy of every recurrent state after each of the last
+    // `positions` processed tokens, so truncate() can return to any of them
+    // (speculative verification needs draft count + 1). Costs positions x
+    // recurrent_state_bytes() of memory and one state copy per token and
+    // recurrent block; 0 (the default) turns it off. No effect on models
+    // without recurrent blocks. Discards existing checkpoints.
+    void set_rollback_window(int32_t positions);
+    [[nodiscard]] int32_t rollback_window() const noexcept { return rollback_window_; }
     // Declares positions [0, n) cached after their KV pages were attached
     // externally (KvCache::attach_external_pages). Requires an empty context.
     // Unsupported for hybrid models (KV pages do not carry recurrent states).
@@ -231,6 +241,9 @@ private:
     struct RecurrentState {
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
         std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
+        // Rollback ring: slot s holds [conv | ssm] after the token at the
+        // position checkpoint_pos_[s] (slot = position % rollback window).
+        std::vector<float> checkpoints;
     };
 
     // Weight views of one block, rebased into a triple-buffer slot when a
@@ -293,6 +306,8 @@ private:
     std::unique_ptr<ExpertStore> expert_store_;
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
+    int32_t rollback_window_ = 0;
+    std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;
