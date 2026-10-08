@@ -99,6 +99,9 @@ struct TransformerOptions {
     int64_t expert_cache_bytes = -1;
     // > 0: total memory the engine may keep resident (see usable_memory_bytes()).
     uint64_t memory_budget_bytes = 0;
+    // With expert streaming: convert the resident Q8_0 matrices to Q4_K (4)
+    // or Q5_K (5) at load, before the expert cache is sized (lossy; 0: off).
+    int32_t requant_bits = 0;
 };
 
 class Transformer {
@@ -243,7 +246,7 @@ private:
     // entering block l (83% vs 77% of the top-8 on Qwen3.6-35B-A3B), while the
     // reads still overlap block l's experts and block l + 1's mixer.
     void predict_experts(int32_t layer, int32_t n, const Route& route);
-    Status attach_expert_store(int64_t budget_option, uint64_t memory_budget);
+    Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
@@ -285,6 +288,7 @@ private:
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_;  // MoE scratch
+    std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
 };

@@ -245,7 +245,8 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     }
 
     if (c.n_expert > 0) {
-        LIYAB_RETURN_IF_ERROR(model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes));
+        LIYAB_RETURN_IF_ERROR(
+            model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.requant_bits));
     }
     model->file_->configure_layers(c.n_layers);
     LIYAB_LOG_INFO("%s: %d layers, d=%d, ff=%d, heads=%d/%d x %d, vocab=%d, ctx=%d%s, kv=%s, %.1f KiB/token",
@@ -732,8 +733,11 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
 // Expert streaming: the routed experts stay on storage and are read on
 // demand into a fixed RAM cache; every other tensor stays resident in the
 // mapping (paged in now, never swept by the streaming window).
-Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget) {
+Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits) {
     if (budget_option == 0) return Status::ok();
+    if (requant_bits != 0 && requant_bits != 4 && requant_bits != 5) {
+        return Status(ErrorCode::InvalidArgument, "requant_bits must be 0, 4 or 5");
+    }
     const ModelConfig& c = config_;
     auto is_expert = [](const TensorView& t) {
         const std::string_view n = t.name;
@@ -743,19 +747,39 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     for (const TensorView& t : file_->tensors()) {
         if (is_expert(t)) expert_bytes += t.nbytes;
     }
-    const size_t resident_bytes = file_->file_size() - expert_bytes;
     const uint64_t available = usable_memory_bytes(memory_budget);
+    // Automatic mode streams only when the model does not fit.
+    if (budget_option < 0 &&
+        (available == 0 || static_cast<double>(file_->file_size()) <= 0.8 * static_cast<double>(available))) {
+        return Status::ok();
+    }
+
+    // Optional lossy conversion of the resident Q8_0 matrices (the UD quants
+    // keep attention and DeltaNet projections in Q8_0, ~2/3 of the bytes read
+    // per token): fewer bytes per token, and the freed memory goes to the
+    // expert cache sized below. The token embedding is skipped: decode reads
+    // one row of it per token.
+    size_t saved = 0;
+    if (requant_bits > 0) {
+        auto requantized = file_->requantize(
+            [&](const TensorView& t) {
+                return !is_expert(t) && t.type == DType::Q8_0 && t.n_dims == 2 && t.rows() > 1 &&
+                       t.cols() % quant::kSuperBlock == 0 && t.name != "token_embd.weight";
+            },
+            requant_bits == 4 ? DType::Q4_K : DType::Q5_K);
+        if (!requantized) return requantized.status();
+        saved = requantized.value();
+        LIYAB_LOG_INFO("resident Q8_0 matrices requantized to %s: %.2f GiB saved", requant_bits == 4 ? "Q4_K" : "Q5_K",
+                       static_cast<double>(saved) / (1024.0 * 1024.0 * 1024.0));
+    }
+    const size_t resident_bytes = file_->file_size() - expert_bytes - saved;
     size_t budget = 0;
     if (budget_option > 0) {
         budget = static_cast<size_t>(budget_option);
     } else {
-        // Automatic: only when the model does not fit. Keep room for the KV
-        // cache, activations and the rest of the app: 1 GiB of free RAM, or
-        // 512 MiB inside an explicit budget (the embedder already left its own
-        // headroom below the platform's cap).
-        if (available == 0 || static_cast<double>(file_->file_size()) <= 0.8 * static_cast<double>(available)) {
-            return Status::ok();
-        }
+        // Keep room for the KV cache, activations and the rest of the app:
+        // 1 GiB of free RAM, or 512 MiB inside an explicit budget (the
+        // embedder already left its own headroom below the platform's cap).
         const size_t margin = memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30;
         budget = available > resident_bytes + margin ? static_cast<size_t>(available) - resident_bytes - margin : 0;
     }
@@ -767,9 +791,9 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     auto store = ExpertStore::create(*file_, std::move(experts), c.n_expert, budget, 4);
     if (!store) return store.status();
     expert_store_ = std::move(store).value();
-    const size_t resident = file_->keep_resident([&](const TensorView& t) { return !is_expert(t); });
+    file_->keep_resident([&](const TensorView& t) { return !is_expert(t) && !file_->converted(t); });
     LIYAB_LOG_INFO("expert streaming: %.2f GiB resident weights, %.2f GiB of experts on storage",
-                   static_cast<double>(resident) / (1024.0 * 1024.0 * 1024.0),
+                   static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0),
                    static_cast<double>(expert_bytes) / (1024.0 * 1024.0 * 1024.0));
     return Status::ok();
 }
@@ -851,8 +875,14 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     router_.resize(un * E);
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
 
-    // Routing: per expert, the (token, weight) pairs that selected it.
-    std::vector<std::vector<std::pair<int32_t, float>>> assigned(E);
+    // Routing: per expert, the tokens that selected it, with the gate weight
+    // and the expert's rank in that token's top-k.
+    struct Use {
+        int32_t token;
+        int32_t rank;
+        float weight;
+    };
+    std::vector<std::vector<Use>> assigned(E);
     std::vector<float> probs(E);
     std::vector<int32_t> order(E);
     for (size_t t = 0; t < un; ++t) {
@@ -876,7 +906,8 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         const float norm = c.moe_norm_weights ? 1.0f / std::max(sum, 6.103515625e-5f) : 1.0f;
         for (size_t k = 0; k < K; ++k) {
             const auto e = static_cast<size_t>(order[k]);
-            assigned[e].emplace_back(static_cast<int32_t>(t), probs[e] * norm * c.moe_weights_scale);
+            assigned[e].push_back(
+                {static_cast<int32_t>(t), static_cast<int32_t>(k), probs[e] * norm * c.moe_weights_scale});
         }
     }
 
@@ -906,6 +937,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
 
     PhaseTimer experts_timer(phases_.experts);
     moe_out_.assign(un * d, 0.0f);
+    ranked_out_.resize(un * K * d);
     // Experts run in waves: the next expert (waiting for it if needed) plus
     // every following one already in RAM, as one batched pass for gate/up and
     // one for down, so the CPU pays two thread fork/joins per wave instead of
@@ -959,7 +991,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             if (users.size() != un) {
                 float* gathered = ein_.data() + first_row[i] * d;
                 for (size_t u = 0; u < users.size(); ++u) {
-                    std::copy_n(xb_.data() + static_cast<size_t>(users[u].first) * d, d, gathered + u * d);
+                    std::copy_n(xb_.data() + static_cast<size_t>(users[u].token) * d, d, gathered + u * d);
                 }
                 in = gathered;
             }
@@ -982,11 +1014,23 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         for (size_t i = 0; i < first_row.size(); ++i) {
             const auto& users = assigned[static_cast<size_t>(wave[i])];
             for (size_t u = 0; u < users.size(); ++u) {
-                float* dst = moe_out_.data() + static_cast<size_t>(users[u].first) * d;
+                float* dst = ranked_out_.data() + (static_cast<size_t>(users[u].token) * K + users[u].rank) * d;
                 const float* src = eout_.data() + (first_row[i] + u) * d;
-                const float weight = users[u].second;
-                for (size_t j = 0; j < d; ++j) dst[j] += weight * src[j];
+                const float weight = users[u].weight;
+                for (size_t j = 0; j < d; ++j) dst[j] = weight * src[j];
             }
+        }
+    }
+    // Sum each token's experts in router order. Experts run in whatever order
+    // their weights arrive in RAM; adding their outputs in that order made
+    // results depend on I/O timing (float addition is not associative, and
+    // the int8-quantized activations downstream turn last-bit differences into
+    // whole rounding steps: run-to-run perplexity varied by ~10%).
+    for (size_t t = 0; t < un; ++t) {
+        float* dst = moe_out_.data() + t * d;
+        for (size_t k = 0; k < K; ++k) {
+            const float* src = ranked_out_.data() + (t * K + k) * d;
+            for (size_t j = 0; j < d; ++j) dst[j] += src[j];
         }
     }
 
