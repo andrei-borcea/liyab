@@ -604,6 +604,10 @@ instead of 5500 the expert cache grows by 1.5 GB, expert reads drop from 284 to 
 from 8.29 to 9.50 tok/s (medians of 3 rounds); 8500 reads 165 MiB but is not faster (9.20), the phone's free RAM
 runs short. Whether HyperOS lets a foreground app keep 7 GB is still to be checked in the app.
 
+Stacked (same session, the two undisturbed rounds): default 7.9–8.1 tok/s; `--memory-budget 7000` 9.3–9.4;
+plus `--expert-mass 0.9` 9.1–10.0; plus `--expert-mass 0.8 --requant 4` instead 9.2–10.9 (~92 ms per token: routed
+experts ~40 of which ~28 waiting for flash, DeltaNet ~26, LM head ~10, routers ~7, attention ~5).
+
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident
 weights (the UD quant keeps attention and DeltaNet projections in Q8_0, the LM head in Q6_K) plus ~0.6 GB of
