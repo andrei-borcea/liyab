@@ -1,9 +1,14 @@
 #include "core/direct_io.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <thread>
@@ -13,15 +18,64 @@
 
 namespace liyab {
 
+namespace {
+
+#if defined(__linux__)
+constexpr long kFuseSuperMagic = 0x65735546;
+
+// Direct reads that "succeed" without delivering the file's bytes have been
+// seen through FUSE (Android's /storage/emulated): compare a direct and a
+// buffered read of the first and the middle block before trusting O_DIRECT.
+bool direct_reads_match(int direct_fd, const std::string& path) {
+    const int plain = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (plain < 0) return false;
+    struct stat st {};
+    bool ok = fstat(plain, &st) == 0;
+    const off_t size = ok ? st.st_size : 0;
+    constexpr size_t kBlock = DirectFile::kAlign;
+    void* a = nullptr;
+    void* b = nullptr;
+    ok = ok && posix_memalign(&a, kBlock, kBlock) == 0 && posix_memalign(&b, kBlock, kBlock) == 0;
+    const off_t offsets[] = {0, size / 2 / static_cast<off_t>(kBlock) * static_cast<off_t>(kBlock)};
+    for (const off_t off : offsets) {
+        if (!ok || off + static_cast<off_t>(kBlock) > size) break;
+        std::memset(a, 0x5A, kBlock);
+        const ssize_t rd = pread(direct_fd, a, kBlock, off);
+        const ssize_t rb = pread(plain, b, kBlock, off);
+        ok = rd == static_cast<ssize_t>(kBlock) && rb == rd && std::memcmp(a, b, kBlock) == 0;
+    }
+    std::free(a);
+    std::free(b);
+    ::close(plain);
+    return ok;
+}
+#endif
+
+}  // namespace
+
 Result<std::unique_ptr<DirectFile>> DirectFile::open(const std::string& path) {
     std::unique_ptr<DirectFile> f(new DirectFile());
     f->path_ = path;
 #if defined(__linux__)
     f->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     f->direct_ = f->fd_ >= 0;
-    if (f->fd_ < 0) {
-        LIYAB_LOG_WARN("O_DIRECT refused for %s (%s): streamed weights go through the page cache", path.c_str(),
-                       std::strerror(errno));
+    std::string reason = f->fd_ < 0 ? std::string("refused: ") + std::strerror(errno) : std::string();
+    if (f->direct_) {
+        struct statfs fs {};
+        if (fstatfs(f->fd_, &fs) == 0 && static_cast<long>(fs.f_type) == kFuseSuperMagic) {
+            reason = "FUSE filesystem";
+        } else if (!direct_reads_match(f->fd_, path)) {
+            reason = "direct reads disagree with buffered reads";
+        }
+        if (!reason.empty()) {
+            ::close(f->fd_);
+            f->fd_ = -1;
+            f->direct_ = false;
+        }
+    }
+    if (!f->direct_) {
+        LIYAB_LOG_WARN("O_DIRECT not used for %s (%s): streamed weights go through the page cache", path.c_str(),
+                       reason.c_str());
         f->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     }
 #else

@@ -15,7 +15,8 @@ public final class LiyabApp extends Application {
         LiyabNative.enableLogs(1);  // info and above into the debug log
         EngineHolder.init(this);
         DebugLog.startPump();
-        DebugLog.add("Liyab Chat started; models folder: " + EngineHolder.modelsDir());
+        DebugLog.add("Liyab Chat started; models: " + EngineHolder.modelsDir() + " (adb push: " + EngineHolder.sharedDir()
+                + ", slower)");
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {
             @Override public void onActivityResumed(Activity a) { PerfOverlay.attach(a); }
             @Override public void onActivityPaused(Activity a) { PerfOverlay.detach(a); }

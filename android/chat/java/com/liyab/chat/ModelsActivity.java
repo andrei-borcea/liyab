@@ -220,8 +220,15 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
     private void renderLocal() {
         File dir = EngineHolder.modelsDir();
         // Split models are listed once, through part 1; a part without its part 1 stays visible so it can be deleted.
-        File[] local = dir.listFiles((d, name) -> name.endsWith(".gguf")
-                && (!HuggingFace.isLaterPart(name) || !new File(d, HuggingFace.firstPart(name)).exists()));
+        java.io.FilenameFilter models = (d, name) -> name.endsWith(".gguf")
+                && (!HuggingFace.isLaterPart(name) || !new File(d, HuggingFace.firstPart(name)).exists());
+        File[] own = dir.listFiles(models);
+        File shared = EngineHolder.sharedDir();
+        File[] pushed = shared != null ? shared.listFiles(models) : null;  // adb-pushed / older downloads
+        List<File> all = new ArrayList<>();
+        if (own != null) all.addAll(java.util.Arrays.asList(own));
+        if (pushed != null) all.addAll(java.util.Arrays.asList(pushed));
+        File[] local = all.toArray(new File[0]);
         List<HuggingFace.Partial> partials = HuggingFace.partials(dir);
         long used = 0;
         if (local != null) for (File f : local) used += EngineHolder.sizeOf(f);
@@ -269,6 +276,11 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
                 + (loaded ? " · ● loaded on "
                 + (EngineHolder.useGpu() ? "GPU" : "CPU") : ""), 12, loaded ? Ui.GOOD : Ui.MUTED);
         card.addView(meta);
+        final boolean shared = EngineHolder.inSharedDir(f);
+        if (shared) {
+            card.addView(Ui.text(this, "In the shared folder: Android routes it through FUSE, so models larger than RAM "
+                    + "stream several times slower. Move it to app storage (fast direct reads).", 12, Ui.BAD));
+        }
         Button load = Ui.primary(this, loaded ? "Loaded" : "Load", v -> {
             EngineHolder.load(f, null);
             render();
@@ -288,6 +300,19 @@ public final class ModelsActivity extends Activity implements EngineHolder.Liste
         }));
         delete.setEnabled(!loaded);  // the loaded model is memory-mapped
         delete.setAlpha(delete.isEnabled() ? 1f : 0.4f);
+        if (shared) {
+            boolean busy = EngineHolder.moving != null;
+            Button move = Ui.pill(this, busy && f.getName().equals(EngineHolder.moving) ? "Moving…" : "Move to app storage",
+                    v -> {
+                        EngineHolder.moveToAppStorage(f);
+                        render();
+                    });
+            move.setEnabled(!loaded && !busy);
+            move.setAlpha(move.isEnabled() ? 1f : 0.4f);
+            card.addView(Ui.buttonRow(this, load, chat, delete));
+            card.addView(Ui.buttonRow(this, move));
+            return card;
+        }
         card.addView(Ui.buttonRow(this, load, chat, delete));
         return card;
     }

@@ -70,6 +70,7 @@ public final class HomeActivity extends Activity
             Downloads.startByName(this, parts[0], parts[1]);
         } else if (load != null) {
             java.io.File f = new java.io.File(EngineHolder.modelsDir(), load);
+            if (!f.canRead() && EngineHolder.sharedDir() != null) f = new java.io.File(EngineHolder.sharedDir(), load);
             if (f.canRead()) EngineHolder.load(f, null);
             else DebugLog.add("ERROR: cannot read " + f);
         } else {

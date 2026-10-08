@@ -3,7 +3,10 @@
 // Streamed weights are read once per use, so going through the page cache
 // only costs memory and evicts weights that are meant to stay resident.
 // DirectFile opens with O_DIRECT (Linux / Android) or F_NOCACHE (Apple) and
-// falls back to buffered reads where direct I/O is refused (e.g. FUSE).
+// falls back to buffered reads where direct I/O is refused or untrustworthy:
+// on FUSE (Android's /storage/emulated, where direct reads were seen to
+// return success without the file's bytes) and whenever a direct read of the
+// first and middle block differs from a buffered one.
 //
 // Measured on a Snapdragon 8 Elite phone (UFS 4, f2fs): one reader peaks at
 // ~2.6 GB/s with 1 MiB requests and ~3.6 GB/s with 4 MiB; two to four

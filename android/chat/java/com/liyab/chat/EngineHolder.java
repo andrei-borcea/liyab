@@ -70,16 +70,85 @@ final class EngineHolder {
         listeners.remove(l);
     }
 
-    private static void changed() {
+    static void changed() {
         main.post(() -> {
             for (Listener l : listeners) l.onEngineChanged();
         });
     }
 
+    /**
+     * Where downloads go: app-private internal storage. It is plain f2fs, so the engine's direct
+     * (O_DIRECT) reads work and streaming runs at full speed.
+     */
     static File modelsDir() {
-        File dir = app.getExternalFilesDir(null);
-        return dir != null ? dir : app.getFilesDir();
+        File dir = new File(app.getFilesDir(), "models");
+        if (!dir.isDirectory()) dir.mkdirs();
+        return dir;
     }
+
+    /**
+     * The shared app folder (/sdcard/Android/data/<package>/files), where adb can push models. Android
+     * serves it through FUSE: direct reads are unavailable there, so streaming models larger than RAM
+     * is several times slower. Null when external storage is unavailable.
+     */
+    static File sharedDir() {
+        return app.getExternalFilesDir(null);
+    }
+
+    /** True for files in the shared (FUSE) folder. */
+    static boolean inSharedDir(File f) {
+        File shared = sharedDir();
+        return shared != null && f.getAbsolutePath().startsWith(shared.getAbsolutePath() + "/");
+    }
+
+    static volatile String moving;  // name of the model being moved, or null
+
+    /** Moves a model (all parts) from the shared folder into modelsDir() in the background. */
+    static void moveToAppStorage(File first) {
+        if (moving != null) return;
+        moving = first.getName();
+        changed();
+        new Thread(() -> {
+            long t0 = System.nanoTime();
+            long bytes = 0;
+            String error = null;
+            try {
+                for (File part : HuggingFace.localParts(first)) {
+                    File dst = new File(modelsDir(), part.getName());
+                    File tmp = new File(modelsDir(), part.getName() + ".moving");
+                    if (modelsDir().getUsableSpace() < part.length()) throw new java.io.IOException("not enough free space");
+                    try (java.nio.channels.FileChannel in = new java.io.FileInputStream(part).getChannel();
+                         java.nio.channels.FileChannel out = new java.io.FileOutputStream(tmp).getChannel()) {
+                        long done = 0, size = in.size(), next = 1L << 30;
+                        while (done < size) {
+                            done += in.transferTo(done, size - done, out);
+                            if (done >= next) {
+                                DebugLog.add(String.format(Locale.US, "Moving %s: %.1f / %.1f GB", part.getName(),
+                                        done / 1e9, size / 1e9));
+                                next += 1L << 30;
+                            }
+                        }
+                        bytes += size;
+                    }
+                    if (!tmp.renameTo(dst)) throw new java.io.IOException("cannot rename " + tmp);
+                    if (!part.delete()) DebugLog.add("Could not delete the shared copy of " + part.getName());
+                }
+                String last = prefs().getString("model", "");
+                if (last.equals(first.getAbsolutePath())) {
+                    prefs().edit().putString("model", new File(modelsDir(), first.getName()).getAbsolutePath()).apply();
+                }
+            } catch (java.io.IOException e) {
+                error = e.getMessage();
+            }
+            double s = (System.nanoTime() - t0) / 1e9;
+            DebugLog.add(error == null
+                    ? String.format(Locale.US, "Moved %s to app storage: %.1f GB in %.0f s", first.getName(), bytes / 1e9, s)
+                    : "Move failed: " + error);
+            moving = null;
+            changed();
+        }, "liyab-move").start();
+    }
+
 
     static boolean isLoaded(File f) {
         return handle != 0 && modelFile != null && modelFile.getAbsolutePath().equals(f.getAbsolutePath());

@@ -436,8 +436,12 @@ adb shell am start -n com.liyab.chat/.HomeActivity --es download "'ggml-org/tiny
 adb shell am start -n com.liyab.chat/.HomeActivity --es load qwen2.5-0.5b-q4_k_m.gguf --es open chat
 ```
 
-Models pushed with `adb` go to `/sdcard/Android/data/com.liyab.chat/files/`. Launch the app once first so the
-folder belongs to the app, and make pushed files readable (`chmod 666`).
+Downloads go to app-private internal storage (`files/models`), which is plain f2fs: the engine's direct reads
+work there and streaming runs at full speed. Models pushed with `adb` go to the shared app folder
+`/sdcard/Android/data/com.liyab.chat/files/` (launch the app once first so the folder belongs to the app, and make
+pushed files readable with `chmod 666`). Android serves that folder through FUSE, where direct reads are unusable
+(the engine detects it and falls back to buffered reads, several times slower for models larger than RAM), so the
+Models page marks those files and offers **Move to app storage**.
 
 ### Command line
 
@@ -462,7 +466,11 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
 * **Storage.** UFS reads are fast only when large and concurrent: on the Snapdragon 8 Elite phone below, direct
   reads reach ~4.4 GB/s with 2–4 requests ≥ 256 KiB in flight, random or sequential alike, but stay under
   1.2 GB/s at 16 KiB. `DirectFile` reads with `O_DIRECT` (no page-cache copy, no eviction of resident weights) and
-  splits large reads into concurrent 4 MiB requests.
+  splits large reads into concurrent 4 MiB requests. On FUSE (Android's `/storage/emulated`), direct reads were
+  seen to return success without the file's bytes, so `DirectFile` never uses `O_DIRECT` there, and it also
+  self-tests direct against buffered reads of two blocks before trusting any file. Keep large models on a
+  native filesystem (app-private storage, or `/data/local/tmp` for the CLI): through FUSE, Qwen3.6-35B-A3B decodes
+  at 1.5 tok/s instead of 3–4.
 * **Dense models.** As many blocks as fit stay resident; the others are streamed through the 3-slot pipeline. The
   streamed blocks are spread evenly through the stack, so storage keeps reading while resident blocks compute.
   With a Vulkan GPU the slots and the resident blocks live in GPU-shared memory: direct reads land where the GPU
