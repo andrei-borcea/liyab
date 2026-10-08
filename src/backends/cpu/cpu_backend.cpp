@@ -19,6 +19,7 @@
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/backend.h"
+#include "liyab/device_detect.h"
 
 namespace liyab {
 
@@ -40,7 +41,7 @@ ActFormat act_format(const TensorView& w) {
 
 class CpuBackend final : public Backend {
 public:
-    explicit CpuBackend(ThreadPool& pool) : pool_(pool) {}
+    explicit CpuBackend(ThreadPool& pool) : pool_(pool), i8mm_(quant::i8mm_kernels_compiled() && detect_cpu().i8mm) {}
 
     [[nodiscard]] BackendKind kind() const noexcept override { return BackendKind::Cpu; }
 
@@ -104,7 +105,7 @@ public:
             for (int64_t r = r0; r < r1; ++i) {
                 const int64_t begin = i == 0 ? 0 : row_end_[i - 1];
                 const int64_t end = std::min(row_end_[i], r1);
-                if (r < end) run_rows(jobs_[i], acts_[jobs_[i].acts], r - begin, end - begin);
+                if (r < end) run_rows(jobs_[i], acts_[jobs_[i].acts], r - begin, end - begin, i8mm_);
                 r = std::max(r, end);
             }
         });
@@ -151,7 +152,7 @@ private:
     }
 
     // Rows [r0, r1) of one job's matrix against all of its input rows.
-    static void run_rows(const Job& job, const Activations& a, int64_t r0, int64_t r1) {
+    static void run_rows(const Job& job, const Activations& a, int64_t r0, int64_t r1, bool i8mm) {
         const TensorView& w = *job.item->w;
         const int64_t rows = w.rows();
         const int64_t cols = w.cols();
@@ -174,6 +175,33 @@ private:
             } else {
                 q8_rows.resize(static_cast<size_t>(n));
                 for (int32_t t = 0; t < n; ++t) q8_rows[static_cast<size_t>(t)] = a.q8.data() + t * blocks;
+            }
+            const bool k_tiles = job.format == ActFormat::Q8_K &&
+                                 (w.type == DType::Q4_K || w.type == DType::Q5_K || w.type == DType::Q6_K);
+            if (i8mm && k_tiles) {
+                // i8mm: 2x2 tiles (two weight rows x two activation rows per SMMLA),
+                // bit-identical to the dot-product kernels.
+                for (; r0 + 1 < r1; r0 += 2) {
+                    const uint8_t* ra = w.data + static_cast<size_t>(r0) * row_bytes;
+                    const uint8_t* rb = ra + row_bytes;
+                    float tile[4];
+                    int32_t t = 0;
+                    for (; t + 1 < n; t += 2) {
+                        quant::dot_q8_K_2x2(w.type, ra, rb, q8k_rows[static_cast<size_t>(t)],
+                                            q8k_rows[static_cast<size_t>(t) + 1], cols, tile);
+                        y[t * rows + r0] = tile[0];
+                        y[(t + 1) * rows + r0] = tile[1];
+                        y[t * rows + r0 + 1] = tile[2];
+                        y[(t + 1) * rows + r0 + 1] = tile[3];
+                    }
+                    if (t < n) {  // odd activation row count: the last row alone
+                        for (int64_t r : {r0, r0 + 1}) {
+                            const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
+                            y[t * rows + r] = quant::dot_lowbit_q8_K(w.type, row, q8k_rows[static_cast<size_t>(t)], cols);
+                        }
+                    }
+                }
+                // An odd weight row count leaves one row for the loop below.
             }
             for (int64_t r = r0; r < r1; ++r) {
                 const uint8_t* row = w.data + static_cast<size_t>(r) * row_bytes;
@@ -217,6 +245,7 @@ private:
     }
 
     ThreadPool& pool_;
+    const bool i8mm_;  // the 2x2 SMMLA tile kernels are built in and the CPU has i8mm
     std::vector<MatmulItem> items_;
     std::vector<Activations> acts_;  // grows to the largest batch's distinct inputs, then reused
     std::vector<Job> jobs_;

@@ -25,7 +25,7 @@ struct SocInfo {
 struct CpuFeatures {
     bool neon = false;
     bool dotprod = false;  // SDOT/UDOT (ARMv8.2), used by the Q4_0/Q8_0 kernels
-    bool i8mm = false;
+    bool i8mm = false;     // SMMLA (ARMv8.6 int8 matrix multiply), used by the 2x2 tile kernels for batched matmuls
     bool fp16 = false;
     int32_t cores = 0;
     int32_t performance_cores = 0;
@@ -57,6 +57,9 @@ struct DeviceInfo {
 // Inspects the running device (system properties, sysctl, /proc, runtime
 // libraries). Safe to call from any thread; takes a few milliseconds.
 LIYAB_API DeviceInfo detect_device();
+// The CPU part only (feature registers / sysctl and core counts): cheap,
+// thread-safe.
+LIYAB_API CpuFeatures detect_cpu();
 
 // Pure classifier over identifiers as exposed by the OS. Any argument may be
 // empty. On Android pass ro.soc.manufacturer, ro.soc.model, ro.board.platform

@@ -66,6 +66,7 @@ add_library(liyab_core OBJECT
   src/core/quant.cpp
   src/core/quant_ext.cpp
   src/core/quant_lowbit.cpp
+  src/core/quant_i8mm.cpp
   src/core/thread_pool.cpp
   src/core/mmap_loader.cpp
   src/core/device_detect.cpp
@@ -131,6 +132,13 @@ endif()
 #    target (apple-m1) already includes it, so only mobile targets get the flag.
 if(LIYAB_USE_NEON AND LIYAB_ARM_DOTPROD AND (ANDROID OR IOS OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
   target_compile_options(liyab_core PRIVATE -march=armv8.2-a+dotprod+fp16)
+endif()
+#  * quant_i8mm.cpp alone is built with +i8mm (SMMLA, Armv8.6 int8 matrix
+#    multiply: Snapdragon 8 Gen 2+, Apple M2+/A15+). Its kernels run only when
+#    the CPU reports the extension at run time, so the library still loads and
+#    runs on older dot-product CPUs.
+if(LIYAB_USE_NEON AND LIYAB_ARM_DOTPROD)
+  set_source_files_properties(src/core/quant_i8mm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16+i8mm")
 endif()
 
 find_package(Threads REQUIRED)

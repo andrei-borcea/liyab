@@ -32,6 +32,7 @@
 #include <cstring>
 
 #include "core/quant.h"
+#include "core/quant_neon_k.h"
 #include "core/quant_tables.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON) && defined(__aarch64__)
@@ -343,29 +344,8 @@ float dot_q2_k(const BlockQ2K* x, const BlockQ8_K* y, int64_t nb) noexcept {
 // horizontal add, two fp16 conversions and scalar 6-bit scale decoding per
 // 32 values. Against Q8_K a super-block accumulates in int32 vectors and is
 // scaled once; the sub-block minimums come from the activation sums.
-constexpr uint32_t kKMask1 = 0x3f3f3f3f, kKMask2 = 0x0f0f0f0f, kKMask3 = 0x03030303;
-
-// The 12 packed scale bytes of Q4_K / Q5_K -> 8 six-bit scales (bytes 0-7 of
-// `scales`) and 8 six-bit mins (bytes 0-7 of `mins`), as llama.cpp's utmp.
-inline void unpack_k4_scales(const uint8_t* packed, uint8x8_t& scales, uint8x8_t& mins) noexcept {
-    uint32_t u[3];
-    std::memcpy(u, packed, 12);
-    const uint32_t mins_lo = u[1] & kKMask1;
-    const uint32_t mins_hi = ((u[2] >> 4) & kKMask2) | (((u[1] >> 6) & kKMask3) << 4);
-    const uint32_t scales_hi = (u[2] & kKMask2) | (((u[0] >> 6) & kKMask3) << 4);
-    const uint32_t scales_lo = u[0] & kKMask1;
-    scales = vcreate_u8(static_cast<uint64_t>(scales_lo) | (static_cast<uint64_t>(scales_hi) << 32));
-    mins = vcreate_u8(static_cast<uint64_t>(mins_lo) | (static_cast<uint64_t>(mins_hi) << 32));
-}
-
-// sum over the 8 sub-blocks of 32 values of min * (activation sum).
-inline int32_t k4_min_sum(uint8x8_t mins, const int16_t* bsums) noexcept {
-    const int16x8_t sums32 = vpaddq_s16(vld1q_s16(bsums), vld1q_s16(bsums + 8));
-    const int16x8_t m = vreinterpretq_s16_u16(vmovl_u8(mins));
-    const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16(sums32), vget_low_s16(m)),
-                                     vmull_s16(vget_high_s16(sums32), vget_high_s16(m)));
-    return vaddvq_s32(prod);
-}
+using kneon::k4_min_sum;
+using kneon::unpack_k4_scales;
 
 float dot_q4_k(const BlockQ4_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
     const uint8x16_t m4 = vdupq_n_u8(0xF);

@@ -98,6 +98,7 @@ float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept;
 // The same Q8_0 weight row against `rows` activation rows (x[r] = row r's
 // blocks): out[r] = dot_q8_0_q8_0(w, x[r], n), up to float summation order.
 void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
+
 float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept;
 float dot_f32(const float* a, const float* b, int64_t n) noexcept;
 
@@ -181,6 +182,15 @@ float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n
 // four rows (speculative verification, prefill); other types loop.
 void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x, int32_t rows, int64_t n,
                           float* out) noexcept;
+
+// 2x2 tiles with the i8mm extension (quant_i8mm.cpp): weight rows wa, wb
+// against activation rows x, y; out = {wa·x, wa·y, wb·x, wb·y}, bit-identical
+// to dot_lowbit_q8_K. Q4_K / Q5_K / Q6_K; false (out untouched) for other
+// types. Call only when i8mm_kernels_compiled() and the CPU supports i8mm
+// (CpuFeatures::i8mm).
+bool i8mm_kernels_compiled() noexcept;
+bool dot_q8_K_2x2(DType type, const void* wa, const void* wb, const BlockQ8_K* x, const BlockQ8_K* y, int64_t n,
+                  float* out) noexcept;
 
 // NEON kernels for the 32-value I-quant / FP4 formats against Q8_0 activations
 // (dispatched by dot_quantized). `n` is a multiple of 32.

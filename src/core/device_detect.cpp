@@ -140,28 +140,6 @@ std::string sysctl_string(const char* name) {
 }
 #endif
 
-CpuFeatures detect_cpu() {
-    CpuFeatures f;
-    f.cores = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
-    f.performance_cores = performance_core_count();
-#if defined(__APPLE__) && defined(__aarch64__)
-    f.neon = true;
-    f.dotprod = sysctl_flag("hw.optional.arm.FEAT_DotProd");
-    f.i8mm = sysctl_flag("hw.optional.arm.FEAT_I8MM");
-    f.fp16 = sysctl_flag("hw.optional.arm.FEAT_FP16");
-#elif defined(__linux__) && defined(__aarch64__)
-#ifndef HWCAP2_I8MM
-#define HWCAP2_I8MM (1 << 13)
-#endif
-    const unsigned long hwcap = getauxval(AT_HWCAP);
-    const unsigned long hwcap2 = getauxval(AT_HWCAP2);
-    f.neon = (hwcap & HWCAP_ASIMD) != 0;
-    f.dotprod = (hwcap & HWCAP_ASIMDDP) != 0;
-    f.fp16 = (hwcap & HWCAP_ASIMDHP) != 0;
-    f.i8mm = (hwcap2 & HWCAP2_I8MM) != 0;
-#endif
-    return f;
-}
 
 uint64_t total_memory_bytes() {
 #if defined(__APPLE__)
@@ -226,6 +204,29 @@ std::vector<BackendKind> rank_backends(const SocInfo& soc, const Accelerators& a
     if (acc.vulkan.available && soc.vendor != SocVendor::Apple) order.push_back(BackendKind::Vulkan);
     order.push_back(BackendKind::Cpu);
     return order;
+}
+
+CpuFeatures detect_cpu() {
+    CpuFeatures f;
+    f.cores = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+    f.performance_cores = performance_core_count();
+#if defined(__APPLE__) && defined(__aarch64__)
+    f.neon = true;
+    f.dotprod = sysctl_flag("hw.optional.arm.FEAT_DotProd");
+    f.i8mm = sysctl_flag("hw.optional.arm.FEAT_I8MM");
+    f.fp16 = sysctl_flag("hw.optional.arm.FEAT_FP16");
+#elif defined(__linux__) && defined(__aarch64__)
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1 << 13)
+#endif
+    const unsigned long hwcap = getauxval(AT_HWCAP);
+    const unsigned long hwcap2 = getauxval(AT_HWCAP2);
+    f.neon = (hwcap & HWCAP_ASIMD) != 0;
+    f.dotprod = (hwcap & HWCAP_ASIMDDP) != 0;
+    f.fp16 = (hwcap & HWCAP_ASIMDHP) != 0;
+    f.i8mm = (hwcap2 & HWCAP2_I8MM) != 0;
+#endif
+    return f;
 }
 
 DeviceInfo detect_device() {

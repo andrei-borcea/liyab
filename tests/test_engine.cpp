@@ -18,6 +18,7 @@
 #include "core/tokenizer.h"
 #include "core/transformer.h"
 #include "liyab/liyab.h"
+#include "liyab/device_detect.h"
 #include "liyab/liyab_c_api.h"
 #include "liyab/speculative_decoder.h"
 #include "test_model.h"
@@ -474,7 +475,7 @@ TEST_CASE("Q8_K activation quantization matches llama.cpp's semantics") {
     }
 }
 
-TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
+TEST_CASE("Multi-row and i8mm tile kernels equal one single-row dot per activation row") {
     std::mt19937 rng(21);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     const int64_t n = 512;
@@ -514,6 +515,17 @@ TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
             for (int32_t r = 0; r < rows; ++r) {
                 const float single = quant::dot_lowbit_q8_K(type, q.data(), pk[static_cast<size_t>(r)], n);
                 CHECK_NEAR(out[static_cast<size_t>(r)], single, 1e-4f * (1.0f + std::fabs(single)));
+            }
+            // i8mm 2x2 tiles (weight row and a second, shifted one): bit-identical to the single dots.
+            if (rows >= 2 && quant::i8mm_kernels_compiled() && detect_cpu().i8mm) {
+                std::vector<uint8_t> q2(q.rbegin(), q.rend());  // another valid-looking row
+                for (size_t i = 0; i < q2.size(); i += block) std::memcpy(q2.data() + i, q.data() + i, 4);  // keep d / dmin sane
+                float tile[4];
+                REQUIRE(quant::dot_q8_K_2x2(type, q.data(), q2.data(), pk[0], pk[1], n, tile));
+                CHECK(tile[0] == quant::dot_lowbit_q8_K(type, q.data(), pk[0], n));
+                CHECK(tile[1] == quant::dot_lowbit_q8_K(type, q.data(), pk[1], n));
+                CHECK(tile[2] == quant::dot_lowbit_q8_K(type, q2.data(), pk[0], n));
+                CHECK(tile[3] == quant::dot_lowbit_q8_K(type, q2.data(), pk[1], n));
             }
         }
         std::vector<quant::BlockQ8_0> w0(static_cast<size_t>(n / 32));
