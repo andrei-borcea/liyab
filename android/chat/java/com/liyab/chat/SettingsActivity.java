@@ -26,12 +26,14 @@ public final class SettingsActivity extends Activity {
     private EditText context;
     private EditText system;
     private TextView error;
+    private EditText memoryBudget;
+    private EditText thermalLimit;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         LinearLayout root = Ui.screen(this);
-        root.addView(Ui.topBar(this, "Model settings", true));
+        root.addView(Ui.topBar(this, "Settings", true));
         ScrollView scroll = new ScrollView(this);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -39,10 +41,22 @@ public final class SettingsActivity extends Activity {
         root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
 
+        // Device-wide settings first: they apply to every model and need no loaded engine.
+        LinearLayout device = Ui.card(this);
+        device.addView(Ui.text(this, "DEVICE (ALL MODELS)", 11, Ui.MUTED));
+        memoryBudget = field(device, "Memory limit (MiB)", String.valueOf(EngineHolder.memoryBudgetMb()), false,
+                "Weights + expert cache + streaming buffers. HyperOS / MIUI close any app above 6 GiB, so keep it "
+                        + "around 5500 there; raise it on other phones. 0 = use all free RAM.");
+        thermalLimit = field(device, "Thermal limit (°C)", fmt(EngineHolder.thermalLimitC()), true,
+                "Above this skin/board temperature the engine halves its CPU threads. The OS thermal status "
+                        + "(severe, critical) slows it down regardless. Default 50.");
+        device.addView(Ui.buttonRow(this, Ui.pill(this, "Save device settings", v -> saveDevice(true))));
+        content.addView(device);
+
         if (EngineHolder.handle == 0) {
             LinearLayout card = Ui.card(this);
             card.addView(Ui.bold(this, "No model loaded", 15));
-            card.addView(Ui.text(this, "Settings belong to a model: load one from Models first.", 13, Ui.MUTED));
+            card.addView(Ui.text(this, "Model settings belong to a model: load one from Models first.", 13, Ui.MUTED));
             content.addView(card);
             return;
         }
@@ -128,7 +142,36 @@ public final class SettingsActivity extends Activity {
         return String.format(Locale.US, "%.2f", v).replaceFirst("\\.?0+$", "");
     }
 
+    /** Saves the device-wide settings; returns whether they changed (the model must reload to apply them). */
+    private boolean saveDevice(boolean announce) {
+        long mem;
+        float thermal;
+        try {
+            mem = Long.parseLong(memoryBudget.getText().toString().trim());
+            thermal = Float.parseFloat(thermalLimit.getText().toString().trim());
+        } catch (NumberFormatException e) {
+            android.widget.Toast.makeText(this, "Memory and thermal limits need numbers", android.widget.Toast.LENGTH_SHORT).show();
+            return false;
+        }
+        if (mem < 0 || (mem > 0 && mem < 1024) || thermal < 30 || thermal > 80) {
+            android.widget.Toast.makeText(this, "Memory limit: 0 or >= 1024 MiB; thermal limit: 30..80 °C",
+                    android.widget.Toast.LENGTH_LONG).show();
+            return false;
+        }
+        boolean changed = mem != EngineHolder.memoryBudgetMb() || thermal != EngineHolder.thermalLimitC();
+        EngineHolder.prefs().edit().putLong("memory_budget_mb", mem).putFloat("thermal_limit", thermal).apply();
+        if (changed) {
+            DebugLog.add(String.format(Locale.US, "Device settings: memory limit %d MiB, thermal limit %.0f °C", mem, thermal));
+            if (announce && EngineHolder.handle != 0) {
+                DebugLog.add("Reloading the model to apply them");
+                EngineHolder.load(EngineHolder.modelFile, EngineHolder.modelUri);
+            }
+        }
+        return changed;
+    }
+
     private void save() {
+        final boolean deviceChanged = saveDevice(false);
         ModelSettings s = new ModelSettings();
         try {
             s.thinking = thinking.isChecked();
@@ -155,7 +198,7 @@ public final class SettingsActivity extends Activity {
             error.setText(problem);
             return;
         }
-        boolean reload = s.contextLength != EngineHolder.settings.contextLength;
+        boolean reload = s.contextLength != EngineHolder.settings.contextLength || deviceChanged;
         s.save(EngineHolder.modelKey);
         EngineHolder.settings = ModelSettings.load(EngineHolder.modelKey, EngineHolder.handle);
         DebugLog.add("Settings saved: " + EngineHolder.settings.summary(EngineHolder.thinkingSupported) + ", context "

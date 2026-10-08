@@ -58,6 +58,8 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
                                                 int32_t max_batch) {
     LoaderOptions loader_options;
     loader_options.streaming = config.streaming;
+    loader_options.memory_budget_bytes =
+        config.memory_budget_mb > 0 ? static_cast<uint64_t>(config.memory_budget_mb) << 20 : 0;
     auto file = MmapLoader::open(path, loader_options);
     if (!file) return file.status();
     TransformerOptions options;
@@ -67,6 +69,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.kv_type = config.kv_cache_type;
     options.max_batch = max_batch;
     options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
+    options.memory_budget_bytes = loader_options.memory_budget_bytes;
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -206,7 +209,8 @@ struct Engine::Impl {
         const size_t largest = *std::max_element(bytes.begin(), bytes.end());
         int32_t streamed = c.n_layers;
         if (!all) {
-            const uint64_t available = available_memory_bytes();
+            const uint64_t available = usable_memory_bytes(
+                config.memory_budget_mb > 0 ? static_cast<uint64_t>(config.memory_budget_mb) << 20 : 0);
             if (available == 0 || static_cast<double>(file.file_size()) <= 0.8 * static_cast<double>(available)) {
                 return Status::ok();  // fits: in-place reads from the page cache
             }

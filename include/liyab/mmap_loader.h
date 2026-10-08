@@ -95,6 +95,8 @@ struct GgufValue {
 struct LoaderOptions {
     // nullopt: stream iff the file is larger than 80% of available memory.
     std::optional<bool> streaming;
+    // > 0: cap on the memory the process may use (see usable_memory_bytes()).
+    uint64_t memory_budget_bytes = 0;
 };
 
 class LIYAB_API MmapLoader {
@@ -195,6 +197,11 @@ private:
 
 // Physical memory the process can still use without being killed, in bytes.
 LIYAB_API uint64_t available_memory_bytes() noexcept;
+
+// available_memory_bytes() capped by `budget_bytes` when it is > 0. Platform
+// per-app caps are invisible to the OS counters (HyperOS stops apps above
+// 6 GiB of PSS however much RAM is free), so embedders pass a budget.
+LIYAB_API uint64_t usable_memory_bytes(uint64_t budget_bytes) noexcept;
 
 }  // namespace liyab
 

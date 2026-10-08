@@ -223,7 +223,9 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         model->inv_freq_[i] = static_cast<float>(freq / factors[i]);
     }
 
-    if (c.n_expert > 0) LIYAB_RETURN_IF_ERROR(model->attach_expert_store(options.expert_cache_bytes));
+    if (c.n_expert > 0) {
+        LIYAB_RETURN_IF_ERROR(model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes));
+    }
     model->file_->configure_layers(c.n_layers);
     LIYAB_LOG_INFO("%s: %d layers, d=%d, ff=%d, heads=%d/%d x %d, vocab=%d, ctx=%d%s, kv=%s, %.1f KiB/token",
                    c.arch.c_str(), c.n_layers, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab,
@@ -708,7 +710,7 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
 // Expert streaming: the routed experts stay on storage and are read on
 // demand into a fixed RAM cache; every other tensor stays resident in the
 // mapping (paged in now, never swept by the streaming window).
-Status Transformer::attach_expert_store(int64_t budget_option) {
+Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget) {
     if (budget_option == 0) return Status::ok();
     const ModelConfig& c = config_;
     auto is_expert = [](const TensorView& t) {
@@ -720,17 +722,19 @@ Status Transformer::attach_expert_store(int64_t budget_option) {
         if (is_expert(t)) expert_bytes += t.nbytes;
     }
     const size_t resident_bytes = file_->file_size() - expert_bytes;
-    const uint64_t available = available_memory_bytes();
+    const uint64_t available = usable_memory_bytes(memory_budget);
     size_t budget = 0;
     if (budget_option > 0) {
         budget = static_cast<size_t>(budget_option);
     } else {
-        // Automatic: only when the model does not fit; keep 1 GiB for the KV
-        // cache, activations and the rest of the app.
+        // Automatic: only when the model does not fit. Keep room for the KV
+        // cache, activations and the rest of the app: 1 GiB of free RAM, or
+        // 512 MiB inside an explicit budget (the embedder already left its own
+        // headroom below the platform's cap).
         if (available == 0 || static_cast<double>(file_->file_size()) <= 0.8 * static_cast<double>(available)) {
             return Status::ok();
         }
-        const size_t margin = size_t{1} << 30;
+        const size_t margin = memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30;
         budget = available > resident_bytes + margin ? static_cast<size_t>(available) - resident_bytes - margin : 0;
     }
     std::vector<std::array<const TensorView*, 3>> experts(static_cast<size_t>(c.n_layers));

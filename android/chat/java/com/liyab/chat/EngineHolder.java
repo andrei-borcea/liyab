@@ -58,6 +58,25 @@ final class EngineHolder {
         return app.getSharedPreferences("liyab", Context.MODE_PRIVATE);
     }
 
+    /**
+     * Skin/board temperature (°C) above which the engine halves its CPU threads. Device-wide setting.
+     * 50 by default: on some phones the only "skin" sensor is a board thermistor that reads 45+ while
+     * charging, which would halve speed at a comfortable temperature. The OS thermal status (severe,
+     * critical) throttles regardless of this value.
+     */
+    static float thermalLimitC() {
+        return prefs().getFloat("thermal_limit", 50f);
+    }
+
+    /**
+     * Memory (MiB) the engine may keep resident: weights, expert cache, streaming slots. Device-wide.
+     * 5500 by default because HyperOS / MIUI stop any app above 6 GiB of PSS, whatever RAM is free;
+     * raise it on phones without such a cap.
+     */
+    static long memoryBudgetMb() {
+        return prefs().getLong("memory_budget_mb", 5500);
+    }
+
     static boolean useGpu() {
         return prefs().getBoolean("gpu", false);
     }
@@ -234,7 +253,8 @@ final class EngineHolder {
                 DebugLog.add("Creating engine on " + (gpu ? "GPU (Vulkan)" : "CPU") + "…");
                 long t0 = System.nanoTime();
                 long h = LiyabNative.create(path, cache.getAbsolutePath(), THREADS,
-                        gpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU, context);
+                        gpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU, context, thermalLimitC(),
+                        memoryBudgetMb());
                 if (gpu) {
                     DebugLog.add("Uploading weights to GPU memory (one-time warm-up)…");
                     LiyabNative.generate(h, "Hi", 1, 0f, 1f, 0, bytes -> true);

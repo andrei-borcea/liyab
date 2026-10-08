@@ -97,6 +97,8 @@ struct TransformerOptions {
     // RAM minus the resident weights and a safety margin), 0: never (experts
     // are read through the mapping), > 0: always, with this budget.
     int64_t expert_cache_bytes = -1;
+    // > 0: total memory the engine may keep resident (see usable_memory_bytes()).
+    uint64_t memory_budget_bytes = 0;
 };
 
 class Transformer {
@@ -213,7 +215,7 @@ private:
     // Expert prefetch: applies block `layer`'s router to the current hidden
     // states (x_) and queues the top-k experts it picks in the ExpertStore.
     void predict_experts(int32_t layer, int32_t n, const Route& route);
-    Status attach_expert_store(int64_t budget_option);
+    Status attach_expert_store(int64_t budget_option, uint64_t memory_budget);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.

@@ -292,7 +292,9 @@ No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with th
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
 the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
 build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
-(`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off), and `liyab_generation_stats`
+(`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off); `memory_budget_mb` caps the
+memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
+OS counters do not show (`liyab-cli --memory-budget MB`); and `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read` and `expert_stall_ms`.
 `liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU
 busy time spent on the engine's work, bytes streamed from storage, tokens generated); it is safe to call while a
@@ -419,6 +421,10 @@ final class LiyabEngine {
     is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
     you leave the page.
 
+* **Device settings (⚙ → "Device").** A memory limit for the engine (weights, expert cache, streaming buffers;
+  5500 MiB by default, because HyperOS / MIUI stop any app above 6 GiB of PSS whatever RAM is free) and a thermal
+  limit (50 °C by default; above it the engine halves its CPU threads, while the OS thermal status still applies).
+  Changing them reloads the model.
 * **Performance overlay (Home → "Overlay").** A draggable panel over every screen with 60-second charts, sampled
   twice a second: process CPU (share of all cores, `/proc/self/stat`), GPU (time the GPU spends on Liyab's work,
   from the engine counters: Android blocks the GPU's own load counters for apps), power drawn from the battery

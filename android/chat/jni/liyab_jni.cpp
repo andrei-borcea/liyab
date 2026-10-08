@@ -78,7 +78,8 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_takeLogs(JNIEnv* env, 
 
 JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jclass, jstring model_path,
                                                                jstring cache_dir, jint threads, jint backend,
-                                                               jint context_length) {
+                                                               jint context_length, jfloat skin_threshold_c,
+                                                               jlong memory_budget_mb) {
     const std::string model = to_string(env, model_path);
     const std::string cache = to_string(env, cache_dir);
     liyab_engine_config config;
@@ -87,7 +88,8 @@ JNIEXPORT jlong JNICALL Java_com_liyab_chat_LiyabNative_create(JNIEnv* env, jcla
     config.n_threads = threads;
     config.backend = static_cast<liyab_backend>(backend);  // LIYAB_BACKEND_CPU or LIYAB_BACKEND_VULKAN
     config.power_profile = LIYAB_POWER_PERFORMANCE;  // a chat UI wants full speed; thermal guard still applies
-    config.skin_threshold_c = 45.0f;
+    config.skin_threshold_c = skin_threshold_c;  // app setting; the OS thermal status still applies
+    config.memory_budget_mb = memory_budget_mb;  // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
     config.context_length = context_length;  // 0: the engine's default
     config.kv_dedup_dir = cache.empty() ? nullptr : cache.c_str();  // multi-turn: reuse earlier turns' KV
 

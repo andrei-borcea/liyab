@@ -287,7 +287,7 @@ Result<std::unique_ptr<MmapLoader>> MmapLoader::open(const std::string& path, co
     LIYAB_RETURN_IF_ERROR(loader->parse(0));
     LIYAB_RETURN_IF_ERROR(loader->open_other_parts());
 
-    const uint64_t available = available_memory_bytes();
+    const uint64_t available = usable_memory_bytes(options.memory_budget_bytes);
     loader->streaming_ = options.streaming.value_or(
         available > 0 && static_cast<double>(loader->file_size()) > 0.8 * static_cast<double>(available));
 
@@ -673,6 +673,12 @@ void MmapLoader::unpack_int4_to_int8_neon(const uint8_t* __restrict src_packed, 
 // ---------------------------------------------------------------------------
 // Memory budget
 // ---------------------------------------------------------------------------
+uint64_t usable_memory_bytes(uint64_t budget_bytes) noexcept {
+    const uint64_t available = available_memory_bytes();
+    if (budget_bytes == 0) return available;
+    return available == 0 ? budget_bytes : std::min(available, budget_bytes);
+}
+
 uint64_t available_memory_bytes() noexcept {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     return static_cast<uint64_t>(os_proc_available_memory());

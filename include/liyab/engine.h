@@ -56,6 +56,11 @@ struct EngineConfig {
     // not fit in RAM; uses the free RAM left after the other weights), 0:
     // never stream experts, > 0: always, with this cache size.
     int64_t expert_cache_mb = -1;
+    // Total memory the engine may keep resident (weights, expert cache,
+    // streaming slots), in MiB; 0: limited by free RAM only. Streaming
+    // decisions use min(free RAM, budget). Set it on platforms with per-app
+    // caps the OS counters do not show (HyperOS stops apps above 6 GiB PSS).
+    int64_t memory_budget_mb = 0;
     int32_t draft_tokens = 4;         // k for speculative decoding
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
