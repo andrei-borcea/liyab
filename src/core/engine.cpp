@@ -1,5 +1,7 @@
 #include "liyab/engine.h"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -73,6 +75,27 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     return Transformer::load(std::move(file).value(), options);
 }
 
+// Anonymous memory regions for weights moved out of the file mapping,
+// unmapped on destruction. Page-aligned, so direct reads can fill them.
+class AnonymousMemory {
+public:
+    AnonymousMemory() = default;
+    AnonymousMemory(const AnonymousMemory&) = delete;
+    AnonymousMemory& operator=(const AnonymousMemory&) = delete;
+    ~AnonymousMemory() {
+        for (const auto& [p, bytes] : regions_) munmap(p, bytes);
+    }
+    uint8_t* allocate(size_t bytes) {
+        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return nullptr;
+        regions_.emplace_back(p, bytes);
+        return static_cast<uint8_t*>(p);
+    }
+
+private:
+    std::vector<std::pair<void*, size_t>> regions_;
+};
+
 }  // namespace
 
 struct Engine::Impl {
@@ -82,6 +105,7 @@ struct Engine::Impl {
     std::unique_ptr<Backend> cpu;
     std::unique_ptr<Backend> gpu;  // Metal today; Vulkan once implemented
     std::unique_ptr<Backend> npu;  // QNN / NeuroPilot once implemented
+    AnonymousMemory resident_memory;  // resident weights moved off the mapping (CPU + expert streaming)
     std::unique_ptr<Transformer> target;
     std::unique_ptr<Transformer> draft;
     std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
@@ -337,16 +361,27 @@ struct Engine::Impl {
         return Status::ok();
     }
 
-    // MoE expert streaming with a GPU: the resident (non-expert) weights move
-    // into GPU-shared memory, read once with direct I/O. The GPU then reads
-    // them in place with its native kernels instead of keeping a second,
-    // repacked copy next to the mapping (which the expert cache budget, sized
-    // at load, does not account for).
-    Status share_resident_weights() {
-        if (!gpu || target->expert_store() == nullptr) return Status::ok();
-        uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign);
-        if (probe == nullptr) return Status::ok();
-        gpu->free_shared(probe);
+    // MoE expert streaming: the resident (non-expert) weights move out of the
+    // file mapping, read once with direct I/O.
+    //  * With a GPU, into GPU-shared memory: the GPU reads them in place with
+    //    its native kernels instead of keeping a second, repacked copy next to
+    //    the mapping (which the expert cache budget, sized at load, does not
+    //    account for).
+    //  * Otherwise into anonymous memory. Mapped file pages are page cache, and
+    //    the experts read through the page cache (ExpertStore) evicted them:
+    //    every token then faulted resident weights back in from flash (31k
+    //    instead of 5k major faults over 48 tokens of the 35B MoE). Anonymous
+    //    pages are only ever swapped, never dropped for page cache.
+    // Either way the PSS is unchanged: mapped pages counted as much.
+    Status place_resident_weights() {
+        if (target->expert_store() == nullptr) return Status::ok();
+        Backend* shared = nullptr;
+        if (gpu) {
+            if (uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign)) {
+                gpu->free_shared(probe);
+                shared = gpu.get();
+            }
+        }
         auto is_expert = [](const TensorView& t) {
             const std::string_view n = t.name;
             return n.size() > 13 && n.substr(n.size() - 12) == "_exps.weight";
@@ -369,11 +404,13 @@ struct Engine::Impl {
                 ranges.emplace_back(begin, end);
             }
         }
-        Backend* shared = gpu.get();
-        auto moved = target->mutable_file().relocate(ranges, [shared](size_t bytes) { return shared->allocate_shared(bytes); });
+        auto moved = target->mutable_file().relocate(ranges, [this, shared](size_t bytes) {
+            return shared != nullptr ? shared->allocate_shared(bytes) : resident_memory.allocate(bytes);
+        });
         if (!moved) return moved.status();
-        LIYAB_LOG_INFO("expert streaming: %.2f GiB of resident weights placed in GPU-shared memory (%zu ranges)",
-                       static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0), ranges.size());
+        LIYAB_LOG_INFO("expert streaming: %.2f GiB of resident weights placed in %s memory (%zu ranges)",
+                       static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0),
+                       shared != nullptr ? "GPU-shared" : "anonymous", ranges.size());
         return Status::ok();
     }
 
@@ -416,7 +453,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     impl->target = std::move(target).value();
 
     LIYAB_RETURN_IF_ERROR(impl->attach_layer_streaming(config.triple_buffer_loading));
-    LIYAB_RETURN_IF_ERROR(impl->share_resident_weights());
+    LIYAB_RETURN_IF_ERROR(impl->place_resident_weights());
 
     auto tokenizer = Tokenizer::load(impl->target->file());
     if (!tokenizer) return tokenizer.status();
@@ -772,6 +809,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         stats.expert_late = static_cast<int32_t>(after.late - experts_before.late);
         stats.expert_misses = static_cast<int32_t>(after.misses - experts_before.misses);
         stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
+        stats.expert_page_cache_loads = static_cast<int32_t>(after.page_cache_loads - experts_before.page_cache_loads);
         stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
         stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
         const Transformer::ExpertPredictions& predictions = s.target->expert_predictions();

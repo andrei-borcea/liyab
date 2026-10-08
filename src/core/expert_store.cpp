@@ -1,6 +1,7 @@
 #include "core/expert_store.h"
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -69,6 +70,9 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
         auto part = DirectFile::open(file.shard(i).path());
         if (!part) return part.status();
         s->files_.push_back(std::move(part).value());
+        auto buffered = DirectFile::open(file.shard(i).path(), false);
+        if (!buffered) return buffered.status();
+        s->buffered_.push_back(std::move(buffered).value());
     }
     for (int32_t i = 0; i < std::max(io_threads, 1); ++i) s->io_threads_.emplace_back([p = s.get()] { p->io_loop(); });
     LIYAB_LOG_INFO("expert cache: %zu slots x %.2f MiB = %.2f GiB (%.0f%% of %.2f GiB of experts)%s", n_slots,
@@ -101,15 +105,40 @@ ExpertStore::Segment ExpertStore::segment(int32_t key, int32_t matrix) const {
     return {t.shard, t.file_offset + static_cast<uint64_t>(key % n_expert_) * bytes, bytes};
 }
 
-Status ExpertStore::read_entry(int32_t key, uint8_t* dst) {
+bool ExpertStore::in_page_cache(const Segment& seg) const {
+#if defined(__APPLE__)
+    using Residency = char;
+#else
+    using Residency = unsigned char;
+#endif
+    static const auto page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    const uint64_t begin = seg.offset / page * page;
+    const size_t length = static_cast<size_t>(seg.offset + seg.bytes - begin);
+    thread_local std::vector<Residency> pages;
+    pages.resize((length + page - 1) / page);
+    auto* addr = const_cast<uint8_t*>(file_->shard(seg.shard).data()) + begin;
+    if (mincore(addr, length, pages.data()) != 0) return false;
+    return std::all_of(pages.begin(), pages.end(), [](Residency r) { return (r & 1) != 0; });
+}
+
+Status ExpertStore::read_entry(int32_t key, uint8_t* dst, bool on_demand) {
+    static const int mode = std::getenv("LIYAB_PC_MODE") ? std::atoi(std::getenv("LIYAB_PC_MODE")) : 1;  // TEMP
+    bool all_cached = true;
+    uint64_t bytes = 0;
     for (int32_t m = 0; m < 3; ++m) {
         const Segment seg = segment(key, m);
         const uint64_t begin = seg.offset / kAlign * kAlign;
         const size_t length = align_up(static_cast<size_t>(seg.offset - begin) + seg.bytes);
-        LIYAB_RETURN_IF_ERROR(files_[seg.shard]->read(begin, length, dst + slot_offsets_[static_cast<size_t>(m)]));
-        std::lock_guard<std::mutex> lock(mutex_);
-        stats_.bytes_read += length;
+        const bool cached = mode != 0 && in_page_cache(seg);
+        all_cached = all_cached && cached;
+        const bool buffered = cached || mode == 1 || (mode == 2 && !on_demand);
+        const DirectFile& f = buffered ? *buffered_[seg.shard] : *files_[seg.shard];
+        LIYAB_RETURN_IF_ERROR(f.read(begin, length, dst + slot_offsets_[static_cast<size_t>(m)]));
+        if (!cached) bytes += length;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.bytes_read += bytes;
+    if (all_cached) ++stats_.page_cache_loads;
     return Status::ok();
 }
 
@@ -165,9 +194,11 @@ void ExpertStore::io_loop() {
         e.slot = slot;
         slots_[static_cast<size_t>(slot)].entry = key;
         uint8_t* dst = arena_ + static_cast<size_t>(slot) * slot_bytes_;
+        const bool urgent = e.urgent;
         lock.unlock();
-        const Status status = read_entry(key, dst);
+        const Status status = read_entry(key, dst, urgent);
         lock.lock();
+        e.urgent = false;
         if (!status.is_ok()) {
             LIYAB_LOG_ERROR("%s", status.to_string().c_str());
             e.failed = true;
@@ -194,11 +225,13 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             if (e.state == State::Queued && !predicted) {  // needed now: move ahead of guesses
                 queue_.erase(std::remove(queue_.begin(), queue_.end(), key), queue_.end());
                 queue_.push_front(key);
+                e.urgent = true;
                 continue;
             }
             if (e.state != State::Empty) continue;
             e.state = State::Queued;
             e.on_demand = !predicted;
+            e.urgent = !predicted;
             if (predicted) {
                 e.uses += 0.5f;  // a predicted expert is worth keeping until it is used
                 queue_.push_back(key);
@@ -229,6 +262,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
     }
     e.on_demand = false;
     if (e.state != State::Ready) {
+        e.urgent = true;
         const auto t0 = std::chrono::steady_clock::now();
         if (e.state == State::Empty) {
             e.state = State::Queued;

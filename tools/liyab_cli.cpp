@@ -218,6 +218,12 @@ int main(int argc, char** argv) {
                              std::max(1, stats.prompt_tokens + stats.generated_tokens),
                          stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
         }
+        if (stats.expert_page_cache_loads > 0) {
+            std::fprintf(stderr, "experts: %d loads copied from the page cache (%.1f per token)\n",
+                         stats.expert_page_cache_loads,
+                         static_cast<double>(stats.expert_page_cache_loads) /
+                             std::max(1, stats.prompt_tokens + stats.generated_tokens));
+        }
         if (stats.expert_predicted > 0) {
             std::fprintf(stderr, "experts: prediction precision %.0f%% (%d of %d guesses chosen)\n",
                          100.0 * stats.expert_predicted_used / stats.expert_predicted, stats.expert_predicted_used,

@@ -53,9 +53,17 @@ bool direct_reads_match(int direct_fd, const std::string& path) {
 
 }  // namespace
 
-Result<std::unique_ptr<DirectFile>> DirectFile::open(const std::string& path) {
+Result<std::unique_ptr<DirectFile>> DirectFile::open(const std::string& path, bool direct) {
     std::unique_ptr<DirectFile> f(new DirectFile());
     f->path_ = path;
+    if (!direct) {
+        f->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (f->fd_ < 0) return Status(ErrorCode::IoError, "cannot open " + path + ": " + std::strerror(errno));
+#if defined(__linux__)
+        posix_fadvise(f->fd_, 0, 0, POSIX_FADV_RANDOM);
+#endif
+        return f;
+    }
 #if defined(__linux__)
     f->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     f->direct_ = f->fd_ >= 0;

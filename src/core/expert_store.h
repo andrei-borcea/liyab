@@ -45,6 +45,7 @@ public:
         uint64_t loads = 0;          // experts read from storage
         uint64_t unused = 0;         // loaded experts evicted before any use (wrong predictions)
         uint64_t bytes_read = 0;
+        uint64_t page_cache_loads = 0;  // loads copied from the kernel page cache instead of read from flash
         double stall_ms = 0.0;       // compute time spent waiting for experts
     };
 
@@ -85,6 +86,7 @@ private:
         int32_t slot = -1;
         int32_t pins = 0;
         bool on_demand = false;  // queued after the router chose it (a miss, even if it arrives in time)
+        bool urgent = false;     // the router chose it: read it for latency, not to fill the page cache
         bool failed = false;     // the last read failed (reported to the waiting acquire())
         bool untouched = false;  // loaded, not acquired since (evicting it wasted the read)
         float uses = 0.0f;
@@ -102,7 +104,10 @@ private:
     ExpertStore() = default;
     void io_loop();
     int32_t take_slot_locked(std::unique_lock<std::mutex>& lock);  // evicts if needed; may wait
-    Status read_entry(int32_t key, uint8_t* dst);
+    Status read_entry(int32_t key, uint8_t* dst, bool on_demand);
+    // Whether every page of `seg` is in the kernel page cache (mincore on the
+    // model mapping, which never faults pages in).
+    [[nodiscard]] bool in_page_cache(const Segment& seg) const;
     [[nodiscard]] Segment segment(int32_t key, int32_t matrix) const;
 
     const MmapLoader* file_ = nullptr;
@@ -112,6 +117,7 @@ private:
     std::array<size_t, 3> slot_offsets_{};  // where each matrix starts inside a slot (max over blocks)
     uint64_t expert_bytes_total_ = 0;
     std::vector<std::unique_ptr<DirectFile>> files_;  // one per file part
+    std::vector<std::unique_ptr<DirectFile>> buffered_;  // the same parts, opened for page-cache reads
 
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;

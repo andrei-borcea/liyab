@@ -30,7 +30,9 @@ public:
     // Alignment of offsets, lengths and buffers for direct I/O.
     static constexpr size_t kAlign = 4096;
 
-    static Result<std::unique_ptr<DirectFile>> open(const std::string& path);
+    // `direct` false opens for ordinary buffered reads (through the page
+    // cache, no read-ahead beyond the requested range).
+    static Result<std::unique_ptr<DirectFile>> open(const std::string& path, bool direct = true);
     ~DirectFile();
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;

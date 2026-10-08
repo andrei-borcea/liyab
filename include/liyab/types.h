@@ -235,7 +235,8 @@ struct GenerationStats {
     int32_t expert_hits = 0;        // routed experts already in the RAM cache
     int32_t expert_late = 0;        // predicted and prefetched, but still loading when needed
     int32_t expert_misses = 0;      // not predicted: read after the router chose them
-    uint64_t expert_bytes_read = 0; // bytes read from storage for experts
+    uint64_t expert_bytes_read = 0; // bytes read from storage for experts (page-cache copies excluded)
+    int32_t expert_page_cache_loads = 0;  // experts copied from the kernel page cache instead of read from storage
     double expert_stall_ms = 0.0;   // time the forward pass waited for expert reads
     int32_t expert_unused = 0;      // experts read (prefetched) and evicted again without being used
     int32_t expert_predicted = 0;   // experts guessed one block ahead (cached ones included)
