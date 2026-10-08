@@ -457,7 +457,8 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
   streamed blocks are spread evenly through the stack, so storage keeps reading while resident blocks compute.
   With a Vulkan GPU the slots and the resident blocks live in GPU-shared memory: direct reads land where the GPU
   reads them and the native kernels decode them in place (no copy, nothing cached per tensor).
-* **Mixture-of-experts models.** Everything but the routed experts stays resident; experts are read by 4 threads
+* **Mixture-of-experts models.** Everything but the routed experts stays resident (with a Vulkan GPU, in
+  GPU-shared memory, so the GPU reads it in place instead of keeping a second copy); experts are read by 4 threads
   into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Before each block the
   engine applies that block's router and the next one's to the current hidden state and prefetches the experts they
   pick, so reads overlap the attention/DeltaNet work; the experts a token really uses are computed cached-first.
@@ -641,7 +642,8 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   their work runs on the GPU/CPU. Next step: QNN HTP graphs for the FFN with rpcmem-registered weights.
 * **Vulkan.** Batched prefill runs the matvec kernel once per token (no weight reuse across the batch); a tiled
   GEMM kernel is the next step. Weights of models that fit in RAM are still copied into GPU memory (so they must fit
-  twice over); only streamed models use the zero-copy shared-memory path so far. MoE experts always run on the CPU
+  twice over); only streamed models use the zero-copy shared-memory path so far (dense block streaming: slots and
+  resident blocks; MoE expert streaming: every non-expert weight). MoE experts always run on the CPU
   (one small matmul per expert; batching them into one GPU submission is the next step). The native kernels read
   bytes one at a time for most formats and are slower than the repacked Q4_x kernels for Q4_K.
 * **Core ML / Apple Neural Engine.** Not used: the ANE is only reachable through compiled Core ML models, not

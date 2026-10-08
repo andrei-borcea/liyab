@@ -1,5 +1,6 @@
 #include "liyab/engine.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -301,6 +302,46 @@ struct Engine::Impl {
         return Status::ok();
     }
 
+    // MoE expert streaming with a GPU: the resident (non-expert) weights move
+    // into GPU-shared memory, read once with direct I/O. The GPU then reads
+    // them in place with its native kernels instead of keeping a second,
+    // repacked copy next to the mapping (which the expert cache budget, sized
+    // at load, does not account for).
+    Status share_resident_weights() {
+        if (!gpu || target->expert_store() == nullptr) return Status::ok();
+        uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign);
+        if (probe == nullptr) return Status::ok();
+        gpu->free_shared(probe);
+        auto is_expert = [](const TensorView& t) {
+            const std::string_view n = t.name;
+            return n.size() > 13 && n.substr(n.size() - 12) == "_exps.weight";
+        };
+        // Runs of consecutive non-expert tensors of the first file become one
+        // range each (gaps under 1 MiB are read along).
+        std::vector<const TensorView*> resident;
+        for (const TensorView& t : target->file().tensors()) {
+            if (t.shard == 0 && !is_expert(t)) resident.push_back(&t);
+        }
+        std::sort(resident.begin(), resident.end(),
+                  [](const TensorView* a, const TensorView* b) { return a->file_offset < b->file_offset; });
+        std::vector<std::pair<size_t, size_t>> ranges;
+        for (const TensorView* t : resident) {
+            const auto begin = static_cast<size_t>(t->file_offset);
+            const size_t end = begin + t->nbytes;
+            if (!ranges.empty() && begin <= ranges.back().second + (size_t{1} << 20)) {
+                ranges.back().second = std::max(ranges.back().second, end);
+            } else {
+                ranges.emplace_back(begin, end);
+            }
+        }
+        Backend* shared = gpu.get();
+        auto moved = target->mutable_file().relocate(ranges, [shared](size_t bytes) { return shared->allocate_shared(bytes); });
+        if (!moved) return moved.status();
+        LIYAB_LOG_INFO("expert streaming: %.2f GiB of resident weights placed in GPU-shared memory (%zu ranges)",
+                       static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0), ranges.size());
+        return Status::ok();
+    }
+
     void apply_policy(const PowerPolicy& policy) {
         const auto threads = static_cast<int32_t>(std::lround(pool->max_threads() * policy.thread_fraction));
         pool->set_active_threads(std::max(1, threads));
@@ -340,6 +381,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     impl->target = std::move(target).value();
 
     LIYAB_RETURN_IF_ERROR(impl->attach_layer_streaming(config.triple_buffer_loading));
+    LIYAB_RETURN_IF_ERROR(impl->share_resident_weights());
 
     auto tokenizer = Tokenizer::load(impl->target->file());
     if (!tokenizer) return tokenizer.status();
