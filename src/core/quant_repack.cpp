@@ -1,9 +1,12 @@
-// Liyab — repacked Q4_K / Q6_K layouts (Q4_K_R8, Q6_K_R8) and their kernels.
+// Liyab — repacked Q4_K / Q5_K / Q6_K / Q8_0 layouts (Q4_K_R8, Q5_K_R8,
+// Q6_K_R8, Q8_0_R4) and their kernels.
 //
 // The layouts and the 4-row SMMLA kernels follow llama.cpp (ggml),
-// ggml/src/ggml-cpu/repack.cpp (make_block_q4_Kx8, make_block_q6_Kx8,
-// ggml_quantize_mat_q8_K_4x8) and ggml/src/ggml-cpu/arch/arm/repack.cpp
-// (ggml_gemm_q4_K_8x8_q8_K, ggml_gemv_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K):
+// ggml/src/ggml-cpu/repack.cpp (make_block_q4_Kx8, make_block_q5_Kx8,
+// make_block_q6_Kx8, make_block_q8_0x4, ggml_quantize_mat_q8_K_4x8) and
+// ggml/src/ggml-cpu/arch/arm/repack.cpp (ggml_gemm_q4_K_8x8_q8_K,
+// ggml_gemm_q5_K_8x8_q8_K, ggml_gemv_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K,
+// ggml_gemv_q8_0_4x8_q8_0, ggml_gemm_q8_0_4x8_q8_0):
 //
 //     Copyright (c) 2023-2026 The ggml authors
 //     Licensed under the MIT License (see THIRD_PARTY_NOTICES.md).
@@ -14,11 +17,14 @@
 // that keeps the integer sums of a whole super-block and applies the same
 // float epilogue as the 4-row kernel, so a token's logits do not depend on how
 // many tokens share the matmul (speculative verification must match decoding).
+// Q4_K and Q5_K share one pair of kernels (Q5_K adds the 5th bits as values
+// are unpacked).
 //
 // Compiled with +i8mm (CMakeLists.txt); callers check the CPU first.
 #include "core/quant.h"
 
 #include <cstring>
+#include <type_traits>
 
 #if defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8) && \
     defined(__ARM_FEATURE_DOTPROD)
@@ -30,12 +36,17 @@ namespace liyab::quant {
 
 namespace {
 
-// One super-block of 8 Q4_K rows -> one Q4_Kx8 block (llama.cpp make_block_q4_Kx8,
-// interleave 8): values 8 bytes at a time; scales and mins of sub-block pair
-// i of the 8 rows packed into 12 bytes at 24 * i (low nibbles' sub-block) and
-// 24 * i + 12 (high nibbles').
-BlockQ4_Kx8 make_q4_Kx8(const BlockQ4_K* in) noexcept {
-    BlockQ4_Kx8 out{};
+// One super-block of 8 Q4_K (Q5_K) rows -> one Q4_Kx8 (Q5_Kx8) block
+// (llama.cpp make_block_q4_Kx8 / make_block_q5_Kx8, interleave 8): values 8
+// bytes at a time (Q5_K: and the 5th bits, likewise); scales and mins of
+// sub-block pair i of the 8 rows packed into 12 bytes at 24 * i (low
+// nibbles' sub-block) and 24 * i + 12 (high nibbles').
+template <typename Out, typename In>
+Out make_k_x8(const In* in) noexcept {
+    Out out{};
+    if constexpr (std::is_same_v<In, BlockQ5_K>) {
+        for (int i = 0; i < kSuperBlock / 8; ++i) std::memcpy(&out.qh[i * 8], &in[i % 8].qh[(i / 8) * 8], 8);
+    }
     for (int i = 0; i < 8; ++i) {
         out.d[i] = in[i].d;
         out.dmin[i] = in[i].dmin;
@@ -82,7 +93,28 @@ BlockQ6_Kx8 make_q6_Kx8(const BlockQ6_K* in) noexcept {
     return out;
 }
 
+// 4 Q8_0 rows' block -> one Q8_0x4 block (llama.cpp make_block_q8_0x4,
+// interleave 8); used for weights and activations alike.
+BlockQ8_0x4 make_q8_0x4(const BlockQ8_0* const* in) noexcept {
+    BlockQ8_0x4 out{};
+    for (int i = 0; i < 4; ++i) out.d[i] = in[i]->d;
+    for (int i = 0; i < kBlock * 4 / 8; ++i) std::memcpy(&out.qs[i * 8], &in[i % 4]->qs[(i / 4) * 8], 8);
+    return out;
+}
+
 #if defined(LIYAB_REPACK)
+
+// fp16 -> fp32 (exact, so gemv and gemm see the same activation scale).
+inline float f16_to_f32(uint16_t h) noexcept {
+    return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h))), 0);
+}
+
+// Q8_0 epilogue shared by gemv and gemm, per activation row and 4 weight
+// rows: acc += sum * d * d8.
+inline float32x4_t epilogue_q8_0(float32x4_t acc, const BlockQ8_0x4& w, float d8, int32x4_t sum) noexcept {
+    const float32x4_t scale = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.d))), vdupq_n_f32(d8));
+    return vfmaq_f32(acc, vcvtq_f32_s32(sum), scale);
+}
 
 // Q6_K epilogue shared by gemv and gemm (no minimums): acc += sum * d * d8.
 inline float32x4_t epilogue_q6(float32x4_t acc, const BlockQ6_Kx8& w, int j, float d8, int32x4_t sum) noexcept {
@@ -106,13 +138,49 @@ inline void decode_scales_x8(const uint8_t* in, int16x8_t* mins, int8_t* scales)
 
 // Float epilogue shared by gemv and gemm, per activation row and 4 weight
 // rows (half j of the 8): acc -= bias * dmin * d8; acc += sum * d * d8.
-inline float32x4_t epilogue(float32x4_t acc, const BlockQ4_Kx8& w, int j, float d8, int32x4_t sum,
-                            int32x4_t bias) noexcept {
+template <typename Block>
+inline float32x4_t epilogue(float32x4_t acc, const Block& w, int j, float d8, int32x4_t sum, int32x4_t bias) noexcept {
     const float32x4_t q8_d = vdupq_n_f32(d8);
     const float32x4_t dmins = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.dmin + j * 4))), q8_d);
     const float32x4_t scale = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.d + j * 4))), q8_d);
     acc = vmlsq_f32(acc, vcvtq_f32_s32(bias), dmins);
     return vmlaq_f32(acc, vcvtq_f32_s32(sum), scale);
+}
+
+// Q5_K's 5th bits of one Q5_Kx8 super-block, held in registers:
+// qh[4 cp + k] is the 16 bytes matching the values at 16 cp + 64 k, shifted
+// right by 2 after each sub-block pair (llama.cpp's order), so bits 0 / 1 are
+// always those of the current pair's low / high nibbles. Nothing for Q4_K.
+template <typename Block>
+struct HighBits {
+    explicit HighBits(const Block&) noexcept {}
+    void apply(int, uint8x16_t&, uint8x16_t&) noexcept {}
+};
+template <>
+struct HighBits<BlockQ5_Kx8> {
+    uint8x16_t qh[16];
+    explicit HighBits(const BlockQ5_Kx8& w) noexcept {
+        for (int i = 0; i < 16; ++i) qh[i] = vld1q_u8(w.qh + 16 * (i / 4) + 64 * (i % 4));
+    }
+    void apply(int i, uint8x16_t& lo, uint8x16_t& hi) noexcept {
+        lo = vsliq_n_u8(lo, vandq_u8(qh[i], vdupq_n_u8(1)), 4);
+        hi = vorrq_u8(hi, vshlq_n_u8(vandq_u8(qh[i], vdupq_n_u8(2)), 3));
+        qh[i] = vshrq_n_u8(qh[i], 2);
+    }
+};
+
+// The values of weight rows 2 cp, 2 cp + 1 in the 16 bytes at 16 cp + 64 k
+// of sub-block pair sb: the low nibbles (sub-block 2 sb) and the high ones
+// (2 sb + 1), Q5_K with their 5th bit. Called for sb = 0, 1, 2, 3 in turn.
+template <typename Block>
+inline void unpack_k_pair(const Block& w, int sb, int cp, int k, HighBits<Block>& high, int8x16_t& lo,
+                          int8x16_t& hi) noexcept {
+    const uint8x16_t q = vld1q_u8(w.qs + sb * kSuperBlock + 16 * cp + 64 * k);
+    uint8x16_t l = vandq_u8(q, vdupq_n_u8(0x0f));
+    uint8x16_t h = vshrq_n_u8(q, 4);
+    high.apply(4 * cp + k, l, h);
+    lo = vreinterpretq_s8_u8(l);
+    hi = vreinterpretq_s8_u8(h);
 }
 
 #endif
@@ -133,8 +201,37 @@ void repack_q4_K_r8(const BlockQ4_K* src, int64_t rows, int64_t cols, BlockQ4_Kx
         for (int64_t b = 0; b < nb; ++b) {
             BlockQ4_K group[8];
             for (int i = 0; i < 8; ++i) group[i] = src[(r + i) * nb + b];
-            *dst++ = make_q4_Kx8(group);
+            *dst++ = make_k_x8<BlockQ4_Kx8>(group);
         }
+    }
+}
+
+void repack_q5_K_r8(const BlockQ5_K* src, int64_t rows, int64_t cols, BlockQ5_Kx8* dst) noexcept {
+    const int64_t nb = cols / kSuperBlock;
+    for (int64_t r = 0; r + 8 <= rows; r += 8) {
+        for (int64_t b = 0; b < nb; ++b) {
+            BlockQ5_K group[8];
+            for (int i = 0; i < 8; ++i) group[i] = src[(r + i) * nb + b];
+            *dst++ = make_k_x8<BlockQ5_Kx8>(group);
+        }
+    }
+}
+
+void repack_q8_0_r4(const BlockQ8_0* src, int64_t rows, int64_t cols, BlockQ8_0x4* dst) noexcept {
+    const int64_t nb = cols / kBlock;
+    for (int64_t r = 0; r + 4 <= rows; r += 4) {
+        for (int64_t b = 0; b < nb; ++b) {
+            const BlockQ8_0* group[4];
+            for (int i = 0; i < 4; ++i) group[i] = &src[(r + i) * nb + b];
+            *dst++ = make_q8_0x4(group);
+        }
+    }
+}
+
+void interleave_q8_0_x4(const BlockQ8_0* const* rows, int64_t cols, BlockQ8_0x4* dst) noexcept {
+    for (int64_t b = 0; b < cols / kBlock; ++b) {
+        const BlockQ8_0* group[4] = {&rows[0][b], &rows[1][b], &rows[2][b], &rows[3][b]};
+        dst[b] = make_q8_0x4(group);
     }
 }
 
@@ -168,17 +265,21 @@ void interleave_q8_K_x4(const BlockQ8_K* const* rows, int64_t cols, BlockQ8_Kx4*
 
 #if defined(LIYAB_REPACK)
 
-void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept {
+namespace {
+
+// Q4_K_R8 / Q5_K_R8 kernels (Block: BlockQ4_Kx8 / BlockQ5_Kx8).
+template <typename Block>
+void gemv_k_r8(const Block* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept {
     const int64_t nb = cols / kSuperBlock;
-    const uint8x16_t m4b = vdupq_n_u8(0x0f);
     for (int64_t g = g0; g < g1; ++g) {
-        const BlockQ4_Kx8* q4 = w + g * nb;
+        const Block* q4 = w + g * nb;
         float32x4_t acc_f32[2] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
         for (int64_t b = 0; b < nb; ++b) {
             int32x4_t sum[2] = {vdupq_n_s32(0), vdupq_n_s32(0)};   // weight rows 0-3, 4-7
             int32x4_t bias[2] = {vdupq_n_s32(0), vdupq_n_s32(0)};
             int16_t bsums[8];  // per 32 values
             vst1q_s16(bsums, vpaddq_s16(vld1q_s16(x[b].bsums), vld1q_s16(x[b].bsums + 8)));
+            HighBits<Block> high(q4[b]);
             for (int sb = 0; sb < kSuperBlock / 64; ++sb) {
                 int16x8_t mins[2];
                 int8_t sc8[2][8];
@@ -186,24 +287,20 @@ void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
                 decode_scales_x8(&q4[b].scales[sb * 24 + 12], &mins[1], sc8[1]);
                 const int16x8_t sc_lo = vmovl_s8(vld1_s8(sc8[0]));  // low nibbles: sub-block 2 sb
                 const int16x8_t sc_hi = vmovl_s8(vld1_s8(sc8[1]));  // high nibbles: sub-block 2 sb + 1
-                const uint8_t* q4_base = q4[b].qs + sb * kSuperBlock;
                 const int8_t* q8_base = x[b].qs + sb * 64;
                 int8x16_t q8[8];
                 for (int i = 0; i < 8; ++i) q8[i] = vreinterpretq_s8_s64(vld1q_dup_s64(reinterpret_cast<const int64_t*>(q8_base + i * 8)));
                 int32x4_t lo[4], hi[4];  // per pair of weight rows: lanes 0-1 row 2cp, 2-3 row 2cp + 1
                 for (int cp = 0; cp < 4; ++cp) {
-                    const uint8x16_t b0 = vld1q_u8(q4_base + 16 * cp);
-                    const uint8x16_t b1 = vld1q_u8(q4_base + 16 * cp + 64);
-                    const uint8x16_t b2 = vld1q_u8(q4_base + 16 * cp + 128);
-                    const uint8x16_t b3 = vld1q_u8(q4_base + 16 * cp + 192);
-                    int32x4_t l = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(b0, m4b)), q8[0]);
-                    l = vdotq_s32(l, vreinterpretq_s8_u8(vandq_u8(b1, m4b)), q8[1]);
-                    l = vdotq_s32(l, vreinterpretq_s8_u8(vandq_u8(b2, m4b)), q8[2]);
-                    lo[cp] = vdotq_s32(l, vreinterpretq_s8_u8(vandq_u8(b3, m4b)), q8[3]);
-                    int32x4_t h = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), q8[4]);
-                    h = vdotq_s32(h, vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), q8[5]);
-                    h = vdotq_s32(h, vreinterpretq_s8_u8(vshrq_n_u8(b2, 4)), q8[6]);
-                    hi[cp] = vdotq_s32(h, vreinterpretq_s8_u8(vshrq_n_u8(b3, 4)), q8[7]);
+                    int32x4_t l = vdupq_n_s32(0), h = vdupq_n_s32(0);
+                    for (int k = 0; k < 4; ++k) {
+                        int8x16_t vl, vh;
+                        unpack_k_pair(q4[b], sb, cp, k, high, vl, vh);
+                        l = vdotq_s32(l, vl, q8[k]);
+                        h = vdotq_s32(h, vh, q8[4 + k]);
+                    }
+                    lo[cp] = l;
+                    hi[cp] = h;
                 }
                 for (int half = 0; half < 2; ++half) {  // weight rows 4 half .. 4 half + 3
                     const int32x4_t dl = vpaddq_s32(lo[2 * half], lo[2 * half + 1]);
@@ -225,12 +322,12 @@ void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
     }
 }
 
-void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
-                  int64_t ldy) noexcept {
+template <typename Block>
+void gemm_k_r8(const Block* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+               int64_t ldy) noexcept {
     const int64_t nb = cols / kSuperBlock;
-    const uint8x16_t m4b = vdupq_n_u8(0x0f);
     for (int64_t g = g0; g < g1; ++g) {
-        const BlockQ4_Kx8* q4 = w + g * nb;
+        const Block* q4 = w + g * nb;
         float32x4_t acc_f32[8];  // [2 t + j]: activation row t, weight rows 4 j .. 4 j + 3
         for (float32x4_t& a : acc_f32) a = vdupq_n_f32(0.0f);
         for (int64_t b = 0; b < nb; ++b) {
@@ -241,6 +338,7 @@ void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
             int32x4_t acc[8];   // SMMLA tiles: [cp] rows 01 x weight pair cp, [cp + 4] rows 23
             int32x4_t bias[8];  // [2 t + j]
             for (int i = 0; i < 8; ++i) acc[i] = bias[i] = vdupq_n_s32(0);
+            HighBits<Block> high(q4[b]);
             for (int sb = 0; sb < kSuperBlock / 64; ++sb) {
                 int8_t sc[2][8];
                 int16x8_t mins[2];
@@ -253,15 +351,8 @@ void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
                     q8[1][i] = vld1q_s8(q8_base + i * 32 + 16);
                 }
                 for (int cp = 0; cp < 4; ++cp) {
-                    const uint8x16_t b0 = vld1q_u8(q4[b].qs + sb * kSuperBlock + 16 * cp);
-                    const uint8x16_t b1 = vld1q_u8(q4[b].qs + sb * kSuperBlock + 16 * cp + 64);
-                    const uint8x16_t b2 = vld1q_u8(q4[b].qs + sb * kSuperBlock + 16 * cp + 128);
-                    const uint8x16_t b3 = vld1q_u8(q4[b].qs + sb * kSuperBlock + 16 * cp + 192);
-                    const int8x16_t nib[2][4] = {
-                        {vreinterpretq_s8_u8(vandq_u8(b0, m4b)), vreinterpretq_s8_u8(vandq_u8(b1, m4b)),
-                         vreinterpretq_s8_u8(vandq_u8(b2, m4b)), vreinterpretq_s8_u8(vandq_u8(b3, m4b))},
-                        {vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)),
-                         vreinterpretq_s8_u8(vshrq_n_u8(b2, 4)), vreinterpretq_s8_u8(vshrq_n_u8(b3, 4))}};
+                    int8x16_t nib[2][4];  // [0: low, 1: high nibbles][k]
+                    for (int k = 0; k < 4; ++k) unpack_k_pair(q4[b], sb, cp, k, high, nib[0][k], nib[1][k]);
                     int32x4_t sb_acc[4];  // [2 rp + blk]
                     for (int rp = 0; rp < 2; ++rp) {
                         for (int blk = 0; blk < 2; ++blk) {
@@ -311,6 +402,79 @@ void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
             vst1q_f32(y + t * ldy + 8 * g, acc_f32[2 * t]);
             vst1q_f32(y + t * ldy + 8 * g + 4, acc_f32[2 * t + 1]);
         }
+    }
+}
+
+}  // namespace
+
+void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept {
+    gemv_k_r8(w, cols, g0, g1, x, y);
+}
+void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept {
+    gemm_k_r8(w, cols, g0, g1, x, y, ldy);
+}
+void gemv_q5_K_r8(const BlockQ5_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept {
+    gemv_k_r8(w, cols, g0, g1, x, y);
+}
+void gemm_q5_K_r8(const BlockQ5_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept {
+    gemm_k_r8(w, cols, g0, g1, x, y, ldy);
+}
+
+void gemv_q8_0_r4(const BlockQ8_0x4* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_0* x, float* y) noexcept {
+    const int64_t nb = cols / kBlock;
+    for (int64_t g = g0; g < g1; ++g) {
+        const BlockQ8_0x4* q = w + g * nb;
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int64_t b = 0; b < nb; ++b) {
+            // 16 bytes = 8 values of 2 weight rows; the 8 activation values twice.
+            const int8x16x4_t lo = vld1q_s8_x4(q[b].qs);
+            const int8x16x4_t hi = vld1q_s8_x4(q[b].qs + 64);
+            const int8x8x4_t a = vld1_s8_x4(x[b].qs);
+            int32x4_t r01 = vdupq_n_s32(0), r23 = vdupq_n_s32(0);  // lanes: [row, half of 8] pairs
+            for (int k = 0; k < 4; ++k) {
+                const int8x16_t ak = vcombine_s8(a.val[k], a.val[k]);
+                const int8x16x4_t& src = k < 2 ? lo : hi;
+                r01 = vdotq_s32(r01, src.val[(k % 2) * 2], ak);
+                r23 = vdotq_s32(r23, src.val[(k % 2) * 2 + 1], ak);
+            }
+            acc = epilogue_q8_0(acc, q[b], f16_to_f32(x[b].d), vpaddq_s32(r01, r23));
+        }
+        vst1q_f32(y + 4 * g, acc);
+    }
+}
+
+void gemm_q8_0_r4(const BlockQ8_0x4* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_0x4* x, float* y,
+                  int64_t ldy) noexcept {
+    const int64_t nb = cols / kBlock;
+    for (int64_t g = g0; g < g1; ++g) {
+        const BlockQ8_0x4* q = w + g * nb;
+        float32x4_t acc_f32[4];  // per activation row
+        for (float32x4_t& a : acc_f32) a = vdupq_n_f32(0.0f);
+        for (int64_t b = 0; b < nb; ++b) {
+            int32x4_t acc[4];  // SMMLA tiles [activation pair][weight pair]
+            for (int32x4_t& a : acc) a = vdupq_n_s32(0);
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const int8x16_t a01 = vld1q_s8(x[b].qs + chunk * 32);
+                const int8x16_t a23 = vld1q_s8(x[b].qs + chunk * 32 + 16);
+                const int8x16_t b01 = vld1q_s8(q[b].qs + chunk * 32);
+                const int8x16_t b23 = vld1q_s8(q[b].qs + chunk * 32 + 16);
+                acc[0] = vmmlaq_s32(acc[0], a01, b01);
+                acc[1] = vmmlaq_s32(acc[1], a01, b23);
+                acc[2] = vmmlaq_s32(acc[2], a23, b01);
+                acc[3] = vmmlaq_s32(acc[3], a23, b23);
+            }
+            // 2x2 tiles -> per activation row, weight rows 0-3.
+            const int32x4_t sum[4] = {
+                vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
+                vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
+                vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
+                vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
+            };
+            for (int t = 0; t < 4; ++t) acc_f32[t] = epilogue_q8_0(acc_f32[t], q[b], f16_to_f32(x[b].d[t]), sum[t]);
+        }
+        for (int t = 0; t < 4; ++t) vst1q_f32(y + t * ldy + 4 * g, acc_f32[t]);
     }
 }
 
@@ -473,6 +637,10 @@ void gemv_q6_K_r8(const BlockQ6_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_K
 void gemm_q6_K_r8(const BlockQ6_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_Kx4*, float*, int64_t) noexcept {}
 void gemv_q4_K_r8(const BlockQ4_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_K*, float*) noexcept {}
 void gemm_q4_K_r8(const BlockQ4_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_Kx4*, float*, int64_t) noexcept {}
+void gemv_q5_K_r8(const BlockQ5_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_K*, float*) noexcept {}
+void gemm_q5_K_r8(const BlockQ5_Kx8*, int64_t, int64_t, int64_t, const BlockQ8_Kx4*, float*, int64_t) noexcept {}
+void gemv_q8_0_r4(const BlockQ8_0x4*, int64_t, int64_t, int64_t, const BlockQ8_0*, float*) noexcept {}
+void gemm_q8_0_r4(const BlockQ8_0x4*, int64_t, int64_t, int64_t, const BlockQ8_0x4*, float*, int64_t) noexcept {}
 
 #endif
 

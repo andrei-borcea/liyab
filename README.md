@@ -41,7 +41,7 @@ This README describes what the code does today. Anything not implemented is list
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model or context lookup, batched verification, hybrid models included) | ✅ implemented |
-| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass); Q4_K / Q6_K repacked for i8mm (SMMLA) at load | ✅ implemented |
+| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass); Q4_K / Q5_K / Q6_K / Q8_0 repacked for i8mm (SMMLA) at load | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
 | Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
@@ -829,7 +829,7 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Quantization kernels.** On the CPU, TQ1_0 and NVFP4 still use the generic decode + SDOT path (correct, about
   3–7 GB/s matvec on 4 Apple M4 Pro cores versus 45–80 GB/s for Q2_K/Q3_K/Q4_K/IQ4_XS/TQ2_0), and the
   lattice-grid I-quants (IQ1/IQ2/IQ3, 20–30 GB/s) stay 2–3× slower than Q4_K because every 4–8 values cost a table
-  lookup. There are no i8mm (SMMLA) paths yet. On the GPU, TQ1_0, NVFP4 and BF16 have no kernel (CPU fallback).
+  lookup. Only Q4_K, Q5_K, Q6_K and Q8_0 have i8mm (SMMLA) paths (repacked at load). On the GPU, TQ1_0, NVFP4 and BF16 have no kernel (CPU fallback).
 * **Tokenizer.** Other BPE pre-tokenizers (GPT-2 default, DeepSeek V3, Tekken…) are not implemented.
 * **Architectures.** DeepSeek V4 (`deepseek4`: hyper-connections, compressed sparse attention, hash routing),
   fused `ffn_gate_up_exps` tensors, Gemma, Phi and YaRN RoPE scaling are not supported yet.
@@ -854,16 +854,24 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   memory, is the limit. 2×2 `smmla` tiles over the file's layout did not help either (the tile assembly costs
   more than it saves).
 * **Repacked weights for i8mm CPUs.** When the CPU computes every block (no GPU / NPU route) and has the i8mm
-  extension, the resident Q4_K and Q6_K matrices are rearranged at load into llama.cpp's 8-row interleaved
-  layout (`Q4_K_R8`, `Q6_K_R8`: lossless, same size). One `smmla` then multiplies 8 weight rows by 4 activation
-  rows: 4 rows cost ~1.7× one row instead of ~3.7×, and one row ~14% less than before (Q4_K 2048×8192, one core).
+  extension, the resident Q4_K, Q5_K and Q6_K matrices are rearranged at load into llama.cpp's 8-row interleaved
+  layouts (`Q4_K_R8`, `Q5_K_R8`, `Q6_K_R8`) and Q8_0 into its 4-row one (`Q8_0_R4`): lossless, same size. With
+  MoE expert streaming that is every matrix but the experts. One `smmla` then multiplies 8 (Q8_0: 4) weight rows
+  by 4 activation rows: 4 rows cost ~1.7× one row instead of ~3.7×, and one row ~14% less than before (Q4_K
+  2048×8192, one core). A last 2 or 3 activation rows go through the 4-row kernel too, padded with copies.
+  2048×8192 over 4 rows on the Snapdragon 8 Elite (8 threads): 380 µs instead of 500 (Q8_0), 300 instead of 623
+  (Q4_K), 408 instead of 601 (Q5_K), 387 instead of 728 (Q6_K); one row costs the same as before.
   The single-row kernel keeps the same integer sums and float epilogue as the 4-row one, so a token's logits do
   not depend on how many tokens share the matmul (tested), and speculative output still equals plain decoding.
   Qwen3-4B Q4_K_M on the phone: a 403-token prompt prefills in 11.7–14.0 s instead of 18.3–24.4, and lookup
   speculation now pays on text that repeats its context (code edit, 256 tokens, alternating runs, hot phone):
   11.27 / 11.16 tok/s without, 12.51 / 12.61 with `--lookup --draft-tokens 3 --fixed-drafts` (65% of drafts
   accepted), 9.97 / 9.70 with 7 drafts. Three drafts is the default: a verification pass of 4 tokens is exactly
-  one tile. MoE prefill reads the union of the batch's experts, so it runs at about decode speed.
+  one tile. MoE prefill reads the union of the batch's experts, so it runs at about decode speed. Repacking
+  Q8_0 and Q5_K as well (alternating runs against the Q4_K/Q6_K-only build, warm phone): Qwen3.6-35B-A3B UD
+  (Q8_0 attention and DeltaNet, experts streamed) decodes at 7.07 / 6.72 / 6.60 tok/s instead of 7.01 / 5.90 /
+  5.77 with a 444-token prompt prefilled ~3% faster; Qwen3.5-4B Q4_K_M prefills it in 15.8–15.9 s instead of
+  16.8–17.3 and decodes at 11.50 / 11.63 tok/s instead of 11.20 / 11.51.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.

@@ -261,17 +261,26 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
                        static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
     }
-    // CPU-only, fully resident models: Q4_K / Q6_K matrices in the layout of the
-    // i8mm batched kernels (a lossless rearrangement, same size). Streamed
-    // blocks are read in the file's layout, so a streaming model keeps it.
+    // CPU-only models: the resident Q4_K / Q5_K / Q6_K / Q8_0 matrices in the
+    // layout of the i8mm batched kernels (a lossless rearrangement, same
+    // size). With expert streaming that is every matrix but the experts (3-D,
+    // read from storage in the file's layout); a model under the layer
+    // streaming window keeps the file's layout throughout.
     if (options.repack_cpu && !model->file_->streaming()) {
-        for (const auto& [from, to] : {std::pair{DType::Q4_K, DType::Q4_K_R8}, std::pair{DType::Q6_K, DType::Q6_K_R8}}) {
+        struct Repack {
+            DType from, to;
+            int64_t rows, cols;  // required multiples
+        };
+        for (const Repack& r : {Repack{DType::Q4_K, DType::Q4_K_R8, 8, quant::kSuperBlock},
+                                Repack{DType::Q5_K, DType::Q5_K_R8, 8, quant::kSuperBlock},
+                                Repack{DType::Q6_K, DType::Q6_K_R8, 8, quant::kSuperBlock},
+                                Repack{DType::Q8_0, DType::Q8_0_R4, 4, quant::kBlock}}) {
             auto repacked = model->file_->requantize(
-                [&, from = from](const TensorView& t) {
-                    return t.type == from && t.n_dims == 2 && t.rows() % 8 == 0 && t.cols() % quant::kSuperBlock == 0 &&
+                [&](const TensorView& t) {
+                    return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
                            t.name != "token_embd.weight" && !model->file_->converted(t);
                 },
-                to);
+                r.to);
             if (!repacked) return repacked.status();
         }
     }

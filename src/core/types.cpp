@@ -68,6 +68,8 @@ DTypeTraits dtype_traits(DType type) noexcept {
         case DType::Q4_K: return {"q4_k", 256, 144};
         case DType::Q4_K_R8: return {"q4_k_r8", 256, 144};
         case DType::Q6_K_R8: return {"q6_k_r8", 256, 210};
+        case DType::Q5_K_R8: return {"q5_k_r8", 256, 176};
+        case DType::Q8_0_R4: return {"q8_0_r4", 32, 34};
         case DType::Q5_K: return {"q5_k", 256, 176};
         case DType::Q6_K: return {"q6_k", 256, 210};
         case DType::Q2_K: return {"q2_k", 256, 84};

@@ -198,7 +198,7 @@ void unpack_q5_block(const uint8_t* qh, const uint8_t* qs, bool symmetric, int8_
 
 // --- Repacked layouts (quant_repack.cpp) ---------------------------------
 //
-// Q4_K_R8 / Q6_K_R8: the super-blocks of 8 consecutive rows stored together, values
+// Q4_K_R8 / Q5_K_R8 / Q6_K_R8: the super-blocks of 8 consecutive rows stored together, values
 // interleaved 8 bytes at a time (llama.cpp's block_q4_Kx8), so one SMMLA
 // multiplies 8 weight rows by 4 activation rows (Q8_K_X4, also interleaved
 // 8 bytes at a time). A matmul over 4 activation rows then costs ~1.7x one
@@ -220,11 +220,27 @@ struct BlockQ6_Kx8 {
     uint8_t qh[512];      // high 2 bits, likewise
 };
 static_assert(sizeof(BlockQ6_Kx8) == 8 * sizeof(BlockQ6_K), "Q6_K_R8 keeps Q6_K's size");
+struct BlockQ5_Kx8 {      // Q4_Kx8 plus the 5th bits
+    uint16_t d[8];
+    uint16_t dmin[8];
+    uint8_t scales[96];
+    uint8_t qs[1024];
+    uint8_t qh[256];      // the 8 rows' qh, interleaved 8 bytes at a time
+};
+static_assert(sizeof(BlockQ5_Kx8) == 8 * sizeof(BlockQ5_K), "Q5_K_R8 keeps Q5_K's size");
 struct BlockQ8_Kx4 {
     float d[4];
     int8_t qs[kSuperBlock * 4];   // 4 rows interleaved 8 bytes at a time
     int16_t bsums[kSuperBlock / 4];
 };
+// Q8_0_R4: blocks of 4 consecutive Q8_0 rows stored together, values
+// interleaved 8 bytes at a time (llama.cpp's block_q8_0x4, interleave 8); the
+// same struct holds 4 interleaved Q8_0 activation rows.
+struct BlockQ8_0x4 {
+    uint16_t d[4];
+    int8_t qs[kBlock * 4];
+};
+static_assert(sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0), "Q8_0_R4 keeps Q8_0's size");
 
 // Whether the repacked kernels are built in (they also need the CPU's i8mm).
 bool repack_kernels_available() noexcept;
@@ -240,10 +256,23 @@ void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
 // Bit-identical to four gemv_q4_K_r8 calls.
 void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
                   int64_t ldy) noexcept;
-// Q6_K_R8 (llama.cpp's block_q6_Kx8): the same three functions.
+// Q5_K_R8 (llama.cpp's block_q5_Kx8) and Q6_K_R8 (block_q6_Kx8): the same three functions.
+void repack_q5_K_r8(const BlockQ5_K* src, int64_t rows, int64_t cols, BlockQ5_Kx8* dst) noexcept;
+void gemv_q5_K_r8(const BlockQ5_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept;
+void gemm_q5_K_r8(const BlockQ5_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept;
 void repack_q6_K_r8(const BlockQ6_K* src, int64_t rows, int64_t cols, BlockQ6_Kx8* dst) noexcept;
 void gemv_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept;
 void gemm_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept;
+// Q8_0_R4 (row groups of 4, Q8_0 activations): rearranges `rows` (a multiple
+// of 4) Q8_0 rows; interleaves 4 Q8_0 activation rows; row groups [g0, g1)
+// against one activation row (y[4 * g + i]) or 4 (y[t * ldy + 4 * g + i]),
+// bit-identical as above.
+void repack_q8_0_r4(const BlockQ8_0* src, int64_t rows, int64_t cols, BlockQ8_0x4* dst) noexcept;
+void interleave_q8_0_x4(const BlockQ8_0* const* rows, int64_t cols, BlockQ8_0x4* dst) noexcept;
+void gemv_q8_0_r4(const BlockQ8_0x4* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_0* x, float* y) noexcept;
+void gemm_q8_0_r4(const BlockQ8_0x4* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_0x4* x, float* y,
                   int64_t ldy) noexcept;
 
 }  // namespace liyab::quant

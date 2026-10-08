@@ -496,8 +496,10 @@ void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept {
             break;
         }
         case DType::Q4_K_R8:
+        case DType::Q5_K_R8:
         case DType::Q6_K_R8:
-            // Repacked layouts store 8 rows together: no single row to decode.
+        case DType::Q8_0_R4:
+            // Repacked layouts store 4 or 8 rows together: no single row to decode.
             // Only the CPU backend's matmuls read them; this path is never taken.
             std::fill_n(y, n, 0.0f);
             break;

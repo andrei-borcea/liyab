@@ -527,7 +527,7 @@ TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
     }
 }
 
-TEST_CASE("Repacked Q4_K_R8 / Q6_K_R8: gemm equals gemv exactly, and both match the row kernel") {
+TEST_CASE("Repacked K-quants (Q4_K_R8 / Q5_K_R8 / Q6_K_R8): gemm equals gemv exactly, and both match the row kernel") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");
         return;
@@ -569,6 +569,23 @@ TEST_CASE("Repacked Q4_K_R8 / Q6_K_R8: gemm equals gemv exactly, and both match 
     CHECK(part[0] == -1.0f && part[7] == -1.0f && part[16] == -1.0f);
     CHECK(part[8] != -1.0f && part[15] != -1.0f);
 
+    // Q5_K_R8 (5th bits interleaved alongside the nibbles).
+    std::vector<quant::BlockQ5_K> q5(static_cast<size_t>(rows * nb));
+    for (int64_t r = 0; r < rows; ++r) quant::quantize_row(DType::Q5_K, w.data() + r * cols, q5.data() + r * nb, cols);
+    std::vector<quant::BlockQ5_Kx8> packed5(static_cast<size_t>(rows / 8 * nb));
+    quant::repack_q5_K_r8(q5.data(), rows, cols, packed5.data());
+    quant::gemm_q5_K_r8(packed5.data(), cols, 0, rows / 8, act4.data(), batch.data(), rows);
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> single(static_cast<size_t>(rows));
+        quant::gemv_q5_K_r8(packed5.data(), cols, 0, rows / 8, rows4[t], single.data());
+        for (int64_t r = 0; r < rows; ++r) {
+            mismatches += single[static_cast<size_t>(r)] != batch[static_cast<size_t>(t * rows + r)];
+            const float ref = quant::dot_lowbit_q8_K(DType::Q5_K, q5.data() + r * nb, rows4[t], cols);
+            CHECK_NEAR(single[static_cast<size_t>(r)], ref, 1e-4f * (1.0f + std::fabs(ref)));
+        }
+    }
+    CHECK(mismatches == 0);
+
     // Q6_K_R8: no Q6_K quantizer, so random blocks (valid for any bytes; d kept finite).
     std::vector<quant::BlockQ6_K> q6(static_cast<size_t>(rows * nb));
     for (quant::BlockQ6_K& blk : q6) {
@@ -590,6 +607,99 @@ TEST_CASE("Repacked Q4_K_R8 / Q6_K_R8: gemm equals gemv exactly, and both match 
         }
     }
     CHECK(mismatches == 0);
+}
+
+TEST_CASE("Repacked Q8_0_R4: gemm equals gemv exactly, and both match the row kernel") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    std::mt19937 rng(37);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t rows = 12, cols = 96, nb = cols / 32;
+    std::vector<float> w(static_cast<size_t>(rows * cols));
+    for (float& v : w) v = normal(rng);
+    std::vector<quant::BlockQ8_0> q(static_cast<size_t>(rows * nb));
+    for (int64_t r = 0; r < rows; ++r) quant::quantize_row_q8_0(w.data() + r * cols, q.data() + r * nb, cols);
+    std::vector<quant::BlockQ8_0x4> packed(static_cast<size_t>(rows / 4 * nb));
+    quant::repack_q8_0_r4(q.data(), rows, cols, packed.data());
+    std::vector<quant::BlockQ8_0> act(static_cast<size_t>(4 * nb));
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> x(static_cast<size_t>(cols));
+        for (float& v : x) v = normal(rng);
+        quant::quantize_row_q8_0(x.data(), act.data() + t * nb, cols);
+    }
+    const quant::BlockQ8_0* rows4[4] = {act.data(), act.data() + nb, act.data() + 2 * nb, act.data() + 3 * nb};
+    std::vector<quant::BlockQ8_0x4> act4(static_cast<size_t>(nb));
+    quant::interleave_q8_0_x4(rows4, cols, act4.data());
+    std::vector<float> batch(static_cast<size_t>(4 * rows));
+    quant::gemm_q8_0_r4(packed.data(), cols, 0, rows / 4, act4.data(), batch.data(), rows);
+    int mismatches = 0;
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> single(static_cast<size_t>(rows));
+        quant::gemv_q8_0_r4(packed.data(), cols, 0, rows / 4, rows4[t], single.data());
+        for (int64_t r = 0; r < rows; ++r) {
+            mismatches += single[static_cast<size_t>(r)] != batch[static_cast<size_t>(t * rows + r)];
+            const float ref = quant::dot_q8_0_q8_0(q.data() + r * nb, rows4[t], cols);
+            CHECK_NEAR(single[static_cast<size_t>(r)], ref, 1e-4f * (1.0f + std::fabs(ref)));
+        }
+    }
+    CHECK(mismatches == 0);
+    std::vector<float> part(static_cast<size_t>(rows), -1.0f);
+    quant::gemv_q8_0_r4(packed.data(), cols, 1, 2, rows4[0], part.data());
+    CHECK(part[3] == -1.0f && part[8] == -1.0f);
+    CHECK(part[4] != -1.0f && part[7] != -1.0f);
+}
+
+TEST_CASE("CPU backend on repacked weights: any batch size gives each row's single-row result") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    std::mt19937 rng(41);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t rows = 52, cols = 256;  // groups of 8 / 4 cut by the threads' row ranges
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    std::vector<float> x(static_cast<size_t>(6 * cols));
+    for (float& v : x) v = normal(rng);
+    std::vector<float> w(static_cast<size_t>(rows * cols));
+    for (float& v : w) v = normal(rng);
+    for (const auto& [from, to] : {std::pair{DType::Q4_K, DType::Q4_K_R8}, std::pair{DType::Q5_K, DType::Q5_K_R8},
+                                   std::pair{DType::Q8_0, DType::Q8_0_R4}}) {
+        const int64_t group = to == DType::Q8_0_R4 ? 4 : 8;
+        TensorView t;
+        t.type = from;
+        t.n_dims = 2;
+        t.ne = {cols, rows - rows % group, 1, 1};
+        const size_t bytes = t.row_bytes() * static_cast<size_t>(t.rows());
+        std::vector<uint8_t> file(bytes), packed(bytes);
+        for (int64_t r = 0; r < t.rows(); ++r) quant::quantize_row(from, w.data() + r * cols, file.data() + r * t.row_bytes(), cols);
+        if (to == DType::Q4_K_R8) {
+            quant::repack_q4_K_r8(reinterpret_cast<const quant::BlockQ4_K*>(file.data()), t.rows(), cols,
+                                  reinterpret_cast<quant::BlockQ4_Kx8*>(packed.data()));
+        } else if (to == DType::Q5_K_R8) {
+            quant::repack_q5_K_r8(reinterpret_cast<const quant::BlockQ5_K*>(file.data()), t.rows(), cols,
+                                  reinterpret_cast<quant::BlockQ5_Kx8*>(packed.data()));
+        } else {
+            quant::repack_q8_0_r4(reinterpret_cast<const quant::BlockQ8_0*>(file.data()), t.rows(), cols,
+                                  reinterpret_cast<quant::BlockQ8_0x4*>(packed.data()));
+        }
+        t.type = to;
+        t.data = packed.data();
+        t.nbytes = bytes;
+        std::vector<float> single(static_cast<size_t>(6 * t.rows()));
+        for (int k = 0; k < 6; ++k) {
+            REQUIRE(cpu->matmul(t, x.data() + k * cols, single.data() + k * t.rows(), 1).is_ok());
+        }
+        int mismatches = 0;
+        for (int32_t n = 2; n <= 6; ++n) {
+            std::vector<float> y(static_cast<size_t>(n * t.rows()), -1.0f);
+            REQUIRE(cpu->matmul(t, x.data(), y.data(), n).is_ok());
+            for (size_t i = 0; i < y.size(); ++i) mismatches += y[i] != single[i];
+        }
+        CHECK(mismatches == 0);
+    }
 }
 
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
@@ -1082,16 +1192,14 @@ TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactl
     CHECK(max_abs_diff(*again, rows(5)) < 1e-4);
 }
 
-TEST_CASE("Repacked Q4_K weights (CPU i8mm): same logits, batch-size independent") {
-    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
-        std::printf("  skipped: no i8mm on this CPU or build\n");
-        return;
-    }
-    test::TinyModelSpec spec;
+// A model with `ffn` FFNs and Q8_0 attention / output: repacked, it computes
+// the plain model's logits, and one token at a time exactly the batch's.
+static void check_repacked_model(DType ffn, DType packed, const char* name) {
+    test::TinyModelSpec spec;  // Q8_0 attention and output
     spec.n_embd = 256;
     spec.n_ff = 512;
-    spec.ffn_type = DType::Q4_K;
-    const std::string& path = model_path("q4k_ffn", spec);
+    spec.ffn_type = ffn;
+    const std::string& path = model_path(name, spec);
     ThreadPool pool(4);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -1102,9 +1210,11 @@ TEST_CASE("Repacked Q4_K weights (CPU i8mm): same logits, batch-size independent
     auto repacked = load_transformer(path, options);
     auto stepwise = load_transformer(path, options);
     REQUIRE(plain && repacked && stepwise);
-    CHECK(repacked->file().tensor("blk.0.ffn_gate.weight")->type == DType::Q4_K_R8);
-    CHECK(repacked->file().tensor("blk.1.ffn_down.weight")->type == DType::Q4_K_R8);
-    CHECK(plain->file().tensor("blk.0.ffn_gate.weight")->type == DType::Q4_K);
+    CHECK(repacked->file().tensor("blk.0.ffn_gate.weight")->type == packed);
+    CHECK(repacked->file().tensor("blk.1.ffn_down.weight")->type == packed);
+    CHECK(repacked->file().tensor("blk.0.attn_q.weight")->type == DType::Q8_0_R4);
+    CHECK(repacked->file().tensor("output.weight")->type == DType::Q8_0_R4);
+    CHECK(plain->file().tensor("blk.0.ffn_gate.weight")->type == ffn);
     auto a = plain->forward(tokens, Transformer::Logits::All, route, pool);
     REQUIRE(a.has_value());
     const std::vector<float> expected(a->begin(), a->end());
@@ -1120,6 +1230,15 @@ TEST_CASE("Repacked Q4_K weights (CPU i8mm): same logits, batch-size independent
         const std::vector<float> row(batched.begin() + t * vocab, batched.begin() + (t + 1) * vocab);
         CHECK(max_abs_diff(*one, row) < 1e-4);
     }
+}
+
+TEST_CASE("Repacked weights (CPU i8mm): same logits, batch-size independent") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    check_repacked_model(DType::Q4_K, DType::Q4_K_R8, "q4k_ffn");
+    check_repacked_model(DType::Q5_K, DType::Q5_K_R8, "q5k_ffn");
 }
 
 TEST_CASE("Context limit is enforced") {

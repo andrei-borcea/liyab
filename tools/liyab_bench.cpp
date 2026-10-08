@@ -11,7 +11,9 @@
 //   liyab-bench [--threads 1,2,4,8] [--seconds 1.0]
 //
 // A last table times one matmul over 1, 2, 4 and 5 activation rows (the
-// shape of speculative verification and prefill) on every thread.
+// shape of speculative verification and prefill) on every thread, in the
+// file's layouts and, on i8mm CPUs, in the repacked ones the CPU backend
+// loads them into (Q4_K_R8, Q5_K_R8, Q6_K_R8, Q8_0_R4).
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS).
 #include <algorithm>
@@ -25,7 +27,9 @@
 #include <string>
 #include <vector>
 
+#include "core/quant.h"
 #include "core/thread_pool.h"
+#include "liyab/device_detect.h"
 #include "liyab/backend.h"
 
 namespace {
@@ -181,12 +185,20 @@ int main(int argc, char** argv) {
     const int32_t all = pool.max_threads();
     pool.set_active_threads(all);
     std::printf("\n%-28s | %d threads, us per pass for n activation rows (us per row)\n", "batched rows", all);
-    const Case batched[] = {
+    std::vector<Case> batched = {
         {"Q8_0 2048x8192", liyab::DType::Q8_0, 2048, 8192},
         {"Q4_K 2048x8192", liyab::DType::Q4_K, 2048, 8192},
         {"Q5_K 2048x8192", liyab::DType::Q5_K, 2048, 8192},
         {"Q6_K 2048x8192", liyab::DType::Q6_K, 2048, 8192},
     };
+    if (liyab::quant::repack_kernels_available() && liyab::detect_cpu().i8mm) {
+        batched.insert(batched.end(), {
+                                          {"Q8_0_R4 2048x8192", liyab::DType::Q8_0_R4, 2048, 8192},
+                                          {"Q4_K_R8 2048x8192", liyab::DType::Q4_K_R8, 2048, 8192},
+                                          {"Q5_K_R8 2048x8192", liyab::DType::Q5_K_R8, 2048, 8192},
+                                          {"Q6_K_R8 2048x8192", liyab::DType::Q6_K_R8, 2048, 8192},
+                                      });
+    }
     for (const Case& c : batched) {
         liyab::TensorView w;
         w.type = c.type;

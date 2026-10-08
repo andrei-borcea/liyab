@@ -154,9 +154,10 @@ public:
     // anonymous memory the loader owns, and drops their mapped pages:
     //  * DType::Q4_K or Q5_K from Q8_0 matrices with a multiple of 256
     //    columns (lossy: fewer bytes read per token; uses every core);
-    //  * DType::Q4_K_R8 / Q6_K_R8 from Q4_K / Q6_K matrices with a multiple of
-    //    8 rows and of 256 columns (lossless rearrangement for the CPU's
-    //    batched kernels).
+    //  * DType::Q4_K_R8 / Q5_K_R8 / Q6_K_R8 from Q4_K / Q5_K / Q6_K matrices
+    //    with a multiple of 8 rows and of 256 columns, or DType::Q8_0_R4
+    //    from Q8_0 matrices with a multiple of 4 rows (lossless
+    //    rearrangements for the CPU's batched kernels).
     // TensorView::type / data / nbytes then describe the converted copy,
     // while file_offset still names the original bytes. Call before any
     // compute reads the tensors. Returns the bytes saved.
