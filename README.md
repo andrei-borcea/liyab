@@ -610,6 +610,13 @@ Stacked (same session, the two undisturbed rounds): default 7.9–8.1 tok/s; `--
 plus `--expert-mass 0.9` 9.1–10.0; plus `--expert-mass 0.8 --requant 4` instead 9.2–10.9 (~92 ms per token: routed
 experts ~40 of which ~28 waiting for flash, DeltaNet ~26, LM head ~10, routers ~7, attention ~5).
 
+The same file on an Apple M4 Pro (48 GB, CPU backend, 10 threads, `--profile performance`, 64 greedy tokens): with
+the whole model in RAM (mapped in place, all 8 experts, no lossy option) 48–50 tok/s; with `--memory-budget 8000`
+(experts streamed) 32.6 tok/s; with the phone's 5500 MiB budget 27.5 tok/s, or 33.3 with `--experts 4`. Single runs;
+with 48 GB the macOS file cache still held the model, so streamed reads were partly served from RAM. The Metal
+backend is slower here (6.8 tok/s: one command buffer per matmul). The phone is ~6x slower than this Mac mostly
+because of memory bandwidth (~55 vs ~273 GB/s) and UFS instead of RAM for the experts.
+
 Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
 attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident
 weights (the UD quant keeps attention and DeltaNet projections in Q8_0, the LM head in Q6_K) plus ~0.6 GB of
