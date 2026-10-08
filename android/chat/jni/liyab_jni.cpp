@@ -164,6 +164,12 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_metadata(JNIEnv* env, 
     return env->NewStringUTF(value.c_str());
 }
 
+JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_supportedArchitectures(JNIEnv* env, jclass) {
+    std::string text(liyab_supported_architectures(nullptr, 0) + 1, '\0');
+    liyab_supported_architectures(text.data(), text.size());
+    return env->NewStringUTF(text.c_str());
+}
+
 JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_describe(JNIEnv* env, jclass, jlong h) {
     if (h == 0) return env->NewStringUTF("");
     std::string text(liyab_engine_describe(handle(h), nullptr, 0) + 1, '\0');

@@ -26,9 +26,9 @@ import java.util.regex.Pattern;
 final class HuggingFace {
     private static final String API = "https://huggingface.co";
     private static final String USER_AGENT = "LiyabChat/0.1 (Android)";
-    /** Architectures the engine runs (keep in sync with src/core/transformer.cpp). */
+    /** Architectures the engine runs, as reported by the native library (never a copy that could drift). */
     static final java.util.Set<String> SUPPORTED_ARCHS =
-            new java.util.TreeSet<>(java.util.Arrays.asList("llama", "mistral", "qwen2", "qwen3", "qwen35"));
+            new java.util.TreeSet<>(java.util.Arrays.asList(LiyabNative.supportedArchitectures().split(",")));
     // One part of a split GGUF model (gguf-split): <prefix>-00002-of-00005.gguf
     private static final Pattern SPLIT = Pattern.compile("-(\\d{5})-of-(\\d{5})\\.gguf$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUANT = Pattern.compile(

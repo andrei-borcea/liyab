@@ -43,6 +43,9 @@ final class LiyabNative {
 
     static native String describe(long engine);
 
+    /** GGUF architectures the engine runs, comma-separated (e.g. "llama,qwen2,..."). */
+    static native String supportedArchitectures();
+
     /** A scalar GGUF metadata value of the loaded model as text (e.g. "general.sampling.temp"), or null. */
     static native String metadata(long engine, String key);
 

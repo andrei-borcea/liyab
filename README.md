@@ -276,7 +276,8 @@ liyab_engine_destroy(engine);
 No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with the message available from
 `liyab_last_error()` (thread-local). `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
-the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_engine_config.expert_cache_mb`
+the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
+build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off), and `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read` and `expert_stall_ms`.
 

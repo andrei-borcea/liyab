@@ -194,6 +194,9 @@ LIYAB_C_API size_t liyab_engine_describe(const liyab_engine* engine, char* buffe
 LIYAB_C_API int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size);
 /* Same as liyab_engine_describe for the device only; no engine required. */
 LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
+/* GGUF `general.architecture` values this build runs, comma-separated; same
+ * buffer contract as liyab_engine_describe. */
+LIYAB_C_API size_t liyab_supported_architectures(char* buffer, size_t size);
 
 #ifdef __cplusplus
 }

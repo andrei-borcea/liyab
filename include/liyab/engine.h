@@ -64,6 +64,11 @@ struct EngineConfig {
     ExperimentalConfig experimental;
 };
 
+// GGUF `general.architecture` values this build can run, comma-separated
+// (e.g. "llama,mistral,qwen2,..."), so front ends can filter models before
+// downloading them.
+LIYAB_API std::string supported_architectures();
+
 // Receives each decoded piece (complete UTF-8 only) and the token that
 // completed it. Return false to stop generation.
 using TokenCallback = std::function<bool(std::string_view piece, int32_t token)>;

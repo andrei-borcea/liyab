@@ -259,6 +259,14 @@ int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char*
     }
 }
 
+size_t liyab_supported_architectures(char* buffer, size_t size) {
+    try {
+        return copy_out(liyab::supported_architectures(), buffer, size);
+    } catch (...) {
+        return copy_out("", buffer, size);
+    }
+}
+
 size_t liyab_describe_device(char* buffer, size_t size) {
     try {
         return copy_out(liyab::describe_device(liyab::detect_device()), buffer, size);

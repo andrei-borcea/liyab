@@ -60,17 +60,18 @@ TensorView expert_slice(const TensorView& t, int64_t e) {
     return v;
 }
 
-std::string supported_archs() {
-    std::string out;
-    for (const ArchTraits& a : kArchs) out += (out.empty() ? "" : ", ") + std::string(a.name);
-    return out;
-}
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
+std::string supported_architectures() {
+    std::string out;
+    for (const ArchTraits& a : kArchs) out += (out.empty() ? "" : ",") + std::string(a.name);
+    return out;
+}
+
 Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoader> file,
                                                        const TransformerOptions& options) {
     if (!file) return Status(ErrorCode::InvalidArgument, "null model file");
@@ -88,7 +89,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     }
     if (traits == nullptr) {
         return Status(ErrorCode::Unsupported,
-                      "architecture '" + c.arch + "' is not supported yet (supported: " + supported_archs() + ")");
+                      "architecture '" + c.arch + "' is not supported yet (supported: " + supported_architectures() + ")");
     }
     c.rope_neox = traits->rope_neox;
 
