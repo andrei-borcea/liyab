@@ -495,6 +495,39 @@ TEST_CASE("Transformer matches the float reference (F32 weights, F16 KV)") {
     }
 }
 
+TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
+    test::TinyModelSpec dense = f32_spec();
+    dense.arch = "qwen3";
+    test::TinyModelSpec moe = dense;
+    moe.arch = "qwen3moe";
+    moe.n_expert = 8;
+    moe.n_expert_used = 3;
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto a = load_transformer(model_path("dense_twin", dense), options);
+    auto b = load_transformer(model_path("moe_twin", moe), options);
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(b->config().n_expert == 8 && b->config().n_expert_used == 3);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto la = a->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(la.has_value());
+    const std::vector<float> dense_logits(la->begin(), la->end());
+    auto lb = b->forward(tokens, Transformer::Logits::All, route, pool);  // batched: tokens grouped per expert
+    REQUIRE(lb.has_value());
+    CHECK(max_abs_diff(*lb, dense_logits) < 1e-3);
+    b->reset();
+    std::vector<float> stepwise;
+    for (const int32_t t : tokens) {  // decode path: one token, top-3 experts each
+        auto r = b->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(r.has_value());
+        stepwise.insert(stepwise.end(), r->begin(), r->end());
+    }
+    CHECK(max_abs_diff(stepwise, dense_logits) < 1e-3);
+}
+
 TEST_CASE("Transformer with mixed Q4_0/Q8_0 weights and Q8_0 KV stays close to the reference") {
     auto model = load_transformer(mixed_model());
     REQUIRE(model != nullptr);

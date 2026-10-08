@@ -199,6 +199,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
     w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
+    if (s.n_expert > 0) {
+        w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
+        w.add_u32(a + ".expert_used_count", static_cast<uint32_t>(s.n_expert_used));
+        w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
+        w.add_bool(a + ".expert_weights_norm", true);
+    }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
     w.add_f32(a + ".rope.freq_base", 10000.0f);
     w.add_string("tokenizer.ggml.model", "llama");
@@ -211,6 +217,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_bool("tokenizer.ggml.add_bos_token", true);
 
     std::mt19937_64 rng(s.seed);
+    std::mt19937_64 router_rng(s.seed ^ 0x5eed);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     auto random = [&](int64_t n, float scale) {
         std::vector<float> v(static_cast<size_t>(n));
@@ -242,9 +249,27 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
         w.add_tensor(p + "ffn_norm.weight", {d}, DType::F32, norm_weights(d));
-        w.add_tensor(p + "ffn_gate.weight", {d, s.n_ff}, s.ffn_type, random(d * s.n_ff, s.weight_scale));
-        w.add_tensor(p + "ffn_up.weight", {d, s.n_ff}, s.ffn_type, random(d * s.n_ff, s.weight_scale));
-        w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, random(s.n_ff * d, s.weight_scale));
+        const std::vector<float> gate = random(d * s.n_ff, s.weight_scale);
+        const std::vector<float> up = random(d * s.n_ff, s.weight_scale);
+        const std::vector<float> down = random(s.n_ff * d, s.weight_scale);
+        if (s.n_expert == 0) {
+            w.add_tensor(p + "ffn_gate.weight", {d, s.n_ff}, s.ffn_type, gate);
+            w.add_tensor(p + "ffn_up.weight", {d, s.n_ff}, s.ffn_type, up);
+            w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);
+            continue;
+        }
+        auto stacked = [&](const std::vector<float>& one) {
+            std::vector<float> all;
+            for (int32_t e = 0; e < s.n_expert; ++e) all.insert(all.end(), one.begin(), one.end());
+            return all;
+        };
+        w.add_tensor(p + "ffn_gate_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, stacked(gate));
+        w.add_tensor(p + "ffn_up_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, stacked(up));
+        w.add_tensor(p + "ffn_down_exps.weight", {s.n_ff, d, s.n_expert}, s.ffn_type, stacked(down));
+        // The router uses its own generator so every other weight matches the dense twin.
+        std::vector<float> router(static_cast<size_t>(d * s.n_expert));
+        for (float& x : router) x = normal(router_rng) * 0.5f;
+        w.add_tensor(p + "ffn_gate_inp.weight", {d, s.n_expert}, DType::F32, router);
     }
     w.write(path);
 }

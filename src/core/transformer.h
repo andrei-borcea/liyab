@@ -7,7 +7,8 @@
 // mixer a block uses, and which optional tensors it has, is decided by the
 // tensors present, so hybrid models (Qwen3.5: three DeltaNet blocks per
 // attention block) and plain transformers (Llama, Mistral, Qwen2/3) share one
-// forward pass. Architectures only contribute a small traits row (RoPE style).
+// forward pass. The FFN is dense SwiGLU or a mixture of experts (router +
+// top-k routed experts + optional gated shared expert), again per block. Architectures only contribute a small traits row (RoPE style).
 // Tensor precision is per tensor, so mixed-precision files run unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
@@ -28,6 +29,9 @@
 namespace liyab {
 
 class ThreadPool;
+
+// How a mixture-of-experts router turns logits into expert probabilities.
+enum class MoeGating : uint8_t { Softmax, Sigmoid };
 
 // Token mixer of one block.
 enum class MixerKind : uint8_t {
@@ -58,6 +62,15 @@ struct ModelConfig {
     int32_t ssm_head_dim = 0;     // key and value head size (ssm.state_size)
     int32_t ssm_k_heads = 0;      // query/key heads (ssm.group_count)
     int32_t ssm_v_heads = 0;      // value heads = recurrent states per block (ssm.time_step_rank)
+
+    // Mixture of experts (zero when every FFN is dense).
+    int32_t n_expert = 0;        // routed experts per MoE block
+    int32_t n_expert_used = 0;   // experts selected per token (top-k)
+    int32_t n_ff_expert = 0;     // hidden size of one routed expert
+    int32_t n_ff_shared = 0;     // hidden size of the shared expert (0: none)
+    MoeGating moe_gating = MoeGating::Softmax;
+    bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
+    float moe_weights_scale = 1.0f;
 
     // True when some block keeps a recurrent state: such models cannot roll
     // back to an arbitrary earlier position (only to 0 or the current one).
@@ -138,6 +151,8 @@ private:
         kQ, kK, kV, kO,              // attention (kQ yields [q | gate] per head when gated)
         kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
         kGate, kUp, kDown,           // SwiGLU FFN
+        kRouter, kGateExps, kUpExps, kDownExps,  // MoE: router [n_embd x n_expert], experts stacked on dim 2
+        kGateShared, kUpShared, kDownShared,     // MoE: shared expert
         kWeightRoles
     };
     struct Layer {
@@ -151,6 +166,9 @@ private:
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
         std::vector<float> ssm_dt;   // per value head: decay bias
         std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
+        bool moe = false;                 // FFN is a mixture of experts
+        std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
+        std::vector<float> expert_bias;   // optional: added to probabilities for selection only
     };
     // Recurrent memory of one DeltaNet block.
     struct RecurrentState {
@@ -170,6 +188,9 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // FFNs: read the normalized input from xb_, leave the output in xb_.
+    Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
+    Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
@@ -202,6 +223,7 @@ private:
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
+    std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_;  // MoE scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
 };
 

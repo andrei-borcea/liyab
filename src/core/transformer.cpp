@@ -41,11 +41,24 @@ void l2norm(float* x, int32_t n, float eps) {
 // (block mixers, gates, biases, norms) is discovered from the file.
 struct ArchTraits {
     std::string_view name;
-    bool rope_neox;  // rotate pairs (i, i + rope_dim/2) instead of (2i, 2i + 1)
+    bool rope_neox;         // rotate pairs (i, i + rope_dim/2) instead of (2i, 2i + 1)
+    bool moe_norm_weights;  // MoE top-k weights renormalized when the file does not say
 };
 constexpr ArchTraits kArchs[] = {
-    {"llama", false}, {"mistral", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true},
+    {"llama", false, false},  {"mistral", false, false}, {"qwen2", true, false},     {"qwen3", true, false},
+    {"qwen35", true, false},  {"qwen3moe", true, true},  {"qwen35moe", true, true},
 };
+
+// Expert `e` of a stacked expert tensor [cols, rows, n_expert] as a 2-D view.
+TensorView expert_slice(const TensorView& t, int64_t e) {
+    TensorView v = t;
+    v.n_dims = 2;
+    v.ne = {t.ne[0], t.ne[1], 1, 1};
+    v.nbytes = t.row_bytes() * static_cast<size_t>(t.ne[1]);
+    v.data = t.data + static_cast<size_t>(e) * v.nbytes;
+    v.file_offset = t.file_offset + static_cast<uint64_t>(e) * v.nbytes;
+    return v;
+}
 
 std::string supported_archs() {
     std::string out;
@@ -93,7 +106,25 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     c.n_layers -= static_cast<int32_t>(f.get_int(key("nextn_predict_layers")).value_or(0));
     if (c.n_layers <= 0) return Status(ErrorCode::InvalidModel, "invalid nextn_predict_layers");
     LIYAB_RETURN_IF_ERROR(require_int("embedding_length", c.n_embd));
-    LIYAB_RETURN_IF_ERROR(require_int("feed_forward_length", c.n_ff));
+    // Mixture of experts: dense FFN size is optional when every FFN is MoE.
+    c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
+    if (c.n_expert > 0) {
+        LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
+        LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
+        c.n_ff_shared = static_cast<int32_t>(f.get_int(key("expert_shared_feed_forward_length")).value_or(0));
+        const int64_t gating = f.get_int(key("expert_gating_func")).value_or(1);
+        if (gating != 1 && gating != 2) {
+            return Status(ErrorCode::Unsupported, "MoE gating function " + std::to_string(gating) + " is not supported");
+        }
+        c.moe_gating = gating == 2 ? MoeGating::Sigmoid : MoeGating::Softmax;
+        const GgufValue* norm = f.metadata(key("expert_weights_norm"));
+        c.moe_norm_weights = norm != nullptr && norm->as_bool() ? *norm->as_bool() : traits->moe_norm_weights;
+        c.moe_weights_scale = static_cast<float>(f.get_float(key("expert_weights_scale")).value_or(1.0));
+        if (c.moe_weights_scale == 0.0f) c.moe_weights_scale = 1.0f;
+        if (c.n_expert_used > c.n_expert) return Status(ErrorCode::InvalidModel, "expert_used_count > expert_count");
+    }
+    c.n_ff = static_cast<int32_t>(f.get_int(key("feed_forward_length")).value_or(0));
+    if (c.n_ff <= 0 && c.n_expert == 0) return Status(ErrorCode::InvalidModel, "missing or invalid " + key("feed_forward_length"));
     LIYAB_RETURN_IF_ERROR(require_int("attention.head_count", c.n_head));
     c.n_head_kv = static_cast<int32_t>(f.get_int(key("attention.head_count_kv")).value_or(c.n_head));
     c.head_dim = static_cast<int32_t>(f.get_int(key("attention.key_length")).value_or(c.n_embd / c.n_head));
@@ -140,9 +171,16 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     }
 
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
+    const Layer& first = model->layers_[0];
+    const TensorView* ffn_weight = first.moe ? first.w[kUpExps] : first.w[kUp];
     LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d, %d attention + %d DeltaNet blocks)", c.n_layers,
-                   std::string(dtype_traits(model->layers_[0].w[kUp]->type).name).c_str(), c.arch.c_str(), c.head_dim,
+                   std::string(dtype_traits(ffn_weight->type).name).c_str(), c.arch.c_str(), c.head_dim,
                    c.n_attn_layers, c.n_layers - c.n_attn_layers);
+    if (c.n_expert > 0) {
+        LIYAB_LOG_INFO("MoE: %d experts, top-%d, expert ff %d, shared ff %d, %s gating%s", c.n_expert, c.n_expert_used,
+                       c.n_ff_expert, c.n_ff_shared, c.moe_gating == MoeGating::Softmax ? "softmax" : "sigmoid",
+                       c.moe_norm_weights ? ", renormalized" : "");
+    }
 
     // Context and KV cache.
     model->context_length_ = options.context_length > 0
@@ -280,9 +318,40 @@ Status Transformer::bind_weights() {
                                          ? layer_name(l, "ffn_norm.weight")
                                          : layer_name(l, "post_attention_norm.weight");
         LIYAB_RETURN_IF_ERROR(vec(ffn_norm, c.n_embd, true, L.ffn_norm));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
-        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
+        // A router tensor makes the FFN a mixture of experts.
+        L.moe = f.tensor(layer_name(l, "ffn_gate_inp.weight")) != nullptr;
+        if (!L.moe) {
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
+            continue;
+        }
+        if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
+        if (f.tensor(layer_name(l, "ffn_gate_up_exps.weight")) != nullptr) {
+            return Status(ErrorCode::Unsupported, "fused ffn_gate_up_exps tensors are not supported yet");
+        }
+        LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate_inp.weight"), c.n_embd, c.n_expert, L.w[kRouter]));
+        auto experts = [&](const char* suffix, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
+            const std::string name = layer_name(l, suffix);
+            const TensorView* t = f.tensor(name);
+            if (t == nullptr) return Status(ErrorCode::InvalidModel, "missing tensor '" + name + "'");
+            if (t->ne[0] != cols || t->ne[1] != rows || t->ne[2] != c.n_expert || t->ne[3] != 1) {
+                return Status(ErrorCode::InvalidModel, "tensor '" + name + "' does not have the expert shape");
+            }
+            out = t;
+            return Status::ok();
+        };
+        LIYAB_RETURN_IF_ERROR(experts("ffn_gate_exps.weight", c.n_embd, c.n_ff_expert, L.w[kGateExps]));
+        LIYAB_RETURN_IF_ERROR(experts("ffn_up_exps.weight", c.n_embd, c.n_ff_expert, L.w[kUpExps]));
+        LIYAB_RETURN_IF_ERROR(experts("ffn_down_exps.weight", c.n_ff_expert, c.n_embd, L.w[kDownExps]));
+        LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "exp_probs_b.bias"), c.n_expert, false, L.expert_bias));
+        if (f.tensor(layer_name(l, "ffn_up_shexp.weight")) != nullptr) {
+            const int64_t sh = c.n_ff_shared > 0 ? c.n_ff_shared : f.tensor(layer_name(l, "ffn_up_shexp.weight"))->rows();
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_gate_shexp.weight"), c.n_embd, sh, L.w[kGateShared]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_up_shexp.weight"), c.n_embd, sh, L.w[kUpShared]));
+            LIYAB_RETURN_IF_ERROR(matrix(layer_name(l, "ffn_down_shexp.weight"), sh, c.n_embd, L.w[kDownShared]));
+            LIYAB_RETURN_IF_ERROR(vec(layer_name(l, "ffn_gate_inp_shexp.weight"), c.n_embd, false, L.shared_gate));
+        }
     }
 
     states_.resize(static_cast<size_t>(state_slots));
@@ -626,6 +695,128 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
     return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
 
+Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                              FfnMatmulHook* hook) {
+    const ModelConfig& c = config_;
+    const size_t rows = static_cast<size_t>(n) * static_cast<size_t>(c.n_ff);
+    hb_.resize(rows);
+    hb2_.resize(rows);
+    // FFN projections: an experimental override first, else the routed backend.
+    auto project = [&](FfnProjection p, const TensorView& m, const float* x, float* y) -> Status {
+        if (hook != nullptr && hook->ffn_matmul(layer, p, x, y, n)) return Status::ok();
+        return matmul(route, route.ffn, m, x, y, n);
+    };
+    if (hook != nullptr) {
+        LIYAB_RETURN_IF_ERROR(project(FfnProjection::Gate, w[kGate], xb_.data(), hb_.data()));
+        LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb2_.data()));
+    } else {
+        const TensorView* gate_up[] = {&w[kGate], &w[kUp]};
+        float* outs[] = {hb_.data(), hb2_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
+    }
+    for (size_t i = 0; i < rows; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+    return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
+}
+
+// Mixture of experts, as llama.cpp's build_moe_ffn: router probabilities
+// (softmax or sigmoid), top-k selection (optionally on probability + bias),
+// optional renormalization and scale; each selected expert is a SwiGLU FFN.
+// Tokens are grouped by expert so a batch reads every expert once. A shared
+// expert, optionally scaled by sigmoid(shared_gate . x), is added on top.
+Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto d = static_cast<size_t>(c.n_embd);
+    const auto E = static_cast<size_t>(c.n_expert);
+    const auto K = static_cast<size_t>(c.n_expert_used);
+    const auto ff = static_cast<size_t>(c.n_ff_expert);
+
+    router_.resize(un * E);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
+
+    // Routing: per expert, the (token, weight) pairs that selected it.
+    std::vector<std::vector<std::pair<int32_t, float>>> assigned(E);
+    std::vector<float> probs(E);
+    std::vector<int32_t> order(E);
+    for (size_t t = 0; t < un; ++t) {
+        const float* logits = router_.data() + t * E;
+        if (c.moe_gating == MoeGating::Softmax) {
+            const float mx = *std::max_element(logits, logits + E);
+            float sum = 0.0f;
+            for (size_t e = 0; e < E; ++e) sum += probs[e] = std::exp(logits[e] - mx);
+            for (float& p : probs) p /= sum;
+        } else {
+            for (size_t e = 0; e < E; ++e) probs[e] = sigmoid(logits[e]);
+        }
+        auto selection = [&](int32_t e) {
+            return probs[static_cast<size_t>(e)] + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
+        };
+        for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(K), order.end(),
+                          [&](int32_t a, int32_t b) { return selection(a) > selection(b) || (selection(a) == selection(b) && a < b); });
+        float sum = 0.0f;
+        for (size_t k = 0; k < K; ++k) sum += probs[static_cast<size_t>(order[k])];
+        const float norm = c.moe_norm_weights ? 1.0f / std::max(sum, 6.103515625e-5f) : 1.0f;
+        for (size_t k = 0; k < K; ++k) {
+            const auto e = static_cast<size_t>(order[k]);
+            assigned[e].emplace_back(static_cast<int32_t>(t), probs[e] * norm * c.moe_weights_scale);
+        }
+    }
+
+    moe_out_.assign(un * d, 0.0f);
+    for (size_t e = 0; e < E; ++e) {
+        const auto& users = assigned[e];
+        if (users.empty()) continue;
+        const auto rows = static_cast<int32_t>(users.size());
+        ein_.resize(users.size() * d);
+        for (size_t i = 0; i < users.size(); ++i) {
+            std::copy_n(xb_.data() + static_cast<size_t>(users[i].first) * d, d, ein_.data() + i * d);
+        }
+        const TensorView gate = expert_slice(w[kGateExps], static_cast<int64_t>(e));
+        const TensorView up = expert_slice(w[kUpExps], static_cast<int64_t>(e));
+        const TensorView down = expert_slice(w[kDownExps], static_cast<int64_t>(e));
+        eh_.resize(users.size() * ff);
+        eh2_.resize(users.size() * ff);
+        eout_.resize(users.size() * d);
+        // Expert slices are transient views: they run on the CPU, which reads them in place.
+        const TensorView* gate_up[] = {&gate, &up};
+        float* outs[] = {eh_.data(), eh2_.data()};
+        LIYAB_RETURN_IF_ERROR(route.cpu->matmul_group(gate_up, ein_.data(), outs, rows));
+        for (size_t i = 0; i < eh_.size(); ++i) eh_[i] = silu(eh_[i]) * eh2_[i];
+        LIYAB_RETURN_IF_ERROR(route.cpu->matmul(down, eh_.data(), eout_.data(), rows));
+        for (size_t i = 0; i < users.size(); ++i) {
+            float* dst = moe_out_.data() + static_cast<size_t>(users[i].first) * d;
+            const float* src = eout_.data() + i * d;
+            const float weight = users[i].second;
+            for (size_t j = 0; j < d; ++j) dst[j] += weight * src[j];
+        }
+    }
+
+    if (L.w[kUpShared] != nullptr) {
+        const auto sh = static_cast<size_t>(w[kUpShared].rows());
+        hb_.resize(un * sh);
+        hb2_.resize(un * sh);
+        const TensorView* gate_up[] = {&w[kGateShared], &w[kUpShared]};
+        float* outs[] = {hb_.data(), hb2_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
+        for (size_t i = 0; i < un * sh; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+        eout_.resize(un * d);
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), eout_.data(), n));
+        for (size_t t = 0; t < un; ++t) {
+            float scale = 1.0f;
+            if (!L.shared_gate.empty()) {
+                float dot = 0.0f;
+                for (size_t j = 0; j < d; ++j) dot += L.shared_gate[j] * xb_[t * d + j];
+                scale = sigmoid(dot);
+            }
+            for (size_t j = 0; j < d; ++j) moe_out_[t * d + j] += scale * eout_[t * d + j];
+        }
+    }
+    std::copy(moe_out_.begin(), moe_out_.end(), xb_.begin());
+    return Status::ok();
+}
+
 Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tokens, Logits logits,
                                                     const Route& route, ThreadPool& pool, const ForwardHooks* hooks) {
     const ModelConfig& c = config_;
@@ -645,11 +836,6 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
     FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;
     FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
-    // FFN projections: an experimental override first, else the routed backend.
-    auto ffn_matmul = [&](int32_t layer, FfnProjection p, const TensorView& w, const float* x, float* y) -> Status {
-        if (ffn_hook != nullptr && ffn_hook->ffn_matmul(layer, p, x, y, n)) return Status::ok();
-        return matmul(route, route.ffn, w, x, y, n);
-    };
     last_ffn_skips_ = 0;
 
     const size_t d = static_cast<size_t>(c.n_embd);
@@ -662,9 +848,6 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     k_.resize(un * kv_dim);
     v_.resize(un * kv_dim);
     att_.resize(un * q_dim);
-    hb_.resize(un * static_cast<size_t>(c.n_ff));
-    hb2_.resize(un * static_cast<size_t>(c.n_ff));
-
     for (size_t t = 0; t < un; ++t) {
         quant::dequantize_row(token_embd_->type, token_embd_->row(tokens[t]), x_.data() + t * d, c.n_embd);
     }
@@ -687,23 +870,15 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         }
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
 
-        // --- SwiGLU FFN block (skippable by an experimental hook) ---
+        // --- FFN block: dense SwiGLU or mixture of experts (skippable by an experimental hook) ---
         if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
             ++last_ffn_skips_;
         } else {
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
-            if (ffn_hook != nullptr) {  // experimental per-projection override
-                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Gate, w[kGate], xb_.data(), hb_.data()));
-                LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Up, w[kUp], xb_.data(), hb2_.data()));
-            } else {
-                const TensorView* gate_up[] = {&w[kGate], &w[kUp]};
-                float* outs[] = {hb_.data(), hb2_.data()};
-                LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
-            }
-            for (size_t i = 0; i < hb_.size(); ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
-            LIYAB_RETURN_IF_ERROR(ffn_matmul(l, FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
+            if (L.moe) LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, route));
+            else LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, route, ffn_hook));
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 

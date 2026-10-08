@@ -40,7 +40,7 @@ private:
 };
 
 struct TinyModelSpec {
-    std::string arch = "llama";  // "llama" or "qwen2" (adds QKV bias, NeoX RoPE)
+    std::string arch = "llama";  // "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3" or "qwen3moe"
     int32_t n_layers = 2;
     int32_t n_embd = 128;
     int32_t n_ff = 256;
@@ -55,6 +55,11 @@ struct TinyModelSpec {
     bool tied_output = false;
     uint64_t seed = 1;
     float weight_scale = 0.08f;
+    // n_expert > 0 writes mixture-of-experts FFNs: a random router and
+    // n_expert copies of the dense FFN weights the same seed would produce,
+    // so the model must compute exactly what its dense twin computes.
+    int32_t n_expert = 0;
+    int32_t n_expert_used = 0;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

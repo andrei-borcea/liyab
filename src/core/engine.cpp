@@ -285,6 +285,9 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
             experimental::EarlyExitConfig{x.early_exit_threshold, x.early_exit_min_layer, x.early_exit_interval});
     }
     if (x.tdss) {
+        if (impl->target->config().n_expert > 0) {
+            return Status(ErrorCode::Unsupported, "TDSS sparsifies dense FFNs; this model uses mixture-of-experts FFNs");
+        }
         std::vector<std::array<const TensorView*, 3>> ffn;
         for (int32_t l = 0; l < impl->target->config().n_layers; ++l) ffn.push_back(impl->target->ffn_weights(l));
         auto tdss = experimental::Tdss::create(ffn, *impl->pool, {x.tdss_force});
