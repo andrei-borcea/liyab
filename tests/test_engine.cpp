@@ -527,7 +527,7 @@ TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
     }
 }
 
-TEST_CASE("Repacked Q4_K_R8: gemm equals gemv exactly, and both match the row kernel") {
+TEST_CASE("Repacked Q4_K_R8 / Q6_K_R8: gemm equals gemv exactly, and both match the row kernel") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");
         return;
@@ -568,6 +568,28 @@ TEST_CASE("Repacked Q4_K_R8: gemm equals gemv exactly, and both match the row ke
     quant::gemv_q4_K_r8(packed.data(), cols, 1, 2, rows4[0], part.data());
     CHECK(part[0] == -1.0f && part[7] == -1.0f && part[16] == -1.0f);
     CHECK(part[8] != -1.0f && part[15] != -1.0f);
+
+    // Q6_K_R8: no Q6_K quantizer, so random blocks (valid for any bytes; d kept finite).
+    std::vector<quant::BlockQ6_K> q6(static_cast<size_t>(rows * nb));
+    for (quant::BlockQ6_K& blk : q6) {
+        auto* bytes = reinterpret_cast<uint8_t*>(&blk);
+        for (size_t i = 0; i < sizeof blk; ++i) bytes[i] = static_cast<uint8_t>(rng());
+        blk.d = quant::fp32_to_fp16(0.002f + 0.001f * static_cast<float>(rng() % 7));
+    }
+    std::vector<quant::BlockQ6_Kx8> packed6(static_cast<size_t>(rows / 8 * nb));
+    quant::repack_q6_K_r8(q6.data(), rows, cols, packed6.data());
+    quant::gemm_q6_K_r8(packed6.data(), cols, 0, rows / 8, act4.data(), batch.data(), rows);
+    mismatches = 0;
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> single(static_cast<size_t>(rows));
+        quant::gemv_q6_K_r8(packed6.data(), cols, 0, rows / 8, rows4[t], single.data());
+        for (int64_t r = 0; r < rows; ++r) {
+            mismatches += single[static_cast<size_t>(r)] != batch[static_cast<size_t>(t * rows + r)];
+            const float ref = quant::dot_lowbit_q8_K(DType::Q6_K, q6.data() + r * nb, rows4[t], cols);
+            CHECK_NEAR(single[static_cast<size_t>(r)], ref, 1e-4f * (1.0f + std::fabs(ref)));
+        }
+    }
+    CHECK(mismatches == 0);
 }
 
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {

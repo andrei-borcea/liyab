@@ -75,7 +75,9 @@ struct EngineConfig {
     // MoE: at most this many experts per token (the top ones, renormalized);
     // 0: the model's own top-k. Lossy when below it.
     int32_t moe_max_experts = 0;
-    int32_t draft_tokens = 4;         // k for speculative decoding
+    // Most drafts per speculative step (k). 3 by default: a verification pass
+    // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
+    int32_t draft_tokens = 3;
     // Without a draft model: draft up to draft_tokens tokens by looking the
     // last tokens up in the conversation (SpeculativeDecoder::lookup). Same
     // output distribution, no extra weights, any model; pays off when the text

@@ -553,14 +553,15 @@ Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>
 }
 
 Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&)>& select, DType target) {
-    if (target != DType::Q4_K && target != DType::Q5_K && target != DType::Q4_K_R8) {
-        return Status(ErrorCode::InvalidArgument, "requantize() converts to Q4_K, Q5_K or Q4_K_R8 only");
+    if (target != DType::Q4_K && target != DType::Q5_K && target != DType::Q4_K_R8 && target != DType::Q6_K_R8) {
+        return Status(ErrorCode::InvalidArgument, "requantize() converts to Q4_K, Q5_K, Q4_K_R8 or Q6_K_R8 only");
     }
     size_t saved = 0;
     for (TensorView& t : tensors_) {
         if (!select(t)) continue;
-        const bool repack = target == DType::Q4_K_R8;
-        if ((repack ? t.type != DType::Q4_K || t.rows() % 8 != 0 : t.type != DType::Q8_0) ||
+        const bool repack = target == DType::Q4_K_R8 || target == DType::Q6_K_R8;
+        const DType source = target == DType::Q4_K_R8 ? DType::Q4_K : target == DType::Q6_K_R8 ? DType::Q6_K : DType::Q8_0;
+        if (t.type != source || (repack && t.rows() % 8 != 0) ||
             t.cols() % quant::kSuperBlock != 0) {
             return Status(ErrorCode::InvalidArgument, "cannot requantize " + std::string(t.name));
         }
@@ -574,9 +575,12 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
         if (p == MAP_FAILED) return Status(ErrorCode::OutOfMemory, "cannot allocate requantized weights");
         converted_.emplace_back(p, bytes);
         auto* dst = static_cast<uint8_t*>(p);
-        if (repack) {  // same bytes, 8 rows interleaved: a rearrangement, not a requantization
+        if (target == DType::Q4_K_R8) {  // same bytes, 8 rows interleaved: a rearrangement
             quant::repack_q4_K_r8(reinterpret_cast<const quant::BlockQ4_K*>(t.data), t.rows(), t.cols(),
                                   reinterpret_cast<quant::BlockQ4_Kx8*>(dst));
+        } else if (target == DType::Q6_K_R8) {
+            quant::repack_q6_K_r8(reinterpret_cast<const quant::BlockQ6_K*>(t.data), t.rows(), t.cols(),
+                                  reinterpret_cast<quant::BlockQ6_Kx8*>(dst));
         } else {
         // Rows are independent; the reference quantizer is slow (a weighted
         // search per 32 values), so every core takes a share.

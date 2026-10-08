@@ -92,7 +92,7 @@ public:
                 quantize(acts_[a], it.x, it.w->cols(), it.n, format);
                 ++n_acts;
             }
-            if (it.w->type == DType::Q4_K_R8 && it.n >= 4 && !acts_[a].q8k4_ready) interleave_x4(acts_[a]);
+            if (is_repacked(it.w->type) && it.n >= 4 && !acts_[a].q8k4_ready) interleave_x4(acts_[a]);
             jobs_[i] = {&it, a, format};  // an index: acts_ may still grow
             total_rows += it.n > 0 ? it.w->rows() : 0;
             row_end_[i] = total_rows;
@@ -146,26 +146,40 @@ private:
         a.q8k4_ready = true;
     }
 
-    // Rows [r0, r1) of a Q4_K_R8 matrix (8-row groups): 4 activation rows at
+    static bool is_repacked(DType type) { return type == DType::Q4_K_R8 || type == DType::Q6_K_R8; }
+
+    // Rows [r0, r1) of a repacked matrix (8-row groups): 4 activation rows at
     // a time through gemm, the rest through gemv; a group cut by the range
     // goes through a scratch tile so only rows inside it are written.
     static void run_rows_r8(const Job& job, const Activations& a, int64_t r0, int64_t r1) {
         const TensorView& w = *job.item->w;
+        if (w.type == DType::Q4_K_R8) {
+            run_groups(job, a, r0, r1, reinterpret_cast<const quant::BlockQ4_Kx8*>(w.data), quant::gemv_q4_K_r8,
+                       quant::gemm_q4_K_r8);
+        } else {
+            run_groups(job, a, r0, r1, reinterpret_cast<const quant::BlockQ6_Kx8*>(w.data), quant::gemv_q6_K_r8,
+                       quant::gemm_q6_K_r8);
+        }
+    }
+
+    template <typename Block, typename Gemv, typename Gemm>
+    static void run_groups(const Job& job, const Activations& a, int64_t r0, int64_t r1, const Block* packed,
+                           Gemv gemv, Gemm gemm) {
+        const TensorView& w = *job.item->w;
         const int64_t rows = w.rows();
         const int64_t cols = w.cols();
         const int64_t super_blocks = cols / quant::kSuperBlock;
-        const auto* packed = reinterpret_cast<const quant::BlockQ4_Kx8*>(w.data);
         const int32_t n = job.item->n;
         float* y = job.item->y;
         const int64_t g_first = r0 / 8, g_last = (r1 + 7) / 8;           // groups touched
         const int64_t g_in0 = (r0 + 7) / 8, g_in1 = std::max(g_in0, r1 / 8);  // groups fully inside
         auto partial = [&](int64_t g, int32_t t, int32_t count) {
             float tile[4 * 8];
-            const quant::BlockQ4_Kx8* wg = packed + g * super_blocks;
+            const Block* wg = packed + g * super_blocks;
             if (count == 4) {
-                quant::gemm_q4_K_r8(wg, cols, 0, 1, a.q8k4.data() + t / 4 * super_blocks, tile, 8);
+                gemm(wg, cols, 0, 1, a.q8k4.data() + t / 4 * super_blocks, tile, 8);
             } else {
-                quant::gemv_q4_K_r8(wg, cols, 0, 1, a.q8k.data() + t * super_blocks, tile);
+                gemv(wg, cols, 0, 1, a.q8k.data() + t * super_blocks, tile);
             }
             for (int32_t k = 0; k < count; ++k) {
                 for (int64_t r = std::max(r0, 8 * g); r < std::min(r1, 8 * g + 8); ++r) {
@@ -177,9 +191,9 @@ private:
             const int32_t count = t + 4 <= n ? 4 : 1;
             if (g_in1 > g_in0) {
                 if (count == 4) {
-                    quant::gemm_q4_K_r8(packed, cols, g_in0, g_in1, a.q8k4.data() + t / 4 * super_blocks, y + t * rows, rows);
+                    gemm(packed, cols, g_in0, g_in1, a.q8k4.data() + t / 4 * super_blocks, y + t * rows, rows);
                 } else {
-                    quant::gemv_q4_K_r8(packed, cols, g_in0, g_in1, a.q8k.data() + t * super_blocks, y + t * rows);
+                    gemv(packed, cols, g_in0, g_in1, a.q8k.data() + t * super_blocks, y + t * rows);
                 }
             }
             for (int64_t g = g_first; g < g_last; ++g) {
@@ -223,7 +237,7 @@ private:
         const int32_t n = job.item->n;
         const float* x = job.item->x;
         float* y = job.item->y;
-        if (w.type == DType::Q4_K_R8) {
+        if (is_repacked(w.type)) {
             run_rows_r8(job, a, r0, r1);
             return;
         }

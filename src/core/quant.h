@@ -198,7 +198,7 @@ void unpack_q5_block(const uint8_t* qh, const uint8_t* qs, bool symmetric, int8_
 
 // --- Repacked layouts (quant_repack.cpp) ---------------------------------
 //
-// Q4_K_R8: the super-blocks of 8 consecutive rows stored together, values
+// Q4_K_R8 / Q6_K_R8: the super-blocks of 8 consecutive rows stored together, values
 // interleaved 8 bytes at a time (llama.cpp's block_q4_Kx8), so one SMMLA
 // multiplies 8 weight rows by 4 activation rows (Q8_K_X4, also interleaved
 // 8 bytes at a time). A matmul over 4 activation rows then costs ~1.7x one
@@ -213,6 +213,13 @@ struct BlockQ4_Kx8 {
     uint8_t qs[1024];     // 4-bit values of the 8 rows, interleaved 8 bytes at a time
 };
 static_assert(sizeof(BlockQ4_Kx8) == 8 * sizeof(BlockQ4_K), "Q4_K_R8 keeps Q4_K's size");
+struct BlockQ6_Kx8 {
+    uint16_t d[8];
+    int8_t scales[128];   // scale k of the 8 rows at 8 k .. 8 k + 7
+    uint8_t ql[1024];     // low 4 bits of the 8 rows, interleaved 8 bytes at a time
+    uint8_t qh[512];      // high 2 bits, likewise
+};
+static_assert(sizeof(BlockQ6_Kx8) == 8 * sizeof(BlockQ6_K), "Q6_K_R8 keeps Q6_K's size");
 struct BlockQ8_Kx4 {
     float d[4];
     int8_t qs[kSuperBlock * 4];   // 4 rows interleaved 8 bytes at a time
@@ -232,6 +239,11 @@ void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
 // The same against 4 activation rows: y[t * ldy + 8 * g + i] for t < 4.
 // Bit-identical to four gemv_q4_K_r8 calls.
 void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept;
+// Q6_K_R8 (llama.cpp's block_q6_Kx8): the same three functions.
+void repack_q6_K_r8(const BlockQ6_K* src, int64_t rows, int64_t cols, BlockQ6_Kx8* dst) noexcept;
+void gemv_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept;
+void gemm_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
                   int64_t ldy) noexcept;
 
 }  // namespace liyab::quant

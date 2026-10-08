@@ -127,6 +127,7 @@ enum class DType : uint32_t {
     // the CPU's batched kernels. Same bytes per row as their source type, but
     // stored in groups of 8 rows, so TensorView::row() does not address them.
     Q4_K_R8 = 1000,  // Q4_K, 8 rows interleaved 8 bytes at a time (llama.cpp's block_q4_Kx8)
+    Q6_K_R8 = 1001,  // Q6_K, likewise (block_q6_Kx8)
 };
 
 struct DTypeTraits {

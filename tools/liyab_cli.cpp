@@ -41,7 +41,7 @@ void usage() {
                  "  --top-k K          (default 40)    --top-p P (default 0.95)\n"
                  "  --seed N           RNG seed (default random)\n"
                  "  --draft PATH       draft model for speculative decoding\n"
-                 "  --draft-tokens K   tokens per speculative step (default 4)\n"
+                 "  --draft-tokens K   tokens per speculative step (default 3)\n"
                  "  --lookup           speculative decoding without a draft model: drafts from the\n"
                  "                     conversation (n-gram lookup)\n"
                  "  --fixed-drafts     always verify --draft-tokens drafts (default: learned per device)\n"

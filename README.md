@@ -41,7 +41,7 @@ This README describes what the code does today. Anything not implemented is list
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model or context lookup, batched verification, hybrid models included) | ✅ implemented |
-| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass) | ✅ implemented |
+| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass); Q4_K / Q6_K repacked for i8mm (SMMLA) at load | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
 | Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
@@ -850,10 +850,20 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **CPU batches** (prefill, speculative verification): Q8_0, Q4_K, Q5_K and Q6_K weights are decoded once per
   row for up to four activation rows. On the Snapdragon 8 Elite a 2048×8192 matmul over 4 rows takes 509–561 µs
   instead of 707–791 (Q8_0), 648–678 instead of 884–930 (Q5_K), 754–783 instead of 959–1013 (Q6_K); Q4_K is
-  unchanged (~620–690). Four rows still cost 2.2–3.3× one row, so speculative decoding does not pay on the CPU
-  yet (Qwen3.5-4B: 10.6 tok/s plain, 9.0 with lookup drafts at 83% acceptance): the per-row `sdot` work, not
-  memory, is the limit. 2×2 tiles with the i8mm `smmla` instruction are the next step. MoE prefill reads the
-  union of the batch's experts, so it runs at about decode speed.
+  unchanged (~620–690). Four rows still cost 2.2–3.3× one row with these kernels: the per-row `sdot` work, not
+  memory, is the limit. 2×2 `smmla` tiles over the file's layout did not help either (the tile assembly costs
+  more than it saves).
+* **Repacked weights for i8mm CPUs.** When the CPU computes every block (no GPU / NPU route) and has the i8mm
+  extension, the resident Q4_K and Q6_K matrices are rearranged at load into llama.cpp's 8-row interleaved
+  layout (`Q4_K_R8`, `Q6_K_R8`: lossless, same size). One `smmla` then multiplies 8 weight rows by 4 activation
+  rows: 4 rows cost ~1.7× one row instead of ~3.7×, and one row ~14% less than before (Q4_K 2048×8192, one core).
+  The single-row kernel keeps the same integer sums and float epilogue as the 4-row one, so a token's logits do
+  not depend on how many tokens share the matmul (tested), and speculative output still equals plain decoding.
+  Qwen3-4B Q4_K_M on the phone: a 403-token prompt prefills in 11.7–14.0 s instead of 18.3–24.4, and lookup
+  speculation now pays on text that repeats its context (code edit, 256 tokens, alternating runs, hot phone):
+  11.27 / 11.16 tok/s without, 12.51 / 12.61 with `--lookup --draft-tokens 3 --fixed-drafts` (65% of drafts
+  accepted), 9.97 / 9.70 with 7 drafts. Three drafts is the default: a verification pass of 4 tokens is exactly
+  one tile. MoE prefill reads the union of the batch's experts, so it runs at about decode speed.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
