@@ -25,7 +25,7 @@ final class EngineHolder {
         void onEngineChanged();  // main thread
     }
 
-    static final int THREADS = 4;  // fastest setting measured on Snapdragon 8 Elite
+    static final int THREADS = 0;  // engine default: performance cores, one left for I/O and the UI (7 on an 8 Elite)
     static final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     static volatile long handle;

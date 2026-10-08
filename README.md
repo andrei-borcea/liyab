@@ -41,7 +41,7 @@ This README describes what the code does today. Anything not implemented is list
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model, batched verification) | ✅ implemented |
-| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool; batched matmuls in one parallel pass) | ✅ implemented |
+| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass) | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
 | Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
@@ -649,7 +649,11 @@ Reading the table:
   larger than RAM, where the automatic mode streams just the blocks that do not fit. The engine logs a warning when
   it is enabled for a model that fits in memory.
 * **8 threads slower than 4** pointed at the fork/join cost of the condition-variable thread pool (measured
-  before the spinning pool, which picks a job up in about a microsecond instead of ~80–100 µs). Prefill
+  before the spinning pool, which picks a job up in about a microsecond instead of ~80–100 µs). With the spinning
+  pool, the 35B MoE runs fastest on 7 of the 8 cores: 8 spinning workers left the expert I/O threads waiting for a
+  core (flash waits grew by a third). The default is therefore the performance cores minus one on CPUs without an
+  efficiency cluster, and the pool hands out 4 chunks per thread on demand, so a preempted or slower core (the
+  prime cores are ~20% faster) no longer holds up a whole matmul. Prefill
   (~74 tok/s) still uses the per-row matvec kernel; a tiled GEMM for batches is the next CPU optimization.
 * Apple M4 Pro, same prompt: 49 tok/s (CPU, Q8_0) and 40 tok/s (Metal, Q4_0). Metal is limited by one command
   buffer per matmul.

@@ -6,6 +6,7 @@
 // Without LIYAB_BENCH_MODEL the shapes come from a small synthetic model.
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -184,6 +185,25 @@ TEST_CASE("CPU matmul_batch over mixed formats and shared inputs equals one matm
     for (size_t i = 0; i < ws.size(); ++i) {
         REQUIRE(serial->matmul(ws[i], items[i].x, single[i].data(), 2).is_ok());
         for (size_t j = 0; j < single[i].size(); ++j) CHECK(batched[i][j] == single[i][j]);
+    }
+}
+
+TEST_CASE("ThreadPool::parallel_for runs every index exactly once") {
+    // Chunks are claimed dynamically: back-to-back jobs of every size (fewer
+    // indices than threads, uneven splits, many chunks), with the active
+    // thread count changing in between, must neither skip nor repeat work.
+    ThreadPool pool(6);
+    std::vector<std::atomic<int32_t>> hits(5000);
+    for (int32_t round = 0; round < 2000; ++round) {
+        if (round % 7 == 0) pool.set_active_threads(1 + round % 6);
+        const int64_t n = 1 + (round * 37) % static_cast<int32_t>(hits.size());
+        for (int64_t i = 0; i < n; ++i) hits[static_cast<size_t>(i)].store(0, std::memory_order_relaxed);
+        pool.parallel_for(n, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) hits[static_cast<size_t>(i)].fetch_add(1, std::memory_order_relaxed);
+        });
+        int32_t wrong = 0;
+        for (int64_t i = 0; i < n; ++i) wrong += hits[static_cast<size_t>(i)].load(std::memory_order_relaxed) != 1;
+        REQUIRE(wrong == 0);
     }
 }
 

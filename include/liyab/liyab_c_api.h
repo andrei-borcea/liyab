@@ -68,7 +68,7 @@ typedef enum liyab_kv_cache_type {
 typedef struct liyab_engine_config {
     const char* model_path;       /* required: GGUF file */
     const char* draft_model_path; /* optional (NULL): enables speculative decoding */
-    int32_t n_threads;            /* 0: performance cores */
+    int32_t n_threads;            /* 0: performance cores, minus one when there is no efficiency cluster */
     int32_t context_length;       /* 0: min(model context, 4096) */
     int32_t sliding_window;       /* 0: full attention */
     int32_t kv_sink_tokens;       /* attention sinks kept with a sliding window (default 8) */

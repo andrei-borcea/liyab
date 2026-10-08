@@ -25,7 +25,7 @@ inline void cpu_relax() noexcept {
 }  // namespace
 
 ThreadPool::ThreadPool(int32_t n_threads) {
-    if (n_threads < 1) n_threads = performance_core_count();
+    if (n_threads < 1) n_threads = default_thread_count();
     n_threads = std::clamp<int32_t>(n_threads, 1, kMaxThreads);
     workers_.reserve(static_cast<size_t>(n_threads - 1));
     for (int32_t i = 0; i < n_threads - 1; ++i) {
@@ -54,22 +54,40 @@ void ThreadPool::parallel_for(int64_t n, const std::function<void(int64_t, int64
         fn(0, n);
         return;
     }
+    const auto chunks = static_cast<int32_t>(std::min<int64_t>(n, int64_t{threads} * kChunksPerThread));
     job_ = &fn;
     job_size_ = n;
-    pending_.store(threads - 1, std::memory_order_relaxed);
-    const uint64_t sequence = (generation_.load(std::memory_order_relaxed) >> 8) + 1;
-    // seq_cst: publishes the job, and is ordered before the sleepers_ read.
+    done_.store(0, std::memory_order_relaxed);
+    const uint64_t sequence = ((generation_.load(std::memory_order_relaxed) >> 8) + 1) & 0xFFFFFFFFu;
+    ticket_.store(sequence << 32 | static_cast<uint64_t>(chunks) << 16, std::memory_order_release);
+    // seq_cst: ordered after the ticket, and before the sleepers_ read.
     generation_.store(sequence << 8 | static_cast<uint64_t>(threads));
     if (sleepers_.load() > 0) {
         std::lock_guard<std::mutex> lock(mutex_);  // a worker between its check and its wait holds the mutex
         wake_.notify_all();
     }
 
-    fn(0, n / threads);  // the caller takes chunk 0
-
-    // Siblings finish chunks of the same size at about the same time: spin.
-    while (pending_.load(std::memory_order_acquire) != 0) cpu_relax();
+    run_chunks(sequence);
+    // The remaining chunks are running on other threads: spin until they end.
+    while (done_.load(std::memory_order_acquire) != chunks) cpu_relax();
     job_ = nullptr;
+}
+
+void ThreadPool::run_chunks(uint64_t sequence) {
+    uint64_t ticket = ticket_.load(std::memory_order_acquire);
+    for (;;) {
+        const auto next = static_cast<int64_t>(ticket & 0xFFFF);
+        const auto chunks = static_cast<int64_t>(ticket >> 16 & 0xFFFF);
+        if ((ticket >> 32) != sequence || next >= chunks) return;
+        if (!ticket_.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acquire,
+                                           std::memory_order_acquire)) {
+            continue;  // `ticket` now holds the current value
+        }
+        const int64_t size = job_size_;
+        (*job_)(size * next / chunks, size * (next + 1) / chunks);
+        done_.fetch_add(1, std::memory_order_release);
+        ticket = ticket_.load(std::memory_order_acquire);
+    }
 }
 
 uint64_t ThreadPool::wait_for_job(uint64_t seen) {
@@ -90,15 +108,13 @@ uint64_t ThreadPool::wait_for_job(uint64_t seen) {
 
 void ThreadPool::worker_loop(int32_t index) {
     uint64_t seen = 0;
-    const int32_t chunk = index + 1;
+    const int32_t participant = index + 1;  // the caller is participant 0
     for (;;) {
         seen = wait_for_job(seen);
         if (stop_.load(std::memory_order_relaxed)) return;
         const auto threads = static_cast<int32_t>(seen & 0xFF);
-        if (chunk >= threads) continue;  // not a participant this round
-        const int64_t size = job_size_;
-        (*job_)(size * chunk / threads, size * (chunk + 1) / threads);
-        pending_.fetch_sub(1, std::memory_order_release);
+        if (participant >= threads) continue;  // not a participant this round
+        run_chunks(seen >> 8);
     }
 }
 
@@ -132,6 +148,12 @@ int32_t performance_core_count() noexcept {
 #else
     return hw;
 #endif
+}
+
+int32_t default_thread_count() noexcept {
+    const int32_t big = performance_core_count();
+    const auto all = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+    return big >= all && big > 2 ? big - 1 : big;
 }
 
 }  // namespace liyab

@@ -37,7 +37,7 @@ struct ExperimentalConfig {
 struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
     std::string draft_model_path;     // optional: enables speculative decoding
-    int32_t n_threads = 0;            // 0: number of performance cores
+    int32_t n_threads = 0;            // 0: performance cores, minus one when there is no efficiency cluster
     int32_t context_length = 0;       // 0: min(model training context, 4096)
     int32_t sliding_window = 0;       // 0: full attention; else attend to the last N tokens
     int32_t kv_sink_tokens = 8;       // with a sliding window: first N tokens stay visible (attention sinks)

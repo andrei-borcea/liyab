@@ -18,10 +18,17 @@ namespace liyab {
 // made small matmuls slower on 8 threads than on one. Spinning workers pick
 // a job up in about a microsecond. After kSpinMicros without work they block
 // on a condition variable, so an idle engine costs no CPU.
+//
+// A job is split into kChunksPerThread chunks per participating thread, and
+// every participant (the caller included) claims the next unclaimed chunk
+// until none is left. With one fixed chunk per thread, the job ended when the
+// slowest thread did: the prime cores run ~20% faster than the performance
+// cores, and a worker the OS preempts (I/O threads, the app's UI) stalled the
+// whole job until it ran again. Now the others take over its chunks.
 class ThreadPool {
 public:
-    // `n_threads` includes the calling thread; values < 1 select the number of
-    // performance-class cores reported by the OS.
+    // `n_threads` includes the calling thread; values < 1 select
+    // default_thread_count().
     explicit ThreadPool(int32_t n_threads);
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;
@@ -33,32 +40,42 @@ public:
     void set_active_threads(int32_t n) noexcept;
 
     // Runs fn(begin, end) over [0, n) split into contiguous chunks and blocks
-    // until every chunk finished. Not reentrant: kernels must not nest calls,
+    // until every chunk finished. Chunks run concurrently and in any order, on
+    // any participating thread. Not reentrant: kernels must not nest calls,
     // and only one thread may call it at a time.
     void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn);
 
     // How long an idle worker spins before it sleeps.
     static constexpr int64_t kSpinMicros = 300;
     static constexpr int32_t kMaxThreads = 255;  // fits the low byte of generation_
+    // Chunks per participating thread: enough to rebalance around a slow or
+    // preempted thread, few enough that claiming one (a CAS) stays negligible.
+    static constexpr int32_t kChunksPerThread = 4;
 
 private:
     void worker_loop(int32_t index);
     // Waits for a generation other than `seen` (or stop); returns it.
     uint64_t wait_for_job(uint64_t seen);
+    // Claims and runs chunks of job `sequence` until none is left.
+    void run_chunks(uint64_t sequence);
 
     std::vector<std::thread> workers_;
     std::atomic<int32_t> active_{1};
 
-    // Job: written by parallel_for() before it publishes a new generation,
-    // read by participants after they observe it. Participants are counted in
-    // pending_, so the next job cannot overwrite these while they read them.
+    // Job: written by parallel_for() before it publishes the job's ticket,
+    // read by a participant only after it claimed a chunk. parallel_for()
+    // returns once every chunk is done_, so a claimed chunk keeps these valid;
+    // a thread that claims nothing never reads them.
     const std::function<void(int64_t, int64_t)>* job_ = nullptr;
     int64_t job_size_ = 0;
-    // (job sequence << 8) | participating threads: one word, so a worker that
-    // does not take part (and is not waited for) never reads a later job's
-    // fields to decide that.
+    // (job sequence << 32) | (chunks << 16) | next unclaimed chunk. Claimed by
+    // compare-and-swap, never fetch_add: a worker still looking at a finished
+    // job must fail on the sequence instead of taking a chunk of the next one.
+    std::atomic<uint64_t> ticket_{0};
+    std::atomic<int32_t> done_{0};  // chunks finished
+    // (job sequence << 8) | participating threads: wakes the workers and tells
+    // each one whether to take part.
     std::atomic<uint64_t> generation_{0};
-    std::atomic<int32_t> pending_{0};
     std::atomic<bool> stop_{false};
 
     // Sleeping workers. The publisher stores the generation, then reads
@@ -72,6 +89,13 @@ private:
 // Number of "big" cores (highest max frequency) on this device; falls back to
 // std::thread::hardware_concurrency().
 int32_t performance_core_count() noexcept;
+
+// Default pool size: the performance cores, minus one when every core is a
+// performance core (Snapdragon 8 Elite: 8 Oryon cores). With no efficiency
+// cluster, one free core is what the expert/block I/O threads, the OS and the
+// app's UI run on: 8 workers spinning on 8 cores kept the I/O threads waiting
+// for a core, and Qwen3.6-35B-A3B decoded 21% slower than with 7.
+int32_t default_thread_count() noexcept;
 
 }  // namespace liyab
 

@@ -24,7 +24,8 @@ final class LiyabNative {
     static final int BACKEND_VULKAN = 2;  // LIYAB_BACKEND_VULKAN
 
     /**
-     * Loads the model on `backend` with a `contextLength`-token context (0: engine default) and a
+     * Loads the model on `backend` with `threads` CPU workers (0: engine default, the performance cores minus
+     * one on CPUs without an efficiency cluster), a `contextLength`-token context (0: engine default) and a
      * thermal guard that halves the CPU threads above `skinThresholdC` (the OS thermal status applies
      * regardless), keeping weights and caches within `memoryBudgetMb` (0: free RAM only); throws
      * RuntimeException with Liyab's error message on failure.
