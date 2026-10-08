@@ -73,6 +73,7 @@ typedef struct liyab_engine_config {
     int32_t sliding_window;       /* 0: full attention */
     int32_t kv_sink_tokens;       /* attention sinks kept with a sliding window (default 8) */
     int32_t draft_tokens;         /* tokens proposed per speculative step */
+    int32_t lookup_drafts;        /* nonzero, no draft model: draft by context lookup (n-gram) */
     liyab_kv_cache_type kv_cache_type;
     liyab_backend backend;
     liyab_power_profile power_profile;

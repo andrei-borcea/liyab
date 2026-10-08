@@ -18,6 +18,7 @@
 #include "core/transformer.h"
 #include "liyab/liyab.h"
 #include "liyab/liyab_c_api.h"
+#include "liyab/speculative_decoder.h"
 #include "test_model.h"
 #include "test_util.h"
 
@@ -1148,6 +1149,51 @@ TEST_CASE("Speculative decoding with greedy sampling reproduces plain greedy out
         REQUIRE(diff_engine.has_value());
         CHECK(run(*diff_engine.value(), prompt, greedy(24), &stats) == expected);
         CHECK(stats.draft_tokens_accepted < stats.draft_tokens_proposed);
+    }
+}
+
+TEST_CASE("Context lookup drafts the tokens that followed the longest repeated suffix") {
+    std::vector<int32_t> out;
+    // ... 7 8 9 | 5 ... 7 8 9: the 3-token suffix occurred once, followed by 5 6.
+    SpeculativeDecoder::lookup(std::vector<int32_t>{1, 7, 8, 9, 5, 6, 2, 7, 8, 9}, 4, out);
+    CHECK((out == std::vector<int32_t>{5, 6, 2, 7}));
+    // The most recent occurrence wins.
+    SpeculativeDecoder::lookup(std::vector<int32_t>{3, 4, 10, 3, 4, 11, 12, 3, 4}, 2, out);
+    CHECK((out == std::vector<int32_t>{11, 12}));
+    // A single repeated token is not enough, and nothing repeats here at all.
+    SpeculativeDecoder::lookup(std::vector<int32_t>{1, 4, 2, 3, 4}, 3, out);
+    CHECK(out.empty());
+    SpeculativeDecoder::lookup(std::vector<int32_t>{1}, 3, out);
+    CHECK(out.empty());
+}
+
+TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, also on hybrid models") {
+    // A prompt that repeats itself, so lookup finds drafts.
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    test::TinyModelSpec hybrid;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+        EngineConfig plain = engine_config(path);
+        plain.backend = BackendKind::Cpu;
+        auto base_engine = Engine::create(plain);
+        REQUIRE(base_engine.has_value());
+        const auto expected = run(*base_engine.value(), prompt, greedy(32));
+        REQUIRE(!expected.empty());
+
+        EngineConfig lookup = plain;
+        lookup.lookup_drafts = true;
+        lookup.draft_tokens = 3;
+        auto engine = Engine::create(lookup);
+        REQUIRE(engine.has_value());
+        GenerationStats stats;
+        CHECK(run(*engine.value(), prompt, greedy(32), &stats) == expected);
+        CHECK(stats.draft_tokens_proposed > 0);
+        // A second turn continues the same context (prefix reuse) and still matches.
+        auto again = run(*engine.value(), prompt, greedy(32), &stats);
+        CHECK(again == expected);
     }
 }
 

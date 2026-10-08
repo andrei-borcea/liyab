@@ -40,7 +40,7 @@ This README describes what the code does today. Anything not implemented is list
 | Every GGML tensor format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0/TQ2_0, MXFP4, NVFP4 (all mixes such as Q4_K_M, IQ3_M) | ✅ implemented, bit-exact vs llama.cpp's reference decoder |
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
-| Speculative decoding (draft model, batched verification) | ✅ implemented |
+| Speculative decoding (draft model or context lookup, batched verification, hybrid models included) | ✅ implemented |
 | CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool with dynamically claimed chunks; batched matmuls in one parallel pass) | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
 | Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
@@ -112,14 +112,18 @@ This README describes what the code does today. Anything not implemented is list
   SoC idles between tokens. A polling thread reads the OS thermal status (Android `AThermal_*`, Apple
   `NSProcessInfo.thermalState`) and the sysfs skin/SoC zones. At ≥ 40 °C skin temperature, or at a severe OS
   status, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the token rate.
-* **Speculative decoding.** A small draft model proposes *k* tokens, and the target verifies them in one batched
-  pass, reading its weights once for *k*+1 tokens. Acceptance follows Leviathan et al. (2023), so output matches the
+* **Speculative decoding.** A small draft model proposes *k* tokens, or, without one (`lookup_drafts`, `liyab-cli
+  --lookup`), the tokens that followed the most recent earlier occurrence of the last 4..2 tokens in the
+  conversation are proposed (no extra weights, any model). The target verifies them in one batched pass, reading
+  its weights once for *k*+1 tokens. Acceptance follows Leviathan et al. (2023), so output matches the
   target's distribution. With greedy sampling it is token-for-token identical to plain decoding (tested). Hybrid
   (DeltaNet) models take part too: with a draft model both keep a copy of their recurrent states after each of the
   last *k*+1 tokens (`Transformer::set_rollback_window`), so rejected tokens roll back exactly (tested). That costs
   (*k*+1) × the recurrent state in memory (62.8 MiB per position for Qwen3.6-35B-A3B) and one state copy per token
   and DeltaNet block. On a MoE whose experts stream from flash the gain is small: a pass over *n* tokens reads
-  the union of their experts (35B on the phone: 1.55× the cost of one token for 2, 2.5× for 3).
+  the union of their experts (35B on the phone: 1.55× the cost of one token for 2, 2.5× for 3). Lookup drafts on
+  the 35B writing a WebGL game (256 tokens, single runs): 6.33 tok/s without, 6.19 with *k* = 2 (31% of drafts
+  accepted), 6.48 with *k* = 4 (20%).
 
 ---
 

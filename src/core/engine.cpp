@@ -90,8 +90,9 @@ struct Engine::Impl {
     std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
     std::atomic<uint64_t> tokens_generated{0};  // Engine::counters()
     // Tokens whose KV / recurrent state the target holds, in order
-    // (target->n_past() == context.size()). Not used with a draft model, whose
-    // cache moves in step with the target's during speculation.
+    // (target->n_past() == context.size()); context lookup drafts from it. Not
+    // used with a draft model, whose cache moves in step with the target's
+    // during speculation.
     std::vector<int32_t> context;
 
     void clear_context() {
@@ -438,6 +439,9 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         draft.value()->set_rollback_window(config.draft_tokens + 1);
         impl->draft = std::move(draft).value();
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
+    } else if (config.lookup_drafts && config.draft_tokens > 0) {
+        impl->target->set_rollback_window(config.draft_tokens + 1);
+        impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, config.draft_tokens);
     }
 
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
@@ -704,12 +708,16 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 
         std::vector<int32_t> next;
         if (s.speculative) {
-            auto r = s.speculative->step(last, sampler, route, s.draft_route(), *s.pool);
+            auto r = s.speculative->step(last, s.context, sampler, route, s.draft_route(), *s.pool);
             if (!r) {
                 s.clear_context();
                 return r.status();
             }
             next = std::move(r).value();
+            if (!s.draft) {  // the target now caches `last` and every returned token but the final one
+                s.context.push_back(last);
+                s.context.insert(s.context.end(), next.begin(), next.end() - 1);
+            }
         } else {
             const ForwardHooks hooks = s.hooks(policy, true);
             auto logits =

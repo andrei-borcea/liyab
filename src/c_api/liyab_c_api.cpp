@@ -122,6 +122,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->sliding_window = d.sliding_window;
     config->kv_sink_tokens = d.kv_sink_tokens;
     config->draft_tokens = d.draft_tokens;
+    config->lookup_drafts = d.lookup_drafts ? 1 : 0;
     config->kv_cache_type = static_cast<liyab_kv_cache_type>(d.kv_cache_type);
     config->backend = LIYAB_BACKEND_AUTO;
     config->power_profile = static_cast<liyab_power_profile>(d.power.profile);
@@ -168,6 +169,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.sliding_window = config->sliding_window;
         c.kv_sink_tokens = config->kv_sink_tokens;
         c.draft_tokens = config->draft_tokens;
+        c.lookup_drafts = config->lookup_drafts != 0;
         c.kv_cache_type = static_cast<liyab::KvCacheType>(config->kv_cache_type);
         if (config->backend != LIYAB_BACKEND_AUTO) c.backend = static_cast<liyab::BackendKind>(config->backend);
         c.power.profile = static_cast<liyab::PowerProfile>(config->power_profile);

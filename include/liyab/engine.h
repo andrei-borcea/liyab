@@ -76,6 +76,12 @@ struct EngineConfig {
     // 0: the model's own top-k. Lossy when below it.
     int32_t moe_max_experts = 0;
     int32_t draft_tokens = 4;         // k for speculative decoding
+    // Without a draft model: draft up to draft_tokens tokens by looking the
+    // last tokens up in the conversation (SpeculativeDecoder::lookup). Same
+    // output distribution, no extra weights, any model; pays off when the text
+    // repeats its context and on models that verify k tokens for about the
+    // cost of one (dense models in RAM).
+    bool lookup_drafts = false;
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing

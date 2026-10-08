@@ -42,6 +42,8 @@ void usage() {
                  "  --seed N           RNG seed (default random)\n"
                  "  --draft PATH       draft model for speculative decoding\n"
                  "  --draft-tokens K   tokens per speculative step (default 4)\n"
+                 "  --lookup           speculative decoding without a draft model: drafts from the\n"
+                 "                     conversation (n-gram lookup)\n"
                  "  --profile P        performance | balanced | low_power (default balanced)\n"
                  "  --tps R            override the paced token rate\n"
                  "  --skin-threshold C thermal throttle threshold in °C (default 40)\n"
@@ -99,6 +101,7 @@ int main(int argc, char** argv) {
         else if (arg == "--seed") params.seed = std::strtoull(next(), nullptr, 10);
         else if (arg == "--draft") config.draft_model_path = next();
         else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
+        else if (arg == "--lookup") config.lookup_drafts = true;
         else if (arg == "--tps") config.target_tps = std::atof(next());
         else if (arg == "--skin-threshold") config.skin_threshold_c = static_cast<float>(std::atof(next()));
         else if (arg == "--ctx") config.context_length = std::atoi(next());
