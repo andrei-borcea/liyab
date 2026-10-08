@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -145,6 +146,12 @@ void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept {
         case DType::Q4_1:
             quantize_row_q4_1(x, static_cast<BlockQ4_1*>(dst), n);
             break;
+        case DType::Q4_K:
+            quantize_row_q4_K(x, static_cast<BlockQ4_K*>(dst), n);
+            break;
+        case DType::Q5_K:
+            quantize_row_q5_K(x, static_cast<BlockQ5_K*>(dst), n);
+            break;
         default:
             break;  // weight-only formats are never produced at runtime; callers do not request them
     }
@@ -163,7 +170,171 @@ inline void scale_min_k4(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) noexc
     }
 }
 
+// Rounds to nearest with llama.cpp's float trick (nearest_int).
+inline int nearest_int(float f) noexcept {
+    float v = f + 12582912.0f;
+    int i;
+    std::memcpy(&i, &v, sizeof i);
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+// llama.cpp make_qkx2_quants: levels L in [0, nmax] and (scale, min) for one
+// 32-value sub-block, minimizing the weighted squared error over a small grid
+// of scales around the plain min/max fit. Returns the scale; *the_min is the
+// (non-negative) value subtracted before scaling.
+float make_qkx2_quants(int n, int nmax, const float* x, const float* weights, uint8_t* L, float* the_min,
+                       uint8_t* Laux, float rmin, float rdelta, int nstep) noexcept {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+    for (int i = 1; i < n; ++i) {
+        min = std::min(min, x[i]);
+        max = std::max(max, x[i]);
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
+    }
+    if (min > 0) min = 0;
+    if (max == min) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        *the_min = -min;
+        return 0.0f;
+    }
+    float iscale = static_cast<float>(nmax) / (max - min);
+    float scale = 1 / iscale;
+    float best_error = 0;
+    for (int i = 0; i < n; ++i) {
+        const int l = nearest_int(iscale * (x[i] - min));
+        L[i] = static_cast<uint8_t>(std::max(0, std::min(nmax, l)));
+        const float diff = scale * L[i] + min - x[i];
+        best_error += weights[i] * (diff * diff);  // llama.cpp's evaluation order
+    }
+    for (int is = 0; is <= nstep; ++is) {
+        iscale = (rmin + rdelta * static_cast<float>(is) + static_cast<float>(nmax)) / (max - min);
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        for (int i = 0; i < n; ++i) {
+            const int l = std::max(0, std::min(nmax, nearest_int(iscale * (x[i] - min))));
+            Laux[i] = static_cast<uint8_t>(l);
+            const float w = weights[i];
+            sum_l += w * static_cast<float>(l);
+            sum_l2 += w * static_cast<float>(l) * static_cast<float>(l);
+            sum_xl += w * static_cast<float>(l) * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (this_min > 0) {
+                this_min = 0;
+                this_scale = sum_xl / sum_l2;
+            }
+            float cur_error = 0;
+            for (int i = 0; i < n; ++i) {
+                const float diff = this_scale * Laux[i] + this_min - x[i];
+                cur_error += weights[i] * (diff * diff);
+            }
+            if (cur_error < best_error) {
+                std::copy_n(Laux, n, L);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+// The part Q4_K and Q5_K share: per 256-value super-block, the 8 sub-block
+// scales and mins (6-bit, packed into `scales`, under fp16 d / dmin) and the
+// levels L in [0, nmax] requantized against those rounded scales.
+void quantize_k_super_block(const float* x, int nmax, float rmin, int nstep, uint16_t& d_out, uint16_t& dmin_out,
+                            uint8_t* packed, uint8_t* L) noexcept {
+    uint8_t Laux[32];
+    float weights[32];
+    float mins[kSuperBlock / 32];
+    float scales[kSuperBlock / 32];
+    float max_scale = 0;  // the min is subtracted, so scales are never negative
+    float max_min = 0;
+    for (int j = 0; j < kSuperBlock / 32; ++j) {
+        float sum_x2 = 0;
+        for (int l = 0; l < 32; ++l) sum_x2 += x[32 * j + l] * x[32 * j + l];
+        const float av_x = std::sqrt(sum_x2 / 32);
+        for (int l = 0; l < 32; ++l) weights[l] = av_x + std::fabs(x[32 * j + l]);
+        scales[j] = make_qkx2_quants(32, nmax, x + 32 * j, weights, L + 32 * j, &mins[j], Laux, rmin, 0.1f, nstep);
+        max_scale = std::max(max_scale, scales[j]);
+        max_min = std::max(max_min, mins[j]);
+    }
+    const float inv_scale = max_scale > 0 ? 63.0f / max_scale : 0.0f;
+    const float inv_min = max_min > 0 ? 63.0f / max_min : 0.0f;
+    std::fill_n(packed, 12, uint8_t{0});
+    for (int j = 0; j < kSuperBlock / 32; ++j) {
+        const auto ls = static_cast<uint8_t>(std::min(63, nearest_int(inv_scale * scales[j])));
+        const auto lm = static_cast<uint8_t>(std::min(63, nearest_int(inv_min * mins[j])));
+        if (j < 4) {
+            packed[j] = ls;
+            packed[j + 4] = lm;
+        } else {
+            packed[j + 4] = static_cast<uint8_t>((ls & 0xF) | ((lm & 0xF) << 4));
+            packed[j - 4] |= static_cast<uint8_t>((ls >> 4) << 6);
+            packed[j] |= static_cast<uint8_t>((lm >> 4) << 6);
+        }
+    }
+    d_out = fp32_to_fp16(max_scale / 63.0f);
+    dmin_out = fp32_to_fp16(max_min / 63.0f);
+    for (int j = 0; j < kSuperBlock / 32; ++j) {
+        uint8_t sc, m;
+        scale_min_k4(j, packed, sc, m);
+        const float d = fp16_to_fp32(d_out) * sc;
+        if (d == 0.0f) continue;
+        const float dm = fp16_to_fp32(dmin_out) * m;
+        for (int i = 0; i < 32; ++i) {
+            L[32 * j + i] = static_cast<uint8_t>(std::max(0, std::min(nmax, nearest_int((x[32 * j + i] + dm) / d))));
+        }
+    }
+}
+
 }  // namespace
+
+void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n) noexcept {
+    uint8_t L[kSuperBlock];
+    for (int64_t b = 0; b < n / kSuperBlock; ++b, x += kSuperBlock) {
+        BlockQ4_K& blk = y[b];
+        quantize_k_super_block(x, 15, -1.0f, 20, blk.d, blk.dmin, blk.scales, L);
+        uint8_t* q = blk.qs;
+        for (int j = 0; j < kSuperBlock; j += 64, q += 32) {
+            for (int l = 0; l < 32; ++l) q[l] = static_cast<uint8_t>(L[j + l] | (L[j + l + 32] << 4));
+        }
+    }
+}
+
+void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n) noexcept {
+    uint8_t L[kSuperBlock];
+    for (int64_t b = 0; b < n / kSuperBlock; ++b, x += kSuperBlock) {
+        BlockQ5_K& blk = y[b];
+        quantize_k_super_block(x, 31, -0.5f, 15, blk.d, blk.dmin, blk.scales, L);
+        std::fill_n(blk.qh, 32, uint8_t{0});
+        uint8_t* ql = blk.qs;
+        uint8_t m1 = 1, m2 = 2;
+        for (int c = 0; c < kSuperBlock; c += 64, ql += 32) {
+            for (int j = 0; j < 32; ++j) {
+                int l1 = L[c + j];
+                int l2 = L[c + j + 32];
+                if (l1 > 15) {
+                    l1 -= 16;
+                    blk.qh[j] |= m1;
+                }
+                if (l2 > 15) {
+                    l2 -= 16;
+                    blk.qh[j] |= m2;
+                }
+                ql[j] = static_cast<uint8_t>(l1 | (l2 << 4));
+            }
+            m1 = static_cast<uint8_t>(m1 << 2);
+            m2 = static_cast<uint8_t>(m2 << 2);
+        }
+    }
+}
 
 void unpack_q5_block(const uint8_t* qh_bytes, const uint8_t* qs, bool symmetric, int8_t* q) noexcept {
     uint32_t qh;

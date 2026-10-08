@@ -76,6 +76,14 @@ uint16_t fp32_to_fp16(float f) noexcept;
 void quantize_row_q8_0(const float* x, BlockQ8_0* y, int64_t n) noexcept;
 void quantize_row_q4_0(const float* x, BlockQ4_0* y, int64_t n) noexcept;
 void quantize_row_q4_1(const float* x, BlockQ4_1* y, int64_t n) noexcept;
+// K-quants with 6-bit sub-block scales and mins: llama.cpp's
+// quantize_row_q4_K_ref / quantize_row_q5_K_ref (identical blocks when both
+// are compiled without FMA contraction; otherwise last-bit differences in a
+// few scales).
+// `n` must be a multiple of kSuperBlock. Slow (a weighted search per
+// sub-block): meant for converting weights at load, not for activations.
+void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n) noexcept;
+void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n) noexcept;
 // Writes a row of `type` from floats into `dst`.
 void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept;
 void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept;

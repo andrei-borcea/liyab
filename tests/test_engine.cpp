@@ -269,6 +269,36 @@ TEST_CASE("Q4_0 / Q8_0 dot kernels match the float dot product") {
     }
 }
 
+TEST_CASE("Q4_K / Q5_K quantization round-trips within the formats' error") {
+    // Gaussian weights with a few outliers, and an all-zero super-block.
+    std::mt19937 rng(11);
+    std::normal_distribution<float> normal(0.0f, 0.02f);
+    const int64_t n = 256 * 64;
+    std::vector<float> w(static_cast<size_t>(n));
+    for (auto& v : w) v = normal(rng);
+    for (int64_t i = 0; i < n; i += 997) w[static_cast<size_t>(i)] *= 30.0f;
+    std::fill_n(w.begin(), 256, 0.0f);
+    double power = 0;
+    for (const float v : w) power += static_cast<double>(v) * v;
+    auto relative_rmse = [&](DType type, size_t block_bytes) {
+        std::vector<uint8_t> q(static_cast<size_t>(n / 256) * block_bytes);
+        std::vector<float> back(w.size());
+        quant::quantize_row(type, w.data(), q.data(), n);
+        quant::dequantize_row(type, q.data(), back.data(), n);
+        double err = 0;
+        for (size_t i = 0; i < w.size(); ++i) {
+            if (i < 256) CHECK(back[i] == 0.0f);
+            err += (static_cast<double>(back[i]) - w[i]) * (static_cast<double>(back[i]) - w[i]);
+        }
+        return std::sqrt(err / power);
+    };
+    const double e4 = relative_rmse(DType::Q4_K, sizeof(quant::BlockQ4_K));
+    const double e5 = relative_rmse(DType::Q5_K, sizeof(quant::BlockQ5_K));
+    CHECK(e4 < 0.12);  // measured: 0.087 and 0.043 (Q8_0: 0.009)
+    CHECK(e5 < 0.06);
+    CHECK(e5 < e4 * 0.7);
+}
+
 TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") {
     std::mt19937 rng(17);
     std::normal_distribution<float> normal(0.0f, 1.0f);
