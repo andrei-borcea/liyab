@@ -152,9 +152,11 @@ static_assert(sizeof(BlockQ8_K) == 292, "Q8_K block must match GGML layout");
 void quantize_row_q8_K(const float* x, BlockQ8_K* y, int64_t n) noexcept;
 
 // True when `type` has a dedicated Q8_K dot kernel on this build (AArch64 NEON):
-// Q2_K, Q3_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and
+// Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and
 // TQ2_0. Callers should then quantize activations with quantize_row_q8_K and
-// call dot_lowbit_q8_K; other types keep the Q8_0 path (dot_quantized).
+// call dot_lowbit_q8_K; other types keep the Q8_0 path (dot_quantized). The
+// 4-6 bit K-quants are cheap to decode, but per 32 values the Q8_0 path pays a
+// horizontal add and two fp16 conversions; per 256 they accumulate in int32.
 bool uses_q8_K(DType type) noexcept;
 
 // Dot of one weight row of `type` (any type listed for uses_q8_K) with a Q8_K

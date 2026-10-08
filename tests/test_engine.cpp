@@ -445,9 +445,9 @@ TEST_CASE("Q8_K activation quantization matches llama.cpp's semantics") {
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
     std::vector<QuantVector> vectors;
     if (!load_quant_vectors(vectors)) return;
-    const DType lowbit[] = {DType::Q2_K,   DType::Q3_K,    DType::TQ2_0,  DType::IQ1_S,
-                            DType::IQ1_M,  DType::IQ2_XXS, DType::IQ2_XS, DType::IQ2_S,
-                            DType::IQ3_XXS, DType::IQ3_S,  DType::IQ4_XS};
+    const DType lowbit[] = {DType::Q2_K,   DType::Q3_K,    DType::Q4_K,   DType::Q5_K,  DType::Q6_K,
+                            DType::TQ2_0,  DType::IQ1_S,   DType::IQ1_M,  DType::IQ2_XXS, DType::IQ2_XS,
+                            DType::IQ2_S,  DType::IQ3_XXS, DType::IQ3_S,  DType::IQ4_XS};
     std::mt19937 rng(29);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     ThreadPool pool(3);
@@ -482,7 +482,11 @@ TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (lla
         //    (only activation-quantization error separates them).
         std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(n / 32));
         quant::quantize_row_q8_0(x.data(), xq.data(), n);
-        const float old_path = quant::dot_ext_q8_0(qv.type, qv.blocks.data(), xq.data(), n);
+        std::vector<int32_t> xsums(xq.size());
+        quant::block_sums(xq.data(), xsums.data(), n);
+        const float old_path = quant::is_extended(qv.type)
+                                   ? quant::dot_ext_q8_0(qv.type, qv.blocks.data(), xq.data(), n)
+                                   : quant::dot_quantized(qv.type, qv.blocks.data(), xq.data(), xsums.data(), n);
         const bool old_ok = std::fabs(kernel - old_path) <= 2e-2 * mag;
         const bool float_ok = std::fabs(kernel - exact) <= 2e-2 * mag;
         CHECK(old_ok);
@@ -506,7 +510,7 @@ TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (lla
             CHECK(y[0] == kernel);
             CHECK(y[1] == second);
         } else {
-            CHECK(y[0] == quant::dot_quantized(qv.type, qv.blocks.data(), xq.data(), nullptr, n));
+            CHECK(y[0] == old_path);
         }
         std::printf("  %-8s kernel-vs-dequant %.1e  vs Q8_0 path %.1e  vs float %.1e  (of %.2f)\n",
                     std::string(dtype_traits(qv.type).name).c_str(), std::fabs(kernel - reference) / mag,

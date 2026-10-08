@@ -143,10 +143,11 @@ This README describes what the code does today. Anything not implemented is list
   rejected with a clear error. Decoders are ported from llama.cpp's gguf-py reference. `tests/data/quant_vectors.bin`
   (written by `tools/gen_quant_vectors.py`) holds reference outputs, and `test_engine` checks all 24 formats
   bit-exactly. I-quant grids are extracted from gguf-py by `tools/gen_quant_tables.py`.
-* **Kernels:** Q4_0/Q4_1/Q8_0, Q5_0/Q5_1 and Q4_K/Q5_K/Q6_K have dedicated NEON + SDOT kernels that unpack bits in
-  registers. Q2_K, Q3_K, TQ2_0, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S and IQ4_XS use NEON kernels adapted from llama.cpp
-  (`src/core/quant_lowbit.cpp`) against Q8_K activations (one scale per 256 values plus 16-value sums, quantized
-  once per matmul); IQ4_NL and MXFP4 use table-lookup kernels against Q8_0. TQ1_0 and NVFP4 (and every format on
+* **Kernels:** Q4_0/Q4_1/Q8_0 and Q5_0/Q5_1 have dedicated NEON + SDOT kernels that unpack bits in registers.
+  The K-quants Q2_K to Q6_K, TQ2_0, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S and IQ4_XS use NEON kernels adapted from
+  llama.cpp (`src/core/quant_lowbit.cpp`) against Q8_K activations (one scale per 256 values plus 16-value sums,
+  quantized once per matmul), so a whole super-block accumulates in int32 and is scaled once (for Q4_K–Q6_K this
+  roughly doubled single-core throughput on Apple M4 over the previous per-32-value Q8_0 path); IQ4_NL and MXFP4 use table-lookup kernels against Q8_0. TQ1_0 and NVFP4 (and every format on
   non-NEON targets) decode each block to int8 values with per-16 scales, then use SDOT. On Vulkan, weights in
   ordinary memory are copied once (Q4_K and Q5_0 repacked exactly into the Q4_1/Q8_0 layouts; other formats fall
   back to the CPU per matmul); weights in GPU-shared memory (`Backend::allocate_shared`) are read in place by
