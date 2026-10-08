@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -133,6 +134,12 @@ public:
     // (slot n_layers = output head). Requires configure_layers() and a
     // single-file model (a split model's block may span files: {0, 0}).
     [[nodiscard]] std::pair<size_t, size_t> layer_range(int32_t slot) const;
+    // Selective residency (MoE expert streaming): tensors for which
+    // `resident` is true are paged in now and stay mapped; the others are
+    // marked MADV_RANDOM (no read-ahead), because their bytes are read through
+    // another path. Turns off the streaming window (call before
+    // configure_layers). Returns the resident bytes.
+    size_t keep_resident(const std::function<bool(const TensorView&)>& resident);
     // Blocks until all queued prefetches completed (tests, benchmarks).
     void wait_prefetch_idle();
     [[nodiscard]] uint64_t prefetched_bytes() const noexcept { return prefetched_bytes_.load(); }

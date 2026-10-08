@@ -528,6 +528,60 @@ TEST_CASE("Mixture of experts with identical experts equals its dense twin (rout
     CHECK(max_abs_diff(stepwise, dense_logits) < 1e-3);
 }
 
+TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O) equals in-place expert reads") {
+    test::TinyModelSpec spec;  // Q4_0 experts: block-quantized slices at unaligned offsets
+    spec.arch = "qwen3moe";
+    spec.n_layers = 3;
+    spec.n_expert = 32;
+    spec.n_expert_used = 4;
+    spec.identical_experts = false;
+    const std::string& path = model_path("moe_streamed", spec);
+    TransformerOptions in_place;
+    in_place.expert_cache_bytes = 0;
+    TransformerOptions streamed;
+    streamed.expert_cache_bytes = 1;  // minimum: a few dozen slots for 96 experts
+    auto a = load_transformer(path, in_place);
+    auto b = load_transformer(path, streamed);
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(a->expert_store() == nullptr);
+    REQUIRE(b->expert_store() != nullptr);
+    CHECK(b->expert_store()->entries() < 96);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 40; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto la = a->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(la.has_value());
+    const std::vector<float> expected(la->begin(), la->end());
+    auto lb = b->forward(tokens, Transformer::Logits::All, route, pool);
+    if (!lb) std::printf("  streamed forward failed: %s\n", lb.status().to_string().c_str());
+    REQUIRE(lb.has_value());
+    CHECK(max_abs_diff(*lb, expected) == 0.0f);
+    b->reset();
+    std::vector<float> stepwise;
+    for (const int32_t t : tokens) {
+        auto r = b->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(r.has_value());
+        stepwise.insert(stepwise.end(), r->begin(), r->end());
+    }
+    a->reset();
+    std::vector<float> stepwise_ref;
+    for (const int32_t t : tokens) {
+        auto r = a->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(r.has_value());
+        stepwise_ref.insert(stepwise_ref.end(), r->begin(), r->end());
+    }
+    CHECK(max_abs_diff(stepwise, stepwise_ref) == 0.0f);
+    const ExpertStore::Stats st = b->expert_store()->stats();
+    std::printf("  expert cache: %llu hits, %llu late, %llu misses, %llu loads, %.1f MiB read\n",
+                static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.late),
+                static_cast<unsigned long long>(st.misses), static_cast<unsigned long long>(st.loads),
+                static_cast<double>(st.bytes_read) / (1024.0 * 1024.0));
+    CHECK(st.loads > b->expert_store()->entries());  // evictions happened
+    CHECK(st.hits + st.late > 0);                     // predictions were used
+}
+
 TEST_CASE("Transformer with mixed Q4_0/Q8_0 weights and Q8_0 KV stays close to the reference") {
     auto model = load_transformer(mixed_model());
     REQUIRE(model != nullptr);

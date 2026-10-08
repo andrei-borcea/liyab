@@ -74,7 +74,9 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.cancelled ? 1 : 0,     s.early_exits,           s.early_exit_layers_skipped,
                                         s.head_pruned_steps,     s.weight_stalls,         s.weight_wait_ms,
                                         s.kv_cache_bytes,        s.ffn_blocks_skipped,    s.sparse_ffn_steps,
-                                        s.ttft_ms,               s.cached_prefix_tokens};
+                                        s.ttft_ms,               s.cached_prefix_tokens,  s.expert_hits,
+                                        s.expert_late,           s.expert_misses,         s.expert_bytes_read,
+                                        s.expert_stall_ms};
     }
     return LIYAB_OK;
 }
@@ -118,6 +120,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->target_tps = d.power.target_tps;
     config->thermal_polling = d.thermal_polling ? 1 : 0;
     config->triple_buffer_loading = d.triple_buffer_loading ? 1 : 0;
+    config->expert_cache_mb = d.expert_cache_mb;
     config->early_exit = d.experimental.early_exit ? 1 : 0;
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
@@ -159,6 +162,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.power.target_tps = config->target_tps;
         c.thermal_polling = config->thermal_polling != 0;
         c.triple_buffer_loading = config->triple_buffer_loading != 0;
+        c.expert_cache_mb = config->expert_cache_mb;
         c.experimental.early_exit = config->early_exit != 0;
         c.experimental.early_exit_threshold = config->early_exit_threshold;
         c.experimental.head_pruning = config->head_pruning != 0;

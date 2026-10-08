@@ -222,6 +222,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         model->inv_freq_[i] = static_cast<float>(freq / factors[i]);
     }
 
+    if (c.n_expert > 0) LIYAB_RETURN_IF_ERROR(model->attach_expert_store(options.expert_cache_bytes));
     model->file_->configure_layers(c.n_layers);
     LIYAB_LOG_INFO("%s: %d layers, d=%d, ff=%d, heads=%d/%d x %d, vocab=%d, ctx=%d%s, kv=%s, %.1f KiB/token",
                    c.arch.c_str(), c.n_layers, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab,
@@ -375,16 +376,19 @@ size_t Transformer::recurrent_state_bytes() const noexcept {
 // ---------------------------------------------------------------------------
 class Transformer::BlockWeights {
 public:
-    BlockWeights(Transformer& model, int32_t layer) : model_(model), layer_(layer) {
+    BlockWeights(Transformer& model, int32_t layer) : model_(model) {
         const Layer& L = model.layers_[static_cast<size_t>(layer)];
         for (size_t i = 0; i < kWeightRoles; ++i) {
             if (L.w[i] != nullptr) views_[i] = *L.w[i];
         }
-        if (model.layer_source_ == nullptr) {
-            model.file_->begin_layer(layer);  // mmap path: advance the prefetch window
+        item_ = model.layer_source_ == nullptr ? -1
+                : model.layer_items_.empty()  ? layer
+                                              : model.layer_items_[static_cast<size_t>(layer)];
+        if (item_ < 0) {
+            model.file_->begin_layer(layer);  // mmap path: advance the prefetch window (if any)
             return;
         }
-        auto base = model.layer_source_->acquire(layer);
+        auto base = model.layer_source_->acquire(item_);
         if (!base) {
             status_ = base.status();
             return;
@@ -398,7 +402,7 @@ public:
         }
     }
     ~BlockWeights() {
-        if (acquired_) model_.layer_source_->release(layer_);
+        if (acquired_) model_.layer_source_->release(item_);
     }
     BlockWeights(const BlockWeights&) = delete;
     BlockWeights& operator=(const BlockWeights&) = delete;
@@ -409,7 +413,7 @@ public:
 
 private:
     Transformer& model_;
-    int32_t layer_;
+    int32_t item_ = -1;  // layer source item, -1: read in place
     bool acquired_ = false;
     Status status_;
     TensorView views_[kWeightRoles];
@@ -695,6 +699,82 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
     return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
 
+// Expert streaming: the routed experts stay on storage and are read on
+// demand into a fixed RAM cache; every other tensor stays resident in the
+// mapping (paged in now, never swept by the streaming window).
+Status Transformer::attach_expert_store(int64_t budget_option) {
+    if (budget_option == 0) return Status::ok();
+    const ModelConfig& c = config_;
+    auto is_expert = [](const TensorView& t) {
+        const std::string_view n = t.name;
+        return n.size() > 13 && n.substr(n.size() - 12) == "_exps.weight";
+    };
+    size_t expert_bytes = 0;
+    for (const TensorView& t : file_->tensors()) {
+        if (is_expert(t)) expert_bytes += t.nbytes;
+    }
+    const size_t resident_bytes = file_->file_size() - expert_bytes;
+    const uint64_t available = available_memory_bytes();
+    size_t budget = 0;
+    if (budget_option > 0) {
+        budget = static_cast<size_t>(budget_option);
+    } else {
+        // Automatic: only when the model does not fit; keep 1 GiB for the KV
+        // cache, activations and the rest of the app.
+        if (available == 0 || static_cast<double>(file_->file_size()) <= 0.8 * static_cast<double>(available)) {
+            return Status::ok();
+        }
+        const size_t margin = size_t{1} << 30;
+        budget = available > resident_bytes + margin ? static_cast<size_t>(available) - resident_bytes - margin : 0;
+    }
+    std::vector<std::array<const TensorView*, 3>> experts(static_cast<size_t>(c.n_layers));
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        const Layer& L = layers_[static_cast<size_t>(l)];
+        if (L.moe) experts[static_cast<size_t>(l)] = {L.w[kGateExps], L.w[kUpExps], L.w[kDownExps]};
+    }
+    auto store = ExpertStore::create(*file_, std::move(experts), c.n_expert, budget, 4);
+    if (!store) return store.status();
+    expert_store_ = std::move(store).value();
+    const size_t resident = file_->keep_resident([&](const TensorView& t) { return !is_expert(t); });
+    LIYAB_LOG_INFO("expert streaming: %.2f GiB resident weights, %.2f GiB of experts on storage",
+                   static_cast<double>(resident) / (1024.0 * 1024.0 * 1024.0),
+                   static_cast<double>(expert_bytes) / (1024.0 * 1024.0 * 1024.0));
+    return Status::ok();
+}
+
+void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) {
+    if (expert_store_ == nullptr || layer >= config_.n_layers) return;
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    if (!L.moe) return;
+    const auto d = static_cast<size_t>(c.n_embd);
+    const auto E = static_cast<size_t>(c.n_expert);
+    const auto un = static_cast<size_t>(n);
+    pred_in_.resize(un * d);
+    pred_logits_.resize(un * E);
+    for (size_t t = 0; t < un; ++t) {
+        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), pred_in_.data() + t * d, c.n_embd, c.rms_eps);
+    }
+    if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
+    std::vector<int32_t> order(E);
+    std::vector<int32_t> picks;
+    for (size_t t = 0; t < un; ++t) {
+        const float* logits = pred_logits_.data() + t * E;
+        auto score = [&](int32_t e) {  // softmax and sigmoid are monotonic; the selection bias is added on top
+            const float p = c.moe_gating == MoeGating::Softmax ? logits[e] : sigmoid(logits[e]);
+            return p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
+        };
+        for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
+        const auto k = static_cast<std::ptrdiff_t>(c.n_expert_used);
+        std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                          [&](int32_t a, int32_t b) { return score(a) > score(b); });
+        picks.insert(picks.end(), order.begin(), order.begin() + k);
+    }
+    std::sort(picks.begin(), picks.end());
+    picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
+    expert_store_->prefetch(layer, picks, true);
+}
+
 Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                               FfnMatmulHook* hook) {
     const ModelConfig& c = config_;
@@ -764,27 +844,54 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         }
     }
 
-    moe_out_.assign(un * d, 0.0f);
+    // With expert streaming, queue every chosen expert now (missed
+    // predictions jump the queue) and compute cached ones first, so reads
+    // overlap the work on the others.
+    std::vector<int32_t> chosen;
     for (size_t e = 0; e < E; ++e) {
+        if (!assigned[e].empty()) chosen.push_back(static_cast<int32_t>(e));
+    }
+    if (expert_store_ != nullptr) {
+        expert_store_->prefetch(layer, chosen, false);
+        std::stable_partition(chosen.begin(), chosen.end(),
+                              [&](int32_t e) { return expert_store_->ready(layer, e); });
+    }
+
+    moe_out_.assign(un * d, 0.0f);
+    for (const int32_t chosen_expert : chosen) {
+        const auto e = static_cast<size_t>(chosen_expert);
         const auto& users = assigned[e];
-        if (users.empty()) continue;
         const auto rows = static_cast<int32_t>(users.size());
         ein_.resize(users.size() * d);
         for (size_t i = 0; i < users.size(); ++i) {
             std::copy_n(xb_.data() + static_cast<size_t>(users[i].first) * d, d, ein_.data() + i * d);
         }
-        const TensorView gate = expert_slice(w[kGateExps], static_cast<int64_t>(e));
-        const TensorView up = expert_slice(w[kUpExps], static_cast<int64_t>(e));
-        const TensorView down = expert_slice(w[kDownExps], static_cast<int64_t>(e));
+        std::array<TensorView, 3> views{};
+        if (expert_store_ != nullptr) {
+            auto loaded = expert_store_->acquire(layer, chosen_expert);
+            if (!loaded) return loaded.status();
+            views = *loaded;
+        } else {
+            views = {expert_slice(w[kGateExps], static_cast<int64_t>(e)), expert_slice(w[kUpExps], static_cast<int64_t>(e)),
+                     expert_slice(w[kDownExps], static_cast<int64_t>(e))};
+        }
+        const TensorView& gate = views[0];
+        const TensorView& up = views[1];
+        const TensorView& down = views[2];
         eh_.resize(users.size() * ff);
         eh2_.resize(users.size() * ff);
         eout_.resize(users.size() * d);
         // Expert slices are transient views: they run on the CPU, which reads them in place.
         const TensorView* gate_up[] = {&gate, &up};
         float* outs[] = {eh_.data(), eh2_.data()};
-        LIYAB_RETURN_IF_ERROR(route.cpu->matmul_group(gate_up, ein_.data(), outs, rows));
+        if (Status st = route.cpu->matmul_group(gate_up, ein_.data(), outs, rows); !st.is_ok()) {
+            if (expert_store_ != nullptr) expert_store_->release(layer, chosen_expert);
+            return st;
+        }
         for (size_t i = 0; i < eh_.size(); ++i) eh_[i] = silu(eh_[i]) * eh2_[i];
-        LIYAB_RETURN_IF_ERROR(route.cpu->matmul(down, eh_.data(), eout_.data(), rows));
+        const Status down_status = route.cpu->matmul(down, eh_.data(), eout_.data(), rows);
+        if (expert_store_ != nullptr) expert_store_->release(layer, chosen_expert);
+        LIYAB_RETURN_IF_ERROR(down_status);
         for (size_t i = 0; i < users.size(); ++i) {
             float* dst = moe_out_.data() + static_cast<size_t>(users[i].first) * d;
             const float* src = eout_.data() + i * d;
@@ -857,6 +964,14 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
 
+        // --- expert prefetch: this block's router and the next one's, applied
+        // to the hidden state entering the block, guess the experts ahead of
+        // the mixer so their reads overlap it ---
+        if (expert_store_ != nullptr) {
+            if (l == 0) predict_experts(0, n, route);
+            predict_experts(l + 1, n, route);
+        }
+
         // --- token mixer (attention or DeltaNet) ---
         if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
         for (size_t t = 0; t < un; ++t) {
@@ -897,6 +1012,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
 
     n_past_ += n;
     kv_->release_unreachable(n_past_, max_batch_);  // recycle pages that left the window
+    if (expert_store_ != nullptr && ++decode_steps_ % 16 == 0) expert_store_->age();
     if (logits == Logits::None) return std::span<const float>();
 
     // --- output head ---

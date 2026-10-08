@@ -217,6 +217,12 @@ struct GenerationStats {
     int32_t weight_stalls = 0;      // triple-buffer: block fetches the executor had to wait for
     double weight_wait_ms = 0.0;
     uint64_t kv_cache_bytes = 0;    // KV pages in use at the end of generation
+    // MoE expert streaming (zero when experts are read in place):
+    int32_t expert_hits = 0;        // routed experts already in the RAM cache
+    int32_t expert_late = 0;        // predicted and prefetched, but still loading when needed
+    int32_t expert_misses = 0;      // not predicted: read after the router chose them
+    uint64_t expert_bytes_read = 0; // bytes read from storage for experts
+    double expert_stall_ms = 0.0;   // time the forward pass waited for expert reads
     bool cancelled = false;
 };
 

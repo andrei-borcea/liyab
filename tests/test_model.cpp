@@ -260,7 +260,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
         auto stacked = [&](const std::vector<float>& one) {
             std::vector<float> all;
-            for (int32_t e = 0; e < s.n_expert; ++e) all.insert(all.end(), one.begin(), one.end());
+            for (int32_t e = 0; e < s.n_expert; ++e) {
+                if (s.identical_experts || e == 0) {
+                    all.insert(all.end(), one.begin(), one.end());
+                    continue;
+                }
+                for (size_t i = 0; i < one.size(); ++i) all.push_back(normal(router_rng) * s.weight_scale);
+            }
             return all;
         };
         w.add_tensor(p + "ffn_gate_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, stacked(gate));

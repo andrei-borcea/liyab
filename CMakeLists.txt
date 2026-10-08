@@ -74,6 +74,8 @@ add_library(liyab_core OBJECT
   src/core/tokenizer.cpp
   src/core/sampling.cpp
   src/core/transformer.cpp
+  src/core/expert_store.cpp
+  src/core/direct_io.cpp
   src/core/speculative_decoder.cpp
   src/core/engine.cpp
   src/backends/cpu/cpu_backend.cpp

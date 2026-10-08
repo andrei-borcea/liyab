@@ -80,6 +80,7 @@ typedef struct liyab_engine_config {
     double target_tps;            /* > 0 overrides the profile's pacing rate */
     int32_t thermal_polling;      /* nonzero: background thermal sampling */
     int32_t triple_buffer_loading; /* nonzero: stream blocks through 3 rotating buffers */
+    int64_t expert_cache_mb;      /* MoE: -1 auto (default), 0 never stream experts, > 0 cache size in MiB */
     /* Experimental (build with LIYAB_ENABLE_EXPERIMENTAL=ON, else LIYAB_ERR_UNSUPPORTED). */
     int32_t early_exit;           /* nonzero: confidence-based early exit (lossy) */
     float early_exit_threshold;   /* default 0.98 */
@@ -121,6 +122,12 @@ typedef struct liyab_generation_stats {
     int32_t sparse_ffn_steps;
     double ttft_ms;
     int32_t cached_prefix_tokens;
+    /* MoE expert streaming (zero when experts are read in place) */
+    int32_t expert_hits;          /* routed experts already cached in RAM */
+    int32_t expert_late;          /* prefetched but still loading when needed */
+    int32_t expert_misses;        /* read after the router chose them */
+    uint64_t expert_bytes_read;
+    double expert_stall_ms;       /* time spent waiting for expert reads */
 } liyab_generation_stats;
 
 /*

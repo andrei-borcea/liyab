@@ -520,6 +520,25 @@ void MmapLoader::configure_layers(int32_t n_layers) {
     if (streaming_) prefetch_thread_ = std::thread([this] { prefetch_loop(); });
 }
 
+size_t MmapLoader::keep_resident(const std::function<bool(const TensorView&)>& resident) {
+    streaming_ = false;
+    size_t bytes = 0;
+    for (const TensorView& t : tensors_) {
+        const MappedFile& f = *files_[t.shard];
+        if (resident(t)) {
+            f.advise_willneed(t.file_offset, t.nbytes);
+            bytes += t.nbytes;
+        } else {
+            f.advise_dontneed(t.file_offset, t.nbytes);  // drop anything read so far
+            const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            const size_t begin = static_cast<size_t>(t.file_offset) & ~(page - 1);
+            madvise(const_cast<uint8_t*>(f.data()) + begin, static_cast<size_t>(t.file_offset) + t.nbytes - begin,
+                    MADV_RANDOM);
+        }
+    }
+    return bytes;
+}
+
 void MmapLoader::begin_layer(int32_t layer) {
     if (!streaming_ || layer_ranges_.empty()) return;
     const auto slots = static_cast<int32_t>(layer_ranges_.size());

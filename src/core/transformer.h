@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "core/expert_store.h"
 #include "liyab/backend.h"
 #include "liyab/experimental/forward_hooks.h"
 #include "liyab/kv_cache.h"
@@ -91,6 +92,11 @@ struct TransformerOptions {
     int32_t sink_tokens = 8;      // attention-sink anchors kept with a sliding window
     KvCacheType kv_type = KvCacheType::Q8_0;
     int32_t max_batch = 64;       // largest rollback the caller performs (speculative k + 1)
+    // MoE models: RAM for routed experts streamed from storage (ExpertStore).
+    // -1: automatic (stream when the model does not fit in RAM, budget = free
+    // RAM minus the resident weights and a safety margin), 0: never (experts
+    // are read through the mapping), > 0: always, with this budget.
+    int64_t expert_cache_bytes = -1;
 };
 
 class Transformer {
@@ -99,6 +105,7 @@ public:
 
     [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
     [[nodiscard]] const MmapLoader& file() const noexcept { return *file_; }
+    [[nodiscard]] MmapLoader& mutable_file() noexcept { return *file_; }
     [[nodiscard]] const KvCache& kv_cache() const noexcept { return *kv_; }
     [[nodiscard]] int32_t context_length() const noexcept { return context_length_; }
     [[nodiscard]] int32_t n_past() const noexcept { return n_past_; }
@@ -125,6 +132,9 @@ public:
         const Layer& L = layers_[static_cast<size_t>(layer)];
         return {L.w[kGate], L.w[kUp], L.w[kDown]};
     }
+    // Routed-expert streaming (MoE models larger than RAM); nullptr when the
+    // experts are read in place from the mapping.
+    [[nodiscard]] const ExpertStore* expert_store() const noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
@@ -140,10 +150,15 @@ public:
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
-    // Streams transformer blocks through `source` (item i = block i, laid out
-    // as MmapLoader::layer_range(i)) instead of reading the mapping in place.
-    // nullptr restores in-place reads. `source` must outlive its use here.
-    void set_layer_source(TripleBufferLoader* source) noexcept { layer_source_ = source; }
+    // Streams transformer blocks through `source` instead of reading the
+    // mapping in place. Block l is item `items[l]` of the source (laid out as
+    // MmapLoader::layer_range(l)), or read in place when items[l] < 0; an
+    // empty `items` streams every block (item i = block i). nullptr restores
+    // in-place reads. `source` must outlive its use here.
+    void set_layer_source(TripleBufferLoader* source, std::vector<int32_t> items = {}) {
+        layer_source_ = source;
+        layer_items_ = std::move(items);
+    }
 
 private:
     // Matrices of one block, by role; unused roles stay nullptr.
@@ -191,6 +206,10 @@ private:
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
+    // Expert prefetch: applies block `layer`'s router to the current hidden
+    // states (x_) and queues the top-k experts it picks in the ExpertStore.
+    void predict_experts(int32_t layer, int32_t n, const Route& route);
+    Status attach_expert_store(int64_t budget_option);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
@@ -211,12 +230,15 @@ private:
     int32_t last_ffn_skips_ = 0;
     std::unique_ptr<KvCache> kv_;
     TripleBufferLoader* layer_source_ = nullptr;
+    std::vector<int32_t> layer_items_;
 
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
     std::vector<float> output_norm_;
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
+    std::unique_ptr<ExpertStore> expert_store_;
+    int64_t decode_steps_ = 0;  // expert cache aging clock
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 
     // Scratch, sized for the current batch.
@@ -224,6 +246,7 @@ private:
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_;  // MoE scratch
+    std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
 };
 

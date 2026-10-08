@@ -165,7 +165,7 @@ TEST_CASE("HeadPruner ranks heads by Wo norm and activates with the power policy
     REQUIRE(model != nullptr);
     const ModelConfig& c = model->config();
     std::vector<const TensorView*> wo;
-    for (int32_t l = 0; l < c.n_layers; ++l) wo.push_back(&model->attn_output(l));
+    for (int32_t l = 0; l < c.n_layers; ++l) wo.push_back(model->attn_output(l));
 
     auto full = HeadPruner::create(wo, c.n_head, c.head_dim, {1.0f});
     REQUIRE(full.has_value());
@@ -207,7 +207,7 @@ TEST_CASE("Head masks change attention output; an all-ones mask does not") {
     REQUIRE(base && ones && pruned);
     const ModelConfig& c = base->config();
     std::vector<const TensorView*> wo;
-    for (int32_t l = 0; l < c.n_layers; ++l) wo.push_back(&pruned->attn_output(l));
+    for (int32_t l = 0; l < c.n_layers; ++l) wo.push_back(pruned->attn_output(l));
     auto pruner = HeadPruner::create(wo, c.n_head, c.head_dim, {0.5f});
     REQUIRE(pruner.has_value());
     pruner->set_active(true);
@@ -874,7 +874,7 @@ TEST_CASE("[bench] early exit and head pruning: decode throughput") {
                 static_cast<long long>(ee_forced.exits), steps);
 
     std::vector<const TensorView*> wo;
-    for (int32_t l = 0; l < spec.n_layers; ++l) wo.push_back(&model->attn_output(l));
+    for (int32_t l = 0; l < spec.n_layers; ++l) wo.push_back(model->attn_output(l));
     auto pruner = HeadPruner::create(wo, spec.n_head, spec.n_embd / spec.n_head, {0.5f});
     REQUIRE(pruner.has_value());
     pruner->set_active(true);

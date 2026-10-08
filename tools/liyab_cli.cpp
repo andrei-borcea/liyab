@@ -50,6 +50,7 @@ void usage() {
                  "  --ctx N            context length    --window N  sliding window\n"
                  "  --sinks N          attention-sink tokens kept with --window (default 8)\n"
                  "  --triple-buffer    stream blocks through 3 rotating buffers (bounded memory)\n"
+                 "  --expert-cache MB  MoE: RAM for streamed experts (-1 auto, 0 off; default auto)\n"
                  "  --threads N        worker threads (default: performance cores)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
         else if (arg == "--window") config.sliding_window = std::atoi(next());
         else if (arg == "--sinks") config.kv_sink_tokens = std::atoi(next());
         else if (arg == "--triple-buffer") config.triple_buffer_loading = 1;
+        else if (arg == "--expert-cache") config.expert_cache_mb = std::atoll(next());
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;
@@ -202,6 +204,16 @@ int main(int argc, char** argv) {
         if (stats.ffn_blocks_skipped > 0) {
             std::fprintf(stderr, "EGLS: %d FFN blocks skipped (%.1f per token)\n", stats.ffn_blocks_skipped,
                          static_cast<double>(stats.ffn_blocks_skipped) / std::max(1, stats.generated_tokens));
+        }
+        if (const int32_t used = stats.expert_hits + stats.expert_late + stats.expert_misses; used > 0) {
+            std::fprintf(stderr,
+                         "experts: %d used, %.0f%% cached, %.0f%% prefetched late, %.0f%% missed; %.1f MiB/token read, "
+                         "%.0f ms waiting (%.0f%% of decode)\n",
+                         used, 100.0 * stats.expert_hits / used, 100.0 * stats.expert_late / used,
+                         100.0 * stats.expert_misses / used,
+                         static_cast<double>(stats.expert_bytes_read) / (1024.0 * 1024.0) /
+                             std::max(1, stats.prompt_tokens + stats.generated_tokens),
+                         stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
         }
         if (stats.cached_prefix_tokens > 0) {
             std::fprintf(stderr, "KV dedup: %d prompt tokens restored from snapshot\n", stats.cached_prefix_tokens);

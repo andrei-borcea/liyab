@@ -51,6 +51,11 @@ struct EngineConfig {
     // capped by flash bandwidth / model size. With LIYAB_ENABLE_EXPERIMENTAL
     // stage 1 uses O_DIRECT / io_uring.
     bool triple_buffer_loading = false;
+    // Mixture-of-experts models: RAM cache for routed experts streamed from
+    // storage with direct I/O, in MiB. -1: automatic (only when the model does
+    // not fit in RAM; uses the free RAM left after the other weights), 0:
+    // never stream experts, > 0: always, with this cache size.
+    int64_t expert_cache_mb = -1;
     int32_t draft_tokens = 4;         // k for speculative decoding
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM

@@ -60,6 +60,8 @@ struct TinyModelSpec {
     // so the model must compute exactly what its dense twin computes.
     int32_t n_expert = 0;
     int32_t n_expert_used = 0;
+    // false: every expert gets its own random weights (no dense twin).
+    bool identical_experts = true;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

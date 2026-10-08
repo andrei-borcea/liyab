@@ -11,6 +11,7 @@
 #include "core/sampling.h"
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
+#include "core/direct_io.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
 #include "liyab/mmap_loader.h"
@@ -24,7 +25,6 @@
 #include "liyab/experimental/tdss.h"
 #include "liyab/experimental/kv_dedup.h"
 #include "liyab/experimental/head_pruner.h"
-#include "liyab/experimental/io_uring_loader.h"
 #endif
 
 namespace liyab {
@@ -65,6 +65,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.sink_tokens = config.kv_sink_tokens;
     options.kv_type = config.kv_cache_type;
     options.max_batch = max_batch;
+    options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -79,9 +80,7 @@ struct Engine::Impl {
     std::unique_ptr<Backend> npu;  // QNN / NeuroPilot once implemented
     std::unique_ptr<Transformer> target;
     std::unique_ptr<Transformer> draft;
-#if defined(LIYAB_ENABLE_EXPERIMENTAL)
-    std::unique_ptr<experimental::DirectReader> direct_reader;  // must outlive weight_loader
-#endif
+    std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
     std::unique_ptr<TripleBufferLoader> weight_loader;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
@@ -175,48 +174,85 @@ struct Engine::Impl {
         return Status::ok();
     }
 
-    // Builds the 3-stage weight pipeline for the target model's blocks.
-    Status attach_weight_loader() {
+    // Streams dense blocks from storage through the 3-slot pipeline. `all`:
+    // every block (EngineConfig::triple_buffer_loading). Otherwise, for a
+    // dense model larger than RAM, as many blocks as fit stay resident (read
+    // in place from the mapping, which direct I/O never evicts) and the rest
+    // are streamed; the streamed blocks are spread evenly through the stack
+    // so storage keeps reading while resident blocks compute.
+    Status attach_layer_streaming(bool all) {
         const MmapLoader& file = target->file();
-        if (file.shard_count() > 1) {
-            return Status(ErrorCode::Unsupported, "triple-buffer loading needs a single-file model (this one is split)");
-        }
-        if (!file.streaming()) {
-            // Fits in RAM: in-place mmap reads hit the page cache, while the
-            // triple buffer re-fetches every block for every token.
-            LIYAB_LOG_WARN("triple-buffer loading on a model that fits in memory: every token re-reads all blocks "
-                           "from storage; in-place mmap is faster unless the model exceeds RAM");
-        }
-        std::vector<TripleBufferLoader::Item> items;
-        for (int32_t l = 0; l < target->config().n_layers; ++l) {
-            const auto [begin, end] = file.layer_range(l);
-            items.push_back({begin, end - begin});
-        }
-        TripleBufferLoader::FetchFn fetch;
-#if defined(LIYAB_ENABLE_EXPERIMENTAL)
-        // Stage 1 as DMA into the slot: O_DIRECT (io_uring where permitted).
-        auto reader = experimental::DirectReader::open(file.file().path());
-        if (!reader) return reader.status();
-        direct_reader = std::move(reader).value();
-        LIYAB_LOG_INFO("weight fetch: %s%s%s", experimental::io_method_name(direct_reader->method()),
-                       direct_reader->fallback_reason().empty() ? "" : " - ", direct_reader->fallback_reason().c_str());
-        fetch = [r = direct_reader.get()](uint64_t offset, size_t length, uint8_t* dst) {
-            return r->read_into(offset, length, dst);
-        };
-#else
-        // Stage 1 from the mapping: page faults happen on the fetch thread.
-        fetch = [&file](uint64_t offset, size_t length, uint8_t* dst) {
-            const size_t size = file.file().size();
-            const size_t n = offset < size ? std::min(length, size - static_cast<size_t>(offset)) : 0;
-            std::memcpy(dst, file.file().data() + offset, n);
+        const ModelConfig& c = target->config();
+        if (target->expert_store() != nullptr) {
+            if (all) {
+                return Status(ErrorCode::Unsupported, "triple-buffer loading and expert streaming are exclusive (MoE "
+                                                      "models stream their experts already)");
+            }
             return Status::ok();
+        }
+        if (file.shard_count() > 1) {
+            if (all) return Status(ErrorCode::Unsupported, "block streaming needs a single-file model (this one is split)");
+            return Status::ok();  // split dense models keep the mmap streaming window
+        }
+        std::vector<size_t> bytes(static_cast<size_t>(c.n_layers));
+        size_t block_total = 0;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const auto [begin, end] = file.layer_range(l);
+            bytes[static_cast<size_t>(l)] = end - begin;
+            block_total += end - begin;
+        }
+        const size_t largest = *std::max_element(bytes.begin(), bytes.end());
+        int32_t streamed = c.n_layers;
+        if (!all) {
+            const uint64_t available = available_memory_bytes();
+            if (available == 0 || static_cast<double>(file.file_size()) <= 0.8 * static_cast<double>(available)) {
+                return Status::ok();  // fits: in-place reads from the page cache
+            }
+            // Resident budget: free RAM minus the non-block weights, the 3
+            // pipeline slots and 1 GiB for KV cache, activations and the app.
+            const size_t fixed = file.file_size() - block_total + 3 * largest + (size_t{1} << 30);
+            const size_t budget = available > fixed ? static_cast<size_t>(available) - fixed : 0;
+            const size_t average = block_total / static_cast<size_t>(c.n_layers);
+            const auto resident = static_cast<int32_t>(std::min<size_t>(budget / average, static_cast<size_t>(c.n_layers)));
+            streamed = c.n_layers - resident;
+            if (streamed == 0) return Status::ok();
+        }
+        std::vector<int32_t> items(static_cast<size_t>(c.n_layers), -1);
+        std::vector<TripleBufferLoader::Item> ranges;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            // Evenly spaced: block l streams when floor((l+1)s/n) > floor(ls/n).
+            if ((int64_t{l} + 1) * streamed / c.n_layers > int64_t{l} * streamed / c.n_layers) {
+                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
+                const auto [begin, end] = file.layer_range(l);
+                ranges.push_back({begin, end - begin});
+            }
+        }
+        auto reader = DirectFile::open(file.file().path());
+        if (!reader) return reader.status();
+        direct_file = std::move(reader).value();
+        // Stage 1: a few concurrent large direct reads saturate UFS (see direct_io.h).
+        TripleBufferLoader::FetchFn fetch = [f = direct_file.get()](uint64_t offset, size_t length, uint8_t* dst) {
+            return f->read_parallel(offset, length, dst, 4);
         };
-#endif
         // Stage 2 is a pass-through: the kernels consume packed blocks directly.
-        auto loader = TripleBufferLoader::create(std::move(items), std::move(fetch));
+        auto loader = TripleBufferLoader::create(std::move(ranges), std::move(fetch));
         if (!loader) return loader.status();
         weight_loader = std::move(loader).value();
-        target->set_layer_source(weight_loader.get());
+        // Resident blocks and the other weights stay paged in; streamed blocks
+        // are dropped from the page cache and never read through the mapping.
+        const size_t resident_bytes = target->mutable_file().keep_resident([&](const TensorView& t) {
+            for (int32_t l = 0; l < c.n_layers; ++l) {
+                if (items[static_cast<size_t>(l)] < 0) continue;
+                const auto [begin, end] = file.layer_range(l);
+                if (t.file_offset >= begin && t.file_offset < end) return false;
+            }
+            return true;
+        });
+        target->set_layer_source(weight_loader.get(), std::move(items));
+        LIYAB_LOG_INFO("block streaming: %d of %d blocks streamed (%s direct reads, 3 x %.0f MiB slots), %.2f GiB resident",
+                       streamed, c.n_layers, direct_file->direct() ? "O_DIRECT" : "buffered",
+                       static_cast<double>(weight_loader->slot_bytes()) / (1024.0 * 1024.0),
+                       static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0));
         return Status::ok();
     }
 
@@ -258,7 +294,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     if (!target) return target.status();
     impl->target = std::move(target).value();
 
-    if (config.triple_buffer_loading) LIYAB_RETURN_IF_ERROR(impl->attach_weight_loader());
+    LIYAB_RETURN_IF_ERROR(impl->attach_layer_streaming(config.triple_buffer_loading));
 
     auto tokenizer = Tokenizer::load(impl->target->file());
     if (!tokenizer) return tokenizer.status();
@@ -421,6 +457,8 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     const TripleBufferLoader::Stats loader_before =
         s.weight_loader ? s.weight_loader->stats() : TripleBufferLoader::Stats{};
     stats.prompt_tokens = static_cast<int32_t>(prompt.size());
+    const ExpertStore::Stats experts_before =
+        s.target->expert_store() != nullptr ? s.target->expert_store()->stats() : ExpertStore::Stats{};
 
     // Prefill everything but the last prompt token, which seeds the decode
     // loop (the speculative decoder expects it uncached).
@@ -547,6 +585,14 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         stats.weight_wait_ms = after.consumer_wait_ms - loader_before.consumer_wait_ms;
     }
     stats.kv_cache_bytes = s.target->kv_cache().bytes_in_use();
+    if (const ExpertStore* store = s.target->expert_store()) {
+        const ExpertStore::Stats after = store->stats();
+        stats.expert_hits = static_cast<int32_t>(after.hits - experts_before.hits);
+        stats.expert_late = static_cast<int32_t>(after.late - experts_before.late);
+        stats.expert_misses = static_cast<int32_t>(after.misses - experts_before.misses);
+        stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
+        stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
+    }
     if (s.speculative) {
         stats.draft_tokens_proposed = s.speculative->proposed();
         stats.draft_tokens_accepted = s.speculative->accepted();
