@@ -680,6 +680,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 #endif
 
     const auto t_decode = Clock::now();
+    const Transformer::PhaseTimes phases_before = s.target->phase_times();
     std::string pending_utf8;
     std::vector<float> probs;
     int32_t last = prompt.back();
@@ -771,7 +772,16 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         stats.expert_misses = static_cast<int32_t>(after.misses - experts_before.misses);
         stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
         stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
+        stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
     }
+    const Transformer::PhaseTimes& phases = s.target->phase_times();
+    stats.decode_phases = {phases.attention - phases_before.attention,
+                           phases.delta_net - phases_before.delta_net,
+                           phases.router - phases_before.router,
+                           phases.experts - phases_before.experts,
+                           phases.shared_expert - phases_before.shared_expert,
+                           phases.dense_ffn - phases_before.dense_ffn,
+                           phases.lm_head - phases_before.lm_head};
     if (s.speculative) {
         stats.draft_tokens_proposed = s.speculative->proposed();
         stats.draft_tokens_accepted = s.speculative->accepted();

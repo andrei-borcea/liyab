@@ -41,7 +41,7 @@ This README describes what the code does today. Anything not implemented is list
 | Paged KV cache, F16 / Q8_0 / INT4 (Q4_0 symmetric, Q4_1 asymmetric) | ✅ implemented |
 | Sliding-window attention with attention sinks | ✅ implemented |
 | Speculative decoding (draft model, batched verification) | ✅ implemented |
-| CPU backend: ARM NEON + dot-product (SDOT), multithreaded | ✅ implemented |
+| CPU backend: ARM NEON + dot-product (SDOT), multithreaded (spinning thread pool; batched matmuls in one parallel pass) | ✅ implemented |
 | Apple GPU backend: Metal, zero-copy weights on unified memory | ✅ implemented |
 | Android GPU backend: Vulkan compute (Adreno / Mali); weights repacked in GPU memory, or read in place from GPU-shared memory by native kernels for 23 formats (K- and I-quants included) | ✅ implemented, +25% decode vs CPU on Adreno 830 |
 | Power manager: duty-cycle pacing, thermal polling, throttle routing | ✅ implemented |
@@ -220,8 +220,12 @@ needed.
 | `test_device_detect` | SoC classification, backend ranking, live detection, sysfs thermal parsing, power policy, pacing |
 | `test_engine` | quant kernels (including the Q8_K low-bit kernels against llama.cpp-encoded blocks), tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, MoE vs its dense twin, streamed experts (with evictions) vs in-place reads, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
 | `test_kv_cache` | memory per token, on-demand paging and reuse, sinks and page recycling over 5000 positions, quantization accuracy, engine KV memory |
-| `test_backends` | per-matmul latency of each backend on a model's shapes, grouped submissions, dispatch overhead |
+| `test_backends` | per-matmul latency of each backend on a model's shapes, grouped submissions, dispatch overhead; batched CPU matmuls (mixed formats, shared inputs) equal one matmul per item |
 | `test_experimental` | early exit, head pruning, direct I/O correctness, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them, `LIYAB_BENCH_MB=N` sizes the I/O file) |
+
+`liyab-bench` (built with the tests) measures CPU matvec throughput on a MoE model's decode shapes (Q8_0 projections,
+F32 routers, Q6_K LM head, Q4_K/Q5_K/Q6_K experts) in GB/s, next to the RAM read ceiling, for several thread counts:
+`liyab-bench --threads 1,4,8 --seconds 1`.
 
 On a device (USB debugging enabled):
 
@@ -303,7 +307,10 @@ build runs, so front ends can filter downloads without a copy of the list. `liya
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off); `memory_budget_mb` caps the
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
 OS counters do not show (`liyab-cli --memory-budget MB`); and `liyab_generation_stats`
-reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read` and `expert_stall_ms`.
+reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms` and
+`expert_unused` (experts read and evicted again without being used), plus where decode time went: `attention_ms`,
+`delta_net_ms`, `router_ms`, `experts_ms`, `shared_expert_ms`, `dense_ffn_ms` and `lm_head_ms` (C++:
+`GenerationStats::decode_phases`; `liyab-cli` prints them per token).
 `liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU
 busy time spent on the engine's work, bytes streamed from storage, tokens generated); it is safe to call while a
 generation runs.
@@ -494,8 +501,11 @@ Streaming is automatic when a model does not fit (file larger than 80% of the av
   GPU-shared memory, so the GPU reads it in place instead of keeping a second copy); experts are read by 4 threads
   into a fixed RAM cache (one entry = an expert's gate/up/down; LFU with periodic halving). Before each block the
   engine applies that block's router and the next one's to the current hidden state and prefetches the experts they
-  pick, so reads overlap the attention/DeltaNet work; the experts a token really uses are computed cached-first.
-  `GenerationStats` (and `liyab-cli`) report hits, late prefetches, misses, bytes read and time spent waiting.
+  pick, so reads overlap the attention/DeltaNet work. A freshly loaded expert is not evicted before the block it was
+  loaded for has used it (plain LFU would pick it first: it has no uses yet, and the cache then read it twice). The
+  experts a token really uses run in waves: every expert already in RAM in one batched CPU pass (gate and up for all
+  of them, then down), then the ones still loading. `GenerationStats` (and `liyab-cli`) report hits, late
+  prefetches, misses, bytes read, unused reads, time spent waiting, and decode time by phase.
 * **Correctness.** Streamed experts (with evictions) and streamed blocks give bit-identical logits to in-place
   reads (`test_engine`).
 
@@ -521,6 +531,22 @@ Matvec throughput on that model's real tensors (GB/s of weights, 4 CPU threads v
 
 The phone throttles as it heats up; numbers vary by ±30% between runs.
 
+Mixture of experts, measured on the same phone: Qwen3.6-35B-A3B UD-Q4_K_M (22.1 GB, 40 blocks of which 30 Gated
+DeltaNet, 256 experts, top-8) with `--memory-budget 5500` (the app's default, under HyperOS's 6 GiB per-app limit),
+CPU backend, 8 threads, a 9-token prompt and 64 greedy tokens from a cold expert cache:
+
+| Engine | Decode | ms/token | Expert reads per token |
+| :--- | ---: | ---: | ---: |
+| Condition-variable thread pool (before) | 3.06 tok/s | 327 | 596 MiB |
+| + spinning thread pool | 3.24 tok/s | 308 | 480 MiB |
+| + freshly loaded experts kept until used | 5.54 tok/s | 181 | 309 MiB |
+| + a block's experts in one batched pass | **5.93 tok/s** | 169 | 309 MiB |
+
+Per token, now: routed experts 87 ms (of which ~43 ms waiting for flash), Gated DeltaNet 40 ms, LM head 14 ms,
+attention 9 ms, routers and prediction 9 ms, shared experts 7 ms. Per token the model reads ~2 GB of resident
+weights (the UD quant keeps attention and DeltaNet projections in Q8_0, the LM head in Q6_K) plus ~0.6 GB of
+experts, so RAM bandwidth (~55 GB/s measured with `liyab-bench`) caps a single token near 20 tok/s.
+
 ---
 
 ## Measured results
@@ -540,6 +566,10 @@ The numbers live in [`docs/benchmarks/results.json`](docs/benchmarks/results.jso
 ![Matrix-vector throughput by weight format: CPU before, CPU NEON, GPU native](docs/benchmarks/matvec_formats.svg)
 
 ![Decode speed of models that fit in RAM, CPU vs GPU](docs/benchmarks/in_ram_decode.svg)
+
+![Qwen3.6-35B-A3B decode speed by engine version](docs/benchmarks/moe_35b_decode.svg)
+
+![Qwen3.6-35B-A3B decode time per token by phase, before and now](docs/benchmarks/moe_35b_phases.svg)
 
 ### Correctness against llama.cpp
 
@@ -607,7 +637,8 @@ Reading the table:
   with single-request reads, before the parallel 4 MiB reads that reach ~4.4 GB/s). It only pays off for models
   larger than RAM, where the automatic mode streams just the blocks that do not fit. The engine logs a warning when
   it is enabled for a model that fits in memory.
-* **8 threads slower than 4** points at the fork/join cost of the condition-variable thread pool. Prefill
+* **8 threads slower than 4** pointed at the fork/join cost of the condition-variable thread pool (measured
+  before the spinning pool, which picks a job up in about a microsecond instead of ~80–100 µs). Prefill
   (~74 tok/s) still uses the per-row matvec kernel; a tiled GEMM for batches is the next CPU optimization.
 * Apple M4 Pro, same prompt: 49 tok/s (CPU, Q8_0) and 40 tok/s (Metal, Q4_0). Metal is limited by one command
   buffer per matmul.
@@ -703,8 +734,8 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   dedicated draft model; neither is used yet, and DeltaNet blocks would need recurrent-state checkpoints to roll
   back rejected tokens. For weight streaming this is the largest remaining multiplier (each streamed byte would
   serve several tokens).
-* **CPU threading / prefill.** The thread pool synchronizes with condition variables (4 threads beat 8 on the
-  phone), and prefill reuses the matvec kernel. A spinning pool and a tiled GEMM are the next CPU steps.
+* **CPU prefill** reuses the matvec kernel; a tiled GEMM is the next CPU step. MoE prefill reads the union of the
+  batch's experts, so it runs at about decode speed.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
@@ -720,8 +751,8 @@ src/core/               engine, loader, KV cache, triple buffer, expert store, d
 src/backends/           cpu/ (NEON), metal/ (Metal), vulkan/ (Vulkan compute + shaders/), qnn/, neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab_cli.cpp (command-line front end over the C ABI), table/vector generators,
-                        gen_bench_charts.py (README charts)
+tools/                  liyab_cli.cpp (command-line front end over the C ABI), liyab_bench.cpp (CPU kernel
+                        throughput vs the RAM read ceiling), table/vector generators, gen_bench_charts.py (README charts)
 docs/benchmarks/        benchmark data (results.json) and the charts drawn from it
 android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks

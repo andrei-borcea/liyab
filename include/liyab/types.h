@@ -197,6 +197,20 @@ struct SamplingParams {
     bool add_bos = true;
 };
 
+// Where decode time went, in ms (decode steps only, the target model's
+// forward passes). The rest of GenerationStats::decode_ms is norms, residual
+// adds, waits for streamed dense blocks (weight_wait_ms), sampling, token
+// callbacks and pacing.
+struct DecodePhases {
+    double attention_ms = 0.0;      // softmax-attention mixers, projections included
+    double delta_net_ms = 0.0;      // Gated DeltaNet mixers, projections included
+    double router_ms = 0.0;         // MoE routers, top-k selection and expert prediction
+    double experts_ms = 0.0;        // routed experts, waits for streamed ones (expert_stall_ms) included
+    double shared_expert_ms = 0.0;  // MoE shared experts
+    double dense_ffn_ms = 0.0;      // dense SwiGLU FFNs
+    double lm_head_ms = 0.0;        // final norm and output projection (vocabulary logits)
+};
+
 struct GenerationStats {
     int32_t prompt_tokens = 0;
     int32_t generated_tokens = 0;
@@ -223,6 +237,8 @@ struct GenerationStats {
     int32_t expert_misses = 0;      // not predicted: read after the router chose them
     uint64_t expert_bytes_read = 0; // bytes read from storage for experts
     double expert_stall_ms = 0.0;   // time the forward pass waited for expert reads
+    int32_t expert_unused = 0;      // experts read (prefetched) and evicted again without being used
+    DecodePhases decode_phases;
     bool cancelled = false;
 };
 

@@ -1,45 +1,201 @@
 {
-  "device": "Xiaomi 25010PN30G: Snapdragon 8 Elite (SM8750), 15 GB RAM, UFS 4, Adreno 830",
-  "notes": "Measured with liyab-cli and scratch benchmarks on the phone; the phone throttles as it heats up, so runs vary by up to +-30%. Matvec numbers are the best of several runs.",
-  "dense_27b": {
-    "title": "Qwen3.8-27B UD-IQ2_S (8.4 GB) on a phone with 8.2 GB free RAM",
-    "runs": [
-      {"label": "mmap window + CPU (before)", "decode_tps": 0.14, "prompt_s": 71.0},
-      {"label": "Block streaming + CPU", "decode_tps": 0.17, "prompt_s": 71.0},
-      {"label": "Block streaming + shared GPU memory", "decode_tps": 0.94, "prompt_s": 8.7}
-    ]
-  },
-  "flash": {
-    "title": "Direct (O_DIRECT) random reads from UFS 4, 8.4 GB file",
-    "chunk_kib": [16, 64, 256, 512, 1024, 2048, 4096],
-    "gbps_by_threads": {
-      "1 thread": [0.16, 0.52, 1.47, 1.98, 2.57, 3.22, 3.67],
-      "2 threads": [0.29, 1.05, 2.74, 4.05, 4.35, 4.45, 4.21],
-      "4 threads": [0.56, 1.88, 4.26, 4.23, 4.45, 4.46, 4.34],
-      "8 threads": [1.18, 2.95, 4.43, 4.43, 4.44, 4.46, 4.24]
-    }
-  },
-  "matvec": {
-    "title": "Matrix-vector throughput on real tensors (GB/s of weights)",
-    "series": ["CPU, generic decoder (before)", "CPU, NEON kernels", "GPU, native Vulkan kernels"],
-    "formats": {
-      "Q2_K": [0.24, 12.6, 15.5],
-      "IQ2_XXS": [0.70, 8.4, 15.7],
-      "IQ2_S": [0.79, 7.0, 19.7],
-      "IQ3_S": [2.07, 6.7, 21.1],
-      "IQ4_XS": [0.99, 21.7, 24.1],
-      "Q4_K": [16.8, 16.8, 17.4]
-    }
-  },
-  "in_ram": {
-    "title": "Models that fit in RAM: decode speed, CPU vs GPU (4 threads)",
-    "series": ["CPU (NEON + SDOT)", "GPU (Vulkan, repacked weights)"],
-    "models": {
-      "TinyLlama-1.1B Q4_0": [31.0, 38.6],
-      "TinyLlama-1.1B Q4_K_M": [24.7, 20.7],
-      "Qwen2.5-0.5B Q4_K_M": [35.2, 27.9],
-      "Qwen3.5-0.8B Q4_K_M": [22.6, null],
-      "Qwen3.5-2B Q4_K_M": [11.8, 12.3]
-    }
+ "device": "Xiaomi 25010PN30G: Snapdragon 8 Elite (SM8750), 15 GB RAM, UFS 4, Adreno 830",
+ "notes": "Measured with liyab-cli and scratch benchmarks on the phone; the phone throttles as it heats up, so runs vary by up to +-30%. Matvec numbers are the best of several runs.",
+ "dense_27b": {
+  "title": "Qwen3.8-27B UD-IQ2_S (8.4 GB) on a phone with 8.2 GB free RAM",
+  "runs": [
+   {
+    "label": "mmap window + CPU (before)",
+    "decode_tps": 0.14,
+    "prompt_s": 71.0
+   },
+   {
+    "label": "Block streaming + CPU",
+    "decode_tps": 0.17,
+    "prompt_s": 71.0
+   },
+   {
+    "label": "Block streaming + shared GPU memory",
+    "decode_tps": 0.94,
+    "prompt_s": 8.7
+   }
+  ]
+ },
+ "flash": {
+  "title": "Direct (O_DIRECT) random reads from UFS 4, 8.4 GB file",
+  "chunk_kib": [
+   16,
+   64,
+   256,
+   512,
+   1024,
+   2048,
+   4096
+  ],
+  "gbps_by_threads": {
+   "1 thread": [
+    0.16,
+    0.52,
+    1.47,
+    1.98,
+    2.57,
+    3.22,
+    3.67
+   ],
+   "2 threads": [
+    0.29,
+    1.05,
+    2.74,
+    4.05,
+    4.35,
+    4.45,
+    4.21
+   ],
+   "4 threads": [
+    0.56,
+    1.88,
+    4.26,
+    4.23,
+    4.45,
+    4.46,
+    4.34
+   ],
+   "8 threads": [
+    1.18,
+    2.95,
+    4.43,
+    4.43,
+    4.44,
+    4.46,
+    4.24
+   ]
   }
+ },
+ "matvec": {
+  "title": "Matrix-vector throughput on real tensors (GB/s of weights)",
+  "series": [
+   "CPU, generic decoder (before)",
+   "CPU, NEON kernels",
+   "GPU, native Vulkan kernels"
+  ],
+  "formats": {
+   "Q2_K": [
+    0.24,
+    12.6,
+    15.5
+   ],
+   "IQ2_XXS": [
+    0.7,
+    8.4,
+    15.7
+   ],
+   "IQ2_S": [
+    0.79,
+    7.0,
+    19.7
+   ],
+   "IQ3_S": [
+    2.07,
+    6.7,
+    21.1
+   ],
+   "IQ4_XS": [
+    0.99,
+    21.7,
+    24.1
+   ],
+   "Q4_K": [
+    16.8,
+    16.8,
+    17.4
+   ]
+  }
+ },
+ "in_ram": {
+  "title": "Models that fit in RAM: decode speed, CPU vs GPU (4 threads)",
+  "series": [
+   "CPU (NEON + SDOT)",
+   "GPU (Vulkan, repacked weights)"
+  ],
+  "models": {
+   "TinyLlama-1.1B Q4_0": [
+    31.0,
+    38.6
+   ],
+   "TinyLlama-1.1B Q4_K_M": [
+    24.7,
+    20.7
+   ],
+   "Qwen2.5-0.5B Q4_K_M": [
+    35.2,
+    27.9
+   ],
+   "Qwen3.5-0.8B Q4_K_M": [
+    22.6,
+    null
+   ],
+   "Qwen3.5-2B Q4_K_M": [
+    11.8,
+    12.3
+   ]
+  }
+ },
+ "moe_35b": {
+  "title": "Qwen3.6-35B-A3B UD-Q4_K_M (22.1 GB MoE) with a 5500 MiB memory budget",
+  "setup": "liyab-cli, CPU backend, 8 threads, 9-token prompt, 64 greedy tokens, cold expert cache (new process); runs vary by about 10% with heat",
+  "runs": [
+   {
+    "label": "Before (condition-variable thread pool)",
+    "decode_tps": 3.06,
+    "ms_per_token": 326.9
+   },
+   {
+    "label": "+ spinning thread pool",
+    "decode_tps": 3.24,
+    "ms_per_token": 308.4
+   },
+   {
+    "label": "+ fresh expert loads kept in the cache",
+    "decode_tps": 5.54,
+    "ms_per_token": 180.6
+   },
+   {
+    "label": "+ a block's experts in one batched pass",
+    "decode_tps": 5.93,
+    "ms_per_token": 168.6
+   }
+  ],
+  "phases_ms_per_token": {
+   "series": [
+    "before",
+    "now"
+   ],
+   "phases": {
+    "Routed experts (incl. flash waits)": [
+     190.4,
+     87.3
+    ],
+    "Gated DeltaNet": [
+     69.6,
+     40.0
+    ],
+    "LM head": [
+     23.4,
+     14.4
+    ],
+    "Attention": [
+     16.6,
+     8.7
+    ],
+    "Shared expert": [
+     12.7,
+     7.4
+    ],
+    "Routers + prediction": [
+     12.3,
+     9.3
+    ]
+   }
+  }
+ }
 }

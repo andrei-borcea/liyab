@@ -176,6 +176,15 @@ def main():
                        [x["label"] for x in r["runs"]], ["prompt"], [[x["prompt_s"]] for x in r["runs"]],
                        "seconds", os.path.join(OUT, "dense_27b_prompt.svg"))
 
+    moe = d["moe_35b"]
+    grouped_hbar_chart(moe["title"] + ": decode speed", "Higher is better. Each step adds to the previous one.",
+                       [x["label"] for x in moe["runs"]], ["decode"], [[x["decode_tps"]] for x in moe["runs"]],
+                       "tokens / s", os.path.join(OUT, "moe_35b_decode.svg"))
+    ph = moe["phases_ms_per_token"]
+    grouped_hbar_chart("Qwen3.6-35B-A3B: decode time per token by phase", "Lower is better.", list(ph["phases"]),
+                       ph["series"], list(ph["phases"].values()), "ms / token",
+                       os.path.join(OUT, "moe_35b_phases.svg"))
+
     fl = d["flash"]
     labels = [f"{k} KiB" if k < 1024 else f"{k // 1024} MiB" for k in fl["chunk_kib"]]
     line_chart(fl["title"], "Requests of 256 KiB or more, 2-4 in flight, saturate the device; small requests do not.",

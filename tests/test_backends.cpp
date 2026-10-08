@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/backend.h"
 #include "liyab/mmap_loader.h"
@@ -133,6 +134,57 @@ TEST_CASE("[bench] per-matmul latency by backend on the model's shapes") {
     for (auto& b : list) std::printf(" %10.3f", per_block[b.name]);
     std::printf("\n");
     if (std::getenv("LIYAB_BENCH_MODEL") == nullptr) std::remove(path.c_str());
+}
+
+TEST_CASE("CPU matmul_batch over mixed formats and shared inputs equals one matmul per item") {
+    // Weights in several formats, quantized from the same random floats.
+    const int64_t cols = 256;
+    const DType types[] = {DType::F32, DType::F16, DType::Q8_0, DType::Q4_0, DType::Q4_1};
+    std::vector<std::vector<uint8_t>> storage;
+    std::vector<TensorView> ws;
+    uint32_t seed = 1;
+    auto rnd = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(seed >> 8) / static_cast<float>(1u << 24) - 0.5f;
+    };
+    for (size_t i = 0; i < 10; ++i) {
+        const DType type = types[i % (sizeof types / sizeof types[0])];
+        const int64_t rows = 3 + static_cast<int64_t>(i) * 7;  // uneven, so chunks straddle matrices
+        TensorView w;
+        w.type = type;
+        w.n_dims = 2;
+        w.ne = {cols, rows, 1, 1};
+        storage.emplace_back(w.row_bytes() * static_cast<size_t>(rows));
+        std::vector<float> row(static_cast<size_t>(cols));
+        for (int64_t r = 0; r < rows; ++r) {
+            for (float& v : row) v = rnd();
+            quant::quantize_row(type, row.data(), storage.back().data() + static_cast<size_t>(r) * w.row_bytes(), cols);
+        }
+        w.data = storage.back().data();
+        w.nbytes = storage.back().size();
+        ws.push_back(w);
+    }
+    // Two inputs of two rows each; even items share the first, odd the second.
+    std::vector<float> x0(static_cast<size_t>(2 * cols)), x1(static_cast<size_t>(2 * cols));
+    for (float& v : x0) v = rnd();
+    for (float& v : x1) v = rnd();
+
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    std::vector<std::vector<float>> batched(ws.size()), single(ws.size());
+    std::vector<Backend::MatmulItem> items;
+    for (size_t i = 0; i < ws.size(); ++i) {
+        batched[i].resize(static_cast<size_t>(2 * ws[i].rows()));
+        single[i].resize(batched[i].size());
+        items.push_back({&ws[i], i % 2 == 0 ? x0.data() : x1.data(), batched[i].data(), 2});
+    }
+    REQUIRE(cpu->matmul_batch(items).is_ok());
+    ThreadPool one(1);
+    auto serial = make_cpu_backend(one);
+    for (size_t i = 0; i < ws.size(); ++i) {
+        REQUIRE(serial->matmul(ws[i], items[i].x, single[i].data(), 2).is_ok());
+        for (size_t j = 0; j < single[i].size(); ++j) CHECK(batched[i][j] == single[i][j]);
+    }
 }
 
 TEST_MAIN()

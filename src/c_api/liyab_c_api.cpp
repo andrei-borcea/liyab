@@ -76,7 +76,14 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.kv_cache_bytes,        s.ffn_blocks_skipped,    s.sparse_ffn_steps,
                                         s.ttft_ms,               s.cached_prefix_tokens,  s.expert_hits,
                                         s.expert_late,           s.expert_misses,         s.expert_bytes_read,
-                                        s.expert_stall_ms};
+                                        s.expert_stall_ms,       s.expert_unused,
+                                        s.decode_phases.attention_ms,
+                                        s.decode_phases.delta_net_ms,
+                                        s.decode_phases.router_ms,
+                                        s.decode_phases.experts_ms,
+                                        s.decode_phases.shared_expert_ms,
+                                        s.decode_phases.dense_ffn_ms,
+                                        s.decode_phases.lm_head_ms};
     }
     return LIYAB_OK;
 }

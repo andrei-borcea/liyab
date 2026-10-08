@@ -1,6 +1,7 @@
 #include "core/transformer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -47,6 +48,26 @@ struct ArchTraits {
 constexpr ArchTraits kArchs[] = {
     {"llama", false, false},  {"mistral", false, false}, {"qwen2", true, false},     {"qwen3", true, false},
     {"qwen35", true, false},  {"qwen3moe", true, true},  {"qwen35moe", true, true},
+};
+
+// Adds the wall time of its scope to `total_ms` (Transformer::PhaseTimes).
+class PhaseTimer {
+public:
+    explicit PhaseTimer(double& total_ms) : total_ms_(total_ms), start_(std::chrono::steady_clock::now()) {}
+    ~PhaseTimer() { stop(); }
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+    // Ends the measurement early (later calls and the destructor add nothing).
+    void stop() {
+        if (stopped_) return;
+        stopped_ = true;
+        total_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_).count();
+    }
+
+private:
+    double& total_ms_;
+    std::chrono::steady_clock::time_point start_;
+    bool stopped_ = false;
 };
 
 // Expert `e` of a stacked expert tensor [cols, rows, n_expert] as a 2-D view.
@@ -529,6 +550,7 @@ Status Transformer::matmul_group(const Route& route, Backend* backend, std::span
 Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t rows) {
     const ModelConfig& c = config_;
     const size_t d = static_cast<size_t>(c.n_embd);
+    const PhaseTimer timer(phases_.lm_head);
     file_->begin_layer(c.n_layers);  // output head slot of the prefetch window
     for (int32_t r = 0; r < rows; ++r) {
         rmsnorm(x_.data() + (first_row + static_cast<size_t>(r)) * d, output_norm_.data(),
@@ -757,6 +779,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
     if (!L.moe) return;
+    const PhaseTimer timer(phases_.router);
     const auto d = static_cast<size_t>(c.n_embd);
     const auto E = static_cast<size_t>(c.n_expert);
     const auto un = static_cast<size_t>(n);
@@ -822,6 +845,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     const auto K = static_cast<size_t>(c.n_expert_used);
     const auto ff = static_cast<size_t>(c.n_ff_expert);
 
+    PhaseTimer router_timer(phases_.router);
     router_.resize(un * E);
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
 
@@ -866,51 +890,98 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         std::stable_partition(chosen.begin(), chosen.end(),
                               [&](int32_t e) { return expert_store_->ready(layer, e); });
     }
+    router_timer.stop();
 
+    PhaseTimer experts_timer(phases_.experts);
     moe_out_.assign(un * d, 0.0f);
-    for (const int32_t chosen_expert : chosen) {
-        const auto e = static_cast<size_t>(chosen_expert);
-        const auto& users = assigned[e];
-        const auto rows = static_cast<int32_t>(users.size());
-        ein_.resize(users.size() * d);
-        for (size_t i = 0; i < users.size(); ++i) {
-            std::copy_n(xb_.data() + static_cast<size_t>(users[i].first) * d, d, ein_.data() + i * d);
-        }
-        std::array<TensorView, 3> views{};
+    // Experts run in waves: the next expert (waiting for it if needed) plus
+    // every following one already in RAM, as one batched pass for gate/up and
+    // one for down, so the CPU pays two thread fork/joins per wave instead of
+    // two per expert. Expert slices are transient views: they run on the CPU,
+    // which reads them in place.
+    constexpr size_t kMaxWave = 32;  // bounds the cache slots one wave pins
+    std::vector<int32_t> wave;
+    std::vector<std::array<TensorView, 3>> views;
+    std::vector<size_t> first_row;  // per wave expert: its first row in the wave's scratch
+    std::vector<Backend::MatmulItem> items;
+    auto release_wave = [&] {
         if (expert_store_ != nullptr) {
-            auto loaded = expert_store_->acquire(layer, chosen_expert);
-            if (!loaded) return loaded.status();
-            views = *loaded;
-        } else {
-            views = {expert_slice(w[kGateExps], static_cast<int64_t>(e)), expert_slice(w[kUpExps], static_cast<int64_t>(e)),
-                     expert_slice(w[kDownExps], static_cast<int64_t>(e))};
+            for (const int32_t ex : wave) expert_store_->release(layer, ex);
         }
-        const TensorView& gate = views[0];
-        const TensorView& up = views[1];
-        const TensorView& down = views[2];
-        eh_.resize(users.size() * ff);
-        eh2_.resize(users.size() * ff);
-        eout_.resize(users.size() * d);
-        // Expert slices are transient views: they run on the CPU, which reads them in place.
-        const TensorView* gate_up[] = {&gate, &up};
-        float* outs[] = {eh_.data(), eh2_.data()};
-        if (Status st = route.cpu->matmul_group(gate_up, ein_.data(), outs, rows); !st.is_ok()) {
-            if (expert_store_ != nullptr) expert_store_->release(layer, chosen_expert);
+    };
+    for (size_t next = 0; next < chosen.size();) {
+        wave.clear();
+        views.clear();
+        first_row.clear();
+        size_t rows_total = 0;
+        do {
+            const int32_t ex = chosen[next++];
+            if (expert_store_ != nullptr) {
+                auto loaded = expert_store_->acquire(layer, ex);
+                if (!loaded) {
+                    release_wave();
+                    return loaded.status();
+                }
+                views.push_back(*loaded);
+            } else {
+                views.push_back({expert_slice(w[kGateExps], ex), expert_slice(w[kUpExps], ex),
+                                 expert_slice(w[kDownExps], ex)});
+            }
+            wave.push_back(ex);
+            first_row.push_back(rows_total);
+            rows_total += assigned[static_cast<size_t>(ex)].size();
+        } while (next < chosen.size() && wave.size() < kMaxWave &&
+                 (expert_store_ == nullptr || expert_store_->ready(layer, chosen[next])));
+
+        // Inputs: an expert every token chose reads xb_ itself (always the
+        // case in decode), so all of them share one quantized copy.
+        ein_.resize(rows_total * d);
+        eh_.resize(rows_total * ff);
+        eh2_.resize(rows_total * ff);
+        eout_.resize(rows_total * d);
+        items.clear();
+        for (size_t i = 0; i < wave.size(); ++i) {
+            const auto& users = assigned[static_cast<size_t>(wave[i])];
+            const auto rows = static_cast<int32_t>(users.size());
+            const float* in = xb_.data();
+            if (users.size() != un) {
+                float* gathered = ein_.data() + first_row[i] * d;
+                for (size_t u = 0; u < users.size(); ++u) {
+                    std::copy_n(xb_.data() + static_cast<size_t>(users[u].first) * d, d, gathered + u * d);
+                }
+                in = gathered;
+            }
+            items.push_back({&views[i][0], in, eh_.data() + first_row[i] * ff, rows});
+            items.push_back({&views[i][1], in, eh2_.data() + first_row[i] * ff, rows});
+        }
+        if (Status st = route.cpu->matmul_batch(items); !st.is_ok()) {
+            release_wave();
             return st;
         }
-        for (size_t i = 0; i < eh_.size(); ++i) eh_[i] = silu(eh_[i]) * eh2_[i];
-        const Status down_status = route.cpu->matmul(down, eh_.data(), eout_.data(), rows);
-        if (expert_store_ != nullptr) expert_store_->release(layer, chosen_expert);
+        for (size_t i = 0; i < rows_total * ff; ++i) eh_[i] = silu(eh_[i]) * eh2_[i];
+        items.clear();
+        for (size_t i = 0; i < wave.size(); ++i) {
+            const auto rows = static_cast<int32_t>(assigned[static_cast<size_t>(wave[i])].size());
+            items.push_back({&views[i][2], eh_.data() + first_row[i] * ff, eout_.data() + first_row[i] * d, rows});
+        }
+        const Status down_status = route.cpu->matmul_batch(items);
+        release_wave();  // the outputs are in eout_; the weights are no longer read
         LIYAB_RETURN_IF_ERROR(down_status);
-        for (size_t i = 0; i < users.size(); ++i) {
-            float* dst = moe_out_.data() + static_cast<size_t>(users[i].first) * d;
-            const float* src = eout_.data() + i * d;
-            const float weight = users[i].second;
-            for (size_t j = 0; j < d; ++j) dst[j] += weight * src[j];
+        for (size_t i = 0; i < first_row.size(); ++i) {
+            const auto& users = assigned[static_cast<size_t>(wave[i])];
+            for (size_t u = 0; u < users.size(); ++u) {
+                float* dst = moe_out_.data() + static_cast<size_t>(users[u].first) * d;
+                const float* src = eout_.data() + (first_row[i] + u) * d;
+                const float weight = users[u].second;
+                for (size_t j = 0; j < d; ++j) dst[j] += weight * src[j];
+            }
         }
     }
 
+    experts_timer.stop();
+
     if (L.w[kUpShared] != nullptr) {
+        const PhaseTimer timer(phases_.shared_expert);
         const auto sh = static_cast<size_t>(w[kUpShared].rows());
         hb_.resize(un * sh);
         hb2_.resize(un * sh);
@@ -990,8 +1061,10 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
         }
         if (L.mixer == MixerKind::DeltaNet) {
+            const PhaseTimer timer(phases_.delta_net);
             LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
         } else {
+            const PhaseTimer timer(phases_.attention);
             LIYAB_RETURN_IF_ERROR(
                 attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
         }
@@ -1004,8 +1077,12 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             for (size_t t = 0; t < un; ++t) {
                 rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
             }
-            if (L.moe) LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
-            else LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
+            if (L.moe) {
+                LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
+            } else {
+                const PhaseTimer timer(phases_.dense_ffn);
+                LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
+            }
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 

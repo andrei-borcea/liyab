@@ -12,6 +12,12 @@
 
 namespace liyab {
 
+// Workers spin between jobs for a short while before they sleep: a decode
+// step issues about a thousand parallel_for calls of 10–300 us each, and a
+// condition-variable wake-up costs ~80–100 us on a Snapdragon 8 Elite, which
+// made small matmuls slower on 8 threads than on one. Spinning workers pick
+// a job up in about a microsecond. After kSpinMicros without work they block
+// on a condition variable, so an idle engine costs no CPU.
 class ThreadPool {
 public:
     // `n_threads` includes the calling thread; values < 1 select the number of
@@ -27,24 +33,40 @@ public:
     void set_active_threads(int32_t n) noexcept;
 
     // Runs fn(begin, end) over [0, n) split into contiguous chunks and blocks
-    // until every chunk finished. Not reentrant: kernels must not nest calls.
+    // until every chunk finished. Not reentrant: kernels must not nest calls,
+    // and only one thread may call it at a time.
     void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn);
+
+    // How long an idle worker spins before it sleeps.
+    static constexpr int64_t kSpinMicros = 300;
+    static constexpr int32_t kMaxThreads = 255;  // fits the low byte of generation_
 
 private:
     void worker_loop(int32_t index);
+    // Waits for a generation other than `seen` (or stop); returns it.
+    uint64_t wait_for_job(uint64_t seen);
 
     std::vector<std::thread> workers_;
     std::atomic<int32_t> active_{1};
 
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    std::condition_variable done_;
+    // Job: written by parallel_for() before it publishes a new generation,
+    // read by participants after they observe it. Participants are counted in
+    // pending_, so the next job cannot overwrite these while they read them.
     const std::function<void(int64_t, int64_t)>* job_ = nullptr;
     int64_t job_size_ = 0;
-    int32_t job_threads_ = 0;
-    uint64_t generation_ = 0;
-    int32_t pending_ = 0;
-    bool stop_ = false;
+    // (job sequence << 8) | participating threads: one word, so a worker that
+    // does not take part (and is not waited for) never reads a later job's
+    // fields to decide that.
+    std::atomic<uint64_t> generation_{0};
+    std::atomic<int32_t> pending_{0};
+    std::atomic<bool> stop_{false};
+
+    // Sleeping workers. The publisher stores the generation, then reads
+    // sleepers_; a worker increments sleepers_, then re-reads the generation
+    // (both sequentially consistent), so one of them always sees the other.
+    std::atomic<int32_t> sleepers_{0};
+    std::mutex mutex_;
+    std::condition_variable wake_;
 };
 
 // Number of "big" cores (highest max frequency) on this device; falls back to

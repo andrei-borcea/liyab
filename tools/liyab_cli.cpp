@@ -217,6 +217,23 @@ int main(int argc, char** argv) {
                              std::max(1, stats.prompt_tokens + stats.generated_tokens),
                          stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
         }
+        if (stats.expert_unused > 0) {
+            std::fprintf(stderr, "experts: %d prefetched and evicted unused\n", stats.expert_unused);
+        }
+        if (stats.generated_tokens > 0 && stats.decode_ms > 0.0) {
+            // Decode time per token by phase; "other" is norms, residuals, sampling and callbacks.
+            const double per = 1.0 / stats.generated_tokens;
+            const double phases[] = {stats.attention_ms, stats.delta_net_ms, stats.router_ms, stats.experts_ms,
+                                     stats.shared_expert_ms, stats.dense_ffn_ms, stats.lm_head_ms};
+            const char* names[] = {"attention", "DeltaNet", "router", "experts", "shared expert", "dense FFN", "LM head"};
+            double timed = 0.0;
+            std::fprintf(stderr, "decode ms/token:");
+            for (size_t i = 0; i < sizeof phases / sizeof phases[0]; ++i) {
+                timed += phases[i];
+                if (phases[i] > 0.0) std::fprintf(stderr, " %s %.1f |", names[i], phases[i] * per);
+            }
+            std::fprintf(stderr, " other %.1f | total %.1f\n", (stats.decode_ms - timed) * per, stats.decode_ms * per);
+        }
         if (stats.cached_prefix_tokens > 0) {
             std::fprintf(stderr, "KV dedup: %d prompt tokens restored from snapshot\n", stats.cached_prefix_tokens);
         }

@@ -56,6 +56,24 @@ public:
         for (size_t i = 0; i < ws.size(); ++i) LIYAB_RETURN_IF_ERROR(matmul(*ws[i], x, ys[i], n));
         return Status::ok();
     }
+
+    // One independent matmul of a batch: y[n][w.rows()] = x[n][w.cols()] · wᵀ.
+    struct MatmulItem {
+        const TensorView* w = nullptr;
+        const float* x = nullptr;
+        float* y = nullptr;
+        int32_t n = 0;
+    };
+    // Independent matmuls, each with its own weights, input and output (e.g.
+    // the selected experts of a MoE block). Inputs may be shared between
+    // items; outputs must not overlap any input or each other. Runs them as
+    // one unit of work (the CPU backend: a single parallel pass over all
+    // their rows, so small matrices do not each pay a thread fork/join). The
+    // default runs them one by one.
+    virtual Status matmul_batch(std::span<const MatmulItem> items) {
+        for (const MatmulItem& it : items) LIYAB_RETURN_IF_ERROR(matmul(*it.w, it.x, it.y, it.n));
+        return Status::ok();
+    }
 };
 
 // Always available. `pool` must outlive the backend.

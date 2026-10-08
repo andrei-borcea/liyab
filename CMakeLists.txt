@@ -258,4 +258,8 @@ if(LIYAB_BUILD_TESTS)
     target_compile_definitions(${name} PRIVATE LIYAB_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
     add_test(NAME ${name} COMMAND ${name})
   endforeach()
+  # Kernel throughput benchmark (internal headers, like the tests; not a test).
+  add_executable(liyab-bench tools/liyab_bench.cpp)
+  target_link_libraries(liyab-bench PRIVATE liyab_core)
+  target_include_directories(liyab-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()

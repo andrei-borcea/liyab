@@ -43,6 +43,7 @@ public:
         uint64_t late = 0;    // predicted, but still in flight when needed (partial stall)
         uint64_t misses = 0;  // not predicted: read once the router chose it
         uint64_t loads = 0;          // experts read from storage
+        uint64_t unused = 0;         // loaded experts evicted before any use (wrong predictions)
         uint64_t bytes_read = 0;
         double stall_ms = 0.0;       // compute time spent waiting for experts
     };
@@ -85,6 +86,7 @@ private:
         int32_t pins = 0;
         bool on_demand = false;  // queued after the router chose it (a miss, even if it arrives in time)
         bool failed = false;     // the last read failed (reported to the waiting acquire())
+        bool untouched = false;  // loaded, not acquired since (evicting it wasted the read)
         float uses = 0.0f;
         uint64_t last_use = 0;
     };

@@ -16,6 +16,10 @@ namespace {
 
 constexpr size_t kAlign = DirectFile::kAlign;
 
+// Acquires (8 per block for a top-8 model) during which a freshly loaded,
+// not yet used expert is not evicted.
+constexpr uint64_t kFreshTicks = 48;
+
 size_t align_up(size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
 }  // namespace
@@ -112,21 +116,31 @@ Status ExpertStore::read_entry(int32_t key, uint8_t* dst) {
 int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock) {
     for (;;) {
         if (stop_) return -1;
+        // A fresh load has no uses yet, so plain LFU would evict it first,
+        // before the acquire() it was loaded for (which then reads it again).
+        // Fresh entries are spared until a few blocks' worth of acquires
+        // passed, unless nothing else can go.
         int32_t victim = -1;
+        int32_t fresh_victim = -1;
+        auto better = [&](size_t candidate, int32_t current) {
+            if (current < 0) return true;
+            const Entry& e = entries_[static_cast<size_t>(slots_[candidate].entry)];
+            const Entry& v = entries_[static_cast<size_t>(slots_[static_cast<size_t>(current)].entry)];
+            return e.uses < v.uses || (e.uses == v.uses && e.last_use < v.last_use);
+        };
         for (size_t i = 0; i < slots_.size(); ++i) {
             const int32_t key = slots_[i].entry;
             if (key < 0) return static_cast<int32_t>(i);
             const Entry& e = entries_[static_cast<size_t>(key)];
             if (e.state != State::Ready || e.pins > 0) continue;
-            if (victim < 0) {
-                victim = static_cast<int32_t>(i);
-                continue;
-            }
-            const Entry& v = entries_[static_cast<size_t>(slots_[static_cast<size_t>(victim)].entry)];
-            if (e.uses < v.uses || (e.uses == v.uses && e.last_use < v.last_use)) victim = static_cast<int32_t>(i);
+            int32_t& best = e.untouched && clock_ - e.last_use < kFreshTicks ? fresh_victim : victim;
+            if (better(i, best)) best = static_cast<int32_t>(i);
         }
+        if (victim < 0) victim = fresh_victim;
         if (victim >= 0) {
             Entry& old = entries_[static_cast<size_t>(slots_[static_cast<size_t>(victim)].entry)];
+            if (old.untouched) ++stats_.unused;
+            old.untouched = false;
             old.state = State::Empty;
             old.slot = -1;
             slots_[static_cast<size_t>(victim)].entry = -1;
@@ -162,6 +176,8 @@ void ExpertStore::io_loop() {
             slots_[static_cast<size_t>(slot)].entry = -1;
         } else {
             e.state = State::Ready;
+            e.untouched = true;
+            e.last_use = clock_;
             ++stats_.loads;
         }
         ready_cv_.notify_all();
@@ -237,6 +253,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
         if (e.state != State::Ready) return Status(ErrorCode::IoError, "expert could not be loaded");
     }
     ++e.pins;
+    e.untouched = false;
     e.uses += 1.0f;
     e.last_use = ++clock_;
     const uint8_t* base = arena_ + static_cast<size_t>(e.slot) * slot_bytes_;

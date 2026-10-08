@@ -141,6 +141,20 @@ public:
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
 
+    // Wall time spent in each phase of forward(), in ms, cumulative over every
+    // call (callers diff two snapshots). A steady_clock read per phase and
+    // block, a few hundred per token: noise next to the matmuls they time.
+    struct PhaseTimes {
+        double attention = 0.0;      // softmax-attention mixers, projections included
+        double delta_net = 0.0;      // Gated DeltaNet mixers, projections included
+        double router = 0.0;         // MoE routers, top-k selection and expert prediction
+        double experts = 0.0;        // routed experts, waits for streamed ones included
+        double shared_expert = 0.0;  // MoE shared expert
+        double dense_ffn = 0.0;      // dense SwiGLU FFNs
+        double lm_head = 0.0;        // final norm and output projection
+    };
+    [[nodiscard]] const PhaseTimes& phase_times() const noexcept { return phases_; }
+
     // Discards cached positions >= n (speculative-decoding rollback). Hybrid
     // models only accept n == 0 or n == n_past(): a recurrent state cannot be
     // rewound (Unsupported otherwise).
@@ -246,6 +260,7 @@ private:
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
     int64_t decode_steps_ = 0;  // expert cache aging clock
+    PhaseTimes phases_;
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 
     // Scratch, sized for the current batch.

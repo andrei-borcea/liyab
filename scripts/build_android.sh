@@ -5,7 +5,7 @@
 #                            [--ndk PATH] [--no-vulkan] [--no-qnn] [--no-neuropilot]
 #                            [--no-tests] [--experimental] [--out DIR]
 #
-# Output: <out>/<abi>/libliyab.so, liyab-cli, test_* (default out: build/android)
+# Output: <out>/<abi>/libliyab.so, liyab-cli, liyab-bench, test_* (default out: build/android)
 # NDK lookup order: --ndk, $ANDROID_NDK_HOME, $ANDROID_NDK_ROOT, newest NDK under
 # $ANDROID_HOME/ndk, $ANDROID_SDK_ROOT/ndk, ~/Library/Android/sdk/ndk, ~/Android/Sdk/ndk.
 set -euo pipefail

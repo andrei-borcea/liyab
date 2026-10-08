@@ -129,6 +129,16 @@ typedef struct liyab_generation_stats {
     int32_t expert_misses;        /* read after the router chose them */
     uint64_t expert_bytes_read;
     double expert_stall_ms;       /* time spent waiting for expert reads */
+    int32_t expert_unused;        /* experts read and evicted again without being used */
+    /* Decode time by phase, ms (decode steps only; the rest of decode_ms is
+     * norms, residuals, sampling, callbacks and pacing) */
+    double attention_ms;          /* softmax-attention mixers */
+    double delta_net_ms;          /* Gated DeltaNet mixers */
+    double router_ms;             /* MoE routers and expert prediction */
+    double experts_ms;            /* routed experts, expert_stall_ms included */
+    double shared_expert_ms;      /* MoE shared experts */
+    double dense_ffn_ms;          /* dense FFNs */
+    double lm_head_ms;            /* output projection */
 } liyab_generation_stats;
 
 /*
