@@ -261,6 +261,22 @@ int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char*
     }
 }
 
+liyab_status liyab_engine_prefill(liyab_engine* engine, const char* text, int32_t add_bos) {
+    if (engine == nullptr || text == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Status s = engine->engine->prefill(text, add_bos != 0);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
+liyab_status liyab_engine_reset_context(liyab_engine* engine) {
+    if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    engine->engine->reset_context();
+    return LIYAB_OK;
+}
+
 liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_counters* out) {
     if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {

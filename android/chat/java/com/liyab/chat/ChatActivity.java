@@ -129,6 +129,7 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
         }
         messages.removeAllViews();
         DebugLog.add("New chat: history cleared");
+        EngineHolder.prepareSystemPrompt();
     }
 
     private TextView addBubble(String text, boolean user) {
@@ -230,9 +231,9 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
         send.setText("Stop");
 
         final String prompt;
+        final ChatTemplate.Thinking mode = !EngineHolder.thinkingSupported ? ChatTemplate.Thinking.NONE
+                : thinking ? ChatTemplate.Thinking.ON : ChatTemplate.Thinking.OFF;
         synchronized (EngineHolder.history) {
-            ChatTemplate.Thinking mode = !EngineHolder.thinkingSupported ? ChatTemplate.Thinking.NONE
-                    : thinking ? ChatTemplate.Thinking.ON : ChatTemplate.Thinking.OFF;
             prompt = EngineHolder.template.build(settings.systemPrompt, EngineHolder.history, message, mode);
         }
         final StringBuilder text = new StringBuilder();
@@ -288,12 +289,14 @@ public final class ChatActivity extends Activity implements EngineHolder.Listene
             final double[] s = stats;
             final String err = error;
             final String answer;
+            final String exact;  // the reply token for token, so the next prompt continues the engine's context
             synchronized (text) {
                 answer = splitReasoning(text.toString(), thinking)[1].trim();
+                exact = EngineHolder.template.assistantPrefix(mode) + text;
             }
             if (s != null) {
                 synchronized (EngineHolder.history) {
-                    EngineHolder.history.add(new String[] {message, answer});
+                    EngineHolder.history.add(new String[] {message, answer, exact});
                     while (EngineHolder.history.size() > MAX_TURNS) EngineHolder.history.remove(0);
                 }
                 DebugLog.add(String.format(Locale.US, "Generated %d tok at %.1f tok/s, TTFT %.0f ms, prompt %d tok (%d reused)",

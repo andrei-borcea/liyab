@@ -86,6 +86,36 @@ struct Engine::Impl {
     std::unique_ptr<Transformer> draft;
     std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
     std::atomic<uint64_t> tokens_generated{0};  // Engine::counters()
+    // Tokens whose KV / recurrent state the target holds, in order
+    // (target->n_past() == context.size()). Not used with a draft model, whose
+    // cache moves in step with the target's during speculation.
+    std::vector<int32_t> context;
+
+    void clear_context() {
+        target->reset();
+        if (draft) draft->reset();
+        context.clear();
+    }
+
+    // Keeps the longest usable prefix of `tokens` already in the context and
+    // returns its length (at most `limit`); drops everything else.
+    size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit) {
+        if (draft || context.size() != static_cast<size_t>(target->n_past())) {
+            clear_context();
+            return 0;
+        }
+        size_t common = 0;
+        const size_t n = std::min({context.size(), tokens.size(), limit});
+        while (common < n && context[common] == tokens[common]) ++common;
+        if (common == context.size()) return common;  // pure continuation: nothing to drop
+        // Rewinding works for attention-only models; recurrent states cannot rewind.
+        if (common > 0 && target->truncate(static_cast<int32_t>(common)).is_ok()) {
+            context.resize(common);
+            return common;
+        }
+        clear_context();
+        return 0;
+    }
     std::unique_ptr<TripleBufferLoader> weight_loader;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
@@ -533,6 +563,38 @@ std::string Engine::describe() const {
     return out;
 }
 
+Status Engine::prefill(std::string_view text, bool add_bos) {
+    auto tokens = tokenize(text, add_bos);
+    if (!tokens) return tokens.status();
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
+    s.cancel.store(false, std::memory_order_relaxed);
+    const std::vector<int32_t>& t = tokens.value();
+    const size_t reused = s.reuse_prefix(t, t.size());
+    const PowerPolicy policy = s.power->policy();
+    s.apply_policy(policy);
+    const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
+    const ForwardHooks hooks = s.hooks(policy, false);
+    const auto chunk = static_cast<size_t>(s.target->max_batch());
+    for (size_t i = reused; i < t.size(); i += chunk) {
+        if (s.cancel.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
+        const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
+        if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+            s.clear_context();
+            return r.status();
+        }
+        s.context.insert(s.context.end(), part.begin(), part.end());
+    }
+    return Status::ok();
+}
+
+void Engine::reset_context() {
+    std::lock_guard<std::mutex> lock(impl_->busy);
+    impl_->clear_context();
+}
+
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
     auto tokens = tokenize(prompt, params.add_bos);
@@ -549,8 +611,8 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 
     Impl& s = *impl_;
     s.cancel.store(false, std::memory_order_relaxed);
-    s.target->reset();
-    if (s.draft) s.draft->reset();
+    // The last prompt token seeds the decode loop, so it is never reused.
+    const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
     if (s.speculative) s.speculative->reset_stats();
     s.power->reset_pacing();
     Sampler sampler(params);
@@ -564,21 +626,23 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     // Prefill everything but the last prompt token, which seeds the decode
     // loop (the speculative decoder expects it uncached).
     const auto t_prefill = Clock::now();
-    size_t first_uncached = 0;
+    size_t first_uncached = reused;
+    stats.cached_prefix_tokens = static_cast<int32_t>(reused);
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     // Persistent prefix cache: attach snapshotted KV pages for the longest
     // known prefix (full attention, no draft model).
     // (Not for hybrid models: the snapshots hold KV pages, not recurrent states.)
-    const bool use_dedup =
-        s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0 && !s.target->config().hybrid();
+    const bool use_dedup = reused == 0 && s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0 &&
+                           !s.target->config().hybrid();
     if (use_dedup) {
         const int32_t restored = s.kv_dedup->restore(prompt, static_cast<int32_t>(prompt.size()) - 1,
                                                      s.target->mutable_kv_cache());
         if (restored > 0 && s.target->adopt_cached_prefix(restored).is_ok()) {
             first_uncached = static_cast<size_t>(restored);
             stats.cached_prefix_tokens = restored;
+            s.context.assign(prompt.begin(), prompt.begin() + restored);
         } else {
-            s.target->reset();
+            s.clear_context();
         }
     }
 #endif
@@ -595,10 +659,16 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         }
         const auto part = prefix.subspan(i, std::min(chunk, prefix.size() - i));
         if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &prefill_hooks); !r) {
+            s.clear_context();
             return r.status();
         }
         if (s.draft) {
-            if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) return r.status();
+            if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
+                s.clear_context();
+                return r.status();
+            }
+        } else {
+            s.context.insert(s.context.end(), part.begin(), part.end());
         }
     }
     stats.prefill_ms = ms_since(t_prefill);
@@ -629,13 +699,20 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         std::vector<int32_t> next;
         if (s.speculative) {
             auto r = s.speculative->step(last, sampler, route, s.draft_route(), *s.pool);
-            if (!r) return r.status();
+            if (!r) {
+                s.clear_context();
+                return r.status();
+            }
             next = std::move(r).value();
         } else {
             const ForwardHooks hooks = s.hooks(policy, true);
             auto logits =
                 s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
-            if (!logits) return logits.status();
+            if (!logits) {
+                s.clear_context();
+                return logits.status();
+            }
+            s.context.push_back(last);
             if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
             stats.ffn_blocks_skipped += s.target->last_ffn_skips();
             if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;

@@ -166,6 +166,12 @@ JNIEXPORT jstring JNICALL Java_com_liyab_chat_LiyabNative_metadata(JNIEnv* env, 
     return env->NewStringUTF(value.c_str());
 }
 
+JNIEXPORT void JNICALL Java_com_liyab_chat_LiyabNative_prefill(JNIEnv* env, jclass, jlong h, jstring text) {
+    if (h == 0) return;
+    const std::string s = to_string(env, text);
+    if (liyab_engine_prefill(handle(h), s.c_str(), 1) != LIYAB_OK) throw_runtime(env, liyab_last_error());
+}
+
 // Returns {accelerator_busy_ms, storage_bytes_read, tokens_generated}, or null.
 JNIEXPORT jdoubleArray JNICALL Java_com_liyab_chat_LiyabNative_counters(JNIEnv* env, jclass, jlong h) {
     liyab_engine_counters c{};

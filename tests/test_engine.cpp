@@ -829,13 +829,50 @@ TEST_CASE("Engine generates text from a prompt and streams pieces") {
     CHECK(pieces > 0);
     CHECK(stats->tokens_per_second > 0);
 
-    // Greedy decoding is deterministic across calls (fresh context each time).
+    // Greedy decoding is deterministic across calls (the context is rewound to the common prefix).
     std::string again;
     REQUIRE(engine.value()->generate("hello world", greedy(16), [&](std::string_view piece, int32_t) {
         again += piece;
         return true;
     }).has_value());
     CHECK(text == again);
+}
+
+TEST_CASE("Context reuse: continuing a conversation or a prefill equals a fresh context") {
+    EngineConfig config = engine_config(f32_model());
+    auto reused = Engine::create(config);
+    auto fresh = Engine::create(config);
+    REQUIRE(reused.has_value() && fresh.has_value());
+    auto run = [](Engine& e, const std::string& prompt, GenerationStats* out = nullptr) {
+        std::string text;
+        auto st = e.generate(prompt, greedy(12), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+    // Turn 1, then turn 2 continuing turn 1's prompt and reply: only the new tokens are processed.
+    const std::string turn1 = "hello world";
+    const std::string reply = run(*reused.value(), turn1);
+    const std::string turn2 = turn1 + reply + " hello";
+    GenerationStats st{};
+    const std::string continued = run(*reused.value(), turn2, &st);
+    CHECK(st.cached_prefix_tokens > 0);
+    fresh.value()->reset_context();
+    CHECK(continued == run(*fresh.value(), turn2));
+    // A prefill followed by a prompt that extends it.
+    reused.value()->reset_context();
+    REQUIRE(reused.value()->prefill("hello", true).is_ok());
+    GenerationStats st2{};
+    const std::string after_prefill = run(*reused.value(), "hello world", &st2);
+    CHECK(st2.cached_prefix_tokens > 0);
+    fresh.value()->reset_context();
+    CHECK(after_prefill == run(*fresh.value(), "hello world"));
+    // An unrelated prompt drops the old context.
+    GenerationStats st3{};
+    run(*reused.value(), "world", &st3);
+    CHECK(st3.cached_prefix_tokens <= 1);
 }
 
 TEST_CASE("Engine routes to CPU when forced and matches the default route") {

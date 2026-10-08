@@ -204,6 +204,7 @@ public final class SettingsActivity extends Activity {
         DebugLog.add("Settings saved: " + EngineHolder.settings.summary(EngineHolder.thinkingSupported) + ", context "
                 + s.contextLength + (reload ? " (reloading the model)" : ""));
         if (reload) EngineHolder.load(EngineHolder.modelFile, EngineHolder.modelUri);
+        else EngineHolder.prepareSystemPrompt();  // the system prompt may have changed
         finish();
     }
 

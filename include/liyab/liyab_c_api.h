@@ -195,6 +195,14 @@ LIYAB_C_API size_t liyab_engine_describe(const liyab_engine* engine, char* buffe
 LIYAB_C_API int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size);
 /* Same as liyab_engine_describe for the device only; no engine required. */
 LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
+/* Processes `text` into the context without generating, so a later generate
+ * whose prompt starts with it skips that work (e.g. a chat's system prompt,
+ * prepared right after loading). generate reuses the context whenever its
+ * prompt continues the tokens already processed. */
+LIYAB_C_API liyab_status liyab_engine_prefill(liyab_engine* engine, const char* text, int32_t add_bos);
+/* Forgets the context: the next call starts from scratch. */
+LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
+
 /* Live counters for monitoring UIs, cumulative since creation: sample them
  * periodically and divide deltas by the elapsed time. Thread-safe (may be
  * called while a generation runs). */

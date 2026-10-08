@@ -270,6 +270,13 @@ int main() {
 
 `Engine::cancel()` is thread-safe and stops generation at the next token boundary.
 
+The context is kept between calls: when a prompt continues the tokens the engine already processed (the previous
+prompt plus its generated reply, which is how a chat grows), only the new tokens are processed, recurrent DeltaNet
+states included; attention-only models also keep the longest common prefix. `Engine::prefill(text)` processes a
+prefix ahead of time (a chat's system prompt right after loading) and `reset_context()` forgets everything. The
+output equals a fresh context's (tested). On the phone, Qwen3.6-35B-A3B's first token went from 13–16 s per
+message (whole conversation reprocessed) to 3.2 s for the first message and ~6 s for later ones.
+
 ### C ABI (`liyab_c_api.h`)
 
 ```c
@@ -288,7 +295,8 @@ liyab_engine_destroy(engine);
 ```
 
 No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with the message available from
-`liyab_last_error()` (thread-local). `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
+`liyab_last_error()` (thread-local). `liyab_engine_prefill` / `liyab_engine_reset_context` expose the context reuse
+described above. `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
 the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
 build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
@@ -395,8 +403,9 @@ final class LiyabEngine {
   switch CPU/GPU, unload, model settings, performance overlay. The debug log stays visible here, with timestamped app events plus the engine's own log
   lines (via `liyab_set_log_callback`), and can be copied or cleared.
 * **Chat.** Replies stream token by token; Stop cancels. Leaving the screen keeps the conversation. The prompt
-  format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). Earlier turns
-  are reused through the KV dedup prefix cache (attention-only models). With thinking on, the reasoning streams
+  format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). The system
+  prompt is processed in the background right after a model loads, and past turns are replayed exactly as
+  generated, so each message only costs its own tokens (the engine keeps its context between turns). With thinking on, the reasoning streams
   into a dimmed panel above the answer, folds away when the answer starts ("Thought for N s") and opens on tap;
   only answers are kept in the history. The header shows the active settings.
 * **Model settings (⚙ in Chat and on Home).** Per model file: thinking on/off (models whose vocabulary has

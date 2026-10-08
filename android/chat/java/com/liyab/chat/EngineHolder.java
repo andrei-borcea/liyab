@@ -255,10 +255,6 @@ final class EngineHolder {
                 long h = LiyabNative.create(path, cache.getAbsolutePath(), THREADS,
                         gpu ? LiyabNative.BACKEND_VULKAN : LiyabNative.BACKEND_CPU, context, thermalLimitC(),
                         memoryBudgetMb());
-                if (gpu) {
-                    DebugLog.add("Uploading weights to GPU memory (one-time warm-up)…");
-                    LiyabNative.generate(h, "Hi", 1, 0f, 1f, 0, bytes -> true);
-                }
                 double seconds = (System.nanoTime() - t0) / 1e9;
                 DebugLog.drainNative();
                 description = LiyabNative.describe(h);
@@ -280,6 +276,7 @@ final class EngineHolder {
                 }
                 prefs().edit().putString("model", file != null ? file.getAbsolutePath() : uri.toString()).apply();
                 status = String.format(Locale.US, "%s · %s · ready in %.1fs", label, gpu ? "GPU" : "CPU", seconds);
+                prepareSystemPrompt();  // queued after this load finishes; also the GPU warm-up
             } catch (Exception e) {
                 DebugLog.drainNative();
                 DebugLog.add("ERROR: " + e.getMessage());
@@ -295,6 +292,27 @@ final class EngineHolder {
                 changed();
             }
         });
+    }
+
+    /**
+     * Processes the chat's system block in the background, so the first message only costs its own
+     * tokens: the engine keeps that context and the chat prompt starts with exactly this text.
+     */
+    static void prepareSystemPrompt() {
+        worker.execute(EngineHolder::prepareSystemPromptOnWorker);  // no-op if nothing is loaded by then
+    }
+
+    private static void prepareSystemPromptOnWorker() {
+        long h = handle;
+        if (h == 0) return;
+        long t0 = System.nanoTime();
+        try {
+            LiyabNative.prefill(h, template.system(settings.systemPrompt));
+            DebugLog.add(String.format(Locale.US, "System prompt prepared in %.1f s",
+                    (System.nanoTime() - t0) / 1e9));
+        } catch (RuntimeException e) {
+            DebugLog.add("System prompt not prepared: " + e.getMessage());
+        }
     }
 
     static void deleteRecursively(File f) {

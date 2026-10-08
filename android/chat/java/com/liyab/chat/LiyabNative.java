@@ -47,6 +47,12 @@ final class LiyabNative {
     static native String describe(long engine);
 
     /**
+     * Processes `text` into the context without generating (e.g. the system prompt right after
+     * loading); a later generate() whose prompt starts with it skips that work. Blocking.
+     */
+    static native void prefill(long engine, String text);
+
+    /**
      * Live cumulative counters {gpu_busy_ms, storage_bytes_read, tokens_generated}, or null. Safe while a
      * generation runs; the caller must keep the engine alive (EngineHolder.LIFECYCLE).
      */

@@ -86,13 +86,26 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     // Generates a continuation of `prompt` (already chat-formatted by the
-    // caller). Each call starts from an empty context. Not reentrant: a
-    // concurrent call returns ErrorCode::Busy.
+    // caller). The context is reused across calls: when `prompt` continues the
+    // tokens the engine already processed (previous prompt + its generated
+    // reply, or a prefill()), only the new tokens are processed, which makes
+    // chat turns start fast; recurrent (DeltaNet) states are reused the same
+    // way. Attention-only models also keep the longest common prefix; anything
+    // else starts from an empty context. Output is the same as from a fresh
+    // context. Not reentrant: a concurrent call returns ErrorCode::Busy.
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
     // Same, from token ids (for vocabularies whose text encoder Liyab lacks).
     Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                             const TokenCallback& on_token);
+
+    // Processes `text` into the context without generating, so a later
+    // generate() whose prompt starts with it skips that work (e.g. the system
+    // prompt, prepared right after loading). Follows the same reuse rules as
+    // generate(). Not reentrant (Busy); cancel() stops it between chunks.
+    Status prefill(std::string_view text, bool add_bos = true);
+    // Forgets the context (the next call starts from scratch).
+    void reset_context();
 
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
