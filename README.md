@@ -653,7 +653,15 @@ Reading the table:
   pool, the 35B MoE runs fastest on 7 of the 8 cores: 8 spinning workers left the expert I/O threads waiting for a
   core (flash waits grew by a third). The default is therefore the performance cores minus one on CPUs without an
   efficiency cluster, and the pool hands out 4 chunks per thread on demand, so a preempted or slower core (the
-  prime cores are ~20% faster) no longer holds up a whole matmul. Prefill
+  prime cores are ~20% faster) no longer holds up a whole matmul.
+* **The kernel page cache as a second expert cache did not pay off** (tried on branch `feat/page-cache-tier`).
+  HyperOS stops apps by PSS (`persist.sys.stability.pss_highest_line`, 6 GiB), and pages read with plain `pread`
+  are not in the PSS, so the free RAM could cache experts evicted from the engine's own cache. Copies from the page
+  cache are fast (~6.6 GB/s on 4 threads against ~3.7 GB/s for direct reads from flash), and the 35B MoE read
+  28–35% fewer bytes from flash. But buffered reads that miss the page cache run at ~2.5 GB/s and hold the I/O
+  threads that the router's urgent reads wait for, so decode got slower in every A/B (7.0 → 4.8–6.3 tok/s, cold
+  or warm page cache). The expert pages also pushed the mapped resident weights out of the page cache, unless
+  those were first copied to anonymous memory. Prefill
   (~74 tok/s) still uses the per-row matvec kernel; a tiled GEMM for batches is the next CPU optimization.
 * Apple M4 Pro, same prompt: 49 tok/s (CPU, Q8_0) and 40 tok/s (Metal, Q4_0). Metal is limited by one command
   buffer per matmul.
