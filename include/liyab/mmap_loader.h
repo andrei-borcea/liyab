@@ -150,13 +150,15 @@ public:
     // bytes moved; on failure no tensor of the failing range was moved.
     Result<size_t> relocate(const std::vector<std::pair<size_t, size_t>>& ranges,
                             const std::function<uint8_t*(size_t bytes)>& allocate);
-    // Converts every tensor for which `select` is true into `target`
-    // (DType::Q4_K or Q5_K; tensors must be Q8_0 matrices with a multiple of
-    // 256 columns), into anonymous memory the loader owns, and drops their
-    // mapped pages. TensorView::type / data / nbytes then describe the
-    // converted copy, while file_offset still names the original bytes.
-    // Lossy: a quality trade for fewer bytes read per token. Uses every core;
-    // call before any compute reads the tensors. Returns the bytes saved.
+    // Converts every tensor for which `select` is true into `target`, into
+    // anonymous memory the loader owns, and drops their mapped pages:
+    //  * DType::Q4_K or Q5_K from Q8_0 matrices with a multiple of 256
+    //    columns (lossy: fewer bytes read per token; uses every core);
+    //  * DType::Q4_K_R8 from Q4_K matrices with a multiple of 8 rows and of
+    //    256 columns (lossless rearrangement for the CPU's batched kernels).
+    // TensorView::type / data / nbytes then describe the converted copy,
+    // while file_offset still names the original bytes. Call before any
+    // compute reads the tensors. Returns the bytes saved.
     Result<size_t> requantize(const std::function<bool(const TensorView&)>& select, DType target);
     // Whether `t` was converted by requantize() (its bytes are not the file's).
     [[nodiscard]] bool converted(const TensorView& t) const noexcept;

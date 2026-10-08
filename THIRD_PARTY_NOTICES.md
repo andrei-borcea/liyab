@@ -9,7 +9,8 @@ Liyab includes code adapted from the following projects.
   IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4, and the Q8_K activation quantization,
   adapted from `ggml/src/ggml-cpu/arch/arm/quants.c` and `ggml/src/ggml-quants.c`) and `src/core/quant.cpp`
   (the Q4_K / Q5_K quantizers, ported from `quantize_row_q4_K_ref`, `quantize_row_q5_K_ref` and
-  `make_qkx2_quants` in `ggml/src/ggml-quants.c`). The I-quant lookup grids in
+  `make_qkx2_quants` in `ggml/src/ggml-quants.c`) and `src/core/quant_repack.cpp` (the Q4_K_R8 layout and its
+  4-row SMMLA kernel, from `ggml/src/ggml-cpu/repack.cpp` and `ggml/src/ggml-cpu/arch/arm/repack.cpp`). The I-quant lookup grids in
   `src/core/quant_tables.inc` are generated from gguf-py, llama.cpp's Python package, by
   `tools/gen_quant_tables.py`.
 

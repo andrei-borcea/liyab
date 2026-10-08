@@ -1229,7 +1229,7 @@ bool uses_q8_K(DType type) noexcept {
     switch (type) {
         case DType::Q2_K: case DType::Q3_K: case DType::Q4_K: case DType::Q5_K: case DType::Q6_K:
         case DType::TQ2_0: case DType::IQ1_S: case DType::IQ1_M: case DType::IQ2_XXS: case DType::IQ2_XS:
-        case DType::IQ2_S: case DType::IQ3_XXS: case DType::IQ3_S: case DType::IQ4_XS:
+        case DType::IQ2_S: case DType::IQ3_XXS: case DType::IQ3_S: case DType::IQ4_XS: case DType::Q4_K_R8:
             return true;
         default:
             return false;

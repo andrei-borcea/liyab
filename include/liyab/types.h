@@ -123,6 +123,10 @@ enum class DType : uint32_t {
     TQ2_0 = 35,   // ternary, 2.06 bits/weight
     MXFP4 = 39,   // OCP microscaling FP4 (e2m1) with e8m0 scale per 32
     NVFP4 = 40,   // FP4 (e2m1) with ue4m3 scale per 16
+    // Internal layouts (never in a GGUF file): weights rearranged at load for
+    // the CPU's batched kernels. Same bytes per row as their source type, but
+    // stored in groups of 8 rows, so TensorView::row() does not address them.
+    Q4_K_R8 = 1000,  // Q4_K, 8 rows interleaved 8 bytes at a time (llama.cpp's block_q4_Kx8)
 };
 
 struct DTypeTraits {

@@ -111,6 +111,9 @@ struct TransformerOptions {
     // score, renormalized like the model's top-k); 0 or >= the model's top-k:
     // the model's own count. Lossy when it cuts.
     int32_t max_experts = 0;
+    // Repack the resident Q4_K matrices into Q4_K_R8 for the CPU's i8mm
+    // kernels (set only when the CPU computes every block; lossless).
+    bool repack_cpu = false;
 };
 
 class Transformer {

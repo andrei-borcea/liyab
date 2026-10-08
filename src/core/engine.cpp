@@ -9,6 +9,7 @@
 #include <mutex>
 
 #include "core/log.h"
+#include "core/quant.h"
 #include "core/sampling.h"
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
@@ -54,8 +55,10 @@ size_t complete_utf8_prefix(std::string_view s) {
     return n;  // only continuation bytes: malformed input, pass it through
 }
 
+// `repack_cpu`: the CPU computes every block (no GPU / NPU route), so its
+// i8mm kernels may get their own weight layout (TransformerOptions::repack_cpu).
 Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const EngineConfig& config,
-                                                int32_t max_batch) {
+                                                int32_t max_batch, bool repack_cpu) {
     LoaderOptions loader_options;
     loader_options.streaming = config.streaming;
     loader_options.memory_budget_bytes =
@@ -73,6 +76,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.requant_bits = config.requant_bits;
     options.expert_mass = config.moe_expert_mass;
     options.max_experts = config.moe_max_experts;
+    options.repack_cpu = repack_cpu && !config.triple_buffer_loading;
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -416,7 +420,9 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 
     // Prefill chunks and speculative verification batches share max_batch.
     const int32_t max_batch = std::max(64, config.draft_tokens + 1);
-    auto target = load_model(config.model_path, config, max_batch);
+    // Repacked weights are for the CPU's i8mm kernels only: no GPU / NPU route.
+    const bool repack_cpu = !impl->gpu && !impl->npu && impl->device.cpu.i8mm && quant::repack_kernels_available();
+    auto target = load_model(config.model_path, config, max_batch, repack_cpu);
     if (!target) return target.status();
     impl->target = std::move(target).value();
 
@@ -428,7 +434,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     impl->tokenizer.emplace(std::move(tokenizer).value());
 
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
-        auto draft = load_model(config.draft_model_path, config, max_batch);
+        auto draft = load_model(config.draft_model_path, config, max_batch, repack_cpu);
         if (!draft) return draft.status();
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");

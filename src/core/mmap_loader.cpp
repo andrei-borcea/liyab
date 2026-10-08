@@ -553,13 +553,15 @@ Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>
 }
 
 Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&)>& select, DType target) {
-    if (target != DType::Q4_K && target != DType::Q5_K) {
-        return Status(ErrorCode::InvalidArgument, "requantize() converts to Q4_K or Q5_K only");
+    if (target != DType::Q4_K && target != DType::Q5_K && target != DType::Q4_K_R8) {
+        return Status(ErrorCode::InvalidArgument, "requantize() converts to Q4_K, Q5_K or Q4_K_R8 only");
     }
     size_t saved = 0;
     for (TensorView& t : tensors_) {
         if (!select(t)) continue;
-        if (t.type != DType::Q8_0 || t.cols() % quant::kSuperBlock != 0) {
+        const bool repack = target == DType::Q4_K_R8;
+        if ((repack ? t.type != DType::Q4_K || t.rows() % 8 != 0 : t.type != DType::Q8_0) ||
+            t.cols() % quant::kSuperBlock != 0) {
             return Status(ErrorCode::InvalidArgument, "cannot requantize " + std::string(t.name));
         }
         TensorView out = t;
@@ -572,6 +574,10 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
         if (p == MAP_FAILED) return Status(ErrorCode::OutOfMemory, "cannot allocate requantized weights");
         converted_.emplace_back(p, bytes);
         auto* dst = static_cast<uint8_t*>(p);
+        if (repack) {  // same bytes, 8 rows interleaved: a rearrangement, not a requantization
+            quant::repack_q4_K_r8(reinterpret_cast<const quant::BlockQ4_K*>(t.data), t.rows(), t.cols(),
+                                  reinterpret_cast<quant::BlockQ4_Kx8*>(dst));
+        } else {
         // Rows are independent; the reference quantizer is slow (a weighted
         // search per 32 values), so every core takes a share.
         const auto n_threads = static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()));
@@ -586,6 +592,7 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
             });
         }
         for (std::thread& w : workers) w.join();
+        }
         if (t.data >= files_[t.shard]->data() && t.data < files_[t.shard]->data() + files_[t.shard]->size()) {
             files_[t.shard]->advise_dontneed(t.file_offset, t.nbytes);
         }

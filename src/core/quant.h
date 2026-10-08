@@ -196,6 +196,44 @@ void unpack_k_block(DType type, const void* block, int8_t* q, float* scale16, fl
 // Unpacks one Q5_0 / Q5_1 block into 32 int8 values (Q5_0: -16..15, Q5_1: 0..31).
 void unpack_q5_block(const uint8_t* qh, const uint8_t* qs, bool symmetric, int8_t* q) noexcept;
 
+// --- Repacked layouts (quant_repack.cpp) ---------------------------------
+//
+// Q4_K_R8: the super-blocks of 8 consecutive rows stored together, values
+// interleaved 8 bytes at a time (llama.cpp's block_q4_Kx8), so one SMMLA
+// multiplies 8 weight rows by 4 activation rows (Q8_K_X4, also interleaved
+// 8 bytes at a time). A matmul over 4 activation rows then costs ~1.7x one
+// row instead of ~3.7x, and one row costs ~14% less than the row kernels
+// (Snapdragon 8 Elite, single core). The single-row kernel (gemv) uses the
+// same integer sums and float epilogue as the 4-row one (gemm), so results do
+// not depend on the batch size. Requires i8mm (repack_kernels_available()).
+struct BlockQ4_Kx8 {
+    uint16_t d[8];        // fp16 super-block scales of the 8 rows
+    uint16_t dmin[8];
+    uint8_t scales[96];   // per 64 values: 8 rows' 6-bit scales and mins, re-packed
+    uint8_t qs[1024];     // 4-bit values of the 8 rows, interleaved 8 bytes at a time
+};
+static_assert(sizeof(BlockQ4_Kx8) == 8 * sizeof(BlockQ4_K), "Q4_K_R8 keeps Q4_K's size");
+struct BlockQ8_Kx4 {
+    float d[4];
+    int8_t qs[kSuperBlock * 4];   // 4 rows interleaved 8 bytes at a time
+    int16_t bsums[kSuperBlock / 4];
+};
+
+// Whether the repacked kernels are built in (they also need the CPU's i8mm).
+bool repack_kernels_available() noexcept;
+// Rearranges `rows` (a multiple of 8) Q4_K rows of `cols` values into Q4_K_R8.
+void repack_q4_K_r8(const BlockQ4_K* src, int64_t rows, int64_t cols, BlockQ4_Kx8* dst) noexcept;
+// Interleaves 4 Q8_K activation rows of `cols` values into Q8_K_X4 blocks
+// (the same integers, so gemv and gemm see identical inputs).
+void interleave_q8_K_x4(const BlockQ8_K* const* rows, int64_t cols, BlockQ8_Kx4* dst) noexcept;
+// Row groups [g0, g1) (8 rows each) of a Q4_K_R8 matrix against one Q8_K
+// activation row: y[8 * g + i] for every row of those groups.
+void gemv_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept;
+// The same against 4 activation rows: y[t * ldy + 8 * g + i] for t < 4.
+// Bit-identical to four gemv_q4_K_r8 calls.
+void gemm_q4_K_r8(const BlockQ4_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_Kx4* x, float* y,
+                  int64_t ldy) noexcept;
+
 }  // namespace liyab::quant
 
 #endif  // LIYAB_CORE_QUANT_H

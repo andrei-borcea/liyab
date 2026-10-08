@@ -261,6 +261,18 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
                        static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
     }
+    // CPU-only, fully resident models: Q4_K matrices in the layout of the
+    // i8mm batched kernels (a lossless rearrangement, same size). Streamed
+    // blocks are read in the file's layout, so a streaming model keeps it.
+    if (options.repack_cpu && !model->file_->streaming()) {
+        auto repacked = model->file_->requantize(
+            [&](const TensorView& t) {
+                return t.type == DType::Q4_K && t.n_dims == 2 && t.rows() % 8 == 0 &&
+                       t.cols() % quant::kSuperBlock == 0 && t.name != "token_embd.weight" && !model->file_->converted(t);
+            },
+            DType::Q4_K_R8);
+        if (!repacked) return repacked.status();
+    }
     return model;
 }
 

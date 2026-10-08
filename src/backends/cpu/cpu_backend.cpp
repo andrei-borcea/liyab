@@ -92,6 +92,7 @@ public:
                 quantize(acts_[a], it.x, it.w->cols(), it.n, format);
                 ++n_acts;
             }
+            if (it.w->type == DType::Q4_K_R8 && it.n >= 4 && !acts_[a].q8k4_ready) interleave_x4(acts_[a]);
             jobs_[i] = {&it, a, format};  // an index: acts_ may still grow
             total_rows += it.n > 0 ? it.w->rows() : 0;
             row_end_[i] = total_rows;
@@ -121,6 +122,10 @@ private:
         std::vector<quant::BlockQ8_0> q8;
         std::vector<quant::BlockQ8_K> q8k;
         std::vector<int32_t> sums;
+        // Q8_K rows interleaved by 4 for the repacked kernels (Q4_K_R8 weights,
+        // n >= 4); built on first use by such a weight.
+        std::vector<quant::BlockQ8_Kx4> q8k4;
+        bool q8k4_ready = false;
     };
     struct Job {
         const MatmulItem* item = nullptr;
@@ -128,7 +133,64 @@ private:
         ActFormat format = ActFormat::Float;
     };
 
+    // Groups of 4 Q8_K activation rows -> Q8_K_X4 (n / 4 groups; the last
+    // n % 4 rows stay single).
+    static void interleave_x4(Activations& a) {
+        const int64_t super_blocks = a.cols / quant::kSuperBlock;
+        a.q8k4.resize(static_cast<size_t>(a.n / 4 * super_blocks));
+        for (int32_t t = 0; t + 4 <= a.n; t += 4) {
+            const quant::BlockQ8_K* rows[4];
+            for (int k = 0; k < 4; ++k) rows[k] = a.q8k.data() + (t + k) * super_blocks;
+            quant::interleave_q8_K_x4(rows, a.cols, a.q8k4.data() + t / 4 * super_blocks);
+        }
+        a.q8k4_ready = true;
+    }
+
+    // Rows [r0, r1) of a Q4_K_R8 matrix (8-row groups): 4 activation rows at
+    // a time through gemm, the rest through gemv; a group cut by the range
+    // goes through a scratch tile so only rows inside it are written.
+    static void run_rows_r8(const Job& job, const Activations& a, int64_t r0, int64_t r1) {
+        const TensorView& w = *job.item->w;
+        const int64_t rows = w.rows();
+        const int64_t cols = w.cols();
+        const int64_t super_blocks = cols / quant::kSuperBlock;
+        const auto* packed = reinterpret_cast<const quant::BlockQ4_Kx8*>(w.data);
+        const int32_t n = job.item->n;
+        float* y = job.item->y;
+        const int64_t g_first = r0 / 8, g_last = (r1 + 7) / 8;           // groups touched
+        const int64_t g_in0 = (r0 + 7) / 8, g_in1 = std::max(g_in0, r1 / 8);  // groups fully inside
+        auto partial = [&](int64_t g, int32_t t, int32_t count) {
+            float tile[4 * 8];
+            const quant::BlockQ4_Kx8* wg = packed + g * super_blocks;
+            if (count == 4) {
+                quant::gemm_q4_K_r8(wg, cols, 0, 1, a.q8k4.data() + t / 4 * super_blocks, tile, 8);
+            } else {
+                quant::gemv_q4_K_r8(wg, cols, 0, 1, a.q8k.data() + t * super_blocks, tile);
+            }
+            for (int32_t k = 0; k < count; ++k) {
+                for (int64_t r = std::max(r0, 8 * g); r < std::min(r1, 8 * g + 8); ++r) {
+                    y[(t + k) * rows + r] = tile[k * 8 + (r - 8 * g)];
+                }
+            }
+        };
+        for (int32_t t = 0; t < n;) {
+            const int32_t count = t + 4 <= n ? 4 : 1;
+            if (g_in1 > g_in0) {
+                if (count == 4) {
+                    quant::gemm_q4_K_r8(packed, cols, g_in0, g_in1, a.q8k4.data() + t / 4 * super_blocks, y + t * rows, rows);
+                } else {
+                    quant::gemv_q4_K_r8(packed, cols, g_in0, g_in1, a.q8k.data() + t * super_blocks, y + t * rows);
+                }
+            }
+            for (int64_t g = g_first; g < g_last; ++g) {
+                if (g < g_in0 || g >= g_in1) partial(g, t, count);
+            }
+            t += count;
+        }
+    }
+
     static void quantize(Activations& a, const float* x, int64_t cols, int32_t n, ActFormat format) {
+        a.q8k4_ready = false;
         a.x = x;
         a.cols = cols;
         a.n = n;
@@ -161,6 +223,10 @@ private:
         const int32_t n = job.item->n;
         const float* x = job.item->x;
         float* y = job.item->y;
+        if (w.type == DType::Q4_K_R8) {
+            run_rows_r8(job, a, r0, r1);
+            return;
+        }
         // Several activation rows: Q8_K and Q8_0 kernels decode each weight
         // row once for all of them (speculative verification, prefill).
         if (n > 1 && (job.format == ActFormat::Q8_K || (job.format == ActFormat::Q8_0 && w.type == DType::Q8_0))) {

@@ -18,6 +18,7 @@
 #include "core/tokenizer.h"
 #include "core/transformer.h"
 #include "liyab/liyab.h"
+#include "liyab/device_detect.h"
 #include "liyab/liyab_c_api.h"
 #include "liyab/speculative_decoder.h"
 #include "test_model.h"
@@ -526,6 +527,49 @@ TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
     }
 }
 
+TEST_CASE("Repacked Q4_K_R8: gemm equals gemv exactly, and both match the row kernel") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    std::mt19937 rng(31);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t rows = 24, cols = 512, nb = cols / 256;
+    std::vector<float> w(static_cast<size_t>(rows * cols));
+    for (float& v : w) v = normal(rng);
+    std::vector<quant::BlockQ4_K> q(static_cast<size_t>(rows * nb));
+    for (int64_t r = 0; r < rows; ++r) quant::quantize_row(DType::Q4_K, w.data() + r * cols, q.data() + r * nb, cols);
+    std::vector<quant::BlockQ4_Kx8> packed(static_cast<size_t>(rows / 8 * nb));
+    quant::repack_q4_K_r8(q.data(), rows, cols, packed.data());
+    std::vector<quant::BlockQ8_K> act(static_cast<size_t>(4 * nb));
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> x(static_cast<size_t>(cols));
+        for (float& v : x) v = normal(rng);
+        quant::quantize_row_q8_K(x.data(), act.data() + t * nb, cols);
+    }
+    const quant::BlockQ8_K* rows4[4] = {act.data(), act.data() + nb, act.data() + 2 * nb, act.data() + 3 * nb};
+    std::vector<quant::BlockQ8_Kx4> act4(static_cast<size_t>(nb));
+    quant::interleave_q8_K_x4(rows4, cols, act4.data());
+    std::vector<float> batch(static_cast<size_t>(4 * rows));
+    quant::gemm_q4_K_r8(packed.data(), cols, 0, rows / 8, act4.data(), batch.data(), rows);
+    int mismatches = 0;
+    for (int t = 0; t < 4; ++t) {
+        std::vector<float> single(static_cast<size_t>(rows));
+        quant::gemv_q4_K_r8(packed.data(), cols, 0, rows / 8, rows4[t], single.data());
+        for (int64_t r = 0; r < rows; ++r) {
+            mismatches += single[static_cast<size_t>(r)] != batch[static_cast<size_t>(t * rows + r)];
+            const float ref = quant::dot_lowbit_q8_K(DType::Q4_K, q.data() + r * nb, rows4[t], cols);
+            CHECK_NEAR(single[static_cast<size_t>(r)], ref, 1e-4f * (1.0f + std::fabs(ref)));
+        }
+    }
+    CHECK(mismatches == 0);
+    // A group range writes only its own rows.
+    std::vector<float> part(static_cast<size_t>(rows), -1.0f);
+    quant::gemv_q4_K_r8(packed.data(), cols, 1, 2, rows4[0], part.data());
+    CHECK(part[0] == -1.0f && part[7] == -1.0f && part[16] == -1.0f);
+    CHECK(part[8] != -1.0f && part[15] != -1.0f);
+}
+
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
     std::vector<QuantVector> vectors;
     if (!load_quant_vectors(vectors)) return;
@@ -1014,6 +1058,46 @@ TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactl
     auto again = model->forward(std::span<const int32_t>(tokens).subspan(5), Transformer::Logits::All, route, pool);
     REQUIRE(again.has_value());
     CHECK(max_abs_diff(*again, rows(5)) < 1e-4);
+}
+
+TEST_CASE("Repacked Q4_K weights (CPU i8mm): same logits, batch-size independent") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    test::TinyModelSpec spec;
+    spec.n_embd = 256;
+    spec.n_ff = 512;
+    spec.ffn_type = DType::Q4_K;
+    const std::string& path = model_path("q4k_ffn", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99};
+    auto plain = load_transformer(path);
+    TransformerOptions options;
+    options.repack_cpu = true;
+    auto repacked = load_transformer(path, options);
+    auto stepwise = load_transformer(path, options);
+    REQUIRE(plain && repacked && stepwise);
+    CHECK(repacked->file().tensor("blk.0.ffn_gate.weight")->type == DType::Q4_K_R8);
+    CHECK(repacked->file().tensor("blk.1.ffn_down.weight")->type == DType::Q4_K_R8);
+    CHECK(plain->file().tensor("blk.0.ffn_gate.weight")->type == DType::Q4_K);
+    auto a = plain->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(a.has_value());
+    const std::vector<float> expected(a->begin(), a->end());
+    auto b = repacked->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(b.has_value());
+    const std::vector<float> batched(b->begin(), b->end());
+    CHECK(max_abs_diff(batched, expected) < 1e-3);
+    // One token at a time gives exactly the batch's logits (gemv == gemm).
+    const auto vocab = static_cast<size_t>(stepwise->config().n_vocab);
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        auto one = stepwise->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(one.has_value());
+        const std::vector<float> row(batched.begin() + t * vocab, batched.begin() + (t + 1) * vocab);
+        CHECK(max_abs_diff(*one, row) < 1e-4);
+    }
 }
 
 TEST_CASE("Context limit is enforced") {
