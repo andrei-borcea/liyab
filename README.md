@@ -4,7 +4,8 @@
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
 
 **Liyab** (*Tagalog for "flame"*) is a C++20 inference engine for running GGUF language models directly on phones,
-with no cloud dependency. Weights are memory-mapped and never copied, work is routed per device
+with no cloud dependency. Weights are memory-mapped and read in place, or, for models larger than RAM, streamed
+from storage with direct I/O straight into memory the CPU and GPU share; work is routed per device
 (NPU → GPU → CPU), and a power manager paces token output and reacts to thermal pressure.
 
 This README describes what the code does today. Anything not implemented is listed under
@@ -47,7 +48,7 @@ This README describes what the code does today. Anything not implemented is list
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
 | Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
-| Experimental: early exit, head pruning, `O_DIRECT` / io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
+| Experimental: early exit, head pruning, EGLS, TDSS 2:4 sparsity, JIT unpacker, persistent KV prefix cache, io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
 
@@ -63,33 +64,45 @@ This README describes what the code does today. Anything not implemented is list
    │  ├─ DeviceDetect ── SoC + accelerator probes → backend ranking   │
    │  ├─ PowerManager ── thermal polling, pacing, throttle policy     │
    │  ├─ Tokenizer, Sampler, SpeculativeDecoder                       │
-   │  └─ Transformer ── paged KV cache (F16/Q8_0/Q4_0/Q4_1, sinks)   │
+   │  └─ Transformer ── per-block mixer (attention / DeltaNet) + FFN  │
+   │                    (dense / MoE), paged KV cache, recurrent state│
    └───────┬──────────────────────────────────┬───────────────────────┘
            │ weights                          │ matmuls (Route)
-   ┌───────▼──────────────────────┐   ┌───────▼─────────────────────────┐
-   │ MmapLoader (zero-copy GGUF)  │   │ attention → GPU, FFN → NPU,     │
-   │  or TripleBufferLoader       │   │ fallback chain NPU → GPU → CPU  │
-   │  (fetch | prepare | execute) │   │  Metal ✅ Vulkan ✅ CPU NEON ✅  │
-   └──────────────────────────────┘   │  QNN / NeuroPilot 🟡            │
-                                      └─────────────────────────────────┘
+   ┌───────▼──────────────────────────┐   ┌───▼─────────────────────────────┐
+   │ MmapLoader (zero-copy GGUF,      │   │ attention → GPU, FFN → NPU,     │
+   │  split files)                    │   │ fallback chain NPU → GPU → CPU  │
+   │ larger than RAM:                 │   │  Metal ✅ Vulkan ✅ CPU NEON ✅  │
+   │  TripleBufferLoader (dense)      │   │  QNN / NeuroPilot 🟡            │
+   │  ExpertStore (MoE experts)       │   │ shared memory: GPU reads weights│
+   │  DirectFile (parallel O_DIRECT)  │   │  where storage wrote them       │
+   └──────────────────────────────────┘   └─────────────────────────────────┘
 ```
 
 * **Zero-copy weights.** `MmapLoader` maps the GGUF file read-only. Every tensor is a view into the mapping, and
   the CPU kernels read Q4_0/Q4_1/Q8_0 blocks in place. On Apple Silicon each tensor is wrapped in an `MTLBuffer`
   with `newBufferWithBytesNoCopy`, so the GPU reads the page cache directly.
-* **Streaming mode.** When the file is larger than 80% of available memory, the mapping is advised
-  `MADV_SEQUENTIAL` and a prefetch thread keeps a three-block window resident: the block being computed and the
-  next two being faulted in. Blocks behind the cursor are released with `MADV_DONTNEED`.
-* **Triple-buffered loader** (`EngineConfig::triple_buffer_loading`, for models larger than RAM). Three page-aligned slots rotate through a
-  fetch thread (stage 1), a transform thread (stage 2), and the executing layer (stage 3). Weight memory is bounded
-  at 3 × the largest block. Stage 2 is a pass-through in the engine because the kernels consume packed INT4
-  directly; an INT4→INT8 pass would double the bytes read. Stalls are counted in `GenerationStats::weight_stalls`.
+* **Models larger than RAM** stream automatically (file > 80% of available memory): dense models keep as many
+  blocks resident as fit and stream the rest, MoE models keep everything but the routed experts resident and
+  stream experts through a cache. See [Models larger than RAM](#models-larger-than-ram). The older `mmap`
+  streaming window (a prefetch thread keeps the current block and the next two faulted in, `MADV_DONTNEED` behind
+  the cursor) remains only for dense split models.
+* **Triple-buffered loader.** Three page-aligned slots rotate through a fetch thread (stage 1: parallel direct
+  reads), a transform thread (stage 2) and the executing block (stage 3). Block streaming uses it for the streamed
+  blocks; `EngineConfig::triple_buffer_loading` (`--triple-buffer`) streams every block. Stage 2 is a pass-through
+  because the kernels consume packed blocks directly. Stalls are counted in `GenerationStats::weight_stalls`.
 * **Vulkan backend (Android GPUs).** Mobile drivers lack `VK_EXT_external_memory_host` (Adreno 830 included), so
-  each tensor is copied once into host-visible GPU memory on first use and repacked into an aligned layout: float
-  scales plus 16-byte quant words. Kernels (`src/backends/vulkan/shaders/matvec.comp`, one SPIR-V module per weight
-  type, compiled with the NDK's `glslc` and embedded at build time) compute 4 rows per 64-lane workgroup with
-  16-byte loads and `vec4` dot products. Matmuls that share an input (Q/K/V, gate/up) go out in one submission, and
-  completion is polled briefly before the driver wait. A per-call dispatch costs 0.055 ms.
+  mmap'd weights cannot be wrapped in place. Two paths:
+  * *Shared memory* (`Backend::allocate_shared`): the engine places weights in host-visible, device-local,
+    coherent and cached memory (on Adreno the same RAM; direct reads from storage land there and the CPU reads it at
+    full speed). Matmuls on tensors inside it bind the region at the tensor's offset and decode the native GGUF
+    blocks (`shaders/matvec_native.comp`, 23 formats). Nothing is cached per tensor, so streaming slots can be
+    refilled freely. Used for streamed models.
+  * *Repacked copies* (models that fit): each tensor is copied once into GPU memory on first use and repacked into
+    float scales plus 16-byte quant words (`shaders/matvec.comp`, Q4_0/Q4_1/Q8_0/Q4_K/Q5_0/F16/F32).
+
+  Kernels are compiled with the NDK's `glslc` and embedded at build time; they compute 4 rows per 64-lane
+  workgroup. Matmuls that share an input (Q/K/V, gate/up) go out in one submission, and completion is polled briefly
+  before the driver wait. A per-call dispatch costs 0.055 ms.
 * **Heterogeneous routing.** Attention projections go to the GPU, while the FFN and output head go to the NPU.
   Any backend that reports `Unsupported` falls back to the CPU per matmul.
 * **Paged KV cache.** Fixed 64-token pages (all layers per page) come from a pool on demand through a page table.
@@ -101,7 +114,8 @@ This README describes what the code does today. Anything not implemented is list
   status, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the token rate.
 * **Speculative decoding.** A small draft model proposes *k* tokens, and the target verifies them in one batched
   pass, reading its weights once for *k*+1 tokens. Acceptance follows Leviathan et al. (2023), so output matches the
-  target's distribution. With greedy sampling it is token-for-token identical to plain decoding (tested).
+  target's distribution. With greedy sampling it is token-for-token identical to plain decoding (tested). Not
+  available for hybrid (DeltaNet) models yet: rejected tokens would need recurrent-state checkpoints.
 
 ---
 
@@ -189,7 +203,7 @@ auto-links Metal, Foundation and libc++. If `xcodebuild` reports missing compone
 | `LIYAB_USE_VULKAN` | ON on Android | Vulkan GPU backend + probe (loader opened with `dlopen`; shaders need `glslc` from the NDK or Vulkan SDK) |
 | `LIYAB_USE_QNN` | ON on Android | QNN HTP runtime probe (no SDK needed) |
 | `LIYAB_USE_NEUROPILOT` | ON on Android | NeuroPilot runtime probe |
-| `LIYAB_ENABLE_EXPERIMENTAL` | OFF | Early exit, head pruning, direct-I/O loader, `test_experimental` |
+| `LIYAB_ENABLE_EXPERIMENTAL` | OFF | Early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader, `test_experimental` |
 | `LIYAB_BUILD_SHARED` | ON | Shared (`.so`/`.dylib`) or static library |
 | `LIYAB_BUILD_TESTS` / `LIYAB_BUILD_CLI` | ON | Unit tests / `liyab-cli` |
 
@@ -202,9 +216,9 @@ needed.
 
 | Suite | Covers |
 | :--- | :--- |
-| `test_mmap` | mapping, `madvise` hints, NEON INT4→INT8 unpacking, GGUF parsing and malformed-file rejection, prefetcher, triple-buffer pipeline (ordering, resync, unpack stage, stall accounting, errors) |
+| `test_mmap` | mapping, `madvise` hints, NEON INT4→INT8 unpacking, GGUF parsing and malformed-file rejection, split models (parts, missing part, opening a later part), prefetcher, triple-buffer pipeline (ordering, resync, unpack stage, stall accounting, errors) |
 | `test_device_detect` | SoC classification, backend ranking, live detection, sysfs thermal parsing, power policy, pacing |
-| `test_engine` | quant kernels (including the Q8_K low-bit kernels against llama.cpp-encoded blocks), tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
+| `test_engine` | quant kernels (including the Q8_K low-bit kernels against llama.cpp-encoded blocks), tokenizer, transformer vs an independent float reference, batching/rollback, sliding window + sinks, MoE vs its dense twin, streamed experts (with evictions) vs in-place reads, Metal vs CPU, triple-buffer vs mmap equivalence, speculative decoding invariants, cancellation, pacing, C API |
 | `test_kv_cache` | memory per token, on-demand paging and reuse, sinks and page recycling over 5000 positions, quantization accuracy, engine KV memory |
 | `test_backends` | per-matmul latency of each backend on a model's shapes, grouped submissions, dispatch overhead |
 | `test_experimental` | early exit, head pruning, direct I/O correctness, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them, `LIYAB_BENCH_MB=N` sizes the I/O file) |
@@ -513,11 +527,11 @@ K-quants and Qwen on the same phone (CPU NEON + SDOT, 4 threads; GPU = Vulkan):
 | :--- | ---: | ---: |
 | TinyLlama-1.1B Q4_K_M | 24.7 tok/s | 20.7 tok/s |
 | Qwen2.5-0.5B-Instruct Q4_K_M (Q4_K + Q5_0 + Q6_K + Q8_0) | 35.2 tok/s | 27.9 tok/s |
-
 | Qwen3.5-0.8B Q4_K_M (hybrid DeltaNet) | 22.6 tok/s | — |
 | Qwen3.5-2B Q4_K_M (hybrid DeltaNet) | 11.8 tok/s | 12.3 tok/s |
 
-On these models the GPU is slower or level because Q6_K and other tensors fall back to the CPU. Compared with
+These models fit in RAM, so the GPU uses the repacked-copy path, where Q6_K and other formats fall back to the CPU;
+that is why it is slower or level here (streamed models use the native kernels instead). Compared with
 llama.cpp on identical GGUF files, the logits of Qwen2.5-0.5B (Q8_0, Q4_K_M, Q5_K_M) and TinyLlama (Q4_K_M, Q8_0)
 have the same argmax at ≥ 95% of positions and a mean correlation ≥ 0.998. Qwen3.5 (90-token multilingual prompt,
 token-identical tokenization): 0.8B Q8_0 98.9% argmax / 0.9992 correlation, 2B Q4_K_M 98.9% / 0.996, 0.8B Q4_K_M
@@ -538,9 +552,11 @@ Reading the table:
 * **Thermal guard.** With the default 40 °C threshold, this device's board thermistor (`xo-therm`, no dedicated skin
   sensor; the phone was charging over USB) crossed 40 °C under sustained load. The guard then rerouted, halved
   threads and capped the rate, as designed. Pass `skin_threshold_c` (C API) or `--skin-threshold` to tune it.
-* **Triple buffering** re-reads every block from flash for every token (bounded memory, no page cache). That is
-  the right trade only for models larger than RAM: here 560 MB/token ÷ 2.8 GB/s ≈ 5 tok/s, which matches the
-  measurement. The engine logs a warning when it is enabled for a model that fits in memory.
+* **Triple buffering every block** (`--triple-buffer`) re-reads the whole model from flash for every token
+  (bounded memory, no page cache): here 560 MB/token ÷ 2.8 GB/s ≈ 5 tok/s, which matches the measurement (taken
+  with single-request reads, before the parallel 4 MiB reads that reach ~4.4 GB/s). It only pays off for models
+  larger than RAM, where the automatic mode streams just the blocks that do not fit. The engine logs a warning when
+  it is enabled for a model that fits in memory.
 * **8 threads slower than 4** points at the fork/join cost of the condition-variable thread pool. Prefill
   (~74 tok/s) still uses the per-row matvec kernel; a tiled GEMM for batches is the next CPU optimization.
 * Apple M4 Pro, same prompt: 49 tok/s (CPU, Q8_0) and 40 tok/s (Metal, Q4_0). Metal is limited by one command
@@ -567,6 +583,8 @@ Weight streaming from UFS (256 MiB, 1 MiB chunks, page cache dropped before each
 | `mmap` + page touch | 2278 MB/s |
 | `pread` through the page cache | 2218 MB/s |
 | `pread` + `O_DIRECT` (io_uring denied by SELinux, see below) | 2796 MB/s (+23% vs mmap) |
+| `pread` + `O_DIRECT`, 2–4 concurrent requests of ≥ 256 KiB (random or sequential, 8.4 GB file) | ~4400 MB/s |
+| `pread` + `O_DIRECT`, 16 KiB requests, 1–8 threads | 160–1180 MB/s |
 
 KV cache memory (32 layers, 8 KV heads, head_dim 128 — Llama-3-8B class):
 
@@ -597,7 +615,7 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 | **JIT tensor unpacker** (`jit_unpacker.h`) | Emits a fully unrolled, branch-free AArch64 NEON routine for a fixed size and layout (interleaved INT4, or GGML Q4_0 blocks with the scales skipped), mapped W^X (`mprotect` / `MAP_JIT`) | Phone: 78.8 vs 57.5 GB/s for a 4096-element row (+37%), +12% at 11008. 1M elements: 25 vs 63 GB/s (I-cache thrash). Mac M4: 4–10% slower than intrinsics | Helps only for row-sized routines (≤ ~12 KiB of code). Not on Liyab's hot path today (kernels read packed INT4 directly). Unavailable on iOS (no runtime codegen) |
 | **TDSS: thermal-driven 2:4 sparsity** (`tdss.h`) | While throttled (≥ 40 °C), FFN projections switch to a 2:4 magnitude-pruned copy (3.5 bits/weight: INT4 values + 2-bit positions). The NEON kernel gathers activations with one `TBL` and does one `SDOT` per 32 columns | TinyLlama FFN: 408 → 318 MiB. Decode **32.3 → 14.8 tok/s on the phone (−54%)**, −57% on M4. Output diverges at token 4 (14% of tokens match) | **Counterproductive on current mobile hardware**: no 2:4 sparse units (an NVIDIA Ampere+ feature), so index decode + gather cost more than the halved MACs. Watts not measured (needs a battery-powered device and a power monitor) |
 | **KV dedup: persistent prefix cache** (`kv_dedup.h`) | After prefill, whole KV pages of the prompt are saved to a file keyed by xxHash64(model fingerprint, KV layout, prefix tokens). A new session with the same prefix (system prompt) mmaps the file and attaches the pages read-only, without copying, to the paged KV cache. Only the rest is prefilled | 447-token system prompt, TinyLlama: **TTFT 6.4 s → 1.06 s on the phone (6×)**, 1.8 s → 0.27 s on M4. Restored KV is bit-identical (same logits, same output). 9.5 MiB on disk | Full attention only, no speculative decoding, no directory eviction yet. TTFT < 10 ms only when the whole prompt is cached; the new user turn is still prefilled |
-| **Direct I/O loader** (`io_uring_loader.h`) | `O_DIRECT` reads into page-aligned buffers via raw io_uring syscalls (no liburing), with fallbacks. `read_into()` is the triple buffer's DMA stage | `O_DIRECT` +23% vs mmap (table above) | Android blocks `io_uring_setup` for apps *and* for `adb shell` (`EACCES`), so phones use the `O_DIRECT` pread fallback. macOS uses `F_NOCACHE`. DMA-BUF heaps are not app-accessible, so buffers are `posix_memalign` |
+| **io_uring loader** (`io_uring_loader.h`) | `O_DIRECT` reads into page-aligned buffers via raw io_uring syscalls (no liburing), with fallbacks | `O_DIRECT` +23% vs mmap (table above) | Android blocks `io_uring_setup` for apps *and* for `adb shell` (`EACCES`), so the engine streams with the core `DirectFile` (parallel `O_DIRECT` preads, ~4.4 GB/s) instead; this module is kept for platforms where io_uring is allowed |
 
 ---
 
@@ -628,8 +646,12 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   swap the expert cache (it is `mlock`ed only when RLIMIT_MEMLOCK allows).
 * **Dense 30–35B models on phones** are bandwidth-bound. Each generated token reads every weight once: a 32B model
   at ~4.5 bits is ~18 GB, so at ~77 GB/s LPDDR5X the ceiling is ~4 tok/s even fully resident, and far less when
-  streamed from flash (~4.4 GB/s with parallel direct reads). Speculative decoding, MoE models, and smaller dense models are the
-  practical routes to interactive speeds.
+  streamed from flash (~4.4 GB/s with parallel direct reads; Qwen3.8-27B UD-IQ2_S reaches 0.94 tok/s). Speculative
+  decoding, MoE models, and smaller dense models are the practical routes to interactive speeds.
+* **Speculative decoding for hybrid models.** Qwen3.5/3.8 ship a multi-token-prediction head and DeepSeek V4 a
+  dedicated draft model; neither is used yet, and DeltaNet blocks would need recurrent-state checkpoints to roll
+  back rejected tokens. For weight streaming this is the largest remaining multiplier (each streamed byte would
+  serve several tokens).
 * **CPU threading / prefill.** The thread pool synchronizes with condition variables (4 threads beat 8 on the
   phone), and prefill reuses the matvec kernel. A spinning pool and a tiled GEMM are the next CPU steps.
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
