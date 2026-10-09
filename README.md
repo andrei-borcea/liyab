@@ -439,7 +439,7 @@ final class LiyabEngine {
 
 ### Liyab app (Flutter, `app/`)
 
-`app/` is the Liyab app in Flutter, for Android now and iOS next, replacing the Java demo below step by step. It
+`app/` is the Liyab app in Flutter, for Android now and iOS next. It
 calls the C ABI directly through `dart:ffi` (hand-written bindings in `app/lib/engine/liyab_ffi.dart`, mirroring
 `liyab_c_api.h`): model loads, prefills and generations run on a worker isolate, while cancel and the live counters
 are called directly because the C API makes them thread-safe.
@@ -472,68 +472,12 @@ are called directly because the C API makes them thread-safe.
 
 Not yet in the Flutter app: the floating performance overlay over other apps (the Activity page replaces it inside
 Liyab).
-It uses the same application id (`com.liyab.chat`) and signing key (`build/liyab-debug.keystore`) as the Java demo,
-so installing it over that app keeps the downloaded models; settings start from their defaults.
+The application id is `com.liyab.chat` and the APK is signed with `build/liyab-debug.keystore` (the earlier Java
+demo app's key, so installing over that app kept its models).
 
 ```bash
 scripts/build_flutter_app.sh --install   # libliyab + release APK; waits while the app is open
 cd app && flutter analyze && flutter test
-```
-
-### Demo app: Liyab Chat (Android)
-
-`android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with four screens:
-
-* **Home.** Shows the model status (name, backend, SoC, running download) and quick actions: open chat, Models,
-  switch CPU/GPU, unload, model settings, performance overlay. The debug log stays visible here, with timestamped app events plus the engine's own log
-  lines (via `liyab_set_log_callback`), and can be copied or cleared.
-* **Chat.** Replies stream token by token; Stop cancels. Leaving the screen keeps the conversation. The prompt
-  format is chosen automatically from the vocabulary: ChatML (Qwen), Llama 3, or Zephyr (TinyLlama). The system
-  prompt is processed in the background right after a model loads, and past turns are replayed exactly as
-  generated, so each message only costs its own tokens (the engine keeps its context between turns). With thinking on, the reasoning streams
-  into a dimmed panel above the answer, folds away when the answer starts ("Thought for N s") and opens on tap;
-  only answers are kept in the history. The header shows the active settings.
-* **Model settings (⚙ in Chat and on Home).** Per model file: thinking on/off (models whose vocabulary has
-  `<think>`/`</think>`, e.g. Qwen3 and Qwen3.5: on opens the reasoning block, off sends the empty block their
-  templates use to skip it), temperature, top-p, top-k, max reply tokens, context length (reloads the model) and the
-  system prompt. Defaults come from the GGUF's `general.sampling.*` recommendations when present, else 0.7 / 0.9 /
-  40, 1024 reply tokens, 4096 context; "Reset" fills them in.
-* **Models (a full page, two tabs).**
-  * *On this phone:* load, chat, or delete each model (the loaded one is protected). Partial downloads can be
-    resumed or deleted. Any `.gguf` can be opened with the system picker (mapped through `/proc/self/fd`, so no copy
-    and no storage permission).
-  * *Hugging Face:* search GGUF repositories, then open one to list only the files Liyab can run, with size,
-    quantization and a RAM-fit hint. A split model is one entry ("N parts") whose download fetches every part in
-    turn, with one progress bar; vision projectors (`mmproj`) and imatrix files are hidden. The repository's
-    `general.architecture` is read from the first 64 KB of a file (HTTP range request), so a model with an
-    unsupported architecture is flagged and its downloads are disabled before any gigabytes are fetched.
-  * On the phone a split model is listed once (through part 1, with its total size), and deleting it deletes every
-    part. A lone later part (part 1 missing) stays listed so it can be deleted; loading it explains which file to
-    open.
-  * A live download card stays at the top. Downloads use 4 parallel range connections with per-segment state
-    persisted, so they resume after a pause, a kill or a network loss. Retries use exponential backoff, and the file
-    is checked against Hugging Face's SHA-256 before loading. A partial wake lock keeps the download running when
-    you leave the page.
-
-* **Device settings (⚙ → "Device").** A memory limit for the engine (weights, expert cache, streaming buffers;
-  5500 MiB by default, because HyperOS / MIUI stop any app above 6 GiB of PSS whatever RAM is free) and a thermal
-  limit (50 °C by default; above it the engine halves its CPU threads, while the OS thermal status still applies).
-  Changing them reloads the model.
-* **Performance overlay (Home → "Overlay").** A draggable panel over every screen with 60-second charts, sampled
-  twice a second: process CPU (share of all cores, `/proc/self/stat`), GPU (time the GPU spends on Liyab's work,
-  from the engine counters: Android blocks the GPU's own load counters for apps), power drawn from the battery
-  (`BatteryManager` current × voltage; while charging this is the net battery flow, and the panel says so),
-  tokens per second and flash read MB/s, plus battery level, temperature, thermal status and joules per token.
-  Tap its header to fold it into one line.
-
-Engine, log and download state live in process-wide holders (`EngineHolder`, `DebugLog`, `Downloads`), so moving
-between screens never interrupts them.
-
-```bash
-scripts/build_android_app.sh --install
-# scriptable entry points (tests / automation / deep links):
-adb shell am start -n com.liyab.chat/.HomeActivity --es download "'ggml-org/tiny-llamas|stories15M.gguf'"
-adb shell am start -n com.liyab.chat/.HomeActivity --es load qwen2.5-0.5b-q4_k_m.gguf --es open chat
 ```
 
 Downloads go to app-private internal storage (`files/models`), which is plain f2fs: the engine's direct reads
@@ -958,9 +902,8 @@ tools/                  liyab_cli.cpp (command-line front end over the C ABI), l
 docs/benchmarks/        benchmark data (results.json) and the charts drawn from it
 docs/brand/             the Liyab mark and app icon (SVG, 512 px PNG); "liyab" is Tagalog for flame
 app/                    the Liyab app (Flutter; Android, iOS next), built by scripts/build_flutter_app.sh
-android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI, adaptive launcher icon in res/), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
-scripts/                build_android.sh, build_android_app.sh, build_flutter_app.sh, build_ios.sh
+scripts/                build_android.sh, build_flutter_app.sh, build_ios.sh
 ```
 
 ## License

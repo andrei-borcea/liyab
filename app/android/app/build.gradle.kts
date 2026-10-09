@@ -5,8 +5,8 @@ plugins {
 }
 
 android {
-    // Same application id and signing key as the Java demo app it replaces
-    // (android/chat): installing over it keeps the downloaded models.
+    // The id (and key, below) of the earlier Java demo app, so phones that had
+    // it updated in place and kept their downloaded models.
     namespace = "com.liyab.chat"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
@@ -34,8 +34,9 @@ android {
     // libliyab.so comes from scripts/build_flutter_app.sh (CMake + NDK), copied here.
     sourceSets["main"].jniLibs.srcDir("src/main/jniLibs")
 
-    // The keystore scripts/build_android_app.sh creates (build/liyab-debug.keystore):
-    // one key for both apps. Falls back to the debug key when it does not exist.
+    // build/liyab-debug.keystore (scripts/build_flutter_app.sh creates it): an
+    // APK signed with another key cannot update the installed app. Falls back
+    // to the debug key when it does not exist.
     val liyabKeystore = rootProject.file("../../build/liyab-debug.keystore")
     signingConfigs {
         create("liyab") {

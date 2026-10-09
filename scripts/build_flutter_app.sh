@@ -5,8 +5,8 @@
 #   scripts/build_flutter_app.sh [--install]
 #
 # Requires: Flutter, Android SDK (platform 36), NDK, JDK 17, cmake. The APK is
-# signed with build/liyab-debug.keystore (created here if missing), the key the
-# Java demo app uses, so it installs over that app and keeps its models.
+# signed with build/liyab-debug.keystore (created here if missing): keep it, an
+# APK signed with another key cannot update the installed app.
 # --install waits while the app is running instead of stopping it.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
 set -euo pipefail
