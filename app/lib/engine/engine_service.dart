@@ -99,7 +99,12 @@ class EngineCounters {
   final int tokensGenerated;
 }
 
-const _metadataKeys = ['general.sampling.temp', 'general.sampling.top_p', 'general.sampling.top_k'];
+const _metadataKeys = [
+  'general.sampling.temp',
+  'general.sampling.top_p',
+  'general.sampling.top_k',
+  'tokenizer.chat_template', // how the model calls tools
+];
 
 class EngineService {
   EngineService._(this._commands, this._replies);

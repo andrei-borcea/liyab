@@ -6,6 +6,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../agent/tool_format.dart';
+import '../agent/tools.dart';
 import '../chat/chat_template.dart';
 import '../engine/engine_service.dart';
 import '../engine/liyab_ffi.dart';
@@ -15,21 +17,32 @@ import 'models_store.dart';
 import 'settings.dart';
 
 class ChatMessage {
-  ChatMessage(this.user, this.prefix);
+  ChatMessage(this.user, this.prefix, {String? promptUser}) : promptUser = promptUser ?? user;
 
+  /// What the user wrote (shown).
   final String user;
 
-  /// What the template put at the start of the reply (thinking control).
-  final String prefix;
+  /// The user turn as the model saw it (with the current date and time).
+  final String promptUser;
 
-  /// Everything the model generated, reasoning included.
+  /// What the template put at the start of the current reply segment (thinking control).
+  String prefix;
+
+  /// The current segment as generated, reasoning included. A reply that calls
+  /// tools has several segments: each call ends one, its result follows.
   String raw = '';
+
+  /// Earlier segments with their tool results, exactly as the model saw them.
+  String done = '';
+
+  /// The tools this reply used, shown above the answer.
+  final List<ToolStep> steps = [];
   GenerationStats? stats;
   String? error;
   bool streaming = true;
 
   /// The reply as the next prompt replays it (token for token what the engine saw).
-  String get exact => prefix + raw;
+  String get exact => done + prefix + raw;
 
   /// The model's reasoning, when it opened a `<think>` block itself or thinking is on.
   String? get reasoning {
@@ -40,11 +53,13 @@ class ChatMessage {
     return (close < 0 ? raw.substring(start) : raw.substring(start, close)).trim();
   }
 
-  /// The answer without the reasoning block.
+  /// The answer without the reasoning block, or a tool call being written.
   String get answer {
     final close = raw.indexOf('</think>');
-    if (close >= 0) return raw.substring(close + '</think>'.length).trimLeft();
-    return reasoning != null ? '' : raw;
+    var text = close >= 0 ? raw.substring(close + '</think>'.length).trimLeft() : (reasoning != null ? '' : raw);
+    final call = text.indexOf('<tool_call>');
+    if (call >= 0) text = text.substring(0, call).trimRight();
+    return text;
   }
 
   bool get thinkingNow => streaming && reasoning != null && !raw.contains('</think>');
@@ -59,7 +74,7 @@ class LogLine {
 }
 
 class AppState extends ChangeNotifier {
-  AppState._(this.engine, this.prefs, this.downloads) : device = DeviceSettings(prefs) {
+  AppState._(this.engine, this.prefs, this.downloads) : device = DeviceSettings(prefs), toolbox = Toolbox(prefs) {
     monitor = DeviceMonitor(engine, (lines) {
       for (final l in lines) {
         _log(l, engine: true);
@@ -71,7 +86,11 @@ class AppState extends ChangeNotifier {
   final SharedPreferences prefs;
   final DeviceSettings device;
   final Downloads downloads;
+  final Toolbox toolbox;
   late final DeviceMonitor monitor;
+
+  /// How the loaded model calls tools (none: no tools offered).
+  ToolDialect toolDialect = ToolDialect.none;
 
   String status = 'No model loaded';
   bool loading = false;
@@ -149,12 +168,14 @@ class AppState extends ChangeNotifier {
       template = detected;
       thinkingSupported = thinks;
       settings = ModelSettings.resolve(prefs, name, model.metadata);
+      toolDialect =
+          template == ChatTemplate.chatml ? ToolDialect.of(model.metadata['tokenizer.chat_template'] ?? '') : ToolDialect.none;
       modelPath = path;
       modelName = name;
       description = model.description;
       device.lastModel = path;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
-      _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${template.label})');
+      _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${template.label}, tools: ${toolDialect.name})');
       for (final line in description.split('\n')) {
         _log('  $line');
       }
@@ -174,12 +195,17 @@ class AppState extends ChangeNotifier {
     if (!engine.loaded) return;
     final watch = Stopwatch()..start();
     try {
-      await engine.prefill(template.system(settings.systemPrompt));
+      await engine.prefill(await _systemBlock());
       _log('System prompt prepared in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
     } on EngineException catch (e) {
       _log('System prompt not prepared: $e');
     }
   }
+
+  /// The system block: the system prompt, and the enabled tools when the model can call them.
+  Future<String> _systemBlock() async => toolDialect == ToolDialect.none
+      ? template.system(settings.systemPrompt)
+      : toolDialect.system(settings.systemPrompt, await toolbox.enabled());
 
   Thinking get _thinking => !thinkingSupported ? Thinking.none : (settings.thinking ? Thinking.on : Thinking.off);
 
@@ -188,44 +214,65 @@ class AppState extends ChangeNotifier {
   Future<String> _prompt(String user) async {
     final history = [
       for (final m in messages)
-        if (m.error == null && !m.streaming) Turn(user: m.user, exact: m.exact)
+        if (m.error == null && !m.streaming) Turn(user: m.promptUser, exact: m.exact)
     ];
     final budget = settings.contextLength - settings.maxTokens;
+    final system = await _systemBlock();
     while (true) {
-      final prompt = template.build(settings.systemPrompt, history, user, _thinking);
+      final prompt = template.build(system, history, user, _thinking);
       if (history.isEmpty || await engine.countTokens(prompt) <= budget) return prompt;
       history.removeAt(0);
     }
   }
 
+  static const _weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  static const _months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+
+  /// "[Now: Friday 9 October 2026, 13:40, UTC+02:00]": appended to each user
+  /// turn so "today" or "in two hours" mean something (the system prompt stays
+  /// fixed, so its context is reused).
+  static String nowLine(DateTime t) {
+    final o = t.timeZoneOffset;
+    final sign = o.isNegative ? '-' : '+';
+    String two(int v) => v.abs().toString().padLeft(2, '0');
+    return '[Now: ${_weekdays[t.weekday - 1]} ${t.day} ${_months[t.month - 1]} ${t.year}, '
+        '${two(t.hour)}:${two(t.minute)}, UTC$sign${two(o.inHours)}:${two(o.inMinutes % 60)}]';
+  }
+
+  /// At most this many tool calls per reply.
+  static const _maxToolCalls = 4;
+
   Future<void> send(String text) async {
     if (generating || !engine.loaded || text.trim().isEmpty) return;
     generating = true;
-    final prompt = await _prompt(text);
-    final message = ChatMessage(text, template.assistantPrefix(_thinking));
+    final promptUser = '$text\n\n${nowLine(DateTime.now())}';
+    final prompt = await _prompt(promptUser);
+    final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser);
+    // The prompt without the reply's opening: each step appends the reply so far.
+    final head = prompt.substring(0, prompt.length - message.prefix.length);
     messages.add(message);
     notifyListeners();
-    // Streaming redraws are batched (~15 a second): the engine runs on all but
-    // one core, and rebuilding the reply for every token would take CPU time
-    // from it.
-    var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
+    final sampling = SamplingOptions(
+        temperature: settings.temperature, topP: settings.topP, topK: settings.topK, maxTokens: settings.maxTokens);
     try {
-      await for (final event in engine.generate(
-          prompt,
-          SamplingOptions(
-              temperature: settings.temperature,
-              topP: settings.topP,
-              topK: settings.topK,
-              maxTokens: settings.maxTokens))) {
-        switch (event) {
-          case TextPiece(:final text):
-            message.raw += text;
-            final now = DateTime.now();
-            if (now.difference(lastPaint) < const Duration(milliseconds: 66)) continue;
-            lastPaint = now;
-          case GenerationDone(:final stats):
-            message.stats = stats;
-        }
+      for (var calls = 0;; ++calls) {
+        await _stream(head + message.exact, sampling, message);
+        final call = calls < _maxToolCalls && message.stats?.cancelled != true ? toolDialect.parse(message.raw) : null;
+        final tool = call == null ? null : toolbox.byName(call.name);
+        if (call == null) break;
+        final (result, summary) = tool == null || !toolbox.isOn(tool)
+            ? ('{"error": "No tool named ${call.name} is available."}', 'Unknown tool')
+            : await _runTool(tool, call);
+        if (tool != null) message.steps.add(ToolStep(tool.label, summary));
+        _log('Tool ${call.name}(${call.arguments}): $summary');
+        // The call ends this segment; its result and the next reply follow.
+        message
+          ..done = message.exact + ToolDialect.response(result)
+          ..prefix = template.assistantPrefix(_thinking)
+          ..raw = '';
         notifyListeners();
       }
     } on EngineException catch (e) {
@@ -236,6 +283,39 @@ class AppState extends ChangeNotifier {
       generating = false;
       notifyListeners();
     }
+  }
+
+  Future<(String, String)> _runTool(AgentTool tool, ToolCall call) async {
+    try {
+      return await tool.run(call.arguments);
+    } on Exception catch (e) {
+      return ('{"error": "The tool failed: $e"}', 'Failed');
+    }
+  }
+
+  /// Streams one generation into the message's current segment. Redraws are
+  /// batched (~15 a second): the engine runs on all but one core, and
+  /// rebuilding the reply for every token would take CPU time from it.
+  Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message) async {
+    var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
+    await for (final event in engine.generate(prompt, sampling)) {
+      switch (event) {
+        case TextPiece(:final text):
+          message.raw += text;
+          final now = DateTime.now();
+          if (now.difference(lastPaint) < const Duration(milliseconds: 66)) continue;
+          lastPaint = now;
+        case GenerationDone(:final stats):
+          message.stats = stats;
+      }
+      notifyListeners();
+    }
+  }
+
+  /// Tools changed (turned on or off): the system block that lists them changes too.
+  Future<void> toolsChanged() async {
+    notifyListeners();
+    await prepareSystemPrompt();
   }
 
   void stop() => engine.cancel();

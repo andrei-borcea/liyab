@@ -259,6 +259,19 @@ class MessageView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 14),
+          // The tools the reply used, e.g. "Read your calendar: 3 events".
+          for (final step in message.steps)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                Icon(Icons.auto_awesome_outlined, size: 16, color: theme.colorScheme.primary),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text('${step.label}: ${step.summary}',
+                      style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+                ),
+              ]),
+            ),
           if (reasoning != null) _Reasoning(text: reasoning, active: message.thinkingNow),
           // The reply: plain text, full width, like a page.
           if (message.answer.isNotEmpty || (message.streaming && reasoning == null))

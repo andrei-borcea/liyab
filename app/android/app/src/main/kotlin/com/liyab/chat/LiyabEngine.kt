@@ -51,6 +51,7 @@ abstract class SharedEngineActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         DeviceChannel.attach(this, flutterEngine)
+        DataChannel.attach(applicationContext, flutterEngine)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

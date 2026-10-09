@@ -56,9 +56,10 @@ enum ChatTemplate {
         }
       : '';
 
-  /// The full prompt for a new message after `history`.
-  String build(String systemText, List<Turn> history, String user, Thinking thinking) {
-    final p = StringBuffer(system(systemText));
+  /// The full prompt for a new message after `history`, starting with
+  /// `systemBlock` (system(), or a block that also lists tools).
+  String build(String systemBlock, List<Turn> history, String user, Thinking thinking) {
+    final p = StringBuffer(systemBlock);
     for (final t in history) {
       p.write(_turn(t));
     }

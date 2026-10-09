@@ -8,6 +8,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Agent tools, each enabled by the user in Settings: today's events, what to do next. Read on the phone only. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <!-- permission_handler grants the calendar group only with both; writing serves "add an event" (confirmed by the user). -->
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <application
         android:label="Liyab"
         android:allowBackup="false"
@@ -52,6 +59,16 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Notification access (granted by the user in Android's settings): messages and alerts the assistant can read. -->
+        <service
+            android:name=".LiyabNotificationListener"
+            android:exported="false"
+            android:label="Liyab"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"

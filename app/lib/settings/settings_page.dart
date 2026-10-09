@@ -3,7 +3,9 @@
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart' show openAppSettings;
 
+import '../agent/tools.dart';
 import '../engine/engine_service.dart';
 import '../state/app_state.dart';
 
@@ -15,7 +17,47 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver {
+  /// Per tool: whether its permission is granted (re-checked when the user comes back from Android's settings).
+  final Map<String, bool> _permitted = {};
+
+  Future<void> _checkTools() async {
+    for (final t in app.toolbox.all) {
+      _permitted[t.name] = await t.permitted();
+    }
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _checkTools();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkTools();
+      setState(() => _assistant = _isAssistant());
+    }
+  }
+
+  Future<void> _toggleTool(AgentTool tool, bool on) async {
+    if (on && !(_permitted[tool.name] ?? false)) {
+      final granted = await tool.requestPermission();
+      _permitted[tool.name] = granted;
+      if (!granted && mounted && tool is! NotificationsTool) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: const Text('Android did not grant access. You can allow it in the app settings.'),
+          action: SnackBarAction(label: 'Open', onPressed: openAppSettings),
+        ));
+      }
+    }
+    await app.toolbox.setOn(tool, on);
+    setState(() {});
+    await app.toolsChanged();
+  }
   late final _system = TextEditingController(text: widget.app.settings.systemPrompt);
   late Future<PermissionStatus> _notifications = widget.app.downloads.notificationPermission();
   static const _device = MethodChannel('liyab/device');
@@ -36,6 +78,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _system.dispose();
     super.dispose();
   }
@@ -151,6 +194,25 @@ class _SettingsPageState extends State<SettingsPage> {
             );
           },
         ),
+        heading('What Liyab can read'),
+        Text(
+          app.toolDialect.name == 'none' && app.modelName.isNotEmpty
+              ? 'The loaded model cannot call tools; Qwen3, Qwen3.5 and Qwen3.6 can.'
+              : 'Turn on what the assistant may read to answer about your day. It reads on this phone, only when a '
+                  'question needs it, and nothing leaves the device.',
+          style: muted,
+        ),
+        for (final t in app.toolbox.all)
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            secondary: Icon(_toolIcon(t)),
+            title: Text(_toolTitle(t)),
+            subtitle: Text(app.toolbox.isOn(t) && !(_permitted[t.name] ?? true)
+                ? 'Waiting for Android\'s permission: tap to ask again.'
+                : _toolExample(t)),
+            value: app.toolbox.isOn(t) && (_permitted[t.name] ?? false),
+            onChanged: (v) => _toggleTool(t, v),
+          ),
         heading('Permissions'),
         FutureBuilder<PermissionStatus>(
           future: _notifications,
@@ -196,3 +258,30 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 }
+
+IconData _toolIcon(AgentTool t) => switch (t) {
+      CalendarTool() => Icons.event_outlined,
+      NotificationsTool() => Icons.notifications_outlined,
+      MessagesTool() => Icons.sms_outlined,
+      CallsTool() => Icons.call_outlined,
+      ContactsTool() => Icons.contacts_outlined,
+      _ => Icons.content_paste_outlined,
+    };
+
+String _toolTitle(AgentTool t) => switch (t) {
+      CalendarTool() => 'Calendar',
+      NotificationsTool() => 'Notifications (chats, email previews)',
+      MessagesTool() => 'Text messages',
+      CallsTool() => 'Calls',
+      ContactsTool() => 'Contacts',
+      _ => 'Clipboard',
+    };
+
+String _toolExample(AgentTool t) => switch (t) {
+      CalendarTool() => '"What do I have today?" "Am I free at 5?"',
+      NotificationsTool() => '"What did Marco write me?" "Any new email?" Android asks in its settings.',
+      MessagesTool() => '"What did the bank\'s SMS say?"',
+      CallsTool() => '"Who called me this morning?"',
+      ContactsTool() => '"What is Anna\'s number?"',
+      _ => '"Summarize what I copied." Android shows a notice when it is read.',
+    };
