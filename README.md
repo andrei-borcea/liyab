@@ -514,9 +514,13 @@ are called directly because the C API makes them thread-safe.
 * **Activity.** Live meters (tok/s, battery W, CPU %, storage MB/s, thermal status with Android's 10 s headroom
   forecast, J/token on battery) with two-minute sparklines, sampled once a second only while the app is in the
   foreground; plus the app's and the engine's log (`liyab_log_buffer_*`), copyable.
-* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit and memory budget per
-  device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
+* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit, memory budget and
+  idle release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
   storage and imports go through the system picker).
+* **Idle release.** A loaded model keeps several GB while Liyab sits in the background, and the process outlives
+  its window (the notification listener keeps it running). After 5 minutes hidden (1, 15, 60 minutes or never in
+  Settings) the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
+  with the chat kept and the system prompt restored from its saved state.
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal
   headroom (cool with headroom, hot near throttling). It redraws about 24 times a second at rest and 30 while the

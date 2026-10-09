@@ -7,6 +7,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleListener;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -84,6 +85,47 @@ class AppState extends ChangeNotifier {
         _log(l, engine: true);
       }
     });
+    _lifecycle = AppLifecycleListener(onHide: _scheduleRelease, onShow: _backOnScreen);
+  }
+
+  // Idle release: a loaded model holds its memory (GBs) while Liyab sits in
+  // the background, and the process outlives the window (the notification
+  // listener keeps it). After device.releaseAfterMinutes hidden, the model is
+  // unloaded; it loads again, chat kept, as soon as Liyab is back on screen.
+  late final AppLifecycleListener _lifecycle;
+  Timer? _releaseTimer;
+  String? _released; // the model unloaded while idle
+
+  void _scheduleRelease() {
+    _releaseTimer?.cancel();
+    final minutes = device.releaseAfterMinutes;
+    if (minutes > 0) _releaseTimer = Timer(Duration(minutes: minutes), _releaseIdle);
+  }
+
+  Future<void> _releaseIdle() async {
+    final path = modelPath;
+    if (path == null || _released != null) return;
+    if (generating || loading || moving != null) return _scheduleRelease(); // busy: try again later
+    await engine.unload();
+    _released = path;
+    _prepared = null;
+    status = 'Model unloaded while idle';
+    _log('Unloaded $modelName after ${device.releaseAfterMinutes} min in the background');
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    _releaseTimer?.cancel();
+    super.dispose();
+  }
+
+  void _backOnScreen() {
+    _releaseTimer?.cancel();
+    final path = _released;
+    _released = null;
+    if (path != null && File(path).existsSync()) unawaited(load(path, keepChat: true));
   }
 
   final EngineService engine;
@@ -141,6 +183,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> unload() async {
     if (loading || generating) return;
+    _released = null;
     await engine.unload();
     _log('Unloaded $modelName');
     modelPath = null;
@@ -152,12 +195,14 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> load(String path) async {
+  /// Loads `path`; `keepChat` keeps the conversation (a reload after an idle release).
+  Future<void> load(String path, {bool keepChat = false}) async {
     if (loading) return;
+    _released = null;
     final name = File(path).uri.pathSegments.last;
     loading = true;
     status = 'Loading $name…';
-    messages.clear();
+    if (!keepChat) messages.clear();
     notifyListeners();
     try {
       final gpu = device.useGpu;

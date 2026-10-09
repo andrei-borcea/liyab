@@ -108,6 +108,12 @@ class DeviceSettings {
   int get memoryBudgetMb => _prefs.getInt('memory_budget_mb') ?? 5500;
   set memoryBudgetMb(int v) => _prefs.setInt('memory_budget_mb', v);
 
+  /// Minutes Liyab stays in the background before it unloads the model to
+  /// give its memory back (several GB for a large model); 0 keeps it loaded.
+  /// The model reloads, with its saved system prompt, when Liyab is opened again.
+  int get releaseAfterMinutes => _prefs.getInt('release_after_min') ?? 5;
+  set releaseAfterMinutes(int v) => _prefs.setInt('release_after_min', v);
+
   /// The last loaded model file, reloaded at start.
   String? get lastModel => _prefs.getString('model');
   set lastModel(String? v) => v == null ? _prefs.remove('model') : _prefs.setString('model', v);

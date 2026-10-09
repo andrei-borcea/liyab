@@ -74,6 +74,13 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   }
   bool _dirty = false;
 
+  static const _releaseChoices = [1, 5, 15, 60, 0]; // minutes; 0 = never
+  static String _releaseLabel(int minutes) => switch (minutes) {
+        0 => 'Never',
+        60 => 'After 1 hour',
+        _ => 'After $minutes min',
+      };
+
   AppState get app => widget.app;
 
   @override
@@ -169,6 +176,17 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
         slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048, 12288, 40,
             (v) => '${(v / 1024).toStringAsFixed(1)} GB', (v) => app.device.memoryBudgetMb = (v / 256).round() * 256),
         Text('HyperOS and MIUI close apps that use more than 6 GB. Both apply the next time the model loads.',
+            style: muted),
+        const SizedBox(height: 12),
+        slider(
+            'Free memory when idle',
+            _releaseChoices.indexOf(app.device.releaseAfterMinutes).clamp(0, _releaseChoices.length - 1).toDouble(),
+            0,
+            _releaseChoices.length - 1.0,
+            _releaseChoices.length - 1,
+            (v) => _releaseLabel(_releaseChoices[v.round()]),
+            (v) => app.device.releaseAfterMinutes = _releaseChoices[v.round()]),
+        Text('After this long in the background Liyab unloads the model; it loads again when you open Liyab.',
             style: muted),
         heading('Assistant'),
         FutureBuilder<bool>(
