@@ -89,7 +89,7 @@ public:
     size_t trim();
 
     [[nodiscard]] Stats stats() const;
-    [[nodiscard]] size_t capacity_bytes() const noexcept { return slot_bytes_ * slots_.size(); }
+    [[nodiscard]] size_t capacity_bytes() const noexcept { return arena_bytes_; }
     [[nodiscard]] size_t entries() const noexcept { return slots_.size(); }
     [[nodiscard]] uint64_t expert_bytes_total() const noexcept { return expert_bytes_total_; }
 
@@ -110,6 +110,15 @@ private:
     };
     struct Slot {
         int32_t entry = -1;  // key = layer * n_expert + expert
+        size_t offset = 0;   // in the arena
+        int32_t size_class = 0;
+    };
+    // Slots for the experts of blocks with one matrix layout (sizes and offsets).
+    struct SizeClass {
+        size_t bytes = 0;
+        std::array<size_t, 3> offsets{};  // gate, up, down inside a slot
+        size_t first_slot = 0;
+        size_t n_slots = 0;
     };
     struct Segment {      // one matrix of one expert in storage
         uint32_t shard = 0;
@@ -119,7 +128,8 @@ private:
 
     ExpertStore() = default;
     void io_loop();
-    int32_t take_slot_locked(std::unique_lock<std::mutex>& lock);  // evicts if needed; may wait
+    // A free slot of `size_class`, evicting within the class if needed; may wait.
+    int32_t take_slot_locked(std::unique_lock<std::mutex>& lock, int32_t size_class);
     // Reads matrix `m` of entry `key` (Loading, slot assigned) without the
     // lock, then marks the entry Ready (or Empty on failure) after its last part.
     void read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m);
@@ -130,8 +140,8 @@ private:
     const MmapLoader* file_ = nullptr;
     std::vector<std::array<const TensorView*, 3>> experts_;
     int32_t n_expert_ = 0;
-    size_t slot_bytes_ = 0;
-    std::array<size_t, 3> slot_offsets_{};  // where each matrix starts inside a slot (max over blocks)
+    std::vector<SizeClass> classes_;
+    std::vector<int32_t> block_class_;  // per block: its size class, -1 without experts
     uint64_t expert_bytes_total_ = 0;
     std::vector<std::unique_ptr<DirectFile>> files_;  // one per file part
 

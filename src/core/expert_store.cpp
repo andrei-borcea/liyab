@@ -6,7 +6,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "core/log.h"
 
@@ -33,27 +35,55 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
     s->experts_ = std::move(experts);
     s->n_expert_ = n_expert;
 
-    // A slot holds the three matrices of any block's expert, each in its own
-    // aligned area (an expert's offset is not block-aligned, so one extra
-    // alignment unit is reserved per matrix).
-    std::array<size_t, 3> area{};
-    for (const auto& block : s->experts_) {
+    // A slot holds the three matrices of one expert, each in its own aligned
+    // area (an expert's offset is not block-aligned, so one extra alignment
+    // unit is reserved per matrix). Blocks quantized alike share a slot size
+    // class; mixed quantizations (Unsloth's UD files: Q5_K or Q6_K down
+    // matrices in a few blocks) would otherwise size every slot for the
+    // largest expert. Each class gets a share of the budget proportional to
+    // its blocks, since every block runs top-k experts per token.
+    s->block_class_.assign(s->experts_.size(), -1);
+    std::vector<size_t> class_blocks;
+    for (size_t l = 0; l < s->experts_.size(); ++l) {
+        const auto& block = s->experts_[l];
         if (block[0] == nullptr) continue;
+        std::array<size_t, 3> area{};
         for (size_t m = 0; m < 3; ++m) {
             const size_t bytes = block[m]->row_bytes() * static_cast<size_t>(block[m]->ne[1]);
-            area[m] = std::max(area[m], align_up(bytes + kAlign));
+            area[m] = align_up(bytes + kAlign);
             s->expert_bytes_total_ += static_cast<uint64_t>(bytes) * static_cast<uint64_t>(n_expert);
         }
+        const std::array<size_t, 3> offsets = {0, area[0], area[0] + area[1]};
+        const size_t bytes = area[0] + area[1] + area[2];
+        size_t c = 0;
+        while (c < s->classes_.size() && (s->classes_[c].bytes != bytes || s->classes_[c].offsets != offsets)) ++c;
+        if (c == s->classes_.size()) {
+            s->classes_.push_back({bytes, offsets, 0, 0});
+            class_blocks.push_back(0);
+        }
+        ++class_blocks[c];
+        s->block_class_[l] = static_cast<int32_t>(c);
     }
-    if (area[0] == 0) return Status(ErrorCode::InvalidArgument, "no expert tensors");
-    s->slot_offsets_ = {0, area[0], area[0] + area[1]};
-    s->slot_bytes_ = area[0] + area[1] + area[2];
+    if (s->classes_.empty()) return Status(ErrorCode::InvalidArgument, "no expert tensors");
 
-    // Enough slots for a block's top-k plus the in-flight loads, whatever the budget.
+    // Per class: its share of the budget, and at least enough slots for a
+    // block's top-k plus the in-flight loads.
     const size_t total_entries = s->experts_.size() * static_cast<size_t>(n_expert);
+    size_t moe_blocks = 0;
+    for (const size_t b : class_blocks) moe_blocks += b;
     const size_t min_slots = static_cast<size_t>(std::max(io_threads, 1)) + 34;
-    const size_t n_slots = std::clamp(budget_bytes / s->slot_bytes_, std::min(min_slots, total_entries), total_entries);
-    s->arena_bytes_ = n_slots * s->slot_bytes_;
+    size_t n_slots = 0;
+    for (size_t c = 0; c < s->classes_.size(); ++c) {
+        SizeClass& sc = s->classes_[c];
+        const size_t entries = class_blocks[c] * static_cast<size_t>(n_expert);
+        const double share = static_cast<double>(budget_bytes) * static_cast<double>(class_blocks[c]) /
+                             static_cast<double>(moe_blocks);
+        sc.first_slot = n_slots;
+        sc.n_slots = std::clamp(static_cast<size_t>(share / static_cast<double>(sc.bytes)), std::min(min_slots, entries),
+                                entries);
+        n_slots += sc.n_slots;
+        s->arena_bytes_ += sc.n_slots * sc.bytes;
+    }
     void* arena = nullptr;
     if (posix_memalign(&arena, kAlign, s->arena_bytes_) != 0) {
         return Status(ErrorCode::OutOfMemory, "cannot allocate the expert cache");
@@ -63,6 +93,15 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
     // usually caps RLIMIT_MEMLOCK, in which case the cache stays pageable).
     s->locked_ = mlock(s->arena_, s->arena_bytes_) == 0;
     s->slots_.resize(n_slots);
+    size_t offset = 0;
+    for (size_t c = 0; c < s->classes_.size(); ++c) {
+        for (size_t i = 0; i < s->classes_[c].n_slots; ++i) {
+            Slot& slot = s->slots_[s->classes_[c].first_slot + i];
+            slot.offset = offset;
+            slot.size_class = static_cast<int32_t>(c);
+            offset += s->classes_[c].bytes;
+        }
+    }
     s->entries_.resize(total_entries);
 
     for (size_t i = 0; i < file.shard_count(); ++i) {
@@ -71,8 +110,14 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
         s->files_.push_back(std::move(part).value());
     }
     for (int32_t i = 0; i < std::max(io_threads, 1); ++i) s->io_threads_.emplace_back([p = s.get()] { p->io_loop(); });
-    LIYAB_LOG_INFO("expert cache: %zu slots x %.2f MiB = %.2f GiB (%.0f%% of %.2f GiB of experts)%s", n_slots,
-                   static_cast<double>(s->slot_bytes_) / (1024.0 * 1024.0),
+    std::string classes;
+    for (const SizeClass& sc : s->classes_) {
+        char part[48];
+        std::snprintf(part, sizeof part, "%s%zu x %.2f MiB", classes.empty() ? "" : " + ", sc.n_slots,
+                      static_cast<double>(sc.bytes) / (1024.0 * 1024.0));
+        classes += part;
+    }
+    LIYAB_LOG_INFO("expert cache: %s = %.2f GiB (%.0f%% of %.2f GiB of experts)%s", classes.c_str(),
                    static_cast<double>(s->arena_bytes_) / (1024.0 * 1024.0 * 1024.0),
                    100.0 * static_cast<double>(n_slots) / static_cast<double>(total_entries),
                    static_cast<double>(s->expert_bytes_total_) / (1024.0 * 1024.0 * 1024.0),
@@ -106,7 +151,8 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     const Segment seg = segment(key, m);
     const uint64_t begin = seg.offset / kAlign * kAlign;
     const size_t length = align_up(static_cast<size_t>(seg.offset - begin) + seg.bytes);
-    uint8_t* dst = arena_ + static_cast<size_t>(e.slot) * slot_bytes_ + slot_offsets_[static_cast<size_t>(m)];
+    const Slot& slot = slots_[static_cast<size_t>(e.slot)];
+    uint8_t* dst = arena_ + slot.offset + classes_[static_cast<size_t>(slot.size_class)].offsets[static_cast<size_t>(m)];
     lock.unlock();
     // One read per matrix: smaller parts (tried: 2 and 4 per matrix) cost
     // the flash more than the extra concurrency saves.
@@ -132,7 +178,8 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     ready_cv_.notify_all();
 }
 
-int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock) {
+int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock, int32_t size_class) {
+    const SizeClass& sc = classes_[static_cast<size_t>(size_class)];
     for (;;) {
         if (stop_) return -1;
         // A fresh load has no uses yet, so plain LFU would evict it first,
@@ -147,7 +194,7 @@ int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock) {
             const Entry& v = entries_[static_cast<size_t>(slots_[static_cast<size_t>(current)].entry)];
             return e.uses < v.uses || (e.uses == v.uses && e.last_use < v.last_use);
         };
-        for (size_t i = 0; i < slots_.size(); ++i) {
+        for (size_t i = sc.first_slot; i < sc.first_slot + sc.n_slots; ++i) {
             const int32_t key = slots_[i].entry;
             if (key < 0) return static_cast<int32_t>(i);
             const Entry& e = entries_[static_cast<size_t>(key)];
@@ -187,7 +234,7 @@ void ExpertStore::io_loop() {
         // Loading from here on: taking a slot may wait (unlocked), and the
         // entry must not be queued or dropped again meanwhile.
         e.state = State::Loading;
-        const int32_t slot = take_slot_locked(lock);
+        const int32_t slot = take_slot_locked(lock, block_class_[static_cast<size_t>(key / n_expert_)]);
         if (slot < 0) return;
         e.slot = slot;
         e.parts_left = 3;
@@ -291,7 +338,9 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
     e.untouched = false;
     e.uses += 1.0f;
     e.last_use = ++clock_;
-    const uint8_t* base = arena_ + static_cast<size_t>(e.slot) * slot_bytes_;
+    const Slot& slot = slots_[static_cast<size_t>(e.slot)];
+    const uint8_t* base = arena_ + slot.offset;
+    const std::array<size_t, 3>& offsets = classes_[static_cast<size_t>(slot.size_class)].offsets;
     std::array<TensorView, 3> views{};
     const auto& block = experts_[static_cast<size_t>(layer)];
     for (int32_t m = 0; m < 3; ++m) {
@@ -302,7 +351,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
         v.ne = {t.ne[0], t.ne[1], 1, 1};
         v.nbytes = seg.bytes;
         v.file_offset = seg.offset;
-        v.data = base + slot_offsets_[static_cast<size_t>(m)] + static_cast<size_t>(seg.offset % kAlign);
+        v.data = base + offsets[static_cast<size_t>(m)] + static_cast<size_t>(seg.offset % kAlign);
         views[static_cast<size_t>(m)] = v;
     }
     return views;
@@ -344,7 +393,7 @@ size_t ExpertStore::trim() {
         e.untouched = false;
         e.uses = 0.0f;
         slot.entry = -1;
-        released += slot_bytes_;
+        released += classes_[static_cast<size_t>(slot.size_class)].bytes;
     }
     // Locked pages cannot be dropped; the cache stays pageable from now on
     // (re-locking would fault the whole arena back in).
