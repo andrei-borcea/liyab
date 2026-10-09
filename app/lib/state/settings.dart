@@ -105,7 +105,7 @@ class ExperimentalSettings {
   double expertMass = 1.0; // MoE: fewest top experts covering this router mass
   int maxExperts = 0; // MoE: experts per token cap; 0 = the model's
   int kvCacheType = 1; // liyab_kv_cache_type: 0 F16, 1 Q8_0, 2 Q4_0, 3 Q4_1
-  int requantBits = 0; // MoE streaming: resident Q8_0 matrices to Q4_K / Q5_K
+  int requantBits = -1; // MoE streaming: resident Q8_0 matrices to Q4_K / Q5_K; -1 only when memory is tight
   int threads = 0; // 0 = the engine's choice
 
   Map<String, Object?> toJson() => {
@@ -162,7 +162,8 @@ class ExperimentalSettings {
       if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
       if (maxExperts > 0) 'max $maxExperts experts',
       if (kvCacheType != d.kvCacheType) '${const ['F16', 'Q8_0', 'Q4_0', 'Q4_1'][kvCacheType]} KV',
-      if (requantBits != 0) 'requant Q${requantBits}_K',
+      if (requantBits > 0) 'requant Q${requantBits}_K',
+      if (requantBits == 0) 'no automatic requant',
       if (threads != 0) '$threads threads',
     ];
   }

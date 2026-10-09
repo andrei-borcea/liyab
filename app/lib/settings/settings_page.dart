@@ -198,8 +198,11 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
             (v) => app.device.thermalLimitC = v.roundToDouble()),
         slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048, 12288, 40,
             (v) => '${(v / 1024).toStringAsFixed(1)} GB', (v) => app.device.memoryBudgetMb = (v / 256).round() * 256),
-        Text('HyperOS and MIUI close apps that use more than 6 GB. Both apply the next time the model loads.',
-            style: muted),
+        Text(
+            'HyperOS and MIUI close apps that use more than 6 GB. Both apply the next time the model loads.'
+            '${app.memory.recommendedBytes > 0 ? ' The loaded model runs well with about '
+                '${(app.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB.' : ''}',
+            style: app.memory.tight ? muted?.copyWith(color: theme.colorScheme.error) : muted),
         const SizedBox(height: 12),
         slider(
             'Free memory when idle',

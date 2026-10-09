@@ -551,6 +551,11 @@ Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bo
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
 
+Engine::MemoryPlan Engine::memory_plan() const {
+    const Transformer::MemoryPlan& p = impl_->target->memory_plan();
+    return {p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};
+}
+
 size_t Engine::trim_memory() {
     size_t released = 0;
     if (ExpertStore* store = impl_->target->expert_store()) released += store->trim();

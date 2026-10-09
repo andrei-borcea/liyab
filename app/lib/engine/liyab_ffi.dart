@@ -179,6 +179,19 @@ final class LiyabGenerationStats extends Struct {
   external int expertDropped;
 }
 
+final class LiyabMemoryPlan extends Struct {
+  @Uint64()
+  external int residentBytes;
+  @Uint64()
+  external int expertBytes;
+  @Uint64()
+  external int expertCacheBytes;
+  @Uint64()
+  external int recommendedBytes;
+  @Int32()
+  external int requantBits;
+}
+
 final class LiyabEngineCounters extends Struct {
   @Double()
   external double acceleratorBusyMs;
@@ -238,6 +251,8 @@ final class LiyabLib {
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>)>('liyab_engine_load_state'),
         trimMemory = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint64>),
             int Function(Pointer<Void>, Pointer<Uint64>)>('liyab_engine_trim_memory'),
+        memoryPlan = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabMemoryPlan>),
+            int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>)>('liyab_engine_memory_plan'),
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
             'liyab_supported_architectures'),
         getCounters = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabEngineCounters>),
@@ -270,6 +285,7 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>) saveState;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
   final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
+  final int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>) memoryPlan;
   final void Function(int) logBufferEnable;
   final int Function(Pointer<Utf8>, int) logBufferTake;
 

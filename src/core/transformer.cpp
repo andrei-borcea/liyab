@@ -981,8 +981,8 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
 // mapping (paged in now, never swept by the streaming window).
 Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits) {
     if (budget_option == 0) return Status::ok();
-    if (requant_bits != 0 && requant_bits != 4 && requant_bits != 5) {
-        return Status(ErrorCode::InvalidArgument, "requant_bits must be 0, 4 or 5");
+    if (requant_bits != -1 && requant_bits != 0 && requant_bits != 4 && requant_bits != 5) {
+        return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
     }
     const ModelConfig& c = config_;
     auto is_expert = [](const TensorView& t) {
@@ -1000,37 +1000,67 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
         return Status::ok();
     }
 
+    // The expert cache gets what the resident weights leave, after room for
+    // the KV cache, activations and the rest of the app: 1 GiB of free RAM,
+    // or 512 MiB inside an explicit budget (the embedder already left its own
+    // headroom below the platform's cap). Recurrent-state snapshots
+    // (snapshot_state) come out of the cache too.
+    const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
+                          static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
+    auto cache_budget = [&](size_t resident) -> size_t {
+        if (budget_option > 0) return static_cast<size_t>(budget_option);
+        return available > resident + margin ? static_cast<size_t>(available) - resident - margin : 0;
+    };
+
     // Optional lossy conversion of the resident Q8_0 matrices (the UD quants
     // keep attention and DeltaNet projections in Q8_0, ~2/3 of the bytes read
     // per token): fewer bytes per token, and the freed memory goes to the
-    // expert cache sized below. The token embedding is skipped: decode reads
-    // one row of it per token.
+    // expert cache. The token embedding is skipped: decode reads one row of
+    // it per token. Automatic (-1): only when the cache would hold less than
+    // kTightCache of the experts, where hit rates fall off and nearly every
+    // token waits for storage; Q5_K if that frees enough, else Q4_K.
+    auto convertible = [&](const TensorView& t) {
+        return !is_expert(t) && t.type == DType::Q8_0 && t.n_dims == 2 && t.rows() > 1 &&
+               t.cols() % quant::kSuperBlock == 0 && t.name != "token_embd.weight";
+    };
+    const size_t resident_q8 = file_->file_size() - expert_bytes;
+    int32_t bits = requant_bits;
+    if (bits < 0) {
+        bits = 0;
+        const auto wanted = static_cast<size_t>(kTightCache * static_cast<double>(expert_bytes));
+        if (cache_budget(resident_q8) < wanted) {
+            size_t q8_bytes = 0;
+            for (const TensorView& t : file_->tensors()) {
+                if (convertible(t)) q8_bytes += t.nbytes;
+            }
+            // Q8_0: 8.5 bits per weight; Q5_K 5.5, Q4_K 4.5.
+            const auto saving = [&](double bpw) { return static_cast<size_t>(static_cast<double>(q8_bytes) * (1.0 - bpw / 8.5)); };
+            bits = q8_bytes == 0 ? 0 : (cache_budget(resident_q8 - saving(5.5)) >= wanted ? 5 : 4);
+            LIYAB_LOG_INFO("memory is tight for this model (expert cache %.2f GiB, %.0f%% of experts): %s",
+                           static_cast<double>(cache_budget(resident_q8)) / (1024.0 * 1024.0 * 1024.0),
+                           100.0 * static_cast<double>(cache_budget(resident_q8)) / static_cast<double>(expert_bytes),
+                           bits == 0 ? "no Q8_0 matrices to convert" : bits == 5 ? "converting resident Q8_0 to Q5_K"
+                                                                      : "converting resident Q8_0 to Q4_K");
+        }
+    }
     size_t saved = 0;
-    if (requant_bits > 0) {
-        auto requantized = file_->requantize(
-            [&](const TensorView& t) {
-                return !is_expert(t) && t.type == DType::Q8_0 && t.n_dims == 2 && t.rows() > 1 &&
-                       t.cols() % quant::kSuperBlock == 0 && t.name != "token_embd.weight";
-            },
-            requant_bits == 4 ? DType::Q4_K : DType::Q5_K);
+    if (bits > 0) {
+        auto requantized = file_->requantize(convertible, bits == 4 ? DType::Q4_K : DType::Q5_K);
         if (!requantized) return requantized.status();
         saved = requantized.value();
-        LIYAB_LOG_INFO("resident Q8_0 matrices requantized to %s: %.2f GiB saved", requant_bits == 4 ? "Q4_K" : "Q5_K",
+        LIYAB_LOG_INFO("resident Q8_0 matrices requantized to %s: %.2f GiB saved", bits == 4 ? "Q4_K" : "Q5_K",
                        static_cast<double>(saved) / (1024.0 * 1024.0 * 1024.0));
     }
-    const size_t resident_bytes = file_->file_size() - expert_bytes - saved;
-    size_t budget = 0;
-    if (budget_option > 0) {
-        budget = static_cast<size_t>(budget_option);
-    } else {
-        // Keep room for the KV cache, activations and the rest of the app:
-        // 1 GiB of free RAM, or 512 MiB inside an explicit budget (the
-        // embedder already left its own headroom below the platform's cap).
-        // Recurrent-state snapshots (snapshot_state) come out of the cache too.
-        const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
-                              static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
-        budget = available > resident_bytes + margin ? static_cast<size_t>(available) - resident_bytes - margin : 0;
-    }
+    const size_t resident_bytes = resident_q8 - saved;
+    const size_t budget = cache_budget(resident_bytes);
+    memory_plan_.resident_bytes = resident_bytes;
+    memory_plan_.expert_bytes = expert_bytes;
+    memory_plan_.requant_bits = bits;
+    // What the cache needs for most experts to come from RAM (~85% hits at
+    // 12-15% of the experts cached on Qwen3.6-35B-A3B; the share, not the size,
+    // is what matters across models).
+    memory_plan_.recommended_bytes =
+        resident_q8 + static_cast<size_t>(kComfortableCache * static_cast<double>(expert_bytes)) + margin;
     std::vector<std::array<const TensorView*, 3>> experts(static_cast<size_t>(c.n_layers));
     for (int32_t l = 0; l < c.n_layers; ++l) {
         const Layer& L = layers_[static_cast<size_t>(l)];
@@ -1039,6 +1069,13 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     auto store = ExpertStore::create(*file_, std::move(experts), c.n_expert, budget, 4);
     if (!store) return store.status();
     expert_store_ = std::move(store).value();
+    memory_plan_.expert_cache_bytes = expert_store_->capacity_bytes();
+    if (memory_plan_.expert_cache_bytes < static_cast<size_t>(kTightCache * static_cast<double>(expert_bytes))) {
+        LIYAB_LOG_WARN("expert cache holds %.0f%% of the experts: most tokens will wait for storage; about %.1f GiB of "
+                       "memory budget would let this model run well",
+                       100.0 * static_cast<double>(memory_plan_.expert_cache_bytes) / static_cast<double>(expert_bytes),
+                       static_cast<double>(memory_plan_.recommended_bytes) / (1024.0 * 1024.0 * 1024.0));
+    }
     file_->keep_resident([&](const TensorView& t) { return !is_expert(t) && !file_->converted(t); });
     LIYAB_LOG_INFO("expert streaming: %.2f GiB resident weights, %.2f GiB of experts on storage",
                    static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0),

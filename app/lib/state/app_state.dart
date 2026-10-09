@@ -208,6 +208,9 @@ class AppState extends ChangeNotifier {
   ChatTemplate template = ChatTemplate.zephyr;
   bool thinkingSupported = false;
   ModelSettings settings = ModelSettings();
+
+  /// How the loaded model uses memory (expert streaming); zero for models that fit.
+  MemoryPlan memory = const MemoryPlan(0, 0, 0, 0, 0);
   final List<ChatMessage> messages = [];
 
   /// Name of the model being moved into app storage, if any.
@@ -301,7 +304,17 @@ class AppState extends ChangeNotifier {
       modelName = name;
       description = model.description;
       device.lastModel = path;
+      memory = model.memory;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
+      if (model.memory.tight) {
+        status = '$name · needs about ${(model.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB of memory to '
+            'answer quickly (Settings, Memory for the model)';
+        _log('Memory too tight for $name: ${(model.memory.expertCacheBytes / (1 << 30)).toStringAsFixed(2)} GB of expert '
+            'cache; about ${(model.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB recommended');
+      }
+      if (model.memory.requantBits > 0) {
+        _log('Resident weights converted to ${model.memory.requantBits} bits to make room (memory was tight)');
+      }
       _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${template.label}, tools: ${toolDialect.name})');
       if (experimental.active.isNotEmpty) _log('Experimental: ${experimental.active.join(', ')}');
       for (final line in description.split('\n')) {

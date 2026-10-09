@@ -84,7 +84,7 @@ typedef struct liyab_engine_config {
     int32_t triple_buffer_loading; /* nonzero: stream blocks through 3 rotating buffers */
     int64_t expert_cache_mb;      /* MoE: -1 auto (default), 0 never stream experts, > 0 cache size in MiB */
     int64_t memory_budget_mb;     /* > 0: cap on resident memory in MiB (e.g. per-app OS limits); 0: free RAM only */
-    int32_t requant_bits;         /* MoE expert streaming: resident Q8_0 matrices -> Q4_K (4) / Q5_K (5) at load (lossy); 0 off */
+    int32_t requant_bits;         /* MoE expert streaming: resident Q8_0 matrices -> Q4_K (4) / Q5_K (5) at load (lossy); 0 off, -1 only when memory is tight */
     float moe_expert_mass;        /* MoE: run the fewest top experts covering this router mass (lossy, e.g. 0.9); >= 1 all (default 1) */
     int32_t moe_max_experts;      /* MoE: at most this many experts per token (lossy); 0: the model's top-k */
     /* Experimental (build with LIYAB_ENABLE_EXPERIMENTAL=ON, else LIYAB_ERR_UNSUPPORTED). */
@@ -245,6 +245,18 @@ LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const cha
  * bytes released to *out_bytes (may be NULL; 0 for models without streamed
  * experts). Not while a generation runs on the engine. See Engine::trim_memory. */
 LIYAB_C_API liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t* out_bytes);
+
+/* How a MoE model with streamed experts uses memory (all zero when experts
+ * are read in place): an app can tell the user that its memory budget is too
+ * small for the model, and how much would let it run well. */
+typedef struct liyab_memory_plan {
+    uint64_t resident_bytes;     /* weights kept in RAM (after any requantization) */
+    uint64_t expert_bytes;       /* routed experts read from storage */
+    uint64_t expert_cache_bytes; /* RAM caching experts */
+    uint64_t recommended_bytes;  /* memory budget at which most expert uses would come from RAM */
+    int32_t requant_bits;        /* resident Q8_0 matrices converted at load (4 / 5); 0: none */
+} liyab_memory_plan;
+LIYAB_C_API liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out);
 
 /* Live counters for monitoring UIs, cumulative since creation: sample them
  * periodically and divide deltas by the elapsed time. Thread-safe (may be

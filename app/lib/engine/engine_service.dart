@@ -49,12 +49,27 @@ class SamplingOptions {
   final int maxTokens;
 }
 
+/// How a MoE model with streamed experts uses memory (Engine::MemoryPlan); zero otherwise.
+class MemoryPlan {
+  const MemoryPlan(this.residentBytes, this.expertBytes, this.expertCacheBytes, this.recommendedBytes, this.requantBits);
+  final int residentBytes;
+  final int expertBytes;
+  final int expertCacheBytes;
+  final int recommendedBytes;
+  final int requantBits;
+
+  /// Whether the expert cache is too small for most expert uses to come from RAM (Transformer::kTightCache).
+  bool get tight => expertBytes > 0 && expertCacheBytes < expertBytes * 0.10;
+}
+
 /// What the engine reported about a loaded model.
 class LoadedModel {
-  const LoadedModel({required this.description, required this.loadSeconds, required this.metadata});
+  const LoadedModel(
+      {required this.description, required this.loadSeconds, required this.metadata, required this.memory});
 
   final String description;
   final double loadSeconds;
+  final MemoryPlan memory;
 
   /// The GGUF keys the app reads (missing ones absent).
   final Map<String, String> metadata;
@@ -190,10 +205,12 @@ class EngineService {
     final r = await _call<List<Object?>>(
         ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile]);
     _engine = r[0] as int;
+    final plan = r[4] as List<Object?>;
     return LoadedModel(
         description: r[1] as String,
         loadSeconds: r[2] as double,
-        metadata: Map<String, String>.from(r[3] as Map));
+        metadata: Map<String, String>.from(r[3] as Map),
+        memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int));
   }
 
   Future<void> unload() async {
@@ -300,10 +317,18 @@ void _worker(SendPort replies) {
               final value = LiyabLib.readText((b, s) => lib.metadata(engine, k, b, s));
               if (value.isNotEmpty) metadata[key] = value;
             }
+            final plan = arena<LiyabMemoryPlan>();
+            lib.memoryPlan(engine, plan);
             replies.send([
               'ok',
               id,
-              [engine.address, description, watch.elapsedMicroseconds / 1e6, metadata]
+              [
+                engine.address,
+                description,
+                watch.elapsedMicroseconds / 1e6,
+                metadata,
+                [plan.ref.residentBytes, plan.ref.expertBytes, plan.ref.expertCacheBytes, plan.ref.recommendedBytes, plan.ref.requantBits]
+              ]
             ]);
           });
         case 'unload':

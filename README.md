@@ -370,7 +370,11 @@ build runs, so front ends can filter downloads without a copy of the list. `liya
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
 OS counters do not show (`liyab-cli --memory-budget MB`); `requant_bits` (4 or 5, default 0 = off; `liyab-cli
 --requant 4|5`) converts the resident Q8_0 matrices of a MoE model with streamed experts to Q4_K or Q5_K at load
-(lossy, see the 35B results below); `moe_expert_mass` (`liyab-cli --expert-mass P`, default 1 = off) runs, per token,
+(lossy, see the 35B results below), and -1 does so only when memory is tight: when the expert cache would hold under
+10% of the experts, where nearly every token waits for storage (Q5_K if that frees enough memory, else Q4_K; the
+app's default). `Engine::memory_plan()` (`liyab_engine_memory_plan`) reports the resident bytes, the experts' bytes,
+the expert cache and the budget at which 15% of the experts would be cached, so an app can tell the user that a
+budget is too small for a model (the Liyab app does, in its status line and Settings); `moe_expert_mass` (`liyab-cli --expert-mass P`, default 1 = off) runs, per token,
 only the top experts covering a fraction P of the router weight (lossy, see below); `moe_max_experts` (`liyab-cli
 --experts N`, default 0 = the model's top-k) caps the experts per token (lossy when below the model's count); and
 `liyab_generation_stats`

@@ -88,8 +88,9 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
           (v) => _x.expertMass = v),
       choice('Experts per token', 'Fewer experts read less per token (lossy).', _x.maxExperts,
           const [(0, 'Model'), (2, '2'), (4, '4'), (6, '6')], (v) => _x.maxExperts = v),
-      choice('Requantize resident matrices', 'Q8_0 attention and shared weights to 4 or 5 bits at load (lossy).',
-          _x.requantBits, const [(0, 'Off'), (4, 'Q4_K'), (5, 'Q5_K')], (v) => _x.requantBits = v),
+      choice('Requantize resident matrices', 'Q8_0 attention and shared weights to 4 or 5 bits at load (lossy). '
+          'Auto: only when memory is too tight for the expert cache.',
+          _x.requantBits, const [(-1, 'Auto'), (0, 'Off'), (4, 'Q4_K'), (5, 'Q5_K')], (v) => _x.requantBits = v),
       Text('Decoding', style: theme.textTheme.titleSmall),
       toggle('Lookup speculative decoding', 'Drafts tokens from the conversation\'s own text and verifies them in one '
           'pass. Exact output. The lossy features above do not apply with it.', _x.lookupDrafts, (v) => _x.lookupDrafts = v),

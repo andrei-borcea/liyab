@@ -351,6 +351,13 @@ liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path) {
     }
 }
 
+liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out) {
+    if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    const liyab::Engine::MemoryPlan p = engine->engine->memory_plan();
+    *out = liyab_memory_plan{p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};
+    return LIYAB_OK;
+}
+
 liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t* out_bytes) {
     if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {

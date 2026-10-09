@@ -101,7 +101,8 @@ struct TransformerOptions {
     // > 0: total memory the engine may keep resident (see usable_memory_bytes()).
     uint64_t memory_budget_bytes = 0;
     // With expert streaming: convert the resident Q8_0 matrices to Q4_K (4)
-    // or Q5_K (5) at load, before the expert cache is sized (lossy; 0: off).
+    // or Q5_K (5) at load, before the expert cache is sized (lossy; 0: off;
+    // -1: only when memory is tight, see Transformer::kTightCache).
     int32_t requant_bits = 0;
     // MoE: per token, run only the fewest top-ranked experts of the top-k
     // whose router probabilities cover this fraction of the top-k's total
@@ -154,6 +155,22 @@ public:
     // Routed-expert streaming (MoE models larger than RAM); nullptr when the
     // experts are read in place from the mapping.
     [[nodiscard]] const ExpertStore* expert_store() const noexcept { return expert_store_.get(); }
+
+    // How expert streaming uses memory (all zero when experts are read in place).
+    struct MemoryPlan {
+        size_t resident_bytes = 0;      // weights kept in RAM (after any requantization)
+        size_t expert_bytes = 0;        // routed experts on storage
+        size_t expert_cache_bytes = 0;  // RAM for cached experts
+        size_t recommended_bytes = 0;   // memory budget at which the cache holds kComfortableCache of the experts
+        int32_t requant_bits = 0;       // resident Q8_0 matrices converted to Q4_K (4) / Q5_K (5); 0: none
+    };
+    [[nodiscard]] const MemoryPlan& memory_plan() const noexcept { return memory_plan_; }
+    // Below this share of the experts cached, hit rates fall off and nearly
+    // every token waits for storage; automatic requantization aims above it.
+    static constexpr double kTightCache = 0.10;
+    // A share at which most expert uses come from RAM (~85% hits at 12-15% on
+    // Qwen3.6-35B-A3B): what the recommended budget is computed for.
+    static constexpr double kComfortableCache = 0.15;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
@@ -338,6 +355,7 @@ private:
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
+    MemoryPlan memory_plan_;
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
     int32_t rollback_window_ = 0;

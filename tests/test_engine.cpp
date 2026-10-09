@@ -1038,6 +1038,34 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
     CHECK(b->expert_store()->stats().loads > st.loads);
 }
 
+TEST_CASE("Automatic requantization converts the resident Q8_0 matrices only when the expert cache is tight") {
+    test::TinyModelSpec spec;  // as below: Q8_0 attention and output, 256 columns
+    spec.arch = "qwen3moe";
+    spec.n_layers = 2;
+    spec.n_embd = 256;
+    spec.n_expert = 8;
+    spec.n_expert_used = 2;
+    spec.identical_experts = false;
+    const std::string& path = model_path("moe_requant", spec);
+    auto plan_for = [&](int64_t cache_bytes) -> std::pair<Transformer::MemoryPlan, DType> {
+        TransformerOptions options;
+        options.expert_cache_bytes = cache_bytes;
+        options.requant_bits = -1;
+        auto model = load_transformer(path, options);
+        CHECK(model != nullptr);
+        if (model == nullptr || model->expert_store() == nullptr) return {Transformer::MemoryPlan{}, DType::F32};
+        return {model->memory_plan(), model->file().tensor("blk.0.attn_q.weight")->type};
+    };
+    const auto [tight, tight_type] = plan_for(1);  // far below 10% of the experts
+    CHECK(tight.requant_bits != 0);
+    CHECK(tight_type != DType::Q8_0);
+    CHECK(tight.expert_bytes > 0);
+    CHECK(tight.recommended_bytes > tight.resident_bytes);
+    const auto [roomy, roomy_type] = plan_for(int64_t{1} << 30);  // every expert fits
+    CHECK(roomy.requant_bits == 0);
+    CHECK(roomy_type == DType::Q8_0);
+}
+
 TEST_CASE("Expert streaming with requant_bits converts the resident Q8_0 matrices and stays close") {
     test::TinyModelSpec spec;  // Q8_0 attention and output, 256 columns: eligible for Q4_K / Q5_K
     spec.arch = "qwen3moe";

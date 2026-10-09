@@ -65,7 +65,9 @@ struct EngineConfig {
     // (attention / DeltaNet projections, shared experts) to Q4_K (4) or Q5_K
     // (5) at load. Lossy, opt-in: fewer bytes read per token, and the memory
     // saved goes to the expert cache. Converted on every core at load;
-    // ignored when experts are not streamed. 0: off.
+    // ignored when experts are not streamed. 0: off. -1: automatic, only when
+    // the expert cache would otherwise hold under 10% of the experts (Q5_K if
+    // that frees enough memory, else Q4_K); see Engine::memory_plan().
     int32_t requant_bits = 0;
     // MoE: per token, run only the fewest top-ranked experts of the top-k
     // whose router probabilities cover this fraction of the top-k's total
@@ -160,6 +162,16 @@ public:
     // the bytes released (0 for models without streamed experts). Call it
     // between generations, from the thread that generates.
     size_t trim_memory();
+
+    // How a MoE model with streamed experts uses memory; all zero otherwise.
+    struct MemoryPlan {
+        uint64_t resident_bytes = 0;      // weights kept in RAM (after any requantization)
+        uint64_t expert_bytes = 0;        // routed experts read from storage
+        uint64_t expert_cache_bytes = 0;  // RAM caching experts
+        uint64_t recommended_bytes = 0;   // memory budget at which most expert uses would come from RAM
+        int32_t requant_bits = 0;         // resident Q8_0 matrices converted at load (4 / 5); 0: none
+    };
+    [[nodiscard]] MemoryPlan memory_plan() const;
 
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
