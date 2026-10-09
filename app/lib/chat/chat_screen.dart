@@ -431,7 +431,7 @@ class _Composer extends StatelessWidget {
             const SizedBox(width: 6),
             Padding(
               padding: const EdgeInsets.only(bottom: 2),
-              child: _RoundAction(
+              child: RoundAction(
                 tooltip: generating ? 'Stop' : 'Send',
                 icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
                 onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
@@ -444,8 +444,9 @@ class _Composer extends StatelessWidget {
   }
 }
 
-class _RoundAction extends StatelessWidget {
-  const _RoundAction({required this.tooltip, required this.icon, required this.onPressed});
+/// The round send / stop button in the flame's gradient (docs/brand).
+class RoundAction extends StatelessWidget {
+  const RoundAction({super.key, required this.tooltip, required this.icon, required this.onPressed});
   final String tooltip;
   final IconData icon;
   final VoidCallback? onPressed;

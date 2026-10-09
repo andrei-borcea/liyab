@@ -451,7 +451,8 @@ are called directly because the C API makes them thread-safe.
   power or home button) then starts `AssistActivity` through `ACTION_ASSIST`: a see-through window over the
   current app where a sheet rises with the living flame, a text field and the latest answer. It expands in place
   (button, or dragging its handle up) into a full-height conversation, still over that app, as Gemini's overlay
-  does; tapping outside or closing returns to the app. Both windows share one Flutter engine (`LiyabEngine`,
+  does; tapping outside or closing returns to the app. Its edge glows in the flame's colours (following the
+  phone's heat) and, while the model works, pulses with a light running along the top edge. Both windows share one Flutter engine (`LiyabEngine`,
   created by the first activity, not at process start, so download jobs never load a model), so the sheet uses the
   model already loaded instead of loading a second copy. Since one engine draws into one surface and keeps one
   lifecycle state, only the window in front reports lifecycle states and takes the surface back when it returns,
