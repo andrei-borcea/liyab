@@ -147,6 +147,14 @@ const _metadataKeys = [
   'tokenizer.chat_template', // how the model calls tools
 ];
 
+/// A command waiting for the worker isolate.
+class _Job {
+  _Job(this.id, this.message, {required this.background});
+  final int id;
+  final List<Object?> message;
+  final bool background;
+}
+
 class EngineService {
   EngineService._(this._commands, this._replies);
 
@@ -156,6 +164,48 @@ class EngineService {
   final Map<int, StreamController<GenerationEvent>> _streams = {};
   int _nextId = 0;
   int _engine = 0; // address of the loaded liyab_engine, 0 when none
+
+  // Scheduler. The worker runs one command at a time; the others wait here,
+  // and the foreground ones (the user's request: loading, generating, the
+  // tokenizing that builds its prompt) go before the background ones
+  // (prefills typed ahead, the system prompt's preparation, saves, cache
+  // warming). A foreground command arriving while a background prefill runs
+  // cancels that prefill (liyab_engine_cancel_prefill, which never touches a
+  // generation): the engine keeps the work done, and the foreground prompt
+  // continues from it. Before, a message sent during a long preparation
+  // waited for all of it.
+  final List<_Job> _queue = [];
+  _Job? _running;
+
+  void _enqueue(_Job job) {
+    _queue.add(job);
+    if (!job.background) preempt();
+    _pump();
+  }
+
+  /// Stops a background prefill now running, for a request of the user that
+  /// is about to come (the engine keeps the work done).
+  void preempt() {
+    final running = _running;
+    if (running != null && running.background && running.message[0] == 'prefill' && _engine != 0) {
+      LiyabLib.instance.cancelPrefill(Pointer<Void>.fromAddress(_engine));
+    }
+  }
+
+  void _pump() {
+    if (_running != null || _queue.isEmpty) return;
+    final next = _queue.firstWhere((j) => !j.background, orElse: () => _queue.first);
+    _queue.remove(next);
+    _running = next;
+    _commands.send(next.message);
+  }
+
+  /// A reply that ends command `id` (its result, its error, or a generation's last event).
+  void _finished(int id) {
+    if (_running?.id != id) return;
+    _running = null;
+    _pump();
+  }
 
   bool get loaded => _engine != 0;
 
@@ -177,6 +227,7 @@ class EngineService {
 
   void _onReply(List<Object?> m) {
     final kind = m[0] as String, id = m[1] as int;
+    if (kind != 'piece') _finished(id);
     switch (kind) {
       case 'piece':
         _streams[id]?.add(TextPiece(m[2] as String));
@@ -211,11 +262,12 @@ class EngineService {
     }
   }
 
-  Future<T> _call<T>(List<Object?> command) {
+  /// Queues `command`; `background` work yields to the user's requests.
+  Future<T> _call<T>(List<Object?> command, {bool background = false}) {
     final id = _nextId++;
     final completer = Completer<T>();
     _pending[id] = (value) => value is EngineException ? completer.completeError(value) : completer.complete(value as T);
-    _commands.send([command[0], id, ...command.skip(1)]);
+    _enqueue(_Job(id, [command[0], id, ...command.skip(1)], background: background));
     return completer.future;
   }
 
@@ -243,10 +295,12 @@ class EngineService {
   Future<int> countTokens(String text) => _call<int>(['tokenize', text]);
 
   /// The token ids `text` encodes to.
-  Future<List<int>> tokenIds(String text) async => List<int>.from(await _call<List<Object?>>(['tokenIds', text]));
+  Future<List<int>> tokenIds(String text, {bool background = false}) async =>
+      List<int>.from(await _call<List<Object?>>(['tokenIds', text], background: background));
 
   /// Processes `text` into the context so a later prompt starting with it skips that work.
-  Future<void> prefill(String text) => _call<Object?>(['prefill', text]);
+  Future<void> prefill(String text, {bool background = false}) =>
+      _call<Object?>(['prefill', text], background: background);
 
   /// Saves the context (e.g. the prefilled system prompt) to `path`.
   Future<void> saveState(String path) => _call<Object?>(['saveState', path]);
@@ -255,13 +309,13 @@ class EngineService {
   Future<int> loadState(String path) => _call<int>(['loadState', path]);
 
   /// Empties the engine's expert cache (the model stays loaded); the bytes released.
-  Future<int> trimMemory() => _call<int>(['trim']);
+  Future<int> trimMemory() => _call<int>(['trim'], background: true);
 
   /// Queues the experts that were hot before the last trim, behind any demand read; how many.
-  Future<int> warmMemory() => _call<int>(['warm']);
+  Future<int> warmMemory() => _call<int>(['warm'], background: true);
 
   /// Saves / restores the expert cache's hot list (a few KB) for a later process.
-  Future<void> saveExpertProfile(String path) => _call<Object?>(['saveProfile', path]);
+  Future<void> saveExpertProfile(String path) => _call<Object?>(['saveProfile', path], background: true);
   Future<void> loadExpertProfile(String path) => _call<Object?>(['loadProfile', path]);
 
   /// Streams the reply to `prompt` (already chat-formatted).
@@ -269,7 +323,7 @@ class EngineService {
     final id = _nextId++;
     final controller = StreamController<GenerationEvent>();
     _streams[id] = controller;
-    _commands.send(['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens]);
+    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens], background: false));
     return controller.stream;
   }
 

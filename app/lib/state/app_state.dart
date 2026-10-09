@@ -485,16 +485,22 @@ class AppState extends ChangeNotifier {
       }
     }
     try {
-      await engine.prefill(block);
+      // In the background: a message sent meanwhile goes first, and its
+      // prompt (which starts with this block) continues the work done.
+      await engine.prefill(block, background: true);
       _log('System prompt prepared in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
       await engine.saveState(file);
       for (final old in dir.listSync().whereType<File>()) {
         if (old.path != file && old.uri.pathSegments.last.startsWith('$modelName.')) old.deleteSync();
       }
     } on EngineException catch (e) {
-      _log('System prompt not prepared: $e');
+      _prepared = null; // prepared again (and saved) when the engine is free
+      if (!_cancelled(e)) _log('System prompt not prepared: $e');
     }
   }
+
+  /// A background prefill the scheduler stopped for a request of the user.
+  static bool _cancelled(EngineException e) => e.message.contains('cancel');
 
   /// The system block: the system prompt, and the enabled tools when the model can call them.
   Future<String> _systemBlock() async => toolDialect == ToolDialect.none
@@ -567,7 +573,7 @@ class AppState extends ChangeNotifier {
       const marker = '\u0000';
       final template = await _prompt(marker);
       final head = template.substring(0, template.indexOf(marker));
-      final whole = await engine.tokenIds(head + text);
+      final whole = await engine.tokenIds(head + text, background: true);
       var cut = text.length;
       for (var tries = 0; tries < 3; ++tries) {
         // Whole words; before the first one, the history alone.
@@ -575,10 +581,10 @@ class AppState extends ChangeNotifier {
         if (cut < 0) cut = 0;
         final stable = head + text.substring(0, cut);
         if (_drafted.startsWith(stable)) return; // nothing new to process
-        final ids = await engine.tokenIds(stable);
+        final ids = await engine.tokenIds(stable, background: true);
         if (ids.length < whole.length && _isPrefix(ids, whole)) {
           final watch = Stopwatch()..start();
-          await engine.prefill(stable);
+          await engine.prefill(stable, background: true);
           _log('Draft prepared (${ids.length} tokens) in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(2)} s');
           _drafted = stable;
           return;
@@ -586,7 +592,7 @@ class AppState extends ChangeNotifier {
         if (cut == 0) return;
       }
     } on EngineException catch (e) {
-      _log('Draft not prepared: $e');
+      if (!_cancelled(e)) _log('Draft not prepared: $e');
     } finally {
       _drafting = false;
     }
@@ -638,6 +644,7 @@ class AppState extends ChangeNotifier {
     } else if (loading) {
       await _pendingLoad;
     }
+    engine.preempt(); // a system prompt still being prepared yields to the message
     await _preparing;
     if (!engine.loaded) {
       message

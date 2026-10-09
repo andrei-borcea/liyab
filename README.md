@@ -570,6 +570,13 @@ are called directly because the C API makes them thread-safe.
   cut; the messages stay on screen). Dropping one turn per message instead would change the start of every prompt,
   and the engine would process the whole conversation again for each message; this way the following messages
   extend the same prompt and the cost comes once every many messages. The cut is saved with the conversation.
+* **Scheduling.** The engine's worker runs one command at a time; the app queues them with two priorities. The
+  user's requests (loading, generating, the tokenizing that builds a prompt) go before background work (prefills
+  typed ahead, the system prompt's preparation, saves, cache warming), and a request that arrives while a
+  background prefill runs cancels it (`liyab_engine_cancel_prefill`: checked between blocks, so within a fraction
+  of a second even inside a 1024-token pass; it never touches a generation). The engine keeps the work done (a
+  hybrid model's state is snapshotted before each pass and an abandoned pass returns to it), so the request's
+  prompt continues from it. Before, a message sent during a long preparation waited for all of it.
 * **Typing ahead.** While the user writes, the stable part of the draft (whole words, cut where its tokens are a
   prefix of the text so far, since a hybrid model's context is reused only up to the snapshot at the end of a
   prefill) is processed in the background, 0.6 s after the last keystroke, starting with the history. Sending then
