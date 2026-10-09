@@ -127,7 +127,8 @@ This README describes what the code does today. Anything not implemented is list
   (`AThermal_getThermalHeadroom`, Android 12+, smoothed) and the sysfs skin/SoC zones. The response is gradual: the
   forecast becomes a pressure from 0 to 1 over a band of headroom set by the profile (Performance 0.75–0.95,
   Balanced 0.65–0.90, LowPower 0.35–0.60, so a cooler profile reacts earlier). With pressure the engine sheds cores,
-  down to half, and paces tokens at up to twice their full-speed work time (learned while unslowed): the same tokens
+  down to half, and paces tokens at up to twice their full-speed work time (learned while unslowed; only from a
+  pressure of 0.1: below it a performance hint asking for the current pace kept the clocks there): the same tokens
   at lower clocks, for fewer watts. At pressure 1, at the profile's OS-status limit, above the skin threshold (40 °C
   by default) or with the SoC past its 95 °C emergency limit (on a smoothed reading: the hottest zone spikes by
   25–30 °C for single samples), it reroutes GPU work to the NPU/CPU, halves the active

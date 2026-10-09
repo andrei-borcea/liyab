@@ -241,6 +241,8 @@ TEST_CASE("Cooler profiles react earlier and slow tokens down before throttling"
     CHECK(p.pressure < 1e-3f);  // the start of Performance's band
     CHECK(p.slowdown == 1.0f);
 
+    CHECK(p.slowdown == 1.0f);  // no pacing at a sliver of pressure
+
     pm.set_profile(PowerProfile::Balanced);  // band 0.65-0.90: 40% of the way
     p = pm.policy();
     CHECK_NEAR(p.pressure, 0.4, 1e-3);

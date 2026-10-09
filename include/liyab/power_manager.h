@@ -129,6 +129,8 @@ private:
     // forecast and the status / temperature guards.
     // With a headroom forecast, the skin guard is an emergency this far above the threshold (°C).
     static constexpr float kSkinEmergencyMargin = 8.0f;
+    // Below this pressure tokens are not paced (no slowdown, no performance hint).
+    static constexpr float kPacingPressure = 0.1f;
     [[nodiscard]] float pressure_locked(const ThermalSample& sample) const;
 
     mutable std::mutex mutex_;

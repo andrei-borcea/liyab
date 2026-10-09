@@ -364,7 +364,11 @@ PowerPolicy PowerManager::policy() const {
 
     p.pressure = pressure_locked(sample_);
     p.thread_fraction = std::min(p.thread_fraction, 1.0f - 0.5f * p.pressure);  // shed up to half the cores
-    p.slowdown = 1.0f + p.pressure;  // up to twice the full-speed time per token
+    // Up to twice the full-speed time per token, from kPacingPressure on: at a
+    // pressure of 0.0001 (a charging phone resting at the band's start) the
+    // performance hint already asked for the current, slowest pace, and the
+    // governor held the clocks there, capping the app at ~6 tok/s.
+    p.slowdown = p.pressure >= kPacingPressure ? 1.0f + p.pressure : 1.0f;
     p.throttled = p.pressure >= 1.0f;
     if (p.throttled) {
         p.target_tps = p.target_tps > 0.0 ? p.target_tps * 0.5 : 8.0;
