@@ -183,6 +183,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->moe_expert_mass = d.moe_expert_mass;
     config->moe_max_experts = d.moe_max_experts;
     config->moe_skip_slow = d.moe_skip_slow;
+    config->prefix_cache_mb = d.prefix_cache_mb;
     config->early_exit = d.experimental.early_exit ? 1 : 0;
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
@@ -241,6 +242,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.experimental.tdss_force = config->tdss == 2;
         if (config->kv_dedup_dir != nullptr) c.experimental.kv_dedup_dir = config->kv_dedup_dir;
         c.moe_skip_slow = config->moe_skip_slow;
+        c.prefix_cache_mb = config->prefix_cache_mb;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

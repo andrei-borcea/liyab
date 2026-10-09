@@ -577,6 +577,14 @@ are called directly because the C API makes them thread-safe.
   of a second even inside a 1024-token pass; it never touches a generation). The engine keeps the work done (a
   hybrid model's state is snapshotted before each pass and an abandoned pass returns to it), so the request's
   prompt continues from it. Before, a message sent during a long preparation waited for all of it.
+* **Prefix cache across conversations.** With `prefix_cache_mb` (C ABI field of the same name, `liyab-cli
+  --prefix-cache MB`; the app uses 256 when its memory budget is at least 5 GB, taken out of that budget) a context
+  that a prompt from another conversation replaces (it shares less than half of it) is set aside in RAM as a
+  serialized state (KV pages and recurrent states; a hybrid model's at its pinned snapshot, the last prompt's end),
+  in an LRU of that size. A prompt that later continues one is restored from it, cut back to where the two diverge
+  (a reply sent back as text may encode differently from the tokens generated), instead of being processed again;
+  the output equals a fresh context's (tested on attention-only and hybrid models). On Qwen3.6-35B-A3B a
+  2000-token conversation costs ~85 MiB.
 * **Typing ahead.** While the user writes, the stable part of the draft (whole words, cut where its tokens are a
   prefix of the text so far, since a hybrid model's context is reused only up to the snapshot at the end of a
   prefill) is processed in the background, 0.6 s after the last keystroke, starting with the history. Sending then

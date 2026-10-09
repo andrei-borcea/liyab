@@ -97,6 +97,7 @@ typedef struct liyab_engine_config {
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
     const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
     float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy); 0 off */
+    int64_t prefix_cache_mb;      /* RAM for contexts other conversations replaced, restored when a prompt continues one; 0 off */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

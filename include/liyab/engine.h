@@ -82,6 +82,12 @@ struct EngineConfig {
     // router weight is below this share of the token's experts (the others
     // renormalized). Lossy, opt-in: cuts stalls on low-impact experts. 0: off.
     float moe_skip_slow = 0.0f;
+    // Prefix cache, MiB of RAM (0: off): contexts another conversation's
+    // prompt replaced are kept (KV pages and recurrent states, LRU) and
+    // restored when a prompt continues one, instead of processing it again.
+    // Taken out of memory_budget_mb. On Qwen3.6-35B-A3B a 2000-token
+    // conversation costs ~85 MiB.
+    int64_t prefix_cache_mb = 0;
     // Most drafts per speculative step (k). 3 by default: a verification pass
     // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
     int32_t draft_tokens = 3;

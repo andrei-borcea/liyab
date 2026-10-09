@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
         else if (arg == "--expert-mass") config.moe_expert_mass = static_cast<float>(std::atof(next()));
         else if (arg == "--experts") config.moe_max_experts = std::atoi(next());
         else if (arg == "--skip-slow") config.moe_skip_slow = static_cast<float>(std::atof(next()));
+        else if (arg == "--prefix-cache") config.prefix_cache_mb = std::atoll(next());
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;

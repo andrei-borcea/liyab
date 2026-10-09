@@ -220,6 +220,8 @@ public:
     // there (the caller takes one before a cancellable pass of a hybrid
     // model); without one, Unsupported and the context must be reset.
     Status abandon_pass();
+    // The position of the pinned state snapshot (the last prompt's end), or -1.
+    [[nodiscard]] int32_t pinned_snapshot() const noexcept;
     // The longest prefix of at most n positions truncate() accepts: n itself
     // for models without recurrent blocks, else the nearest checkpoint or
     // snapshot at or below n (0 if none).

@@ -1704,6 +1704,13 @@ Status Transformer::adopt_cached_prefix(int32_t n) {
     return Status::ok();
 }
 
+int32_t Transformer::pinned_snapshot() const noexcept {
+    for (const StateSnapshot& s : snapshots_) {
+        if (s.pinned) return s.pos;
+    }
+    return -1;
+}
+
 Status Transformer::abandon_pass() {
     if (!config_.hybrid()) return kv_->truncate(n_past_);
     const auto snap = std::find_if(snapshots_.begin(), snapshots_.end(),

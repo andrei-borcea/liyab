@@ -89,6 +89,8 @@ final class LiyabEngineConfig extends Struct {
   external Pointer<Utf8> kvDedupDir;
   @Float()
   external double moeSkipSlow;
+  @Int64()
+  external int prefixCacheMb;
 }
 
 final class LiyabSamplingParams extends Struct {

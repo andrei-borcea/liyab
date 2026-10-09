@@ -1514,6 +1514,47 @@ TEST_CASE("Context reuse: continuing a conversation or a prefill equals a fresh 
     CHECK(st3.cached_prefix_tokens <= 1);
 }
 
+TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        EngineConfig config = engine_config(model_path(std::string("prefix_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        config.prefix_cache_mb = 64;
+        auto cached = Engine::create(config);
+        config.prefix_cache_mb = 0;
+        auto fresh = Engine::create(config);
+        REQUIRE(cached.has_value() && fresh.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string a, b;
+        for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        Engine& e = *cached.value();
+        const std::string reply_a = run(e, a);
+        run(e, b);  // another conversation: A's context goes to the prefix cache
+        const std::string next_a = a + reply_a + " hello";
+        GenerationStats st{};
+        const std::string out = run(e, next_a, &st);
+        const auto a_tokens = static_cast<int32_t>(e.tokenize(a, true)->size());
+        // A's prompt but its last token, which decoding processes: a hybrid
+        // model's pinned snapshot sits there.
+        CHECK(st.cached_prefix_tokens >= a_tokens - 1);
+        CHECK(out == run(*fresh.value(), next_a));
+    }
+}
+
 TEST_CASE("A prefill cancelled mid-pass keeps its work and the output stays exact") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";

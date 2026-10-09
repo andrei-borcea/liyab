@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -62,8 +63,13 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
                                                 int32_t max_batch, bool repack_cpu) {
     LoaderOptions loader_options;
     loader_options.streaming = config.streaming;
+    // The prefix cache comes out of the memory budget (the expert cache gets the rest).
     loader_options.memory_budget_bytes =
-        config.memory_budget_mb > 0 ? static_cast<uint64_t>(config.memory_budget_mb) << 20 : 0;
+        config.memory_budget_mb > 0
+            ? static_cast<uint64_t>(std::max<int64_t>(config.memory_budget_mb - std::max<int64_t>(config.prefix_cache_mb, 0),
+                                                      config.memory_budget_mb / 2))
+                  << 20
+            : 0;
     auto file = MmapLoader::open(path, loader_options);
     if (!file) return file.status();
     TransformerOptions options;
@@ -142,6 +148,93 @@ struct Engine::Impl {
 
     // Keeps the longest usable prefix of `tokens` already in the context and
     // returns its length (at most `limit`); drops everything else.
+    // Prefix cache (EngineConfig::prefix_cache_mb): contexts set aside when
+    // a prompt from another conversation replaced them (the chat, the
+    // assistant sheet, a background agent, other apps through an API), kept
+    // as serialized states (KV pages and recurrent states) in an LRU of
+    // bounded size. A prompt that continues one of them restores it instead
+    // of processing it again. Only contexts the new prompt shares less than
+    // half of are set aside: edits within a conversation keep using the
+    // context's own snapshots.
+    struct PrefixEntry {
+        std::vector<int32_t> tokens;
+        std::string state;  // Transformer::write_state
+        uint64_t last_use = 0;
+    };
+    std::vector<PrefixEntry> prefix_cache;
+    size_t prefix_cache_budget = 0;
+    uint64_t prefix_clock = 0;
+    static constexpr size_t kMinPrefixEntry = 128;  // shorter contexts are cheaper to process again
+
+    size_t prefix_cache_bytes() const {
+        size_t bytes = 0;
+        for (const PrefixEntry& e : prefix_cache) bytes += e.state.size() + e.tokens.size() * sizeof(int32_t);
+        return bytes;
+    }
+
+    void stash_context() {
+        if (prefix_cache_budget == 0 || context.size() < kMinPrefixEntry) return;
+        // A hybrid model's recurrent state rewinds only to a snapshot: set the
+        // context aside at its pinned one (the last prompt's end, which that
+        // conversation's next prompt continues), dropping the reply after it.
+        if (target->config().hybrid()) {
+            const int32_t pinned = target->pinned_snapshot();
+            if (pinned >= static_cast<int32_t>(kMinPrefixEntry) && pinned < target->n_past() &&
+                target->truncate(pinned).is_ok()) {
+                context.resize(static_cast<size_t>(pinned));
+            }
+        }
+        std::erase_if(prefix_cache, [&](const PrefixEntry& e) {  // an older copy of the same conversation
+            return e.tokens.size() <= context.size() && std::equal(e.tokens.begin(), e.tokens.end(), context.begin());
+        });
+        std::ostringstream out;
+        if (!target->write_state(out).is_ok()) return;
+        prefix_cache.push_back({context, std::move(out).str(), ++prefix_clock});
+        while (prefix_cache_bytes() > prefix_cache_budget && !prefix_cache.empty()) {
+            const auto oldest = std::min_element(prefix_cache.begin(), prefix_cache.end(),
+                                                 [](const PrefixEntry& a, const PrefixEntry& b) { return a.last_use < b.last_use; });
+            prefix_cache.erase(oldest);
+        }
+    }
+
+    // Restores the cached context sharing the longest prefix with `tokens`
+    // (at most `limit` tokens of it) when that prefix is longer than `have`,
+    // cut back to where they diverge (a reply sent back as text may encode
+    // differently from the tokens generated); the tokens kept, or 0.
+    size_t restore_cached(std::span<const int32_t> tokens, size_t limit, size_t have) {
+        const PrefixEntry* best = nullptr;
+        size_t best_common = 0;
+        for (const PrefixEntry& e : prefix_cache) {
+            const size_t n = std::min({e.tokens.size(), tokens.size(), limit});
+            size_t common = 0;
+            while (common < n && e.tokens[common] == tokens[common]) ++common;
+            if (common > best_common) {
+                best = &e;
+                best_common = common;
+            }
+        }
+        if (best == nullptr || best_common <= have || best_common < kMinPrefixEntry) return 0;
+        std::istringstream in(best->state);
+        if (!target->read_state(in).is_ok()) {
+            target->reset();
+            return 0;
+        }
+        context = best->tokens;
+        context_text_valid = false;
+        prefix_cache.erase(prefix_cache.begin() + (best - prefix_cache.data()));  // it is the live context now
+        size_t keep = context.size();
+        if (best_common < keep) {
+            keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(best_common)));
+            if (keep == 0 || !target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+                clear_context();
+                return 0;
+            }
+            context.resize(keep);
+        }
+        LIYAB_LOG_INFO("prefix cache: restored %zu tokens", keep);
+        return keep;
+    }
+
     size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit) {
         if (draft || context.size() != static_cast<size_t>(target->n_past())) {
             clear_context();
@@ -151,6 +244,10 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
+        if (prefix_cache_budget > 0 && common < context.size() / 2) {
+            stash_context();
+            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
+        }
         // Attention-only models rewind to any position; hybrid ones to the
         // nearest recurrent-state checkpoint or snapshot below it.
         const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
@@ -544,6 +641,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 #endif
 
     impl->power = std::make_unique<PowerManager>(config.power);
+    impl->prefix_cache_budget = config.prefix_cache_mb > 0 ? static_cast<size_t>(config.prefix_cache_mb) << 20 : 0;
     impl->power->poll_once();
     if (config.thermal_polling) impl->power->start();
     const Route route = impl->normal_route();

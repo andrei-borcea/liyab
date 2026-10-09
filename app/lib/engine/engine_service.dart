@@ -386,7 +386,10 @@ void _worker(SendPort replies) {
               ..contextLength = m[4] as int
               ..powerProfile = m[8] as int
               ..skinThresholdC = m[5] as double
-              ..memoryBudgetMb = m[6] as int; // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
+              ..memoryBudgetMb = m[6] as int // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
+              // Contexts of other conversations (the sheet, an agent, the API) kept to come back to,
+              // out of the budget: worth it only when the budget leaves the expert cache room.
+              ..prefixCacheMb = (m[6] as int) >= 5000 ? 256 : 0;
             _applyExperimental(config.ref, m[7] as Map<String, Object?>, arena);
             final out = arena<Pointer<Void>>();
             final watch = Stopwatch()..start();
