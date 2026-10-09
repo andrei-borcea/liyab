@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/brand/liyab-mark.svg" width="112" alt="Liyab logo: two blades of flame around a core of light"></p>
 
-# Liyab — on-device LLM inference for Android and iOS
+# Liyab: Ignite your mobile silicon
 
 [![Platform](https://img.shields.io/badge/Platform-Android_%7C_iOS_%7C_macOS-brightgreen.svg)]()
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
