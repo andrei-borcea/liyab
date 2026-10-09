@@ -302,15 +302,38 @@ void PowerManager::set_profile(PowerProfile profile) {
     config_.profile = profile;
 }
 
+namespace {
+
+// What each profile trades: where on the headroom forecast the response
+// starts and reaches full strength, the token-rate cap (0: none), the share
+// of cores, and the OS status at which the OS itself limits us.
+struct ProfileTraits {
+    float ramp_start;
+    float ramp_end;
+    double cap_tps;
+    float thread_fraction;
+    ThermalStatus os_limit;
+};
+
+ProfileTraits traits(PowerProfile profile) {
+    switch (profile) {
+        case PowerProfile::Performance: return {0.75f, 0.95f, 0.0, 1.0f, ThermalStatus::Severe};
+        case PowerProfile::Balanced: return {0.55f, 0.80f, 12.0, 1.0f, ThermalStatus::Moderate};
+        case PowerProfile::LowPower: return {0.35f, 0.60f, 6.0, 0.5f, ThermalStatus::Light};
+    }
+    return {0.75f, 0.95f, 0.0, 1.0f, ThermalStatus::Severe};
+}
+
+}  // namespace
+
 float PowerManager::pressure_locked(const ThermalSample& s) const {
-    // The forecast ramps the response: nothing below 0.75, full at 0.95.
+    // The forecast ramps the response over the profile's band of headroom.
+    const ProfileTraits t = traits(config_.profile);
     float p = 0.0f;
-    if (headroom_ema_) p = std::clamp((*headroom_ema_ - 0.75f) / 0.20f, 0.0f, 1.0f);
+    if (headroom_ema_) p = std::clamp((*headroom_ema_ - t.ramp_start) / (t.ramp_end - t.ramp_start), 0.0f, 1.0f);
     // Guards: the status at which the OS itself limits us (per profile), the
     // skin threshold, and the SoC's emergency temperature.
-    ThermalStatus limit = ThermalStatus::Moderate;
-    if (config_.profile == PowerProfile::Performance) limit = ThermalStatus::Severe;
-    if (config_.profile == PowerProfile::LowPower) limit = ThermalStatus::Light;
+    const ThermalStatus limit = t.os_limit;
     if ((s.status != ThermalStatus::Unknown && s.status >= limit) || (s.skin_c && *s.skin_c >= config_.skin_threshold_c) ||
         (s.soc_c && *s.soc_c >= config_.soc_threshold_c)) {
         p = 1.0f;
@@ -321,15 +344,13 @@ float PowerManager::pressure_locked(const ThermalSample& s) const {
 PowerPolicy PowerManager::policy() const {
     std::lock_guard<std::mutex> lock(mutex_);
     PowerPolicy p;
-    switch (config_.profile) {
-        case PowerProfile::Performance: p.target_tps = 0.0; break;
-        case PowerProfile::Balanced: p.target_tps = 12.0; break;
-        case PowerProfile::LowPower: p.target_tps = 6.0; p.thread_fraction = 0.5f; break;
-    }
-    if (config_.target_tps > 0.0) p.target_tps = config_.target_tps;
+    const ProfileTraits t = traits(config_.profile);
+    p.target_tps = config_.target_tps > 0.0 ? config_.target_tps : t.cap_tps;
+    p.thread_fraction = t.thread_fraction;
 
     p.pressure = pressure_locked(sample_);
     p.thread_fraction = std::min(p.thread_fraction, 1.0f - 0.5f * p.pressure);  // shed up to half the cores
+    p.slowdown = 1.0f + p.pressure;  // up to twice the full-speed time per token
     p.throttled = p.pressure >= 1.0f;
     if (p.throttled) {
         p.target_tps = p.target_tps > 0.0 ? p.target_tps * 0.5 : 8.0;
@@ -344,15 +365,25 @@ PowerPolicy PowerManager::policy() const {
 
 std::chrono::microseconds PowerManager::pace_token() {
     using clock = std::chrono::steady_clock;
-    const double tps = policy().target_tps;
+    const PowerPolicy policy = this->policy();
     auto now = clock::now();
-    if (tps <= 0.0) {
+    // Full-speed work time per token, learned only while not slowed down: a
+    // slowed token takes longer at the lower clocks the hint lets the
+    // governor pick, and learning from it would slow the pace further.
+    if (has_work_start_ && policy.slowdown <= 1.0f) {
+        const double work = std::chrono::duration<double>(now - work_start_).count();
+        work_ema_s_ = work_ema_s_ > 0.0 ? 0.8 * work_ema_s_ + 0.2 * work : work;
+    }
+    double period_s = policy.target_tps > 0.0 ? 1.0 / policy.target_tps : 0.0;
+    if (policy.slowdown > 1.0f && work_ema_s_ > 0.0) period_s = std::max(period_s, work_ema_s_ * policy.slowdown);
+    if (period_s <= 0.0) {
         has_deadline_ = false;
-        has_work_start_ = false;
+        has_work_start_ = true;
+        work_start_ = now;
         hint_->close();  // full speed: no target to hint
         return std::chrono::microseconds(0);
     }
-    const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / tps));
+    const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(period_s));
     if (has_work_start_) {
         hint_->report(std::chrono::duration_cast<std::chrono::nanoseconds>(now - work_start_).count(),
                       std::chrono::duration_cast<std::chrono::nanoseconds>(period).count());
@@ -373,7 +404,7 @@ std::chrono::microseconds PowerManager::pace_token() {
 
 void PowerManager::reset_pacing() {
     has_deadline_ = false;
-    has_work_start_ = false;
+    has_work_start_ = false;  // the first token's work includes the prompt: not a per-token time
 }
 
 void PowerManager::set_hint_threads(std::vector<int32_t> thread_ids) {

@@ -124,14 +124,17 @@ This README describes what the code does today. Anything not implemented is list
 * **Power manager.** `pace_token()` caps output at the profile's rate (Balanced 12 tok/s, LowPower 6 tok/s) so the
   SoC idles between tokens. A polling thread reads, once a second, the OS thermal status (Android `AThermal_*`,
   Apple `NSProcessInfo.thermalState`), Android's thermal-headroom forecast 10 s ahead
-  (`AThermal_getThermalHeadroom`, Android 12+, smoothed) and the sysfs skin/SoC zones. The response is gradual:
-  below a forecast headroom of 0.75 nothing changes; from 0.75 to 0.95 the engine sheds cores, down to half; at
-  0.95 or above, at the profile's OS-status limit, above the skin threshold (40 °C by default) or with the SoC
-  past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the
-  token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and no longer throttles
-  by itself; the forecast decides. While pacing on Android 13+, the decode threads report each token's work time to
-  a performance-hint session (ADPF, `APerformanceHint_*`) with the token period as its target, so the CPU governor
-  runs just fast enough for the rate instead of sprinting and sleeping. Unpaced decoding opens no session.
+  (`AThermal_getThermalHeadroom`, Android 12+, smoothed) and the sysfs skin/SoC zones. The response is gradual: the
+  forecast becomes a pressure from 0 to 1 over a band of headroom set by the profile (Performance 0.75–0.95,
+  Balanced 0.55–0.80, LowPower 0.35–0.60, so a cooler profile reacts earlier). With pressure the engine sheds cores,
+  down to half, and paces tokens at up to twice their full-speed work time (learned while unslowed): the same tokens
+  at lower clocks, for fewer watts. At pressure 1, at the profile's OS-status limit, above the skin threshold (40 °C
+  by default) or with the SoC past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active
+  threads and halves the token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and
+  no longer throttles by itself; the forecast decides. While pacing on Android 13+, the decode threads report each
+  token's work time to a performance-hint session (ADPF, `APerformanceHint_*`) with the token period as its target,
+  so the CPU governor runs just fast enough for the rate instead of sprinting and sleeping. Unpaced decoding opens no
+  session. Without a forecast (iOS, older Android) the status and temperature guards apply.
 * **Speculative decoding.** A small draft model proposes *k* tokens, or, without one (`lookup_drafts`, `liyab-cli
   --lookup`), the tokens that followed the most recent earlier occurrence of the last 4..2 tokens in the
   conversation are proposed (no extra weights, any model). The target verifies them in one batched pass, reading
@@ -526,8 +529,9 @@ are called directly because the C API makes them thread-safe.
 * **Activity.** Live meters (tok/s, battery W, CPU %, storage MB/s, thermal status with Android's 10 s headroom
   forecast, J/token on battery) with two-minute sparklines, sampled once a second only while the app is in the
   foreground; plus the app's and the engine's log (`liyab_log_buffer_*`), copyable.
-* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit, memory budget and
-  idle release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
+* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, speed or coolness (Fastest,
+  Balanced by default, Coolest: the engine's power profiles, applied at once), thermal limit, memory budget and idle
+  release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
   storage and imports go through the system picker). **Experimental** exposes the engine's lossy, unfinished or
   measurement-only options, applied on the next load and listed in the Activity log: early exit, head pruning, EGLS
   FFN skipping, 2:4 sparse FFN (TDSS), the persistent prefix KV cache (KV dedup), lookup speculative decoding and its

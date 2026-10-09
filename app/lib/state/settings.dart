@@ -194,6 +194,13 @@ class DeviceSettings {
   int get releaseAfterMinutes => _prefs.getInt('release_after_min') ?? 5;
   set releaseAfterMinutes(int v) => _prefs.setInt('release_after_min', v);
 
+  /// How early the phone's heat slows the engine (LiyabPowerProfile): 0 Fastest
+  /// (only near the OS's own limit), 1 Balanced (default: paces tokens and lowers
+  /// clocks as heat builds, capped at reading speed), 2 Coolest (reacts earliest,
+  /// half the cores). Applied at once.
+  int get powerProfile => _prefs.getInt('power_profile') ?? 1;
+  set powerProfile(int v) => _prefs.setInt('power_profile', v);
+
   /// Experimental engine options (applied on the next load).
   ExperimentalSettings get experimental {
     final saved = _prefs.getString('experimental');

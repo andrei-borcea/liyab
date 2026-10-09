@@ -172,6 +172,28 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                   if (app.modelPath != null) app.load(app.modelPath!);
                 },
         ),
+        const SizedBox(height: 8),
+        Text('Speed or coolness'),
+        const SizedBox(height: 8),
+        SegmentedButton<int>(
+          segments: const [
+            ButtonSegment(value: 0, label: Text('Fastest')),
+            ButtonSegment(value: 1, label: Text('Balanced')),
+            ButtonSegment(value: 2, label: Text('Coolest')),
+          ],
+          selected: {app.device.powerProfile},
+          onSelectionChanged: (v) => setState(() => app.setPowerProfile(v.first)),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          const [
+            'Full speed; slows down only near Android\'s own heat limit.',
+            'Answers at reading speed or faster; as the phone warms up, tokens come a little slower at lower clocks.',
+            'Reacts to heat earliest, on half the cores: the phone stays cool, answers come slower.',
+          ][app.device.powerProfile.clamp(0, 2)],
+          style: muted,
+        ),
+        const SizedBox(height: 8),
         slider('Cool down above', app.device.thermalLimitC, 38, 60, 22, (v) => '${v.round()} °C',
             (v) => app.device.thermalLimitC = v.roundToDouble()),
         slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048, 12288, 40,

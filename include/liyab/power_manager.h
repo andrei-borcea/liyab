@@ -9,13 +9,17 @@
 //   thermal zones (skin and SoC temperatures, where the sandbox allows it).
 // * Thermal control: the main input is the OS's thermal-headroom forecast
 //   (Android AThermal_getThermalHeadroom, 10 s ahead; 1.0 = severe
-//   throttling), smoothed. Below 0.75 nothing changes; from 0.75 to 0.95 the
-//   engine sheds cores gradually (down to half); near 1.0, or at the OS's own
-//   limiting status, above the skin threshold, or with the SoC past its
-//   emergency temperature, policy() reports throttled: work moves off the GPU,
-//   half the cores, and the token rate is capped. A gradual response keeps a
-//   hot but stable phone at full speed, where an on/off threshold on SoC
-//   temperature (85 °C, ordinary for a flagship SoC under load) halved it.
+//   throttling), smoothed, turned into a pressure from 0 to 1 over a band of
+//   headroom that depends on the profile: Performance 0.75-0.95, Balanced
+//   0.55-0.80, LowPower 0.35-0.60 (a cooler profile reacts earlier). With
+//   pressure the engine sheds cores (down to half) and paces tokens at up to
+//   twice their full-speed work time, which the performance hint (ADPF) turns
+//   into lower clocks: the same tokens for fewer watts, instead of racing and
+//   then halving. At pressure 1, at the OS's own limiting status, above the
+//   skin threshold, or with the SoC past its emergency temperature, policy()
+//   reports throttled: work moves off the GPU, half the cores, and the token
+//   rate is capped. Devices without a forecast (iOS, older Android) use the
+//   status and temperature guards only.
 #ifndef LIYAB_POWER_MANAGER_H
 #define LIYAB_POWER_MANAGER_H
 
@@ -75,6 +79,10 @@ struct PowerPolicy {
     bool throttled = false;        // route GPU work away and shed cores
     float thread_fraction = 1.0f;  // share of the thread pool to use
     float pressure = 0.0f;         // thermal pressure, 0 none .. 1 throttled
+    // >= 1: tokens are paced to this multiple of their full-speed work time
+    // (1 + pressure), so under thermal pressure the performance hint lets the
+    // governor lower clocks: the same tokens, more slowly, for fewer watts.
+    float slowdown = 1.0f;
 };
 
 class LIYAB_API PowerManager {
@@ -135,6 +143,7 @@ private:
     std::chrono::steady_clock::time_point deadline_{};
     bool has_work_start_ = false;
     std::chrono::steady_clock::time_point work_start_{};  // when the current token's work began
+    double work_ema_s_ = 0.0;  // full-speed work time per token (seconds), see pace_token()
     std::unique_ptr<HintSession> hint_;
 };
 

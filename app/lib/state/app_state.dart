@@ -285,6 +285,7 @@ class AppState extends ChangeNotifier {
         contextLength: ModelSettings.contextFor(prefs, name),
         skinThresholdC: device.thermalLimitC,
         memoryBudgetMb: device.memoryBudgetMb,
+        powerProfile: device.powerProfile,
         experimental: {
           ...experimental.toJson(),
           if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,
@@ -633,6 +634,13 @@ class AppState extends ChangeNotifier {
   }
 
   void stop() => engine.cancel();
+
+  /// Saves the power profile and applies it to the loaded model at once.
+  void setPowerProfile(int profile) {
+    device.powerProfile = profile;
+    engine.setPowerProfile(profile);
+    notifyListeners();
+  }
 
   /// Starts a new conversation (the engine keeps the system prompt's context).
   void newChat() {

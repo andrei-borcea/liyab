@@ -22,6 +22,7 @@ class LoadOptions {
     this.contextLength = 4096,
     this.skinThresholdC = 50,
     this.memoryBudgetMb = 5500,
+    this.powerProfile = LiyabPowerProfile.balanced,
     this.experimental = const {},
   });
 
@@ -30,6 +31,9 @@ class LoadOptions {
   final int contextLength;
   final double skinThresholdC;
   final int memoryBudgetMb;
+
+  /// LiyabPowerProfile: how early heat slows the engine down (Performance: near the OS's limit).
+  final int powerProfile;
 
   /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson (plus 'kvDedupDir');
   /// absent keys keep the engine's defaults.
@@ -184,7 +188,7 @@ class EngineService {
   Future<LoadedModel> load(LoadOptions o) async {
     _engine = 0;
     final r = await _call<List<Object?>>(
-        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental]);
+        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile]);
     _engine = r[0] as int;
     return LoadedModel(
         description: r[1] as String,
@@ -222,6 +226,11 @@ class EngineService {
     _streams[id] = controller;
     _commands.send(['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens]);
     return controller.stream;
+  }
+
+  /// Changes the power profile at once, even during a generation (thread-safe; no queueing).
+  void setPowerProfile(int profile) {
+    if (_engine != 0) LiyabLib.instance.setPowerProfile(Pointer<Void>.fromAddress(_engine), profile);
   }
 
   /// Stops the running generation at the next token (thread-safe; no queueing).
@@ -276,7 +285,7 @@ void _worker(SendPort replies) {
               ..modelPath = (m[2] as String).toNativeUtf8(allocator: arena)
               ..backend = m[3] as int
               ..contextLength = m[4] as int
-              ..powerProfile = LiyabPowerProfile.performance // a chat wants full speed; the thermal guard still applies
+              ..powerProfile = m[8] as int
               ..skinThresholdC = m[5] as double
               ..memoryBudgetMb = m[6] as int; // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
             _applyExperimental(config.ref, m[7] as Map<String, Object?>, arena);

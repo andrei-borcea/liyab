@@ -209,6 +209,31 @@ TEST_CASE("PowerManager sheds cores gradually on the headroom forecast") {
     CHECK(pm.policy().throttled);
 }
 
+TEST_CASE("Cooler profiles react earlier and slow tokens down before throttling") {
+    ThermalSample sample;
+    PowerConfig config;
+    config.profile = PowerProfile::Performance;
+    PowerManager pm(config, [&] { return sample; });
+    sample.headroom = 0.65f;
+    for (int i = 0; i < 40; ++i) pm.poll_once();
+    PowerPolicy p = pm.policy();
+    CHECK(p.pressure == 0.0f);  // below Performance's band
+    CHECK(p.slowdown == 1.0f);
+
+    pm.set_profile(PowerProfile::Balanced);  // band 0.55-0.80: 40% of the way
+    p = pm.policy();
+    CHECK_NEAR(p.pressure, 0.4, 1e-3);
+    CHECK_NEAR(p.slowdown, 1.4, 1e-3);
+    CHECK_NEAR(p.thread_fraction, 0.8, 1e-3);
+    CHECK(!p.throttled);
+
+    pm.set_profile(PowerProfile::LowPower);  // band 0.35-0.60: past its end
+    p = pm.policy();
+    CHECK(p.throttled);
+    CHECK_NEAR(p.slowdown, 2.0, 1e-6);
+    CHECK_NEAR(p.target_tps, 3.0, 1e-9);  // its 6 tok/s cap, halved
+}
+
 TEST_CASE("PowerManager polling thread samples the sensor") {
     std::atomic<int> calls{0};
     PowerConfig config;

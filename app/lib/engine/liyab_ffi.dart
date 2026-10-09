@@ -217,6 +217,8 @@ final class LiyabLib {
         tokenize = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32, Pointer<Int32>, Int32),
             int Function(Pointer<Void>, Pointer<Utf8>, int, Pointer<Int32>, int)>('liyab_engine_tokenize'),
         cancel = lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('liyab_engine_cancel'),
+        setPowerProfile = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32), int Function(Pointer<Void>, int)>(
+            'liyab_engine_set_power_profile'),
         describe = lib.lookupFunction<Size Function(Pointer<Void>, Pointer<Utf8>, Size),
             int Function(Pointer<Void>, Pointer<Utf8>, int)>('liyab_engine_describe'),
         metadata = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
@@ -257,6 +259,7 @@ final class LiyabLib {
       Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<Void>, Pointer<LiyabGenerationStats>) generate;
   final int Function(Pointer<Void>, Pointer<Utf8>, int, Pointer<Int32>, int) tokenize;
   final void Function(Pointer<Void>) cancel;
+  final int Function(Pointer<Void>, int) setPowerProfile;
   final int Function(Pointer<Void>, Pointer<Utf8>, int) describe;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int) metadata;
   final int Function(Pointer<Utf8>, int) describeDevice;
