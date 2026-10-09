@@ -1063,6 +1063,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
     std::vector<int32_t> picks;
+    std::vector<int32_t> best_rank(E, -1);
     const bool cut = expert_mass_ < 1.0f || (max_experts_ > 0 && max_experts_ < c.n_expert_used);
     std::vector<float> probs(cut ? E : 0);
     for (size_t t = 0; t < un; ++t) {
@@ -1085,12 +1086,28 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
             }
             kept = experts_to_run(probs, order, sum);
         }
-        picks.insert(picks.end(), order.begin(), order.begin() + static_cast<std::ptrdiff_t>(kept));
+        for (size_t r = 0; r < kept; ++r) {
+            int32_t& best = best_rank[static_cast<size_t>(order[r])];
+            if (best < 0 || static_cast<int32_t>(r) < best) best = static_cast<int32_t>(r);
+        }
     }
-    std::sort(picks.begin(), picks.end());
-    picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
-    expert_store_->prefetch(layer, picks, true);
-    predicted_ = std::move(picks);
+    if (rank_guessed_.size() != static_cast<size_t>(c.n_expert_used)) {
+        rank_guessed_.assign(static_cast<size_t>(c.n_expert_used), 0.0);
+        rank_used_.assign(static_cast<size_t>(c.n_expert_used), 0.0);
+    }
+    guesses_.clear();
+    std::vector<int32_t> prefetched;
+    for (size_t e = 0; e < E; ++e) {
+        const int32_t r = best_rank[e];
+        if (r < 0) continue;
+        guesses_.push_back({static_cast<int32_t>(e), r});
+        picks.push_back(static_cast<int32_t>(e));
+        // Laplace-smoothed precision of the rank: every rank starts as worth prefetching (2/3).
+        const auto ur = static_cast<size_t>(r);
+        if ((rank_used_[ur] + 2.0) / (rank_guessed_[ur] + 3.0) > 0.5) prefetched.push_back(static_cast<int32_t>(e));
+    }
+    expert_store_->prefetch(layer, prefetched, true);
+    predicted_ = std::move(picks);  // sorted: built in expert order
     predicted_layer_ = layer;
 }
 
@@ -1203,6 +1220,16 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             for (size_t i = 0, j = 0; i < predicted_.size() && j < chosen.size();) {
                 if (predicted_[i] == chosen[j]) ++predictions_.used;
                 if (predicted_[i] <= chosen[j]) ++i; else ++j;
+            }
+            // Per-rank precision, decayed so it follows the conversation.
+            for (const Guess& g : guesses_) {
+                const auto r = static_cast<size_t>(g.rank);
+                rank_guessed_[r] += 1.0;
+                if (std::binary_search(chosen.begin(), chosen.end(), g.expert)) rank_used_[r] += 1.0;
+                if (rank_guessed_[r] > 2048.0) {
+                    rank_guessed_[r] *= 0.5;
+                    rank_used_[r] *= 0.5;
+                }
             }
             predicted_layer_ = -1;
         }

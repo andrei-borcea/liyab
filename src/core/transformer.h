@@ -352,6 +352,17 @@ private:
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;
+    // Prefetch by confidence: every guess of block predicted_layer_ with its
+    // best rank among the tokens' top-k, and per rank how often a guess was
+    // then chosen. A rank is prefetched only while its guesses are right more
+    // often than not: a right guess saves one read's wait, a wrong one costs
+    // one read (flash time and energy) and evicts a cached expert.
+    struct Guess {
+        int32_t expert;
+        int32_t rank;
+    };
+    std::vector<Guess> guesses_;
+    std::vector<double> rank_guessed_, rank_used_;  // decayed counts per rank
     float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
     int32_t max_experts_ = 0;           // TransformerOptions::max_experts
     std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
