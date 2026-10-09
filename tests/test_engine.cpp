@@ -1349,6 +1349,42 @@ TEST_CASE("Streamed experts repacked on read (CPU i8mm): close to in-place exper
     }
 }
 
+// Decode-time attention at a long context with Qwen3.6's attention shape (16
+// query heads, 2 KV heads of 256): set LIYAB_BENCH_ATTENTION=1 to time it.
+TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
+    if (std::getenv("LIYAB_BENCH_ATTENTION") == nullptr) return;
+    test::TinyModelSpec spec;
+    spec.arch = "qwen3";
+    spec.n_layers = 1;
+    spec.n_embd = 4096;
+    spec.n_ff = 64;
+    spec.n_head = 16;
+    spec.n_head_kv = 2;
+    spec.context_length = 4096;
+    const std::string& path = model_path("attention_bench", spec);
+    ThreadPool pool(0);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    TransformerOptions options;
+    options.context_length = 4096;
+    auto model = load_transformer(path, options);
+    REQUIRE(model != nullptr);
+    std::vector<int32_t> prompt;
+    for (int32_t i = 0; i < 3000; ++i) prompt.push_back(3 + (i * 37) % 250);
+    for (size_t i = 0; i < prompt.size(); i += 512) {
+        const std::span<const int32_t> part(prompt.data() + i, std::min<size_t>(512, prompt.size() - i));
+        REQUIRE(model->forward(part, Transformer::Logits::None, route, pool).has_value());
+    }
+    const double before = model->phase_times().attention;
+    const int steps = 20;
+    for (int i = 0; i < steps; ++i) {
+        const int32_t t = 3 + i;
+        REQUIRE(model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool).has_value());
+    }
+    std::printf("  attention (projections included) at 3000 positions: %.2f ms per token per layer\n",
+                (model->phase_times().attention - before) / steps);
+}
+
 TEST_CASE("Repacked weights (CPU i8mm): same logits, batch-size independent") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");
