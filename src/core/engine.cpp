@@ -428,9 +428,11 @@ struct Engine::Impl {
     // union of the experts its tokens choose, and 64 tokens already choose
     // most of them: Qwen3.6-35B-A3B prefilled 1700 tokens in 180 s in passes
     // of 64, rereading nearly every expert from storage 27 times. Passes of
-    // kStreamedPrefillChunk read each expert once per 512 tokens (activations:
-    // ~0.25 MiB per token). Other models keep max_batch passes.
-    static constexpr int32_t kStreamedPrefillChunk = 512;
+    // kStreamedPrefillChunk read each expert once per 1024 tokens: a 706-token
+    // prompt read 26 MiB per token instead of 36 with passes of 512 and 70
+    // with 64, for 81 MiB more peak memory than 512. Other models keep
+    // max_batch passes.
+    static constexpr int32_t kStreamedPrefillChunk = 1024;
     [[nodiscard]] int32_t prefill_chunk() const {
         return target->expert_store() != nullptr ? std::max(target->max_batch(), kStreamedPrefillChunk)
                                                  : target->max_batch();

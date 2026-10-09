@@ -386,8 +386,10 @@ only the top experts covering a fraction P of the router weight (lossy, see belo
 waiting for its read when, for every token using it, its router weight is below a share W of the token's experts
 (the others renormalized; lossy, in the app's Experimental section); with streamed experts every Q4_K / Q5_K /
 Q6_K / Q8_0 expert matrix is rearranged on the I/O thread into the CPU's i8mm layout as it arrives (lossless, same
-size), so prefill multiplies it by many tokens at once, and prefill runs in passes of 512 tokens (each reads the
-union of its tokens' experts once: 35 instead of 70 MiB per token on a 706-token prompt with Qwen3.6-35B-A3B); and
+size; only experts read for a multi-token pass, since on a decode miss the rearrangement only delayed the read), so
+prefill multiplies it by many tokens at once (a 706-token prompt 9% faster), and prefill runs in passes of 1024
+tokens (each reads the union of its tokens' experts once: 26 instead of 70 MiB per token on that prompt with
+Qwen3.6-35B-A3B, for 81 MiB more peak memory than passes of 512); and
 `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
