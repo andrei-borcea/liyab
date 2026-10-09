@@ -68,6 +68,27 @@ class ChatMessage {
   }
 
   bool get thinkingNow => streaming && reasoning != null && !raw.contains('</think>');
+
+  /// A finished message as saved with its conversation (stats are not kept).
+  Map<String, Object?> toJson() => {
+        'user': user,
+        'promptUser': promptUser,
+        'prefix': prefix,
+        'raw': raw,
+        'done': done,
+        'steps': [for (final s in steps) [s.label, s.summary]],
+        if (error != null) 'error': error,
+      };
+
+  factory ChatMessage.fromJson(Map<String, Object?> o) => ChatMessage(o['user'] as String, o['prefix'] as String,
+      promptUser: o['promptUser'] as String?)
+    ..raw = o['raw'] as String? ?? ''
+    ..done = o['done'] as String? ?? ''
+    ..steps.addAll([
+      for (final s in (o['steps'] as List<Object?>? ?? const []).cast<List<Object?>>()) ToolStep('${s[0]}', '${s[1]}')
+    ])
+    ..error = o['error'] as String?
+    ..streaming = false;
 }
 
 /// One line of the activity log.
@@ -93,56 +114,53 @@ class AppState extends ChangeNotifier {
         _backOnScreen();
       } else if ((state == AppLifecycleState.hidden || state == AppLifecycleState.detached) && !_away) {
         _away = true;
-        _scheduleRelease();
+        _leftScreen();
       }
     });
   }
 
-  // Idle release: a loaded model holds its memory (GBs) while Liyab sits in
-  // the background, and the process outlives the window (the notification
-  // listener keeps it). After a minute hidden the expert cache is emptied
-  // (2.4 GB on a 35B MoE; the model stays loaded, so the assistant answers at
-  // once, only its first tokens are slower); after device.releaseAfterMinutes
-  // the model is unloaded, and loads again, chat kept, once Liyab is back.
+  // Leaving the screen. HyperOS stops a background app that holds several GB
+  // within a minute (kill_bg_proc), and the process outlives the window anyway
+  // (the notification listener keeps it), so the moment Liyab is hidden it
+  // parks: the expert cache is emptied (2.4 GB on a 35B MoE; the model stays
+  // loaded and answers at once, its first tokens a little slower) and the
+  // conversation is saved, messages and context, so a stopped process loses
+  // nothing. After device.releaseAfterMinutes the model is unloaded too; it
+  // loads again, chat kept, once Liyab is back.
   late final AppLifecycleListener _lifecycle;
-  bool _away = false; // off screen since the timers were started
-  Timer? _trimTimer;
+  bool _away = false; // off screen since the last park
+  Timer? _parkRetry;
   Timer? _releaseTimer;
   String? _released; // the model unloaded while idle
 
-  static const _trimAfter = Duration(minutes: 1);
-
-  void _scheduleRelease() {
-    _trimTimer?.cancel();
+  void _leftScreen() {
     _releaseTimer?.cancel();
-    _trimTimer = Timer(_trimAfter, _trimIdle);
+    unawaited(_park());
     final minutes = device.releaseAfterMinutes;
     if (minutes > 0) _releaseTimer = Timer(Duration(minutes: minutes), _releaseIdle);
   }
 
-  Future<void> _trimIdle() async {
-    if (!engine.loaded) return;
+  Future<void> _park() async {
+    _parkRetry?.cancel();
+    if (!_away || !engine.loaded) return;
     if (generating || loading) {
-      _trimTimer = Timer(_trimAfter, _trimIdle); // busy: try again later
+      _parkRetry = Timer(const Duration(seconds: 5), _park); // a reply still finishing: soon after
       return;
     }
     final bytes = await engine.trimMemory();
     if (bytes > 0) _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in the background');
+    await _saveConversation();
   }
 
   Future<void> _releaseIdle() async {
     final path = modelPath;
     if (path == null || _released != null) return;
-    if (generating || loading || moving != null) return _scheduleRelease(); // busy: try again later
-    _released = path; // set first: coming back during the unload reloads it (commands run in order)
-    if (messages.isNotEmpty) {
-      // The conversation's context, so the reload continues it instead of processing the chat again.
-      try {
-        await engine.saveState(await _conversationFile());
-      } on EngineException catch (e) {
-        _log('Conversation not saved: $e');
-      }
+    if (generating || loading || moving != null) {
+      _releaseTimer = Timer(const Duration(minutes: 1), _releaseIdle); // busy: try again later
+      return;
     }
+    _released = path; // set first: coming back during the unload reloads it (commands run in order)
+    await _saveConversation();
     _prepared = null;
     await engine.unload();
     if (_released != path) return; // back on screen meanwhile: already reloading
@@ -154,15 +172,14 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _lifecycle.dispose();
-    _trimTimer?.cancel();
+    _parkRetry?.cancel();
     _releaseTimer?.cancel();
     super.dispose();
   }
 
   void _backOnScreen() {
-    _trimTimer?.cancel();
+    _parkRetry?.cancel();
     _releaseTimer?.cancel();
-    _trimTimer = _releaseTimer = null;
     _away = false;
     final path = _released;
     _released = null;
@@ -208,7 +225,8 @@ class AppState extends ChangeNotifier {
     final state = AppState._(
         await EngineService.start(), await SharedPreferences.getInstance(), await Downloads.start());
     final last = state.device.lastModel;
-    if (last != null && File(last).existsSync()) unawaited(state.load(last));
+    // keepChat: the last conversation comes back if the OS stopped Liyab.
+    if (last != null && File(last).existsSync()) unawaited(state.load(last, keepChat: true));
     return state;
   }
 
@@ -294,44 +312,66 @@ class AppState extends ChangeNotifier {
   /// costs its own tokens (the engine keeps that context and a snapshot of it).
   String? _prepared; // the system block the engine last processed
 
-  /// Where the processed system block of this model is kept: one file per
-  /// model, named with the block's hash (a changed prompt or tool list is a
-  /// different file; the older one is deleted).
   /// The context being prepared after a load (system prompt or saved conversation).
   Future<void>? _preparing;
 
-  /// Where the conversation's context is kept while its model is unloaded for being idle.
-  Future<String> _conversationFile() async {
+  /// Where this model's conversation is kept: the engine's context and the messages.
+  Future<(String, String)> _conversationFiles() async {
     final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
     if (!dir.existsSync()) dir.createSync(recursive: true);
-    return '${dir.path}/$modelName.conversation.state';
+    return ('${dir.path}/$modelName.conversation.state', '${dir.path}/$modelName.conversation.json');
+  }
+
+  /// Saves the conversation (removes it when there is none). Between generations only.
+  Future<void> _saveConversation() async {
+    final (state, chat) = await _conversationFiles();
+    if (messages.isEmpty) return _discardConversation();
+    try {
+      await engine.saveState(state);
+      await File(chat).writeAsString(jsonEncode([for (final m in messages) m.toJson()]));
+    } on EngineException catch (e) {
+      _log('Conversation not saved: $e');
+    }
   }
 
   Future<void> _discardConversation() async {
-    final file = File(await _conversationFile());
-    if (file.existsSync()) file.deleteSync();
+    final (state, chat) = await _conversationFiles();
+    for (final path in [state, chat]) {
+      if (File(path).existsSync()) File(path).deleteSync();
+    }
   }
 
-  /// After an idle reload: the conversation's saved context (system prompt
-  /// included), else the system prompt alone. The file is used once.
+  /// When a load keeps the chat (back from an idle unload, or a restart after
+  /// the OS stopped Liyab): the saved messages if none are shown, and the
+  /// conversation's context (system prompt included), else the system prompt alone.
   Future<void> _restoreConversation() async {
-    final file = File(await _conversationFile());
-    if (file.existsSync()) {
+    final (state, chat) = await _conversationFiles();
+    if (messages.isEmpty && File(chat).existsSync()) {
+      try {
+        final list = jsonDecode(await File(chat).readAsString()) as List<Object?>;
+        messages.addAll([for (final o in list) ChatMessage.fromJson(o as Map<String, Object?>)]);
+        notifyListeners();
+      } on Object catch (e) {
+        _log('Saved conversation not readable ($e)');
+      }
+    }
+    if (messages.isNotEmpty && File(state).existsSync()) {
       final watch = Stopwatch()..start();
       try {
-        final n = await engine.loadState(file.path);
+        final n = await engine.loadState(state);
         _prepared = await _systemBlock(); // the conversation starts with it
-        _log('Conversation restored ($n tokens) in ${watch.elapsedMilliseconds} ms');
+        _log('Conversation restored (${messages.length} messages, $n tokens) in ${watch.elapsedMilliseconds} ms');
         return;
       } on EngineException catch (e) {
-        _log('Saved conversation not usable ($e)');
-      } finally {
-        file.deleteSync();
+        _log('Saved context not usable ($e)');
       }
     }
     await prepareSystemPrompt();
   }
 
+  /// Where the processed system block of this model is kept: one file per
+  /// model, named with the block's hash (a changed prompt or tool list is a
+  /// different file; the older one is deleted).
   Future<(Directory, String)> _stateFile(String block) async {
     final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
     if (!dir.existsSync()) dir.createSync(recursive: true);
@@ -514,6 +554,7 @@ class AppState extends ChangeNotifier {
   void newChat() {
     if (generating) return;
     messages.clear();
+    unawaited(_discardConversation());
     notifyListeners();
   }
 

@@ -1,6 +1,9 @@
 // Tool calling: the dialects' parsing, and replies with tool steps replayed exactly.
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liyab/agent/tool_format.dart';
+import 'package:liyab/agent/tools.dart';
 import 'package:liyab/chat/chat_template.dart';
 import 'package:liyab/state/app_state.dart';
 
@@ -47,5 +50,19 @@ void main() {
 
   test('the time line names the day, date, time and offset', () {
     expect(AppState.nowLine(DateTime(2026, 10, 9, 13, 5)), startsWith('[Now: Friday 9 October 2026, 13:05, UTC'));
+  });
+
+  test('a saved message comes back as the model saw it', () {
+    final m = ChatMessage('What do I have today?', '<think>\n\n</think>\n\n', promptUser: 'What do I have today?\n\n[Now: …]')
+      ..done = 'call<tool_response>{}</tool_response>'
+      ..raw = 'Nothing today.'
+      ..streaming = false;
+    m.steps.add(const ToolStep('Read your calendar', 'No events'));
+    final back = ChatMessage.fromJson(jsonDecode(jsonEncode(m.toJson())) as Map<String, Object?>);
+    expect(back.exact, m.exact);
+    expect(back.promptUser, m.promptUser);
+    expect(back.answer, 'Nothing today.');
+    expect(back.steps.single.summary, 'No events');
+    expect(back.streaming, isFalse);
   });
 }

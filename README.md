@@ -523,15 +523,17 @@ are called directly because the C API makes them thread-safe.
 * **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit, memory budget and
   idle release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
   storage and imports go through the system picker).
-* **Idle release.** A loaded model keeps several GB while Liyab sits in the background, and the process outlives
-  its window (the notification listener keeps it running). After a minute hidden the expert cache is emptied
-  (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the default budget; the model stays loaded, so the assistant still
-  answers at once). After 5 minutes hidden (1, 15, 60 minutes or never in Settings) the conversation's context is
-  saved (`save_state`) and the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
-  with the chat kept and the conversation's context restored, so the next message is not preceded by the whole chat
-  being processed again. A message sent meanwhile shows at once and waits for the model, and while it loads the
-  flame burns in the middle of the conversation ("Waking up") so the wait is never mistaken for a hang. App events (loads,
-  restores, trims; never message text or tool arguments) also go to logcat (`adb logcat -s flutter`).
+* **Leaving the screen.** HyperOS stops a background app that holds several GB within a minute
+  (`kill_bg_proc`), and the process outlives its window anyway (the notification listener keeps it running). So the
+  moment Liyab is hidden it parks: the expert cache is emptied (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the
+  default budget; the model stays loaded and answers at once) and the conversation is saved in app storage, its
+  messages and the engine's context (`save_state`). If the OS stops Liyab anyway, the next start brings the
+  conversation back, context included, so it is not processed again. After 5 minutes hidden (1, 15, 60 minutes or
+  never in Settings) the model is unloaded as well; it loads again as soon as Liyab is on screen, the app or the
+  assistant sheet. A message sent meanwhile shows at once and waits for the model, and while it loads the flame
+  burns in the middle of the conversation ("Waking up"). A new chat or another model deletes the saved
+  conversation. App events (loads, restores, trims; never message text or tool arguments) also go to logcat
+  (`adb logcat -s flutter`).
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal
   headroom (cool with headroom, hot near throttling). It redraws about 24 times a second at rest and 30 while the
