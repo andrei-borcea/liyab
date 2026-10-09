@@ -68,7 +68,7 @@ echo "==> NDK:   $NDK"
 echo "==> ABI:   $ABI (API $API, $BUILD_TYPE)"
 echo "==> Flags: vulkan=$VULKAN qnn=$QNN neuropilot=$NEUROPILOT tests=$TESTS experimental=$EXPERIMENTAL"
 
-cmake -S "$ROOT" -B "$BUILD_DIR" "${GENERATOR[@]}" \
+cmake -S "$ROOT" -B "$BUILD_DIR" ${GENERATOR[@]+"${GENERATOR[@]}"} \
   -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
   -DANDROID_ABI="$ABI" \
   -DANDROID_PLATFORM="android-$API" \
