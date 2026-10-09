@@ -147,6 +147,7 @@ typedef struct liyab_generation_stats {
     /* MoE expert prediction (one block ahead): precision = used / predicted */
     int32_t expert_predicted;     /* experts guessed ahead of the router, cached ones included */
     int32_t expert_predicted_used; /* guesses the router then chose */
+    int32_t expert_dropped;       /* wrong guesses removed from the read queue before being read */
 } liyab_generation_stats;
 
 /*

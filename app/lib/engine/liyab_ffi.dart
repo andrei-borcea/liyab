@@ -175,6 +175,8 @@ final class LiyabGenerationStats extends Struct {
   external int expertPredicted;
   @Int32()
   external int expertPredictedUsed;
+  @Int32()
+  external int expertDropped;
 }
 
 final class LiyabEngineCounters extends Struct {

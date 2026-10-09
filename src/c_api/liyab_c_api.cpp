@@ -86,7 +86,8 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.decode_phases.dense_ffn_ms,
                                         s.decode_phases.lm_head_ms,
                                         s.expert_predicted,
-                                        s.expert_predicted_used};
+                                        s.expert_predicted_used,
+                                        s.expert_dropped};
     }
     return LIYAB_OK;
 }

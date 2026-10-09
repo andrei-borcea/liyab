@@ -373,7 +373,9 @@ only the top experts covering a fraction P of the router weight (lossy, see belo
 `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
-`expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), plus where decode
+`expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), `expert_dropped`
+(wrong guesses removed from the read queue once their block's router chose: those already read become the next to
+evict, instead of keeping their prefetch bonus), plus where decode
 time went: `attention_ms`, `delta_net_ms`, `router_ms`, `experts_ms`, `shared_expert_ms`, `dense_ffn_ms` and `lm_head_ms` (C++:
 `GenerationStats::decode_phases`; `liyab-cli` prints them per token).
 `liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU
