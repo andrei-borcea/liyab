@@ -1,10 +1,11 @@
 // The conversation: the living flame at rest in an empty chat, then the
-// messages; a composer whose edge glows while the model works.
+// messages; a composer with the flame's lit edge while the model works.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../state/app_state.dart';
 import '../ui/app_drawer.dart';
+import '../ui/ember_edge.dart';
 import '../ui/living_flame.dart';
 import '../ui/waking_up.dart';
 import '../ui/theme.dart';
@@ -167,6 +168,8 @@ class _ChatScreenState extends State<ChatScreen> {
             generating: app.generating,
             onSend: _send,
             onStop: app.stop,
+            flameState: _flameState,
+            heat: _heat,
           ),
         ],
       ),
@@ -431,8 +434,12 @@ class _Composer extends StatelessWidget {
     required this.generating,
     required this.onSend,
     required this.onStop,
+    required this.flameState,
+    required this.heat,
   });
 
+  final FlameState flameState;
+  final double heat;
   final TextEditingController controller;
   final FocusNode focus;
   final bool enabled;
@@ -443,55 +450,53 @@ class _Composer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // While the model works the composer's edge takes the flame's colour,
-    // with a soft halo around the bar itself.
-    const ember = Color(0xFFFF7A3D);
+    // While the model works the bar has the assistant sheet's lit edge.
     return SafeArea(
       top: false,
       minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 500),
-        curve: Curves.easeOut,
-        padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(28),
-          border: Border.all(color: generating ? ember.withValues(alpha: 0.55) : theme.colorScheme.outline),
-          boxShadow: [
-            BoxShadow(color: ember.withValues(alpha: generating ? 0.22 : 0), blurRadius: 22, spreadRadius: -2),
-          ],
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                focusNode: focus,
-                enabled: enabled,
-                minLines: 1,
-                maxLines: 6,
-                textCapitalization: TextCapitalization.sentences,
-                style: theme.textTheme.bodyLarge,
-                decoration: InputDecoration(
-                  hintText: enabled ? 'Ask Liyab' : 'Load a model first',
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+      child: EmberEdge(
+        state: flameState,
+        heat: heat,
+        borderRadius: BorderRadius.circular(28),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: theme.colorScheme.outline),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  focusNode: focus,
+                  enabled: enabled,
+                  minLines: 1,
+                  maxLines: 6,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: theme.textTheme.bodyLarge,
+                  decoration: InputDecoration(
+                    hintText: enabled ? 'Ask Liyab' : 'Load a model first',
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  onSubmitted: enabled && !generating ? (_) => onSend() : null,
                 ),
-                onSubmitted: enabled && !generating ? (_) => onSend() : null,
               ),
-            ),
-            const SizedBox(width: 6),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 2),
-              child: RoundAction(
-                tooltip: generating ? 'Stop' : 'Send',
-                icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
-                onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: RoundAction(
+                  tooltip: generating ? 'Stop' : 'Send',
+                  icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
+                  onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

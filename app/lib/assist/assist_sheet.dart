@@ -3,13 +3,13 @@
 // expands in place into a full-height conversation, still over the app the
 // user was in (as Gemini's overlay does); closing returns to that app. The
 // full Liyab app is never opened from here.
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../chat/chat_screen.dart';
 import '../state/app_state.dart';
+import '../ui/ember_edge.dart';
 import '../ui/living_flame.dart';
 import '../ui/waking_up.dart';
 import '../ui/theme.dart';
@@ -129,10 +129,10 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
                 ).animate(CurvedAnimation(parent: _rise, curve: Curves.easeOutCubic)),
                 child: ListenableBuilder(
                   listenable: Listenable.merge([app, app.monitor]),
-                  builder: (context, _) => _EmberEdge(
+                  builder: (context, _) => EmberEdge(
                     state: _flame,
                     heat: app.monitor.heat,
-                    radius: _expanded ? 0 : 28,
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(_expanded ? 0 : 28)),
                     child: AnimatedContainer(
                       key: _sheetKey,
                       // Follows the finger with no delay; snaps animate.
@@ -339,126 +339,4 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
       ),
     );
   }
-}
-
-/// The sheet's lit edge: a glow in the flame's colours (cool to hot with the
-/// phone's heat) and a light running along the top edge. It breathes faster
-/// while the model thinks and calmly while it answers; at rest it stands still,
-/// so the animation only costs power while the model works anyway.
-class _EmberEdge extends StatefulWidget {
-  const _EmberEdge({required this.state, required this.heat, required this.radius, required this.child});
-  final FlameState state;
-  final double heat;
-  final double radius;
-  final Widget child;
-
-  @override
-  State<_EmberEdge> createState() => _EmberEdgeState();
-}
-
-class _EmberEdgeState extends State<_EmberEdge> with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(vsync: this);
-
-  @override
-  void initState() {
-    super.initState();
-    _sync();
-  }
-
-  @override
-  void didUpdateWidget(_EmberEdge old) {
-    super.didUpdateWidget(old);
-    if (old.state != widget.state) _sync();
-  }
-
-  void _sync() {
-    final period = switch (widget.state) {
-      FlameState.thinking => const Duration(milliseconds: 1300),
-      FlameState.answering || FlameState.listening => const Duration(milliseconds: 2400),
-      FlameState.resting => Duration.zero,
-    };
-    if (period == Duration.zero) {
-      _c.stop();
-      _c.value = 0;
-    } else {
-      _c
-        ..duration = period
-        ..repeat();
-    }
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  // Cool (headroom) -> ember -> flare (near throttling), as the flame.
-  Color get _glow => widget.heat < 0.5
-      ? Color.lerp(const Color(0xFF8F9CFF), Palette.ember, widget.heat / 0.5)!
-      : Color.lerp(Palette.ember, Palette.flare, (widget.heat - 0.5) / 0.5)!;
-
-  @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    animation: _c,
-    child: widget.child,
-    builder: (context, child) {
-      final working = widget.state != FlameState.resting;
-      final pulse = working ? 0.5 - 0.5 * math.cos(2 * math.pi * _c.value) : 0.0;
-      final glow = _glow;
-      final radius = BorderRadius.vertical(top: Radius.circular(widget.radius));
-      return DecoratedBox(
-        decoration: BoxDecoration(
-          borderRadius: radius,
-          boxShadow: [
-            BoxShadow(
-              color: glow.withValues(alpha: 0.28 + 0.32 * pulse),
-              blurRadius: 44 + 36 * pulse,
-              spreadRadius: -14 + 8 * pulse,
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: radius,
-          child: Stack(
-            children: [
-              child!,
-              if (working)
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  top: 0,
-                  height: 2.5,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          glow.withValues(alpha: 0),
-                          Palette.flare,
-                          Palette.gold,
-                          Palette.core,
-                          glow.withValues(alpha: 0),
-                        ],
-                        stops: const [0, 0.3, 0.5, 0.7, 1],
-                        transform: _Slide(_c.value),
-                      ),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      );
-    },
-  );
-}
-
-/// Moves a gradient across its box: phase 0..1 sweeps it from left to right.
-class _Slide extends GradientTransform {
-  const _Slide(this.phase);
-  final double phase;
-
-  @override
-  Matrix4 transform(Rect bounds, {TextDirection? textDirection}) =>
-      Matrix4.translationValues(bounds.width * (phase * 2 - 1), 0, 0);
 }
