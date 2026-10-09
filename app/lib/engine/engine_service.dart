@@ -22,6 +22,7 @@ class LoadOptions {
     this.contextLength = 4096,
     this.skinThresholdC = 50,
     this.memoryBudgetMb = 5500,
+    this.experimental = const {},
   });
 
   final String modelPath;
@@ -29,6 +30,10 @@ class LoadOptions {
   final int contextLength;
   final double skinThresholdC;
   final int memoryBudgetMb;
+
+  /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson (plus 'kvDedupDir');
+  /// absent keys keep the engine's defaults.
+  final Map<String, Object?> experimental;
 }
 
 class SamplingOptions {
@@ -179,7 +184,7 @@ class EngineService {
   Future<LoadedModel> load(LoadOptions o) async {
     _engine = 0;
     final r = await _call<List<Object?>>(
-        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb]);
+        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental]);
     _engine = r[0] as int;
     return LoadedModel(
         description: r[1] as String,
@@ -271,6 +276,7 @@ void _worker(SendPort replies) {
               ..powerProfile = LiyabPowerProfile.performance // a chat wants full speed; the thermal guard still applies
               ..skinThresholdC = m[5] as double
               ..memoryBudgetMb = m[6] as int; // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
+            _applyExperimental(config.ref, m[7] as Map<String, Object?>, arena);
             final out = arena<Pointer<Void>>();
             final watch = Stopwatch()..start();
             if (lib.create(config, out) != LiyabStatus.ok) return fail();
@@ -333,6 +339,29 @@ void _worker(SendPort replies) {
       fail('$e');
     }
   });
+}
+
+/// Sets the experimental and advanced options present in `x` (see LoadOptions.experimental).
+void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena) {
+  int flag(String k) => x[k] == true ? 1 : 0;
+  double? n(String k) => (x[k] as num?)?.toDouble();
+  int? i(String k) => (x[k] as num?)?.toInt();
+  if (x.containsKey('earlyExit')) c.earlyExit = flag('earlyExit');
+  c.earlyExitThreshold = n('earlyExitThreshold') ?? c.earlyExitThreshold;
+  if (x.containsKey('headPruning')) c.headPruning = flag('headPruning');
+  c.headKeepRatio = n('headKeepRatio') ?? c.headKeepRatio;
+  if (x.containsKey('egls')) c.egls = flag('egls');
+  c.eglsThreshold = n('eglsThreshold') ?? c.eglsThreshold;
+  c.tdss = i('tdss') ?? c.tdss;
+  if (x.containsKey('lookupDrafts')) c.lookupDrafts = flag('lookupDrafts');
+  c.draftTokens = i('draftTokens') ?? c.draftTokens;
+  c.moeExpertMass = n('expertMass') ?? c.moeExpertMass;
+  c.moeMaxExperts = i('maxExperts') ?? c.moeMaxExperts;
+  c.kvCacheType = i('kvCacheType') ?? c.kvCacheType;
+  c.requantBits = i('requantBits') ?? c.requantBits;
+  c.nThreads = i('threads') ?? c.nThreads;
+  final dedup = x['kvDedupDir'] as String?;
+  if (dedup != null) c.kvDedupDir = dedup.toNativeUtf8(allocator: arena);
 }
 
 void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort replies) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds the Liyab Flutter app (app/) for Android: libliyab with the NDK, then
-# the release APK, and optionally installs it.
+# Builds the Liyab Flutter app (app/) for Android: libliyab with the NDK (with
+# the experimental modules, which Settings > Experimental turns on; all off by
+# default), then the release APK, and optionally installs it.
 #
 #   scripts/build_flutter_app.sh [--install]
 #
@@ -24,7 +25,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "==> libliyab"
-"$ROOT/scripts/build_android.sh" --no-tests >/dev/null
+"$ROOT/scripts/build_android.sh" --no-tests --experimental >/dev/null
 JNI="$ROOT/app/android/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$JNI"
 cp "$ROOT/build/android/arm64-v8a/libliyab.so" "$JNI/"

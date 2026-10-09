@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart' show openAppSettings
 import '../agent/tools.dart';
 import '../engine/engine_service.dart';
 import '../state/app_state.dart';
+import 'experimental_section.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key, required this.app});
@@ -267,6 +268,8 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
           title: Text('Internet'),
           subtitle: Text('Only to search and download models from Hugging Face. Conversations never leave the phone.'),
         ),
+        heading('Experimental'),
+        ExperimentalSection(app: app),
         heading('About this device'),
         SelectableText(
           app.description.isEmpty ? EngineService.deviceDescription() : app.description,

@@ -522,7 +522,11 @@ are called directly because the C API makes them thread-safe.
   foreground; plus the app's and the engine's log (`liyab_log_buffer_*`), copyable.
 * **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit, memory budget and
   idle release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
-  storage and imports go through the system picker).
+  storage and imports go through the system picker). **Experimental** exposes the engine's lossy, unfinished or
+  measurement-only options, applied on the next load and listed in the Activity log: early exit, head pruning, EGLS
+  FFN skipping, 2:4 sparse FFN (TDSS), the persistent prefix KV cache (KV dedup), lookup speculative decoding and its
+  draft length, MoE expert mass and experts per token, requantized resident matrices, KV cache format and thread
+  count. The app's `libliyab.so` is built with `LIYAB_ENABLE_EXPERIMENTAL=ON` for this; everything is off by default.
 * **Leaving the screen.** HyperOS stops a background app that holds several GB within a minute
   (`kill_bg_proc`), and the process outlives its window anyway (the notification listener keeps it running). So the
   moment Liyab is hidden it parks: the expert cache is emptied (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the

@@ -88,6 +88,86 @@ class ModelSettings {
   static String _key(String model) => 'model:$model';
 }
 
+/// Engine options that are lossy, unfinished or meant for measurements
+/// (Settings, Experimental), applied the next time a model loads. The
+/// defaults are the engine's own: everything off.
+class ExperimentalSettings {
+  bool earlyExit = false; // skip the remaining blocks on confident tokens
+  double earlyExitThreshold = 0.98;
+  bool headPruning = false; // skip low-importance attention heads while hot
+  double headKeepRatio = 0.75;
+  bool egls = false; // skip a block's FFN when it barely changes the prediction
+  double eglsThreshold = 0.002;
+  int tdss = 0; // 2:4 sparse FFN weights: 0 off, 1 while hot, 2 always
+  bool kvDedup = false; // persistent prefix KV cache on storage
+  bool lookupDrafts = false; // speculative decoding from the conversation's own text
+  int draftTokens = 3;
+  double expertMass = 1.0; // MoE: fewest top experts covering this router mass
+  int maxExperts = 0; // MoE: experts per token cap; 0 = the model's
+  int kvCacheType = 1; // liyab_kv_cache_type: 0 F16, 1 Q8_0, 2 Q4_0, 3 Q4_1
+  int requantBits = 0; // MoE streaming: resident Q8_0 matrices to Q4_K / Q5_K
+  int threads = 0; // 0 = the engine's choice
+
+  Map<String, Object?> toJson() => {
+        'earlyExit': earlyExit,
+        'earlyExitThreshold': earlyExitThreshold,
+        'headPruning': headPruning,
+        'headKeepRatio': headKeepRatio,
+        'egls': egls,
+        'eglsThreshold': eglsThreshold,
+        'tdss': tdss,
+        'kvDedup': kvDedup,
+        'lookupDrafts': lookupDrafts,
+        'draftTokens': draftTokens,
+        'expertMass': expertMass,
+        'maxExperts': maxExperts,
+        'kvCacheType': kvCacheType,
+        'requantBits': requantBits,
+        'threads': threads,
+      };
+
+  static ExperimentalSettings fromJson(Map<String, Object?> o) {
+    final d = ExperimentalSettings();
+    bool b(String k, bool v) => o[k] as bool? ?? v;
+    double n(String k, double v) => (o[k] as num?)?.toDouble() ?? v;
+    int i(String k, int v) => (o[k] as num?)?.toInt() ?? v;
+    return d
+      ..earlyExit = b('earlyExit', d.earlyExit)
+      ..earlyExitThreshold = n('earlyExitThreshold', d.earlyExitThreshold)
+      ..headPruning = b('headPruning', d.headPruning)
+      ..headKeepRatio = n('headKeepRatio', d.headKeepRatio)
+      ..egls = b('egls', d.egls)
+      ..eglsThreshold = n('eglsThreshold', d.eglsThreshold)
+      ..tdss = i('tdss', d.tdss)
+      ..kvDedup = b('kvDedup', d.kvDedup)
+      ..lookupDrafts = b('lookupDrafts', d.lookupDrafts)
+      ..draftTokens = i('draftTokens', d.draftTokens)
+      ..expertMass = n('expertMass', d.expertMass)
+      ..maxExperts = i('maxExperts', d.maxExperts)
+      ..kvCacheType = i('kvCacheType', d.kvCacheType)
+      ..requantBits = i('requantBits', d.requantBits)
+      ..threads = i('threads', d.threads);
+  }
+
+  /// What differs from the defaults, for the log ("early exit 0.98, Q4_0 KV").
+  List<String> get active {
+    final d = ExperimentalSettings();
+    return [
+      if (earlyExit) 'early exit ${earlyExitThreshold.toStringAsFixed(3)}',
+      if (headPruning) 'head pruning ${(headKeepRatio * 100).round()}%',
+      if (egls) 'EGLS ${eglsThreshold.toStringAsFixed(4)}',
+      if (tdss != 0) 'TDSS ${tdss == 1 ? 'while hot' : 'always'}',
+      if (kvDedup) 'KV dedup',
+      if (lookupDrafts) 'lookup drafts ($draftTokens)',
+      if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
+      if (maxExperts > 0) 'max $maxExperts experts',
+      if (kvCacheType != d.kvCacheType) '${const ['F16', 'Q8_0', 'Q4_0', 'Q4_1'][kvCacheType]} KV',
+      if (requantBits != 0) 'requant Q${requantBits}_K',
+      if (threads != 0) '$threads threads',
+    ];
+  }
+}
+
 /// Device-wide settings.
 class DeviceSettings {
   DeviceSettings(this._prefs);
@@ -113,6 +193,19 @@ class DeviceSettings {
   /// The model reloads, with its saved system prompt, when Liyab is opened again.
   int get releaseAfterMinutes => _prefs.getInt('release_after_min') ?? 5;
   set releaseAfterMinutes(int v) => _prefs.setInt('release_after_min', v);
+
+  /// Experimental engine options (applied on the next load).
+  ExperimentalSettings get experimental {
+    final saved = _prefs.getString('experimental');
+    if (saved == null) return ExperimentalSettings();
+    try {
+      return ExperimentalSettings.fromJson(jsonDecode(saved) as Map<String, Object?>);
+    } on FormatException {
+      return ExperimentalSettings();
+    }
+  }
+
+  set experimental(ExperimentalSettings v) => _prefs.setString('experimental', jsonEncode(v.toJson()));
 
   /// The last loaded model file, reloaded at start.
   String? get lastModel => _prefs.getString('model');

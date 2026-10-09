@@ -278,12 +278,17 @@ class AppState extends ChangeNotifier {
     try {
       final gpu = device.useGpu;
       _prepared = null;
+      final experimental = device.experimental;
       final model = await engine.load(LoadOptions(
         modelPath: path,
         backend: gpu ? LiyabBackend.vulkan : LiyabBackend.cpu,
         contextLength: ModelSettings.contextFor(prefs, name),
         skinThresholdC: device.thermalLimitC,
         memoryBudgetMb: device.memoryBudgetMb,
+        experimental: {
+          ...experimental.toJson(),
+          if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,
+        },
       ));
       final (detected, thinks) = await ChatTemplate.detect(engine);
       template = detected;
@@ -297,6 +302,7 @@ class AppState extends ChangeNotifier {
       device.lastModel = path;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
       _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${template.label}, tools: ${toolDialect.name})');
+      if (experimental.active.isNotEmpty) _log('Experimental: ${experimental.active.join(', ')}');
       for (final line in description.split('\n')) {
         _log('  $line');
       }
@@ -314,6 +320,10 @@ class AppState extends ChangeNotifier {
   /// Processes the system block in the background, so the first message only
   /// costs its own tokens (the engine keeps that context and a snapshot of it).
   String? _prepared; // the system block the engine last processed
+
+  /// Where the experimental persistent prefix KV cache lives (the engine needs an existing directory).
+  Future<Directory> _kvDedupDir() async =>
+      Directory('${(await getApplicationSupportDirectory()).path}/kv-dedup').create(recursive: true);
 
   /// The context being prepared after a load (system prompt or saved conversation).
   Future<void>? _preparing;
