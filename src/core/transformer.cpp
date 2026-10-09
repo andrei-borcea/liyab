@@ -1214,6 +1214,38 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     // The next block's guess goes behind this block's own reads in the queue.
     if (expert_store_ != nullptr) predict_experts(layer + 1, n, route);
 
+    // The shared expert (when the block has one) runs where the routed ones
+    // would wait for a read, or after them; its output is added last either
+    // way, so the result does not depend on when it ran.
+    double shared_in_experts_ms = 0.0;  // shared-expert time inside the experts phase, moved back to its own
+    bool shared_done = L.w[kUpShared] == nullptr;
+    auto run_shared = [&]() -> Status {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto sh = static_cast<size_t>(w[kUpShared].rows());
+        hb_.resize(un * sh);
+        hb2_.resize(un * sh);
+        const TensorView* gate_up[] = {&w[kGateShared], &w[kUpShared]};
+        float* outs[] = {hb_.data(), hb2_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
+        for (size_t i = 0; i < un * sh; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+        shared_out_.resize(un * d);
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), shared_out_.data(), n));
+        for (size_t t = 0; t < un; ++t) {
+            float scale = 1.0f;
+            if (!L.shared_gate.empty()) {
+                float dot = 0.0f;
+                for (size_t j = 0; j < d; ++j) dot += L.shared_gate[j] * xb_[t * d + j];
+                scale = sigmoid(dot);
+            }
+            for (size_t j = 0; j < d; ++j) shared_out_[t * d + j] *= scale;
+        }
+        shared_done = true;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        phases_.shared_expert += ms;
+        shared_in_experts_ms += ms;
+        return Status::ok();
+    };
+
     PhaseTimer experts_timer(phases_.experts);
     moe_out_.assign(un * d, 0.0f);
     ranked_out_.resize(un * K * d);
@@ -1240,6 +1272,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         do {
             const int32_t ex = chosen[next++];
             if (expert_store_ != nullptr) {
+                // About to wait for a read: do the shared expert's work meanwhile.
+                if (!shared_done && wave.empty() && !expert_store_->ready(layer, ex)) {
+                    if (Status st = run_shared(); !st.is_ok()) return st;
+                }
                 auto loaded = expert_store_->acquire(layer, ex);
                 if (!loaded) {
                     release_wave();
@@ -1314,27 +1350,11 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     }
 
     experts_timer.stop();
+    phases_.experts -= shared_in_experts_ms;
 
+    if (!shared_done) LIYAB_RETURN_IF_ERROR(run_shared());
     if (L.w[kUpShared] != nullptr) {
-        const PhaseTimer timer(phases_.shared_expert);
-        const auto sh = static_cast<size_t>(w[kUpShared].rows());
-        hb_.resize(un * sh);
-        hb2_.resize(un * sh);
-        const TensorView* gate_up[] = {&w[kGateShared], &w[kUpShared]};
-        float* outs[] = {hb_.data(), hb2_.data()};
-        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
-        for (size_t i = 0; i < un * sh; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
-        eout_.resize(un * d);
-        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), eout_.data(), n));
-        for (size_t t = 0; t < un; ++t) {
-            float scale = 1.0f;
-            if (!L.shared_gate.empty()) {
-                float dot = 0.0f;
-                for (size_t j = 0; j < d; ++j) dot += L.shared_gate[j] * xb_[t * d + j];
-                scale = sigmoid(dot);
-            }
-            for (size_t j = 0; j < d; ++j) moe_out_[t * d + j] += scale * eout_[t * d + j];
-        }
+        for (size_t i = 0; i < un * d; ++i) moe_out_[i] += shared_out_[i];
     }
     std::copy(moe_out_.begin(), moe_out_.end(), xb_.begin());
     return Status::ok();
