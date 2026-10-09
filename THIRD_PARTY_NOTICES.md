@@ -37,3 +37,11 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Fonts in the Flutter app
+
+* Bricolage Grotesque (<https://github.com/ateliertriay/bricolage>) and Figtree
+  (<https://github.com/erikdkennedy/figtree>), from Google Fonts.
+* Used in: `app/assets/fonts/`, bundled so the app makes no network request for fonts.
+* License: SIL Open Font License 1.1 (`app/assets/fonts/OFL-BricolageGrotesque.txt`,
+  `app/assets/fonts/OFL-Figtree.txt`).

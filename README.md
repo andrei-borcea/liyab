@@ -435,6 +435,33 @@ final class LiyabEngine {
 }
 ```
 
+### Liyab app (Flutter, `app/`)
+
+`app/` is the Liyab app in Flutter, for Android now and iOS next, replacing the Java demo below step by step. It
+calls the C ABI directly through `dart:ffi` (hand-written bindings in `app/lib/engine/liyab_ffi.dart`, mirroring
+`liyab_c_api.h`): model loads, prefills and generations run on a worker isolate, while cancel and the live counters
+are called directly because the C API makes them thread-safe.
+
+* **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
+  is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
+  every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system
+  prompt is processed right after loading.
+* **Models and settings.** Models are listed from app storage and the shared folder (marked, since streaming is
+  slower there); the CPU/GPU switch, sampling, context length, system prompt, thermal limit and memory budget are
+  in sheets, saved per model and per device.
+* **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
+  shows whether the assistant is resting, thinking or answering, and its colour turns from cool to hot when the
+  engine reports thermal throttling. At rest it redraws about 24 times a second instead of at the display rate.
+
+Not yet in the Flutter app: model downloads, the performance overlay and the debug log (still in the Java demo).
+It uses the same application id (`com.liyab.chat`) and signing key (`build/liyab-debug.keystore`) as the Java demo,
+so installing it over that app keeps the downloaded models; settings start from their defaults.
+
+```bash
+scripts/build_flutter_app.sh --install   # libliyab + release APK; waits while the app is open
+cd app && flutter analyze && flutter test
+```
+
 ### Demo app: Liyab Chat (Android)
 
 `android/chat` is a small Android app in plain Java (no Gradle, no AndroidX) over the C ABI, with four screens:
@@ -912,9 +939,10 @@ tools/                  liyab_cli.cpp (command-line front end over the C ABI), l
                         throughput vs the RAM read ceiling), table/vector generators, gen_bench_charts.py (README charts)
 docs/benchmarks/        benchmark data (results.json) and the charts drawn from it
 docs/brand/             the Liyab mark and app icon (SVG, 512 px PNG); "liyab" is Tagalog for flame
+app/                    the Liyab app (Flutter; Android, iOS next), built by scripts/build_flutter_app.sh
 android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI, adaptive launcher icon in res/), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
-scripts/                build_android.sh, build_android_app.sh, build_ios.sh
+scripts/                build_android.sh, build_android_app.sh, build_flutter_app.sh, build_ios.sh
 ```
 
 ## License
