@@ -157,6 +157,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     try {
       final gpu = device.useGpu;
+      _prepared = null;
       final model = await engine.load(LoadOptions(
         modelPath: path,
         backend: gpu ? LiyabBackend.vulkan : LiyabBackend.cpu,
@@ -191,11 +192,16 @@ class AppState extends ChangeNotifier {
 
   /// Processes the system block in the background, so the first message only
   /// costs its own tokens (the engine keeps that context and a snapshot of it).
+  String? _prepared; // the system block the engine last processed
+
   Future<void> prepareSystemPrompt() async {
     if (!engine.loaded) return;
+    final block = await _systemBlock();
+    if (block == _prepared) return;
+    _prepared = block;
     final watch = Stopwatch()..start();
     try {
-      await engine.prefill(await _systemBlock());
+      await engine.prefill(block);
       _log('System prompt prepared in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
     } on EngineException catch (e) {
       _log('System prompt not prepared: $e');
@@ -312,10 +318,14 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Tools changed (turned on or off): the system block that lists them changes too.
+  Timer? _toolsSettle;
+
+  /// Tools changed (turned on or off): the system block that lists them
+  /// changes too. Prefilled once the switches settle, not once per switch.
   Future<void> toolsChanged() async {
     notifyListeners();
-    await prepareSystemPrompt();
+    _toolsSettle?.cancel();
+    _toolsSettle = Timer(const Duration(seconds: 2), prepareSystemPrompt);
   }
 
   void stop() => engine.cancel();

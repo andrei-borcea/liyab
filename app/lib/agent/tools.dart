@@ -51,7 +51,7 @@ abstract class AgentTool {
         'function': {
           'name': name,
           'description': description,
-          'parameters': {'type': 'object', 'properties': parameters, 'required': required},
+          'parameters': {'type': 'object', 'properties': parameters, if (required.isNotEmpty) 'required': required},
         },
       };
 }
@@ -71,14 +71,12 @@ class CalendarTool extends AgentTool {
 
   @override
   String get description =>
-      "Lists the events in the user's calendars between two local date-times (recurring events included). "
-      'Use it for questions about their schedule: what is on today or tomorrow, what comes next, '
-      'whether they are free at some time, when a meeting is.';
+      "The user's calendar events between two local times.";
 
   @override
   Map<String, Object?> get parameters => {
-        'start': {'type': 'string', 'description': 'Start, local time, ISO 8601 (e.g. 2026-10-09T00:00).'},
-        'end': {'type': 'string', 'description': 'End, local time, ISO 8601 (e.g. 2026-10-10T00:00).'},
+        'start': {'type': 'string', 'description': 'e.g. 2026-10-09T00:00'},
+        'end': {'type': 'string', 'description': 'e.g. 2026-10-10T00:00'},
       };
 
   @override
@@ -132,8 +130,7 @@ class ClipboardTool extends AgentTool {
 
   @override
   String get description =>
-      'Returns the text the user last copied. Use it when they refer to something they copied or ask to '
-      'summarize, translate, explain or answer it.';
+      'The text the user last copied.';
 
   @override
   Map<String, Object?> get parameters => const {};
@@ -152,7 +149,7 @@ class ClipboardTool extends AgentTool {
 DateTime _since(Object? v) => DateTime.tryParse('${v ?? ''}') ?? DateTime.now().subtract(const Duration(hours: 24));
 
 const _sinceParam = {
-  'since': {'type': 'string', 'description': 'From when, local time, ISO 8601 (e.g. 2026-10-09T08:00). Default: 24 hours ago.'},
+  'since': {'type': 'string', 'description': 'e.g. 2026-10-09T08:00; default 24 h ago'},
 };
 
 String _plural(int n, String one) => '$n $one${n == 1 ? '' : 's'}';
@@ -163,10 +160,10 @@ class ContactsTool extends AgentTool {
   @override
   String get label => 'Looked up your contacts';
   @override
-  String get description => "Finds people in the user's contacts by (part of) their name: phone numbers and email addresses.";
+  String get description => "Finds the user's contacts by name: numbers and emails.";
   @override
   Map<String, Object?> get parameters => {
-        'name': {'type': 'string', 'description': 'The name, or part of it.'},
+        'name': {'type': 'string'},
       };
   @override
   List<String> get required => const ['name'];
@@ -189,12 +186,11 @@ class MessagesTool extends AgentTool {
   String get label => 'Read your text messages';
   @override
   String get description =>
-      'Lists the SMS messages the user received or sent since a time, newest first, optionally only those from or to '
-      'a person (name or number). For chat apps (WhatsApp, Telegram…) and email use read_notifications.';
+      'SMS sent or received since a time, optionally with one person. Chat apps and email: read_notifications.';
   @override
   Map<String, Object?> get parameters => {
         ..._sinceParam,
-        'from': {'type': 'string', 'description': 'Only messages with this person (name or number). Optional.'},
+        'from': {'type': 'string', 'description': 'name or number'},
       };
   @override
   Future<bool> permitted() => Permission.sms.isGranted;
@@ -225,7 +221,7 @@ class CallsTool extends AgentTool {
   @override
   String get label => 'Checked your calls';
   @override
-  String get description => 'Lists phone calls since a time, newest first: who, when, incoming / outgoing / missed, length.';
+  String get description => 'Phone calls since a time: who, when, missed or not, length.';
   @override
   Map<String, Object?> get parameters => _sinceParam;
   @override
@@ -258,13 +254,11 @@ class NotificationsTool extends AgentTool {
   String get label => 'Read your notifications';
   @override
   String get description =>
-      'Lists the notifications the phone received since a time (newest first): chat messages (WhatsApp, Telegram, '
-      'Signal…), email previews (Gmail, Outlook…) and app alerts, each with the app, title (often the sender) and '
-      'text. Optionally only from one app. Only what arrived while Liyab was running is known.';
+      'Notifications since a time: chat messages (WhatsApp, Telegram…), email previews, app alerts.';
   @override
   Map<String, Object?> get parameters => {
         ..._sinceParam,
-        'app': {'type': 'string', 'description': 'Only this app, e.g. WhatsApp or Gmail. Optional.'},
+        'app': {'type': 'string', 'description': 'e.g. WhatsApp, Gmail'},
       };
   @override
   Future<bool> permitted() async => await _data.invokeMethod<bool>('notificationAccess') ?? false;
