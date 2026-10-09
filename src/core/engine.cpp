@@ -741,6 +741,13 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     s.context_text_valid = false;  // set again once the run completes
     if (s.speculative) s.speculative->reset_stats();
     s.power->reset_pacing();
+    {
+        // The caller decodes too, and may be a different OS thread each run
+        // (a Dart isolate moves between threads).
+        std::vector<int32_t> decode_threads = s.pool->worker_thread_ids();
+        decode_threads.push_back(ThreadPool::current_thread_id());
+        s.power->set_hint_threads(std::move(decode_threads));
+    }
     Sampler sampler(params);
     GenerationStats stats;
     const TripleBufferLoader::Stats loader_before =

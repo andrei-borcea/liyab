@@ -165,8 +165,78 @@ ThermalSample read_platform_thermal() {
 // ---------------------------------------------------------------------------
 // PowerManager
 // ---------------------------------------------------------------------------
+// APerformanceHint_* (API 33), resolved at runtime like AThermal_*. A session
+// covers the decode threads; its target is the token period, and each report
+// is one token's work time.
+struct PowerManager::HintSession {
+    std::vector<int32_t> threads;
+    void* session = nullptr;
+    int64_t target_ns = 0;
+    bool failed = false;  // creation refused: do not retry for these threads
+
+#if defined(__ANDROID__)
+    struct Api {
+        void* manager = nullptr;
+        void* (*create)(void*, const int32_t*, size_t, int64_t) = nullptr;
+        int (*update_target)(void*, int64_t) = nullptr;
+        int (*report)(void*, int64_t) = nullptr;
+        void (*close)(void*) = nullptr;
+    };
+    static const Api& api() {
+        static const Api a = [] {
+            Api r;
+            void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+            if (!lib) return r;
+            auto get_manager = reinterpret_cast<void* (*)()>(dlsym(lib, "APerformanceHint_getManager"));
+            r.create = reinterpret_cast<decltype(r.create)>(dlsym(lib, "APerformanceHint_createSession"));
+            r.update_target = reinterpret_cast<decltype(r.update_target)>(dlsym(lib, "APerformanceHint_updateTargetWorkDuration"));
+            r.report = reinterpret_cast<decltype(r.report)>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+            r.close = reinterpret_cast<decltype(r.close)>(dlsym(lib, "APerformanceHint_closeSession"));
+            if (get_manager && r.create && r.update_target && r.report && r.close) r.manager = get_manager();
+            return r;
+        }();
+        return a;
+    }
+#endif
+
+    ~HintSession() { close(); }
+
+    void close() {
+#if defined(__ANDROID__)
+        if (session != nullptr) api().close(session);
+#endif
+        session = nullptr;
+    }
+
+    // One token's work against a period of `period_ns`.
+    void report(int64_t work_ns, int64_t period_ns) {
+#if defined(__ANDROID__)
+        if (threads.empty() || failed || api().manager == nullptr || work_ns <= 0) return;
+        if (session == nullptr) {
+            session = api().create(api().manager, threads.data(), threads.size(), period_ns);
+            if (session == nullptr) {
+                failed = true;
+                LIYAB_LOG_WARN("performance hints unavailable for %zu decode threads", threads.size());
+                return;
+            }
+            target_ns = period_ns;
+            LIYAB_LOG_INFO("performance hints: %zu decode threads, %.1f ms per token", threads.size(), period_ns / 1e6);
+        } else if (period_ns != target_ns) {
+            api().update_target(session, period_ns);
+            target_ns = period_ns;
+        }
+        api().report(session, work_ns);
+#else
+        (void)work_ns;
+        (void)period_ns;
+#endif
+    }
+};
+
 PowerManager::PowerManager(PowerConfig config, ThermalSensor sensor)
-    : config_(config), sensor_(sensor ? std::move(sensor) : ThermalSensor(read_platform_thermal)) {}
+    : config_(config),
+      sensor_(sensor ? std::move(sensor) : ThermalSensor(read_platform_thermal)),
+      hint_(std::make_unique<HintSession>()) {}
 
 PowerManager::~PowerManager() { stop(); }
 
@@ -278,9 +348,15 @@ std::chrono::microseconds PowerManager::pace_token() {
     auto now = clock::now();
     if (tps <= 0.0) {
         has_deadline_ = false;
+        has_work_start_ = false;
+        hint_->close();  // full speed: no target to hint
         return std::chrono::microseconds(0);
     }
     const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / tps));
+    if (has_work_start_) {
+        hint_->report(std::chrono::duration_cast<std::chrono::nanoseconds>(now - work_start_).count(),
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(period).count());
+    }
     std::chrono::microseconds slept{0};
     if (!has_deadline_ || now > deadline_ + period) {
         deadline_ = now;  // first token, or fell behind: re-anchor, no burst
@@ -290,9 +366,23 @@ std::chrono::microseconds PowerManager::pace_token() {
     }
     has_deadline_ = true;
     deadline_ += period;
+    has_work_start_ = true;
+    work_start_ = clock::now();  // the next token's work starts after the sleep
     return slept;
 }
 
-void PowerManager::reset_pacing() { has_deadline_ = false; }
+void PowerManager::reset_pacing() {
+    has_deadline_ = false;
+    has_work_start_ = false;
+}
+
+void PowerManager::set_hint_threads(std::vector<int32_t> thread_ids) {
+    std::erase(thread_ids, 0);
+    std::sort(thread_ids.begin(), thread_ids.end());
+    if (thread_ids == hint_->threads) return;
+    hint_->close();
+    hint_->threads = std::move(thread_ids);
+    hint_->failed = false;
+}
 
 }  // namespace liyab

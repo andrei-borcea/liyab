@@ -8,6 +8,10 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace liyab {
 
@@ -28,6 +32,7 @@ ThreadPool::ThreadPool(int32_t n_threads) {
     if (n_threads < 1) n_threads = default_thread_count();
     n_threads = std::clamp<int32_t>(n_threads, 1, kMaxThreads);
     workers_.reserve(static_cast<size_t>(n_threads - 1));
+    worker_tids_ = std::vector<std::atomic<int32_t>>(static_cast<size_t>(n_threads - 1));
     for (int32_t i = 0; i < n_threads - 1; ++i) {
         workers_.emplace_back([this, i] { worker_loop(i); });
     }
@@ -106,7 +111,24 @@ uint64_t ThreadPool::wait_for_job(uint64_t seen) {
     return generation_.load(std::memory_order_acquire);
 }
 
+std::vector<int32_t> ThreadPool::worker_thread_ids() const {
+    std::vector<int32_t> ids;
+    for (const auto& tid : worker_tids_) {
+        if (const int32_t id = tid.load(std::memory_order_acquire); id > 0) ids.push_back(id);
+    }
+    return ids;
+}
+
+int32_t ThreadPool::current_thread_id() noexcept {
+#if defined(__linux__)
+    return static_cast<int32_t>(syscall(SYS_gettid));
+#else
+    return 0;
+#endif
+}
+
 void ThreadPool::worker_loop(int32_t index) {
+    worker_tids_[static_cast<size_t>(index)].store(current_thread_id(), std::memory_order_release);
     uint64_t seen = 0;
     const int32_t participant = index + 1;  // the caller is participant 0
     for (;;) {

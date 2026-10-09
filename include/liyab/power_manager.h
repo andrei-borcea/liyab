@@ -22,10 +22,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "liyab/types.h"
 
@@ -97,10 +99,23 @@ public:
     // token's slot at policy().target_tps (the first token is never delayed).
     // Falling behind never causes a catch-up burst. Returns the time slept.
     // Generation thread only (not synchronized).
+    //
+    // While pacing on Android 13+, it also reports each token's work time to
+    // a performance-hint session (ADPF) over the threads given to
+    // set_hint_threads(), with the token period as the target: the CPU
+    // governor then picks the lowest clocks that still meet the rate, rather
+    // than sprinting and sleeping (lower voltage, less energy per token).
+    // Unpaced decoding wants the highest clocks and opens no session.
     std::chrono::microseconds pace_token();
+    // Starts a new run: the next token is not delayed and its work time is not reported.
     void reset_pacing();
+    // The OS ids of the threads that decode (the generation thread and its
+    // workers); a change closes the open hint session. Generation thread only.
+    void set_hint_threads(std::vector<int32_t> thread_ids);
 
 private:
+    struct HintSession;  // ADPF session; a no-op off Android
+
     void poll_loop();
     // 0 (no thermal pressure) .. 1 (throttle), from the smoothed headroom
     // forecast and the status / temperature guards.
@@ -118,6 +133,9 @@ private:
 
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_{};
+    bool has_work_start_ = false;
+    std::chrono::steady_clock::time_point work_start_{};  // when the current token's work began
+    std::unique_ptr<HintSession> hint_;
 };
 
 }  // namespace liyab

@@ -38,6 +38,11 @@ public:
     [[nodiscard]] int32_t active_threads() const noexcept { return active_.load(std::memory_order_relaxed); }
     // Lets the power manager shed cores under thermal pressure (clamped to [1, max]).
     void set_active_threads(int32_t n) noexcept;
+    // OS thread ids of the workers (Linux / Android; empty elsewhere), for
+    // performance-hint sessions. Workers that have not started yet are left out.
+    [[nodiscard]] std::vector<int32_t> worker_thread_ids() const;
+    // OS thread id of the calling thread; 0 where there is none to report.
+    static int32_t current_thread_id() noexcept;
 
     // Runs fn(begin, end) over [0, n) split into contiguous chunks and blocks
     // until every chunk finished. Chunks run concurrently and in any order, on
@@ -60,6 +65,7 @@ private:
     void run_chunks(uint64_t sequence);
 
     std::vector<std::thread> workers_;
+    std::vector<std::atomic<int32_t>> worker_tids_;  // set by each worker as it starts
     std::atomic<int32_t> active_{1};
 
     // Job: written by parallel_for() before it publishes the job's ticket,

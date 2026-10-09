@@ -129,7 +129,9 @@ This README describes what the code does today. Anything not implemented is list
   0.95 or above, at the profile's OS-status limit, above the skin threshold (40 °C by default) or with the SoC
   past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the
   token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and no longer throttles
-  by itself; the forecast decides.
+  by itself; the forecast decides. While pacing on Android 13+, the decode threads report each token's work time to
+  a performance-hint session (ADPF, `APerformanceHint_*`) with the token period as its target, so the CPU governor
+  runs just fast enough for the rate instead of sprinting and sleeping. Unpaced decoding opens no session.
 * **Speculative decoding.** A small draft model proposes *k* tokens, or, without one (`lookup_drafts`, `liyab-cli
   --lookup`), the tokens that followed the most recent earlier occurrence of the last 4..2 tokens in the
   conversation are proposed (no extra weights, any model). The target verifies them in one batched pass, reading
@@ -937,8 +939,8 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
 * **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
-  assistant listens at once; the flame's listening animation is ready for it), then Android performance hints
-  (ADPF) for the power manager, which already follows the thermal-headroom forecast, then
+  assistant listens at once; the flame's listening animation is ready for it), then measuring the power manager's
+  headroom-driven control and performance hints on battery (sustained tok/s and joules per token), then
   actions (alarms, timers, calendar events, message replies, every outward action confirmed by the user),
   constrained decoding so tool calls always parse, the screen content through a voice-interaction service, email
   through IMAP or the Gmail API (opt-in), GPU prefill, and local memory over the user's own data. The iOS app is not
