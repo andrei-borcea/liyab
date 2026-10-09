@@ -46,6 +46,13 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
   late final int _firstMessage = widget.app.messages.length; // the sheet shows only what was asked here
   bool _expanded = false;
 
+  // Resizing: the sheet follows a drag on its handle or header and stays where
+  // it is let go; reaching the top edge turns it into the app.
+  final _sheetKey = GlobalKey();
+  double? _height; // set once dragged; null: fit the content
+  bool _dragging = false;
+  double _screen = 800;
+
   AppState get app => widget.app;
 
   @override
@@ -70,7 +77,10 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
 
   void _setExpanded(bool v) {
     HapticFeedback.selectionClick();
-    setState(() => _expanded = v);
+    setState(() {
+      _expanded = v;
+      _height = null;
+    });
   }
 
   List<ChatMessage> get _asked =>
@@ -85,7 +95,7 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
-    final height = MediaQuery.sizeOf(context).height;
+    final height = _screen = MediaQuery.sizeOf(context).height;
     return PopScope(
       canPop: false,
       // Back (once pages pushed from the drawer are closed): collapse, then close.
@@ -123,12 +133,17 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
                     heat: app.monitor.heat,
                     radius: _expanded ? 0 : 28,
                     child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 360),
+                      key: _sheetKey,
+                      // Follows the finger with no delay; snaps animate.
+                      duration: _dragging ? Duration.zero : const Duration(milliseconds: 360),
                       curve: Curves.easeOutCubic,
                       // Constraints animate (a null height cannot): compact fits its
-                      // content up to 60 % of the screen, expanded fills it.
+                      // content up to 60 % of the screen, a dragged sheet keeps its
+                      // height, expanded fills the screen.
                       constraints: _expanded
                           ? BoxConstraints.tightFor(height: height)
+                          : _height != null
+                          ? BoxConstraints.tightFor(height: _height)
                           : BoxConstraints(maxHeight: height * 0.6),
                       decoration: BoxDecoration(
                         color: Palette.kiln,
@@ -154,14 +169,40 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
     );
   }
 
-  /// The drag handle: up expands, down collapses or closes.
-  Widget _handle() => GestureDetector(
+  void _dragStart(DragStartDetails _) {
+    final box = _sheetKey.currentContext?.findRenderObject() as RenderBox?;
+    setState(() {
+      _dragging = true;
+      _height = box?.size.height ?? _screen * 0.4;
+    });
+  }
+
+  void _dragUpdate(DragUpdateDetails d) =>
+      setState(() => _height = ((_height ?? 0) - d.delta.dy).clamp(120.0, _screen));
+
+  /// Let go near the top (or flung up): the app; flung down or nearly gone:
+  /// closed; anywhere else: the sheet stays at that height.
+  void _dragEnd(DragEndDetails d) {
+    final v = d.primaryVelocity ?? 0;
+    final h = _height ?? 0;
+    setState(() => _dragging = false);
+    if (h >= _screen * 0.9 || v < -1500) {
+      _setExpanded(true);
+    } else if (v > 1200 || h < 150) {
+      _close();
+    }
+  }
+
+  /// The part of the sheet that resizes it when dragged.
+  Widget _dragArea(Widget child) => GestureDetector(
     behavior: HitTestBehavior.opaque,
-    onVerticalDragEnd: (d) {
-      final v = d.primaryVelocity ?? 0;
-      if (v < -200) _setExpanded(true);
-      if (v > 200) _expanded ? _setExpanded(false) : _close();
-    },
+    onVerticalDragStart: _dragStart,
+    onVerticalDragUpdate: _dragUpdate,
+    onVerticalDragEnd: _dragEnd,
+    child: child,
+  );
+
+  Widget _handle() => GestureDetector(
     onTap: () => _setExpanded(!_expanded),
     child: Center(
       child: Container(
@@ -209,11 +250,17 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
     final ready = app.modelPath != null && !app.loading;
     final title = last?.user ?? (ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'No model loaded'));
     return Column(
-      mainAxisSize: MainAxisSize.min,
+      mainAxisSize: _height != null ? MainAxisSize.max : MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _handle(),
-        _header(theme, title: title),
+        _dragArea(
+          Column(
+            children: [
+              _handle(),
+              _header(theme, title: title),
+            ],
+          ),
+        ),
         if (last != null)
           Flexible(
             child: SingleChildScrollView(
@@ -244,6 +291,8 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
             ],
           ),
         ],
+        // A resized sheet keeps its composer at the bottom.
+        if (_height != null && last == null) const Spacer(),
         const SizedBox(height: 12),
         _composer(theme),
       ],

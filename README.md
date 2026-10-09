@@ -449,8 +449,9 @@ are called directly because the C API makes them thread-safe.
 * **Assistant sheet.** Liyab can be the default digital assistant (Settings → Assistant opens the system's
   default-apps page; Android does not let apps request that role with a dialog). The assist gesture (holding the
   power or home button) then starts `AssistActivity` through `ACTION_ASSIST`: a see-through window over the
-  current app where a sheet rises with the living flame, a text field and the latest answer. Expanding it
-  (button, or dragging its handle up) grows it into the app itself, as Gemini's overlay does: the chat screen with
+  current app where a sheet rises with the living flame, a text field and the latest answer. Dragging its handle
+  or header resizes it (it stays where it is let go); reaching the top edge, flinging it up or the expand button
+  turns it into the app itself, as Gemini's overlay does: the chat screen with
   the whole conversation and the navigation drawer (Models, Activity, Settings), still in the same window over the
   previous app; "Show as a sheet" or Back shrinks it to the sheet again, and closing returns to the app. (Pages
   that need a full activity, such as importing a file, may not open from that window yet.) Its edge glows in the flame's colours (following the
