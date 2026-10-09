@@ -41,7 +41,6 @@ class AssistSheet extends StatefulWidget {
 
 class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStateMixin {
   final _input = TextEditingController();
-  final _scroll = ScrollController();
   late final AnimationController _rise = AnimationController(vsync: this, duration: const Duration(milliseconds: 380))
     ..forward();
   late final int _firstMessage = widget.app.messages.length; // the sheet shows only what was asked here
@@ -52,7 +51,6 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
   @override
   void dispose() {
     _input.dispose();
-    _scroll.dispose();
     _rise.dispose();
     super.dispose();
   }
@@ -88,58 +86,70 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
   @override
   Widget build(BuildContext context) {
     final height = MediaQuery.sizeOf(context).height;
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      resizeToAvoidBottomInset: true,
-      body: Stack(
-        children: [
-          // Outside the sheet: a dim layer that closes it (compact only).
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: _expanded ? null : _close,
-              child: FadeTransition(
-                opacity: CurvedAnimation(parent: _rise, curve: Curves.easeOut),
-                child: const ColoredBox(color: Color(0x66000000)),
+    return PopScope(
+      canPop: false,
+      // Back (once pages pushed from the drawer are closed): collapse, then close.
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _expanded ? _setExpanded(false) : _close();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        resizeToAvoidBottomInset: true,
+        body: Stack(
+          children: [
+            // Outside the sheet: a dim layer that closes it (compact only).
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _expanded ? null : _close,
+                child: FadeTransition(
+                  opacity: CurvedAnimation(parent: _rise, curve: Curves.easeOut),
+                  child: const ColoredBox(color: Color(0x66000000)),
+                ),
               ),
             ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: SlideTransition(
-              position: Tween(
-                begin: const Offset(0, 1),
-                end: Offset.zero,
-              ).animate(CurvedAnimation(parent: _rise, curve: Curves.easeOutCubic)),
-              child: ListenableBuilder(
-                listenable: Listenable.merge([app, app.monitor]),
-                builder: (context, _) => _EmberEdge(
-                  state: _flame,
-                  heat: app.monitor.heat,
-                  radius: _expanded ? 0 : 28,
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 360),
-                    curve: Curves.easeOutCubic,
-                    // Constraints animate (a null height cannot): compact fits its
-                    // content up to 60 % of the screen, expanded fills it.
-                    constraints: _expanded
-                        ? BoxConstraints.tightFor(height: height)
-                        : BoxConstraints(maxHeight: height * 0.6),
-                    decoration: BoxDecoration(
-                      color: Palette.kiln,
-                      borderRadius: BorderRadius.vertical(top: Radius.circular(_expanded ? 0 : 28)),
-                    ),
-                    child: SafeArea(
-                      top: _expanded,
-                      minimum: const EdgeInsets.fromLTRB(14, 6, 14, 12),
-                      child: _expanded ? _full(context) : _compact(context),
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: SlideTransition(
+                position: Tween(
+                  begin: const Offset(0, 1),
+                  end: Offset.zero,
+                ).animate(CurvedAnimation(parent: _rise, curve: Curves.easeOutCubic)),
+                child: ListenableBuilder(
+                  listenable: Listenable.merge([app, app.monitor]),
+                  builder: (context, _) => _EmberEdge(
+                    state: _flame,
+                    heat: app.monitor.heat,
+                    radius: _expanded ? 0 : 28,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 360),
+                      curve: Curves.easeOutCubic,
+                      // Constraints animate (a null height cannot): compact fits its
+                      // content up to 60 % of the screen, expanded fills it.
+                      constraints: _expanded
+                          ? BoxConstraints.tightFor(height: height)
+                          : BoxConstraints(maxHeight: height * 0.6),
+                      decoration: BoxDecoration(
+                        color: Palette.kiln,
+                        borderRadius: BorderRadius.vertical(top: Radius.circular(_expanded ? 0 : 28)),
+                      ),
+                      // Expanded, the sheet becomes the app itself: its chat screen
+                      // with the whole conversation and the navigation drawer.
+                      child: _expanded
+                          ? ChatScreen(app: app, onCollapse: () => _setExpanded(false))
+                          : SafeArea(
+                              top: false,
+                              minimum: const EdgeInsets.fromLTRB(14, 6, 14, 12),
+                              child: _compact(context),
+                            ),
                     ),
                   ),
                 ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -235,39 +245,6 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
           ),
         ],
         const SizedBox(height: 12),
-        _composer(theme),
-      ],
-    );
-  }
-
-  Widget _full(BuildContext context) {
-    final theme = Theme.of(context);
-    final asked = _asked;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients && _scroll.position.extentAfter < 120) _scroll.jumpTo(_scroll.position.maxScrollExtent);
-    });
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _handle(),
-        _header(theme, title: 'Liyab'),
-        Expanded(
-          child: asked.isEmpty
-              ? Center(
-                  child: Text(
-                    'Ask anything. The conversation stays on this phone.',
-                    style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                    textAlign: TextAlign.center,
-                  ),
-                )
-              : ListView.builder(
-                  controller: _scroll,
-                  padding: const EdgeInsets.fromLTRB(4, 4, 4, 16),
-                  itemCount: asked.length,
-                  itemBuilder: (context, i) => MessageView(message: asked[i]),
-                ),
-        ),
-        const SizedBox(height: 8),
         _composer(theme),
       ],
     );

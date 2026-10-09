@@ -10,8 +10,11 @@ import '../ui/theme.dart';
 import 'model_sheet.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.app});
+  const ChatScreen({super.key, required this.app, this.onCollapse});
   final AppState app;
+
+  /// Set when the chat fills the assistant sheet: shrinks it back to the sheet.
+  final VoidCallback? onCollapse;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -84,21 +87,26 @@ class _ChatScreenState extends State<ChatScreen> {
           onTap: () => showModelSheet(context, app),
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-            child: Row(children: [
-              LivingFlame(size: 34, state: _flameState, heat: _heat),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Liyab', style: theme.textTheme.titleLarge),
-                  Text(
-                    app.loading ? app.status : (app.modelName.isEmpty ? 'Choose a model' : app.modelName),
-                    style: theme.textTheme.labelSmall,
-                    overflow: TextOverflow.ellipsis,
+            child: Row(
+              children: [
+                LivingFlame(size: 34, state: _flameState, heat: _heat),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Liyab', style: theme.textTheme.titleLarge),
+                      Text(
+                        app.loading ? app.status : (app.modelName.isEmpty ? 'Choose a model' : app.modelName),
+                        style: theme.textTheme.labelSmall,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
                   ),
-                ]),
-              ),
-              Icon(Icons.expand_more, color: theme.colorScheme.onSurfaceVariant, size: 20),
-            ]),
+                ),
+                Icon(Icons.expand_more, color: theme.colorScheme.onSurfaceVariant, size: 20),
+              ],
+            ),
           ),
         ),
         actions: [
@@ -107,33 +115,41 @@ class _ChatScreenState extends State<ChatScreen> {
             onPressed: app.messages.isEmpty || app.generating ? null : app.newChat,
             icon: const Icon(Icons.edit_note_rounded),
           ),
+          if (widget.onCollapse != null)
+            IconButton(
+              tooltip: 'Show as a sheet',
+              onPressed: widget.onCollapse,
+              icon: const Icon(Icons.close_fullscreen_rounded),
+            ),
           const SizedBox(width: 4),
         ],
       ),
-      body: Column(children: [
-        Expanded(
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 350),
-            child: app.messages.isEmpty
-                ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
-                : ListView.builder(
-                    key: const ValueKey('messages'),
-                    controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                    itemCount: app.messages.length,
-                    itemBuilder: (context, i) => MessageView(message: app.messages[i]),
-                  ),
+      body: Column(
+        children: [
+          Expanded(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 350),
+              child: app.messages.isEmpty
+                  ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
+                  : ListView.builder(
+                      key: const ValueKey('messages'),
+                      controller: _scroll,
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                      itemCount: app.messages.length,
+                      itemBuilder: (context, i) => MessageView(message: app.messages[i]),
+                    ),
+            ),
           ),
-        ),
-        _Composer(
-          controller: _input,
-          focus: _focus,
-          enabled: app.modelPath != null && !app.loading,
-          generating: app.generating,
-          onSend: _send,
-          onStop: app.stop,
-        ),
-      ]),
+          _Composer(
+            controller: _input,
+            focus: _focus,
+            enabled: app.modelPath != null && !app.loading,
+            generating: app.generating,
+            onSend: _send,
+            onStop: app.stop,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -159,44 +175,47 @@ class _EmptyChat extends StatelessWidget {
       key: const ValueKey('empty'),
       child: SingleChildScrollView(
         padding: const EdgeInsets.symmetric(horizontal: 24),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          LivingFlame(size: 168, state: app.loading ? FlameState.thinking : flameState, heat: heat),
-          const SizedBox(height: 8),
-          Text(
-            ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'Choose a model to begin'),
-            style: theme.textTheme.headlineMedium,
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 6),
-          Text(
-            ready ? 'Runs on this phone. Nothing you write leaves it.' : app.status,
-            style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
-          if (ready)
-            Wrap(
-              alignment: WrapAlignment.center,
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (final s in _suggestions)
-                  ActionChip(
-                    label: Text(s),
-                    onPressed: () => onSuggestion(s),
-                    backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                    side: BorderSide(color: theme.colorScheme.outline),
-                    shape: const StadiumBorder(),
-                  ),
-              ],
-            )
-          else if (!app.loading)
-            FilledButton.icon(
-              onPressed: () => showModelSheet(context, app),
-              icon: const Icon(Icons.folder_open_rounded),
-              label: const Text('Choose a model'),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            LivingFlame(size: 168, state: app.loading ? FlameState.thinking : flameState, heat: heat),
+            const SizedBox(height: 8),
+            Text(
+              ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'Choose a model to begin'),
+              style: theme.textTheme.headlineMedium,
+              textAlign: TextAlign.center,
             ),
-        ]),
+            const SizedBox(height: 6),
+            Text(
+              ready ? 'Runs on this phone. Nothing you write leaves it.' : app.status,
+              style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            if (ready)
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final s in _suggestions)
+                    ActionChip(
+                      label: Text(s),
+                      onPressed: () => onSuggestion(s),
+                      backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                      side: BorderSide(color: theme.colorScheme.outline),
+                      shape: const StadiumBorder(),
+                    ),
+                ],
+              )
+            else if (!app.loading)
+              FilledButton.icon(
+                onPressed: () => showModelSheet(context, app),
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('Choose a model'),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -220,58 +239,65 @@ class MessageView extends StatelessWidget {
         opacity: v,
         child: Transform.translate(offset: Offset(0, (1 - v) * 12), child: child),
       ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        const SizedBox(height: 16),
-        // The user's message: a pill on the right.
-        Align(
-          alignment: Alignment.centerRight,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.8),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SizedBox(height: 16),
+          // The user's message: a pill on the right.
+          Align(
+            alignment: Alignment.centerRight,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(22),
+                ),
+                child: SelectableText(message.user, style: theme.textTheme.bodyLarge),
               ),
-              child: SelectableText(message.user, style: theme.textTheme.bodyLarge),
             ),
           ),
-        ),
-        const SizedBox(height: 14),
-        if (reasoning != null) _Reasoning(text: reasoning, active: message.thinkingNow),
-        // The reply: plain text, full width, like a page.
-        if (message.answer.isNotEmpty || (message.streaming && reasoning == null))
-          AnimatedSize(
-            duration: const Duration(milliseconds: 120),
-            alignment: Alignment.topLeft,
-            child: SelectableText.rich(
-              TextSpan(children: [
-                TextSpan(text: message.answer),
-                if (message.streaming && !message.thinkingNow)
-                  const WidgetSpan(alignment: PlaceholderAlignment.middle, child: _Caret()),
-              ]),
-              style: theme.textTheme.bodyLarge,
+          const SizedBox(height: 14),
+          if (reasoning != null) _Reasoning(text: reasoning, active: message.thinkingNow),
+          // The reply: plain text, full width, like a page.
+          if (message.answer.isNotEmpty || (message.streaming && reasoning == null))
+            AnimatedSize(
+              duration: const Duration(milliseconds: 120),
+              alignment: Alignment.topLeft,
+              child: SelectableText.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(text: message.answer),
+                    if (message.streaming && !message.thinkingNow)
+                      const WidgetSpan(alignment: PlaceholderAlignment.middle, child: _Caret()),
+                  ],
+                ),
+                style: theme.textTheme.bodyLarge,
+              ),
             ),
-          ),
-        if (message.error != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Text('The reply stopped: ${message.error}',
-                style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error)),
-          ),
-        if (stats != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Text(
-              '${stats.generatedTokens} tokens, ${stats.tokensPerSecond.toStringAsFixed(1)} tok/s, '
-              'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, '
-              '${stats.cachedPrefixTokens} of ${stats.promptTokens} prompt tokens reused'
-              '${stats.thermalReroutes > 0 ? ', cooling down' : ''}'
-              '${stats.cancelled ? ', stopped' : ''}',
-              style: theme.textTheme.labelSmall,
+          if (message.error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'The reply stopped: ${message.error}',
+                style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error),
+              ),
             ),
-          ),
-      ]),
+          if (stats != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                '${stats.generatedTokens} tokens, ${stats.tokensPerSecond.toStringAsFixed(1)} tok/s, '
+                'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, '
+                '${stats.cachedPrefixTokens} of ${stats.promptTokens} prompt tokens reused'
+                '${stats.thermalReroutes > 0 ? ', cooling down' : ''}'
+                '${stats.cancelled ? ', stopped' : ''}',
+                style: theme.textTheme.labelSmall,
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
@@ -296,30 +322,38 @@ class _ReasoningState extends State<_Reasoning> {
     final show = widget.active || _open;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: widget.active ? null : () => setState(() => _open = !_open),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 4),
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              Text(widget.active ? 'Thinking' : 'Reasoning', style: muted?.copyWith(fontWeight: FontWeight.w600)),
-              if (!widget.active) Icon(show ? Icons.expand_less : Icons.expand_more, size: 18, color: muted?.color),
-            ]),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: widget.active ? null : () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(widget.active ? 'Thinking' : 'Reasoning', style: muted?.copyWith(fontWeight: FontWeight.w600)),
+                  if (!widget.active) Icon(show ? Icons.expand_less : Icons.expand_more, size: 18, color: muted?.color),
+                ],
+              ),
+            ),
           ),
-        ),
-        AnimatedSize(
-          duration: const Duration(milliseconds: 220),
-          alignment: Alignment.topLeft,
-          child: show
-              ? Container(
-                  padding: const EdgeInsets.only(left: 12),
-                  decoration: BoxDecoration(border: Border(left: BorderSide(color: theme.colorScheme.outline, width: 2))),
-                  child: Text(widget.text, style: muted),
-                )
-              : const SizedBox(width: double.infinity),
-        ),
-      ]),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            alignment: Alignment.topLeft,
+            child: show
+                ? Container(
+                    padding: const EdgeInsets.only(left: 12),
+                    decoration: BoxDecoration(
+                      border: Border(left: BorderSide(color: theme.colorScheme.outline, width: 2)),
+                    ),
+                    child: Text(widget.text, style: muted),
+                  )
+                : const SizedBox(width: double.infinity),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -332,8 +366,8 @@ class _Caret extends StatefulWidget {
 }
 
 class _CaretState extends State<_Caret> with SingleTickerProviderStateMixin {
-  late final AnimationController _c =
-      AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat(reverse: true);
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))
+    ..repeat(reverse: true);
 
   @override
   void dispose() {
@@ -343,17 +377,17 @@ class _CaretState extends State<_Caret> with SingleTickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) => FadeTransition(
-        opacity: Tween(begin: 0.35, end: 1.0).animate(_c),
-        child: Container(
-          width: 9,
-          height: 9,
-          margin: const EdgeInsets.only(left: 4),
-          decoration: const BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: LinearGradient(colors: [Palette.flare, Palette.gold]),
-          ),
-        ),
-      );
+    opacity: Tween(begin: 0.35, end: 1.0).animate(_c),
+    child: Container(
+      width: 9,
+      height: 9,
+      margin: const EdgeInsets.only(left: 4),
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(colors: [Palette.flare, Palette.gold]),
+      ),
+    ),
+  );
 }
 
 class _Composer extends StatelessWidget {
@@ -376,71 +410,77 @@ class _Composer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Stack(clipBehavior: Clip.none, children: [
-      // The flame's glow rises over the composer while the model works.
-      Positioned(
-        left: 0,
-        right: 0,
-        top: -48,
-        height: 48,
-        child: IgnorePointer(
-          child: AnimatedOpacity(
-            opacity: generating ? 1 : 0,
-            duration: const Duration(milliseconds: 500),
-            child: const DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  center: Alignment.bottomCenter,
-                  radius: 1.6,
-                  colors: [Color(0x55FF7A3D), Color(0x00FF7A3D)],
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        // The flame's glow rises over the composer while the model works.
+        Positioned(
+          left: 0,
+          right: 0,
+          top: -48,
+          height: 48,
+          child: IgnorePointer(
+            child: AnimatedOpacity(
+              opacity: generating ? 1 : 0,
+              duration: const Duration(milliseconds: 500),
+              child: const DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: RadialGradient(
+                    center: Alignment.bottomCenter,
+                    radius: 1.6,
+                    colors: [Color(0x55FF7A3D), Color(0x00FF7A3D)],
+                  ),
                 ),
               ),
             ),
           ),
         ),
-      ),
-      SafeArea(
-        top: false,
-        minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(color: theme.colorScheme.outline),
-          ),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                focusNode: focus,
-                enabled: enabled,
-                minLines: 1,
-                maxLines: 6,
-                textCapitalization: TextCapitalization.sentences,
-                style: theme.textTheme.bodyLarge,
-                decoration: InputDecoration(
-                  hintText: enabled ? 'Ask Liyab' : 'Load a model first',
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+        SafeArea(
+          top: false,
+          minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(28),
+              border: Border.all(color: theme.colorScheme.outline),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    focusNode: focus,
+                    enabled: enabled,
+                    minLines: 1,
+                    maxLines: 6,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: theme.textTheme.bodyLarge,
+                    decoration: InputDecoration(
+                      hintText: enabled ? 'Ask Liyab' : 'Load a model first',
+                      border: InputBorder.none,
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    onSubmitted: enabled && !generating ? (_) => onSend() : null,
+                  ),
                 ),
-                onSubmitted: enabled && !generating ? (_) => onSend() : null,
-              ),
+                const SizedBox(width: 6),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: RoundAction(
+                    tooltip: generating ? 'Stop' : 'Send',
+                    icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
+                    onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 6),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 2),
-              child: RoundAction(
-                tooltip: generating ? 'Stop' : 'Send',
-                icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
-                onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
-              ),
-            ),
-          ]),
+          ),
         ),
-      ),
-    ]);
+      ],
+    );
   }
 }
 
@@ -453,29 +493,33 @@ class RoundAction extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Tooltip(
-        message: tooltip,
-        child: AnimatedOpacity(
-          opacity: onPressed == null ? 0.4 : 1,
-          duration: const Duration(milliseconds: 200),
-          child: Material(
-            shape: const CircleBorder(),
-            clipBehavior: Clip.antiAlias,
-            child: Ink(
-              width: 44,
-              height: 44,
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(begin: Alignment.bottomLeft, end: Alignment.topRight, colors: [Palette.flare, Palette.ember]),
-              ),
-              child: InkWell(
-                onTap: onPressed,
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 180),
-                  transitionBuilder: (c, a) => ScaleTransition(scale: a, child: c),
-                  child: Icon(icon, key: ValueKey(icon), color: Colors.white),
-                ),
-              ),
+    message: tooltip,
+    child: AnimatedOpacity(
+      opacity: onPressed == null ? 0.4 : 1,
+      duration: const Duration(milliseconds: 200),
+      child: Material(
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: Ink(
+          width: 44,
+          height: 44,
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.bottomLeft,
+              end: Alignment.topRight,
+              colors: [Palette.flare, Palette.ember],
+            ),
+          ),
+          child: InkWell(
+            onTap: onPressed,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              transitionBuilder: (c, a) => ScaleTransition(scale: a, child: c),
+              child: Icon(icon, key: ValueKey(icon), color: Colors.white),
             ),
           ),
         ),
-      );
+      ),
+    ),
+  );
 }
