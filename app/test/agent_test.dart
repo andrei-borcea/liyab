@@ -52,6 +52,37 @@ void main() {
     expect(AppState.nowLine(DateTime(2026, 10, 9, 13, 5)), startsWith('[Now: Friday 9 October 2026, 13:05, UTC'));
   });
 
+  test('tool results are short lines, days shown only when not today', () {
+    final now = DateTime(2026, 10, 9, 13, 0);
+    int ms(DateTime t) => t.millisecondsSinceEpoch;
+    final events = ToolText.events([
+      {'title': 'Standup', 'begin': ms(DateTime(2026, 10, 9, 9)), 'end': ms(DateTime(2026, 10, 9, 9, 30)), 'calendar': 'Work'},
+      {'title': 'Dentist', 'begin': ms(DateTime(2026, 10, 10, 14)), 'end': ms(DateTime(2026, 10, 10, 15)), 'location': 'Via Roma 1'},
+      {'title': 'Holiday', 'begin': ms(DateTime(2026, 10, 9)), 'end': ms(DateTime(2026, 10, 10)), 'allDay': true},
+    ], DateTime(2026, 10, 9), DateTime(2026, 10, 11), now);
+    expect(events.split('\n'), [
+      'Calendar from 2026-10-09 00:00 to 2026-10-11 00:00, 3 events:',
+      '- 09:00-09:30 Standup [Work]',
+      '- 2026-10-10 14:00-15:00 Dentist @ Via Roma 1',
+      '- 2026-10-09 all day Holiday',
+    ]);
+    expect(ToolText.events([], DateTime(2026, 10, 9), DateTime(2026, 10, 10), now), endsWith(': no events.'));
+  });
+
+  test('notifications drop reposts and keep the newest', () {
+    final now = DateTime(2026, 10, 9, 13, 0);
+    final raw = [
+      for (var i = 0; i < 30; ++i)
+        {'app': 'WhatsApp', 'title': 'Marco', 'text': 'message $i', 'time': DateTime(2026, 10, 9, 12, i).millisecondsSinceEpoch},
+      {'app': 'WhatsApp', 'title': 'Marco', 'text': 'message 29', 'time': DateTime(2026, 10, 9, 12, 31).millisecondsSinceEpoch},
+    ];
+    final lines = ToolText.notifications(raw, DateTime(2026, 10, 9, 8), '', now, limit: 5).split('\n');
+    expect(lines.first, 'Notifications since 08:00 (newest 5 of 30), newest first:');
+    expect(lines[1], '- 12:31 WhatsApp: Marco - message 29');
+    expect(lines.length, 6);
+    expect(ToolText.notifications(raw, DateTime(2026, 10, 9, 8), 'gmail', now), endsWith('from gmail: none.'));
+  });
+
   test('a saved message comes back as the model saw it', () {
     final m = ChatMessage('What do I have today?', '<think>\n\n</think>\n\n', promptUser: 'What do I have today?\n\n[Now: …]')
       ..done = 'call<tool_response>{}</tool_response>'

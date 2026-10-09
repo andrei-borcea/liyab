@@ -508,7 +508,7 @@ class AppState extends ChangeNotifier {
         final tool = call == null ? null : toolbox.byName(call.name);
         if (call == null) break;
         final (result, summary) = tool == null || !toolbox.isOn(tool)
-            ? ('{"error": "No tool named ${call.name} is available."}', 'Unknown tool')
+            ? ('No tool named ${call.name} is available.', 'Unknown tool')
             : await _runTool(tool, call);
         if (tool != null) message.steps.add(ToolStep(tool.label, summary));
         _log('Tool ${call.name}(${call.arguments}): $summary');
@@ -535,7 +535,7 @@ class AppState extends ChangeNotifier {
     try {
       return await tool.run(call.arguments);
     } on Exception catch (e) {
-      return ('{"error": "The tool failed: $e"}', 'Failed');
+      return ('The tool failed: $e', 'Failed');
     }
   }
 

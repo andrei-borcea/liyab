@@ -1,8 +1,8 @@
 // Agent tools: what the model may read on the phone to answer about the
 // user's own data. Each tool is off until the user turns it on in Settings
 // (and Android grants its permission); only enabled tools are offered to the
-// model. Results stay on the device and go back to the model as data.
-import 'dart:convert';
+// model. Results stay on the device and go back to the model as data, as
+// short text (ToolText).
 
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -59,7 +59,108 @@ abstract class AgentTool {
 const _data = MethodChannel('liyab/data');
 
 String _two(int v) => v.toString().padLeft(2, '0');
-String _local(DateTime t) => '${t.year}-${_two(t.month)}-${_two(t.day)} ${_two(t.hour)}:${_two(t.minute)}';
+
+/// Tool results as short text, one line per item. Before the answer starts the
+/// model processes every token of a result, and on a 35B MoE that costs about
+/// as much as generating one: JSON repeats every key on every item, so the same
+/// items as lines take about half the tokens. Lists are capped, newest first,
+/// and long texts cut. Dates are ISO 8601 (no day or month names, which the
+/// model could carry into an answer in another language); today's times stand
+/// alone, since each user turn ends with the current date and weekday.
+abstract final class ToolText {
+  static String day(DateTime t) => '${t.year}-${_two(t.month)}-${_two(t.day)}';
+  static String hm(DateTime t) => '${_two(t.hour)}:${_two(t.minute)}';
+  static bool _sameDay(DateTime a, DateTime b) => a.year == b.year && a.month == b.month && a.day == b.day;
+
+  /// `t` as a time, with its day unless it falls on `today`.
+  static String at(DateTime t, DateTime today) => _sameDay(t, today) ? hm(t) : '${day(t)} ${hm(t)}';
+
+  /// One line, at most `max` characters.
+  static String clip(Object? text, int max) {
+    final s = '${text ?? ''}'.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return s.length <= max ? s : '${s.substring(0, max - 1)}…';
+  }
+
+  static DateTime _time(Object? ms) => DateTime.fromMillisecondsSinceEpoch((ms as num).toInt());
+
+  /// Calendar instances (DataChannel.calendarEvents) between `from` and `to`.
+  static String events(List<Map<Object?, Object?>> raw, DateTime from, DateTime to, DateTime now) {
+    final head = 'Calendar from ${day(from)} ${hm(from)} to ${day(to)} ${hm(to)}';
+    if (raw.isEmpty) return '$head: no events.';
+    final lines = [
+      for (final e in raw)
+        () {
+          final begin = _time(e['begin']), end = _time(e['end']);
+          final when = e['allDay'] == true
+              ? '${day(begin)} all day'
+              : '${at(begin, now)}-${_sameDay(begin, end) ? hm(end) : at(end, now)}';
+          final title = clip(e['title'] ?? '(no title)', 120);
+          final location = clip(e['location'], 80), calendar = clip(e['calendar'], 40), notes = clip(e['description'], 120);
+          return '- $when $title${location.isEmpty ? '' : ' @ $location'}${calendar.isEmpty ? '' : ' [$calendar]'}'
+              '${notes.isEmpty ? '' : ' (notes: $notes)'}';
+        }()
+    ];
+    return '$head, ${raw.length} event${raw.length == 1 ? '' : 's'}:\n${lines.join('\n')}';
+  }
+
+  /// Notifications (newest last in `raw`), duplicates dropped, newest first, at most `limit`.
+  static String notifications(List<Map<Object?, Object?>> raw, DateTime since, String app, DateTime now,
+      {int limit = 25}) {
+    final seen = <String>{};
+    final lines = <String>[];
+    var total = 0;
+    for (final n in raw.reversed) {
+      if (app.isNotEmpty && !'${n['app']}'.toLowerCase().contains(app.toLowerCase())) continue;
+      final title = clip(n['title'], 80), text = clip(n['text'], 200);
+      if (!seen.add('${n['app']}|$title|$text')) continue; // chat apps repost the same lines
+      ++total;
+      if (lines.length < limit) {
+        lines.add('- ${at(_time(n['time']), now)} ${clip(n['app'], 30)}: $title${text.isEmpty ? '' : ' - $text'}');
+      }
+    }
+    final head = 'Notifications since ${at(since, now)}${app.isEmpty ? '' : ' from $app'}';
+    if (lines.isEmpty) return '$head: none.';
+    final more = total > lines.length ? ' (newest $limit of $total)' : '';
+    return '$head$more, newest first:\n${lines.join('\n')}';
+  }
+
+  /// SMS (DataChannel.sms, newest first), at most `limit`.
+  static String sms(List<Map<Object?, Object?>> raw, DateTime since, DateTime now, {int limit = 30}) {
+    final head = 'Text messages since ${at(since, now)}';
+    if (raw.isEmpty) return '$head: none.';
+    final lines = [
+      for (final m in raw.take(limit))
+        '- ${at(_time(m['time']), now)} ${m['sent'] == true ? 'to' : 'from'} ${clip(m['from'], 40)}: ${clip(m['text'], 300)}'
+    ];
+    final more = raw.length > limit ? ' (newest $limit of ${raw.length})' : '';
+    return '$head$more, newest first:\n${lines.join('\n')}';
+  }
+
+  /// Calls (DataChannel.calls, newest first), at most `limit`.
+  static String calls(List<Map<Object?, Object?>> raw, DateTime since, DateTime now, {int limit = 30}) {
+    final head = 'Calls since ${at(since, now)}';
+    if (raw.isEmpty) return '$head: none.';
+    String length(Object? s) {
+      final v = (s as num?)?.toInt() ?? 0;
+      return v == 0 ? '' : ' (${v ~/ 60}:${_two(v % 60)})';
+    }
+
+    final lines = [
+      for (final c in raw.take(limit)) '- ${at(_time(c['time']), now)} ${c['type']} ${clip(c['who'], 40)}${length(c['seconds'])}'
+    ];
+    final more = raw.length > limit ? ' (newest $limit of ${raw.length})' : '';
+    return '$head$more, newest first:\n${lines.join('\n')}';
+  }
+
+  /// Contacts (DataChannel.contacts): name, numbers, email addresses.
+  static String contacts(List<Object?> raw, String query) {
+    if (raw.isEmpty) return 'No contact matches "$query".';
+    return [
+      for (final c in raw.cast<Map<Object?, Object?>>())
+        '- ${c['name']}: ${[...(c['phones'] as List? ?? const []), ...(c['emails'] as List? ?? const [])].join(', ')}'
+    ].join('\n');
+  }
+}
 
 class CalendarTool extends AgentTool {
   @override
@@ -67,7 +168,6 @@ class CalendarTool extends AgentTool {
 
   @override
   String get label => 'Read your calendar';
-
 
   @override
   String get description =>
@@ -96,28 +196,12 @@ class CalendarTool extends AgentTool {
     var end = DateTime.tryParse('${args['end'] ?? ''}') ?? today.add(const Duration(days: 1));
     if (!end.isAfter(start)) end = start.add(const Duration(days: 1));
     if (!await permitted()) {
-      return (jsonEncode({'error': 'Calendar access is off. The user can allow it in Liyab Settings.'}), 'Calendar access is off');
+      return ('Calendar access is off. The user can allow it in Liyab Settings.', 'Calendar access is off');
     }
     final raw = await _data.invokeListMethod<Map<Object?, Object?>>(
             'calendarEvents', {'start': start.millisecondsSinceEpoch, 'end': end.millisecondsSinceEpoch}) ??
         const [];
-    final events = [
-      for (final e in raw)
-        {
-          'title': e['title'] ?? '(no title)',
-          if (e['allDay'] == true)
-            'all_day': true
-          else ...{
-            'start': _local(DateTime.fromMillisecondsSinceEpoch((e['begin'] as num).toInt())),
-            'end': _local(DateTime.fromMillisecondsSinceEpoch((e['end'] as num).toInt())),
-          },
-          if ((e['location'] as String?)?.isNotEmpty ?? false) 'location': e['location'],
-          if ((e['calendar'] as String?)?.isNotEmpty ?? false) 'calendar': e['calendar'],
-          if ((e['description'] as String?)?.isNotEmpty ?? false) 'notes': e['description'],
-        }
-    ];
-    final result = jsonEncode({'from': _local(start), 'to': _local(end), 'events': events});
-    return (result, events.isEmpty ? 'No events' : '${events.length} event${events.length == 1 ? '' : 's'}');
+    return (ToolText.events(raw, start, end, now), raw.isEmpty ? 'No events' : _plural(raw.length, 'event'));
   }
 }
 
@@ -138,10 +222,10 @@ class ClipboardTool extends AgentTool {
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
     final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
-    if (text.isEmpty) return (jsonEncode({'text': '', 'note': 'The clipboard is empty.'}), 'Nothing copied');
+    if (text.isEmpty) return ('The clipboard is empty.', 'Nothing copied');
     const limit = 6000;
     final clipped = text.length > limit ? '${text.substring(0, limit)}…' : text;
-    return (jsonEncode({'text': clipped}), '${text.length} characters');
+    return ('Copied text:\n$clipped', '${text.length} characters');
   }
 }
 
@@ -174,8 +258,9 @@ class ContactsTool extends AgentTool {
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
-    final found = await _data.invokeListMethod<Object?>('contacts', {'query': '${args['name'] ?? ''}'}) ?? const [];
-    return (jsonEncode({'contacts': found}), _plural(found.length, 'contact'));
+    final query = '${args['name'] ?? ''}';
+    final found = await _data.invokeListMethod<Object?>('contacts', {'query': query}) ?? const [];
+    return (ToolText.contacts(found, query), _plural(found.length, 'contact'));
   }
 }
 
@@ -203,15 +288,7 @@ class MessagesTool extends AgentTool {
     final raw = await _data.invokeListMethod<Map<Object?, Object?>>(
             'sms', {'since': since.millisecondsSinceEpoch, 'from': args['from']}) ??
         const [];
-    final messages = [
-      for (final m in raw)
-        {
-          (m['sent'] == true ? 'to' : 'from'): m['from'],
-          'time': _local(DateTime.fromMillisecondsSinceEpoch((m['time'] as num).toInt())),
-          'text': m['text'],
-        }
-    ];
-    return (jsonEncode({'since': _local(since), 'messages': messages}), _plural(messages.length, 'message'));
+    return (ToolText.sms(raw, since, DateTime.now()), _plural(raw.length, 'message'));
   }
 }
 
@@ -234,16 +311,7 @@ class CallsTool extends AgentTool {
     final since = _since(args['since']);
     final raw = await _data.invokeListMethod<Map<Object?, Object?>>('calls', {'since': since.millisecondsSinceEpoch}) ??
         const [];
-    final calls = [
-      for (final c in raw)
-        {
-          'who': c['who'],
-          'type': c['type'],
-          'time': _local(DateTime.fromMillisecondsSinceEpoch((c['time'] as num).toInt())),
-          'seconds': c['seconds'],
-        }
-    ];
-    return (jsonEncode({'since': _local(since), 'calls': calls}), _plural(calls.length, 'call'));
+    return (ToolText.calls(raw, since, DateTime.now()), _plural(raw.length, 'call'));
   }
 }
 
@@ -273,21 +341,13 @@ class NotificationsTool extends AgentTool {
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
     final since = _since(args['since']);
-    final app = '${args['app'] ?? ''}'.toLowerCase();
+    final app = '${args['app'] ?? ''}';
     final raw = await _data.invokeListMethod<Map<Object?, Object?>>(
             'notifications', {'since': since.millisecondsSinceEpoch}) ??
         const [];
-    final items = [
-      for (final n in raw.reversed)
-        if (app.isEmpty || '${n['app']}'.toLowerCase().contains(app))
-          {
-            'app': n['app'],
-            'title': n['title'],
-            'text': n['text'],
-            'time': _local(DateTime.fromMillisecondsSinceEpoch((n['time'] as num).toInt())),
-          }
-    ].take(60).toList();
-    return (jsonEncode({'since': _local(since), 'notifications': items}), _plural(items.length, 'notification'));
+    final text = ToolText.notifications(raw, since, app, DateTime.now());
+    final shown = '\n'.allMatches(text).length;
+    return (text, _plural(shown, 'notification'));
   }
 }
 

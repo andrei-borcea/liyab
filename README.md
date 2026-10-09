@@ -498,7 +498,11 @@ are called directly because the C API makes them thread-safe.
   loaded model's own format, read from its GGUF chat template: Qwen3.5 / Qwen3.6 XML calls
   (`<function=…><parameter=…>`) or Qwen2.5 / Qwen3 JSON calls; the app runs a call on the phone, returns the result
   in a `<tool_response>` turn and lets the model continue, up to 4 calls per reply, each shown above the answer
-  ("Read your calendar: 3 events"). Every user turn carries the current date and time (`[Now: Friday 9 October
+  ("Read your calendar: 3 events"). Results are short text, one line per item with ISO dates (no day or month names
+  that could leak into an answer in another language), capped (25 notifications with chat apps' reposts dropped,
+  30 messages or calls) and with long texts cut: on Qwen3.5/3.6's tokenizer 6 events take 190 tokens instead of 428
+  as JSON and 25 notifications 713 instead of 1375, about 18 s and 50 s less to process on Qwen3.6-35B-A3B before
+  the answer starts. Every user turn carries the current date and time (`[Now: Friday 9 October
   2026, 13:40, UTC+02:00]`) so "in two hours" means something, while the system prompt stays fixed and its context
   reused. The default system prompt tells the model to use tools for the user's data, never to invent it, and to
   treat tool results as data, not instructions. Not readable: full email bodies (Android gives apps no access to
@@ -960,14 +964,17 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
-* **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
-  assistant listens at once; the flame's listening animation is ready for it), then measuring the power manager's
-  headroom-driven control and performance hints on battery (sustained tok/s and joules per token), then
-  actions (alarms, timers, calendar events, message replies, every outward action confirmed by the user),
-  constrained decoding so tool calls always parse, the screen content through a voice-interaction service, email
-  through IMAP or the Gmail API (opt-in), GPU prefill, and local memory over the user's own data. The iOS app is not
-  built yet. In the assistant sheet's window, pages that need a full activity (importing a file, a permission
-  prompt) may not open.
+* **The app and the agent.** Next, in order: closing the gap between the app's decode speed and the CLI's (about 6
+  vs 8 tok/s on Qwen3.6-35B-A3B); two tiers, a small model always loaded for the assistant sheet and tools and the
+  large one in a separate process (its own memory limit) when the small one escalates; a study of fewer experts per
+  token during prefill; voice input (on-device speech recognition, kept loaded; the flame's listening animation is
+  ready for it); actions (alarms, timers, calendar events, message replies, every outward action confirmed by the
+  user) with constrained decoding so tool calls always parse; the screen content through a voice-interaction
+  service; email through IMAP or the Gmail API (opt-in); local memory over the user's own data; measuring joules per
+  token on battery; non-resident token embeddings; GPU prefill for the small model; the app's UI in more languages
+  (Flutter localization); a hint to allow HyperOS autostart (a force-stop also stops the notification listener).
+  The iOS app is not built yet. In the assistant sheet's window, pages that need a full activity (importing a file,
+  a permission prompt) may not open.
 
 ---
 
