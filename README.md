@@ -446,6 +446,13 @@ are called directly because the C API makes them thread-safe.
 
 * **Pages.** A navigation drawer (with the model in use) leads to Chat, Models, Activity and Settings; the first
   launch shows a welcome page that explains the privacy model and asks for the one permission.
+* **Assistant sheet.** Liyab can be the default digital assistant (Settings → Assistant opens the system's
+  default-apps page; Android does not let apps request that role with a dialog). The assist gesture (holding the
+  power or home button) then starts `AssistActivity` through `ACTION_ASSIST`: a see-through window over the
+  current app where a sheet rises with the living flame, a text field and the streamed answer; tapping outside
+  closes it and "Continue in Liyab" opens the conversation in the app. Both windows share one Flutter engine
+  (`LiyabEngine`, created by the first activity, not at process start, so download jobs never load a model), so
+  the sheet uses the model already loaded instead of loading a second copy.
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system

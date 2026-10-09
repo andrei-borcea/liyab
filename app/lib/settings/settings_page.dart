@@ -2,6 +2,7 @@
 // the permissions Liyab uses.
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../engine/engine_service.dart';
 import '../state/app_state.dart';
@@ -17,6 +18,18 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   late final _system = TextEditingController(text: widget.app.settings.systemPrompt);
   late Future<PermissionStatus> _notifications = widget.app.downloads.notificationPermission();
+  static const _device = MethodChannel('liyab/device');
+  late Future<bool> _assistant = _isAssistant();
+
+  static Future<bool> _isAssistant() async {
+    try {
+      return await _device.invokeMethod<bool>('isAssistant') ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
   bool _dirty = false;
 
   AppState get app => widget.app;
@@ -114,6 +127,30 @@ class _SettingsPageState extends State<SettingsPage> {
             (v) => '${(v / 1024).toStringAsFixed(1)} GB', (v) => app.device.memoryBudgetMb = (v / 256).round() * 256),
         Text('HyperOS and MIUI close apps that use more than 6 GB. Both apply the next time the model loads.',
             style: muted),
+        heading('Assistant'),
+        FutureBuilder<bool>(
+          future: _assistant,
+          builder: (context, snap) {
+            final on = snap.data ?? false;
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(on ? Icons.assistant_rounded : Icons.assistant_outlined),
+              title: const Text('Open Liyab from any app'),
+              subtitle: Text(on
+                  ? 'Liyab is your digital assistant: hold the power button to ask it anything.'
+                  : 'Make Liyab the default digital assistant, then hold the power button to open it over any app.'),
+              trailing: on
+                  ? null
+                  : TextButton(
+                      onPressed: () async {
+                        await _device.invokeMethod<void>('openAssistantSettings');
+                        setState(() => _assistant = _isAssistant());
+                      },
+                      child: const Text('Set up'),
+                    ),
+            );
+          },
+        ),
         heading('Permissions'),
         FutureBuilder<PermissionStatus>(
           future: _notifications,
