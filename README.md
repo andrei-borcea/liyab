@@ -526,8 +526,11 @@ are called directly because the C API makes them thread-safe.
 * **Idle release.** A loaded model keeps several GB while Liyab sits in the background, and the process outlives
   its window (the notification listener keeps it running). After a minute hidden the expert cache is emptied
   (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the default budget; the model stays loaded, so the assistant still
-  answers at once). After 5 minutes hidden (1, 15, 60 minutes or never in Settings) the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
-  with the chat kept and the system prompt restored from its saved state.
+  answers at once). After 5 minutes hidden (1, 15, 60 minutes or never in Settings) the conversation's context is
+  saved (`save_state`) and the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
+  with the chat kept and the conversation's context restored, so the next message is not preceded by the whole chat
+  being processed again. A message sent meanwhile shows at once and waits for the model. App events (loads,
+  restores, trims; never message text or tool arguments) also go to logcat (`adb logcat -s flutter`).
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal
   headroom (cool with headroom, hot near throttling). It redraws about 24 times a second at rest and 30 while the

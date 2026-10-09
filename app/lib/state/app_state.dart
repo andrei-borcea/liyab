@@ -135,6 +135,14 @@ class AppState extends ChangeNotifier {
     if (path == null || _released != null) return;
     if (generating || loading || moving != null) return _scheduleRelease(); // busy: try again later
     _released = path; // set first: coming back during the unload reloads it (commands run in order)
+    if (messages.isNotEmpty) {
+      // The conversation's context, so the reload continues it instead of processing the chat again.
+      try {
+        await engine.saveState(await _conversationFile());
+      } on EngineException catch (e) {
+        _log('Conversation not saved: $e');
+      }
+    }
     _prepared = null;
     await engine.unload();
     if (_released != path) return; // back on screen meanwhile: already reloading
@@ -206,6 +214,8 @@ class AppState extends ChangeNotifier {
 
   void _log(String line, {bool engine = false}) {
     log.add(LogLine(line, engine: engine));
+    // App events in logcat too (adb logcat -s flutter), without tool arguments: they can hold the user's data.
+    if (!engine) debugPrint('liyab-app: ${line.startsWith('Tool ') ? line.split('(').first : line}');
     if (log.length > 1000) log.removeAt(0);
   }
 
@@ -269,7 +279,8 @@ class AppState extends ChangeNotifier {
       for (final line in description.split('\n')) {
         _log('  $line');
       }
-      unawaited(prepareSystemPrompt());
+      _preparing = keepChat ? _restoreConversation() : prepareSystemPrompt();
+      if (!keepChat) _discardConversation();
     } on EngineException catch (e) {
       status = 'Failed to load $name: $e';
       _log('ERROR: $e');
@@ -286,6 +297,41 @@ class AppState extends ChangeNotifier {
   /// Where the processed system block of this model is kept: one file per
   /// model, named with the block's hash (a changed prompt or tool list is a
   /// different file; the older one is deleted).
+  /// The context being prepared after a load (system prompt or saved conversation).
+  Future<void>? _preparing;
+
+  /// Where the conversation's context is kept while its model is unloaded for being idle.
+  Future<String> _conversationFile() async {
+    final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return '${dir.path}/$modelName.conversation.state';
+  }
+
+  Future<void> _discardConversation() async {
+    final file = File(await _conversationFile());
+    if (file.existsSync()) file.deleteSync();
+  }
+
+  /// After an idle reload: the conversation's saved context (system prompt
+  /// included), else the system prompt alone. The file is used once.
+  Future<void> _restoreConversation() async {
+    final file = File(await _conversationFile());
+    if (file.existsSync()) {
+      final watch = Stopwatch()..start();
+      try {
+        final n = await engine.loadState(file.path);
+        _prepared = await _systemBlock(); // the conversation starts with it
+        _log('Conversation restored ($n tokens) in ${watch.elapsedMilliseconds} ms');
+        return;
+      } on EngineException catch (e) {
+        _log('Saved conversation not usable ($e)');
+      } finally {
+        file.deleteSync();
+      }
+    }
+    await prepareSystemPrompt();
+  }
+
   Future<(Directory, String)> _stateFile(String block) async {
     final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
     if (!dir.existsSync()) dir.createSync(recursive: true);
@@ -370,25 +416,31 @@ class AppState extends ChangeNotifier {
   static const _maxToolCalls = 4;
 
   Future<void> send(String text) async {
-    if (generating || text.trim().isEmpty) return;
-    if (!engine.loaded) {
-      // Unloaded while idle, or still loading: wait for the model rather than drop the message.
-      final released = _released;
-      if (released != null) {
-        await load(released, keepChat: true);
-      } else if (loading) {
-        await _pendingLoad;
-      }
-      if (generating || !engine.loaded) return;
-    }
+    if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
     generating = true;
     final promptUser = '$text\n\n${nowLine(DateTime.now())}';
-    final prompt = await _prompt(promptUser);
     final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser);
+    messages.add(message); // shown at once, also while the model wakes up
+    notifyListeners();
+    // Unloaded while idle, or still loading: wait for the model, then for its context.
+    final released = _released;
+    if (released != null) {
+      await load(released, keepChat: true);
+    } else if (loading) {
+      await _pendingLoad;
+    }
+    await _preparing;
+    if (!engine.loaded) {
+      message
+        ..error = 'The model could not be loaded'
+        ..streaming = false;
+      generating = false;
+      notifyListeners();
+      return;
+    }
+    final prompt = await _prompt(promptUser);
     // The prompt without the reply's opening: each step appends the reply so far.
     final head = prompt.substring(0, prompt.length - message.prefix.length);
-    messages.add(message);
-    notifyListeners();
     final sampling = SamplingOptions(
         temperature: settings.temperature, topP: settings.topP, topK: settings.topK, maxTokens: settings.maxTokens);
     try {
