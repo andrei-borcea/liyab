@@ -923,6 +923,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
         stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
         stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
+        stats.expert_dropped = static_cast<int32_t>(after.dropped - experts_before.dropped);
         const Transformer::ExpertPredictions& predictions = s.target->expert_predictions();
         stats.expert_predicted = static_cast<int32_t>(predictions.predicted - predictions_before.predicted);
         stats.expert_predicted_used = static_cast<int32_t>(predictions.used - predictions_before.used);

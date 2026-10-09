@@ -48,6 +48,7 @@ public:
         uint64_t misses = 0;  // not predicted: read once the router chose it
         uint64_t loads = 0;          // experts read from storage
         uint64_t unused = 0;         // loaded experts evicted before any use (wrong predictions)
+        uint64_t dropped = 0;        // wrong guesses removed from the queue before they were read
         uint64_t bytes_read = 0;
         double stall_ms = 0.0;       // compute time spent waiting for experts
     };
@@ -65,7 +66,11 @@ public:
     // Queues background loads of `experts` of block `layer` (cached or queued
     // ones are skipped). `predicted`: a guess made ahead of time (queued
     // behind earlier work); false: the router already chose them (front of
-    // the queue, counted as misses). Never blocks on I/O.
+    // the queue, counted as misses), which also settles the block's guesses:
+    // those not chosen are dropped from the queue if still waiting, and
+    // become the first to evict if already read (a wrong guess kept its
+    // prefetch bonus and pushed out experts that were in use). Never blocks
+    // on I/O.
     void prefetch(int32_t layer, std::span<const int32_t> experts, bool predicted = true);
     // The {gate, up, down} views of one expert, pinned until release().
     // Blocks until the expert is in RAM.
@@ -99,6 +104,7 @@ private:
         bool part_failed = false;
         bool failed = false;     // the last read failed (reported to the waiting acquire())
         bool untouched = false;  // loaded, not acquired since (evicting it wasted the read)
+        bool guess = false;      // queued by a prediction its block's router has not confirmed yet
         float uses = 0.0f;
         uint64_t last_use = 0;
     };
@@ -118,6 +124,8 @@ private:
     // lock, then marks the entry Ready (or Empty on failure) after its last part.
     void read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m);
     [[nodiscard]] Segment segment(int32_t key, int32_t matrix) const;
+    // Drops or demotes block `layer`'s guesses that its router did not confirm.
+    void settle_locked(int32_t layer);
 
     const MmapLoader* file_ = nullptr;
     std::vector<std::array<const TensorView*, 3>> experts_;

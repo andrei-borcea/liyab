@@ -246,6 +246,7 @@ struct GenerationStats {
     uint64_t expert_bytes_read = 0; // bytes read from storage for experts
     double expert_stall_ms = 0.0;   // time the forward pass waited for expert reads
     int32_t expert_unused = 0;      // experts read (prefetched) and evicted again without being used
+    int32_t expert_dropped = 0;     // wrong guesses removed from the read queue before being read
     int32_t expert_predicted = 0;   // experts guessed one block ahead (cached ones included)
     int32_t expert_predicted_used = 0;  // ... that the router then chose (precision = used / predicted)
     DecodePhases decode_phases;

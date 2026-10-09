@@ -207,6 +207,7 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
         for (const int32_t x : experts) {
             const int32_t key = layer * n_expert_ + x;
             Entry& e = entries_[static_cast<size_t>(key)];
+            if (!predicted) e.guess = false;  // confirmed: settle_locked keeps it
             if (e.state == State::Queued && !predicted) {  // needed now: move ahead of guesses
                 queue_.erase(std::remove(queue_.begin(), queue_.end(), key), queue_.end());
                 queue_.push_front(key);
@@ -215,6 +216,7 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             if (e.state != State::Empty) continue;
             e.state = State::Queued;
             e.on_demand = !predicted;
+            e.guess = predicted;
             if (predicted) {
                 e.uses += 0.5f;  // a predicted expert is worth keeping until it is used
                 queue_.push_back(key);
@@ -223,8 +225,25 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             }
             queued = true;
         }
+        if (!predicted) settle_locked(layer);
     }
     if (queued) work_cv_.notify_all();
+}
+
+void ExpertStore::settle_locked(int32_t layer) {
+    const auto first = static_cast<size_t>(layer) * static_cast<size_t>(n_expert_);
+    for (size_t key = first; key < first + static_cast<size_t>(n_expert_); ++key) {
+        Entry& e = entries_[key];
+        if (!e.guess) continue;
+        e.guess = false;
+        if (e.state == State::Queued) {
+            e.state = State::Empty;  // io_loop skips keys that are no longer Queued
+            ++stats_.dropped;
+        } else if (e.state == State::Ready && e.untouched) {
+            e.uses = 0.0f;  // no prefetch bonus, and old: the next eviction takes it
+            e.last_use = 0;
+        }
+    }
 }
 
 bool ExpertStore::ready(int32_t layer, int32_t expert) const {

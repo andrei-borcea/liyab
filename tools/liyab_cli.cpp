@@ -232,9 +232,11 @@ int main(int argc, char** argv) {
                          stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
         }
         if (stats.expert_predicted > 0) {
-            std::fprintf(stderr, "experts: prediction precision %.0f%% (%d of %d guesses chosen)\n",
+            std::fprintf(stderr,
+                         "experts: prediction precision %.0f%% (%d of %d guesses chosen); wrong guesses: %d dropped "
+                         "before reading, %d read and evicted unused\n",
                          100.0 * stats.expert_predicted_used / stats.expert_predicted, stats.expert_predicted_used,
-                         stats.expert_predicted);
+                         stats.expert_predicted, stats.expert_dropped, stats.expert_unused);
         }
         if (stats.expert_unused > 0) {
             std::fprintf(stderr, "experts: %d prefetched and evicted unused (%.1f per token)\n", stats.expert_unused,
