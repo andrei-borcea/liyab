@@ -11,6 +11,10 @@
 #include "core/quant.h"
 #include "core/thread_pool.h"
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace liyab {
 
 namespace {
@@ -38,6 +42,71 @@ void l2norm(float* x, int32_t n, float eps) {
     for (int32_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
     const auto scale = static_cast<float>(1.0 / std::sqrt(ss + eps));
     for (int32_t i = 0; i < n; ++i) x[i] *= scale;
+}
+
+// One token of the gated delta rule for one value head, S [hd x hd] row j
+// mapping keys to value component j:
+//   S = decay * S;  S += strength * (v - S k) k^T;  o = (S q) * q_scale
+// Rows are independent: each is decayed and read against k, corrected, then
+// read against q, in two passes over its hd values. On NEON four
+// accumulators break the dependency chains of the dot products (a fixed
+// order, so results do not depend on the thread count); the scalar loop
+// elsewhere keeps one.
+void delta_rule_step(float* S, const float* q, const float* k, const float* v, float decay, float strength,
+                     float q_scale, float* o, size_t hd) {
+    for (size_t j = 0; j < hd; ++j) {
+        float* row = S + j * hd;
+        size_t i = 0;
+        float sk = 0.0f;
+#if defined(__ARM_NEON)
+        if (hd % 16 == 0) {
+            const float32x4_t dv = vdupq_n_f32(decay);
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+            for (; i < hd; i += 16) {
+                float32x4_t r0 = vmulq_f32(vld1q_f32(row + i), dv), r1 = vmulq_f32(vld1q_f32(row + i + 4), dv);
+                float32x4_t r2 = vmulq_f32(vld1q_f32(row + i + 8), dv), r3 = vmulq_f32(vld1q_f32(row + i + 12), dv);
+                vst1q_f32(row + i, r0);
+                vst1q_f32(row + i + 4, r1);
+                vst1q_f32(row + i + 8, r2);
+                vst1q_f32(row + i + 12, r3);
+                a0 = vfmaq_f32(a0, r0, vld1q_f32(k + i));
+                a1 = vfmaq_f32(a1, r1, vld1q_f32(k + i + 4));
+                a2 = vfmaq_f32(a2, r2, vld1q_f32(k + i + 8));
+                a3 = vfmaq_f32(a3, r3, vld1q_f32(k + i + 12));
+            }
+            sk = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+            const float32x4_t delta = vdupq_n_f32((v[j] - sk) * strength);
+            a0 = a1 = a2 = a3 = vdupq_n_f32(0.0f);
+            for (i = 0; i < hd; i += 16) {
+                const float32x4_t r0 = vfmaq_f32(vld1q_f32(row + i), vld1q_f32(k + i), delta);
+                const float32x4_t r1 = vfmaq_f32(vld1q_f32(row + i + 4), vld1q_f32(k + i + 4), delta);
+                const float32x4_t r2 = vfmaq_f32(vld1q_f32(row + i + 8), vld1q_f32(k + i + 8), delta);
+                const float32x4_t r3 = vfmaq_f32(vld1q_f32(row + i + 12), vld1q_f32(k + i + 12), delta);
+                vst1q_f32(row + i, r0);
+                vst1q_f32(row + i + 4, r1);
+                vst1q_f32(row + i + 8, r2);
+                vst1q_f32(row + i + 12, r3);
+                a0 = vfmaq_f32(a0, r0, vld1q_f32(q + i));
+                a1 = vfmaq_f32(a1, r1, vld1q_f32(q + i + 4));
+                a2 = vfmaq_f32(a2, r2, vld1q_f32(q + i + 8));
+                a3 = vfmaq_f32(a3, r3, vld1q_f32(q + i + 12));
+            }
+            o[j] = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))) * q_scale;
+            continue;
+        }
+#endif
+        for (i = 0; i < hd; ++i) {
+            row[i] *= decay;
+            sk += row[i] * k[i];
+        }
+        const float delta = (v[j] - sk) * strength;
+        float oq = 0.0f;
+        for (i = 0; i < hd; ++i) {
+            row[i] += k[i] * delta;
+            oq += row[i] * q[i];
+        }
+        o[j] = oq * q_scale;
+    }
 }
 
 // Per-architecture facts that the tensors cannot tell. Everything else
@@ -808,12 +877,17 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
 }
 
-// Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention), token by token:
+// Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention):
 //   [q|k|v] = SiLU(causal_conv1d(W_qkv x)),  q, k L2-normalized, q scaled by 1/sqrt(d)
 //   decay = exp(softplus(W_a x + dt_bias) * A),  b = sigmoid(W_b x)
 //   S = decay * S;  S += b * (v - S k) k^T;  o = S q
 //   out = W_out (RMSNorm(o) * SiLU(W_z x))      (per value head)
 // Key/query heads are shared by value heads modulo their count (ggml's layout).
+// A batch takes two parallel passes whatever its length: the convolution by
+// channel heads through all tokens, then the recurrence by value head through
+// all tokens (both are independent across their tasks, sequential in time).
+// Token by token, a batch of n cost 2 n thread-pool rounds per block and ran
+// the convolution, SiLU and L2 norms on one thread.
 Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                     ThreadPool& pool) {
     const ModelConfig& c = config_;
@@ -840,67 +914,65 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
     }
 
-    const float q_scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    for (size_t t = 0; t < un; ++t) {
-        float* m = mix_.data() + t * conv_dim;
-        // Causal depthwise convolution over [history, current], then SiLU; the
-        // history shifts by one input.
-        for (size_t ch = 0; ch < conv_dim; ++ch) {
-            float* hist = st.conv.data() + ch * history;
-            const float* tap = L.conv1d.data() + ch * taps;
-            float acc = m[ch] * tap[history];
-            for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
-            for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
-            hist[history - 1] = m[ch];
-            m[ch] = silu(acc);
-        }
-        for (size_t h = 0; h < 2 * hk; ++h) l2norm(m + h * hd, static_cast<int32_t>(hd), c.rms_eps);
+    // Checkpoints: the state after each of the last rollback_window_ tokens of
+    // the batch, for truncate(); slot = position % window, layout [conv | ssm].
+    const size_t per_state = st.conv.size() + st.ssm.size();
+    const bool checkpoint = rollback_window_ > 0 && checkpointing_;
+    auto slot_of = [&](size_t t) -> float* {
+        if (!checkpoint || t + static_cast<size_t>(rollback_window_) < un) return nullptr;
+        return st.checkpoints.data() +
+               static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
+    };
 
-        const float* a = alpha_.data() + t * hv;
-        const float* b = beta_.data() + t * hv;
-        float* out = dn_.data() + t * value_dim;
-        pool.parallel_for(static_cast<int64_t>(hv), [&](int64_t begin, int64_t end) {
-            for (auto h = static_cast<size_t>(begin); h < static_cast<size_t>(end); ++h) {
+    // 1. Causal depthwise convolution over [history, current] and SiLU, every
+    //    channel through all n tokens (channels are independent, tokens are
+    //    not), then the L2 norm of each query / key head. One task per head of
+    //    channels: 2 hk query/key heads, then hv value heads.
+    const auto conv_tasks = static_cast<int64_t>(2 * hk + hv);
+    pool.parallel_for(conv_tasks, [&](int64_t begin, int64_t end) {
+        for (auto task = static_cast<size_t>(begin); task < static_cast<size_t>(end); ++task) {
+            const size_t ch0 = task * hd;  // query heads, key heads and value heads are hd channels each
+            for (size_t ch = ch0; ch < ch0 + hd; ++ch) {
+                float* hist = st.conv.data() + ch * history;
+                const float* tap = L.conv1d.data() + ch * taps;
+                for (size_t t = 0; t < un; ++t) {
+                    float* m = mix_.data() + t * conv_dim;
+                    float acc = m[ch] * tap[history];
+                    for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
+                    for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
+                    hist[history - 1] = m[ch];
+                    m[ch] = silu(acc);
+                    if (float* slot = slot_of(t)) std::copy(hist, hist + history, slot + ch * history);
+                }
+            }
+            if (task < 2 * hk) {
+                for (size_t t = 0; t < un; ++t) l2norm(mix_.data() + t * conv_dim + ch0, static_cast<int32_t>(hd), c.rms_eps);
+            }
+        }
+    });
+
+    // 2. The recurrence, one task per value head through all n tokens (heads
+    //    are independent), then the head's gated RMSNorm.
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    pool.parallel_for(static_cast<int64_t>(hv), [&](int64_t begin, int64_t end) {
+        for (auto h = static_cast<size_t>(begin); h < static_cast<size_t>(end); ++h) {
+            float* S = st.ssm.data() + h * hd * hd;
+            for (size_t t = 0; t < un; ++t) {
+                const float* m = mix_.data() + t * conv_dim;
                 const float* q = m + (h % hk) * hd;
                 const float* k = m + key_dim + (h % hk) * hd;
                 const float* v = m + 2 * key_dim + h * hd;
-                const float decay = std::exp(softplus(a[h] + L.ssm_dt[h]) * L.ssm_a[h]);
-                const float strength = sigmoid(b[h]);
-                float* S = st.ssm.data() + h * hd * hd;
-                float* o = out + h * hd;
-                // Row j of S maps keys to value component j, so each row is
-                // decayed, corrected and read independently in two passes.
-                for (size_t j = 0; j < hd; ++j) {
-                    float* row = S + j * hd;
-                    float sk = 0.0f;
-                    for (size_t i = 0; i < hd; ++i) {
-                        row[i] *= decay;
-                        sk += row[i] * k[i];
-                    }
-                    const float delta = (v[j] - sk) * strength;
-                    float oq = 0.0f;
-                    for (size_t i = 0; i < hd; ++i) {
-                        row[i] += k[i] * delta;
-                        oq += row[i] * q[i];
-                    }
-                    o[j] = oq * q_scale;
-                }
-                // Gated RMSNorm of the head output.
+                const float decay = std::exp(softplus(alpha_[t * hv + h] + L.ssm_dt[h]) * L.ssm_a[h]);
+                const float strength = sigmoid(beta_[t * hv + h]);
+                float* o = dn_.data() + t * value_dim + h * hd;
+                delta_rule_step(S, q, k, v, decay, strength, q_scale, o, hd);
                 const float* z = z_.data() + t * value_dim + h * hd;
                 rmsnorm(o, L.ssm_norm.data(), o, static_cast<int32_t>(hd), c.rms_eps);
                 for (size_t j = 0; j < hd; ++j) o[j] *= silu(z[j]);
+                if (float* slot = slot_of(t)) std::copy(S, S + hd * hd, slot + st.conv.size() + h * hd * hd);
             }
-        });
-        // The state after this token, for truncate(); in a longer batch only
-        // the last rollback_window_ tokens' copies would survive in the ring.
-        if (rollback_window_ > 0 && checkpointing_ && t + static_cast<size_t>(rollback_window_) >= un) {
-            const size_t per_state = st.conv.size() + st.ssm.size();
-            float* slot = st.checkpoints.data() +
-                          static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
-            std::copy(st.conv.begin(), st.conv.end(), slot);
-            std::copy(st.ssm.begin(), st.ssm.end(), slot + st.conv.size());
         }
-    }
+    });
     return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
 
