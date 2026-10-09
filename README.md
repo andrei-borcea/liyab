@@ -146,8 +146,9 @@ This README describes what the code does today. Anything not implemented is list
   batch are grouped per expert so each expert is read once. An architecture adds a one-line traits row (RoPE
   style, MoE weight renormalization default).
   DeltaNet blocks keep a recurrent state (conv history + one 128×128 matrix per value head, 19 MiB for Qwen3.5-2B):
-  such models roll back only inside a rollback window of recurrent-state checkpoints (used by speculative decoding),
-  so early exit, head pruning and the KV prefix cache are disabled for them with a clear message.
+  such models roll back only inside a rollback window of recurrent-state checkpoints (used by speculative decoding)
+  or to a state snapshot taken at the end of each prompt (two kept: the oldest and the newest), so early exit,
+  head pruning and the KV prefix cache are disabled for them with a clear message.
 * **Tensor types:** every format llama.cpp writes, mixed freely per tensor. That covers F32, F16, BF16, the legacy
   Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-quants Q2_K…Q6_K (and their Q*_K_S/M/L mixes), the I-quants IQ1_S, IQ1_M,
   IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL, IQ4_XS, the ternary TQ1_0/TQ2_0 and the FP4 formats MXFP4/NVFP4. Q1_0 is
@@ -292,11 +293,17 @@ int main() {
 
 `Engine::cancel()` is thread-safe and stops generation at the next token boundary.
 
-The context is kept between calls: when a prompt continues the tokens the engine already processed (the previous
-prompt plus its generated reply, which is how a chat grows), only the new tokens are processed, recurrent DeltaNet
-states included; attention-only models also keep the longest common prefix. `Engine::prefill(text)` processes a
-prefix ahead of time (a chat's system prompt right after loading) and `reset_context()` forgets everything. The
-output equals a fresh context's (tested). On the phone, Qwen3.6-35B-A3B's first token went from 13–16 s per
+The context is kept between calls: when a prompt continues the text the engine already processed (the previous
+prompt plus its generated reply, which is how a chat grows), that text keeps the tokens it was processed as and only
+the rest is processed, recurrent DeltaNet states included. Re-encoding a reply need not give back the tokens that
+were generated (e.g. around `</think>` or merged spaces); before, any such difference made a hybrid model start over.
+Otherwise the longest common token prefix is kept: any length on attention-only models, and on hybrid models back to
+the nearest recurrent-state snapshot, taken at the end of every prompt and `prefill()`. An edited last reply or a
+turn dropped from the history then recomputes only what follows the previous prompt or the system prompt.
+`Engine::prefill(text)` processes a prefix ahead of time (a chat's system prompt right after loading) and
+`reset_context()` forgets everything. The output equals a fresh context's (tested), except that a reused reply keeps
+the tokenization it was generated with. The two snapshots cost 2 × the recurrent state (~120 MiB on
+Qwen3.6-35B-A3B), set aside from the expert cache budget. On the phone, Qwen3.6-35B-A3B's first token went from 13–16 s per
 message (whole conversation reprocessed) to 3.2 s for the first message and ~6 s for later ones.
 
 ### C ABI (`liyab_c_api.h`)

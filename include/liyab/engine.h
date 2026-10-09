@@ -113,15 +113,22 @@ public:
 
     // Generates a continuation of `prompt` (already chat-formatted by the
     // caller). The context is reused across calls: when `prompt` continues the
-    // tokens the engine already processed (previous prompt + its generated
-    // reply, or a prefill()), only the new tokens are processed, which makes
-    // chat turns start fast; recurrent (DeltaNet) states are reused the same
-    // way. Attention-only models also keep the longest common prefix; anything
-    // else starts from an empty context. Output is the same as from a fresh
-    // context. Not reentrant: a concurrent call returns ErrorCode::Busy.
+    // text the engine already processed (previous prompt + its generated
+    // reply, or a prefill()), that text keeps the tokens it was processed as
+    // (re-encoding a reply need not reproduce the tokens that were generated)
+    // and only the rest is processed, which makes chat turns start fast.
+    // Otherwise the longest common token prefix is kept: any length on
+    // attention-only models; on hybrid (DeltaNet) models, whose recurrent
+    // states cannot rewind, up to the nearest state snapshot, taken at the end
+    // of every prompt and prefill (Transformer::snapshot_state), so an edited
+    // last reply or a dropped turn recomputes only what follows that point.
+    // Output is the same as from a fresh context, except that a reused reply
+    // keeps the tokenization it was generated with. Not reentrant: a
+    // concurrent call returns ErrorCode::Busy.
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
-    // Same, from token ids (for vocabularies whose text encoder Liyab lacks).
+    // Same, from token ids (for vocabularies whose text encoder Liyab lacks);
+    // reuse follows token prefixes only.
     Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                             const TokenCallback& on_token);
 
@@ -162,6 +169,10 @@ public:
 private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);
+    // generate_tokens() with the busy lock held; `text`, when given, is the
+    // text `prompt` encodes, remembered for the next call's reuse.
+    Result<GenerationStats> generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
+                                            const TokenCallback& on_token, const std::string_view* text);
     std::unique_ptr<Impl> impl_;
 };
 

@@ -181,12 +181,26 @@ public:
     };
     [[nodiscard]] const ExpertPredictions& expert_predictions() const noexcept { return predictions_; }
 
-    // Discards cached positions >= n (speculative-decoding rollback). KV
-    // caches simply drop positions. Recurrent (DeltaNet) states cannot be
-    // rewound, so hybrid models restore a checkpoint instead: they accept
-    // n == 0, n == n_past(), or any n whose position n - 1 is still inside the
-    // rollback window (Unsupported otherwise).
+    // Discards cached positions >= n (speculative-decoding rollback, a chat
+    // turn that rewrites the end of the context). KV caches simply drop
+    // positions. Recurrent (DeltaNet) states cannot be rewound, so hybrid
+    // models restore a copy instead: they accept n == 0, n == n_past(), any n
+    // whose position n - 1 is still inside the rollback window, or the
+    // position of a state snapshot (Unsupported otherwise).
     Status truncate(int32_t n);
+    // The longest prefix of at most n positions truncate() accepts: n itself
+    // for models without recurrent blocks, else the nearest checkpoint or
+    // snapshot at or below n (0 if none).
+    [[nodiscard]] int32_t restorable_prefix(int32_t n) const noexcept;
+    // Hybrid models: keeps a copy of the recurrent states at the current
+    // position, so truncate() can return exactly here later. The engine
+    // takes one at the end of every prompt: the next chat turn re-sends that
+    // prompt, and its end (the last reply, an edited or dropped turn) may
+    // differ. At most kStateSnapshots are kept, the oldest (usually the
+    // system prompt) and the newest; their memory is set aside from the expert
+    // cache budget at load. No-op without recurrent blocks or at position 0.
+    void snapshot_state();
+    static constexpr int32_t kStateSnapshots = 2;
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -317,6 +331,11 @@ private:
     int32_t rollback_window_ = 0;
     bool checkpointing_ = true;
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
+    struct StateSnapshot {
+        int32_t pos = 0;           // n_past() when taken
+        std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order
+    };
+    std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;

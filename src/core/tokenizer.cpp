@@ -251,6 +251,14 @@ const std::string& Tokenizer::piece(int32_t id) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
+    return encode_from(text, add_bos, true);
+}
+
+Result<std::vector<int32_t>> Tokenizer::encode_continuation(std::string_view text, int32_t previous) const {
+    return encode_from(text, false, std::find(control_.begin(), control_.end(), previous) != control_.end());
+}
+
+Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool add_bos, bool after_control) const {
     if (kind_ == Kind::Gpt2 && pre_ == PreTokenizer::None) {
         return Status(ErrorCode::Unsupported, "BPE pre-tokenizer '" + pre_name_ +
                                                   "' is not supported yet (qwen2, qwen35 and llama3 are); pass token ids instead");
@@ -260,7 +268,7 @@ Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_b
     // Split around control-token texts; plain segments go through SPM. As in
     // llama.cpp, a segment gets the space prefix when it starts the text or
     // follows a control token.
-    bool prev_control = true;
+    bool prev_control = after_control;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t best = std::string_view::npos;

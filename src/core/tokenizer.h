@@ -25,6 +25,12 @@ public:
     // Unsupported. Special tokens written in the text (e.g. "</s>",
     // "<|im_start|>") map to their ids.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
+    // Encodes `text` that directly follows already-encoded text ending with
+    // token `previous` (a prompt that continues the context): no BOS and, for
+    // SentencePiece vocabularies, the space prefix only after a control token,
+    // as encode() would place it, so the earlier ids followed by these spell
+    // the joined text.
+    [[nodiscard]] Result<std::vector<int32_t>> encode_continuation(std::string_view text, int32_t previous) const;
 
     // Raw bytes for one token; control tokens decode to "". A multi-byte
     // UTF-8 character may span several tokens.
@@ -38,6 +44,7 @@ public:
     [[nodiscard]] bool is_end_of_generation(int32_t id) const;
 
 private:
+    Result<std::vector<int32_t>> encode_from(std::string_view text, bool add_bos, bool after_control) const;
     Kind kind_ = Kind::Spm;
     std::vector<std::string_view> texts_;  // raw vocabulary entries (in the mapping)
     std::vector<float> scores_;

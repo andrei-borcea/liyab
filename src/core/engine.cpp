@@ -98,11 +98,44 @@ struct Engine::Impl {
     // used with a draft model, whose cache moves in step with the target's
     // during speculation.
     std::vector<int32_t> context;
+    // The text `context` encodes, when known (valid): a prompt given as text
+    // followed by the pieces of the reply tokens generated after it.
+    std::string context_text;
+    bool context_text_valid = false;
 
     void clear_context() {
         target->reset();
         if (draft) draft->reset();
         context.clear();
+        context_text_valid = false;
+    }
+
+    // Tokens for `text`. When it starts with the text the context holds, the
+    // context's own tokens followed by the encoding of the rest: re-encoding
+    // the previous reply need not give back the tokens that were generated,
+    // and on a hybrid model any difference would recompute from the last
+    // state snapshot.
+    Result<std::vector<int32_t>> encode_continuation(std::string_view text, bool add_bos) const {
+        const bool bos = add_bos && tokenizer->add_bos_default();
+        if (!draft && context_text_valid && !context.empty() && text.size() > context_text.size() &&
+            text.starts_with(context_text) &&
+            (static_cast<unsigned char>(text[context_text.size()]) & 0xC0) != 0x80) {  // not mid-character
+            auto rest = tokenizer->encode_continuation(text.substr(context_text.size()), context.back());
+            if (!rest) return rest.status();
+            std::vector<int32_t> tokens = context;
+            tokens.insert(tokens.end(), rest->begin(), rest->end());
+            return tokens;
+        }
+        return tokenizer->encode(text, bos);
+    }
+
+    // After a run over `prompt` (the encoding of `text`): records the text the
+    // context now holds, if the context still starts with the whole prompt.
+    void remember_text(std::span<const int32_t> prompt, std::string_view text) {
+        context_text_valid = context.size() >= prompt.size() && std::equal(prompt.begin(), prompt.end(), context.begin());
+        if (!context_text_valid) return;
+        context_text.assign(text);
+        for (size_t i = prompt.size(); i < context.size(); ++i) context_text += tokenizer->piece(context[i]);
     }
 
     // Keeps the longest usable prefix of `tokens` already in the context and
@@ -116,10 +149,13 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
-        // Rewinding works for attention-only models; recurrent states cannot rewind.
-        if (common > 0 && target->truncate(static_cast<int32_t>(common)).is_ok()) {
-            context.resize(common);
-            return common;
+        // Attention-only models rewind to any position; hybrid ones to the
+        // nearest recurrent-state checkpoint or snapshot below it.
+        const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
+        if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+            context.resize(keep);
+            context_text_valid = false;
+            return keep;
         }
         clear_context();
         return 0;
@@ -579,15 +615,16 @@ std::string Engine::describe() const {
 }
 
 Status Engine::prefill(std::string_view text, bool add_bos) {
-    auto tokens = tokenize(text, add_bos);
-    if (!tokens) return tokens.status();
     std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
     if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
+    auto tokens = s.encode_continuation(text, add_bos);
+    if (!tokens) return tokens.status();
     s.cancel.store(false, std::memory_order_relaxed);
     const std::vector<int32_t>& t = tokens.value();
     const size_t reused = s.reuse_prefix(t, t.size());
+    s.context_text_valid = false;
     const PowerPolicy policy = s.power->policy();
     s.apply_policy(policy);
     const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
@@ -602,6 +639,8 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
         }
         s.context.insert(s.context.end(), part.begin(), part.end());
     }
+    s.target->snapshot_state();  // the next prompt starts with this text
+    s.remember_text(t, text);
     return Status::ok();
 }
 
@@ -612,15 +651,22 @@ void Engine::reset_context() {
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
-    auto tokens = tokenize(prompt, params.add_bos);
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
-    return generate_tokens(*tokens, params, on_token);
+    return generate_locked(*tokens, params, on_token, &prompt);
 }
 
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
     std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
     if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    return generate_locked(prompt, params, on_token, nullptr);
+}
+
+Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
+                                                const TokenCallback& on_token, const std::string_view* text) {
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
@@ -628,6 +674,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     s.cancel.store(false, std::memory_order_relaxed);
     // The last prompt token seeds the decode loop, so it is never reused.
     const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
+    s.context_text_valid = false;  // set again once the run completes
     if (s.speculative) s.speculative->reset_stats();
     s.power->reset_pacing();
     Sampler sampler(params);
@@ -688,6 +735,8 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         }
     }
     stats.prefill_ms = ms_since(t_prefill);
+    // The next chat turn re-sends this prompt: keep its recurrent state.
+    if (!s.draft) s.target->snapshot_state();
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (use_dedup) {
         auto saved = s.kv_dedup->save(prompt, static_cast<int32_t>(prompt.size()) - 1, s.target->kv_cache());
@@ -809,6 +858,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
         stats.draft_tokens_proposed = s.speculative->proposed();
         stats.draft_tokens_accepted = s.speculative->accepted();
     }
+    if (text != nullptr && !s.draft) s.remember_text(prompt, *text);
     return stats;
 }
 

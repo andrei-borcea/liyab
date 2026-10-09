@@ -480,7 +480,40 @@ void Transformer::reset() noexcept {
         std::fill(st.ssm.begin(), st.ssm.end(), 0.0f);
     }
     std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
+    snapshots_.clear();
     n_past_ = 0;
+}
+
+void Transformer::snapshot_state() {
+    if (states_.empty() || n_past_ == 0) return;
+    if (!snapshots_.empty() && snapshots_.back().pos == n_past_) return;  // already held
+    StateSnapshot snap;
+    if (static_cast<int32_t>(snapshots_.size()) >= kStateSnapshots) {
+        // Keep the oldest; recycle the buffer of the one after it.
+        snap = std::move(snapshots_[snapshots_.size() > 1 ? 1 : 0]);
+        snapshots_.erase(snapshots_.begin() + (snapshots_.size() > 1 ? 1 : 0));
+    }
+    snap.pos = n_past_;
+    snap.data.resize(recurrent_state_bytes() / sizeof(float));
+    float* out = snap.data.data();
+    for (const RecurrentState& st : states_) {
+        out = std::copy(st.conv.begin(), st.conv.end(), out);
+        out = std::copy(st.ssm.begin(), st.ssm.end(), out);
+    }
+    snapshots_.push_back(std::move(snap));
+}
+
+int32_t Transformer::restorable_prefix(int32_t n) const noexcept {
+    n = std::clamp(n, 0, n_past_);
+    if (!config_.hybrid() || n == n_past_) return n;
+    int32_t best = 0;
+    for (const int32_t p : checkpoint_pos_) {  // a checkpoint at position p restores n = p + 1
+        if (p >= 0 && p + 1 <= n) best = std::max(best, p + 1);
+    }
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos <= n) best = std::max(best, snap.pos);
+    }
+    return best;
 }
 
 void Transformer::set_rollback_window(int32_t positions) {
@@ -824,7 +857,9 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
         // Keep room for the KV cache, activations and the rest of the app:
         // 1 GiB of free RAM, or 512 MiB inside an explicit budget (the
         // embedder already left its own headroom below the platform's cap).
-        const size_t margin = memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30;
+        // Recurrent-state snapshots (snapshot_state) come out of the cache too.
+        const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
+                              static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
         budget = available > resident_bytes + margin ? static_cast<size_t>(available) - resident_bytes - margin : 0;
     }
     std::vector<std::array<const TensorView*, 3>> experts(static_cast<size_t>(c.n_layers));
@@ -1277,20 +1312,28 @@ Status Transformer::truncate(int32_t n) {
     }
     if (config_.hybrid()) {
         const int32_t slot = rollback_window_ > 0 ? (n - 1) % rollback_window_ : -1;
-        if (slot < 0 || checkpoint_pos_[static_cast<size_t>(slot)] != n - 1) {
+        const bool in_ring = slot >= 0 && checkpoint_pos_[static_cast<size_t>(slot)] == n - 1;
+        const auto snap = std::find_if(snapshots_.begin(), snapshots_.end(),
+                                       [n](const StateSnapshot& s) { return s.pos == n; });
+        if (!in_ring && snap == snapshots_.end()) {
             return Status(ErrorCode::Unsupported,
-                          "recurrent (DeltaNet) states can only be rolled back inside the rollback window");
+                          "recurrent (DeltaNet) states can only be rolled back inside the rollback window or to a "
+                          "snapshot");
         }
         LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
+        const float* saved = in_ring ? nullptr : snap->data.data();
         for (RecurrentState& st : states_) {
-            const float* saved = st.checkpoints.data() + static_cast<size_t>(slot) * (st.conv.size() + st.ssm.size());
+            if (in_ring) saved = st.checkpoints.data() + static_cast<size_t>(slot) * (st.conv.size() + st.ssm.size());
             std::copy_n(saved, st.conv.size(), st.conv.begin());
             std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+            if (!in_ring) saved += st.conv.size() + st.ssm.size();
         }
-        // Checkpoints of the discarded positions describe a future that no longer exists.
+        // Checkpoints and snapshots of the discarded positions describe a
+        // future that no longer exists.
         for (int32_t& p : checkpoint_pos_) {
             if (p >= n) p = -1;
         }
+        std::erase_if(snapshots_, [n](const StateSnapshot& s) { return s.pos > n; });
         n_past_ = n;
         return Status::ok();
     }

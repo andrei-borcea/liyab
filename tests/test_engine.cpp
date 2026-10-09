@@ -1358,6 +1358,59 @@ TEST_CASE("Context reuse: continuing a conversation or a prefill equals a fresh 
     CHECK(st3.cached_prefix_tokens <= 1);
 }
 
+TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapshot, exactly") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("hybrid", spec));
+    config.backend = BackendKind::Cpu;
+    auto reused = Engine::create(config);
+    auto fresh = Engine::create(config);
+    REQUIRE(reused.has_value() && fresh.has_value());
+    auto run = [](Engine& e, const std::string& prompt, GenerationStats* out = nullptr) {
+        std::string text;
+        auto st = e.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+    Engine& e = *reused.value();
+    const std::string system = "hello world hello";
+    REQUIRE(e.prefill(system, true).is_ok());
+    const auto system_tokens = static_cast<int32_t>(e.tokenize(system, true)->size());
+    const std::string turn1 = system + " world";
+    const std::string reply = run(e, turn1);
+    const auto turn1_tokens = static_cast<int32_t>(e.tokenize(turn1, true)->size());
+
+    // The exact reply sent back: everything already processed is kept.
+    GenerationStats st{};
+    run(e, turn1 + reply + " hello", &st);
+    CHECK(st.cached_prefix_tokens >= turn1_tokens);
+
+    // An edited reply: recomputes from the snapshot at the end of turn 2's
+    // prompt is impossible (it diverges earlier), so from turn 1's prompt end,
+    // which the snapshot ring still holds (oldest = system, newest = last).
+    // Output equals a fresh context's.
+    const std::string edited = turn1 + "hello world" + " hello";
+    GenerationStats st2{};
+    const std::string after_edit = run(e, edited, &st2);
+    CHECK(st2.cached_prefix_tokens > 0);
+    fresh.value()->reset_context();
+    CHECK(after_edit == run(*fresh.value(), edited));
+
+    // A dropped turn (the text after the system prompt changes): back to the
+    // system prompt's snapshot, never to an empty context.
+    const std::string dropped = system + " hello";
+    GenerationStats st3{};
+    const std::string after_drop = run(e, dropped, &st3);
+    CHECK(st3.cached_prefix_tokens == system_tokens);
+    fresh.value()->reset_context();
+    CHECK(after_drop == run(*fresh.value(), dropped));
+}
+
 TEST_CASE("Engine routes to CPU when forced and matches the default route") {
     EngineConfig cpu_config = engine_config(mixed_model());
     cpu_config.backend = BackendKind::Cpu;
