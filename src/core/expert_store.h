@@ -24,6 +24,7 @@
 #define LIYAB_CORE_EXPERT_STORE_H
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -54,12 +55,14 @@ public:
     };
 
     // `experts[l]` = {gate, up, down} stacked expert tensors of block l, or
-    // all nullptr for a dense block. `repack`: rearrange each matrix as it
-    // arrives (I/O thread) into the CPU's i8mm layout (Q4_K/Q5_K/Q6_K to
-    // *_R8, Q8_0 to Q8_0_R4; lossless, same size), as the resident weights
-    // are at load: acquire() then returns views of that type, which the
-    // batched kernels multiply by many tokens at once instead of decoding
-    // each weight row again for every token (prefill). `budget_bytes` bounds the cache; at
+    // all nullptr for a dense block. `repack`: rearrange the matrices of an
+    // expert read for a multi-token pass (set_batch) into the CPU's i8mm
+    // layout as they arrive (I/O thread; Q4_K/Q5_K/Q6_K to *_R8, Q8_0 to
+    // Q8_0_R4; lossless, same size), as the resident weights are at load:
+    // the batched kernels then multiply it by many tokens at once instead of
+    // decoding each weight row again per token (prefill). Experts read for
+    // single-token decoding stay in the file's layout: there the repacking
+    // only delayed the read a miss waits for (decode was 6% slower). `budget_bytes` bounds the cache; at
     // least a few entries per block are kept whatever the budget.
     static Result<std::unique_ptr<ExpertStore>> create(const MmapLoader& file,
                                                        std::vector<std::array<const TensorView*, 3>> experts,
@@ -84,6 +87,9 @@ public:
     void release(int32_t layer, int32_t expert);
     // Whether acquire() would return without waiting.
     [[nodiscard]] bool ready(int32_t layer, int32_t expert) const;
+    // Whether the forward pass now running covers several tokens (see `repack`).
+    void set_batch(bool batch) noexcept { batch_.store(batch, std::memory_order_relaxed); }
+
     // Halves every use counter (call once per generated token): old
     // popularity fades so the cache follows the conversation.
     void age();
@@ -120,6 +126,8 @@ private:
         bool failed = false;     // the last read failed (reported to the waiting acquire())
         bool untouched = false;  // loaded, not acquired since (evicting it wasted the read)
         bool guess = false;      // queued by a prediction its block's router has not confirmed yet
+        bool for_batch = false;  // queued while a multi-token pass ran: repacked as it is read
+        bool repacked = false;   // its matrices are in the repacked types (served_type)
         float uses = 0.0f;
         uint64_t last_use = 0;
     };
@@ -169,6 +177,7 @@ private:
     std::vector<Entry> entries_;
     std::vector<int32_t> hot_;  // see hot_keys()
     bool repack_ = false;
+    std::atomic<bool> batch_{false};
 
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;   // I/O threads: queue or parts not empty / stop

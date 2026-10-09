@@ -1201,6 +1201,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     const auto ff = static_cast<size_t>(c.n_ff_expert);
 
     PhaseTimer router_timer(phases_.router);
+    if (expert_store_ != nullptr) expert_store_->set_batch(n > 1);  // its reads are repacked for batched kernels
     router_.resize(un * E);
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
 

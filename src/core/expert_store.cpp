@@ -201,6 +201,8 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     const size_t length = align_up(static_cast<size_t>(seg.offset - begin) + seg.bytes);
     const Slot& slot = slots_[static_cast<size_t>(e.slot)];
     uint8_t* dst = arena_ + slot.offset + classes_[static_cast<size_t>(slot.size_class)].offsets[static_cast<size_t>(m)];
+    e.repacked = repack_ && e.for_batch;
+    const bool repack = e.repacked;
     lock.unlock();
     // One read per matrix: smaller parts (tried: 2 and 4 per matrix) cost
     // the flash more than the extra concurrency saves.
@@ -209,7 +211,7 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
         const int32_t layer = key / n_expert_;
         const DType to = served_type(layer, m);
         const TensorView& t = *experts_[static_cast<size_t>(layer)][static_cast<size_t>(m)];
-        if (to != t.type) repack_in_place(dst + (seg.offset - begin), seg.bytes, t.type, to, t.ne[1], t.ne[0]);
+        if (repack && to != t.type) repack_in_place(dst + (seg.offset - begin), seg.bytes, t.type, to, t.ne[1], t.ne[0]);
     }
     lock.lock();
     stats_.bytes_read += length;
@@ -318,6 +320,7 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             e.state = State::Queued;
             e.on_demand = !predicted;
             e.guess = predicted;
+            e.for_batch = batch_.load(std::memory_order_relaxed);
             if (predicted) {
                 e.uses += 0.5f;  // a predicted expert is worth keeping until it is used
                 queue_.push_back(key);
@@ -368,6 +371,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
         const auto t0 = std::chrono::steady_clock::now();
         if (e.state == State::Empty) {
             e.state = State::Queued;
+            e.for_batch = batch_.load(std::memory_order_relaxed);
             queue_.push_front(key);  // demand loads jump the prefetch queue
             work_cv_.notify_one();
         } else if (e.state == State::Queued) {
@@ -381,6 +385,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
             ready_cv_.wait(lock, [&] { return stop_ || e.state == State::Ready || e.state == State::Empty; });
             if (stop_ || e.state == State::Ready || e.failed) break;
             e.state = State::Queued;
+            e.for_batch = batch_.load(std::memory_order_relaxed);
             queue_.push_front(key);
             work_cv_.notify_one();
         }
@@ -401,7 +406,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
         const TensorView& t = *block[static_cast<size_t>(m)];
         const Segment seg = segment(key, m);
         TensorView v = t;
-        v.type = served_type(layer, m);
+        v.type = e.repacked ? served_type(layer, m) : t.type;
         v.n_dims = 2;
         v.ne = {t.ne[0], t.ne[1], 1, 1};
         v.nbytes = seg.bytes;
