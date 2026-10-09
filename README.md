@@ -11,8 +11,9 @@ from storage with direct I/O straight into memory the CPU and GPU share; work is
 (NPU → GPU → CPU), and a power manager paces token output and reacts to thermal pressure.
 
 On top of it, the **Liyab app** (Flutter, Android today) is a private assistant that runs entirely on the phone:
-chat with open models downloaded from Hugging Face, and an assistant sheet that the system's assist gesture opens
-over any app, as Gemini's does, but with nothing leaving the device. Qwen3.6-35B-A3B, a 22 GB mixture-of-experts
+chat with open models downloaded from Hugging Face, an assistant sheet that the system's assist gesture opens
+over any app, as Gemini's does, and tools that read the user's calendar, notifications, messages and calls when
+they ask about their day, with nothing leaving the device. Qwen3.6-35B-A3B, a 22 GB mixture-of-experts
 model, answers at about 7–9 tokens per second on a Snapdragon 8 Elite phone, streamed from storage within the
 6 GiB an app may use.
 
@@ -58,7 +59,8 @@ This README describes what the code does today. Anything not implemented is list
 | Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
 | Context kept between chat turns: a prompt that continues the processed text keeps its tokens; hybrid (DeltaNet) models also snapshot their recurrent state at each prompt's end | ✅ implemented (follow-up turns start in ~1.1–1.6 s on the 35B) |
 | Liyab app (Flutter, `app/`): chat, model library and Hugging Face downloads, live activity and log, settings, assistant sheet over any app (default digital assistant) | ✅ Android; 🟡 iOS app not built yet (the engine builds for iOS) |
-| Voice input and output, agent tools (calendar, alarms, notifications), local memory | 🔜 planned, see [Limitations and roadmap](#limitations-and-roadmap) |
+| Agent tools in the app: the model reads the user's calendar, notifications (chats, email previews), SMS, calls, contacts and clipboard, each source enabled by the user | ✅ implemented (Qwen3 / 3.5 / 3.6 tool-call formats) |
+| Voice input and output, actions (alarms, events, replies), local memory | 🔜 planned, see [Limitations and roadmap](#limitations-and-roadmap) |
 | Experimental: early exit, head pruning, EGLS, TDSS 2:4 sparsity, JIT unpacker, persistent KV prefix cache, io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
@@ -471,6 +473,19 @@ are called directly because the C API makes them thread-safe.
   model already loaded instead of loading a second copy. Since one engine draws into one surface and keeps one
   lifecycle state, only the window in front reports lifecycle states and takes the surface back when it returns,
   and the sheet releases it as soon as it pauses (otherwise the app window went black after the sheet).
+* **Agent tools.** The assistant can read the user's own data to answer about their day: calendar events
+  (`READ_CALENDAR`), notifications from every app, i.e. chat messages and email previews (Android's Notification
+  access, kept in memory only), text messages (`READ_SMS`), calls (`READ_CALL_LOG`), contacts (`READ_CONTACTS`) and
+  the clipboard. Each source is off until the user turns it on under Settings → What Liyab can read (which asks
+  for the permission); only enabled sources are offered to the model. Tools are described and called in the
+  loaded model's own format, read from its GGUF chat template: Qwen3.5 / Qwen3.6 XML calls
+  (`<function=…><parameter=…>`) or Qwen2.5 / Qwen3 JSON calls; the app runs a call on the phone, returns the result
+  in a `<tool_response>` turn and lets the model continue, up to 4 calls per reply, each shown above the answer
+  ("Read your calendar: 3 events"). Every user turn carries the current date and time (`[Now: Friday 9 October
+  2026, 13:40, UTC+02:00]`) so "in two hours" means something, while the system prompt stays fixed and its context
+  reused. The default system prompt tells the model to use tools for the user's data, never to invent it, and to
+  treat tool results as data, not instructions. Not readable: full email bodies (Android gives apps no access to
+  Gmail; only the notification previews) and the screen content (needs a voice-interaction service).
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system
@@ -913,8 +928,9 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
   assistant listens at once; the flame's listening animation is ready for it), then a power and thermal controller
   that uses Android's performance hints and thermal-headroom forecast instead of a fixed temperature threshold, then
-  agent tools (structured tool calls with constrained decoding; alarms, timers, calendar and notifications, every
-  outward action confirmed by the user), GPU prefill, and local memory over the user's own data. The iOS app is not
+  actions (alarms, timers, calendar events, message replies, every outward action confirmed by the user),
+  constrained decoding so tool calls always parse, the screen content through a voice-interaction service, email
+  through IMAP or the Gmail API (opt-in), GPU prefill, and local memory over the user's own data. The iOS app is not
   built yet. In the assistant sheet's window, pages that need a full activity (importing a file, a permission
   prompt) may not open.
 
