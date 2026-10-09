@@ -19,7 +19,7 @@ class LoadOptions {
   const LoadOptions({
     required this.modelPath,
     this.backend = LiyabBackend.cpu,
-    this.contextLength = 4096,
+    this.contextLength = 0,
     this.skinThresholdC = 50,
     this.memoryBudgetMb = 5500,
     this.powerProfile = LiyabPowerProfile.balanced,
@@ -65,11 +65,18 @@ class MemoryPlan {
 /// What the engine reported about a loaded model.
 class LoadedModel {
   const LoadedModel(
-      {required this.description, required this.loadSeconds, required this.metadata, required this.memory});
+      {required this.description,
+      required this.loadSeconds,
+      required this.metadata,
+      required this.memory,
+      required this.contextLength});
 
   final String description;
   final double loadSeconds;
   final MemoryPlan memory;
+
+  /// The context length the engine chose (LoadOptions.contextLength 0: automatic).
+  final int contextLength;
 
   /// The GGUF keys the app reads (missing ones absent).
   final Map<String, String> metadata;
@@ -223,7 +230,8 @@ class EngineService {
         description: r[1] as String,
         loadSeconds: r[2] as double,
         metadata: Map<String, String>.from(r[3] as Map),
-        memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int));
+        memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int),
+        contextLength: r[5] as int);
   }
 
   Future<void> unload() async {
@@ -347,7 +355,8 @@ void _worker(SendPort replies) {
                 description,
                 watch.elapsedMicroseconds / 1e6,
                 metadata,
-                [plan.ref.residentBytes, plan.ref.expertBytes, plan.ref.expertCacheBytes, plan.ref.recommendedBytes, plan.ref.requantBits]
+                [plan.ref.residentBytes, plan.ref.expertBytes, plan.ref.expertCacheBytes, plan.ref.recommendedBytes, plan.ref.requantBits],
+                lib.contextLength(engine),
               ]
             ]);
           });

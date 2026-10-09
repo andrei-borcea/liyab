@@ -88,7 +88,7 @@ struct Route {
 };
 
 struct TransformerOptions {
-    int32_t context_length = 0;   // 0: min(model training context, 4096)
+    int32_t context_length = 0;   // 0: automatic (kKvBudgetBytes of KV, 4096..32768, at most the training context)
     int32_t sliding_window = 0;   // 0: full attention
     int32_t sink_tokens = 8;      // attention-sink anchors kept with a sliding window
     KvCacheType kv_type = KvCacheType::Q8_0;
@@ -175,6 +175,8 @@ public:
     // A share at which most expert uses come from RAM (~85% hits at 12-15% on
     // Qwen3.6-35B-A3B): what the recommended budget is computed for.
     static constexpr double kComfortableCache = 0.15;
+    // KV memory the automatic context length is sized for.
+    static constexpr size_t kKvBudgetBytes = size_t{256} << 20;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;

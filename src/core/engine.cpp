@@ -620,6 +620,8 @@ Status Engine::load_expert_profile(const std::string& path) {
     return Status::ok();
 }
 
+int32_t Engine::context_length() const noexcept { return impl_->target->context_length(); }
+
 Engine::MemoryPlan Engine::memory_plan() const {
     const Transformer::MemoryPlan& p = impl_->target->memory_plan();
     return {p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};

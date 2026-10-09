@@ -30,7 +30,7 @@ class ModelSettings {
     this.topP = 0.9,
     this.topK = 40,
     this.maxTokens = 1024,
-    this.contextLength = 4096,
+    this.contextLength = 0,
     this.systemPrompt = defaultSystemPrompt,
   });
 
@@ -39,7 +39,7 @@ class ModelSettings {
   double topP;
   int topK;
   int maxTokens;
-  int contextLength; // takes effect on the next load
+  int contextLength; // 0: automatic (the engine sizes it from the KV cache's cost); takes effect on the next load
   String systemPrompt;
 
   /// Defaults, overridden by the model file's own sampling metadata, then by saved values.
@@ -58,7 +58,7 @@ class ModelSettings {
       s.topP = (o['top_p'] as num?)?.toDouble() ?? s.topP;
       s.topK = (o['top_k'] as num?)?.toInt() ?? s.topK;
       s.maxTokens = (o['max_tokens'] as num?)?.toInt() ?? s.maxTokens;
-      s.contextLength = (o['context'] as num?)?.toInt() ?? s.contextLength;
+      s.contextLength = _context((o['context'] as num?)?.toInt() ?? s.contextLength);
       final system = o['system'] as String?;
       if (system != null && !_previousDefaultSystemPrompts.contains(system)) s.systemPrompt = system;
     } on FormatException {
@@ -70,11 +70,11 @@ class ModelSettings {
   /// The context length to load `model` with, before an engine exists.
   static int contextFor(SharedPreferences prefs, String model) {
     final saved = prefs.getString(_key(model));
-    if (saved == null) return 4096;
+    if (saved == null) return 0;
     try {
-      return ((jsonDecode(saved) as Map<String, Object?>)['context'] as num?)?.toInt() ?? 4096;
+      return _context(((jsonDecode(saved) as Map<String, Object?>)['context'] as num?)?.toInt() ?? 0);
     } on FormatException {
-      return 4096;
+      return 0;
     }
   }
 
@@ -91,6 +91,9 @@ class ModelSettings {
       }));
 
   static String _key(String model) => 'model:$model';
+
+  /// 4096 was the default every saved setting carried before Auto existed.
+  static int _context(int saved) => saved == 4096 ? 0 : saved;
 }
 
 /// Engine options that are lossy, unfinished or meant for measurements

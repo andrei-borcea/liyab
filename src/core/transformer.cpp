@@ -278,10 +278,19 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.moe_norm_weights ? ", renormalized" : "");
     }
 
-    // Context and KV cache.
+    // Context and KV cache. Automatic: what kKvBudgetBytes of KV holds
+    // (4096..32768 positions, at most the training context). The KV cache is
+    // paged, so memory follows the positions actually used; a hybrid model
+    // with few attention blocks gets a long context (Qwen3.6-35B-A3B: 10.6 KiB
+    // per position, ~24k), where a flat 4096 forced chats with tools to drop
+    // old turns, and each drop meant processing the whole history again.
+    const size_t kv_per_token = KvCache::bytes_per_token(std::max(c.n_attn_layers, 1), c.n_head_kv, c.head_dim,
+                                                         options.kv_type);
+    const auto automatic = static_cast<int32_t>(std::clamp<size_t>(kKvBudgetBytes / std::max<size_t>(kv_per_token, 1),
+                                                                   4096, 32768));
     model->context_length_ = options.context_length > 0
                                  ? options.context_length
-                                 : (c.n_ctx_train > 0 ? std::min(c.n_ctx_train, 4096) : 4096);
+                                 : (c.n_ctx_train > 0 ? std::min(c.n_ctx_train, automatic) : automatic);
     if (c.n_ctx_train > 0 && model->context_length_ > c.n_ctx_train) {
         LIYAB_LOG_WARN("context %d exceeds the model's training context %d", model->context_length_, c.n_ctx_train);
     }

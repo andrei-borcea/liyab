@@ -322,7 +322,7 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             e.guess = predicted;
             e.for_batch = batch_.load(std::memory_order_relaxed);
             if (predicted) {
-                e.uses += 0.5f;  // a predicted expert is worth keeping until it is used
+                if (!batch_.load(std::memory_order_relaxed)) e.uses += 0.5f;  // worth keeping until used
                 queue_.push_back(key);
             } else {
                 queue_.push_front(key);
@@ -395,7 +395,10 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
     }
     ++e.pins;
     e.untouched = false;
-    e.uses += 1.0f;
+    // A multi-token pass (prefill) uses most experts once: crediting those
+    // uses evicted the experts the conversation keeps using, and decoding
+    // after a 1900-token prompt found 73% of its experts cached instead of 85%.
+    if (!batch_.load(std::memory_order_relaxed)) e.uses += 1.0f;
     e.last_use = ++clock_;
     const Slot& slot = slots_[static_cast<size_t>(e.slot)];
     const uint8_t* base = arena_ + slot.offset;

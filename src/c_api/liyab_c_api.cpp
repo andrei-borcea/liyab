@@ -354,6 +354,10 @@ liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path) {
     }
 }
 
+int32_t liyab_engine_context_length(const liyab_engine* engine) {
+    return engine == nullptr ? 0 : engine->engine->context_length();
+}
+
 liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out) {
     if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     const liyab::Engine::MemoryPlan p = engine->engine->memory_plan();

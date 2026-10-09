@@ -38,7 +38,7 @@ struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
     std::string draft_model_path;     // optional: enables speculative decoding
     int32_t n_threads = 0;            // 0: performance cores, minus one when there is no efficiency cluster
-    int32_t context_length = 0;       // 0: min(model training context, 4096)
+    int32_t context_length = 0;       // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the training context
     int32_t sliding_window = 0;       // 0: full attention; else attend to the last N tokens
     int32_t kv_sink_tokens = 8;       // with a sliding window: first N tokens stay visible (attention sinks)
     // Paged KV cache format. Q8_0 is the quality default; Q4_0 / Q4_1 (INT4,
@@ -177,6 +177,8 @@ public:
         int32_t requant_bits = 0;         // resident Q8_0 matrices converted at load (4 / 5); 0: none
     };
     [[nodiscard]] MemoryPlan memory_plan() const;
+    // The context length in positions (EngineConfig::context_length, resolved when 0).
+    [[nodiscard]] int32_t context_length() const noexcept;
 
     // The expert cache's hot list (MoE with streamed experts; no-ops
     // otherwise): the cached experts by use, recorded by trim_memory().

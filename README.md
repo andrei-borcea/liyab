@@ -551,7 +551,7 @@ are called directly because the C API makes them thread-safe.
 * **Activity.** Live meters (tok/s, battery W, CPU %, storage MB/s, thermal status with Android's 10 s headroom
   forecast, J/token on battery) with two-minute sparklines, sampled once a second only while the app is in the
   foreground; plus the app's and the engine's log (`liyab_log_buffer_*`), copyable.
-* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, speed or coolness (Fastest,
+* **Settings.** Sampling, context length (Auto by default) and system prompt per model; CPU/GPU, speed or coolness (Fastest,
   Balanced by default, Coolest: the engine's power profiles, applied at once), thermal limit, memory budget and idle
   release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
   storage and imports go through the system picker). **Experimental** exposes the engine's lossy, unfinished or
@@ -559,7 +559,13 @@ are called directly because the C API makes them thread-safe.
   FFN skipping, 2:4 sparse FFN (TDSS), the persistent prefix KV cache (KV dedup), lookup speculative decoding and its
   draft length, MoE expert mass and experts per token, requantized resident matrices, KV cache format and thread
   count. The app's `libliyab.so` is built with `LIYAB_ENABLE_EXPERIMENTAL=ON` for this; everything is off by default.
-* **Long conversations.** When the history no longer fits the context, it is compacted in one step: the oldest
+* **Long conversations.** With `context_length` 0 the engine sizes the context from the KV cache's cost: what 256
+  MiB of KV holds, 4096 to 32768 positions, at most the training context (Qwen3.6-35B-A3B, 10 attention blocks of
+  40: ~24k; a dense 4B: 4096). The cache is paged, so memory follows the positions used; at 4096, chats with tool
+  results reached the limit within a dozen messages, and each compaction meant processing the remaining history
+  again (1906 tokens, 110 s on the 35B). Multi-token passes give the experts they use no LFU credit, so a long
+  prompt does not evict the experts the conversation keeps using (73% instead of 85% cached after one). When the
+  history no longer fits the context, it is compacted in one step: the oldest
   turns leave the model's context until the history fills at most half of the room (a line in the chat marks the
   cut; the messages stay on screen). Dropping one turn per message instead would change the start of every prompt,
   and the engine would process the whole conversation again for each message; this way the following messages

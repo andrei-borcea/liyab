@@ -215,6 +215,9 @@ class AppState extends ChangeNotifier {
   bool thinkingSupported = false;
   ModelSettings settings = ModelSettings();
 
+  /// The loaded model's context length (positions), as the engine resolved it.
+  int contextLength = 4096;
+
   /// How the loaded model uses memory (expert streaming); zero for models that fit.
   MemoryPlan memory = const MemoryPlan(0, 0, 0, 0, 0);
   final List<ChatMessage> messages = [];
@@ -314,6 +317,7 @@ class AppState extends ChangeNotifier {
       description = model.description;
       device.lastModel = path;
       memory = model.memory;
+      contextLength = model.contextLength;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
       if (model.memory.tight) {
         status = '$name · needs about ${(model.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB of memory to '
@@ -512,7 +516,7 @@ class AppState extends ChangeNotifier {
   /// this way the following messages extend the same prompt, and the cost
   /// comes once every many messages.
   Future<String> _prompt(String user) async {
-    final budget = settings.contextLength - settings.maxTokens;
+    final budget = contextLength - settings.maxTokens;
     final system = await _systemBlock();
     List<Turn> history() => [
           for (final m in messages.skip(_historyStart.clamp(0, messages.length)))

@@ -261,6 +261,8 @@ final class LiyabLib {
             int Function(Pointer<Void>, Pointer<Utf8>)>('liyab_engine_save_expert_profile'),
         loadExpertProfile = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
             int Function(Pointer<Void>, Pointer<Utf8>)>('liyab_engine_load_expert_profile'),
+        contextLength = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
+            'liyab_engine_context_length'),
         memoryPlan = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabMemoryPlan>),
             int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>)>('liyab_engine_memory_plan'),
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
@@ -296,6 +298,7 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
   final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
   final int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>) memoryPlan;
+  final int Function(Pointer<Void>) contextLength;
   final int Function(Pointer<Void>, Pointer<Uint32>) warmMemory;
   final int Function(Pointer<Void>, Pointer<Utf8>) saveExpertProfile;
   final int Function(Pointer<Void>, Pointer<Utf8>) loadExpertProfile;

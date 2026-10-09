@@ -69,7 +69,7 @@ typedef struct liyab_engine_config {
     const char* model_path;       /* required: GGUF file */
     const char* draft_model_path; /* optional (NULL): enables speculative decoding */
     int32_t n_threads;            /* 0: performance cores, minus one when there is no efficiency cluster */
-    int32_t context_length;       /* 0: min(model context, 4096) */
+    int32_t context_length;       /* 0: automatic, what 256 MiB of KV holds (4096..32768), at most the model's */
     int32_t sliding_window;       /* 0: full attention */
     int32_t kv_sink_tokens;       /* attention sinks kept with a sliding window (default 8) */
     int32_t draft_tokens;         /* tokens proposed per speculative step */
@@ -259,6 +259,8 @@ typedef struct liyab_memory_plan {
     int32_t requant_bits;        /* resident Q8_0 matrices converted at load (4 / 5); 0: none */
 } liyab_memory_plan;
 LIYAB_C_API liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out);
+/* The context length the engine was created with (resolved when the config asked for 0). */
+LIYAB_C_API int32_t liyab_engine_context_length(const liyab_engine* engine);
 
 /* The expert cache's hot list (MoE with streamed experts; no-ops otherwise),
  * recorded by liyab_engine_trim_memory: warm_memory queues those experts
