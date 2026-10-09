@@ -126,10 +126,11 @@ This README describes what the code does today. Anything not implemented is list
   Apple `NSProcessInfo.thermalState`), Android's thermal-headroom forecast 10 s ahead
   (`AThermal_getThermalHeadroom`, Android 12+, smoothed) and the sysfs skin/SoC zones. The response is gradual: the
   forecast becomes a pressure from 0 to 1 over a band of headroom set by the profile (Performance 0.75–0.95,
-  Balanced 0.55–0.80, LowPower 0.35–0.60, so a cooler profile reacts earlier). With pressure the engine sheds cores,
+  Balanced 0.65–0.90, LowPower 0.35–0.60, so a cooler profile reacts earlier). With pressure the engine sheds cores,
   down to half, and paces tokens at up to twice their full-speed work time (learned while unslowed): the same tokens
   at lower clocks, for fewer watts. At pressure 1, at the profile's OS-status limit, above the skin threshold (40 °C
-  by default) or with the SoC past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active
+  by default) or with the SoC past its 95 °C emergency limit (on a smoothed reading: the hottest zone spikes by
+  25–30 °C for single samples), it reroutes GPU work to the NPU/CPU, halves the active
   threads and halves the token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and
   no longer throttles by itself; the forecast decides. With a forecast the sysfs "skin" reading is an emergency
 guard only, 8 °C above the threshold: on many phones it is a board thermistor near the SoC (xo-therm reads

@@ -266,6 +266,14 @@ void PowerManager::poll_once() {
     } else {
         headroom_ema_.reset();
     }
+    // The hottest SoC zone jumps by 25-30 °C for a single sample under load
+    // (65 -> 97 -> 70 °C on a Snapdragon 8 Elite): the emergency guard reads
+    // a smoothed value, so one spike does not throttle the next second.
+    if (sample.soc_c) {
+        soc_ema_ = soc_ema_ ? 0.7f * *soc_ema_ + 0.3f * *sample.soc_c : *sample.soc_c;
+    } else {
+        soc_ema_.reset();
+    }
     // Log when the response changes band: none, shedding cores, throttled.
     const float after = pressure_locked(sample_);
     const auto band = [](float p) { return p >= 1.0f ? 2 : (p > 0.0f ? 1 : 0); };
@@ -318,7 +326,7 @@ struct ProfileTraits {
 ProfileTraits traits(PowerProfile profile) {
     switch (profile) {
         case PowerProfile::Performance: return {0.75f, 0.95f, 0.0, 1.0f, ThermalStatus::Severe};
-        case PowerProfile::Balanced: return {0.55f, 0.80f, 12.0, 1.0f, ThermalStatus::Moderate};
+        case PowerProfile::Balanced: return {0.65f, 0.90f, 12.0, 1.0f, ThermalStatus::Moderate};
         case PowerProfile::LowPower: return {0.35f, 0.60f, 6.0, 0.5f, ThermalStatus::Light};
     }
     return {0.75f, 0.95f, 0.0, 1.0f, ThermalStatus::Severe};
@@ -341,7 +349,7 @@ float PowerManager::pressure_locked(const ThermalSample& s) const {
     const ThermalStatus limit = t.os_limit;
     const float skin_limit = config_.skin_threshold_c + (headroom_ema_ ? kSkinEmergencyMargin : 0.0f);
     if ((s.status != ThermalStatus::Unknown && s.status >= limit) || (s.skin_c && *s.skin_c >= skin_limit) ||
-        (s.soc_c && *s.soc_c >= config_.soc_threshold_c)) {
+        (soc_ema_ && *soc_ema_ >= config_.soc_threshold_c)) {
         p = 1.0f;
     }
     return p;

@@ -200,12 +200,18 @@ TEST_CASE("PowerManager sheds cores gradually on the headroom forecast") {
     CHECK_NEAR(p.thread_fraction, 0.5, 1e-6);
     CHECK_NEAR(p.target_tps, 8.0, 1e-9);
 
-    // The SoC's emergency temperature throttles whatever the forecast.
+    // The SoC's emergency temperature throttles whatever the forecast, once
+    // sustained: a single-sample spike does not.
     sample.headroom = 0.3f;
     for (int i = 0; i < 40; ++i) pm.poll_once();
     CHECK(!pm.policy().throttled);
-    sample.soc_c = 96.0f;
+    sample.soc_c = 101.0f;
     pm.poll_once();
+    CHECK(!pm.policy().throttled);  // one spike
+    sample.soc_c = 87.0f;
+    pm.poll_once();
+    sample.soc_c = 97.0f;
+    for (int i = 0; i < 10; ++i) pm.poll_once();
     CHECK(pm.policy().throttled);
 }
 
@@ -229,13 +235,13 @@ TEST_CASE("Cooler profiles react earlier and slow tokens down before throttling"
     PowerConfig config;
     config.profile = PowerProfile::Performance;
     PowerManager pm(config, [&] { return sample; });
-    sample.headroom = 0.65f;
+    sample.headroom = 0.75f;
     for (int i = 0; i < 40; ++i) pm.poll_once();
     PowerPolicy p = pm.policy();
-    CHECK(p.pressure == 0.0f);  // below Performance's band
+    CHECK(p.pressure < 1e-3f);  // the start of Performance's band
     CHECK(p.slowdown == 1.0f);
 
-    pm.set_profile(PowerProfile::Balanced);  // band 0.55-0.80: 40% of the way
+    pm.set_profile(PowerProfile::Balanced);  // band 0.65-0.90: 40% of the way
     p = pm.policy();
     CHECK_NEAR(p.pressure, 0.4, 1e-3);
     CHECK_NEAR(p.slowdown, 1.4, 1e-3);

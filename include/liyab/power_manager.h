@@ -11,7 +11,7 @@
 //   (Android AThermal_getThermalHeadroom, 10 s ahead; 1.0 = severe
 //   throttling), smoothed, turned into a pressure from 0 to 1 over a band of
 //   headroom that depends on the profile: Performance 0.75-0.95, Balanced
-//   0.55-0.80, LowPower 0.35-0.60 (a cooler profile reacts earlier). With
+//   0.65-0.90, LowPower 0.35-0.60 (a cooler profile reacts earlier). With
 //   pressure the engine sheds cores (down to half) and paces tokens at up to
 //   twice their full-speed work time, which the performance hint (ADPF) turns
 //   into lower clocks: the same tokens for fewer watts, instead of racing and
@@ -136,6 +136,7 @@ private:
     ThermalSensor sensor_;
     ThermalSample sample_;
     std::optional<float> headroom_ema_;  // smoothed forecast: one noisy sample does not shed cores
+    std::optional<float> soc_ema_;       // smoothed hottest SoC zone: single-sample spikes are common
 
     std::thread thread_;
     std::condition_variable cv_;
