@@ -1,5 +1,5 @@
 // The conversation: the living flame at rest in an empty chat, then the
-// messages; a composer that glows while the model works.
+// messages; a composer whose edge glows while the model works.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -443,76 +443,57 @@ class _Composer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        // The flame's glow rises over the composer while the model works.
-        Positioned(
-          left: 0,
-          right: 0,
-          top: -48,
-          height: 48,
-          child: IgnorePointer(
-            child: AnimatedOpacity(
-              opacity: generating ? 1 : 0,
-              duration: const Duration(milliseconds: 500),
-              child: const DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: RadialGradient(
-                    center: Alignment.bottomCenter,
-                    radius: 1.6,
-                    colors: [Color(0x55FF7A3D), Color(0x00FF7A3D)],
-                  ),
+    // While the model works the composer's edge takes the flame's colour,
+    // with a soft halo around the bar itself.
+    const ember = Color(0xFFFF7A3D);
+    return SafeArea(
+      top: false,
+      minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeOut,
+        padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(color: generating ? ember.withValues(alpha: 0.55) : theme.colorScheme.outline),
+          boxShadow: [
+            BoxShadow(color: ember.withValues(alpha: generating ? 0.22 : 0), blurRadius: 22, spreadRadius: -2),
+          ],
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Expanded(
+              child: TextField(
+                controller: controller,
+                focusNode: focus,
+                enabled: enabled,
+                minLines: 1,
+                maxLines: 6,
+                textCapitalization: TextCapitalization.sentences,
+                style: theme.textTheme.bodyLarge,
+                decoration: InputDecoration(
+                  hintText: enabled ? 'Ask Liyab' : 'Load a model first',
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
                 ),
+                onSubmitted: enabled && !generating ? (_) => onSend() : null,
               ),
             ),
-          ),
-        ),
-        SafeArea(
-          top: false,
-          minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(28),
-              border: Border.all(color: theme.colorScheme.outline),
+            const SizedBox(width: 6),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 2),
+              child: RoundAction(
+                tooltip: generating ? 'Stop' : 'Send',
+                icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
+                onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
+              ),
             ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: controller,
-                    focusNode: focus,
-                    enabled: enabled,
-                    minLines: 1,
-                    maxLines: 6,
-                    textCapitalization: TextCapitalization.sentences,
-                    style: theme.textTheme.bodyLarge,
-                    decoration: InputDecoration(
-                      hintText: enabled ? 'Ask Liyab' : 'Load a model first',
-                      border: InputBorder.none,
-                      isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                    onSubmitted: enabled && !generating ? (_) => onSend() : null,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 2),
-                  child: RoundAction(
-                    tooltip: generating ? 'Stop' : 'Send',
-                    icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
-                    onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
-                  ),
-                ),
-              ],
-            ),
-          ),
+          ],
         ),
-      ],
+      ),
     );
   }
 }
