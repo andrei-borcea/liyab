@@ -372,7 +372,7 @@ private:
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
-    std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_;  // MoE scratch
+    std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)

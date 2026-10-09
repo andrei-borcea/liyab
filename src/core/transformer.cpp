@@ -1257,14 +1257,15 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         for (size_t i = 0; i < un * sh; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
         shared_out_.resize(un * d);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), shared_out_.data(), n));
-        for (size_t t = 0; t < un; ++t) {
-            float scale = 1.0f;
-            if (!L.shared_gate.empty()) {
+        // The gate scale is applied when the output is added (below), in one
+        // multiply-add as before: scaling here first rounded differently.
+        shared_scale_.assign(un, 1.0f);
+        if (!L.shared_gate.empty()) {
+            for (size_t t = 0; t < un; ++t) {
                 float dot = 0.0f;
                 for (size_t j = 0; j < d; ++j) dot += L.shared_gate[j] * xb_[t * d + j];
-                scale = sigmoid(dot);
+                shared_scale_[t] = sigmoid(dot);
             }
-            for (size_t j = 0; j < d; ++j) shared_out_[t * d + j] *= scale;
         }
         shared_done = true;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1381,7 +1382,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
 
     if (!shared_done) LIYAB_RETURN_IF_ERROR(run_shared());
     if (L.w[kUpShared] != nullptr) {
-        for (size_t i = 0; i < un * d; ++i) moe_out_[i] += shared_out_[i];
+        for (size_t t = 0; t < un; ++t) {
+            const float scale = shared_scale_[t];
+            for (size_t j = 0; j < d; ++j) moe_out_[t * d + j] += scale * shared_out_[t * d + j];
+        }
     }
     std::copy(moe_out_.begin(), moe_out_.end(), xb_.begin());
     return Status::ok();
