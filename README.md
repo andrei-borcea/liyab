@@ -1,4 +1,6 @@
-# 🔥 Liyab — on-device LLM inference for Android and iOS
+<p align="center"><img src="docs/brand/liyab-mark.svg" width="112" alt="Liyab logo: two blades of flame around a core of light"></p>
+
+# Liyab — on-device LLM inference for Android and iOS
 
 [![Platform](https://img.shields.io/badge/Platform-Android_%7C_iOS_%7C_macOS-brightgreen.svg)]()
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
@@ -909,7 +911,8 @@ src/c_api/              C ABI implementation
 tools/                  liyab_cli.cpp (command-line front end over the C ABI), liyab_bench.cpp (CPU kernel
                         throughput vs the RAM read ceiling), table/vector generators, gen_bench_charts.py (README charts)
 docs/benchmarks/        benchmark data (results.json) and the charts drawn from it
-android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI), built by scripts/build_android_app.sh
+docs/brand/             the Liyab mark and app icon (SVG, 512 px PNG); "liyab" is Tagalog for flame
+android/chat/           demo app (Home / Chat / Models / Settings screens, Java + JNI, adaptive launcher icon in res/), built by scripts/build_android_app.sh
 tests/                  self-contained unit tests and benchmarks
 scripts/                build_android.sh, build_android_app.sh, build_ios.sh
 ```

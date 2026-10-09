@@ -55,8 +55,11 @@ javac -source 11 -target 11 -Xlint:-options -encoding UTF-8 -classpath "$PLATFOR
 "$BUILD_TOOLS/d8" --release --min-api 28 --lib "$PLATFORM_JAR" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
 
 echo "==> APK"
+# Resources: the launcher icon (adaptive vector icon, res/).
+rm -rf "$OUT/res.zip"
+"$BUILD_TOOLS/aapt2" compile --dir "$APP/res" -o "$OUT/res.zip"
 "$BUILD_TOOLS/aapt2" link -o "$OUT/unsigned.apk" --manifest "$APP/AndroidManifest.xml" -I "$PLATFORM_JAR" \
-  --min-sdk-version 28 --target-sdk-version 35
+  --min-sdk-version 28 --target-sdk-version 35 "$OUT/res.zip"
 (cd "$OUT/dex" && zip -q -j "$OUT/unsigned.apk" classes.dex)
 (cd "$OUT" && zip -q -r unsigned.apk lib)
 "$BUILD_TOOLS/zipalign" -f -P 16 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"

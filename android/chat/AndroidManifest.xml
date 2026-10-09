@@ -15,6 +15,7 @@
     <application
         android:name=".LiyabApp"
         android:label="Liyab Chat"
+        android:icon="@mipmap/ic_launcher"
         android:extractNativeLibs="true"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
