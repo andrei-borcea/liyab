@@ -12,12 +12,14 @@
 
 namespace liyab {
 
-// Workers spin between jobs for a short while before they sleep: a decode
-// step issues about a thousand parallel_for calls of 10–300 us each, and a
+// Workers wait for the next job in a low-power wait (WFE on ARM64, see
+// wait_step in thread_pool.cpp) for a short while before they sleep: a decode
+// step issues about 400 parallel_for calls of 10–300 us each, and a
 // condition-variable wake-up costs ~80–100 us on a Snapdragon 8 Elite, which
-// made small matmuls slower on 8 threads than on one. Spinning workers pick
-// a job up in about a microsecond. After kSpinMicros without work they block
-// on a condition variable, so an idle engine costs no CPU.
+// made small matmuls slower on 8 threads than on one. Waiting workers pick a
+// job up within about a microsecond of its publication, without keeping
+// their cores at full clock meanwhile. After kSpinMicros without work they
+// block on a condition variable, so an idle engine costs no CPU.
 //
 // A job is split into kChunksPerThread chunks per participating thread, and
 // every participant (the caller included) claims the next unclaimed chunk

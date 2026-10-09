@@ -18,11 +18,36 @@ namespace liyab {
 namespace {
 
 // Tells the core it is in a spin-wait loop (lower power, yields to an SMT sibling).
-inline void cpu_relax() noexcept {
+[[maybe_unused]] inline void cpu_relax() noexcept {
 #if defined(__aarch64__) || defined(__arm__)
     __asm__ __volatile__("yield");
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
+#endif
+}
+
+// One step of waiting for `a` to differ from `old`. On ARM64 the core arms
+// its exclusive monitor on a's cache line and sleeps in WFE until another
+// core writes that line, or until the next event (Linux and Android send one
+// about every 100 us): no instructions issue meanwhile, so the core idles at
+// low power. A `yield` spin keeps it at full clock (yield only helps SMT
+// siblings, which phone and Apple cores do not have), and the pool waits
+// between ~400 jobs per decoded token. Elsewhere a pause / yield hint.
+template <typename T>
+inline void wait_step(const std::atomic<T>& a, T old) noexcept {
+#if defined(__aarch64__)
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8);
+    T v;
+    if constexpr (sizeof(T) == 8) {
+        __asm__ __volatile__("ldaxr %x0, [%1]" : "=r"(v) : "r"(&a) : "memory");
+    } else {
+        __asm__ __volatile__("ldaxr %w0, [%1]" : "=r"(v) : "r"(&a) : "memory");
+    }
+    if (v == old) __asm__ __volatile__("wfe" ::: "memory");
+#else
+    (void)a;
+    (void)old;
+    cpu_relax();
 #endif
 }
 
@@ -43,6 +68,7 @@ ThreadPool::~ThreadPool() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_.store(true);
+        generation_.fetch_add(uint64_t{1} << 8);  // a write to the line wakes workers waiting in WFE
     }
     wake_.notify_all();
     for (auto& t : workers_) t.join();
@@ -73,8 +99,8 @@ void ThreadPool::parallel_for(int64_t n, const std::function<void(int64_t, int64
     }
 
     run_chunks(sequence);
-    // The remaining chunks are running on other threads: spin until they end.
-    while (done_.load(std::memory_order_acquire) != chunks) cpu_relax();
+    // The remaining chunks are running on other threads: wait until they end.
+    for (int32_t d; (d = done_.load(std::memory_order_acquire)) != chunks;) wait_step(done_, d);
     job_ = nullptr;
 }
 
@@ -98,11 +124,11 @@ void ThreadPool::run_chunks(uint64_t sequence) {
 uint64_t ThreadPool::wait_for_job(uint64_t seen) {
     using Clock = std::chrono::steady_clock;
     const auto spin_until = Clock::now() + std::chrono::microseconds(kSpinMicros);
-    for (uint32_t i = 1;; ++i) {
+    for (;;) {
         const uint64_t g = generation_.load(std::memory_order_acquire);
         if (g != seen || stop_.load(std::memory_order_relaxed)) return g;
-        cpu_relax();
-        if ((i & 255) == 0 && Clock::now() >= spin_until) break;  // read the clock rarely
+        wait_step(generation_, seen);
+        if (Clock::now() >= spin_until) break;  // a wait step lasts long enough for a clock read each
     }
     std::unique_lock<std::mutex> lock(mutex_);
     sleepers_.fetch_add(1);  // seq_cst: ordered before the generation re-read below
