@@ -423,6 +423,18 @@ struct Engine::Impl {
         return Status::ok();
     }
 
+    // Tokens per prefill pass. With streamed MoE experts a pass reads the
+    // union of the experts its tokens choose, and 64 tokens already choose
+    // most of them: Qwen3.6-35B-A3B prefilled 1700 tokens in 180 s in passes
+    // of 64, rereading nearly every expert from storage 27 times. Passes of
+    // kStreamedPrefillChunk read each expert once per 512 tokens (activations:
+    // ~0.25 MiB per token). Other models keep max_batch passes.
+    static constexpr int32_t kStreamedPrefillChunk = 512;
+    [[nodiscard]] int32_t prefill_chunk() const {
+        return target->expert_store() != nullptr ? std::max(target->max_batch(), kStreamedPrefillChunk)
+                                                 : target->max_batch();
+    }
+
     void apply_policy(const PowerPolicy& policy) {
         const auto threads = static_cast<int32_t>(std::lround(pool->max_threads() * policy.thread_fraction));
         pool->set_active_threads(std::max(1, threads));
@@ -699,7 +711,7 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     s.apply_policy(policy);
     const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
     const ForwardHooks hooks = s.hooks(policy, false);
-    const auto chunk = static_cast<size_t>(s.target->max_batch());
+    const auto chunk = static_cast<size_t>(s.prefill_chunk());
     for (size_t i = reused; i < t.size(); i += chunk) {
         if (s.cancel.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
         const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
@@ -853,7 +865,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     s.apply_policy(prefill_policy);
     const Route prefill_route = prefill_policy.throttled ? s.throttled_route() : s.normal_route();
     const ForwardHooks prefill_hooks = s.hooks(prefill_policy, false);
-    const auto chunk = static_cast<size_t>(s.target->max_batch());
+    const auto chunk = static_cast<size_t>(s.prefill_chunk());
     const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1).subspan(first_uncached);
     for (size_t i = 0; i < prefix.size(); i += chunk) {
         if (s.cancel.load(std::memory_order_relaxed)) {
