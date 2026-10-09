@@ -1369,8 +1369,11 @@ TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
     options.context_length = 4096;
     auto model = load_transformer(path, options);
     REQUIRE(model != nullptr);
+    const int positions = std::max(1, std::atoi(std::getenv("LIYAB_BENCH_ATTENTION")) > 1
+                                          ? std::atoi(std::getenv("LIYAB_BENCH_ATTENTION"))
+                                          : 3000);  // LIYAB_BENCH_ATTENTION=N: N positions
     std::vector<int32_t> prompt;
-    for (int32_t i = 0; i < 3000; ++i) prompt.push_back(3 + (i * 37) % 250);
+    for (int32_t i = 0; i < positions; ++i) prompt.push_back(3 + (i * 37) % 250);
     for (size_t i = 0; i < prompt.size(); i += 512) {
         const std::span<const int32_t> part(prompt.data() + i, std::min<size_t>(512, prompt.size() - i));
         REQUIRE(model->forward(part, Transformer::Logits::None, route, pool).has_value());
@@ -1381,7 +1384,7 @@ TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
         const int32_t t = 3 + i;
         REQUIRE(model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool).has_value());
     }
-    std::printf("  attention (projections included) at 3000 positions: %.2f ms per token per layer\n",
+    std::printf("  attention (projections included) at %d positions: %.2f ms per token per layer\n", positions,
                 (model->phase_times().attention - before) / steps);
 }
 
