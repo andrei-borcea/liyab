@@ -531,6 +531,12 @@ are called directly because the C API makes them thread-safe.
   FFN skipping, 2:4 sparse FFN (TDSS), the persistent prefix KV cache (KV dedup), lookup speculative decoding and its
   draft length, MoE expert mass and experts per token, requantized resident matrices, KV cache format and thread
   count. The app's `libliyab.so` is built with `LIYAB_ENABLE_EXPERIMENTAL=ON` for this; everything is off by default.
+* **Typing ahead.** While the user writes, the stable part of the draft (whole words, cut where its tokens are a
+  prefix of the text so far, since a hybrid model's context is reused only up to the snapshot at the end of a
+  prefill) is processed in the background, 0.6 s after the last keystroke. Sending then costs only the last words
+  and the time line. On a MoE whose experts stream from storage a prompt token costs about as much as a generated one
+  (Qwen3.6-35B-A3B: 45 new prompt tokens took 5.9–6.8 s before the first word), so this hides most of that wait.
+  Each generation of a reply is logged (new and reused prompt tokens, first token, speed).
 * **Leaving the screen.** HyperOS stops a background app that holds several GB within a minute
   (`kill_bg_proc`), and the process outlives its window anyway (the notification listener keeps it running). So the
   moment Liyab is hidden it parks: the expert cache is emptied (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the

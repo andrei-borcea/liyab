@@ -453,6 +453,62 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  // Typing ahead: while the user writes, the stable part of the draft (whole
+  // words, cut where its tokens are a prefix of the text so far) is processed
+  // in the background, so sending only costs the last words and the time line.
+  // On a MoE whose experts stream from storage a prompt token costs about as
+  // much as a generated one, so this hides most of the wait before an answer.
+  // On hybrid models the engine reuses a context only up to its snapshot at
+  // the end of a prefill, hence the exact token-prefix check.
+  Timer? _draftTimer;
+  String _drafted = ''; // the prompt text last processed for the draft
+  bool _drafting = false;
+
+  /// Called on every edit of the composer's text.
+  void draftChanged(String text) {
+    _draftTimer?.cancel();
+    if (text.trim().isEmpty) return;
+    _draftTimer = Timer(const Duration(milliseconds: 600), () => unawaited(_prefillDraft(text)));
+  }
+
+  Future<void> _prefillDraft(String text) async {
+    if (_drafting || generating || loading || _away || !engine.loaded) return;
+    _drafting = true;
+    try {
+      await _preparing;
+      const marker = '\u0000';
+      final template = await _prompt(marker);
+      final head = template.substring(0, template.indexOf(marker));
+      final whole = await engine.tokenIds(head + text);
+      var cut = text.length;
+      for (var tries = 0; tries < 3; ++tries) {
+        cut = cut <= 0 ? -1 : text.lastIndexOf(RegExp(r'\s'), cut - 1);
+        if (cut <= 0) return;
+        final stable = head + text.substring(0, cut);
+        if (_drafted.startsWith(stable)) return; // nothing new to process
+        final ids = await engine.tokenIds(stable);
+        if (ids.length < whole.length && _isPrefix(ids, whole)) {
+          final watch = Stopwatch()..start();
+          await engine.prefill(stable);
+          _log('Draft prepared (${ids.length} tokens) in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(2)} s');
+          _drafted = stable;
+          return;
+        }
+      }
+    } on EngineException catch (e) {
+      _log('Draft not prepared: $e');
+    } finally {
+      _drafting = false;
+    }
+  }
+
+  static bool _isPrefix(List<int> a, List<int> b) {
+    for (var i = 0; i < a.length; ++i) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   static const _weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   static const _months = [
     'January', 'February', 'March', 'April', 'May', 'June',
@@ -476,6 +532,8 @@ class AppState extends ChangeNotifier {
   Future<void> send(String text) async {
     if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
     generating = true;
+    _draftTimer?.cancel();
+    _drafted = '';
     final promptUser = '$text\n\n${nowLine(DateTime.now())}';
     final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser);
     messages.add(message); // shown at once, also while the model wakes up
@@ -580,6 +638,7 @@ class AppState extends ChangeNotifier {
   void newChat() {
     if (generating) return;
     messages.clear();
+    _drafted = '';
     unawaited(_discardConversation());
     notifyListeners();
   }

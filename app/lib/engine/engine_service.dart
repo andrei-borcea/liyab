@@ -200,6 +200,9 @@ class EngineService {
   /// Number of tokens `text` encodes to (special-token texts count as one).
   Future<int> countTokens(String text) => _call<int>(['tokenize', text]);
 
+  /// The token ids `text` encodes to.
+  Future<List<int>> tokenIds(String text) async => List<int>.from(await _call<List<Object?>>(['tokenIds', text]));
+
   /// Processes `text` into the context so a later prompt starting with it skips that work.
   Future<void> prefill(String text) => _call<Object?>(['prefill', text]);
 
@@ -302,6 +305,16 @@ void _worker(SendPort replies) {
           using((arena) {
             final n = lib.tokenize(engine, (m[2] as String).toNativeUtf8(allocator: arena), 0, nullptr, 0);
             n < 0 ? fail() : replies.send(['ok', id, n]);
+          });
+        case 'tokenIds':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final text = (m[2] as String).toNativeUtf8(allocator: arena);
+            final n = lib.tokenize(engine, text, 0, nullptr, 0);
+            if (n < 0) return fail();
+            final ids = arena<Int32>(n == 0 ? 1 : n);
+            if (lib.tokenize(engine, text, 0, ids, n) < 0) return fail();
+            replies.send(['ok', id, ids.asTypedList(n).toList()]);
           });
         case 'prefill':
           if (engine.address == 0) return fail('no model loaded');

@@ -34,7 +34,11 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     app.addListener(_changed);
     app.monitor.addListener(_heatChanged);
+    _input.addListener(_typed);
   }
+
+  /// The engine processes the draft while the user writes (AppState.draftChanged).
+  void _typed() => app.draftChanged(_input.text);
 
   void _heatChanged() {
     if (mounted) setState(() {});

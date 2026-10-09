@@ -57,6 +57,14 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
   AppState get app => widget.app;
 
   @override
+  void initState() {
+    super.initState();
+    _input.addListener(_typed); // the engine processes the draft while the user writes
+  }
+
+  void _typed() => app.draftChanged(_input.text);
+
+  @override
   void dispose() {
     _input.dispose();
     _rise.dispose();
