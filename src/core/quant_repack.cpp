@@ -479,28 +479,35 @@ void gemm_q8_0_r4(const BlockQ8_0x4* w, int64_t cols, int64_t g0, int64_t g1, co
 }
 
 void gemv_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, const BlockQ8_K* x, float* y) noexcept {
+    // Integer sums per sub-block stay in vectors of 4 rows and meet their
+    // scales in vector multiply-adds: building the scales lane by lane from a
+    // widened stack copy held this kernel at ~60% of the memory bandwidth the
+    // other repacked kernels reach. The sums are the same integers as before.
     const int64_t nb = cols / kSuperBlock;
     const uint8x16_t m4b = vdupq_n_u8(0x0f), mask_lo = vdupq_n_u8(0x03), mask_hi = vdupq_n_u8(0x30);
     for (int64_t g = g0; g < g1; ++g) {
         const BlockQ6_Kx8* q6 = w + g * nb;
         float32x4_t acc_f32[2] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
         for (int64_t b = 0; b < nb; ++b) {
-            int16_t sc[16 * 8];
-            for (int i = 0; i < 16; ++i) vst1q_s16(sc + i * 8, vmovl_s8(vld1_s8(q6[b].scales + i * 8)));
+            __builtin_prefetch(q6 + b + 1);
             // Values are stored as q + 32: subtract 32 * sum(scale * activation sum per 16).
             int32x4_t bias_lo = vdupq_n_s32(0), bias_hi = vdupq_n_s32(0);
             for (int i = 0; i < 16; i += 4) {
                 const int16x4_t bs = vld1_s16(x[b].bsums + i);
-                bias_lo = vmlal_lane_s16(bias_lo, vld1_s16(sc + (i + 0) * 8), bs, 0);
-                bias_hi = vmlal_lane_s16(bias_hi, vld1_s16(sc + (i + 0) * 8 + 4), bs, 0);
-                bias_lo = vmlal_lane_s16(bias_lo, vld1_s16(sc + (i + 1) * 8), bs, 1);
-                bias_hi = vmlal_lane_s16(bias_hi, vld1_s16(sc + (i + 1) * 8 + 4), bs, 1);
-                bias_lo = vmlal_lane_s16(bias_lo, vld1_s16(sc + (i + 2) * 8), bs, 2);
-                bias_hi = vmlal_lane_s16(bias_hi, vld1_s16(sc + (i + 2) * 8 + 4), bs, 2);
-                bias_lo = vmlal_lane_s16(bias_lo, vld1_s16(sc + (i + 3) * 8), bs, 3);
-                bias_hi = vmlal_lane_s16(bias_hi, vld1_s16(sc + (i + 3) * 8 + 4), bs, 3);
+                const int16x8_t s0 = vmovl_s8(vld1_s8(q6[b].scales + (i + 0) * 8));
+                const int16x8_t s1 = vmovl_s8(vld1_s8(q6[b].scales + (i + 1) * 8));
+                const int16x8_t s2 = vmovl_s8(vld1_s8(q6[b].scales + (i + 2) * 8));
+                const int16x8_t s3 = vmovl_s8(vld1_s8(q6[b].scales + (i + 3) * 8));
+                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s0), bs, 0);
+                bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s0), bs, 0);
+                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s1), bs, 1);
+                bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s1), bs, 1);
+                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s2), bs, 2);
+                bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s2), bs, 2);
+                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s3), bs, 3);
+                bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s3), bs, 3);
             }
-            int32x2_t acc[4] = {vdup_n_s32(0), vdup_n_s32(0), vdup_n_s32(0), vdup_n_s32(0)};  // per weight-row pair
+            int32x4_t acc_lo = vdupq_n_s32(0), acc_hi = vdupq_n_s32(0);  // weight rows 0-3, 4-7
             for (int half = 0; half < 2; ++half) {
                 const uint8_t* ql_base = q6[b].ql + half * 512;
                 const uint8_t* qh_base = q6[b].qh + half * 256;
@@ -522,25 +529,27 @@ void gemv_q6_K_r8(const BlockQ6_Kx8* w, int64_t cols, int64_t g0, int64_t g1, co
                             qh1.val[k] = vshrq_n_u8(qh1.val[k], 2);
                         }
                     }
+                    int32x4_t al[4], ah[4];  // lanes: [row 2cp: 2 halves, row 2cp + 1: 2 halves]
                     for (int cp = 0; cp < 4; ++cp) {
                         const int8x16_t l0 = vreinterpretq_s8_u8(vsliq_n_u8(vandq_u8(ql0.val[cp], m4b), vandq_u8(qh0.val[cp], mask_lo), 4));
                         const int8x16_t l1 = vreinterpretq_s8_u8(vsliq_n_u8(vandq_u8(ql1.val[cp], m4b), vandq_u8(qh1.val[cp], mask_lo), 4));
                         const int8x16_t h0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql0.val[cp], 4), vandq_u8(qh0.val[cp], mask_hi)));
                         const int8x16_t h1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql1.val[cp], 4), vandq_u8(qh1.val[cp], mask_hi)));
-                        const int32x4_t al = vdotq_s32(vdotq_s32(vdupq_n_s32(0), l0, xl[0]), l1, xl[1]);
-                        const int32x4_t ah = vdotq_s32(vdotq_s32(vdupq_n_s32(0), h0, xh[0]), h1, xh[1]);
-                        const int32x2_t sl = vpadd_s32(vget_low_s32(al), vget_high_s32(al));  // [row 2cp, row 2cp + 1]
-                        const int32x2_t sh = vpadd_s32(vget_low_s32(ah), vget_high_s32(ah));
-                        const int il = half * 8 + sb, ih = half * 8 + sb + 4;
-                        const int32x2_t vl = {sc[il * 8 + cp * 2], sc[il * 8 + cp * 2 + 1]};
-                        const int32x2_t vh = {sc[ih * 8 + cp * 2], sc[ih * 8 + cp * 2 + 1]};
-                        acc[cp] = vmla_s32(acc[cp], sl, vl);
-                        acc[cp] = vmla_s32(acc[cp], sh, vh);
+                        al[cp] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), l0, xl[0]), l1, xl[1]);
+                        ah[cp] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), h0, xh[0]), h1, xh[1]);
                     }
+                    // Pairwise adds give the 4-row sums; the 8 rows' scales of a sub-block are contiguous.
+                    const int il = half * 8 + sb, ih = half * 8 + sb + 4;
+                    const int16x8_t sl = vmovl_s8(vld1_s8(q6[b].scales + il * 8));
+                    const int16x8_t sh = vmovl_s8(vld1_s8(q6[b].scales + ih * 8));
+                    acc_lo = vmlaq_s32(acc_lo, vpaddq_s32(al[0], al[1]), vmovl_s16(vget_low_s16(sl)));
+                    acc_hi = vmlaq_s32(acc_hi, vpaddq_s32(al[2], al[3]), vmovl_s16(vget_high_s16(sl)));
+                    acc_lo = vmlaq_s32(acc_lo, vpaddq_s32(ah[0], ah[1]), vmovl_s16(vget_low_s16(sh)));
+                    acc_hi = vmlaq_s32(acc_hi, vpaddq_s32(ah[2], ah[3]), vmovl_s16(vget_high_s16(sh)));
                 }
             }
-            const int32x4_t sum_lo = vsubq_s32(vcombine_s32(acc[0], acc[1]), vshlq_n_s32(bias_lo, 5));
-            const int32x4_t sum_hi = vsubq_s32(vcombine_s32(acc[2], acc[3]), vshlq_n_s32(bias_hi, 5));
+            const int32x4_t sum_lo = vsubq_s32(acc_lo, vshlq_n_s32(bias_lo, 5));
+            const int32x4_t sum_hi = vsubq_s32(acc_hi, vshlq_n_s32(bias_hi, 5));
             acc_f32[0] = epilogue_q6(acc_f32[0], q6[b], 0, x[b].d, sum_lo);
             acc_f32[1] = epilogue_q6(acc_f32[1], q6[b], 1, x[b].d, sum_hi);
         }
