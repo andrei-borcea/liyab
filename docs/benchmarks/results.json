@@ -178,6 +178,11 @@
     "label": "+ 7 threads, chunks claimed on demand",
     "decode_tps": 7.83,
     "ms_per_token": 127.7
+   },
+   {
+    "label": "+ an expert's three matrices read in parallel",
+    "decode_tps": 8.89,
+    "ms_per_token": 112.5
    }
   ],
   "phases_ms_per_token": {

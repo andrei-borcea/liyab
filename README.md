@@ -10,6 +10,12 @@ with no cloud dependency. Weights are memory-mapped and read in place, or, for m
 from storage with direct I/O straight into memory the CPU and GPU share; work is routed per device
 (NPU → GPU → CPU), and a power manager paces token output and reacts to thermal pressure.
 
+On top of it, the **Liyab app** (Flutter, Android today) is a private assistant that runs entirely on the phone:
+chat with open models downloaded from Hugging Face, and an assistant sheet that the system's assist gesture opens
+over any app, as Gemini's does, but with nothing leaving the device. Qwen3.6-35B-A3B, a 22 GB mixture-of-experts
+model, answers at about 7–9 tokens per second on a Snapdragon 8 Elite phone, streamed from storage within the
+6 GiB an app may use.
+
 This README describes what the code does today. Anything not implemented is listed under
 [Limitations and roadmap](#limitations-and-roadmap), not in the feature list.
 
@@ -50,6 +56,9 @@ This README describes what the code does today. Anything not implemented is list
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ implemented |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 runtime detection only. Compute falls back to the next backend |
 | Tokenizers: SentencePiece and byte-level BPE (Qwen2/Qwen3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ implemented, token-identical to llama.cpp |
+| Context kept between chat turns: a prompt that continues the processed text keeps its tokens; hybrid (DeltaNet) models also snapshot their recurrent state at each prompt's end | ✅ implemented (follow-up turns start in ~1.1–1.6 s on the 35B) |
+| Liyab app (Flutter, `app/`): chat, model library and Hugging Face downloads, live activity and log, settings, assistant sheet over any app (default digital assistant) | ✅ Android; 🟡 iOS app not built yet (the engine builds for iOS) |
+| Voice input and output, agent tools (calendar, alarms, notifications), local memory | 🔜 planned, see [Limitations and roadmap](#limitations-and-roadmap) |
 | Experimental: early exit, head pruning, EGLS, TDSS 2:4 sparsity, JIT unpacker, persistent KV prefix cache, io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
@@ -57,7 +66,7 @@ This README describes what the code does today. Anything not implemented is list
 ## Architecture
 
 ```
-           Kotlin (JNI)  /  Swift  /  C++
+   Flutter app (dart:ffi)  /  Kotlin (JNI)  /  Swift  /  C++
                         │
               liyab_c_api.h  (stable C ABI)
                         │
@@ -196,6 +205,8 @@ scripts/build_android.sh --help          # --abi, --api, --ndk, --no-vulkan, --n
 ```
 
 The NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations.
+The Liyab app (Flutter 3.x, Android SDK platform 36, JDK 17) builds with `scripts/build_flutter_app.sh [--install]`,
+which builds `libliyab.so` with this script first (see [Liyab app](#liyab-app-flutter-app)).
 The `.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require.
 
 ### iOS (`.xcframework`)
@@ -899,6 +910,13 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
+* **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
+  assistant listens at once; the flame's listening animation is ready for it), then a power and thermal controller
+  that uses Android's performance hints and thermal-headroom forecast instead of a fixed temperature threshold, then
+  agent tools (structured tool calls with constrained decoding; alarms, timers, calendar and notifications, every
+  outward action confirmed by the user), GPU prefill, and local memory over the user's own data. The iOS app is not
+  built yet. In the assistant sheet's window, pages that need a full activity (importing a file, a permission
+  prompt) may not open.
 
 ---
 
