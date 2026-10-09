@@ -557,15 +557,34 @@ void Transformer::reset() noexcept {
     n_past_ = 0;
 }
 
-void Transformer::snapshot_state() {
+void Transformer::snapshot_state(bool pin) {
     if (states_.empty() || n_past_ == 0) return;
-    if (!snapshots_.empty() && snapshots_.back().pos == n_past_) return;  // already held
+    if (!snapshots_.empty() && snapshots_.back().pos == n_past_) {  // already held
+        if (pin) {
+            for (StateSnapshot& s : snapshots_) s.pinned = false;
+            snapshots_.back().pinned = true;
+        }
+        return;
+    }
+    if (pin) {
+        for (StateSnapshot& s : snapshots_) s.pinned = false;
+    }
     StateSnapshot snap;
     if (static_cast<int32_t>(snapshots_.size()) >= kStateSnapshots) {
-        // Keep the oldest; recycle the buffer of the one after it.
-        snap = std::move(snapshots_[snapshots_.size() > 1 ? 1 : 0]);
-        snapshots_.erase(snapshots_.begin() + (snapshots_.size() > 1 ? 1 : 0));
+        // Keep the oldest and the pinned one; recycle the buffer of the
+        // newest other (a draft's), else of the one after the oldest.
+        size_t victim = 0;
+        for (size_t i = snapshots_.size(); i-- > 1;) {
+            if (!snapshots_[i].pinned) {
+                victim = i;
+                break;
+            }
+        }
+        if (victim == 0) victim = 1;
+        snap = std::move(snapshots_[victim]);
+        snapshots_.erase(snapshots_.begin() + static_cast<std::ptrdiff_t>(victim));
     }
+    snap.pinned = pin;
     snap.pos = n_past_;
     snap.data.resize(recurrent_state_bytes() / sizeof(float));
     float* out = snap.data.data();
@@ -667,7 +686,7 @@ Status Transformer::read_state(std::istream& in) {
         }
     }
     n_past_ = n;
-    snapshot_state();
+    snapshot_state(/*pin=*/true);  // a restored context is where the next prompt continues
     return Status::ok();
 }
 

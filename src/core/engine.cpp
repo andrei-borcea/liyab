@@ -891,7 +891,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     }
     stats.prefill_ms = ms_since(t_prefill);
     // The next chat turn re-sends this prompt: keep its recurrent state.
-    if (!s.draft) s.target->snapshot_state();
+    if (!s.draft) s.target->snapshot_state(/*pin=*/true);
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (use_dedup) {
         auto saved = s.kv_dedup->save(prompt, static_cast<int32_t>(prompt.size()) - 1, s.target->kv_cache());

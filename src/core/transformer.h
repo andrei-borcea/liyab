@@ -218,13 +218,18 @@ public:
     [[nodiscard]] int32_t restorable_prefix(int32_t n) const noexcept;
     // Hybrid models: keeps a copy of the recurrent states at the current
     // position, so truncate() can return exactly here later. The engine
-    // takes one at the end of every prompt: the next chat turn re-sends that
-    // prompt, and its end (the last reply, an edited or dropped turn) may
-    // differ. At most kStateSnapshots are kept, the oldest (usually the
-    // system prompt) and the newest; their memory is set aside from the expert
-    // cache budget at load. No-op without recurrent blocks or at position 0.
-    void snapshot_state();
-    static constexpr int32_t kStateSnapshots = 2;
+    // takes one at the end of every prompt (`pin`: the next chat turn
+    // re-sends that prompt, and its end, the last reply or an edited turn,
+    // may differ) and at the end of every prefill (a draft being typed ahead,
+    // which changes as the user edits). At most kStateSnapshots are kept: the
+    // oldest (usually the system prompt), the last pinned one, and the newest
+    // other; their memory is set aside from the expert cache budget at load.
+    // Without a pinned slot, drafts typed ahead replaced the end of the
+    // conversation, and an edit before it fell back to the system prompt
+    // (2838 tokens processed again, 151 s on a 35B MoE). No-op without
+    // recurrent blocks or at position 0.
+    void snapshot_state(bool pin = false);
+    static constexpr int32_t kStateSnapshots = 3;
     // Writes what the context holds (n_past(), the KV pages of positions
     // [0, n_past()), the recurrent states) with a fingerprint of the model and
     // the cache settings, so read_state() accepts it only for the same model
@@ -370,6 +375,7 @@ private:
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
         std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order
+        bool pinned = false;       // the end of the last prompt (see snapshot_state)
     };
     std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_
     ExpertPredictions predictions_;
