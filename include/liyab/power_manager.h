@@ -7,9 +7,15 @@
 // * Thermal telemetry: a polling thread samples the OS thermal status
 //   (Android AThermal API, Apple NSProcessInfo.thermalState) and the sysfs
 //   thermal zones (skin and SoC temperatures, where the sandbox allows it).
-// * Throttle guard: above the skin threshold (40 °C by default) or at a
-//   severe OS thermal status, policy() tells the engine to move GPU work to
-//   the NPU / CPU, shed cores and lower the token-rate cap.
+// * Thermal control: the main input is the OS's thermal-headroom forecast
+//   (Android AThermal_getThermalHeadroom, 10 s ahead; 1.0 = severe
+//   throttling), smoothed. Below 0.75 nothing changes; from 0.75 to 0.95 the
+//   engine sheds cores gradually (down to half); near 1.0, or at the OS's own
+//   limiting status, above the skin threshold, or with the SoC past its
+//   emergency temperature, policy() reports throttled: work moves off the GPU,
+//   half the cores, and the token rate is capped. A gradual response keeps a
+//   hot but stable phone at full speed, where an on/off threshold on SoC
+//   temperature (85 °C, ordinary for a flagship SoC under load) halved it.
 #ifndef LIYAB_POWER_MANAGER_H
 #define LIYAB_POWER_MANAGER_H
 
@@ -42,8 +48,9 @@ LIYAB_API const char* thermal_status_name(ThermalStatus status) noexcept;
 
 struct ThermalSample {
     ThermalStatus status = ThermalStatus::Unknown;
-    std::optional<float> skin_c;  // device surface temperature
-    std::optional<float> soc_c;   // hottest CPU/GPU/SoC zone
+    std::optional<float> skin_c;    // device surface temperature
+    std::optional<float> soc_c;     // hottest CPU/GPU/SoC zone
+    std::optional<float> headroom;  // OS forecast 10 s ahead: 0 cool .. 1 severe throttling (Android 12+)
 };
 
 using ThermalSensor = std::function<ThermalSample()>;
@@ -56,7 +63,7 @@ LIYAB_API ThermalSample read_sysfs_thermal(const std::string& root = "/sys/class
 struct PowerConfig {
     PowerProfile profile = PowerProfile::Balanced;
     float skin_threshold_c = 40.0f;
-    float soc_threshold_c = 85.0f;
+    float soc_threshold_c = 95.0f;  // emergency only: flagship SoCs run at 85-90 °C under load
     double target_tps = 0.0;  // > 0 overrides the profile's pacing rate
     std::chrono::milliseconds poll_interval{1000};
 };
@@ -65,6 +72,7 @@ struct PowerPolicy {
     double target_tps = 0.0;       // 0 = unpaced
     bool throttled = false;        // route GPU work away and shed cores
     float thread_fraction = 1.0f;  // share of the thread pool to use
+    float pressure = 0.0f;         // thermal pressure, 0 none .. 1 throttled
 };
 
 class LIYAB_API PowerManager {
@@ -94,12 +102,15 @@ public:
 
 private:
     void poll_loop();
-    [[nodiscard]] bool throttled_locked(const ThermalSample& sample) const;
+    // 0 (no thermal pressure) .. 1 (throttle), from the smoothed headroom
+    // forecast and the status / temperature guards.
+    [[nodiscard]] float pressure_locked(const ThermalSample& sample) const;
 
     mutable std::mutex mutex_;
     PowerConfig config_;
     ThermalSensor sensor_;
     ThermalSample sample_;
+    std::optional<float> headroom_ema_;  // smoothed forecast: one noisy sample does not shed cores
 
     std::thread thread_;
     std::condition_variable cv_;

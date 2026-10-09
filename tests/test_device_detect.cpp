@@ -163,6 +163,52 @@ TEST_CASE("PowerManager throttles on skin temperature and OS thermal status") {
     CHECK_NEAR(p.target_tps, 2.0, 1e-9);
 }
 
+TEST_CASE("PowerManager sheds cores gradually on the headroom forecast") {
+    ThermalSample sample;
+    PowerConfig config;
+    config.profile = PowerProfile::Performance;
+    PowerManager pm(config, [&] { return sample; });
+
+    // A hot but stable SoC is no longer a throttle: 85 °C is ordinary under load.
+    sample.soc_c = 87.0f;
+    sample.headroom = 0.5f;
+    pm.poll_once();
+    PowerPolicy p = pm.policy();
+    CHECK(!p.throttled);
+    CHECK_NEAR(p.thread_fraction, 1.0, 1e-6);
+    CHECK(p.target_tps == 0.0);
+
+    // One spike from a cool forecast does not jump to a throttle: it is smoothed.
+    sample.headroom = 1.2f;
+    pm.poll_once();
+    CHECK(!pm.policy().throttled);
+
+    // Halfway up the 0.75..0.95 ramp: a quarter of the cores shed, still unpaced.
+    sample.headroom = 0.85f;
+    for (int i = 0; i < 40; ++i) pm.poll_once();  // let the smoothing settle
+    p = pm.policy();
+    CHECK(!p.throttled);
+    CHECK_NEAR(p.pressure, 0.5, 1e-3);
+    CHECK_NEAR(p.thread_fraction, 0.75, 1e-3);
+    CHECK(p.target_tps == 0.0);
+
+    // A sustained forecast past the limit throttles.
+    sample.headroom = 1.2f;
+    for (int i = 0; i < 40; ++i) pm.poll_once();
+    p = pm.policy();
+    CHECK(p.throttled);
+    CHECK_NEAR(p.thread_fraction, 0.5, 1e-6);
+    CHECK_NEAR(p.target_tps, 8.0, 1e-9);
+
+    // The SoC's emergency temperature throttles whatever the forecast.
+    sample.headroom = 0.3f;
+    for (int i = 0; i < 40; ++i) pm.poll_once();
+    CHECK(!pm.policy().throttled);
+    sample.soc_c = 96.0f;
+    pm.poll_once();
+    CHECK(pm.policy().throttled);
+}
+
 TEST_CASE("PowerManager polling thread samples the sensor") {
     std::atomic<int> calls{0};
     PowerConfig config;

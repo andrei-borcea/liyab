@@ -122,9 +122,14 @@ This README describes what the code does today. Anything not implemented is list
   Memory grows with the tokens actually cached, freed pages are reused exactly (no fragmentation), and sliding
   windows keep the first `kv_sink_tokens` positions (attention sinks, default 8) plus the last *N* tokens.
 * **Power manager.** `pace_token()` caps output at the profile's rate (Balanced 12 tok/s, LowPower 6 tok/s) so the
-  SoC idles between tokens. A polling thread reads the OS thermal status (Android `AThermal_*`, Apple
-  `NSProcessInfo.thermalState`) and the sysfs skin/SoC zones. At ≥ 40 °C skin temperature, or at a severe OS
-  status, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the token rate.
+  SoC idles between tokens. A polling thread reads, once a second, the OS thermal status (Android `AThermal_*`,
+  Apple `NSProcessInfo.thermalState`), Android's thermal-headroom forecast 10 s ahead
+  (`AThermal_getThermalHeadroom`, Android 12+, smoothed) and the sysfs skin/SoC zones. The response is gradual:
+  below a forecast headroom of 0.75 nothing changes; from 0.75 to 0.95 the engine sheds cores, down to half; at
+  0.95 or above, at the profile's OS-status limit, above the skin threshold (40 °C by default) or with the SoC
+  past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active threads and halves the
+  token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and no longer throttles
+  by itself; the forecast decides.
 * **Speculative decoding.** A small draft model proposes *k* tokens, or, without one (`lookup_drafts`, `liyab-cli
   --lookup`), the tokens that followed the most recent earlier occurrence of the last 4..2 tokens in the
   conversation are proposed (no extra weights, any model). The target verifies them in one batched pass, reading
@@ -932,8 +937,8 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
 * **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
-  assistant listens at once; the flame's listening animation is ready for it), then a power and thermal controller
-  that uses Android's performance hints and thermal-headroom forecast instead of a fixed temperature threshold, then
+  assistant listens at once; the flame's listening animation is ready for it), then Android performance hints
+  (ADPF) for the power manager, which already follows the thermal-headroom forecast, then
   actions (alarms, timers, calendar events, message replies, every outward action confirmed by the user),
   constrained decoding so tool calls always parse, the screen content through a voice-interaction service, email
   through IMAP or the Gmail API (opt-in), GPU prefill, and local memory over the user's own data. The iOS app is not

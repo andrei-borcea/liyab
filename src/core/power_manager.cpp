@@ -56,23 +56,47 @@ void keep_max(std::optional<float>& slot, float v) {
     if (!slot || v > *slot) slot = v;
 }
 
-ThermalStatus os_thermal_status() {
 #if defined(__ANDROID__)
-    // AThermal_* (API 30+) resolved at runtime so the library still loads on
-    // older releases.
-    struct Api {
-        void* manager = nullptr;
-        int (*get_status)(void*) = nullptr;
-    };
-    static const Api api = [] {
-        Api a;
+// AThermal_* (status: API 30, headroom: API 31) resolved at runtime so the
+// library still loads on older releases.
+struct AThermalApi {
+    void* manager = nullptr;
+    int (*get_status)(void*) = nullptr;
+    float (*get_headroom)(void*, int) = nullptr;
+};
+
+const AThermalApi& athermal() {
+    static const AThermalApi api = [] {
+        AThermalApi a;
         void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
         if (!lib) return a;
         auto acquire = reinterpret_cast<void* (*)()>(dlsym(lib, "AThermal_acquireManager"));
         a.get_status = reinterpret_cast<int (*)(void*)>(dlsym(lib, "AThermal_getCurrentThermalStatus"));
+        a.get_headroom = reinterpret_cast<float (*)(void*, int)>(dlsym(lib, "AThermal_getThermalHeadroom"));
         if (acquire && a.get_status) a.manager = acquire();  // held for the process lifetime
         return a;
     }();
+    return api;
+}
+#endif
+
+// The OS forecast of thermal headroom 10 s ahead (NaN until it has data, and
+// at most one fresh value per second, which the 1 s poll respects).
+std::optional<float> os_thermal_headroom() {
+#if defined(__ANDROID__)
+    const AThermalApi& api = athermal();
+    if (api.manager == nullptr || api.get_headroom == nullptr) return std::nullopt;
+    const float h = api.get_headroom(api.manager, 10);
+    if (std::isnan(h) || h < 0.0f) return std::nullopt;
+    return h;
+#else
+    return std::nullopt;
+#endif
+}
+
+ThermalStatus os_thermal_status() {
+#if defined(__ANDROID__)
+    const AThermalApi& api = athermal();
     if (api.manager == nullptr) return ThermalStatus::Unknown;
     const int status = api.get_status(api.manager);
     return status >= 0 && status <= 6 ? static_cast<ThermalStatus>(status) : ThermalStatus::Unknown;
@@ -134,6 +158,7 @@ ThermalSample read_platform_thermal() {
     ThermalSample sample;
 #endif
     sample.status = os_thermal_status();
+    sample.headroom = os_thermal_headroom();
     return sample;
 }
 
@@ -164,12 +189,21 @@ void PowerManager::stop() {
 void PowerManager::poll_once() {
     const ThermalSample sample = sensor_();
     std::lock_guard<std::mutex> lock(mutex_);
-    const bool was_throttled = throttled_locked(sample_);
+    const float before = pressure_locked(sample_);
     sample_ = sample;
-    if (throttled_locked(sample_) != was_throttled) {
-        LIYAB_LOG_INFO("thermal %s: status=%s skin=%.1fC soc=%.1fC", was_throttled ? "recovered" : "throttle",
-                       thermal_status_name(sample_.status), sample_.skin_c.value_or(-1.0f),
-                       sample_.soc_c.value_or(-1.0f));
+    if (sample.headroom) {
+        headroom_ema_ = headroom_ema_ ? 0.7f * *headroom_ema_ + 0.3f * *sample.headroom : *sample.headroom;
+    } else {
+        headroom_ema_.reset();
+    }
+    // Log when the response changes band: none, shedding cores, throttled.
+    const float after = pressure_locked(sample_);
+    const auto band = [](float p) { return p >= 1.0f ? 2 : (p > 0.0f ? 1 : 0); };
+    if (band(after) != band(before)) {
+        static constexpr const char* kBand[] = {"cool", "shedding cores", "throttle"};
+        LIYAB_LOG_INFO("thermal %s: pressure=%.2f headroom=%.2f status=%s skin=%.1fC soc=%.1fC", kBand[band(after)],
+                       after, headroom_ema_.value_or(-1.0f), thermal_status_name(sample_.status),
+                       sample_.skin_c.value_or(-1.0f), sample_.soc_c.value_or(-1.0f));
     }
 }
 
@@ -198,14 +232,20 @@ void PowerManager::set_profile(PowerProfile profile) {
     config_.profile = profile;
 }
 
-bool PowerManager::throttled_locked(const ThermalSample& s) const {
-    // Status at which the OS itself starts limiting us, per profile.
+float PowerManager::pressure_locked(const ThermalSample& s) const {
+    // The forecast ramps the response: nothing below 0.75, full at 0.95.
+    float p = 0.0f;
+    if (headroom_ema_) p = std::clamp((*headroom_ema_ - 0.75f) / 0.20f, 0.0f, 1.0f);
+    // Guards: the status at which the OS itself limits us (per profile), the
+    // skin threshold, and the SoC's emergency temperature.
     ThermalStatus limit = ThermalStatus::Moderate;
     if (config_.profile == PowerProfile::Performance) limit = ThermalStatus::Severe;
     if (config_.profile == PowerProfile::LowPower) limit = ThermalStatus::Light;
-    return (s.status != ThermalStatus::Unknown && s.status >= limit) ||
-           (s.skin_c && *s.skin_c >= config_.skin_threshold_c) ||
-           (s.soc_c && *s.soc_c >= config_.soc_threshold_c);
+    if ((s.status != ThermalStatus::Unknown && s.status >= limit) || (s.skin_c && *s.skin_c >= config_.skin_threshold_c) ||
+        (s.soc_c && *s.soc_c >= config_.soc_threshold_c)) {
+        p = 1.0f;
+    }
+    return p;
 }
 
 PowerPolicy PowerManager::policy() const {
@@ -218,7 +258,9 @@ PowerPolicy PowerManager::policy() const {
     }
     if (config_.target_tps > 0.0) p.target_tps = config_.target_tps;
 
-    p.throttled = throttled_locked(sample_);
+    p.pressure = pressure_locked(sample_);
+    p.thread_fraction = std::min(p.thread_fraction, 1.0f - 0.5f * p.pressure);  // shed up to half the cores
+    p.throttled = p.pressure >= 1.0f;
     if (p.throttled) {
         p.target_tps = p.target_tps > 0.0 ? p.target_tps * 0.5 : 8.0;
         p.thread_fraction = std::min(p.thread_fraction, 0.5f);
