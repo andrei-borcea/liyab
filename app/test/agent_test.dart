@@ -32,6 +32,31 @@ void main() {
     expect(ToolDialect.hermesJson.parse('<tool_call>\n{broken\n</tool_call>'), isNull);
   });
 
+  test('tool calls are forced: the format, and a name once only one fits', () {
+    const xml = ToolDialect.qwenXml, json = ToolDialect.hermesJson;
+    const names = ['calendar_events', 'read_sms', 'read_notifications'];
+    expect(xml.continuation('Let me check.\n<tool_call>', names), '\n<function=');
+    expect(xml.continuation('<tool_call>\n<function=cal', names), 'endar_events>\n');
+    expect(xml.continuation('<tool_call>\n<function=read_', names), ''); // two fit: the model chooses
+    expect(xml.continuation('<tool_call>\n<function=read_s', names), 'ms>\n');
+    expect(xml.continuation('<tool_call>\n<function=weather', names), ''); // unknown: left to the model
+    expect(xml.continuation('<tool_call>\n<function=read_sms>\n<parameter=from', names), '');
+    expect(xml.continuation('<tool_call>\n<function=read_sms>\n</function>', names), '\n</tool_call>');
+    expect(xml.continuation('<tool_call>\n<function=read_sms>\n</function>\n', names), '</tool_call>');
+    expect(xml.continuation('<tool_call>\n<function=read_sms>\n</function>\n</tool_call>', names), '');
+    // With one tool the whole opening follows <tool_call>.
+    expect(xml.continuation('<tool_call>', const ['read_sms']), '\n<function=read_sms>\n');
+    // Inside reasoning nothing is forced; after it, calls are.
+    expect(xml.continuation('<think>\nmaybe <tool_call>', names), '');
+    expect(xml.continuation('maybe <tool_call>', names, thinking: true), '');
+    expect(xml.continuation('hm</think>\n\n<tool_call>', names, thinking: true), '\n<function=');
+    expect(xml.continuation('<tool_call>', const []), '');
+    expect(json.continuation('<tool_call>', names), '\n{"name": "');
+    expect(json.continuation('<tool_call>\n{"name": "read_n', names), 'otifications", "arguments": ');
+    expect(json.continuation('<tool_call>\n{"name": "read_sms", "arguments": {', names), '');
+    expect(ToolDialect.none.continuation('<tool_call>', names), '');
+  });
+
   test('a reply with a tool step replays exactly and hides the call from the answer', () {
     const t = ChatTemplate.chatml;
     final prefix = t.assistantPrefix(Thinking.off);

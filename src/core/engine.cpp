@@ -918,6 +918,15 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
     return generate_locked(*tokens, params, on_token, &prompt);
 }
 
+Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
+                                         const TokenCallback& on_token, const ForceCallback& force) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
+    if (!tokens) return tokens.status();
+    return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
+}
+
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
     std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
@@ -926,7 +935,8 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 }
 
 Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
-                                                const TokenCallback& on_token, const std::string_view* text) {
+                                                const TokenCallback& on_token, const std::string_view* text,
+                                                const ForceCallback* force) {
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
@@ -1014,6 +1024,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     const auto t_decode = Clock::now();
     const Transformer::PhaseTimes phases_before = s.target->phase_times();
     std::string pending_utf8;
+    std::string generated;  // the output so far, kept for `force`
     std::vector<float> probs;
     int32_t last = prompt.back();
     bool stop = false;
@@ -1076,6 +1087,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             const size_t ready = complete_utf8_prefix(pending_utf8);
             if (ready > 0) {
                 const bool keep_going = on_token ? on_token(std::string_view(pending_utf8).substr(0, ready), token) : true;
+                if (force != nullptr) generated.append(pending_utf8, 0, ready);
                 pending_utf8.erase(0, ready);
                 if (!keep_going) {
                     stop = true;
@@ -1089,6 +1101,31 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             }
         }
         last = next.back();
+
+        // Forced continuation (structured output): text the caller requires
+        // next (a tool call's fixed syntax, a name it completes) goes through
+        // the model in one batched pass with the token just sampled, at a
+        // fraction of decoding it token by token, and is emitted as output.
+        if (!stop && force != nullptr && !s.speculative && pending_utf8.empty()) {
+            const std::string forced = (*force)(generated);
+            if (!forced.empty()) {
+                auto forced_tokens = s.tokenizer->encode(forced, false);
+                if (forced_tokens && !forced_tokens->empty()) {
+                    std::vector<int32_t> batch{last};
+                    batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - 1);
+                    const ForwardHooks hooks = s.hooks(policy, false);
+                    if (auto r = s.target->forward(batch, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+                        s.clear_context();
+                        return r.status();
+                    }
+                    s.context.insert(s.context.end(), batch.begin(), batch.end());
+                    last = forced_tokens->back();
+                    stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
+                    generated += forced;
+                    if (on_token && !on_token(forced, last)) stop = true;
+                }
+            }
+        }
     }
     if (!pending_utf8.empty() && on_token) on_token(pending_utf8, last);
 

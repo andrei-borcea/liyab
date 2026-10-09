@@ -151,6 +151,7 @@ typedef struct liyab_generation_stats {
     int32_t expert_predicted_used; /* guesses the router then chose */
     int32_t expert_dropped;       /* wrong guesses removed from the read queue before being read */
     int32_t expert_skipped;       /* chosen experts skipped instead of waited for (moe_skip_slow) */
+    int32_t forced_tokens;        /* tokens of forced continuations (liyab_engine_generate_forced) */
 } liyab_generation_stats;
 
 /*
@@ -192,11 +193,24 @@ LIYAB_C_API void liyab_sampling_params_default(liyab_sampling_params* params);
 LIYAB_C_API liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine** out_engine);
 LIYAB_C_API void liyab_engine_destroy(liyab_engine* engine);
 
+/* Structured output (liyab_engine_generate_forced): called after each piece
+ * with the output so far; writes up to out_cap bytes the output must continue
+ * with into `out` and returns their length (0: none). The engine runs that
+ * text through the model in one batched pass and emits it through `callback`
+ * like generated text. See Engine's ForceCallback. */
+typedef size_t (*liyab_force_callback)(const char* generated, size_t generated_len, char* out, size_t out_cap,
+                                       void* user_data);
+
 /* Blocking generation; `stats` may be NULL. Cancellation is not an error:
  * it returns LIYAB_OK with stats->cancelled = 1. */
 LIYAB_C_API liyab_status liyab_engine_generate(liyab_engine* engine, const char* prompt,
                                                const liyab_sampling_params* params, liyab_token_callback callback,
                                                void* user_data, liyab_generation_stats* stats);
+/* liyab_engine_generate with forced continuations (`force` may be NULL). */
+LIYAB_C_API liyab_status liyab_engine_generate_forced(liyab_engine* engine, const char* prompt,
+                                                      const liyab_sampling_params* params,
+                                                      liyab_token_callback callback, liyab_force_callback force,
+                                                      void* user_data, liyab_generation_stats* stats);
 LIYAB_C_API liyab_status liyab_engine_generate_tokens(liyab_engine* engine, const int32_t* tokens, size_t n_tokens,
                                                       const liyab_sampling_params* params,
                                                       liyab_token_callback callback, void* user_data,

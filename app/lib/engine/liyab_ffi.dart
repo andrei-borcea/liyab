@@ -183,6 +183,8 @@ final class LiyabGenerationStats extends Struct {
   external int expertDropped;
   @Int32()
   external int expertSkipped;
+  @Int32()
+  external int forcedTokens;
 }
 
 final class LiyabMemoryPlan extends Struct {
@@ -208,6 +210,8 @@ final class LiyabEngineCounters extends Struct {
 }
 
 typedef LiyabTokenCallbackNative = Int32 Function(Pointer<Utf8> piece, Size len, Int32 token, Pointer<Void> user);
+typedef LiyabForceCallbackNative = Size Function(
+    Pointer<Utf8> generated, Size len, Pointer<Uint8> out, Size cap, Pointer<Void> user);
 typedef LiyabLogCallbackNative = Void Function(Int32 level, Pointer<Utf8> message, Pointer<Void> user);
 
 /// The functions of libliyab. Every call is synchronous; long ones (create,
@@ -233,6 +237,13 @@ final class LiyabLib {
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<LiyabSamplingParams>,
                 Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<Void>,
                 Pointer<LiyabGenerationStats>)>('liyab_engine_generate'),
+        generateForced = lib.lookupFunction<
+            Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<NativeFunction<LiyabForceCallbackNative>>,
+                Pointer<Void>, Pointer<LiyabGenerationStats>),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<NativeFunction<LiyabForceCallbackNative>>,
+                Pointer<Void>, Pointer<LiyabGenerationStats>)>('liyab_engine_generate_forced'),
         tokenize = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32, Pointer<Int32>, Int32),
             int Function(Pointer<Void>, Pointer<Utf8>, int, Pointer<Int32>, int)>('liyab_engine_tokenize'),
         cancel = lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('liyab_engine_cancel'),
@@ -288,6 +299,9 @@ final class LiyabLib {
   final void Function(Pointer<Void>) destroy;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<LiyabSamplingParams>,
       Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<Void>, Pointer<LiyabGenerationStats>) generate;
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<LiyabSamplingParams>,
+      Pointer<NativeFunction<LiyabTokenCallbackNative>>, Pointer<NativeFunction<LiyabForceCallbackNative>>,
+      Pointer<Void>, Pointer<LiyabGenerationStats>) generateForced;
   final int Function(Pointer<Void>, Pointer<Utf8>, int, Pointer<Int32>, int) tokenize;
   final void Function(Pointer<Void>) cancel;
   final void Function(Pointer<Void>) cancelPrefill;

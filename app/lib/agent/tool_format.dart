@@ -49,6 +49,64 @@ enum ToolDialect {
   static String response(String result) =>
       '<|im_end|>\n<|im_start|>user\n<tool_response>\n$result\n</tool_response><|im_end|>\n<|im_start|>assistant\n';
 
+  /// Structured output: the text a reply must continue with at this point of a
+  /// tool call ('' for none), given the reply so far (`generated`, after the
+  /// template's opening; `thinking` when that opening is a `<think>` block).
+  /// The fixed parts of the call format are forced, and a function name as
+  /// soon as one of `names` is the only one that fits, so the model samples
+  /// only what it actually chooses (which tool, the arguments) and cannot
+  /// misspell a name or break the format around it. Tags inside reasoning are
+  /// left alone. The result already includes every continuation that follows
+  /// from it (after `<tool_call>`, with a single tool, its whole opening).
+  String continuation(String generated, List<String> names, {bool thinking = false}) {
+    var forced = '';
+    for (var step = _forced(generated, names, thinking); step.isNotEmpty; step = _forced(generated, names, thinking)) {
+      forced += step;
+      generated += step;
+    }
+    return forced;
+  }
+
+  /// continuation() as a function to hand to EngineService.generate: it
+  /// captures only sendable values, so it can run on the engine's isolate.
+  String Function(String generated) forcer(List<String> names, {bool thinking = false}) =>
+      (generated) => continuation(generated, names, thinking: thinking);
+
+  String _forced(String generated, List<String> names, bool thinking) {
+    if (this == none || names.isEmpty) return '';
+    final close = generated.lastIndexOf('</think>');
+    if (close < 0 && (thinking || generated.contains('<think>'))) return '';
+    final body = close < 0 ? generated : generated.substring(close + '</think>'.length);
+    final open = body.lastIndexOf('<tool_call>');
+    if (open < 0) return '';
+    final call = body.substring(open + '<tool_call>'.length);
+    if (call.contains('</tool_call>')) return '';
+    final newline = call.isEmpty ? '\n' : '';
+    switch (this) {
+      case qwenXml:
+        if (call.trim().isEmpty) return '$newline<function=';
+        final end = call.trimRight();
+        if (end.endsWith('</function>')) return '${end.length == call.length ? '\n' : ''}</tool_call>';
+        const fn = '<function=';
+        final at = call.indexOf(fn);
+        if (at < 0 || call.contains('>', at + fn.length)) return '';
+        return _completeName(call.substring(at + fn.length), names, '>\n');
+      case hermesJson:
+        if (call.trim().isEmpty) return '$newline{"name": "';
+        final m = _jsonName.firstMatch(call);
+        return m == null ? '' : _completeName(m.group(1)!, names, '", "arguments": ');
+      case none:
+        return '';
+    }
+  }
+
+  /// The rest of the only name in `names` that starts with `partial`, then `after`; '' when none or several fit.
+  static String _completeName(String partial, List<String> names, String after) {
+    final fits = names.where((n) => n.startsWith(partial)).toList();
+    return fits.length == 1 ? fits.single.substring(partial.length) + after : '';
+  }
+
+  static final _jsonName = RegExp(r'^\s*\{\s*"name"\s*:\s*"([^"]*)$');
   static final _xmlCall = RegExp(r'<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>', dotAll: true);
   static final _xmlParam = RegExp(r'<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>', dotAll: true);
   static final _jsonCall = RegExp(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', dotAll: true);

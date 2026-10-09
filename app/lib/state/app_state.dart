@@ -659,9 +659,14 @@ class AppState extends ChangeNotifier {
     final head = prompt.substring(0, prompt.length - message.prefix.length);
     final sampling = SamplingOptions(
         temperature: settings.temperature, topP: settings.topP, topK: settings.topK, maxTokens: settings.maxTokens);
+    final tools = toolDialect == ToolDialect.none ? const <String>[] : [for (final t in await toolbox.enabled()) t.name];
     try {
       for (var calls = 0;; ++calls) {
-        await _stream(head + message.exact, sampling, message);
+        // Tool calls are structured output: their format and names are forced, not sampled.
+        final force = tools.isEmpty || calls >= _maxToolCalls
+            ? null
+            : toolDialect.forcer(tools, thinking: message.prefix.endsWith('<think>\n'));
+        await _stream(head + message.exact, sampling, message, force);
         final call = calls < _maxToolCalls && message.stats?.cancelled != true ? toolDialect.parse(message.raw) : null;
         final tool = call == null ? null : toolbox.byName(call.name);
         if (call == null) break;
@@ -700,9 +705,10 @@ class AppState extends ChangeNotifier {
   /// Streams one generation into the message's current segment. Redraws are
   /// batched (~15 a second): the engine runs on all but one core, and
   /// rebuilding the reply for every token would take CPU time from it.
-  Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message) async {
+  Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message,
+      String Function(String)? force) async {
     var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
-    await for (final event in engine.generate(prompt, sampling)) {
+    await for (final event in engine.generate(prompt, sampling, force: force)) {
       switch (event) {
         case TextPiece(:final text):
           message.raw += text;
@@ -716,7 +722,8 @@ class AppState extends ChangeNotifier {
           _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
               'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, ${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
-              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}');
+              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}'
+              '${stats.forcedTokens > 0 ? ', ${stats.forcedTokens} forced' : ''}');
           if (stats.generatedTokens >= 16) {
             final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5).map((e) => '${e.key} ${e.value.toStringAsFixed(1)}');
             final total = 1000 / (stats.tokensPerSecond > 0 ? stats.tokensPerSecond : 1);

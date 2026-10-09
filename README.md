@@ -373,7 +373,11 @@ thread) or, for UIs that poll, a buffer: `liyab_log_buffer_enable(max_bytes)` ke
 `"<D|I|W|E> message\n"` and `liyab_log_buffer_take(buf, size)` hands over whole lines and removes them. `liyab_engine_prefill` / `liyab_engine_reset_context` expose the context reuse
 described above. `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
-the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
+the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_engine_generate_forced` (C++: the
+`generate` overload taking a `ForceCallback`) adds structured output: after each piece the callback receives the
+output so far and may return text the output must continue with; the engine runs it through the model in one
+batched pass, emits it through the token callback like generated text and counts it in
+`liyab_generation_stats.forced_tokens` (not in `generated_tokens`). It is ignored with speculative decoding. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
 build runs, so front ends can filter downloads without a copy of the list. `liyab_engine_config.expert_cache_mb`
 (`EngineConfig::expert_cache_mb`) sizes the MoE expert cache (-1 automatic, 0 off); `memory_budget_mb` caps the
 memory the engine keeps resident (weights, expert cache, streaming slots), for platforms whose per-app limits the
@@ -524,7 +528,13 @@ are called directly because the C API makes them thread-safe.
   loaded model's own format, read from its GGUF chat template: Qwen3.5 / Qwen3.6 XML calls
   (`<function=…><parameter=…>`) or Qwen2.5 / Qwen3 JSON calls; the app runs a call on the phone, returns the result
   in a `<tool_response>` turn and lets the model continue, up to 4 calls per reply, each shown above the answer
-  ("Read your calendar: 3 events"). Results are short text, one line per item with ISO dates (no day or month names
+  ("Read your calendar: 3 events"). Calls are structured output: once the model opens `<tool_call>`, the fixed
+  syntax that follows (`<function=`, or `{"name": "` in the JSON format) is forced, a function name is completed as
+  soon as only one enabled tool fits what was sampled so far (with a single tool, right after `<tool_call>`), and
+  `</function>` is followed by `</tool_call>`. Forced text goes through the model in one batched pass, like a short
+  prefill, rather than token by token, and a call can no longer misspell a name or break the format around it;
+  the model still chooses whether to call, which tool when several fit, and the arguments. Nothing is forced
+  inside the reasoning. Results are short text, one line per item with ISO dates (no day or month names
   that could leak into an answer in another language), capped (25 notifications with chat apps' reposts dropped,
   30 messages or calls) and with long texts cut: on Qwen3.5/3.6's tokenizer 6 events take 190 tokens instead of 428
   as JSON and 25 notifications 713 instead of 1375, about 18 s and 50 s less to process on Qwen3.6-35B-A3B before
@@ -1030,7 +1040,7 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
   large one in a separate process (its own memory limit) when the small one escalates; a study of fewer experts per
   token during prefill; voice input (on-device speech recognition, kept loaded; the flame's listening animation is
   ready for it); actions (alarms, timers, calendar events, message replies, every outward action confirmed by the
-  user) with constrained decoding so tool calls always parse; the screen content through a voice-interaction
+  user) with tool-call arguments constrained as well (the call format and tool names are already forced); the screen content through a voice-interaction
   service; email through IMAP or the Gmail API (opt-in); local memory over the user's own data; measuring joules per
   token on battery; non-resident token embeddings; GPU prefill for the small model; the app's UI in more languages
   (Flutter localization); a hint to allow HyperOS autostart (a force-stop also stops the notification listener).

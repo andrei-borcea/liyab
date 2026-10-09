@@ -117,6 +117,15 @@ LIYAB_API std::string supported_architectures();
 // completed it. Return false to stop generation.
 using TokenCallback = std::function<bool(std::string_view piece, int32_t token)>;
 
+// Structured output: called after each decoded piece with the output so far;
+// returns text the output must continue with (empty: none). The engine runs
+// it through the model in one batched pass, as cheap as a short prefill, and
+// emits it like generated text; decoding resumes after it. Used for the fixed
+// parts of a tool call and to complete a name once only one is possible.
+// Called on the generating thread, only at whole-UTF-8 boundaries; forced
+// tokens count in GenerationStats::forced_tokens, not generated_tokens.
+using ForceCallback = std::function<std::string(std::string_view generated)>;
+
 class LIYAB_API Engine {
 public:
     static Result<std::unique_ptr<Engine>> create(const EngineConfig& config);
@@ -140,6 +149,10 @@ public:
     // concurrent call returns ErrorCode::Busy.
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
+    // Same, with forced continuations (see ForceCallback; not with a draft
+    // model or lookup speculation, where it is ignored).
+    Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
+                                     const TokenCallback& on_token, const ForceCallback& force);
     // Same, from token ids (for vocabularies whose text encoder Liyab lacks);
     // reuse follows token prefixes only.
     Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
@@ -236,7 +249,8 @@ private:
     // generate_tokens() with the busy lock held; `text`, when given, is the
     // text `prompt` encodes, remembered for the next call's reuse.
     Result<GenerationStats> generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
-                                            const TokenCallback& on_token, const std::string_view* text);
+                                            const TokenCallback& on_token, const std::string_view* text,
+                                            const ForceCallback* force = nullptr);
     std::unique_ptr<Impl> impl_;
 };
 

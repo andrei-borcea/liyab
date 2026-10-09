@@ -95,6 +95,7 @@ class GenerationStats {
     this.phasesMs = const {},
     this.expertHitRate = 0,
     this.expertStallMs = 0,
+    this.forcedTokens = 0,
   });
 
   final int promptTokens;
@@ -111,6 +112,9 @@ class GenerationStats {
   /// MoE with streamed experts: the share of expert uses served from RAM, and the time waiting for reads.
   final double expertHitRate;
   final double expertStallMs;
+
+  /// Tokens the reply was forced to continue with (structured output), not sampled.
+  final int forcedTokens;
 }
 
 sealed class GenerationEvent {}
@@ -245,6 +249,7 @@ class EngineService {
             phasesMs: Map<String, double>.from(s[7] as Map),
             expertHitRate: s[8] as double,
             expertStallMs: s[9] as double,
+            forcedTokens: s[10] as int,
           )))
           ..close();
       case 'error':
@@ -319,11 +324,17 @@ class EngineService {
   Future<void> loadExpertProfile(String path) => _call<Object?>(['loadProfile', path]);
 
   /// Streams the reply to `prompt` (already chat-formatted).
-  Stream<GenerationEvent> generate(String prompt, SamplingOptions s) {
+  ///
+  /// `force` (structured output) is called after each piece with the reply so
+  /// far and returns the text the reply must continue with ('' for none); the
+  /// engine runs that text through the model in one batched pass and streams
+  /// it like generated text. It runs on the engine's isolate, so it must be a
+  /// pure function of its argument and what it captures.
+  Stream<GenerationEvent> generate(String prompt, SamplingOptions s, {String Function(String generated)? force}) {
     final id = _nextId++;
     final controller = StreamController<GenerationEvent>();
     _streams[id] = controller;
-    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens], background: false));
+    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force], background: false));
     return controller.stream;
   }
 
@@ -523,6 +534,18 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
     },
     exceptionalReturn: 0,
   );
+  final rule = m[7] as String Function(String)?;
+  final force = rule == null
+      ? null
+      : NativeCallable<LiyabForceCallbackNative>.isolateLocal(
+          (Pointer<Utf8> generated, int len, Pointer<Uint8> out, int cap, Pointer<Void> user) {
+            final text = utf8.encode(rule(utf8.decode(generated.cast<Uint8>().asTypedList(len), allowMalformed: true)));
+            if (text.length > cap) return 0; // never cut a continuation short
+            out.asTypedList(cap).setRange(0, text.length, text);
+            return text.length;
+          },
+          exceptionalReturn: 0,
+        );
   try {
     using((arena) {
       final params = arena<LiyabSamplingParams>();
@@ -533,8 +556,10 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
         ..topK = m[5] as int
         ..maxTokens = m[6] as int;
       final stats = arena<LiyabGenerationStats>();
-      final status = lib.generate(
-          engine, (m[2] as String).toNativeUtf8(allocator: arena), params, callback.nativeFunction, nullptr, stats);
+      final prompt = (m[2] as String).toNativeUtf8(allocator: arena);
+      final status = force == null
+          ? lib.generate(engine, prompt, params, callback.nativeFunction, nullptr, stats)
+          : lib.generateForced(engine, prompt, params, callback.nativeFunction, force.nativeFunction, nullptr, stats);
       if (status != LiyabStatus.ok) {
         replies.send(['error', id, lib.errorMessage()]);
         return;
@@ -567,11 +592,13 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
             final used = s.expertHits + s.expertLate + s.expertMisses;
             return used > 0 ? s.expertHits / used : 0.0;
           }(),
-          s.expertStallMs
+          s.expertStallMs,
+          s.forcedTokens,
         ]
       ]);
     });
   } finally {
     callback.close();
+    force?.close();
   }
 }

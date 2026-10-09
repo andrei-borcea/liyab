@@ -88,7 +88,8 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.expert_predicted,
                                         s.expert_predicted_used,
                                         s.expert_dropped,
-                                        s.expert_skipped};
+                                        s.expert_skipped,
+                                        s.forced_tokens};
     }
     return LIYAB_OK;
 }
@@ -261,6 +262,24 @@ liyab_status liyab_engine_generate(liyab_engine* engine, const char* prompt, con
     return guarded([&]() -> liyab_status {
         if (engine == nullptr || prompt == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and prompt are required");
         return finish_generation(engine->engine->generate(prompt, to_cpp(params), wrap(callback, user_data)), stats);
+    });
+}
+
+liyab_status liyab_engine_generate_forced(liyab_engine* engine, const char* prompt, const liyab_sampling_params* params,
+                                          liyab_token_callback callback, liyab_force_callback force, void* user_data,
+                                          liyab_generation_stats* stats) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || prompt == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and prompt are required");
+        if (force == nullptr) {
+            return finish_generation(engine->engine->generate(prompt, to_cpp(params), wrap(callback, user_data)), stats);
+        }
+        const liyab::ForceCallback forced = [force, user_data](std::string_view generated) {
+            char out[512];
+            const size_t n = force(generated.data(), generated.size(), out, sizeof out, user_data);
+            return std::string(out, std::min(n, sizeof out));
+        };
+        return finish_generation(engine->engine->generate(prompt, to_cpp(params), wrap(callback, user_data), forced),
+                                 stats);
     });
 }
 

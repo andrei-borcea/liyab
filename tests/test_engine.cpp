@@ -1514,6 +1514,55 @@ TEST_CASE("Context reuse: continuing a conversation or a prefill equals a fresh 
     CHECK(st3.cached_prefix_tokens <= 1);
 }
 
+TEST_CASE("Forced continuations are emitted, counted, and decoding continues exactly from them") {
+    EngineConfig config = engine_config(f32_model());
+    auto forced_engine = Engine::create(config);
+    auto fresh = Engine::create(config);
+    REQUIRE(forced_engine.has_value() && fresh.has_value());
+    Engine& e = *forced_engine.value();
+
+    // Forced once, after the first sampled piece.
+    const std::string forced = " world hello";
+    std::string text;
+    std::vector<int32_t> tokens;
+    auto st = e.generate("hello world", greedy(8),
+                         [&](std::string_view piece, int32_t token) {
+                             text += piece;
+                             tokens.push_back(token);
+                             return true;
+                         },
+                         [&](std::string_view generated) {
+                             return generated == text && tokens.size() == 1 ? forced : std::string();
+                         });
+    REQUIRE(st.has_value());
+    const auto forced_tokens = e.tokenize(forced, false);
+    REQUIRE(forced_tokens.has_value());
+    CHECK(st->generated_tokens == 8);  // sampled tokens only
+    CHECK(st->forced_tokens == static_cast<int32_t>(forced_tokens->size()));
+    // Pieces are whole UTF-8, so a piece may carry several byte tokens: compare text.
+    REQUIRE(tokens.size() >= 2);
+    CHECK(tokens[1] == forced_tokens->back());
+    const std::string first = text.substr(0, text.find(forced));
+    REQUIRE(first.size() < text.size());
+
+    // The rest equals greedy decoding of the prompt extended with the first token and the forced text.
+    auto prompt = fresh.value()->tokenize("hello world", true);
+    REQUIRE(prompt.has_value());
+    prompt->push_back(tokens[0]);
+    prompt->insert(prompt->end(), forced_tokens->begin(), forced_tokens->end());
+    std::string expected;
+    REQUIRE(fresh.value()->generate_tokens(*prompt, greedy(7), [&](std::string_view piece, int32_t) {
+        expected += piece;
+        return true;
+    }).has_value());
+    CHECK(text.substr(first.size() + forced.size()) == expected);
+
+    // The context holds the forced tokens: continuing the conversation reuses all of it.
+    auto st2 = e.generate_tokens(*prompt, greedy(1), nullptr);
+    REQUIRE(st2.has_value());
+    CHECK(st2->cached_prefix_tokens >= static_cast<int32_t>(prompt->size()) - 1);
+}
+
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
     for (const char* arch : {"llama", "qwen35"}) {
         test::TinyModelSpec spec;
