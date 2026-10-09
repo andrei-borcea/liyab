@@ -29,23 +29,25 @@ enum ChatTemplate {
   final String label;
 
   /// The system block that starts every prompt (prefilled right after loading).
-  String system(String text) => switch (this) {
-        chatml => '<|im_start|>system\n$text<|im_end|>\n',
-        llama3 => '${_header('system')}$text<|eot_id|>',
-        zephyr => '<|system|>\n$text</s>\n',
+  String system(String text) => message('system', text);
+
+  /// One finished message of any role (system, user, assistant).
+  String message(String role, String content) => switch (this) {
+        chatml => '<|im_start|>$role\n$content<|im_end|>\n',
+        llama3 => '${_header(role)}$content<|eot_id|>',
+        zephyr => '<|$role|>\n$content</s>\n',
       };
 
-  String _turn(Turn t) => switch (this) {
-        chatml => '<|im_start|>user\n${t.user}<|im_end|>\n<|im_start|>assistant\n${t.exact}<|im_end|>\n',
-        llama3 => '${_header('user')}${t.user}<|eot_id|>${_header('assistant')}${t.exact}<|eot_id|>',
-        zephyr => '<|user|>\n${t.user}</s>\n<|assistant|>\n${t.exact}</s>\n',
+  /// The opening of the assistant's reply, which the model continues.
+  String reply(Thinking thinking) => switch (this) {
+        chatml => '<|im_start|>assistant\n${assistantPrefix(thinking)}',
+        llama3 => _header('assistant'),
+        zephyr => '<|assistant|>\n',
       };
 
-  String _open(String user, Thinking thinking) => switch (this) {
-        chatml => '<|im_start|>user\n$user<|im_end|>\n<|im_start|>assistant\n${assistantPrefix(thinking)}',
-        llama3 => '${_header('user')}$user<|eot_id|>${_header('assistant')}',
-        zephyr => '<|user|>\n$user</s>\n<|assistant|>\n',
-      };
+  String _turn(Turn t) => message('user', t.user) + message('assistant', t.exact);
+
+  String _open(String user, Thinking thinking) => message('user', user) + reply(thinking);
 
   /// What the reply starts with before the model writes (ChatML thinking control).
   String assistantPrefix(Thinking thinking) => this == chatml

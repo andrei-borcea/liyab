@@ -117,6 +117,17 @@ class GenerationStats {
   final int forcedTokens;
 }
 
+/// A generation queued or running on the engine.
+class Generation {
+  Generation(this.events, this.stop);
+
+  /// Pieces of the reply, then GenerationDone.
+  final Stream<GenerationEvent> events;
+
+  /// Stops this generation (see EngineService.generate); never another one.
+  final void Function() stop;
+}
+
 sealed class GenerationEvent {}
 
 class TextPiece extends GenerationEvent {
@@ -325,17 +336,30 @@ class EngineService {
 
   /// Streams the reply to `prompt` (already chat-formatted).
   ///
+  /// Generation.stop() stops this generation only: at its next token while it
+  /// runs (it still ends with GenerationDone), or drops it while it waits.
+  /// Cancelling the subscription to its events does the same.
+  ///
   /// `force` (structured output) is called after each piece with the reply so
   /// far and returns the text the reply must continue with ('' for none); the
   /// engine runs that text through the model in one batched pass and streams
   /// it like generated text. It runs on the engine's isolate, so it must be a
   /// pure function of its argument and what it captures.
-  Stream<GenerationEvent> generate(String prompt, SamplingOptions s, {String Function(String generated)? force}) {
+  Generation generate(String prompt, SamplingOptions s, {String Function(String generated)? force}) {
     final id = _nextId++;
-    final controller = StreamController<GenerationEvent>();
+    void stop() {
+      if (_running?.id == id) {
+        cancel();
+      } else if (_queue.any((j) => j.id == id)) {
+        _queue.removeWhere((j) => j.id == id);
+        _streams.remove(id)?.close();
+      }
+    }
+
+    final controller = StreamController<GenerationEvent>(onCancel: stop);
     _streams[id] = controller;
     _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force], background: false));
-    return controller.stream;
+    return Generation(controller.stream, stop);
   }
 
   /// Changes the power profile at once, even during a generation (thread-safe; no queueing).

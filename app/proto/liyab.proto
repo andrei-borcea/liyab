@@ -1,0 +1,64 @@
+// gRPC interface of Liyab's local API (app/lib/api/grpc_api.dart), on
+// 127.0.0.1:8643 (HTTP/2 without TLS: loopback only). Every call carries the
+// token from Liyab's Settings as metadata: "authorization: Bearer <token>".
+// Generate stubs for any language from this file (protoc / buf).
+syntax = "proto3";
+
+package liyab.v1;
+
+service Liyab {
+  // The loaded model (none when no model is loaded).
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  // Streams the reply: reasoning pieces (thinking mode), text pieces, then Done.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  // The prompt's length in tokens, without generating.
+  rpc CountTokens(GenerateRequest) returns (CountTokensResponse);
+}
+
+message Message {
+  string role = 1;  // system, user or assistant; a last assistant message is continued
+  string content = 2;
+}
+
+message GenerateRequest {
+  repeated Message messages = 1;  // formatted with the model's chat template
+  optional string prompt = 2;     // raw completion instead of messages
+  optional float temperature = 3; // unset: the model's settings in Liyab
+  optional float top_p = 4;
+  optional int32 top_k = 5;
+  optional int32 max_tokens = 6;
+  repeated string stop = 7;       // stop sequences (not included in the reply)
+  bool thinking = 8;              // reason first, on models with a thinking mode
+}
+
+message GenerateResponse {
+  oneof event {
+    string text = 1;
+    string reasoning = 2;
+    Done done = 3;
+  }
+}
+
+message Done {
+  enum FinishReason {
+    STOP = 0;
+    LENGTH = 1;
+    STOP_SEQUENCE = 2;
+  }
+  FinishReason finish_reason = 1;
+  string stop_sequence = 2;
+  int32 prompt_tokens = 3;
+  int32 completion_tokens = 4;
+  int32 cached_prompt_tokens = 5;  // prompt tokens the engine reused from earlier work
+  float tokens_per_second = 6;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated string models = 1;
+}
+
+message CountTokensResponse {
+  int32 prompt_tokens = 1;
+}

@@ -12,6 +12,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../agent/tool_format.dart';
+import '../api/api_core.dart';
+import '../api/local_api.dart';
 import '../agent/tools.dart';
 import '../chat/chat_template.dart';
 import '../engine/engine_service.dart';
@@ -99,7 +101,7 @@ class LogLine {
   final bool engine; // from libliyab's log (level letter first), else the app
 }
 
-class AppState extends ChangeNotifier {
+class AppState extends ChangeNotifier implements ApiBackend {
   AppState._(this.engine, this.prefs, this.downloads) : device = DeviceSettings(prefs), toolbox = Toolbox(prefs) {
     monitor = DeviceMonitor(engine, (lines) {
       for (final l in lines) {
@@ -209,9 +211,12 @@ class AppState extends ChangeNotifier {
   bool loading = false;
   bool generating = false;
   String? modelPath;
+  @override
   String modelName = '';
   String description = '';
+  @override
   ChatTemplate template = ChatTemplate.zephyr;
+  @override
   bool thinkingSupported = false;
   ModelSettings settings = ModelSettings();
 
@@ -242,8 +247,71 @@ class AppState extends ChangeNotifier {
     final last = state.device.lastModel;
     // keepChat: the last conversation comes back if the OS stopped Liyab.
     if (last != null && File(last).existsSync()) unawaited(state.load(last, keepChat: true));
+    if (state.device.apiEnabled) unawaited(state._startApi());
     return state;
   }
+
+  // The local API (lib/api/local_api.dart): this state is its backend.
+  LocalApi? _api;
+
+  /// Whether the local API is listening, and why not when it should be.
+  bool get apiRunning => _api != null;
+  String apiError = '';
+
+  Future<void> setApiEnabled(bool on) async {
+    device.apiEnabled = on;
+    on ? await _startApi() : await _stopApi();
+  }
+
+  /// Replaces the token: clients holding the old one are refused from now on.
+  Future<void> newApiToken() async {
+    device.apiToken = LocalApi.newToken();
+    if (_api != null) await _startApi();
+  }
+
+  Future<void> _startApi() async {
+    await _stopApi();
+    final token = device.apiToken ?? (device.apiToken = LocalApi.newToken());
+    final api = LocalApi(this, token);
+    try {
+      await api.start();
+      _api = api;
+      apiError = '';
+      _log('Local API on 127.0.0.1:${LocalApi.httpPort} (HTTP) and :${LocalApi.grpcPort} (gRPC)');
+    } on SocketException catch (e) {
+      apiError = 'Port in use (${e.osError?.message ?? e.message})';
+      _log('Local API not started: $apiError');
+    }
+    notifyListeners();
+  }
+
+  Future<void> _stopApi() async {
+    final api = _api;
+    _api = null;
+    await api?.stop();
+    notifyListeners();
+  }
+
+  @override
+  SamplingOptions get defaults => SamplingOptions(
+      temperature: settings.temperature, topP: settings.topP, topK: settings.topK, maxTokens: settings.maxTokens);
+
+  @override
+  Future<void> ensureLoaded() async {
+    final released = _released;
+    if (released != null) {
+      await load(released, keepChat: true);
+    } else if (loading) {
+      await _pendingLoad;
+    }
+    if (!engine.loaded) throw const ApiError(503, 'no model is loaded in Liyab');
+  }
+
+  @override
+  Future<int> countTokens(String text) => engine.countTokens(text);
+
+  @override
+  Generation generate(String prompt, SamplingOptions sampling) => engine.generate(prompt, sampling);
 
   void _log(String line, {bool engine = false}) {
     log.add(LogLine(line, engine: engine));
@@ -708,7 +776,7 @@ class AppState extends ChangeNotifier {
   Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message,
       String Function(String)? force) async {
     var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
-    await for (final event in engine.generate(prompt, sampling, force: force)) {
+    await for (final event in engine.generate(prompt, sampling, force: force).events) {
       switch (event) {
         case TextPiece(:final text):
           message.raw += text;

@@ -60,6 +60,7 @@ This README describes what the code does today. Anything not implemented is list
 | Context kept between chat turns: a prompt that continues the processed text keeps its tokens; hybrid (DeltaNet) models also snapshot their recurrent state at each prompt's end | ✅ implemented (follow-up turns start in ~1.1–1.6 s on the 35B) |
 | Liyab app (Flutter, `app/`): chat, model library and Hugging Face downloads, live activity and log, settings, assistant sheet over any app (default digital assistant) | ✅ Android; 🟡 iOS app not built yet (the engine builds for iOS) |
 | Agent tools in the app: the model reads the user's calendar, notifications (chats, email previews), SMS, calls, contacts and clipboard, each source enabled by the user | ✅ implemented (Qwen3 / 3.5 / 3.6 tool-call formats) |
+| Local API in the app for other apps on the phone: OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/models`), Anthropic Messages (`/v1/messages`, `count_tokens`) and gRPC (`app/proto/liyab.proto`), loopback only, token-protected, off by default | ✅ implemented (text only; no tools or images through the API yet) |
 | Voice input and output, actions (alarms, events, replies), local memory | 🔜 planned, see [Limitations and roadmap](#limitations-and-roadmap) |
 | Experimental: early exit, head pruning, EGLS, TDSS 2:4 sparsity, JIT unpacker, persistent KV prefix cache, io_uring loader | 🧪 behind `LIYAB_ENABLE_EXPERIMENTAL` |
 
@@ -544,6 +545,22 @@ are called directly because the C API makes them thread-safe.
   reused. The default system prompt tells the model to use tools for the user's data, never to invent it, and to
   treat tool results as data, not instructions. Not readable: full email bodies (Android gives apps no access to
   Gmail; only the notification previews) and the screen content (needs a voice-interaction service).
+* **Local API.** Settings → Apps on this phone → Local API (off by default) lets other apps on the device use the
+  loaded model as they would a server: the OpenAI API (`POST /v1/chat/completions`, `POST /v1/completions`,
+  `GET /v1/models`) and the Anthropic Messages API (`POST /v1/messages`, `POST /v1/messages/count_tokens`) at
+  `http://127.0.0.1:8642/v1`, and gRPC service `liyab.v1.Liyab` (`ListModels`, `Generate` streaming, `CountTokens`;
+  `app/proto/liyab.proto`) at `127.0.0.1:8643`. Both listen on the loopback interface only, so nothing outside the
+  phone can connect, and every call needs the token shown there (`Authorization: Bearer <token>`, `x-api-key` for
+  Anthropic clients, gRPC metadata `authorization`); New token revokes the old one. Prompts are built with the
+  loaded model's own chat template; streaming (server-sent events), sampling, `max_tokens`, stop sequences and
+  usage (with the reused prompt tokens) are supported. Thinking is off unless asked for (OpenAI `reasoning_effort`
+  or vLLM's `chat_template_kwargs.enable_thinking`, Anthropic `thinking`), and the reasoning comes back apart
+  (`reasoning_content`, as vLLM returns it; Anthropic `thinking` blocks with an empty signature). A last assistant
+  message is continued (Anthropic's prefill). Requests wait their turn with the user's own messages, and a client
+  that disconnects stops its generation, also while it waits or its prompt is processed. Refused for now (an error,
+  not silently ignored): tools, images and other non-text content, `n` > 1, logprobs. Android may stop Liyab in the
+  background, which stops the API too. The code: `app/lib/api/` (`api_core.dart` builds the prompt and shapes the
+  reply; one file per protocol), tested over real sockets in `app/test/api_test.dart`.
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system

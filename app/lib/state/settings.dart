@@ -229,6 +229,14 @@ class DeviceSettings {
 
   set experimental(ExperimentalSettings v) => _prefs.setString('experimental', jsonEncode(v.toJson()));
 
+  /// The local API (OpenAI, Anthropic and gRPC on 127.0.0.1) for other apps on this device; off by default.
+  bool get apiEnabled => _prefs.getBool('api_enabled') ?? false;
+  set apiEnabled(bool v) => _prefs.setBool('api_enabled', v);
+
+  /// The token the local API's clients must present; made when the API is first turned on.
+  String? get apiToken => _prefs.getString('api_token');
+  set apiToken(String? v) => v == null ? _prefs.remove('api_token') : _prefs.setString('api_token', v);
+
   /// The last loaded model file, reloaded at start.
   String? get lastModel => _prefs.getString('model');
   set lastModel(String? v) => v == null ? _prefs.remove('model') : _prefs.setString('model', v);

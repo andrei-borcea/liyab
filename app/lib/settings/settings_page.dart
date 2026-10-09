@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart' show openAppSettings
 import '../agent/tools.dart';
 import '../engine/engine_service.dart';
 import '../state/app_state.dart';
+import 'api_section.dart';
 import 'experimental_section.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -294,6 +295,8 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
           title: Text('Internet'),
           subtitle: Text('Only to search and download models from Hugging Face. Conversations never leave the phone.'),
         ),
+        heading('Apps on this phone'),
+        ApiSection(app: app),
         heading('Experimental'),
         ExperimentalSection(app: app),
         heading('About this device'),
