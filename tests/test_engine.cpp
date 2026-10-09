@@ -1278,6 +1278,51 @@ static void check_repacked_model(DType ffn, DType packed, const char* name) {
     }
 }
 
+TEST_CASE("Streamed experts repacked on read (CPU i8mm): close to in-place experts, batch-size independent") {
+    if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
+        std::printf("  skipped: no i8mm on this CPU or build\n");
+        return;
+    }
+    test::TinyModelSpec spec;  // K-quant experts with repackable shapes
+    spec.arch = "qwen3moe";
+    spec.n_layers = 2;
+    spec.n_embd = 256;
+    spec.n_ff = 512;
+    spec.n_expert = 8;
+    spec.n_expert_used = 2;
+    spec.identical_experts = false;
+    spec.ffn_type = DType::Q4_K;
+    const std::string& path = model_path("moe_repack_experts", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99};
+    TransformerOptions in_place;
+    in_place.expert_cache_bytes = 0;
+    TransformerOptions streamed;
+    streamed.expert_cache_bytes = 1;
+    streamed.repack_cpu = true;
+    auto a = load_transformer(path, in_place);
+    auto b = load_transformer(path, streamed);
+    auto c = load_transformer(path, streamed);
+    REQUIRE(a && b && c);
+    REQUIRE(b->expert_store() != nullptr);
+    auto la = a->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(la.has_value());
+    const std::vector<float> expected(la->begin(), la->end());
+    auto lb = b->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(lb.has_value());
+    const std::vector<float> batched(lb->begin(), lb->end());
+    CHECK(max_abs_diff(batched, expected) < 1e-3);
+    const auto vocab = static_cast<size_t>(c->config().n_vocab);
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        auto one = c->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(one.has_value());
+        const std::vector<float> row(batched.begin() + t * vocab, batched.begin() + (t + 1) * vocab);
+        CHECK(max_abs_diff(*one, row) < 1e-4);
+    }
+}
+
 TEST_CASE("Repacked weights (CPU i8mm): same logits, batch-size independent") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");

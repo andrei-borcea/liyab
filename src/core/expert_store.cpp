@@ -11,6 +11,7 @@
 #include <string>
 
 #include "core/log.h"
+#include "core/quant.h"
 
 namespace liyab {
 
@@ -28,12 +29,14 @@ size_t align_up(size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
 Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
                                                          std::vector<std::array<const TensorView*, 3>> experts,
-                                                         int32_t n_expert, size_t budget_bytes, int32_t io_threads) {
+                                                         int32_t n_expert, size_t budget_bytes, int32_t io_threads,
+                                                         bool repack) {
     if (n_expert <= 0) return Status(ErrorCode::InvalidArgument, "ExpertStore needs n_expert > 0");
     std::unique_ptr<ExpertStore> s(new ExpertStore());
     s->file_ = &file;
     s->experts_ = std::move(experts);
     s->n_expert_ = n_expert;
+    s->repack_ = repack;
 
     // A slot holds the three matrices of one expert, each in its own aligned
     // area (an expert's offset is not block-aligned, so one extra alignment
@@ -139,6 +142,51 @@ ExpertStore::~ExpertStore() {
     }
 }
 
+DType ExpertStore::served_type(int32_t layer, int32_t matrix) const {
+    const TensorView& t = *experts_[static_cast<size_t>(layer)][static_cast<size_t>(matrix)];
+    if (!repack_) return t.type;
+    const int64_t rows = t.ne[1], cols = t.ne[0];
+    switch (t.type) {
+        case DType::Q4_K: return rows % 8 == 0 && cols % quant::kSuperBlock == 0 ? DType::Q4_K_R8 : t.type;
+        case DType::Q5_K: return rows % 8 == 0 && cols % quant::kSuperBlock == 0 ? DType::Q5_K_R8 : t.type;
+        case DType::Q6_K: return rows % 8 == 0 && cols % quant::kSuperBlock == 0 ? DType::Q6_K_R8 : t.type;
+        case DType::Q8_0: return rows % 4 == 0 && cols % quant::kBlock == 0 ? DType::Q8_0_R4 : t.type;
+        default: return t.type;
+    }
+}
+
+namespace {
+
+// Rearranges one expert matrix in place into its repacked type (same size),
+// through a per-thread copy of the file layout.
+void repack_in_place(uint8_t* data, size_t bytes, DType from, DType to, int64_t rows, int64_t cols) {
+    thread_local std::vector<uint8_t> scratch;
+    scratch.assign(data, data + bytes);
+    switch (to) {
+        case DType::Q4_K_R8:
+            quant::repack_q4_K_r8(reinterpret_cast<const quant::BlockQ4_K*>(scratch.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ4_Kx8*>(data));
+            break;
+        case DType::Q5_K_R8:
+            quant::repack_q5_K_r8(reinterpret_cast<const quant::BlockQ5_K*>(scratch.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ5_Kx8*>(data));
+            break;
+        case DType::Q6_K_R8:
+            quant::repack_q6_K_r8(reinterpret_cast<const quant::BlockQ6_K*>(scratch.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ6_Kx8*>(data));
+            break;
+        case DType::Q8_0_R4:
+            quant::repack_q8_0_r4(reinterpret_cast<const quant::BlockQ8_0*>(scratch.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ8_0x4*>(data));
+            break;
+        default:
+            (void)from;
+            break;
+    }
+}
+
+}  // namespace
+
 ExpertStore::Segment ExpertStore::segment(int32_t key, int32_t matrix) const {
     const auto& block = experts_[static_cast<size_t>(key / n_expert_)];
     const TensorView& t = *block[static_cast<size_t>(matrix)];
@@ -156,7 +204,13 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     lock.unlock();
     // One read per matrix: smaller parts (tried: 2 and 4 per matrix) cost
     // the flash more than the extra concurrency saves.
-    const Status status = files_[seg.shard]->read(begin, length, dst);
+    Status status = files_[seg.shard]->read(begin, length, dst);
+    if (status.is_ok()) {
+        const int32_t layer = key / n_expert_;
+        const DType to = served_type(layer, m);
+        const TensorView& t = *experts_[static_cast<size_t>(layer)][static_cast<size_t>(m)];
+        if (to != t.type) repack_in_place(dst + (seg.offset - begin), seg.bytes, t.type, to, t.ne[1], t.ne[0]);
+    }
     lock.lock();
     stats_.bytes_read += length;
     if (!status.is_ok()) {
@@ -347,6 +401,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
         const TensorView& t = *block[static_cast<size_t>(m)];
         const Segment seg = segment(key, m);
         TensorView v = t;
+        v.type = served_type(layer, m);
         v.n_dims = 2;
         v.ne = {t.ne[0], t.ne[1], 1, 1};
         v.nbytes = seg.bytes;

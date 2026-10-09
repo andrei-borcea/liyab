@@ -54,11 +54,17 @@ public:
     };
 
     // `experts[l]` = {gate, up, down} stacked expert tensors of block l, or
-    // all nullptr for a dense block. `budget_bytes` bounds the cache; at
+    // all nullptr for a dense block. `repack`: rearrange each matrix as it
+    // arrives (I/O thread) into the CPU's i8mm layout (Q4_K/Q5_K/Q6_K to
+    // *_R8, Q8_0 to Q8_0_R4; lossless, same size), as the resident weights
+    // are at load: acquire() then returns views of that type, which the
+    // batched kernels multiply by many tokens at once instead of decoding
+    // each weight row again for every token (prefill). `budget_bytes` bounds the cache; at
     // least a few entries per block are kept whatever the budget.
     static Result<std::unique_ptr<ExpertStore>> create(const MmapLoader& file,
                                                        std::vector<std::array<const TensorView*, 3>> experts,
-                                                       int32_t n_expert, size_t budget_bytes, int32_t io_threads = 2);
+                                                       int32_t n_expert, size_t budget_bytes, int32_t io_threads = 2,
+                                                       bool repack = false);
     ~ExpertStore();
     ExpertStore(const ExpertStore&) = delete;
     ExpertStore& operator=(const ExpertStore&) = delete;
@@ -143,6 +149,8 @@ private:
     // lock, then marks the entry Ready (or Empty on failure) after its last part.
     void read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m);
     [[nodiscard]] Segment segment(int32_t key, int32_t matrix) const;
+    // The type matrix `matrix` of block `layer` is served as (its repacked type, or its own).
+    [[nodiscard]] DType served_type(int32_t layer, int32_t matrix) const;
     // Drops or demotes block `layer`'s guesses that its router did not confirm.
     void settle_locked(int32_t layer);
 
@@ -160,6 +168,7 @@ private:
     std::vector<Slot> slots_;
     std::vector<Entry> entries_;
     std::vector<int32_t> hot_;  // see hot_keys()
+    bool repack_ = false;
 
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;   // I/O threads: queue or parts not empty / stop

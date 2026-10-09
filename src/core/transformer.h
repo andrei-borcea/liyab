@@ -325,7 +325,7 @@ private:
     // entering block l (83% vs 77% of the top-8 on Qwen3.6-35B-A3B), while the
     // reads still overlap block l's experts and block l + 1's mixer.
     void predict_experts(int32_t layer, int32_t n, const Route& route);
-    Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits);
+    Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits, bool repack);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.

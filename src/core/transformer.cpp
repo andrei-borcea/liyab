@@ -319,7 +319,8 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
 
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(
-            model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.requant_bits));
+            model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.requant_bits,
+                                       options.repack_cpu && quant::repack_kernels_available()));
     }
     model->file_->configure_layers(c.n_layers);
     LIYAB_LOG_INFO("%s: %d layers, d=%d, ff=%d, heads=%d/%d x %d, vocab=%d, ctx=%d%s, kv=%s, %.1f KiB/token",
@@ -979,7 +980,8 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
 // Expert streaming: the routed experts stay on storage and are read on
 // demand into a fixed RAM cache; every other tensor stays resident in the
 // mapping (paged in now, never swept by the streaming window).
-Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits) {
+Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits,
+                                        bool repack) {
     if (budget_option == 0) return Status::ok();
     if (requant_bits != -1 && requant_bits != 0 && requant_bits != 4 && requant_bits != 5) {
         return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
@@ -1066,7 +1068,7 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
         const Layer& L = layers_[static_cast<size_t>(l)];
         if (L.moe) experts[static_cast<size_t>(l)] = {L.w[kGateExps], L.w[kUpExps], L.w[kDownExps]};
     }
-    auto store = ExpertStore::create(*file_, std::move(experts), c.n_expert, budget, 4);
+    auto store = ExpertStore::create(*file_, std::move(experts), c.n_expert, budget, 4, repack);
     if (!store) return store.status();
     expert_store_ = std::move(store).value();
     memory_plan_.expert_cache_bytes = expert_store_->capacity_bytes();
