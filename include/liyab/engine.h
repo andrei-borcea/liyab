@@ -193,6 +193,13 @@ public:
 
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
+    // Thread-safe: stops an in-flight prefill() between two blocks of the
+    // model (within a fraction of a second, also inside a long pass); it
+    // returns Cancelled and keeps the context processed so far, so the next
+    // prompt that continues the text resumes there. Never affects generate(),
+    // so a scheduler can preempt background prefills without a race with the
+    // foreground request that follows.
+    void cancel_prefill() noexcept;
 
     // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token).
     [[nodiscard]] Result<std::vector<int32_t>> tokenize(std::string_view text, bool add_bos) const;

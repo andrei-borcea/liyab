@@ -6,6 +6,7 @@
 #ifndef LIYAB_EXPERIMENTAL_FORWARD_HOOKS_H
 #define LIYAB_EXPERIMENTAL_FORWARD_HOOKS_H
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 
@@ -55,6 +56,9 @@ public:
 };
 
 struct ForwardHooks {
+    // Set: forward() checks it between blocks and returns Cancelled when it
+    // is true; the pass is then abandoned (Transformer::abandon_pass).
+    const std::atomic<bool>* cancel = nullptr;
     EarlyExitHook* early_exit = nullptr;
     const HeadMaskHook* head_mask = nullptr;
     FfnSkipHook* ffn_skip = nullptr;

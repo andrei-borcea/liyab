@@ -1514,6 +1514,44 @@ TEST_CASE("Context reuse: continuing a conversation or a prefill equals a fresh 
     CHECK(st3.cached_prefix_tokens <= 1);
 }
 
+TEST_CASE("A prefill cancelled mid-pass keeps its work and the output stays exact") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("hybrid", spec));
+    config.backend = BackendKind::Cpu;
+    auto fresh = Engine::create(config);
+    REQUIRE(fresh.has_value());
+    std::string text;
+    for (int i = 0; i < 60; ++i) text += i % 2 ? " hello" : " world";
+    const std::string prompt = text + " hello";
+    auto run = [](Engine& e, const std::string& p) {
+        std::string out;
+        auto st = e.generate(p, greedy(8), [&](std::string_view piece, int32_t) {
+            out += piece;
+            return true;
+        });
+        return st ? out : std::string("<error>");
+    };
+    const std::string expected = run(*fresh.value(), prompt);
+    int cancelled = 0;
+    for (const int delay_us : {0, 50, 200, 800, 3000}) {
+        auto e = Engine::create(config);
+        REQUIRE(e.has_value());
+        std::thread canceller([&] {
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            e.value()->cancel_prefill();
+        });
+        const Status st = e.value()->prefill(text, true);
+        canceller.join();
+        CHECK((st.is_ok() || st.code() == ErrorCode::Cancelled));
+        if (st.code() == ErrorCode::Cancelled) ++cancelled;
+        CHECK(run(*e.value(), prompt) == expected);  // resumes from what the prefill kept
+    }
+    std::printf("  %d of 5 prefills were cancelled before they ended\n", cancelled);
+}
+
 TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapshot, exactly") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";

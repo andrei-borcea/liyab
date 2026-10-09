@@ -167,6 +167,7 @@ struct Engine::Impl {
     std::optional<Tokenizer> tokenizer;
     std::unique_ptr<PowerManager> power;
     std::atomic<bool> cancel{false};
+    std::atomic<bool> cancel_prefill{false};  // Engine::cancel_prefill: prefill() only
     std::mutex busy;
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     std::unique_ptr<experimental::EarlyExit> early_exit;
@@ -555,6 +556,8 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 
 void Engine::cancel() noexcept { impl_->cancel.store(true, std::memory_order_relaxed); }
 
+void Engine::cancel_prefill() noexcept { impl_->cancel_prefill.store(true, std::memory_order_relaxed); }
+
 const DeviceInfo& Engine::device() const noexcept { return impl_->device; }
 
 PowerManager& Engine::power() noexcept { return *impl_->power; }
@@ -708,19 +711,28 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
     auto tokens = s.encode_continuation(text, add_bos);
     if (!tokens) return tokens.status();
-    s.cancel.store(false, std::memory_order_relaxed);
+    s.cancel_prefill.store(false, std::memory_order_relaxed);
     const std::vector<int32_t>& t = tokens.value();
     const size_t reused = s.reuse_prefix(t, t.size());
     s.context_text_valid = false;
     const PowerPolicy policy = s.power->policy();
     s.apply_policy(policy);
     const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
-    const ForwardHooks hooks = s.hooks(policy, false);
+    ForwardHooks hooks = s.hooks(policy, false);
+    // Interruptible within a pass (cancel_prefill() is checked between
+    // blocks): a pass of 1024 tokens of a streamed MoE runs for tens of
+    // seconds. The work done so far stays: a hybrid model's state is
+    // snapshotted before each pass, and an abandoned pass returns to it, so
+    // the next prompt continuing this text resumes there.
+    hooks.cancel = &s.cancel_prefill;
     const auto chunk = static_cast<size_t>(s.prefill_chunk());
     for (size_t i = reused; i < t.size(); i += chunk) {
-        if (s.cancel.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
+        if (s.target->config().hybrid()) s.target->snapshot_state();
         const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
         if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+            if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {
+                return Status(ErrorCode::Cancelled, "prefill cancelled");
+            }
             s.clear_context();
             return r.status();
         }

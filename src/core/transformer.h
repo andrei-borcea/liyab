@@ -214,6 +214,12 @@ public:
     // whose position n - 1 is still inside the rollback window, or the
     // position of a state snapshot (Unsupported otherwise).
     Status truncate(int32_t n);
+    // After forward() returned Cancelled (ForwardHooks::cancel) partway
+    // through its blocks: returns the context to n_past(), the position the
+    // pass started from. Recurrent states come back from a snapshot taken
+    // there (the caller takes one before a cancellable pass of a hybrid
+    // model); without one, Unsupported and the context must be reset.
+    Status abandon_pass();
     // The longest prefix of at most n positions truncate() accepts: n itself
     // for models without recurrent blocks, else the nearest checkpoint or
     // snapshot at or below n (0 if none).

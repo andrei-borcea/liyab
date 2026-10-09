@@ -233,6 +233,10 @@ LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
  * prepared right after loading). generate reuses the context whenever its
  * prompt continues the tokens already processed. */
 LIYAB_C_API liyab_status liyab_engine_prefill(liyab_engine* engine, const char* text, int32_t add_bos);
+/* Thread-safe: stops an in-flight liyab_engine_prefill between two blocks of
+ * the model; it returns LIYAB_ERR_CANCELLED and keeps the context processed so
+ * far. Never affects liyab_engine_generate. See Engine::cancel_prefill. */
+LIYAB_C_API void liyab_engine_cancel_prefill(liyab_engine* engine);
 /* Forgets the context: the next call starts from scratch. */
 LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
 /* Saves the context (e.g. a prefilled system prompt) to `path`, and restores

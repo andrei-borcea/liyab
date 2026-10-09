@@ -300,6 +300,10 @@ void liyab_engine_cancel(liyab_engine* engine) {
     if (engine != nullptr) engine->engine->cancel();
 }
 
+void liyab_engine_cancel_prefill(liyab_engine* engine) {
+    if (engine != nullptr) engine->engine->cancel_prefill();
+}
+
 liyab_status liyab_engine_set_power_profile(liyab_engine* engine, liyab_power_profile profile) {
     if (engine == nullptr || profile < LIYAB_POWER_PERFORMANCE || profile > LIYAB_POWER_LOW_POWER) {
         return fail(LIYAB_ERR_INVALID_ARGUMENT, "invalid engine or power profile");

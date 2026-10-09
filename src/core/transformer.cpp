@@ -1592,6 +1592,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     EarlyExitHook* early_exit =
         hooks != nullptr && n == 1 && logits == Logits::Last && !c.hybrid() ? hooks->early_exit : nullptr;
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
+    const std::atomic<bool>* cancel = hooks != nullptr ? hooks->cancel : nullptr;
     FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;
     FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
     last_ffn_skips_ = 0;
@@ -1611,6 +1612,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     }
 
     for (int32_t l = 0; l < c.n_layers; ++l) {
+        if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
+            return Status(ErrorCode::Cancelled, "forward pass cancelled");
+        }
         const Layer& L = layers_[static_cast<size_t>(l)];
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
@@ -1697,6 +1701,27 @@ Status Transformer::adopt_cached_prefix(int32_t n) {
         if (kv_->page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "cached prefix pages are not mapped");
     }
     n_past_ = n;
+    return Status::ok();
+}
+
+Status Transformer::abandon_pass() {
+    if (!config_.hybrid()) return kv_->truncate(n_past_);
+    const auto snap = std::find_if(snapshots_.begin(), snapshots_.end(),
+                                   [&](const StateSnapshot& s) { return s.pos == n_past_; });
+    if (snap == snapshots_.end()) {
+        if (n_past_ == 0) {
+            reset();
+            return Status::ok();
+        }
+        return Status(ErrorCode::Unsupported, "no state snapshot at the abandoned pass's start");
+    }
+    LIYAB_RETURN_IF_ERROR(kv_->truncate(n_past_));
+    const float* saved = snap->data.data();
+    for (RecurrentState& st : states_) {
+        std::copy_n(saved, st.conv.size(), st.conv.begin());
+        std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+        saved += st.conv.size() + st.ssm.size();
+    }
     return Status::ok();
 }
 
