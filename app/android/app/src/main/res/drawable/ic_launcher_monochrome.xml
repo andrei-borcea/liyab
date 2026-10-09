@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon layer (Android 13+): the mark in one color; the system tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="512" android:viewportHeight="512">
+    <group android:pivotX="256" android:pivotY="256" android:scaleX="0.62" android:scaleY="0.62"
+        android:translateX="-3" android:translateY="3">
+        <path android:fillColor="#FFFFFFFF" android:pathData="M246,48 C166,144 132,220 132,302 C132,386 192,446 262,458 C212,428 186,378 190,322 C196,252 252,196 246,48 Z"/>
+        <path android:fillColor="#FFFFFFFF" android:pathData="M304,144 C364,210 386,262 386,322 C386,396 332,450 262,458 C308,430 332,390 328,344 C324,290 296,236 304,144 Z"/>
+        <path android:fillColor="#FFFFFFFF" android:pathData="M262,320 a36,36 0 1,0 0.01,0 Z"/>
+    </group>
+</vector>
