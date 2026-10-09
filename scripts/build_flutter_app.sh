@@ -7,7 +7,8 @@
 # Requires: Flutter, Android SDK (platform 36), NDK, JDK 17, cmake. The APK is
 # signed with build/liyab-debug.keystore (created here if missing): keep it, an
 # APK signed with another key cannot update the installed app.
-# --install waits while the app is running instead of stopping it.
+# --install never interrupts the app: it waits while Liyab is on screen or runs
+# a foreground service (a model download), then installs, which restarts it.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
 set -euo pipefail
 
@@ -41,8 +42,14 @@ APK="$ROOT/app/build/app/outputs/flutter-apk/app-release.apk"
 echo "==> Built $APK ($(du -h "$APK" | cut -f1))"
 
 if [[ "$INSTALL" == 1 ]]; then
-  while adb shell pidof com.liyab.chat >/dev/null 2>&1; do
-    echo "    Liyab is open on the phone; waiting for it to be closed…"
+  # The process alone is no sign of use: the notification listener and a
+  # backgrounded chat keep it alive indefinitely.
+  in_use() {
+    adb shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat ||
+      adb shell dumpsys activity services com.liyab.chat | grep -q 'isForeground=true'
+  }
+  while in_use; do
+    echo "    Liyab is in use on the phone; waiting for it to go to the background…"
     sleep 10
   done
   adb install -r "$APK"

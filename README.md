@@ -527,7 +527,7 @@ The application id is `com.liyab.chat` and the APK is signed with `build/liyab-d
 demo app's key, so installing over that app kept its models).
 
 ```bash
-scripts/build_flutter_app.sh --install   # libliyab + release APK; waits while the app is open
+scripts/build_flutter_app.sh --install   # libliyab + release APK; waits while the app is on screen or downloading
 cd app && flutter analyze && flutter test
 ```
 
