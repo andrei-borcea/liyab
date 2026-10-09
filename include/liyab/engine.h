@@ -77,6 +77,11 @@ struct EngineConfig {
     // MoE: at most this many experts per token (the top ones, renormalized);
     // 0: the model's own top-k. Lossy when below it.
     int32_t moe_max_experts = 0;
+    // MoE with streamed experts: a chosen expert that is not in RAM yet is
+    // skipped instead of waited for when, for every token using it, its
+    // router weight is below this share of the token's experts (the others
+    // renormalized). Lossy, opt-in: cuts stalls on low-impact experts. 0: off.
+    float moe_skip_slow = 0.0f;
     // Most drafts per speculative step (k). 3 by default: a verification pass
     // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
     int32_t draft_tokens = 3;

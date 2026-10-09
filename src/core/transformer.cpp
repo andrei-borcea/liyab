@@ -203,6 +203,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     model->expert_mass_ = options.expert_mass;
     model->max_experts_ = options.max_experts;
+    model->skip_slow_ = options.skip_slow;
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
@@ -1214,6 +1215,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     std::vector<float> probs(E);
     std::vector<int32_t> order(E);
     experts_kept_.assign(un, static_cast<int32_t>(K));
+    std::vector<float> token_weight(un, 0.0f);  // per token: the weights of its kept experts (for skip_slow_)
     for (size_t t = 0; t < un; ++t) {
         const float* logits = router_.data() + t * E;
         if (c.moe_gating == MoeGating::Softmax) {
@@ -1243,6 +1245,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             const auto e = static_cast<size_t>(order[k]);
             assigned[e].push_back(
                 {static_cast<int32_t>(t), static_cast<int32_t>(k), probs[e] * norm * c.moe_weights_scale});
+            token_weight[t] += assigned[e].back().weight;
         }
     }
 
@@ -1315,6 +1318,8 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
 
     PhaseTimer experts_timer(phases_.experts);
     moe_out_.assign(un * d, 0.0f);
+    std::vector<float> skipped_weight(un, 0.0f);  // per token, the weight of experts skipped (skip_slow_)
+    std::vector<uint8_t> rank_skipped(un * K, 0);
     ranked_out_.resize(un * K * d);
     // Experts run in waves: the next expert (waiting for it if needed) plus
     // every following one already in RAM, as one batched pass for gate/up and
@@ -1338,6 +1343,22 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         size_t rows_total = 0;
         do {
             const int32_t ex = chosen[next++];
+            if (expert_store_ != nullptr && skip_slow_ > 0.0f && !expert_store_->ready(layer, ex)) {
+                // Not in RAM yet and light for every token using it: skip it
+                // rather than wait (lossy; the token's others are renormalized below).
+                const auto& users = assigned[static_cast<size_t>(ex)];
+                const bool light = std::all_of(users.begin(), users.end(), [&](const Use& u) {
+                    return u.weight < skip_slow_ * token_weight[static_cast<size_t>(u.token)];
+                });
+                if (light) {
+                    for (const Use& u : users) {
+                        skipped_weight[static_cast<size_t>(u.token)] += u.weight;
+                        rank_skipped[static_cast<size_t>(u.token) * K + static_cast<size_t>(u.rank)] = 1;
+                    }
+                    ++predictions_.skipped;
+                    continue;
+                }
+            }
             if (expert_store_ != nullptr) {
                 // About to wait for a read: do the shared expert's work meanwhile.
                 if (!shared_done && wave.empty() && !expert_store_->ready(layer, ex)) {
@@ -1359,6 +1380,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         } while (next < chosen.size() && wave.size() < kMaxWave &&
                  (expert_store_ == nullptr || expert_store_->ready(layer, chosen[next])));
 
+        if (wave.empty()) continue;  // every expert of this wave was skipped
         // Inputs: an expert every token chose reads xb_ itself (always the
         // case in decode), so all of them share one quantized copy.
         ein_.resize(rows_total * d);
@@ -1411,8 +1433,15 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     for (size_t t = 0; t < un; ++t) {
         float* dst = moe_out_.data() + t * d;
         for (size_t k = 0; k < static_cast<size_t>(experts_kept_[t]); ++k) {
+            if (rank_skipped[t * K + k]) continue;
             const float* src = ranked_out_.data() + (t * K + k) * d;
             for (size_t j = 0; j < d; ++j) dst[j] += src[j];
+        }
+        // Skipped experts: the others carry the token's whole weight, as the
+        // model's own top-k normalization would have given it.
+        if (skipped_weight[t] > 0.0f && c.moe_norm_weights && skipped_weight[t] < token_weight[t]) {
+            const float scale = token_weight[t] / (token_weight[t] - skipped_weight[t]);
+            for (size_t j = 0; j < d; ++j) dst[j] *= scale;
         }
     }
 

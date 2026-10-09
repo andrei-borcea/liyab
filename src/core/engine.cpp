@@ -77,6 +77,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.requant_bits = config.requant_bits;
     options.expert_mass = config.moe_expert_mass;
     options.max_experts = config.moe_max_experts;
+    options.skip_slow = config.moe_skip_slow;
     options.repack_cpu = repack_cpu && !config.triple_buffer_loading;
     return Transformer::load(std::move(file).value(), options);
 }
@@ -996,6 +997,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
         stats.expert_dropped = static_cast<int32_t>(after.dropped - experts_before.dropped);
         const Transformer::ExpertPredictions& predictions = s.target->expert_predictions();
+        stats.expert_skipped = static_cast<int32_t>(predictions.skipped - predictions_before.skipped);
         stats.expert_predicted = static_cast<int32_t>(predictions.predicted - predictions_before.predicted);
         stats.expert_predicted_used = static_cast<int32_t>(predictions.used - predictions_before.used);
     }

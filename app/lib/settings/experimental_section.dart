@@ -88,6 +88,10 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
           (v) => _x.expertMass = v),
       choice('Experts per token', 'Fewer experts read less per token (lossy).', _x.maxExperts,
           const [(0, 'Model'), (2, '2'), (4, '4'), (6, '6')], (v) => _x.maxExperts = v),
+      toggle('Skip slow, light experts', 'When an expert the router chose is still being read and weighs little for the '
+          'token, answer without it instead of waiting (lossy).', _x.skipSlow > 0, (v) => _x.skipSlow = v ? 0.1 : 0),
+      if (_x.skipSlow > 0)
+        slider('Skip below', _x.skipSlow, 0.05, 0.3, 5, (v) => '${(v * 100).round()}% of the token', (v) => _x.skipSlow = v),
       choice('Requantize resident matrices', 'Q8_0 attention and shared weights to 4 or 5 bits at load (lossy). '
           'Auto: only when memory is too tight for the expert cache.',
           _x.requantBits, const [(-1, 'Auto'), (0, 'Off'), (4, 'Q4_K'), (5, 'Q5_K')], (v) => _x.requantBits = v),

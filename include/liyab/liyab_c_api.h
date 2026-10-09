@@ -96,6 +96,7 @@ typedef struct liyab_engine_config {
     float egls_threshold;         /* default 0.002 */
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
     const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
+    float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy); 0 off */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -148,6 +149,7 @@ typedef struct liyab_generation_stats {
     int32_t expert_predicted;     /* experts guessed ahead of the router, cached ones included */
     int32_t expert_predicted_used; /* guesses the router then chose */
     int32_t expert_dropped;       /* wrong guesses removed from the read queue before being read */
+    int32_t expert_skipped;       /* chosen experts skipped instead of waited for (moe_skip_slow) */
 } liyab_generation_stats;
 
 /*

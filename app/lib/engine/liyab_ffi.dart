@@ -87,6 +87,8 @@ final class LiyabEngineConfig extends Struct {
   @Int32()
   external int tdss;
   external Pointer<Utf8> kvDedupDir;
+  @Float()
+  external double moeSkipSlow;
 }
 
 final class LiyabSamplingParams extends Struct {
@@ -177,6 +179,8 @@ final class LiyabGenerationStats extends Struct {
   external int expertPredictedUsed;
   @Int32()
   external int expertDropped;
+  @Int32()
+  external int expertSkipped;
 }
 
 final class LiyabMemoryPlan extends Struct {

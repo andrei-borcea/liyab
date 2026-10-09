@@ -109,6 +109,7 @@ class ExperimentalSettings {
   int draftTokens = 3;
   double expertMass = 1.0; // MoE: fewest top experts covering this router mass
   int maxExperts = 0; // MoE: experts per token cap; 0 = the model's
+  double skipSlow = 0; // MoE streaming: skip a light expert not yet in RAM (weight share below this); 0 off
   int kvCacheType = 1; // liyab_kv_cache_type: 0 F16, 1 Q8_0, 2 Q4_0, 3 Q4_1
   int requantBits = -1; // MoE streaming: resident Q8_0 matrices to Q4_K / Q5_K; -1 only when memory is tight
   int threads = 0; // 0 = the engine's choice
@@ -127,6 +128,7 @@ class ExperimentalSettings {
         'draftTokens': draftTokens,
         'expertMass': expertMass,
         'maxExperts': maxExperts,
+        'skipSlow': skipSlow,
         'kvCacheType': kvCacheType,
         'requantBits': requantBits,
         'threads': threads,
@@ -150,6 +152,7 @@ class ExperimentalSettings {
       ..draftTokens = i('draftTokens', d.draftTokens)
       ..expertMass = n('expertMass', d.expertMass)
       ..maxExperts = i('maxExperts', d.maxExperts)
+      ..skipSlow = n('skipSlow', d.skipSlow)
       ..kvCacheType = i('kvCacheType', d.kvCacheType)
       // Version 1 saved the old default (off) whenever anything was changed: Auto now.
       ..requantBits = o['v'] == null && i('requantBits', 0) == 0 ? d.requantBits : i('requantBits', d.requantBits)
@@ -168,6 +171,7 @@ class ExperimentalSettings {
       if (lookupDrafts) 'lookup drafts ($draftTokens)',
       if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
       if (maxExperts > 0) 'max $maxExperts experts',
+      if (skipSlow > 0) 'skip slow experts below ${(skipSlow * 100).round()}%',
       if (kvCacheType != d.kvCacheType) '${const ['F16', 'Q8_0', 'Q4_0', 'Q4_1'][kvCacheType]} KV',
       if (requantBits > 0) 'requant Q${requantBits}_K',
       if (requantBits == 0) 'no automatic requant',

@@ -425,6 +425,7 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   c.draftTokens = i('draftTokens') ?? c.draftTokens;
   c.moeExpertMass = n('expertMass') ?? c.moeExpertMass;
   c.moeMaxExperts = i('maxExperts') ?? c.moeMaxExperts;
+  c.moeSkipSlow = n('skipSlow') ?? c.moeSkipSlow;
   c.kvCacheType = i('kvCacheType') ?? c.kvCacheType;
   c.requantBits = i('requantBits') ?? c.requantBits;
   c.nThreads = i('threads') ?? c.nThreads;

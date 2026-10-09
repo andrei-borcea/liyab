@@ -381,13 +381,19 @@ app's default). `Engine::memory_plan()` (`liyab_engine_memory_plan`) reports the
 the expert cache and the budget at which 15% of the experts would be cached, so an app can tell the user that a
 budget is too small for a model (the Liyab app does, in its status line and Settings); `moe_expert_mass` (`liyab-cli --expert-mass P`, default 1 = off) runs, per token,
 only the top experts covering a fraction P of the router weight (lossy, see below); `moe_max_experts` (`liyab-cli
---experts N`, default 0 = the model's top-k) caps the experts per token (lossy when below the model's count); and
+--experts N`, default 0 = the model's top-k) caps the experts per token (lossy when below the model's count);
+`moe_skip_slow` (`liyab-cli --skip-slow W`, default 0 = off) skips a chosen expert that is not in RAM yet instead of
+waiting for its read when, for every token using it, its router weight is below a share W of the token's experts
+(the others renormalized; lossy, in the app's Experimental section); with streamed experts every Q4_K / Q5_K /
+Q6_K / Q8_0 expert matrix is rearranged on the I/O thread into the CPU's i8mm layout as it arrives (lossless, same
+size), so prefill multiplies it by many tokens at once, and prefill runs in passes of 512 tokens (each reads the
+union of its tokens' experts once: 35 instead of 70 MiB per token on a 706-token prompt with Qwen3.6-35B-A3B); and
 `liyab_generation_stats`
 reports `expert_hits`, `expert_late`, `expert_misses`, `expert_bytes_read`, `expert_stall_ms`,
 `expert_unused` (experts read and evicted again without being used), `expert_predicted` and
 `expert_predicted_used` (experts guessed one block ahead, and how many of them the router chose), `expert_dropped`
 (wrong guesses removed from the read queue once their block's router chose: those already read become the next to
-evict, instead of keeping their prefetch bonus), plus where decode
+evict, instead of keeping their prefetch bonus), `expert_skipped` (experts skipped by `moe_skip_slow`), plus where decode
 time went: `attention_ms`, `delta_net_ms`, `router_ms`, `experts_ms`, `shared_expert_ms`, `dense_ffn_ms` and `lm_head_ms` (C++:
 `GenerationStats::decode_phases`; `liyab-cli` prints them per token).
 `liyab_engine_get_counters` (C++: `Engine::counters()`) returns live cumulative counters for monitoring UIs (GPU

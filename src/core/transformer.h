@@ -113,6 +113,10 @@ struct TransformerOptions {
     // score, renormalized like the model's top-k); 0 or >= the model's top-k:
     // the model's own count. Lossy when it cuts.
     int32_t max_experts = 0;
+    // MoE with streamed experts: skip a chosen expert not in RAM yet when its
+    // weight share is below this for every token using it (Engine's
+    // moe_skip_slow). Lossy; 0: off.
+    float skip_slow = 0.0f;
     // Repack the resident Q4_K / Q5_K / Q6_K / Q8_0 matrices (Q4_K_R8 / Q5_K_R8 /
     // Q6_K_R8 / Q8_0_R4) for the CPU's i8mm kernels (set only when the CPU
     // computes every block; lossless).
@@ -197,6 +201,7 @@ public:
     struct ExpertPredictions {
         uint64_t predicted = 0;
         uint64_t used = 0;
+        uint64_t skipped = 0;  // chosen experts skipped instead of waited for (skip_slow)
     };
     [[nodiscard]] const ExpertPredictions& expert_predictions() const noexcept { return predictions_; }
 
@@ -383,6 +388,7 @@ private:
     std::vector<double> rank_guessed_, rank_used_;  // decayed counts per rank
     float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
     int32_t max_experts_ = 0;           // TransformerOptions::max_experts
+    float skip_slow_ = 0.0f;            // TransformerOptions::skip_slow
     std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
 

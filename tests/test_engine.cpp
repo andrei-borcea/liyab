@@ -1071,6 +1071,32 @@ TEST_CASE("Automatic requantization converts the resident Q8_0 matrices only whe
     CHECK(roomy_type == DType::Q8_0);
 }
 
+TEST_CASE("skip_slow skips light experts that are not in RAM yet, and stays finite") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen3moe";
+    spec.n_layers = 3;
+    spec.n_expert = 32;
+    spec.n_expert_used = 4;
+    spec.identical_experts = false;
+    const std::string& path = model_path("moe_streamed", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 24; ++i) tokens.push_back(3 + (i * 37) % 250);
+    TransformerOptions options;
+    options.expert_cache_bytes = 1;  // a few dozen slots: most experts are not in RAM when chosen
+    options.skip_slow = 0.5f;        // below half of the token's weight: every expert but a dominant one
+    auto model = load_transformer(path, options);
+    REQUIRE(model != nullptr);
+    for (const int32_t t : tokens) {
+        auto r = model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(r.has_value());
+        for (const float v : *r) REQUIRE(std::isfinite(v));
+    }
+    CHECK(model->expert_predictions().skipped > 0);
+}
+
 TEST_CASE("Expert streaming with requant_bits converts the resident Q8_0 matrices and stays close") {
     test::TinyModelSpec spec;  // Q8_0 attention and output, 256 columns: eligible for Q4_K / Q5_K
     spec.arch = "qwen3moe";

@@ -60,6 +60,8 @@ void usage() {
                  "  --expert-mass P    MoE: run only the top experts covering router mass P\n"
                  "                     (lossy, e.g. 0.9; default 1 = all top-k)\n"
                  "  --experts N        MoE: at most N experts per token (lossy; default: the model's)\n"
+                 "  --skip-slow W      MoE streaming: skip a chosen expert not yet in RAM whose router weight\n"
+                 "                     share is below W (e.g. 0.1) for every token using it (lossy; default 0)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -115,6 +117,7 @@ int main(int argc, char** argv) {
         else if (arg == "--requant") config.requant_bits = std::atoi(next());
         else if (arg == "--expert-mass") config.moe_expert_mass = static_cast<float>(std::atof(next()));
         else if (arg == "--experts") config.moe_max_experts = std::atoi(next());
+        else if (arg == "--skip-slow") config.moe_skip_slow = static_cast<float>(std::atof(next()));
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;
@@ -234,9 +237,9 @@ int main(int argc, char** argv) {
         if (stats.expert_predicted > 0) {
             std::fprintf(stderr,
                          "experts: prediction precision %.0f%% (%d of %d guesses chosen); wrong guesses: %d dropped "
-                         "before reading, %d read and evicted unused\n",
+                         "before reading, %d read and evicted unused; %d slow experts skipped\n",
                          100.0 * stats.expert_predicted_used / stats.expert_predicted, stats.expert_predicted_used,
-                         stats.expert_predicted, stats.expert_dropped, stats.expert_unused);
+                         stats.expert_predicted, stats.expert_dropped, stats.expert_unused, stats.expert_skipped);
         }
         if (stats.expert_unused > 0) {
             std::fprintf(stderr, "experts: %d prefetched and evicted unused (%.1f per token)\n", stats.expert_unused,
