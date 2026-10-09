@@ -730,6 +730,15 @@ void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
     }
 }
 
+// Attention over the KV cache, for n query tokens. Work is split by (token,
+// KV head, span of positions): the query heads sharing a KV head (grouped
+// query attention: 8 per KV head on Qwen3.6) are scored together, so each K
+// and V row is fetched and decoded once for the whole group, not once per
+// query head; and in decoding, where one token has only n_head_kv groups,
+// the visible positions are split into spans so every thread works (as in
+// flash decoding). Each span keeps a partial softmax (its maximum, sum and
+// weighted V); the spans are merged exactly (log-sum-exp). On a 2838-token
+// context the per-head loop took 48 ms of a 161 ms decode step.
 void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
     const int32_t hd = c.head_dim;
@@ -738,55 +747,126 @@ void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const 
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     const DType kv_type = kv_->dtype();
     const bool quantized_kv = quant::is_block_quantized(kv_type);
+    const auto uhd = static_cast<size_t>(hd);
+    const auto ugroup = static_cast<size_t>(group);
 
-    pool.parallel_for(int64_t{n} * c.n_head, [&](int64_t begin, int64_t end) {
-        thread_local std::vector<float> scores;
-        thread_local std::vector<quant::BlockQ8_0> q8;
+    // Spans per (token, KV head): enough tasks for every thread, spans of at
+    // least kMinSpan positions (shorter ones cost more to merge than they save).
+    constexpr int32_t kMinSpan = 64;
+    const int32_t longest = kv_->visible(n_past_ + n - 1).sink_end + (n_past_ + n);
+    const int64_t base_tasks = int64_t{n} * c.n_head_kv;
+    const int64_t wanted = int64_t{pool.active_threads()} * ThreadPool::kChunksPerThread;
+    const auto spans = static_cast<int32_t>(std::clamp<int64_t>((wanted + base_tasks - 1) / base_tasks, 1,
+                                                                std::max<int64_t>(1, longest / kMinSpan)));
+    // Partial results per (token, query head, span): maximum, sum, weighted V.
+    const size_t parts = static_cast<size_t>(n) * static_cast<size_t>(c.n_head) * static_cast<size_t>(spans);
+    part_max_.resize(parts);
+    part_sum_.resize(parts);
+    part_out_.resize(parts * uhd);
+    auto part = [&](int32_t t, int32_t h, int32_t sp) {
+        return (static_cast<size_t>(t) * static_cast<size_t>(c.n_head) + static_cast<size_t>(h)) *
+                   static_cast<size_t>(spans) + static_cast<size_t>(sp);
+    };
+
+    pool.parallel_for(base_tasks * spans, [&](int64_t begin, int64_t end) {
+        thread_local std::vector<float> scores;           // [group][span length]
+        thread_local std::vector<quant::BlockQ8_0> q8;    // [group][hd / 32]
+        thread_local std::vector<float> vrow;             // one V row, decoded
         for (int64_t task = begin; task < end; ++task) {
-            const auto t = static_cast<int32_t>(task / c.n_head);
-            const auto h = static_cast<int32_t>(task % c.n_head);
-            float* out = att_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * hd;
-            if (head_mask != nullptr && head_mask[h] == 0) {
-                std::fill(out, out + hd, 0.0f);  // pruned head: contributes nothing
-                continue;
-            }
-            const int32_t g = h / group;
+            const auto sp = static_cast<int32_t>(task % spans);
+            const auto tg = task / spans;
+            const auto t = static_cast<int32_t>(tg / c.n_head_kv);
+            const auto g = static_cast<int32_t>(tg % c.n_head_kv);
             const int32_t pos = n_past_ + t;
             // Visible positions: attention sinks [0, sink_end) + [first, pos].
             const KvCache::Visible vis = kv_->visible(pos);
             const int32_t n_visible = vis.sink_end + (pos - vis.first + 1);
             auto position = [&](int32_t i) { return i < vis.sink_end ? i : vis.first + (i - vis.sink_end); };
-            const float* q = q_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * hd;
-
+            const auto i0 = static_cast<int32_t>(int64_t{n_visible} * sp / spans);
+            const auto i1 = static_cast<int32_t>(int64_t{n_visible} * (sp + 1) / spans);
+            const auto len = static_cast<size_t>(std::max(0, i1 - i0));
+            const int32_t h0 = g * group;
             // Quantized caches are scored with integer dot products against a
-            // Q8_0 copy of the query (same kernels as the weight matmuls).
+            // Q8_0 copy of each query (same kernels as the weight matmuls).
+            const size_t q8_per_head = uhd / quant::kBlock;
             if (quantized_kv) {
-                q8.resize(static_cast<size_t>(hd / quant::kBlock));
-                quant::quantize_row_q8_0(q, q8.data(), hd);
+                q8.resize(ugroup * q8_per_head);
+                for (int32_t j = 0; j < group; ++j) {
+                    const float* q = q_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h0 + j) * uhd;
+                    quant::quantize_row_q8_0(q, q8.data() + static_cast<size_t>(j) * q8_per_head, hd);
+                }
             }
-            scores.resize(static_cast<size_t>(n_visible));
-            float max_score = -INFINITY;
-            for (int32_t i = 0; i < n_visible; ++i) {
-                const uint8_t* k = kv_->k_row(kv_slot, position(i), g);
-                const float s = (quantized_kv ? quant::dot_quantized(kv_type, k, q8.data(), nullptr, hd)
-                                              : quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(k), q, hd)) *
-                                scale;
-                scores[static_cast<size_t>(i)] = s;
-                max_score = std::max(max_score, s);
+            scores.resize(ugroup * std::max<size_t>(len, 1));
+            for (size_t i = 0; i < len; ++i) {
+                const uint8_t* k = kv_->k_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+                for (int32_t j = 0; j < group; ++j) {
+                    const float* q = q_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h0 + j) * uhd;
+                    scores[static_cast<size_t>(j) * len + i] =
+                        (quantized_kv ? quant::dot_quantized(kv_type, k, q8.data() + static_cast<size_t>(j) * q8_per_head,
+                                                             nullptr, hd)
+                                      : quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(k), q, hd)) *
+                        scale;
+                }
             }
-            float sum = 0.0f;
-            for (float& s : scores) {
-                s = std::exp(s - max_score);
-                sum += s;
+            for (int32_t j = 0; j < group; ++j) {
+                const int32_t h = h0 + j;
+                const size_t pi = part(t, h, sp);
+                float* out = part_out_.data() + pi * uhd;
+                std::fill(out, out + hd, 0.0f);
+                part_max_[pi] = -INFINITY;
+                part_sum_[pi] = 0.0f;
+                if (len == 0 || (head_mask != nullptr && head_mask[h] == 0)) continue;
+                float* sc = scores.data() + static_cast<size_t>(j) * len;
+                float mx = -INFINITY;
+                for (size_t i = 0; i < len; ++i) mx = std::max(mx, sc[i]);
+                float sum = 0.0f;
+                for (size_t i = 0; i < len; ++i) sum += sc[i] = std::exp(sc[i] - mx);
+                part_max_[pi] = mx;
+                part_sum_[pi] = sum;
             }
-            std::fill(out, out + hd, 0.0f);
-            const float inv_sum = 1.0f / sum;
-            for (int32_t i = 0; i < n_visible; ++i) {
-                quant::axpy_row(kv_type, kv_->v_row(kv_slot, position(i), g), scores[static_cast<size_t>(i)] * inv_sum,
-                                out, hd);
+            // V: each row decoded once into floats, then added to every head
+            // of the group (decoding it per head cost 8x the work).
+            vrow.resize(uhd);
+            for (size_t i = 0; i < len; ++i) {
+                const uint8_t* v = kv_->v_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+                if (kv_type == DType::F32) {
+                    std::copy_n(reinterpret_cast<const float*>(v), uhd, vrow.data());
+                } else {
+                    quant::dequantize_row(kv_type, v, vrow.data(), hd);
+                }
+                for (int32_t j = 0; j < group; ++j) {
+                    const int32_t h = h0 + j;
+                    if (head_mask != nullptr && head_mask[h] == 0) continue;
+                    const float w = scores[static_cast<size_t>(j) * len + i];
+                    float* out = part_out_.data() + part(t, h, sp) * uhd;
+                    for (size_t d = 0; d < uhd; ++d) out[d] += w * vrow[d];
+                }
             }
         }
     });
+
+    // Merge the spans of every (token, head): exp(m_s - M) rescales each
+    // span's sum and weighted V to the global maximum M.
+    for (int32_t t = 0; t < n; ++t) {
+        for (int32_t h = 0; h < c.n_head; ++h) {
+            float* out = att_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * uhd;
+            std::fill(out, out + hd, 0.0f);
+            if (head_mask != nullptr && head_mask[h] == 0) continue;  // pruned head: contributes nothing
+            float mx = -INFINITY;
+            for (int32_t sp = 0; sp < spans; ++sp) mx = std::max(mx, part_max_[part(t, h, sp)]);
+            float sum = 0.0f;
+            for (int32_t sp = 0; sp < spans; ++sp) {
+                const size_t pi = part(t, h, sp);
+                if (part_sum_[pi] == 0.0f) continue;
+                const float w = std::exp(part_max_[pi] - mx);
+                sum += w * part_sum_[pi];
+                const float* src = part_out_.data() + pi * uhd;
+                for (size_t d = 0; d < uhd; ++d) out[d] += w * src[d];
+            }
+            const float inv = 1.0f / sum;
+            for (size_t d = 0; d < uhd; ++d) out[d] *= inv;
+        }
+    }
 }
 
 Status Transformer::matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y,

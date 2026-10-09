@@ -400,6 +400,7 @@ private:
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
+    std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
