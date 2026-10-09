@@ -706,6 +706,13 @@ class AppState extends ChangeNotifier {
               'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, ${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
               '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}');
+          if (stats.generatedTokens >= 16) {
+            final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5).map((e) => '${e.key} ${e.value.toStringAsFixed(1)}');
+            final total = 1000 / (stats.tokensPerSecond > 0 ? stats.tokensPerSecond : 1);
+            _log('  decode ms/token: ${phases.join(' | ')} | total ${total.toStringAsFixed(0)}'
+                '${stats.expertHitRate > 0 ? '; experts ${(stats.expertHitRate * 100).round()}% cached, '
+                    '${(stats.expertStallMs / stats.generatedTokens).toStringAsFixed(1)} ms/token waiting' : ''}');
+          }
       }
       notifyListeners();
     }

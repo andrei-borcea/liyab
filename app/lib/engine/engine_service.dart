@@ -85,6 +85,9 @@ class GenerationStats {
     required this.cachedPrefixTokens,
     required this.thermalReroutes,
     required this.cancelled,
+    this.phasesMs = const {},
+    this.expertHitRate = 0,
+    this.expertStallMs = 0,
   });
 
   final int promptTokens;
@@ -94,6 +97,13 @@ class GenerationStats {
   final int cachedPrefixTokens;
   final int thermalReroutes;
   final bool cancelled;
+
+  /// Decode time per token by phase (attention, DeltaNet, router, experts, shared expert, dense FFN, LM head), ms.
+  final Map<String, double> phasesMs;
+
+  /// MoE with streamed experts: the share of expert uses served from RAM, and the time waiting for reads.
+  final double expertHitRate;
+  final double expertStallMs;
 }
 
 sealed class GenerationEvent {}
@@ -174,6 +184,9 @@ class EngineService {
             cachedPrefixTokens: s[4] as int,
             thermalReroutes: s[5] as int,
             cancelled: s[6] as bool,
+            phasesMs: Map<String, double>.from(s[7] as Map),
+            expertHitRate: s[8] as double,
+            expertStallMs: s[9] as double,
           )))
           ..close();
       case 'error':
@@ -471,7 +484,24 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
           s.ttftMs,
           s.cachedPrefixTokens,
           s.thermalReroutes,
-          s.cancelled != 0
+          s.cancelled != 0,
+          () {
+            final n = s.generatedTokens > 0 ? s.generatedTokens : 1;
+            return {
+              'attention': s.attentionMs / n,
+              'DeltaNet': s.deltaNetMs / n,
+              'router': s.routerMs / n,
+              'experts': s.expertsMs / n,
+              'shared': s.sharedExpertMs / n,
+              'dense FFN': s.denseFfnMs / n,
+              'LM head': s.lmHeadMs / n,
+            };
+          }(),
+          () {
+            final used = s.expertHits + s.expertLate + s.expertMisses;
+            return used > 0 ? s.expertHits / used : 0.0;
+          }(),
+          s.expertStallMs
         ]
       ]);
     });
