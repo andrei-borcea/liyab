@@ -326,7 +326,9 @@ liyab_engine_destroy(engine);
 ```
 
 No C++ exception crosses the ABI. Errors are returned as `liyab_status`, with the message available from
-`liyab_last_error()` (thread-local). `liyab_engine_prefill` / `liyab_engine_reset_context` expose the context reuse
+`liyab_last_error()` (thread-local). Log messages reach a callback (`liyab_set_log_callback`, called on the logging
+thread) or, for UIs that poll, a buffer: `liyab_log_buffer_enable(max_bytes)` keeps the latest lines as
+`"<D|I|W|E> message\n"` and `liyab_log_buffer_take(buf, size)` hands over whole lines and removes them. `liyab_engine_prefill` / `liyab_engine_reset_context` expose the context reuse
 described above. `liyab_engine_metadata(engine, "general.sampling.temp", buf, size)` reads a
 scalar GGUF metadata value of the loaded model as text (e.g. the publisher's recommended sampling), returning -1 when
 the key is absent; `Engine::model_metadata()` is the C++ equivalent. `liyab_supported_architectures(buf, size)` (C++: `supported_architectures()`) lists the GGUF architectures the
@@ -442,18 +444,34 @@ calls the C ABI directly through `dart:ffi` (hand-written bindings in `app/lib/e
 `liyab_c_api.h`): model loads, prefills and generations run on a worker isolate, while cancel and the live counters
 are called directly because the C API makes them thread-safe.
 
+* **Pages.** A navigation drawer (with the model in use) leads to Chat, Models, Activity and Settings; the first
+  launch shows a welcome page that explains the privacy model and asks for the one permission.
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system
   prompt is processed right after loading.
-* **Models and settings.** Models are listed from app storage and the shared folder (marked, since streaming is
-  slower there, with **Move to app storage**, which copies every part and removes the shared copy); the CPU/GPU switch, sampling, context length, system prompt, thermal limit and memory budget are
-  in sheets, saved per model and per device.
+* **Models.** *On this phone* lists app storage and the shared folder (marked, since streaming is slower there,
+  with **Move to app storage**, which copies every part and removes the shared copy), marks models larger than the
+  memory budget as streamed, and imports a GGUF from anywhere through the system file picker. *Get models* searches
+  Hugging Face (public API, nothing about the user is sent), lists each repository's quantizations (split models as
+  one entry), reads `general.architecture` from the first 64 KiB to flag models the engine cannot run, and downloads
+  with `background_downloader`: 4 parallel range requests per file, pause / resume / cancel, resumed after the app
+  closes, run as a foreground data-sync job with a progress notification, and each part checked against the
+  SHA-256 Hugging Face publishes.
+* **Activity.** Live meters (tok/s, battery W, CPU %, storage MB/s, thermal status with Android's 10 s headroom
+  forecast, J/token on battery) with two-minute sparklines, sampled once a second only while the app is in the
+  foreground; plus the app's and the engine's log (`liyab_log_buffer_*`), copyable.
+* **Settings.** Sampling, context length and system prompt per model; CPU/GPU, thermal limit and memory budget per
+  device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
+  storage and imports go through the system picker).
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
-  shows whether the assistant is resting, thinking or answering, and its colour turns from cool to hot when the
-  engine reports thermal throttling. At rest it redraws about 24 times a second instead of at the display rate.
+  shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal
+  headroom (cool with headroom, hot near throttling). It redraws about 24 times a second at rest and 30 while the
+  model works, and the chat batches streamed text into ~15 redraws a second, so the UI leaves the cores to the
+  engine.
 
-Not yet in the Flutter app: model downloads, the performance overlay and the debug log (still in the Java demo).
+Not yet in the Flutter app: the floating performance overlay over other apps (the Activity page replaces it inside
+Liyab).
 It uses the same application id (`com.liyab.chat`) and signing key (`build/liyab-debug.keystore`) as the Java demo,
 so installing it over that app keeps the downloaded models; settings start from their defaults.
 
