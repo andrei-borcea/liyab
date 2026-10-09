@@ -232,6 +232,12 @@ LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
 LIYAB_C_API liyab_status liyab_engine_prefill(liyab_engine* engine, const char* text, int32_t add_bos);
 /* Forgets the context: the next call starts from scratch. */
 LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
+/* Saves the context (e.g. a prefilled system prompt) to `path`, and restores
+ * it for the same model file loaded with the same cache settings, so a later
+ * prompt continuing its text starts at once. load writes the tokens restored
+ * to *out_tokens (may be NULL). See Engine::save_state / load_state. */
+LIYAB_C_API liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path);
+LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens);
 
 /* Live counters for monitoring UIs, cumulative since creation: sample them
  * periodically and divide deltas by the elapsed time. Thread-safe (may be

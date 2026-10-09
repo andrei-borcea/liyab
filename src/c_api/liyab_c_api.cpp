@@ -340,6 +340,28 @@ liyab_status liyab_engine_reset_context(liyab_engine* engine) {
     return LIYAB_OK;
 }
 
+liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path) {
+    if (engine == nullptr || path == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Status s = engine->engine->save_state(path);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
+liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens) {
+    if (engine == nullptr || path == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        auto r = engine->engine->load_state(path);
+        if (!r) return fail(r.status());
+        if (out_tokens != nullptr) *out_tokens = r.value();
+        return LIYAB_OK;
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
 liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_counters* out) {
     if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {

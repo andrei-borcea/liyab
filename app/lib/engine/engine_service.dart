@@ -198,6 +198,12 @@ class EngineService {
   /// Processes `text` into the context so a later prompt starting with it skips that work.
   Future<void> prefill(String text) => _call<Object?>(['prefill', text]);
 
+  /// Saves the context (e.g. the prefilled system prompt) to `path`.
+  Future<void> saveState(String path) => _call<Object?>(['saveState', path]);
+
+  /// Restores a context saveState() wrote for this model; the tokens restored.
+  Future<int> loadState(String path) => _call<int>(['loadState', path]);
+
   /// Streams the reply to `prompt` (already chat-formatted).
   Stream<GenerationEvent> generate(String prompt, SamplingOptions s) {
     final id = _nextId++;
@@ -293,6 +299,21 @@ void _worker(SendPort replies) {
           using((arena) {
             lib.prefill(engine, (m[2] as String).toNativeUtf8(allocator: arena), 1) == LiyabStatus.ok
                 ? replies.send(['ok', id])
+                : fail();
+          });
+        case 'saveState':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            lib.saveState(engine, (m[2] as String).toNativeUtf8(allocator: arena)) == LiyabStatus.ok
+                ? replies.send(['ok', id])
+                : fail();
+          });
+        case 'loadState':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final n = arena<Int32>();
+            lib.loadState(engine, (m[2] as String).toNativeUtf8(allocator: arena), n) == LiyabStatus.ok
+                ? replies.send(['ok', id, n.value])
                 : fail();
           });
         case 'generate':

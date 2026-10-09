@@ -316,7 +316,11 @@ Otherwise the longest common token prefix is kept: any length on attention-only 
 the nearest recurrent-state snapshot, taken at the end of every prompt and `prefill()`. An edited last reply or a
 turn dropped from the history then recomputes only what follows the previous prompt or the system prompt.
 `Engine::prefill(text)` processes a prefix ahead of time (a chat's system prompt right after loading) and
-`reset_context()` forgets everything. The output equals a fresh context's (tested), except that a reused reply keeps
+`reset_context()` forgets everything. `Engine::save_state(path)` writes the context to a file (KV pages of the
+cached positions, recurrent states, and the tokens and text they encode; through a temporary file and a rename)
+and `load_state(path)` restores it in a later process, only for the same model file loaded with the same cache
+settings (a fingerprint of the file size, model shape and KV layout is checked), so a long system prompt is
+processed once, not after every start. C ABI: `liyab_engine_save_state` / `liyab_engine_load_state`. The output equals a fresh context's (tested), except that a reused reply keeps
 the tokenization it was generated with. The two snapshots cost 2 × the recurrent state (~120 MiB on
 Qwen3.6-35B-A3B), set aside from the expert cache budget. On the phone, Qwen3.6-35B-A3B's first token went from 13–16 s per
 message (whole conversation reprocessed) to 3.2 s for the first message and ~6 s for later ones.
@@ -489,7 +493,9 @@ are called directly because the C API makes them thread-safe.
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system
-  prompt is processed right after loading.
+  block (the system prompt plus the enabled tools' descriptions) is restored right after loading from the state
+  saved the first time it was processed (one file per model, named by the block's hash, under `states/`); only a
+  changed prompt or tool list is processed again, about a minute on Qwen3.6-35B-A3B.
 * **Models.** *On this phone* lists app storage and the shared folder (marked, since streaming is slower there,
   with **Move to app storage**, which copies every part and removes the shared copy), marks models larger than the
   memory budget as streamed, and imports a GGUF from anywhere through the system file picker. *Get models* searches
@@ -925,10 +931,6 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
-* **Cold start with tools.** The system block with the tool descriptions is processed after every model load
-  (about a minute on Qwen3.6-35B-A3B, whose prefill runs at ~11 tokens/s; then every turn reuses it). Next fix:
-  save the processed state (KV pages and recurrent states) to app storage and restore it at load, so the app and
-  the assistant sheet answer at once after a restart.
 * **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
   assistant listens at once; the flame's listening animation is ready for it), then a power and thermal controller
   that uses Android's performance hints and thermal-headroom forecast instead of a fixed temperature threshold, then

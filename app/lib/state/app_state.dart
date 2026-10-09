@@ -3,7 +3,11 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../agent/tool_format.dart';
@@ -194,15 +198,44 @@ class AppState extends ChangeNotifier {
   /// costs its own tokens (the engine keeps that context and a snapshot of it).
   String? _prepared; // the system block the engine last processed
 
+  /// Where the processed system block of this model is kept: one file per
+  /// model, named with the block's hash (a changed prompt or tool list is a
+  /// different file; the older one is deleted).
+  Future<(Directory, String)> _stateFile(String block) async {
+    final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    final hash = sha1.convert(utf8.encode('$block|${device.useGpu}')).toString().substring(0, 16);
+    return (dir, '${dir.path}/$modelName.$hash.state');
+  }
+
+  /// Gets the system block into the engine's context before the first message:
+  /// restored from its saved state when there is one (a fraction of a second),
+  /// else processed (about a minute on a 35B MoE with tools) and saved for the
+  /// next start. The first message then only costs its own tokens.
   Future<void> prepareSystemPrompt() async {
     if (!engine.loaded) return;
     final block = await _systemBlock();
     if (block == _prepared) return;
     _prepared = block;
     final watch = Stopwatch()..start();
+    final (dir, file) = await _stateFile(block);
+    if (File(file).existsSync()) {
+      try {
+        final n = await engine.loadState(file);
+        _log('System prompt restored ($n tokens) in ${watch.elapsedMilliseconds} ms');
+        return;
+      } on EngineException catch (e) {
+        _log('Saved system prompt not usable ($e); processing it again');
+        File(file).deleteSync();
+      }
+    }
     try {
       await engine.prefill(block);
       _log('System prompt prepared in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
+      await engine.saveState(file);
+      for (final old in dir.listSync().whereType<File>()) {
+        if (old.path != file && old.uri.pathSegments.last.startsWith('$modelName.')) old.deleteSync();
+      }
     } on EngineException catch (e) {
       _log('System prompt not prepared: $e');
     }

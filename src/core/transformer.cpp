@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <istream>
+#include <ostream>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -501,6 +503,101 @@ void Transformer::snapshot_state() {
         out = std::copy(st.ssm.begin(), st.ssm.end(), out);
     }
     snapshots_.push_back(std::move(snap));
+}
+
+namespace {
+
+constexpr uint32_t kStateMagic = 0x5453594C;  // "LYST"
+constexpr uint32_t kStateVersion = 1;
+
+template <typename T>
+void put(std::ostream& out, const T& v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof v);
+}
+
+template <typename T>
+bool get(std::istream& in, T& v) {
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(&v), sizeof v));
+}
+
+}  // namespace
+
+// What must match for a saved state to be valid here: the model (file size
+// and shape) and how the KV cache stores rows.
+std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
+    const KvCacheConfig& kv = kv_->config();
+    return {static_cast<int64_t>(file_->file_size()), config_.n_layers, config_.n_embd, config_.n_vocab,
+            kv.n_layers, kv.n_head_kv, kv.head_dim, static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
+}
+
+Status Transformer::write_state(std::ostream& out) const {
+    if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
+    put(out, kStateMagic);
+    put(out, kStateVersion);
+    for (const int64_t v : state_fingerprint()) put(out, v);
+    put(out, n_past_);
+    const int32_t pages = (n_past_ + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
+    put(out, static_cast<uint64_t>(kv_->page_bytes()));
+    put(out, pages);
+    for (int32_t p = 0; p < pages; ++p) {
+        const uint8_t* data = kv_->page_data(p);
+        if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
+    }
+    put(out, static_cast<int32_t>(states_.size()));
+    for (const RecurrentState& st : states_) {
+        put(out, static_cast<uint64_t>(st.conv.size()));
+        put(out, static_cast<uint64_t>(st.ssm.size()));
+        out.write(reinterpret_cast<const char*>(st.conv.data()), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
+        out.write(reinterpret_cast<const char*>(st.ssm.data()), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
+    }
+    return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
+}
+
+Status Transformer::read_state(std::istream& in) {
+    reset();
+    auto fail = [this](ErrorCode code, const char* why) {
+        reset();
+        return Status(code, why);
+    };
+    uint32_t magic = 0, version = 0;
+    if (!get(in, magic) || !get(in, version) || magic != kStateMagic || version != kStateVersion) {
+        return fail(ErrorCode::InvalidArgument, "not a Liyab context state (or another version)");
+    }
+    for (const int64_t expected : state_fingerprint()) {
+        int64_t v = 0;
+        if (!get(in, v) || v != expected) {
+            return fail(ErrorCode::InvalidArgument, "the state was saved for another model or other cache settings");
+        }
+    }
+    int32_t n = 0, pages = 0;
+    uint64_t page_bytes = 0;
+    if (!get(in, n) || !get(in, page_bytes) || !get(in, pages) || n < 0 || n > context_length_ ||
+        page_bytes != kv_->page_bytes() || pages != (n + kv_->config().page_tokens - 1) / kv_->config().page_tokens) {
+        return fail(ErrorCode::InvalidArgument, "the state's cache layout does not match");
+    }
+    if (Status s = kv_->reserve(n); !s.is_ok()) return fail(s.code(), "cannot map the state's cache pages");
+    for (int32_t p = 0; p < pages; ++p) {
+        uint8_t* data = kv_->mutable_page_data(p);
+        if (data == nullptr || !in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(page_bytes))) {
+            return fail(ErrorCode::IoError, "the state's cache pages are truncated");
+        }
+    }
+    int32_t count = 0;
+    if (!get(in, count) || count != static_cast<int32_t>(states_.size())) {
+        return fail(ErrorCode::InvalidArgument, "the state's recurrent blocks do not match");
+    }
+    for (RecurrentState& st : states_) {
+        uint64_t conv = 0, ssm = 0;
+        if (!get(in, conv) || !get(in, ssm) || conv != st.conv.size() || ssm != st.ssm.size() ||
+            !in.read(reinterpret_cast<char*>(st.conv.data()), static_cast<std::streamsize>(conv * sizeof(float))) ||
+            !in.read(reinterpret_cast<char*>(st.ssm.data()), static_cast<std::streamsize>(ssm * sizeof(float)))) {
+            return fail(ErrorCode::IoError, "the state's recurrent states are truncated");
+        }
+    }
+    n_past_ = n;
+    snapshot_state();
+    return Status::ok();
 }
 
 int32_t Transformer::restorable_prefix(int32_t n) const noexcept {

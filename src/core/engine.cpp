@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 
 #include "core/log.h"
@@ -642,6 +643,69 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     s.target->snapshot_state();  // the next prompt starts with this text
     s.remember_text(t, text);
     return Status::ok();
+}
+
+namespace {
+constexpr uint32_t kContextMagic = 0x5458434C;  // "LCXT": the engine's part after the model's state
+}
+
+Status Engine::save_state(const std::string& path) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
+        LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
+        const auto n = static_cast<uint64_t>(s.context.size());
+        const uint64_t text = s.context_text_valid ? s.context_text.size() : UINT64_MAX;
+        out.write(reinterpret_cast<const char*>(&kContextMagic), sizeof kContextMagic);
+        out.write(reinterpret_cast<const char*>(&n), sizeof n);
+        out.write(reinterpret_cast<const char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t)));
+        out.write(reinterpret_cast<const char*>(&text), sizeof text);
+        if (s.context_text_valid) out.write(s.context_text.data(), static_cast<std::streamsize>(s.context_text.size()));
+        if (!out.flush()) return Status(ErrorCode::IoError, "cannot write " + tmp);
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return Status(ErrorCode::IoError, "cannot replace " + path);
+    }
+    return Status::ok();
+}
+
+Result<int32_t> Engine::load_state(const std::string& path) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
+    s.clear_context();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return Status(ErrorCode::IoError, "cannot read " + path);
+    LIYAB_RETURN_IF_ERROR(s.target->read_state(in));
+    uint32_t magic = 0;
+    uint64_t n = 0, text = 0;
+    const auto damaged = [&s] {
+        s.clear_context();
+        return Status(ErrorCode::IoError, "the saved context is damaged");
+    };
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof magic) || magic != kContextMagic ||
+        !in.read(reinterpret_cast<char*>(&n), sizeof n) || n != static_cast<uint64_t>(s.target->n_past())) {
+        return damaged();
+    }
+    s.context.resize(n);
+    if (!in.read(reinterpret_cast<char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t))) ||
+        !in.read(reinterpret_cast<char*>(&text), sizeof text)) {
+        return damaged();
+    }
+    if (text != UINT64_MAX) {
+        if (text > (uint64_t{1} << 30)) return damaged();
+        s.context_text.resize(text);
+        if (!in.read(s.context_text.data(), static_cast<std::streamsize>(text))) return damaged();
+        s.context_text_valid = true;
+    }
+    return static_cast<int32_t>(n);
 }
 
 void Engine::reset_context() {

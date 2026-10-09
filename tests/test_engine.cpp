@@ -1440,6 +1440,51 @@ TEST_CASE("C API log buffer keeps whole lines for polling UIs") {
     liyab_set_log_level(2);
 }
 
+TEST_CASE("A saved context restores in a new engine, exactly, and only for the same model") {
+    test::TinyModelSpec hybrid;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    const std::string dir = test::temp_dir();
+    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid)}) {
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        auto saver = Engine::create(config);
+        auto loader = Engine::create(config);
+        auto fresh = Engine::create(config);
+        REQUIRE(saver.has_value() && loader.has_value() && fresh.has_value());
+        const std::string system = "hello world hello";
+        REQUIRE(saver.value()->prefill(system, true).is_ok());
+        const std::string file = dir + "/liyab_" + std::to_string(getpid()) + "_state.bin";
+        REQUIRE(saver.value()->save_state(file).is_ok());
+        auto restored = loader.value()->load_state(file);
+        REQUIRE(restored.has_value());
+        CHECK(restored.value() == static_cast<int32_t>(saver.value()->tokenize(system, true)->size()));
+        auto run = [](Engine& e, const std::string& prompt, GenerationStats* st) {
+            std::string text;
+            auto r = e.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (r && st != nullptr) *st = *r;
+            return r ? text : std::string("<error>");
+        };
+        GenerationStats st{};
+        const std::string out = run(*loader.value(), system + " world", &st);
+        CHECK(st.cached_prefix_tokens >= restored.value());
+        CHECK(out == run(*fresh.value(), system + " world", nullptr));
+    }
+    // A state from another model is refused, and leaves an empty context.
+    EngineConfig other = engine_config(f32_model());
+    auto engine = Engine::create(other);
+    REQUIRE(engine.has_value());
+    auto wrong = engine.value()->load_state(dir + "/liyab_" + std::to_string(getpid()) + "_state.bin");  // the hybrid model's
+    CHECK(!wrong.has_value());
+    CHECK(wrong.status().code() == ErrorCode::InvalidArgument);
+    CHECK(!engine.value()->load_state(dir + "/liyab_missing_state.bin").has_value());
+    std::remove((dir + "/liyab_" + std::to_string(getpid()) + "_state.bin").c_str());
+}
+
 TEST_CASE("Engine routes to CPU when forced and matches the default route") {
     EngineConfig cpu_config = engine_config(mixed_model());
     cpu_config.backend = BackendKind::Cpu;

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iosfwd>
 #include <memory>
 #include <span>
 #include <string>
@@ -201,6 +202,16 @@ public:
     // cache budget at load. No-op without recurrent blocks or at position 0.
     void snapshot_state();
     static constexpr int32_t kStateSnapshots = 2;
+    // Writes what the context holds (n_past(), the KV pages of positions
+    // [0, n_past()), the recurrent states) with a fingerprint of the model and
+    // the cache settings, so read_state() accepts it only for the same model
+    // file loaded the same way. Unsupported with a sliding window (released
+    // positions are gone). IoError when the stream fails.
+    Status write_state(std::ostream& out) const;
+    // Replaces the context with one write_state() saved, and takes a state
+    // snapshot at its end (truncate() can return there). InvalidArgument when
+    // the fingerprint differs; the context is empty after any failure.
+    Status read_state(std::istream& in);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -331,6 +342,7 @@ private:
     int32_t rollback_window_ = 0;
     bool checkpointing_ = true;
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
+    [[nodiscard]] std::array<int64_t, 9> state_fingerprint() const noexcept;
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
         std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order

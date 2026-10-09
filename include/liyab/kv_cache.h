@@ -82,6 +82,9 @@ public:
     // --- Prefix sharing (used by the experimental KV dedup) ---------------
     // Bytes of logical page `logical` (all layers, K then V), or nullptr.
     [[nodiscard]] const uint8_t* page_data(int32_t logical) const noexcept;
+    // The same page, writable, for restoring a saved state: an owned page that
+    // reserve() mapped; nullptr for unmapped or external pages.
+    [[nodiscard]] uint8_t* mutable_page_data(int32_t logical) noexcept;
     // Maps logical pages 0..n-1 to caller-owned read-only memory (e.g. an
     // mmap'd snapshot), without copying. The cache must be empty and use full
     // attention; the memory must outlive the mapping (until clear()). New

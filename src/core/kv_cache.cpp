@@ -92,6 +92,13 @@ const uint8_t* KvCache::page_data(int32_t logical) const noexcept {
     return page_ptr(static_cast<size_t>(logical));
 }
 
+uint8_t* KvCache::mutable_page_data(int32_t logical) noexcept {
+    if (logical < 0 || static_cast<size_t>(logical) >= table_.size() || table_[static_cast<size_t>(logical)] < 0) {
+        return nullptr;
+    }
+    return page_ptr(static_cast<size_t>(logical));
+}
+
 Status KvCache::attach_external_pages(std::span<const uint8_t* const> pages) {
     for (const int32_t entry : table_) {
         if (entry != kUnmapped) return Status(ErrorCode::InvalidArgument, "external pages need an empty cache");

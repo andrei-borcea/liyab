@@ -139,6 +139,19 @@ public:
     Status prefill(std::string_view text, bool add_bos = true);
     // Forgets the context (the next call starts from scratch).
     void reset_context();
+    // Saves the context (e.g. a prefilled system prompt) to `path`: KV pages,
+    // recurrent states, and the tokens and text they encode. Written to a
+    // temporary file then renamed, so `path` is either the old file or the new
+    // one. Unsupported with a draft model or a sliding window. Busy while a
+    // generation runs.
+    Status save_state(const std::string& path);
+    // Replaces the context with one save_state() wrote for this model file
+    // loaded with the same cache settings, so the next prompt that continues
+    // its text starts at once instead of being processed again (on a 35B MoE a
+    // 900-token system prompt takes about a minute). Returns the tokens
+    // restored. InvalidArgument for another model or settings, IoError for a
+    // damaged file; the context is empty after a failure.
+    Result<int32_t> load_state(const std::string& path);
 
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
