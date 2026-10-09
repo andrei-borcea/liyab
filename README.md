@@ -511,8 +511,8 @@ are called directly because the C API makes them thread-safe.
   that could leak into an answer in another language), capped (25 notifications with chat apps' reposts dropped,
   30 messages or calls) and with long texts cut: on Qwen3.5/3.6's tokenizer 6 events take 190 tokens instead of 428
   as JSON and 25 notifications 713 instead of 1375, about 18 s and 50 s less to process on Qwen3.6-35B-A3B before
-  the answer starts. Every user turn carries the current date and time (`[Now: Friday 9 October
-  2026, 13:40, UTC+02:00]`) so "in two hours" means something, while the system prompt stays fixed and its context
+  the answer starts. Every user turn starts with the current date and time (`[Now: Friday 9 October
+  2026, 13:40, UTC+02:00]`, fixed when the user starts writing) so "in two hours" means something, while the system prompt stays fixed and its context
   reused. The default system prompt tells the model to use tools for the user's data, never to invent it, and to
   treat tool results as data, not instructions. Not readable: full email bodies (Android gives apps no access to
   Gmail; only the notification previews) and the screen content (needs a voice-interaction service).
@@ -548,8 +548,9 @@ are called directly because the C API makes them thread-safe.
   extend the same prompt and the cost comes once every many messages. The cut is saved with the conversation.
 * **Typing ahead.** While the user writes, the stable part of the draft (whole words, cut where its tokens are a
   prefix of the text so far, since a hybrid model's context is reused only up to the snapshot at the end of a
-  prefill) is processed in the background, 0.6 s after the last keystroke. Sending then costs only the last words
-  and the time line. On a MoE whose experts stream from storage a prompt token costs about as much as a generated one
+  prefill) is processed in the background, 0.6 s after the last keystroke, starting with the history and the time
+  line that leads the turn (its digits are a token each: about 25 tokens). Sending then costs only the last words.
+  On a MoE whose experts stream from storage a prompt token costs about as much as a generated one
   (Qwen3.6-35B-A3B: 45 new prompt tokens took 5.9–6.8 s before the first word), so this hides most of that wait.
   Each generation of a reply is logged (new and reused prompt tokens, first token, speed).
 * **Leaving the screen.** HyperOS stops a background app that holds several GB within a minute

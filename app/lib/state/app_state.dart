@@ -505,11 +505,13 @@ class AppState extends ChangeNotifier {
   Timer? _draftTimer;
   String _drafted = ''; // the prompt text last processed for the draft
   bool _drafting = false;
+  DateTime? _draftTime; // the time line of the message being written
 
   /// Called on every edit of the composer's text.
   void draftChanged(String text) {
     _draftTimer?.cancel();
     if (text.trim().isEmpty) return;
+    _draftTime ??= DateTime.now();
     _draftTimer = Timer(const Duration(milliseconds: 600), () => unawaited(_prefillDraft(text)));
   }
 
@@ -520,12 +522,13 @@ class AppState extends ChangeNotifier {
       await _preparing;
       const marker = '\u0000';
       final template = await _prompt(marker);
-      final head = template.substring(0, template.indexOf(marker));
+      final head = '${template.substring(0, template.indexOf(marker))}${nowLine(_draftTime ?? DateTime.now())}\n';
       final whole = await engine.tokenIds(head + text);
       var cut = text.length;
       for (var tries = 0; tries < 3; ++tries) {
-        cut = cut <= 0 ? -1 : text.lastIndexOf(RegExp(r'\s'), cut - 1);
-        if (cut <= 0) return;
+        // Whole words; before the first one, the history and the time line alone.
+        cut = cut <= 0 ? 0 : text.lastIndexOf(RegExp(r'\s'), cut - 1);
+        if (cut < 0) cut = 0;
         final stable = head + text.substring(0, cut);
         if (_drafted.startsWith(stable)) return; // nothing new to process
         final ids = await engine.tokenIds(stable);
@@ -536,6 +539,7 @@ class AppState extends ChangeNotifier {
           _drafted = stable;
           return;
         }
+        if (cut == 0) return;
       }
     } on EngineException catch (e) {
       _log('Draft not prepared: $e');
@@ -576,7 +580,10 @@ class AppState extends ChangeNotifier {
     generating = true;
     _draftTimer?.cancel();
     _drafted = '';
-    final promptUser = '$text\n\n${nowLine(DateTime.now())}';
+    _draftTime = null;
+    // The time line leads the turn, fixed when the draft began, so typing
+    // ahead processes it too (its digits are a token each).
+    final promptUser = '${nowLine(_draftTime ?? DateTime.now())}\n$text';
     final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser);
     messages.add(message); // shown at once, also while the model wakes up
     notifyListeners();
@@ -688,6 +695,7 @@ class AppState extends ChangeNotifier {
     if (generating) return;
     messages.clear();
     _drafted = '';
+    _draftTime = null;
     _historyStart = 0;
     unawaited(_discardConversation());
     notifyListeners();
