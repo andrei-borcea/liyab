@@ -332,9 +332,15 @@ float PowerManager::pressure_locked(const ThermalSample& s) const {
     float p = 0.0f;
     if (headroom_ema_) p = std::clamp((*headroom_ema_ - t.ramp_start) / (t.ramp_end - t.ramp_start), 0.0f, 1.0f);
     // Guards: the status at which the OS itself limits us (per profile), the
-    // skin threshold, and the SoC's emergency temperature.
+    // skin threshold, and the SoC's emergency temperature. With a forecast,
+    // the OS already weighs the device maker's calibrated skin and SoC
+    // sensors, so the sysfs "skin" reading (often a board thermistor near the
+    // SoC: xo-therm reads 45-50 °C under load on a Snapdragon 8 Elite) only
+    // guards emergencies, kSkinEmergencyMargin above the threshold: as a
+    // plain threshold it throttled every token of a phone the OS rated cool.
     const ThermalStatus limit = t.os_limit;
-    if ((s.status != ThermalStatus::Unknown && s.status >= limit) || (s.skin_c && *s.skin_c >= config_.skin_threshold_c) ||
+    const float skin_limit = config_.skin_threshold_c + (headroom_ema_ ? kSkinEmergencyMargin : 0.0f);
+    if ((s.status != ThermalStatus::Unknown && s.status >= limit) || (s.skin_c && *s.skin_c >= skin_limit) ||
         (s.soc_c && *s.soc_c >= config_.soc_threshold_c)) {
         p = 1.0f;
     }

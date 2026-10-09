@@ -131,7 +131,9 @@ This README describes what the code does today. Anything not implemented is list
   at lower clocks, for fewer watts. At pressure 1, at the profile's OS-status limit, above the skin threshold (40 °C
   by default) or with the SoC past its 95 °C emergency limit, it reroutes GPU work to the NPU/CPU, halves the active
   threads and halves the token rate (8 tok/s when unpaced). A SoC at 85–90 °C is normal under load on a flagship and
-  no longer throttles by itself; the forecast decides. While pacing on Android 13+, the decode threads report each
+  no longer throttles by itself; the forecast decides. With a forecast the sysfs "skin" reading is an emergency
+guard only, 8 °C above the threshold: on many phones it is a board thermistor near the SoC (xo-therm reads
+45–50 °C under load), and as a plain threshold it throttled every token of a phone Android rated cool. While pacing on Android 13+, the decode threads report each
   token's work time to a performance-hint session (ADPF, `APerformanceHint_*`) with the token period as its target,
   so the CPU governor runs just fast enough for the rate instead of sprinting and sleeping. Unpaced decoding opens no
   session. Without a forecast (iOS, older Android) the status and temperature guards apply.

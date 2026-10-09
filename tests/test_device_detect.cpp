@@ -209,6 +209,21 @@ TEST_CASE("PowerManager sheds cores gradually on the headroom forecast") {
     CHECK(pm.policy().throttled);
 }
 
+TEST_CASE("With a headroom forecast the skin reading only guards emergencies") {
+    ThermalSample sample;
+    PowerConfig config;
+    config.profile = PowerProfile::Performance;
+    config.skin_threshold_c = 40.0f;
+    PowerManager pm(config, [&] { return sample; });
+    sample.headroom = 0.3f;  // the OS rates the phone cool
+    sample.skin_c = 45.0f;   // a board thermistor near the SoC, above the threshold
+    pm.poll_once();
+    CHECK(!pm.policy().throttled);
+    sample.skin_c = 48.5f;  // past the emergency margin
+    pm.poll_once();
+    CHECK(pm.policy().throttled);
+}
+
 TEST_CASE("Cooler profiles react earlier and slow tokens down before throttling") {
     ThermalSample sample;
     PowerConfig config;

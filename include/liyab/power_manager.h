@@ -127,6 +127,8 @@ private:
     void poll_loop();
     // 0 (no thermal pressure) .. 1 (throttle), from the smoothed headroom
     // forecast and the status / temperature guards.
+    // With a headroom forecast, the skin guard is an emergency this far above the threshold (°C).
+    static constexpr float kSkinEmergencyMargin = 8.0f;
     [[nodiscard]] float pressure_locked(const ThermalSample& sample) const;
 
     mutable std::mutex mutex_;
