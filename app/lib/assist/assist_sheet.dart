@@ -24,10 +24,10 @@ class AssistMode extends ValueNotifier<bool> {
 
   static const _channel = MethodChannel('liyab/assist');
 
-  Future<void> close() async {
-    value = false;
-    await _channel.invokeMethod<void>('close');
-  }
+  /// Finishes the sheet's window. The mode turns off on 'closed' (the window's
+  /// onPause), not here: switching now would draw the app's chat in the
+  /// see-through window for the moment before it disappears.
+  Future<void> close() => _channel.invokeMethod<void>('close');
 }
 
 class AssistSheet extends StatefulWidget {
