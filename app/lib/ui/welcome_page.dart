@@ -51,7 +51,7 @@ class _WelcomePageState extends State<WelcomePage> {
           const SizedBox(height: 8),
           Text('Liyab', style: theme.textTheme.headlineMedium?.copyWith(fontSize: 44), textAlign: TextAlign.center),
           const SizedBox(height: 4),
-          Text('Your assistant, on your phone.', style: muted, textAlign: TextAlign.center),
+          Text("Let's ignite your silicon.", style: muted, textAlign: TextAlign.center),
           const SizedBox(height: 36),
           point(Icons.lock_outline_rounded, 'Private by design',
               'The model runs on this phone. What you write and what it answers never leave it.'),
