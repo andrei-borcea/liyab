@@ -449,10 +449,13 @@ are called directly because the C API makes them thread-safe.
 * **Assistant sheet.** Liyab can be the default digital assistant (Settings → Assistant opens the system's
   default-apps page; Android does not let apps request that role with a dialog). The assist gesture (holding the
   power or home button) then starts `AssistActivity` through `ACTION_ASSIST`: a see-through window over the
-  current app where a sheet rises with the living flame, a text field and the streamed answer; tapping outside
-  closes it and "Continue in Liyab" opens the conversation in the app. Both windows share one Flutter engine
-  (`LiyabEngine`, created by the first activity, not at process start, so download jobs never load a model), so
-  the sheet uses the model already loaded instead of loading a second copy.
+  current app where a sheet rises with the living flame, a text field and the latest answer. It expands in place
+  (button, or dragging its handle up) into a full-height conversation, still over that app, as Gemini's overlay
+  does; tapping outside or closing returns to the app. Both windows share one Flutter engine (`LiyabEngine`,
+  created by the first activity, not at process start, so download jobs never load a model), so the sheet uses the
+  model already loaded instead of loading a second copy. Since one engine draws into one surface and keeps one
+  lifecycle state, only the window in front reports lifecycle states and takes the surface back when it returns,
+  and the sheet releases it as soon as it pauses (otherwise the app window went black after the sheet).
 * **Chat.** Replies stream token by token, with the model's reasoning folded under a "Reasoning" line. The history
   is cut by the context's token budget (counted with the model's tokenizer), not by a fixed number of turns, and
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system

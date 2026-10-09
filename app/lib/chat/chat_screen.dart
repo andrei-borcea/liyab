@@ -121,7 +121,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     controller: _scroll,
                     padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
                     itemCount: app.messages.length,
-                    itemBuilder: (context, i) => _MessageView(message: app.messages[i]),
+                    itemBuilder: (context, i) => MessageView(message: app.messages[i]),
                   ),
           ),
         ),
@@ -202,8 +202,9 @@ class _EmptyChat extends StatelessWidget {
   }
 }
 
-class _MessageView extends StatelessWidget {
-  const _MessageView({required this.message});
+/// One exchange: the user's message as a pill, then the reply (and its reasoning) as text.
+class MessageView extends StatelessWidget {
+  const MessageView({super.key, required this.message});
   final ChatMessage message;
 
   @override

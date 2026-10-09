@@ -1,9 +1,12 @@
 // The assistant sheet: what the system assist gesture opens over any app.
-// A see-through window whose sheet rises from the bottom with the living flame;
-// the conversation is the app's own, so "Continue in Liyab" picks it up there.
+// It rises from the bottom with the living flame and the latest answer, and
+// expands in place into a full-height conversation, still over the app the
+// user was in (as Gemini's overlay does); closing returns to that app. The
+// full Liyab app is never opened from here.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../chat/chat_screen.dart';
 import '../state/app_state.dart';
 import '../ui/living_flame.dart';
 import '../ui/theme.dart';
@@ -23,11 +26,6 @@ class AssistMode extends ValueNotifier<bool> {
     value = false;
     await _channel.invokeMethod<void>('close');
   }
-
-  Future<void> openApp() async {
-    value = false;
-    await _channel.invokeMethod<void>('openApp');
-  }
 }
 
 class AssistSheet extends StatefulWidget {
@@ -41,15 +39,18 @@ class AssistSheet extends StatefulWidget {
 
 class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStateMixin {
   final _input = TextEditingController();
+  final _scroll = ScrollController();
   late final AnimationController _rise =
       AnimationController(vsync: this, duration: const Duration(milliseconds: 380))..forward();
   late final int _firstMessage = widget.app.messages.length; // the sheet shows only what was asked here
+  bool _expanded = false;
 
   AppState get app => widget.app;
 
   @override
   void dispose() {
     _input.dispose();
+    _scroll.dispose();
     _rise.dispose();
     super.dispose();
   }
@@ -67,18 +68,33 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
     app.send(t);
   }
 
+  void _setExpanded(bool v) {
+    HapticFeedback.selectionClick();
+    setState(() => _expanded = v);
+  }
+
+  List<ChatMessage> get _asked =>
+      app.messages.length > _firstMessage ? app.messages.sublist(_firstMessage) : const <ChatMessage>[];
+
+  FlameState get _flame {
+    final last = _asked.isEmpty ? null : _asked.last;
+    if (app.loading) return FlameState.thinking;
+    if (!app.generating || last == null) return FlameState.resting;
+    return last.raw.isEmpty || last.thinkingNow ? FlameState.thinking : FlameState.answering;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final height = MediaQuery.sizeOf(context).height;
     return Scaffold(
       backgroundColor: Colors.transparent,
       resizeToAvoidBottomInset: true,
       body: Stack(children: [
-        // Tapping outside the sheet dismisses it, like a system sheet.
+        // Outside the sheet: a dim layer that closes it (compact only).
         Positioned.fill(
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
-            onTap: _close,
+            onTap: _expanded ? null : _close,
             child: FadeTransition(
               opacity: CurvedAnimation(parent: _rise, curve: Curves.easeOut),
               child: const ColoredBox(color: Color(0x66000000)),
@@ -92,7 +108,25 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
                 .animate(CurvedAnimation(parent: _rise, curve: Curves.easeOutCubic)),
             child: ListenableBuilder(
               listenable: Listenable.merge([app, app.monitor]),
-              builder: (context, _) => _sheet(theme),
+              builder: (context, _) => AnimatedContainer(
+                duration: const Duration(milliseconds: 360),
+                curve: Curves.easeOutCubic,
+                // Constraints animate (a null height cannot): compact fits its
+                // content up to 60 % of the screen, expanded fills it.
+                constraints: _expanded
+                    ? BoxConstraints.tightFor(height: height)
+                    : BoxConstraints(maxHeight: height * 0.6),
+                decoration: BoxDecoration(
+                  color: Palette.kiln,
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(_expanded ? 0 : 28)),
+                  boxShadow: const [BoxShadow(color: Color(0x55FF7A3D), blurRadius: 60, spreadRadius: -10)],
+                ),
+                child: SafeArea(
+                  top: _expanded,
+                  minimum: const EdgeInsets.fromLTRB(14, 6, 14, 12),
+                  child: _expanded ? _full(context) : _compact(context),
+                ),
+              ),
             ),
           ),
         ),
@@ -100,124 +134,137 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
     );
   }
 
-  Widget _sheet(ThemeData theme) {
-    final asked = app.messages.length > _firstMessage ? app.messages.sublist(_firstMessage) : const <ChatMessage>[];
-    final last = asked.isEmpty ? null : asked.last;
-    final flame = !app.generating || last == null
-        ? (app.loading ? FlameState.thinking : FlameState.resting)
-        : (last.raw.isEmpty || last.thinkingNow ? FlameState.thinking : FlameState.answering);
+  /// The drag handle: up expands, down collapses or closes.
+  Widget _handle() => GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onVerticalDragEnd: (d) {
+          final v = d.primaryVelocity ?? 0;
+          if (v < -200) _setExpanded(true);
+          if (v > 200) _expanded ? _setExpanded(false) : _close();
+        },
+        onTap: () => _setExpanded(!_expanded),
+        child: Center(
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 8),
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(color: Palette.hairline, borderRadius: BorderRadius.circular(2)),
+          ),
+        ),
+      );
+
+  Widget _header(ThemeData theme, {required String title}) {
     final ready = app.modelPath != null && !app.loading;
-    return Stack(clipBehavior: Clip.none, children: [
-      // The flame's glow above the sheet.
-      Positioned(
-        left: 0,
-        right: 0,
-        top: -70,
-        height: 70,
-        child: IgnorePointer(
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: RadialGradient(
-                center: Alignment.bottomCenter,
-                radius: 1.4,
-                colors: [Palette.ember.withValues(alpha: app.generating ? 0.5 : 0.25), Palette.ember.withValues(alpha: 0)],
-              ),
+    return Row(children: [
+      LivingFlame(size: 42, state: _flame, heat: app.monitor.heat),
+      const SizedBox(width: 10),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title, style: theme.textTheme.titleLarge, maxLines: 2, overflow: TextOverflow.ellipsis),
+          Text(ready ? 'On this phone. Nothing leaves it.' : app.status,
+              style: theme.textTheme.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ]),
+      ),
+      IconButton(
+        tooltip: _expanded ? 'Collapse' : 'Expand',
+        icon: Icon(_expanded ? Icons.close_fullscreen_rounded : Icons.open_in_full_rounded),
+        onPressed: () => _setExpanded(!_expanded),
+      ),
+      IconButton(tooltip: 'Close', icon: const Icon(Icons.close_rounded), onPressed: _close),
+    ]);
+  }
+
+  Widget _compact(BuildContext context) {
+    final theme = Theme.of(context);
+    final last = _asked.isEmpty ? null : _asked.last;
+    final ready = app.modelPath != null && !app.loading;
+    final title = last?.user ?? (ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'No model loaded'));
+    return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _handle(),
+      _header(theme, title: title),
+      if (last != null)
+        Flexible(
+          child: SingleChildScrollView(
+            reverse: true,
+            padding: const EdgeInsets.only(top: 10, bottom: 4),
+            child: Text(
+              last.answer.isNotEmpty
+                  ? last.answer
+                  : (last.thinkingNow ? 'Thinking…' : (last.error != null ? 'The reply stopped: ${last.error}' : '')),
+              style: theme.textTheme.bodyLarge,
             ),
           ),
         ),
-      ),
-      Container(
-        width: double.infinity,
-        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.75),
-        decoration: const BoxDecoration(
-          color: Palette.kiln,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-        ),
-        child: SafeArea(
-          top: false,
-          minimum: const EdgeInsets.fromLTRB(18, 16, 18, 14),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            Row(children: [
-              LivingFlame(size: 44, state: flame, heat: app.monitor.heat),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(
-                    last == null ? (ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'No model loaded')) : last.user,
-                    style: theme.textTheme.titleLarge,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Text(
-                    ready ? 'On this phone. Nothing leaves it.' : app.status,
-                    style: theme.textTheme.labelSmall,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ]),
-              ),
-              IconButton(
-                tooltip: 'Continue in Liyab',
-                icon: const Icon(Icons.open_in_full_rounded),
-                onPressed: widget.mode.openApp,
-              ),
-            ]),
-            if (last != null)
-              Flexible(
-                child: SingleChildScrollView(
-                  reverse: true,
-                  padding: const EdgeInsets.only(top: 12, bottom: 4),
-                  child: Text(
-                    last.answer.isNotEmpty
-                        ? last.answer
-                        : (last.thinkingNow ? 'Thinking…' : (last.error != null ? 'The reply stopped: ${last.error}' : '')),
-                    style: theme.textTheme.bodyLarge,
-                  ),
-                ),
-              ),
-            if (last == null && ready) ...[
-              const SizedBox(height: 12),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                for (final s in const ['Summarize what I paste', 'Draft a short reply', 'Explain a word'])
-                  ActionChip(
-                    label: Text(s),
-                    onPressed: () => _input.text = '$s: ',
-                    backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                    side: BorderSide(color: theme.colorScheme.outline),
-                    shape: const StadiumBorder(),
-                  ),
-              ]),
-            ],
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.fromLTRB(16, 2, 6, 2),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(26),
-              ),
-              child: Row(children: [
-                Expanded(
-                  child: TextField(
-                    controller: _input,
-                    enabled: ready,
-                    autofocus: ready,
-                    minLines: 1,
-                    maxLines: 4,
-                    textCapitalization: TextCapitalization.sentences,
-                    decoration: const InputDecoration(hintText: 'Ask Liyab', border: InputBorder.none, isDense: true),
-                    onSubmitted: ready && !app.generating ? (_) => _send() : null,
-                  ),
-                ),
-                IconButton(
-                  tooltip: app.generating ? 'Stop' : 'Send',
-                  onPressed: !ready ? null : (app.generating ? app.stop : _send),
-                  icon: Icon(app.generating ? Icons.stop_rounded : Icons.arrow_upward_rounded, color: Palette.ember),
-                ),
-              ]),
+      if (last == null && ready) ...[
+        const SizedBox(height: 10),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final s in const ['Summarize what I paste', 'Draft a short reply', 'Explain a word'])
+            ActionChip(
+              label: Text(s),
+              onPressed: () => _input.text = '$s: ',
+              backgroundColor: theme.colorScheme.surfaceContainerHighest,
+              side: BorderSide(color: theme.colorScheme.outline),
+              shape: const StadiumBorder(),
             ),
-          ]),
-        ),
-      ),
+        ]),
+      ],
+      const SizedBox(height: 12),
+      _composer(theme),
     ]);
+  }
+
+  Widget _full(BuildContext context) {
+    final theme = Theme.of(context);
+    final asked = _asked;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients && _scroll.position.extentAfter < 120) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    });
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _handle(),
+      _header(theme, title: 'Liyab'),
+      Expanded(
+        child: asked.isEmpty
+            ? Center(
+                child: Text('Ask anything. The conversation stays on this phone.',
+                    style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                    textAlign: TextAlign.center),
+              )
+            : ListView.builder(
+                controller: _scroll,
+                padding: const EdgeInsets.fromLTRB(4, 4, 4, 16),
+                itemCount: asked.length,
+                itemBuilder: (context, i) => MessageView(message: asked[i]),
+              ),
+      ),
+      const SizedBox(height: 8),
+      _composer(theme),
+    ]);
+  }
+
+  Widget _composer(ThemeData theme) {
+    final ready = app.modelPath != null && !app.loading;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 2, 6, 2),
+      decoration: BoxDecoration(color: theme.colorScheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(26)),
+      child: Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _input,
+            enabled: ready,
+            autofocus: ready && _asked.isEmpty,
+            minLines: 1,
+            maxLines: 4,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: const InputDecoration(hintText: 'Ask Liyab', border: InputBorder.none, isDense: true),
+            onSubmitted: ready && !app.generating ? (_) => _send() : null,
+          ),
+        ),
+        IconButton(
+          tooltip: app.generating ? 'Stop' : 'Send',
+          onPressed: !ready ? null : (app.generating ? app.stop : _send),
+          icon: Icon(app.generating ? Icons.stop_rounded : Icons.arrow_upward_rounded, color: Palette.ember),
+        ),
+      ]),
+    );
   }
 }
