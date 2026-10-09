@@ -76,6 +76,12 @@ public:
     // Halves every use counter (call once per generated token): old
     // popularity fades so the cache follows the conversation.
     void age();
+    // Empties the cache and returns its pages to the OS, e.g. while the app
+    // sits in the background: queued guesses are dropped, reads in flight and
+    // pinned experts are waited for. The arena stays allocated; its pages
+    // come back as experts load again. Returns the bytes of cached experts
+    // released.
+    size_t trim();
 
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] size_t capacity_bytes() const noexcept { return slot_bytes_ * slots_.size(); }
@@ -123,6 +129,7 @@ private:
 
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;
+    bool locked_ = false;  // mlock succeeded (until trim() unlocks it)
     std::vector<Slot> slots_;
     std::vector<Entry> entries_;
 

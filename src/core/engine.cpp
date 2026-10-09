@@ -551,6 +551,16 @@ Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bo
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
 
+size_t Engine::trim_memory() {
+    size_t released = 0;
+    if (ExpertStore* store = impl_->target->expert_store()) released += store->trim();
+    if (impl_->draft) {
+        if (ExpertStore* store = impl_->draft->expert_store()) released += store->trim();
+    }
+    if (released > 0) LIYAB_LOG_INFO("trimmed %.2f GiB of cached experts", released / (1024.0 * 1024.0 * 1024.0));
+    return released;
+}
+
 Engine::Counters Engine::counters() const {
     Counters c;
     if (impl_->gpu) c.accelerator_busy_ms = impl_->gpu->busy_ms();

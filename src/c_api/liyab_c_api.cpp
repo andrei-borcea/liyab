@@ -350,6 +350,17 @@ liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path) {
     }
 }
 
+liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t* out_bytes) {
+    if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const size_t released = engine->engine->trim_memory();
+        if (out_bytes != nullptr) *out_bytes = released;
+        return LIYAB_OK;
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
 liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens) {
     if (engine == nullptr || path == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {

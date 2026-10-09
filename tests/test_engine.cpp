@@ -1023,6 +1023,19 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
                 static_cast<double>(st.bytes_read) / (1024.0 * 1024.0));
     CHECK(st.loads > b->expert_store()->entries());  // evictions happened
     CHECK(st.hits + st.late > 0);                     // predictions were used
+
+    // trim() empties the cache; the experts are read again and the output is unchanged.
+    CHECK(b->expert_store()->trim() > 0);
+    CHECK(b->expert_store()->trim() == 0);  // nothing left to release
+    b->reset();
+    std::vector<float> after_trim;
+    for (const int32_t t : tokens) {
+        auto r = b->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(r.has_value());
+        after_trim.insert(after_trim.end(), r->begin(), r->end());
+    }
+    CHECK(max_abs_diff(after_trim, stepwise_ref) == 0.0f);
+    CHECK(b->expert_store()->stats().loads > st.loads);
 }
 
 TEST_CASE("Expert streaming with requant_bits converts the resident Q8_0 matrices and stays close") {

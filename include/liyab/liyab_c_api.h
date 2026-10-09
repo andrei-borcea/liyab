@@ -238,6 +238,12 @@ LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
  * to *out_tokens (may be NULL). See Engine::save_state / load_state. */
 LIYAB_C_API liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path);
 LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens);
+/* Gives memory back to the OS while the engine is idle (an app in the
+ * background): empties the MoE expert cache; the model and its context stay
+ * loaded, and the next generation refills the cache from storage. Writes the
+ * bytes released to *out_bytes (may be NULL; 0 for models without streamed
+ * experts). Not while a generation runs on the engine. See Engine::trim_memory. */
+LIYAB_C_API liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t* out_bytes);
 
 /* Live counters for monitoring UIs, cumulative since creation: sample them
  * periodically and divide deltas by the elapsed time. Thread-safe (may be

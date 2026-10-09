@@ -61,7 +61,7 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
     s->arena_ = static_cast<uint8_t*>(arena);
     // Best effort: locked pages are never swapped or compressed (Android
     // usually caps RLIMIT_MEMLOCK, in which case the cache stays pageable).
-    const bool locked = mlock(s->arena_, s->arena_bytes_) == 0;
+    s->locked_ = mlock(s->arena_, s->arena_bytes_) == 0;
     s->slots_.resize(n_slots);
     s->entries_.resize(total_entries);
 
@@ -76,7 +76,7 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
                    static_cast<double>(s->arena_bytes_) / (1024.0 * 1024.0 * 1024.0),
                    100.0 * static_cast<double>(n_slots) / static_cast<double>(total_entries),
                    static_cast<double>(s->expert_bytes_total_) / (1024.0 * 1024.0 * 1024.0),
-                   locked ? ", locked in RAM" : "");
+                   s->locked_ ? ", locked in RAM" : "");
     return s;
 }
 
@@ -89,7 +89,7 @@ ExpertStore::~ExpertStore() {
     ready_cv_.notify_all();
     for (std::thread& t : io_threads_) t.join();
     if (arena_ != nullptr) {
-        munlock(arena_, arena_bytes_);
+        if (locked_) munlock(arena_, arena_bytes_);
         std::free(arena_);
     }
 }
@@ -301,6 +301,44 @@ void ExpertStore::release(int32_t layer, int32_t expert) {
 void ExpertStore::age() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (Entry& e : entries_) e.uses *= 0.5f;
+}
+
+size_t ExpertStore::trim() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (const int32_t key : queue_) {
+        Entry& e = entries_[static_cast<size_t>(key)];
+        if (e.state == State::Queued) e.state = State::Empty;
+    }
+    queue_.clear();
+    ready_cv_.wait(lock, [this] {
+        if (stop_) return true;
+        if (!parts_.empty()) return false;
+        return std::none_of(entries_.begin(), entries_.end(),
+                            [](const Entry& e) { return e.state == State::Loading || e.pins > 0; });
+    });
+    size_t released = 0;
+    for (Slot& slot : slots_) {
+        if (slot.entry < 0) continue;
+        Entry& e = entries_[static_cast<size_t>(slot.entry)];
+        e.state = State::Empty;
+        e.slot = -1;
+        e.untouched = false;
+        e.uses = 0.0f;
+        slot.entry = -1;
+        released += slot_bytes_;
+    }
+    // Locked pages cannot be dropped; the cache stays pageable from now on
+    // (re-locking would fault the whole arena back in).
+    if (locked_) {
+        munlock(arena_, arena_bytes_);
+        locked_ = false;
+    }
+#if defined(__linux__)
+    // Private anonymous pages: freed at once, and read back as zeros (then
+    // overwritten by the next expert read) when touched again.
+    madvise(arena_, arena_bytes_, MADV_DONTNEED);
+#endif
+    return released;
 }
 
 ExpertStore::Stats ExpertStore::stats() const {

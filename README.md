@@ -332,6 +332,12 @@ the tokenization it was generated with. The two snapshots cost 2 × the recurren
 Qwen3.6-35B-A3B), set aside from the expert cache budget. On the phone, Qwen3.6-35B-A3B's first token went from 13–16 s per
 message (whole conversation reprocessed) to 3.2 s for the first message and ~6 s for later ones.
 
+`Engine::trim_memory()` (C ABI: `liyab_engine_trim_memory`) gives memory back while the engine is idle: it empties
+the MoE expert cache and returns its pages to the OS; the model and its context stay loaded. On the phone,
+Qwen3.6-35B-A3B with a 4000 MiB budget went from 3.09 GB resident after two answers to 2.18 GB; the next answer
+decoded at 6.13 tok/s instead of 6.43 (first token 272 ms instead of 177) while the cache refilled, and the one after
+at full speed.
+
 ### C ABI (`liyab_c_api.h`)
 
 ```c
@@ -518,8 +524,9 @@ are called directly because the C API makes them thread-safe.
   idle release per device; the permissions Liyab uses and why (notifications only; no storage permission: models live in app
   storage and imports go through the system picker).
 * **Idle release.** A loaded model keeps several GB while Liyab sits in the background, and the process outlives
-  its window (the notification listener keeps it running). After 5 minutes hidden (1, 15, 60 minutes or never in
-  Settings) the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
+  its window (the notification listener keeps it running). After a minute hidden the expert cache is emptied
+  (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the default budget; the model stays loaded, so the assistant still
+  answers at once). After 5 minutes hidden (1, 15, 60 minutes or never in Settings) the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
   with the chat kept and the system prompt restored from its saved state.
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal

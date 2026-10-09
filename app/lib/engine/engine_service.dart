@@ -204,6 +204,9 @@ class EngineService {
   /// Restores a context saveState() wrote for this model; the tokens restored.
   Future<int> loadState(String path) => _call<int>(['loadState', path]);
 
+  /// Empties the engine's expert cache (the model stays loaded); the bytes released.
+  Future<int> trimMemory() => _call<int>(['trim']);
+
   /// Streams the reply to `prompt` (already chat-formatted).
   Stream<GenerationEvent> generate(String prompt, SamplingOptions s) {
     final id = _nextId++;
@@ -315,6 +318,12 @@ void _worker(SendPort replies) {
             lib.loadState(engine, (m[2] as String).toNativeUtf8(allocator: arena), n) == LiyabStatus.ok
                 ? replies.send(['ok', id, n.value])
                 : fail();
+          });
+        case 'trim':
+          if (engine.address == 0) return replies.send(['ok', id, 0]);
+          using((arena) {
+            final n = arena<Uint64>();
+            lib.trimMemory(engine, n) == LiyabStatus.ok ? replies.send(['ok', id, n.value]) : fail();
           });
         case 'generate':
           if (engine.address == 0) return fail('no model loaded');

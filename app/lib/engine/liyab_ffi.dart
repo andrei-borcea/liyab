@@ -232,6 +232,8 @@ final class LiyabLib {
             'liyab_engine_save_state'),
         loadState = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>),
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>)>('liyab_engine_load_state'),
+        trimMemory = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint64>),
+            int Function(Pointer<Void>, Pointer<Uint64>)>('liyab_engine_trim_memory'),
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
             'liyab_supported_architectures'),
         getCounters = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabEngineCounters>),
@@ -262,6 +264,7 @@ final class LiyabLib {
   final int Function(Pointer<Utf8>, int) supportedArchitectures;
   final int Function(Pointer<Void>, Pointer<Utf8>) saveState;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
+  final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
   final void Function(int) logBufferEnable;
   final int Function(Pointer<Utf8>, int) logBufferTake;
 

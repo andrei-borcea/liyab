@@ -90,16 +90,33 @@ class AppState extends ChangeNotifier {
 
   // Idle release: a loaded model holds its memory (GBs) while Liyab sits in
   // the background, and the process outlives the window (the notification
-  // listener keeps it). After device.releaseAfterMinutes hidden, the model is
-  // unloaded; it loads again, chat kept, as soon as Liyab is back on screen.
+  // listener keeps it). After a minute hidden the expert cache is emptied
+  // (2.4 GB on a 35B MoE; the model stays loaded, so the assistant answers at
+  // once, only its first tokens are slower); after device.releaseAfterMinutes
+  // the model is unloaded, and loads again, chat kept, once Liyab is back.
   late final AppLifecycleListener _lifecycle;
+  Timer? _trimTimer;
   Timer? _releaseTimer;
   String? _released; // the model unloaded while idle
 
+  static const _trimAfter = Duration(minutes: 1);
+
   void _scheduleRelease() {
+    _trimTimer?.cancel();
     _releaseTimer?.cancel();
+    _trimTimer = Timer(_trimAfter, _trimIdle);
     final minutes = device.releaseAfterMinutes;
     if (minutes > 0) _releaseTimer = Timer(Duration(minutes: minutes), _releaseIdle);
+  }
+
+  Future<void> _trimIdle() async {
+    if (!engine.loaded) return;
+    if (generating || loading) {
+      _trimTimer = Timer(_trimAfter, _trimIdle); // busy: try again later
+      return;
+    }
+    final bytes = await engine.trimMemory();
+    if (bytes > 0) _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in the background');
   }
 
   Future<void> _releaseIdle() async {
@@ -117,11 +134,13 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _lifecycle.dispose();
+    _trimTimer?.cancel();
     _releaseTimer?.cancel();
     super.dispose();
   }
 
   void _backOnScreen() {
+    _trimTimer?.cancel();
     _releaseTimer?.cancel();
     final path = _released;
     _released = null;

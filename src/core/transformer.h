@@ -154,6 +154,7 @@ public:
     // Routed-expert streaming (MoE models larger than RAM); nullptr when the
     // experts are read in place from the mapping.
     [[nodiscard]] const ExpertStore* expert_store() const noexcept { return expert_store_.get(); }
+    [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
