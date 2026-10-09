@@ -527,7 +527,8 @@ are called directly because the C API makes them thread-safe.
   (`kill_bg_proc`), and the process outlives its window anyway (the notification listener keeps it running). So the
   moment Liyab is hidden it parks: the expert cache is emptied (`trim_memory`: 2.4 GB on Qwen3.6-35B-A3B at the
   default budget; the model stays loaded and answers at once) and the conversation is saved in app storage, its
-  messages and the engine's context (`save_state`). If the OS stops Liyab anyway, the next start brings the
+  messages and the engine's context (`save_state`, ~200 MB on that model; the messages alone are also saved after
+  every reply, since the OS may stop Liyab while a reply finishes in the background). If the OS stops Liyab anyway, the next start brings the
   conversation back, context included, so it is not processed again. After 5 minutes hidden (1, 15, 60 minutes or
   never in Settings) the model is unloaded as well; it loads again as soon as Liyab is on screen, the app or the
   assistant sheet. A message sent meanwhile shows at once and waits for the model, and while it loads the flame

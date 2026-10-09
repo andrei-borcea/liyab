@@ -144,12 +144,15 @@ class AppState extends ChangeNotifier {
     _parkRetry?.cancel();
     if (!_away || !engine.loaded) return;
     if (generating || loading) {
-      _parkRetry = Timer(const Duration(seconds: 5), _park); // a reply still finishing: soon after
+      _log('In the background while ${generating ? 'answering' : 'loading'}: parking once done');
+      _parkRetry = Timer(const Duration(seconds: 5), _park);
       return;
     }
+    final watch = Stopwatch()..start();
     final bytes = await engine.trimMemory();
-    if (bytes > 0) _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in the background');
-    await _saveConversation();
+    _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in ${watch.elapsedMilliseconds} ms');
+    await _saveConversation(withContext: true);
+    if (messages.isNotEmpty) _log('Conversation saved in ${watch.elapsedMilliseconds} ms');
   }
 
   Future<void> _releaseIdle() async {
@@ -160,7 +163,7 @@ class AppState extends ChangeNotifier {
       return;
     }
     _released = path; // set first: coming back during the unload reloads it (commands run in order)
-    await _saveConversation();
+    await _saveConversation(withContext: true);
     _prepared = null;
     await engine.unload();
     if (_released != path) return; // back on screen meanwhile: already reloading
@@ -322,15 +325,20 @@ class AppState extends ChangeNotifier {
     return ('${dir.path}/$modelName.conversation.state', '${dir.path}/$modelName.conversation.json');
   }
 
-  /// Saves the conversation (removes it when there is none). Between generations only.
-  Future<void> _saveConversation() async {
+  /// Saves the conversation (removes it when there is none): the messages,
+  /// and with `withContext` the engine's context (KV pages and recurrent
+  /// states, ~200 MB on a 35B MoE: written when parking, not after every
+  /// reply). A context older than the messages is still a prefix of the next
+  /// prompt, so it only saves less work. Between generations only.
+  Future<void> _saveConversation({bool withContext = false}) async {
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty) return _discardConversation();
+    await File(chat).writeAsString(jsonEncode([for (final m in messages) m.toJson()]));
+    if (!withContext) return;
     try {
       await engine.saveState(state);
-      await File(chat).writeAsString(jsonEncode([for (final m in messages) m.toJson()]));
     } on EngineException catch (e) {
-      _log('Conversation not saved: $e');
+      _log('Conversation context not saved: $e');
     }
   }
 
@@ -508,6 +516,8 @@ class AppState extends ChangeNotifier {
       message.streaming = false;
       generating = false;
       notifyListeners();
+      // The OS may stop Liyab at any time in the background: the messages are on disk after every reply.
+      unawaited(_saveConversation());
     }
   }
 
