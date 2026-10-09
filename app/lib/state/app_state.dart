@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../chat/chat_template.dart';
 import '../engine/engine_service.dart';
 import '../engine/liyab_ffi.dart';
+import '../models/downloads.dart';
+import 'device_monitor.dart';
 import 'models_store.dart';
 import 'settings.dart';
 
@@ -48,12 +50,28 @@ class ChatMessage {
   bool get thinkingNow => streaming && reasoning != null && !raw.contains('</think>');
 }
 
+/// One line of the activity log.
+class LogLine {
+  LogLine(this.text, {this.engine = false}) : at = DateTime.now();
+  final DateTime at;
+  final String text;
+  final bool engine; // from libliyab's log (level letter first), else the app
+}
+
 class AppState extends ChangeNotifier {
-  AppState._(this.engine, this.prefs) : device = DeviceSettings(prefs);
+  AppState._(this.engine, this.prefs, this.downloads) : device = DeviceSettings(prefs) {
+    monitor = DeviceMonitor(engine, (lines) {
+      for (final l in lines) {
+        _log(l, engine: true);
+      }
+    });
+  }
 
   final EngineService engine;
   final SharedPreferences prefs;
   final DeviceSettings device;
+  final Downloads downloads;
+  late final DeviceMonitor monitor;
 
   String status = 'No model loaded';
   bool loading = false;
@@ -68,18 +86,47 @@ class AppState extends ChangeNotifier {
 
   /// Name of the model being moved into app storage, if any.
   String? moving;
-  final List<String> log = [];
+  final List<LogLine> log = [];
+
+  /// Whether the welcome screen was shown.
+  bool get welcomed => prefs.getBool('welcomed') ?? false;
+  set welcomed(bool v) {
+    prefs.setBool('welcomed', v);
+    notifyListeners();
+  }
 
   static Future<AppState> create() async {
-    final state = AppState._(await EngineService.start(), await SharedPreferences.getInstance());
+    LiyabLib.instance
+      ..setLogLevel(1) // info: loads, streaming, warnings
+      ..logBufferEnable(256 * 1024);
+    final state = AppState._(
+        await EngineService.start(), await SharedPreferences.getInstance(), await Downloads.start());
     final last = state.device.lastModel;
     if (last != null && File(last).existsSync()) unawaited(state.load(last));
     return state;
   }
 
-  void _log(String line) {
-    log.add(line);
-    if (log.length > 500) log.removeAt(0);
+  void _log(String line, {bool engine = false}) {
+    log.add(LogLine(line, engine: engine));
+    if (log.length > 1000) log.removeAt(0);
+  }
+
+  void clearLog() {
+    log.clear();
+    notifyListeners();
+  }
+
+  Future<void> unload() async {
+    if (loading || generating) return;
+    await engine.unload();
+    _log('Unloaded $modelName');
+    modelPath = null;
+    modelName = '';
+    description = '';
+    messages.clear();
+    status = 'No model loaded';
+    device.lastModel = null;
+    notifyListeners();
   }
 
   Future<void> load(String path) async {
@@ -158,6 +205,10 @@ class AppState extends ChangeNotifier {
     final message = ChatMessage(text, template.assistantPrefix(_thinking));
     messages.add(message);
     notifyListeners();
+    // Streaming redraws are batched (~15 a second): the engine runs on all but
+    // one core, and rebuilding the reply for every token would take CPU time
+    // from it.
+    var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
     try {
       await for (final event in engine.generate(
           prompt,
@@ -169,6 +220,9 @@ class AppState extends ChangeNotifier {
         switch (event) {
           case TextPiece(:final text):
             message.raw += text;
+            final now = DateTime.now();
+            if (now.difference(lastPaint) < const Duration(milliseconds: 66)) continue;
+            lastPaint = now;
           case GenerationDone(:final stats):
             message.stats = stats;
         }

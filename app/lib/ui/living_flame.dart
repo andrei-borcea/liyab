@@ -58,11 +58,11 @@ class _LivingFlameState extends State<LivingFlame> with SingleTickerProviderStat
     _last = elapsed;
     if (MediaQuery.maybeDisableAnimationsOf(context) ?? false) return;
     _t += dt;
-    // At rest the flame only breathes: ~24 frames a second are enough and
-    // keep the idle app from drawing at the display's full rate.
-    if (widget.state == FlameState.resting && _sparks.isEmpty && elapsed - _painted < const Duration(milliseconds: 42)) {
-      return;
-    }
+    // At rest the flame only breathes (~24 frames a second); while the model
+    // works ~30 are enough. The engine uses all but one core, so the UI should
+    // not draw at the display's full rate.
+    final interval = widget.state == FlameState.resting && _sparks.isEmpty ? 42 : 33;
+    if (elapsed - _painted < Duration(milliseconds: interval)) return;
     _painted = elapsed;
     setState(() {
       _voice += ((widget.state == FlameState.listening ? widget.voiceLevel : 0) - _voice) * 0.25;

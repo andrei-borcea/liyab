@@ -6,6 +6,7 @@ import 'chat/chat_screen.dart';
 import 'state/app_state.dart';
 import 'ui/living_flame.dart';
 import 'ui/theme.dart';
+import 'ui/welcome_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,9 +33,16 @@ class _LiyabAppState extends State<LiyabApp> {
         themeMode: ThemeMode.dark, // Liyab lives at night, by its own light
         home: FutureBuilder<AppState>(
           future: _app,
-          builder: (context, snap) => snap.hasData
-              ? ChatScreen(app: snap.data!)
-              : const Scaffold(body: Center(child: LivingFlame(size: 140, state: FlameState.thinking))),
+          builder: (context, snap) {
+            final app = snap.data;
+            if (app == null) {
+              return const Scaffold(body: Center(child: LivingFlame(size: 140, state: FlameState.thinking)));
+            }
+            return ListenableBuilder(
+              listenable: app,
+              builder: (context, _) => app.welcomed ? ChatScreen(app: app) : WelcomePage(app: app),
+            );
+          },
         ),
       );
 }

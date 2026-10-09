@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <new>
 #include <string>
 
@@ -97,6 +98,24 @@ liyab::TokenCallback wrap(liyab_token_callback callback, void* user_data) {
     };
 }
 
+// liyab_log_buffer_*: messages kept for UIs that poll.
+std::mutex g_log_mutex;
+std::string g_log;
+size_t g_log_cap = 0;
+
+void buffer_sink(int level, const char* message, void*) {
+    static constexpr char kLetters[] = {'D', 'I', 'W', 'E'};
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log += kLetters[std::clamp(level, 0, 3)];
+    g_log += ' ';
+    g_log += message;
+    g_log += '\n';
+    if (g_log.size() > g_log_cap) {  // drop whole lines from the front
+        const size_t cut = g_log.find('\n', g_log.size() - g_log_cap);
+        g_log.erase(0, cut == std::string::npos ? g_log.size() : cut + 1);
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -111,6 +130,31 @@ void liyab_set_log_level(int32_t level) {
 
 void liyab_set_log_callback(liyab_log_callback callback, void* user_data) {
     liyab::log::set_sink(reinterpret_cast<liyab::log::Sink>(callback), user_data);
+}
+
+void liyab_log_buffer_enable(size_t max_bytes) {
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        g_log_cap = max_bytes;
+        g_log.clear();
+    }
+    liyab::log::set_sink(max_bytes > 0 ? buffer_sink : nullptr, nullptr);
+}
+
+size_t liyab_log_buffer_take(char* buffer, size_t size) {
+    if (buffer == nullptr || size == 0) return 0;
+    buffer[0] = '\0';
+    if (size < 2) return 0;
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    size_t n = std::min(size - 1, g_log.size());
+    if (n < g_log.size()) {  // whole lines only, unless one line alone is too long
+        const size_t end = g_log.rfind('\n', n == 0 ? 0 : n - 1);
+        if (end != std::string::npos) n = end + 1;
+    }
+    std::memcpy(buffer, g_log.data(), n);
+    buffer[n] = '\0';
+    g_log.erase(0, n);
+    return n;
 }
 
 void liyab_engine_config_default(liyab_engine_config* config) {

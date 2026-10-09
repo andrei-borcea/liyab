@@ -1,6 +1,7 @@
 // Choose and load a model stored on the phone; switch between CPU and GPU.
 import 'package:flutter/material.dart';
 
+import '../models/models_page.dart';
 import '../state/app_state.dart';
 import '../state/models_store.dart';
 
@@ -59,11 +60,7 @@ class _ModelSheetState extends State<_ModelSheet> {
               if (models.isEmpty) {
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 16),
-                  child: Text(
-                    'No models on this phone yet. Downloads from Hugging Face come in the next update; '
-                    'for now, push a GGUF file with adb into the app folder.',
-                    style: theme.textTheme.bodyMedium,
-                  ),
+                  child: Text('No models on this phone yet.', style: theme.textTheme.bodyMedium),
                 );
               }
               return Column(children: [
@@ -104,10 +101,14 @@ class _ModelSheetState extends State<_ModelSheet> {
               ]);
             },
           ),
-          TextButton.icon(
-            onPressed: () => setState(() => _models = app.localModels()),
-            icon: const Icon(Icons.refresh_rounded),
-            label: const Text('Refresh'),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.push(context, MaterialPageRoute<void>(builder: (_) => ModelsPage(app: app)));
+            },
+            icon: const Icon(Icons.download_rounded),
+            label: const Text('Get or import models'),
           ),
         ]),
       ),

@@ -225,6 +225,11 @@ final class LiyabLib {
             int Function(Pointer<Void>, Pointer<Utf8>, int)>('liyab_engine_prefill'),
         resetContext =
             lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>('liyab_engine_reset_context'),
+        logBufferEnable = lib.lookupFunction<Void Function(Size), void Function(int)>('liyab_log_buffer_enable'),
+        logBufferTake = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
+            'liyab_log_buffer_take'),
+        supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
+            'liyab_supported_architectures'),
         getCounters = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabEngineCounters>),
             int Function(Pointer<Void>, Pointer<LiyabEngineCounters>)>('liyab_engine_get_counters');
 
@@ -250,6 +255,27 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>, int) prefill;
   final int Function(Pointer<Void>) resetContext;
   final int Function(Pointer<Void>, Pointer<LiyabEngineCounters>) getCounters;
+  final int Function(Pointer<Utf8>, int) supportedArchitectures;
+  final void Function(int) logBufferEnable;
+  final int Function(Pointer<Utf8>, int) logBufferTake;
+
+  /// Engine log lines buffered since the last call ("I message", "W message"…).
+  List<String> takeLogLines() {
+    final lines = <String>[];
+    final buffer = calloc<Uint8>(8192).cast<Utf8>();
+    try {
+      while (logBufferTake(buffer, 8192) > 0) {
+        lines.addAll(buffer.toDartString().split('\n').where((l) => l.isNotEmpty));
+      }
+    } finally {
+      calloc.free(buffer);
+    }
+    return lines;
+  }
+
+  /// GGUF `general.architecture` values this build runs.
+  late final Set<String> architectures =
+      readText((b, s) => supportedArchitectures(b, s)).split(',').where((a) => a.isNotEmpty).toSet();
 
   String errorMessage() => lastError().toDartString();
 

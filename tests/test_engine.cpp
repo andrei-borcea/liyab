@@ -1411,6 +1411,35 @@ TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapsho
     CHECK(after_drop == run(*fresh.value(), dropped));
 }
 
+TEST_CASE("C API log buffer keeps whole lines for polling UIs") {
+    liyab_set_log_level(1);
+    liyab_log_buffer_enable(1 << 16);
+    liyab_engine_config config;
+    liyab_engine_config_default(&config);
+    const std::string path = mixed_model();
+    config.model_path = path.c_str();
+    config.backend = LIYAB_BACKEND_CPU;
+    liyab_engine* engine = nullptr;
+    REQUIRE(liyab_engine_create(&config, &engine) == LIYAB_OK);
+    liyab_engine_destroy(engine);
+    std::string all;
+    char chunk[64];
+    int takes = 0;
+    while (size_t n = liyab_log_buffer_take(chunk, sizeof chunk)) {
+        CHECK(n < sizeof chunk);
+        // Whole lines, or one line longer than the buffer, cut at its size.
+        CHECK((chunk[n - 1] == '\n' || n == sizeof chunk - 1));
+        all.append(chunk, n);
+        ++takes;
+    }
+    CHECK(takes > 1);
+    CHECK(all.find("I ") == 0);
+    CHECK(all.find("mapped ") != std::string::npos);
+    CHECK(liyab_log_buffer_take(chunk, sizeof chunk) == 0);
+    liyab_log_buffer_enable(0);
+    liyab_set_log_level(2);
+}
+
 TEST_CASE("Engine routes to CPU when forced and matches the default route") {
     EngineConfig cpu_config = engine_config(mixed_model());
     cpu_config.backend = BackendKind::Cpu;

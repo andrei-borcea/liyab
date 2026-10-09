@@ -168,6 +168,18 @@ typedef void (*liyab_log_callback)(int32_t level, const char* message, void* use
 LIYAB_C_API void liyab_set_log_level(int32_t level);
 LIYAB_C_API void liyab_set_log_callback(liyab_log_callback callback, void* user_data);
 LIYAB_C_API const char* liyab_last_error(void);
+/*
+ * Log buffer for UIs that poll instead of taking callbacks (e.g. Dart, whose
+ * asynchronous callbacks cannot read `message` after the call returns).
+ * liyab_log_buffer_enable(max_bytes) installs a sink that appends each message
+ * as "<level letter> <message>\n" (D, I, W, E), keeping at most `max_bytes`
+ * (oldest lines dropped); it replaces any callback, and 0 removes it.
+ * liyab_log_buffer_take copies up to size - 1 bytes of whole lines into
+ * `buffer` (NUL-terminated), removes them, and returns the bytes copied; 0
+ * when empty. A single line longer than the buffer is cut. Thread-safe.
+ */
+LIYAB_C_API void liyab_log_buffer_enable(size_t max_bytes);
+LIYAB_C_API size_t liyab_log_buffer_take(char* buffer, size_t size);
 
 LIYAB_C_API void liyab_engine_config_default(liyab_engine_config* config);
 LIYAB_C_API void liyab_sampling_params_default(liyab_sampling_params* params);

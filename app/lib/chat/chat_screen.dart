@@ -4,10 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../state/app_state.dart';
+import '../ui/app_drawer.dart';
 import '../ui/living_flame.dart';
 import '../ui/theme.dart';
 import 'model_sheet.dart';
-import 'settings_sheet.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, required this.app});
@@ -28,11 +28,17 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     app.addListener(_changed);
+    app.monitor.addListener(_heatChanged);
+  }
+
+  void _heatChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     app.removeListener(_changed);
+    app.monitor.removeListener(_heatChanged);
     _input.dispose();
     _scroll.dispose();
     _focus.dispose();
@@ -63,17 +69,16 @@ class _ChatScreenState extends State<ChatScreen> {
     return m.raw.isEmpty || m.thinkingNow ? FlameState.thinking : FlameState.answering;
   }
 
-  double get _heat {
-    final reroutes = app.messages.isEmpty ? 0 : (app.messages.last.stats?.thermalReroutes ?? 0);
-    return reroutes > 0 ? 0.85 : 0.3;
-  }
+  /// The phone's thermal headroom (Android's 10 s forecast), shown as the flame's colour.
+  double get _heat => app.monitor.heat;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
+      drawer: AppDrawer(app: app),
       appBar: AppBar(
-        titleSpacing: 12,
+        titleSpacing: 0,
         title: InkWell(
           borderRadius: BorderRadius.circular(12),
           onTap: () => showModelSheet(context, app),
@@ -101,11 +106,6 @@ class _ChatScreenState extends State<ChatScreen> {
             tooltip: 'New chat',
             onPressed: app.messages.isEmpty || app.generating ? null : app.newChat,
             icon: const Icon(Icons.edit_note_rounded),
-          ),
-          IconButton(
-            tooltip: 'Settings',
-            onPressed: () => showSettingsSheet(context, app),
-            icon: const Icon(Icons.tune_rounded),
           ),
           const SizedBox(width: 4),
         ],
