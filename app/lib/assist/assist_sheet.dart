@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 import '../chat/chat_screen.dart';
 import '../state/app_state.dart';
 import '../ui/living_flame.dart';
+import '../ui/waking_up.dart';
 import '../ui/theme.dart';
 
 /// Whether the assistant sheet is showing, driven by AssistActivity.
@@ -261,7 +262,12 @@ class _AssistSheetState extends State<AssistSheet> with SingleTickerProviderStat
             ],
           ),
         ),
-        if (last != null)
+        if (last != null && app.loading && last.answer.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: WakingUp(status: app.status, heat: app.monitor.heat, size: 72),
+          )
+        else if (last != null)
           Flexible(
             child: SingleChildScrollView(
               reverse: true,

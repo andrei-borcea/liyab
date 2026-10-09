@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../state/app_state.dart';
 import '../ui/app_drawer.dart';
 import '../ui/living_flame.dart';
+import '../ui/waking_up.dart';
 import '../ui/theme.dart';
 import 'model_sheet.dart';
 
@@ -127,17 +128,36 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 350),
-              child: app.messages.isEmpty
-                  ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
-                  : ListView.builder(
-                      key: const ValueKey('messages'),
-                      controller: _scroll,
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                      itemCount: app.messages.length,
-                      itemBuilder: (context, i) => MessageView(message: app.messages[i]),
-                    ),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 350),
+                    child: app.messages.isEmpty
+                        ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
+                        : ListView.builder(
+                            key: const ValueKey('messages'),
+                            controller: _scroll,
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                            itemCount: app.messages.length,
+                            itemBuilder: (context, i) => MessageView(message: app.messages[i]),
+                          ),
+                  ),
+                ),
+                // Over a conversation while the model loads (the empty chat shows its own flame).
+                Positioned.fill(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 300),
+                    child: app.loading && app.messages.isNotEmpty
+                        ? ColoredBox(
+                            key: const ValueKey('waking'),
+                            color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.9),
+                            child: WakingUp(status: app.status, heat: _heat),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ),
+              ],
             ),
           ),
           _Composer(

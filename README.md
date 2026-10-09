@@ -529,7 +529,8 @@ are called directly because the C API makes them thread-safe.
   answers at once). After 5 minutes hidden (1, 15, 60 minutes or never in Settings) the conversation's context is
   saved (`save_state`) and the model is unloaded; it loads again as soon as Liyab is on screen, the app or the assistant sheet,
   with the chat kept and the conversation's context restored, so the next message is not preceded by the whole chat
-  being processed again. A message sent meanwhile shows at once and waits for the model. App events (loads,
+  being processed again. A message sent meanwhile shows at once and waits for the model, and while it loads the
+  flame burns in the middle of the conversation ("Waking up") so the wait is never mistaken for a hang. App events (loads,
   restores, trims; never message text or tool arguments) also go to logcat (`adb logcat -s flutter`).
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour follows the phone's thermal
