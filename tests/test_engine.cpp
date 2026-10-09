@@ -1024,9 +1024,14 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
     CHECK(st.loads > b->expert_store()->entries());  // evictions happened
     CHECK(st.hits + st.late > 0);                     // predictions were used
 
-    // trim() empties the cache; the experts are read again and the output is unchanged.
+    // trim() empties the cache but keeps its hot list; warm() queues it again
+    // (behind demand reads), and the experts are read again with the output unchanged.
+    const size_t hot = b->expert_store()->hot_keys().size();
+    CHECK(hot > 0);
     CHECK(b->expert_store()->trim() > 0);
     CHECK(b->expert_store()->trim() == 0);  // nothing left to release
+    CHECK(b->expert_store()->hot_keys().size() == hot);
+    CHECK(b->expert_store()->warm() == hot);
     b->reset();
     std::vector<float> after_trim;
     for (const int32_t t : tokens) {

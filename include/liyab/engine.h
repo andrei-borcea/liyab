@@ -173,6 +173,17 @@ public:
     };
     [[nodiscard]] MemoryPlan memory_plan() const;
 
+    // The expert cache's hot list (MoE with streamed experts; no-ops
+    // otherwise): the cached experts by use, recorded by trim_memory().
+    // warm_memory() queues them behind any demand read, so the cache refills
+    // in one background pass of large reads once the model is used again
+    // instead of one wait per expert; returns how many were queued.
+    // save_expert_profile() writes the list (a few KB) for a later process,
+    // load_expert_profile() takes it back (InvalidArgument for another model).
+    size_t warm_memory();
+    Status save_expert_profile(const std::string& path) const;
+    Status load_expert_profile(const std::string& path);
+
     // Thread-safe: stops an in-flight generate() at the next token boundary.
     void cancel() noexcept;
 

@@ -236,6 +236,13 @@ class EngineService {
   /// Empties the engine's expert cache (the model stays loaded); the bytes released.
   Future<int> trimMemory() => _call<int>(['trim']);
 
+  /// Queues the experts that were hot before the last trim, behind any demand read; how many.
+  Future<int> warmMemory() => _call<int>(['warm']);
+
+  /// Saves / restores the expert cache's hot list (a few KB) for a later process.
+  Future<void> saveExpertProfile(String path) => _call<Object?>(['saveProfile', path]);
+  Future<void> loadExpertProfile(String path) => _call<Object?>(['loadProfile', path]);
+
   /// Streams the reply to `prompt` (already chat-formatted).
   Stream<GenerationEvent> generate(String prompt, SamplingOptions s) {
     final id = _nextId++;
@@ -339,6 +346,20 @@ void _worker(SendPort replies) {
           using((arena) {
             final n = lib.tokenize(engine, (m[2] as String).toNativeUtf8(allocator: arena), 0, nullptr, 0);
             n < 0 ? fail() : replies.send(['ok', id, n]);
+          });
+        case 'warm':
+          if (engine.address == 0) return replies.send(['ok', id, 0]);
+          using((arena) {
+            final n = arena<Uint32>();
+            lib.warmMemory(engine, n) == LiyabStatus.ok ? replies.send(['ok', id, n.value]) : fail();
+          });
+        case 'saveProfile':
+        case 'loadProfile':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final path = (m[2] as String).toNativeUtf8(allocator: arena);
+            final status = kind == 'saveProfile' ? lib.saveExpertProfile(engine, path) : lib.loadExpertProfile(engine, path);
+            status == LiyabStatus.ok ? replies.send(['ok', id]) : fail();
           });
         case 'tokenIds':
           if (engine.address == 0) return fail('no model loaded');

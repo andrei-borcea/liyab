@@ -258,6 +258,16 @@ typedef struct liyab_memory_plan {
 } liyab_memory_plan;
 LIYAB_C_API liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out);
 
+/* The expert cache's hot list (MoE with streamed experts; no-ops otherwise),
+ * recorded by liyab_engine_trim_memory: warm_memory queues those experts
+ * behind any demand read so the cache refills in the background once the
+ * model is used again (*out_queued may be NULL); save / load keep the list in
+ * a small file for a later process (load fails for another model). Not while
+ * a generation runs on the engine. See Engine::warm_memory. */
+LIYAB_C_API liyab_status liyab_engine_warm_memory(liyab_engine* engine, uint32_t* out_queued);
+LIYAB_C_API liyab_status liyab_engine_save_expert_profile(liyab_engine* engine, const char* path);
+LIYAB_C_API liyab_status liyab_engine_load_expert_profile(liyab_engine* engine, const char* path);
+
 /* Live counters for monitoring UIs, cumulative since creation: sample them
  * periodically and divide deltas by the elapsed time. Thread-safe (may be
  * called while a generation runs). */

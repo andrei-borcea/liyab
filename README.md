@@ -336,7 +336,12 @@ Qwen3.6-35B-A3B), set aside from the expert cache budget. On the phone, Qwen3.6-
 message (whole conversation reprocessed) to 3.2 s for the first message and ~6 s for later ones.
 
 `Engine::trim_memory()` (C ABI: `liyab_engine_trim_memory`) gives memory back while the engine is idle: it empties
-the MoE expert cache and returns its pages to the OS; the model and its context stay loaded. On the phone,
+the MoE expert cache and returns its pages to the OS; the model and its context stay loaded. It keeps the cache's
+hot list (the cached experts by use): `warm_memory()` queues them again behind any demand read, so the cache
+refills in one background pass of large reads (about 0.7 s for 2.4 GB at 3.5 GB/s) once the model is used again,
+instead of a wait per expert; `save_expert_profile()` / `load_expert_profile()` keep the list in a small file for a
+later process (C ABI: `liyab_engine_warm_memory`, `liyab_engine_save_expert_profile`,
+`liyab_engine_load_expert_profile`). The app warms the cache when the user starts writing, and right after a load. On the phone,
 Qwen3.6-35B-A3B with a 4000 MiB budget went from 3.09 GB resident after two answers to 2.18 GB; the next answer
 decoded at 6.13 tok/s instead of 6.43 (first token 272 ms instead of 177) while the cache refilled, and the one after
 at full speed.

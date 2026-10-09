@@ -251,6 +251,12 @@ final class LiyabLib {
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>)>('liyab_engine_load_state'),
         trimMemory = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint64>),
             int Function(Pointer<Void>, Pointer<Uint64>)>('liyab_engine_trim_memory'),
+        warmMemory = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint32>),
+            int Function(Pointer<Void>, Pointer<Uint32>)>('liyab_engine_warm_memory'),
+        saveExpertProfile = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+            int Function(Pointer<Void>, Pointer<Utf8>)>('liyab_engine_save_expert_profile'),
+        loadExpertProfile = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+            int Function(Pointer<Void>, Pointer<Utf8>)>('liyab_engine_load_expert_profile'),
         memoryPlan = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabMemoryPlan>),
             int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>)>('liyab_engine_memory_plan'),
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
@@ -286,6 +292,9 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
   final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
   final int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>) memoryPlan;
+  final int Function(Pointer<Void>, Pointer<Uint32>) warmMemory;
+  final int Function(Pointer<Void>, Pointer<Utf8>) saveExpertProfile;
+  final int Function(Pointer<Void>, Pointer<Utf8>) loadExpertProfile;
   final void Function(int) logBufferEnable;
   final int Function(Pointer<Utf8>, int) logBufferTake;
 

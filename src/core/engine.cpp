@@ -551,6 +551,60 @@ Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bo
 
 std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
 
+namespace {
+constexpr char kExpertProfileMagic[4] = {'L', 'X', 'H', 'L'};
+}  // namespace
+
+size_t Engine::warm_memory() {
+    ExpertStore* store = impl_->target->expert_store();
+    const size_t queued = store != nullptr ? store->warm() : 0;
+    if (queued > 0) LIYAB_LOG_INFO("warming the expert cache: %zu experts queued", queued);
+    return queued;
+}
+
+Status Engine::save_expert_profile(const std::string& path) const {
+    const ExpertStore* store = impl_->target->expert_store();
+    if (store == nullptr) return Status::ok();
+    const std::vector<int32_t> keys = store->hot_keys();
+    const ModelConfig& c = impl_->target->config();
+    // Header: magic, model file size, blocks, experts per block, count.
+    const int64_t header[] = {static_cast<int64_t>(impl_->target->file().file_size()), c.n_layers, c.n_expert,
+                              static_cast<int64_t>(keys.size())};
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(kExpertProfileMagic, sizeof kExpertProfileMagic);
+        out.write(reinterpret_cast<const char*>(header), sizeof header);
+        out.write(reinterpret_cast<const char*>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(int32_t)));
+        if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) return Status(ErrorCode::IoError, "cannot rename " + tmp);
+    return Status::ok();
+}
+
+Status Engine::load_expert_profile(const std::string& path) {
+    ExpertStore* store = impl_->target->expert_store();
+    if (store == nullptr) return Status::ok();
+    std::ifstream in(path, std::ios::binary);
+    char magic[4] = {};
+    int64_t header[4] = {};
+    in.read(magic, sizeof magic);
+    in.read(reinterpret_cast<char*>(header), sizeof header);
+    const ModelConfig& c = impl_->target->config();
+    if (!in || std::memcmp(magic, kExpertProfileMagic, sizeof magic) != 0) {
+        return Status(ErrorCode::IoError, "not an expert profile: " + path);
+    }
+    if (header[0] != static_cast<int64_t>(impl_->target->file().file_size()) || header[1] != c.n_layers ||
+        header[2] != c.n_expert || header[3] < 0 || header[3] > static_cast<int64_t>(c.n_layers) * c.n_expert) {
+        return Status(ErrorCode::InvalidArgument, "expert profile of another model: " + path);
+    }
+    std::vector<int32_t> keys(static_cast<size_t>(header[3]));
+    in.read(reinterpret_cast<char*>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(int32_t)));
+    if (!in) return Status(ErrorCode::IoError, "truncated expert profile: " + path);
+    store->set_hot(std::move(keys));
+    return Status::ok();
+}
+
 Engine::MemoryPlan Engine::memory_plan() const {
     const Transformer::MemoryPlan& p = impl_->target->memory_plan();
     return {p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};

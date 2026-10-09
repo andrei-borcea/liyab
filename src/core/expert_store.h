@@ -88,6 +88,15 @@ public:
     // released.
     size_t trim();
 
+    // The hot list: the cached experts by use (most used first), recorded by
+    // trim() and kept across it, so warm() can refill the cache in the
+    // background (behind any demand read) when the model is used again: one
+    // pass of large reads instead of a miss per expert. Keys are
+    // layer * n_expert + expert; set_hot() restores a saved list.
+    [[nodiscard]] std::vector<int32_t> hot_keys() const;
+    void set_hot(std::vector<int32_t> keys);
+    size_t warm();
+
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] size_t capacity_bytes() const noexcept { return arena_bytes_; }
     [[nodiscard]] size_t entries() const noexcept { return slots_.size(); }
@@ -150,6 +159,7 @@ private:
     bool locked_ = false;  // mlock succeeded (until trim() unlocks it)
     std::vector<Slot> slots_;
     std::vector<Entry> entries_;
+    std::vector<int32_t> hot_;  // see hot_keys()
 
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;   // I/O threads: queue or parts not empty / stop

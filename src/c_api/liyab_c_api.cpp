@@ -358,6 +358,37 @@ liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_p
     return LIYAB_OK;
 }
 
+liyab_status liyab_engine_warm_memory(liyab_engine* engine, uint32_t* out_queued) {
+    if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const size_t queued = engine->engine->warm_memory();
+        if (out_queued != nullptr) *out_queued = static_cast<uint32_t>(queued);
+        return LIYAB_OK;
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
+liyab_status liyab_engine_save_expert_profile(liyab_engine* engine, const char* path) {
+    if (engine == nullptr || path == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Status s = engine->engine->save_expert_profile(path);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
+liyab_status liyab_engine_load_expert_profile(liyab_engine* engine, const char* path) {
+    if (engine == nullptr || path == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Status s = engine->engine->load_expert_profile(path);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
 liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t* out_bytes) {
     if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {

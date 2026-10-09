@@ -371,8 +371,52 @@ void ExpertStore::age() {
     for (Entry& e : entries_) e.uses *= 0.5f;
 }
 
+std::vector<int32_t> ExpertStore::hot_keys() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int32_t> keys;
+    for (const Slot& slot : slots_) {
+        if (slot.entry >= 0 && entries_[static_cast<size_t>(slot.entry)].state == State::Ready) keys.push_back(slot.entry);
+    }
+    std::stable_sort(keys.begin(), keys.end(), [&](int32_t a, int32_t b) {
+        const Entry& x = entries_[static_cast<size_t>(a)];
+        const Entry& y = entries_[static_cast<size_t>(b)];
+        return x.uses > y.uses || (x.uses == y.uses && x.last_use > y.last_use);
+    });
+    return keys.empty() ? hot_ : keys;  // after a trim, the list it recorded
+}
+
+void ExpertStore::set_hot(std::vector<int32_t> keys) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::erase_if(keys, [&](int32_t k) {
+        return k < 0 || static_cast<size_t>(k) >= entries_.size() || block_class_[static_cast<size_t>(k / n_expert_)] < 0;
+    });
+    hot_ = std::move(keys);
+}
+
+size_t ExpertStore::warm() {
+    size_t queued = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const int32_t key : hot_) {
+            if (queued >= slots_.size()) break;  // beyond the cache's size the list would evict itself
+            Entry& e = entries_[static_cast<size_t>(key)];
+            if (e.state != State::Empty) continue;
+            e.state = State::Queued;
+            e.on_demand = false;
+            e.guess = false;
+            e.uses = 0.25f;  // kept like a light prefetch until used
+            queue_.push_back(key);
+            ++queued;
+        }
+    }
+    if (queued > 0) work_cv_.notify_all();
+    return queued;
+}
+
 size_t ExpertStore::trim() {
+    const std::vector<int32_t> hot = hot_keys();
     std::unique_lock<std::mutex> lock(mutex_);
+    if (!hot.empty()) hot_ = hot;
     for (const int32_t key : queue_) {
         Entry& e = entries_[static_cast<size_t>(key)];
         if (e.state == State::Queued) e.state = State::Empty;

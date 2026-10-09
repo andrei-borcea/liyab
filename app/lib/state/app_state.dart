@@ -149,7 +149,13 @@ class AppState extends ChangeNotifier {
       return;
     }
     final watch = Stopwatch()..start();
+    try {
+      await engine.saveExpertProfile(await _expertProfileFile()); // what was hot, to warm up again
+    } on EngineException catch (e) {
+      _log('Expert profile not saved: $e');
+    }
     final bytes = await engine.trimMemory();
+    _cacheCold = bytes > 0;
     _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in ${watch.elapsedMilliseconds} ms');
     await _saveConversation(withContext: true);
     if (messages.isNotEmpty) _log('Conversation saved in ${watch.elapsedMilliseconds} ms');
@@ -324,6 +330,7 @@ class AppState extends ChangeNotifier {
         _log('  $line');
       }
       _preparing = keepChat ? _restoreConversation() : prepareSystemPrompt();
+      unawaited(_loadExpertProfile());
       if (!keepChat) _discardConversation();
     } on EngineException catch (e) {
       status = 'Failed to load $name: $e';
@@ -337,6 +344,40 @@ class AppState extends ChangeNotifier {
   /// Processes the system block in the background, so the first message only
   /// costs its own tokens (the engine keeps that context and a snapshot of it).
   String? _prepared; // the system block the engine last processed
+
+  /// After a load: the hot list a previous process saved, warmed at once (a fresh process has an empty cache).
+  Future<void> _loadExpertProfile() async {
+    final file = File(await _expertProfileFile());
+    if (!file.existsSync()) return;
+    try {
+      await engine.loadExpertProfile(file.path);
+      _cacheCold = true;
+      _warmIfCold();
+    } on EngineException catch (e) {
+      _log('Expert profile not usable: $e');
+    }
+  }
+
+  /// Whether the expert cache was emptied while parked (its hot list is kept to warm it up again).
+  bool _cacheCold = false;
+
+  /// Refills the expert cache in the background with what was hot before it
+  /// was emptied, as soon as the user starts writing: one pass of large reads
+  /// while they type, instead of a wait per expert in the first answer.
+  void _warmIfCold() {
+    if (!_cacheCold || !engine.loaded) return;
+    _cacheCold = false;
+    unawaited(engine.warmMemory().then((n) {
+      if (n > 0) _log('Warming the expert cache: $n experts');
+    }, onError: (Object e) => _log('Expert cache not warmed: $e')));
+  }
+
+  /// The expert cache's hot list of this model.
+  Future<String> _expertProfileFile() async {
+    final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return '${dir.path}/$modelName.experts';
+  }
 
   /// Where the experimental persistent prefix KV cache lives (the engine needs an existing directory).
   Future<Directory> _kvDedupDir() async =>
@@ -511,6 +552,7 @@ class AppState extends ChangeNotifier {
   void draftChanged(String text) {
     _draftTimer?.cancel();
     if (text.trim().isEmpty) return;
+    _warmIfCold();
     _draftTime ??= DateTime.now();
     _draftTimer = Timer(const Duration(milliseconds: 600), () => unawaited(_prefillDraft(text)));
   }
@@ -578,6 +620,7 @@ class AppState extends ChangeNotifier {
   Future<void> send(String text) async {
     if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
     generating = true;
+    _warmIfCold();
     _draftTimer?.cancel();
     _drafted = '';
     _draftTime = null;
