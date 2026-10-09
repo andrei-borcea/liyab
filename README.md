@@ -447,7 +447,7 @@ are called directly because the C API makes them thread-safe.
   every past reply is replayed exactly as generated, so each new message reuses the engine's context. The system
   prompt is processed right after loading.
 * **Models and settings.** Models are listed from app storage and the shared folder (marked, since streaming is
-  slower there); the CPU/GPU switch, sampling, context length, system prompt, thermal limit and memory budget are
+  slower there, with **Move to app storage**, which copies every part and removes the shared copy); the CPU/GPU switch, sampling, context length, system prompt, thermal limit and memory budget are
   in sheets, saved per model and per device.
 * **The living flame.** The Liyab mark (`docs/brand`) is drawn live in the header and the empty chat: its motion
   shows whether the assistant is resting, thinking or answering, and its colour turns from cool to hot when the

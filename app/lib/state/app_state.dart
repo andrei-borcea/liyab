@@ -65,6 +65,9 @@ class AppState extends ChangeNotifier {
   bool thinkingSupported = false;
   ModelSettings settings = ModelSettings();
   final List<ChatMessage> messages = [];
+
+  /// Name of the model being moved into app storage, if any.
+  String? moving;
   final List<String> log = [];
 
   static Future<AppState> create() async {
@@ -196,4 +199,31 @@ class AppState extends ChangeNotifier {
   }
 
   Future<List<LocalModel>> localModels() => ModelsStore.list();
+
+  /// Moves a model (all parts) from the shared folder into app storage, where
+  /// the engine's direct reads work and streaming runs at full speed.
+  Future<void> moveToAppStorage(LocalModel model) async {
+    if (moving != null) return;
+    moving = model.name;
+    notifyListeners();
+    final watch = Stopwatch()..start();
+    try {
+      final dir = await ModelsStore.modelsDir();
+      for (final part in modelParts(model.file)) {
+        final name = part.uri.pathSegments.last;
+        final tmp = await part.copy('${dir.path}/$name.moving');
+        await tmp.rename('${dir.path}/$name');
+        await part.delete();
+      }
+      final moved = '${dir.path}/${model.name}';
+      if (device.lastModel == model.file.path) device.lastModel = moved;
+      _log('Moved ${model.name} to app storage in ${watch.elapsed.inSeconds} s');
+    } on FileSystemException catch (e) {
+      _log('Move failed: ${e.message}');
+      status = 'Could not move ${model.name}: ${e.message}';
+    } finally {
+      moving = null;
+      notifyListeners();
+    }
+  }
 }

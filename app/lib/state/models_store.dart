@@ -61,5 +61,17 @@ abstract final class ModelsStore {
   }
 }
 
+/// Every file of the model whose first file is `first` (one, or all parts of a split model).
+List<File> modelParts(File first) {
+  final m = _part.firstMatch(first.uri.pathSegments.last);
+  if (m == null) return [first];
+  return first.parent
+      .listSync()
+      .whereType<File>()
+      .where((f) => _part.firstMatch(f.uri.pathSegments.last)?.group(1) == m.group(1))
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+}
+
 String formatBytes(int bytes) =>
     bytes >= 1e9 ? '${(bytes / 1e9).toStringAsFixed(2)} GB' : '${(bytes / 1e6).toStringAsFixed(0)} MB';

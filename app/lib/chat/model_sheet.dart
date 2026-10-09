@@ -75,8 +75,26 @@ class _ModelSheetState extends State<_ModelSheet> {
                       color: app.modelPath == m.file.path ? theme.colorScheme.primary : theme.colorScheme.onSurfaceVariant,
                     ),
                     title: Text(m.name, maxLines: 2, overflow: TextOverflow.ellipsis),
-                    subtitle: Text(m.shared ? '${formatBytes(m.bytes)}, shared folder (slower streaming)' : formatBytes(m.bytes)),
-                    onTap: app.loading
+                    subtitle: Text(app.moving == m.name
+                        ? 'Moving to app storage…'
+                        : m.shared
+                            ? '${formatBytes(m.bytes)}, shared folder (slower streaming)'
+                            : formatBytes(m.bytes)),
+                    trailing: !m.shared
+                        ? null
+                        : app.moving == m.name
+                            ? const SizedBox.square(dimension: 22, child: CircularProgressIndicator(strokeWidth: 2.5))
+                            : IconButton(
+                                tooltip: 'Move to app storage',
+                                icon: const Icon(Icons.drive_file_move_outline),
+                                onPressed: app.moving != null || app.modelPath == m.file.path
+                                    ? null
+                                    : () async {
+                                        await app.moveToAppStorage(m);
+                                        if (mounted) setState(() => _models = app.localModels());
+                                      },
+                              ),
+                    onTap: app.loading || app.moving == m.name
                         ? null
                         : () {
                             Navigator.pop(context);
