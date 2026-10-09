@@ -553,6 +553,12 @@ class AppState extends ChangeNotifier {
           lastPaint = now;
         case GenerationDone(:final stats):
           message.stats = stats;
+          // One line per generation (a reply with tool calls has several), so the time of each step shows.
+          final fresh = stats.promptTokens - stats.cachedPrefixTokens;
+          _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
+              'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, ${stats.generatedTokens} tokens at '
+              '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
+              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}');
       }
       notifyListeners();
     }
