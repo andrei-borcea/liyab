@@ -7,7 +7,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/widgets.dart' show AppLifecycleListener;
+import 'package:flutter/widgets.dart' show AppLifecycleListener, AppLifecycleState;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -85,7 +85,17 @@ class AppState extends ChangeNotifier {
         _log(l, engine: true);
       }
     });
-    _lifecycle = AppLifecycleListener(onHide: _scheduleRelease, onShow: _backOnScreen);
+    // States, not transitions: Android may destroy the activity in the
+    // background, and a new one then goes from detached straight to resumed,
+    // which onShow never reports.
+    _lifecycle = AppLifecycleListener(onStateChange: (state) {
+      if (state == AppLifecycleState.resumed) {
+        _backOnScreen();
+      } else if ((state == AppLifecycleState.hidden || state == AppLifecycleState.detached) && !_away) {
+        _away = true;
+        _scheduleRelease();
+      }
+    });
   }
 
   // Idle release: a loaded model holds its memory (GBs) while Liyab sits in
@@ -95,6 +105,7 @@ class AppState extends ChangeNotifier {
   // once, only its first tokens are slower); after device.releaseAfterMinutes
   // the model is unloaded, and loads again, chat kept, once Liyab is back.
   late final AppLifecycleListener _lifecycle;
+  bool _away = false; // off screen since the timers were started
   Timer? _trimTimer;
   Timer? _releaseTimer;
   String? _released; // the model unloaded while idle
@@ -123,9 +134,10 @@ class AppState extends ChangeNotifier {
     final path = modelPath;
     if (path == null || _released != null) return;
     if (generating || loading || moving != null) return _scheduleRelease(); // busy: try again later
-    await engine.unload();
-    _released = path;
+    _released = path; // set first: coming back during the unload reloads it (commands run in order)
     _prepared = null;
+    await engine.unload();
+    if (_released != path) return; // back on screen meanwhile: already reloading
     status = 'Model unloaded while idle';
     _log('Unloaded $modelName after ${device.releaseAfterMinutes} min in the background');
     notifyListeners();
@@ -142,6 +154,8 @@ class AppState extends ChangeNotifier {
   void _backOnScreen() {
     _trimTimer?.cancel();
     _releaseTimer?.cancel();
+    _trimTimer = _releaseTimer = null;
+    _away = false;
     final path = _released;
     _released = null;
     if (path != null && File(path).existsSync()) unawaited(load(path, keepChat: true));
@@ -214,9 +228,16 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Loads `path`; `keepChat` keeps the conversation (a reload after an idle release).
-  Future<void> load(String path, {bool keepChat = false}) async {
-    if (loading) return;
+  /// Loads `path`; `keepChat` keeps the conversation (a reload after an idle
+  /// release). While a load runs, returns that load.
+  Future<void> load(String path, {bool keepChat = false}) {
+    if (loading) return _pendingLoad ?? Future.value();
+    return _pendingLoad = _load(path, keepChat: keepChat);
+  }
+
+  Future<void>? _pendingLoad;
+
+  Future<void> _load(String path, {required bool keepChat}) async {
     _released = null;
     final name = File(path).uri.pathSegments.last;
     loading = true;
@@ -349,7 +370,17 @@ class AppState extends ChangeNotifier {
   static const _maxToolCalls = 4;
 
   Future<void> send(String text) async {
-    if (generating || !engine.loaded || text.trim().isEmpty) return;
+    if (generating || text.trim().isEmpty) return;
+    if (!engine.loaded) {
+      // Unloaded while idle, or still loading: wait for the model rather than drop the message.
+      final released = _released;
+      if (released != null) {
+        await load(released, keepChat: true);
+      } else if (loading) {
+        await _pendingLoad;
+      }
+      if (generating || !engine.loaded) return;
+    }
     generating = true;
     final promptUser = '$text\n\n${nowLine(DateTime.now())}';
     final prompt = await _prompt(promptUser);
