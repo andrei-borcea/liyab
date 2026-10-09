@@ -925,6 +925,10 @@ non-speculative decoding. The numbers below come from `test_experimental` on the
 * **Metal dispatch** submits one command buffer per matmul. Batching a whole layer per command buffer is the next
   optimization.
 * **Draft model** runs on the CPU, sequentially before verification, not concurrently.
+* **Cold start with tools.** The system block with the tool descriptions is processed after every model load
+  (about a minute on Qwen3.6-35B-A3B, whose prefill runs at ~11 tokens/s; then every turn reuses it). Next fix:
+  save the processed state (KV pages and recurrent states) to app storage and restore it at load, so the app and
+  the assistant sheet answer at once after a restart.
 * **The app and the agent.** Next, in order: voice input (on-device speech recognition, kept loaded so the
   assistant listens at once; the flame's listening animation is ready for it), then a power and thermal controller
   that uses Android's performance hints and thermal-headroom forecast instead of a fixed temperature threshold, then
