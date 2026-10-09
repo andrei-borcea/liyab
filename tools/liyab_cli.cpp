@@ -62,6 +62,8 @@ void usage() {
                  "  --experts N        MoE: at most N experts per token (lossy; default: the model's)\n"
                  "  --skip-slow W      MoE streaming: skip a chosen expert not yet in RAM whose router weight\n"
                  "                     share is below W (e.g. 0.1) for every token using it (lossy; default 0)\n"
+                 "  --prefix-cache MB  keep contexts replaced by an unrelated prompt in an in-RAM LRU of\n"
+                 "                     this size, restored when a later prompt continues one (default 0)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
