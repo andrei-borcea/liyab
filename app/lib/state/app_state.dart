@@ -276,7 +276,10 @@ class AppState extends ChangeNotifier {
     final name = File(path).uri.pathSegments.last;
     loading = true;
     status = 'Loading $name…';
-    if (!keepChat) messages.clear();
+    if (!keepChat) {
+      messages.clear();
+      _historyStart = 0;
+    }
     notifyListeners();
     try {
       final gpu = device.useGpu;
@@ -357,7 +360,8 @@ class AppState extends ChangeNotifier {
   Future<void> _saveConversation({bool withContext = false}) async {
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty) return _discardConversation();
-    await File(chat).writeAsString(jsonEncode([for (final m in messages) m.toJson()]));
+    await File(chat).writeAsString(
+        jsonEncode({'start': _historyStart, 'messages': [for (final m in messages) m.toJson()]}));
     if (!withContext) return;
     try {
       await engine.saveState(state);
@@ -380,8 +384,11 @@ class AppState extends ChangeNotifier {
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty && File(chat).existsSync()) {
       try {
-        final list = jsonDecode(await File(chat).readAsString()) as List<Object?>;
+        final saved = jsonDecode(await File(chat).readAsString());
+        // Earlier saves were the bare list of messages.
+        final list = saved is Map ? saved['messages'] as List<Object?> : saved as List<Object?>;
         messages.addAll([for (final o in list) ChatMessage.fromJson(o as Map<String, Object?>)]);
+        _historyStart = saved is Map ? (saved['start'] as num? ?? 0).toInt() : 0;
         notifyListeners();
       } on Object catch (e) {
         _log('Saved conversation not readable ($e)');
@@ -451,20 +458,41 @@ class AppState extends ChangeNotifier {
 
   Thinking get _thinking => !thinkingSupported ? Thinking.none : (settings.thinking ? Thinking.on : Thinking.off);
 
-  /// The prompt for `user` with as much history as fits the context (oldest
-  /// turns dropped first, counted with the model's own tokenizer).
+  /// Messages before this index are no longer replayed to the model (they stay on screen).
+  int _historyStart = 0;
+  int get historyStart => _historyStart;
+
+  /// The prompt for `user` with the history from _historyStart. When it no
+  /// longer fits the context, the history is compacted in one step: the
+  /// oldest turns go until it fills at most half of the room, counted with
+  /// the model's own tokenizer. Dropping one turn per message instead would
+  /// change the start of every prompt, and the engine would process the
+  /// whole conversation again for each message (minutes on a large MoE);
+  /// this way the following messages extend the same prompt, and the cost
+  /// comes once every many messages.
   Future<String> _prompt(String user) async {
-    final history = [
-      for (final m in messages)
-        if (m.error == null && !m.streaming) Turn(user: m.promptUser, exact: m.exact)
-    ];
     final budget = settings.contextLength - settings.maxTokens;
     final system = await _systemBlock();
-    while (true) {
-      final prompt = template.build(system, history, user, _thinking);
-      if (history.isEmpty || await engine.countTokens(prompt) <= budget) return prompt;
-      history.removeAt(0);
+    List<Turn> history() => [
+          for (final m in messages.skip(_historyStart.clamp(0, messages.length)))
+            if (m.error == null && !m.streaming) Turn(user: m.promptUser, exact: m.exact)
+        ];
+    var turns = history();
+    var prompt = template.build(system, turns, user, _thinking);
+    if (turns.isEmpty || await engine.countTokens(prompt) <= budget) return prompt;
+    final before = await engine.countTokens(prompt);
+    final dropped = _historyStart;
+    final base = await engine.countTokens(template.build(system, const [], user, _thinking));
+    while (turns.isNotEmpty) {
+      final rest = await engine.countTokens(prompt) - base;
+      if (rest <= (budget - base) ~/ 2) break;
+      ++_historyStart;
+      turns = history();
+      prompt = template.build(system, turns, user, _thinking);
     }
+    _log('Conversation compacted: ${_historyStart - dropped} older messages left out of the model\'s context '
+        '($before -> ${await engine.countTokens(prompt)} prompt tokens)');
+    return prompt;
   }
 
   // Typing ahead: while the user writes, the stable part of the draft (whole
@@ -660,6 +688,7 @@ class AppState extends ChangeNotifier {
     if (generating) return;
     messages.clear();
     _drafted = '';
+    _historyStart = 0;
     unawaited(_discardConversation());
     notifyListeners();
   }

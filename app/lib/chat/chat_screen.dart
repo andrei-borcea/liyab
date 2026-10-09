@@ -145,7 +145,12 @@ class _ChatScreenState extends State<ChatScreen> {
                             controller: _scroll,
                             padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
                             itemCount: app.messages.length,
-                            itemBuilder: (context, i) => MessageView(message: app.messages[i]),
+                            itemBuilder: (context, i) => i > 0 && i == app.historyStart
+                                ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                                    const _ContextCut(),
+                                    MessageView(message: app.messages[i]),
+                                  ])
+                                : MessageView(message: app.messages[i]),
                           ),
                   ),
                 ),
@@ -545,4 +550,26 @@ class RoundAction extends StatelessWidget {
       ),
     ),
   );
+}
+
+/// Where the conversation was compacted: the messages above are no longer in the model's context.
+class _ContextCut extends StatelessWidget {
+  const _ContextCut();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final style = theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(children: [
+        const Expanded(child: Divider()),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Text('Earlier messages are no longer in Liyab\'s memory', style: style),
+        ),
+        const Expanded(child: Divider()),
+      ]),
+    );
+  }
 }

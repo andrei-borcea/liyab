@@ -541,6 +541,11 @@ are called directly because the C API makes them thread-safe.
   FFN skipping, 2:4 sparse FFN (TDSS), the persistent prefix KV cache (KV dedup), lookup speculative decoding and its
   draft length, MoE expert mass and experts per token, requantized resident matrices, KV cache format and thread
   count. The app's `libliyab.so` is built with `LIYAB_ENABLE_EXPERIMENTAL=ON` for this; everything is off by default.
+* **Long conversations.** When the history no longer fits the context, it is compacted in one step: the oldest
+  turns leave the model's context until the history fills at most half of the room (a line in the chat marks the
+  cut; the messages stay on screen). Dropping one turn per message instead would change the start of every prompt,
+  and the engine would process the whole conversation again for each message; this way the following messages
+  extend the same prompt and the cost comes once every many messages. The cut is saved with the conversation.
 * **Typing ahead.** While the user writes, the stable part of the draft (whole words, cut where its tokens are a
   prefix of the text so far, since a hybrid model's context is reused only up to the snapshot at the end of a
   prefill) is processed in the background, 0.6 s after the last keystroke. Sending then costs only the last words
