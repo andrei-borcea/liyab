@@ -45,8 +45,10 @@ echo "==> Built $APK ($(du -h "$APK" | cut -f1))"
 if [[ "$INSTALL" == 1 ]]; then
   # The process alone is no sign of use: the notification listener and a
   # backgrounded chat keep it alive indefinitely.
+  # On screen means the screen is on too: with it off, Liyab can be the resumed activity unseen.
   in_use() {
-    adb shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat ||
+    { adb shell dumpsys power | grep -q 'mWakefulness=Awake' &&
+      adb shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat; } ||
       adb shell dumpsys activity services com.liyab.chat | grep -q 'isForeground=true'
   }
   while in_use; do
