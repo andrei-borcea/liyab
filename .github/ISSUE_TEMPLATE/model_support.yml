@@ -1,0 +1,29 @@
+name: Model support
+description: Ask for a model or architecture Liyab does not run yet.
+labels: [model-support]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Name and a link to the GGUF (for example on Hugging Face).
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: general.architecture
+      description: The architecture string in the GGUF metadata.
+      placeholder: gemma3
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model
+      description: What you want to use it for, and on which devices.
+  - type: textarea
+    id: details
+    attributes:
+      label: What is different
+      description: New block types, attention variants, RoPE scaling, tokenizer pre-tokenizer, or anything else you know about.

@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as the README describes.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Phone or computer, SoC, RAM, OS version (the first lines of `liyab-cli --device` are ideal).
+      placeholder: Xiaomi 25010PN30G, Snapdragon 8 Elite, 15 GB, Android 15 (HyperOS)
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: GGUF file name and quantization.
+      placeholder: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - Engine / liyab-cli
+        - C ABI / embedding in another app
+        - Liyab app
+        - Local API (OpenAI / Anthropic / gRPC)
+        - Build scripts
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Command and logs
+      description: The command line or app steps, and the output (`LIYAB_LOG=info` for the CLI; the Activity log in the app). Remove anything personal.
+      render: text

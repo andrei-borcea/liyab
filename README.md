@@ -1037,7 +1037,8 @@ tests/                  self-contained unit tests and benchmarks
 app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), lib/agent (tools),
                         lib/api (local OpenAI / Anthropic / gRPC API), proto/ (gRPC interface)
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
-docs/brand/             the Liyab mark, app icon and the README's animated images (tools/gen_brand_svgs.py)
+docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
+                        (tools/gen_brand_svgs.py)
 scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh
 ```
 
@@ -1057,6 +1058,11 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   [architecture mapping layer](#roadmap) lands.
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64
   device for kernel changes, and `flutter analyze && flutter test` in `app/` for app changes.
+
+The full guide is in [CONTRIBUTING.md](CONTRIBUTING.md). Issues have templates for bugs, features and **model
+support requests**; results from devices we have not tested are welcome. Report security problems privately (see
+[SECURITY.md](SECURITY.md)); everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md). If you use Liyab in your
+work, [CITATION.cff](CITATION.cff) has the citation.
 
 ## License
 

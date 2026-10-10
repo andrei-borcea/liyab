@@ -13,7 +13,8 @@ app/assets/fonts), so the images render in the brand's type everywhere.
 
 Usage:  pip install fonttools && python3 tools/gen_brand_svgs.py
 Writes: docs/brand/liyab-banner.svg, liyab-flame.svg, liyab-states.svg,
-        liyab-heat.svg, liyab-palette.svg
+        liyab-heat.svg, liyab-palette.svg, liyab-social.svg (the repository's social
+        preview; GitHub needs it as PNG: liyab-social.png, a 1280x640 screenshot of it)
 """
 import base64
 import io
@@ -81,6 +82,8 @@ def font_face(file, family, axes, text):
     sub.subset(font)
     buf = io.BytesIO()
     font.flavor = "woff"
+    font.recalcTimestamp = False  # the same input gives the same bytes (no "modified" timestamp)
+    font["head"].modified = font["head"].created
     font.save(buf)
     data = base64.b64encode(buf.getvalue()).decode()
     return f"@font-face{{font-family:'{family}';src:url(data:font/woff;base64,{data}) format('woff');}}"
@@ -293,10 +296,32 @@ def palette():
                style("Bricolage Grotesque", text, strong))
 
 
+def social():
+    """The repository's social preview (1280x640, GitHub's size), rasterized to PNG for upload."""
+    title, tagline = "Liyab", "Large open language models on the device in your pocket"
+    facts = ["A 22 GB mixture-of-experts model, streamed from flash, on a phone",
+             "Paced by the phone's thermal forecast: cool to the touch",
+             "Private by construction: nothing leaves the device"]
+    body = [f'<rect width="1280" height="640" fill="{KILN}"/>',
+            f'<rect x="0" y="628" width="1280" height="12" fill="url(#bar)"/>',
+            placed(40, 110, 420, flame("p", "thinking", heat=0.45, seed=5)),
+            f'<text x="480" y="250" class="d" font-size="150" fill="{ASH}" letter-spacing="-4">{title}</text>',
+            f'<text x="486" y="310" class="t" font-size="27" fill="{ASH}">{tagline}</text>']
+    for i, fact in enumerate(facts):
+        y = 390 + i * 52
+        body.append(f'<circle cx="496" cy="{y - 9}" r="6" fill="{(FLARE, EMBER, GOLD)[i]}"/>')
+        body.append(f'<text x="516" y="{y}" class="t" font-size="24" fill="{SMOKE}">{fact}</text>')
+    body.append(f'<text x="486" y="580" class="s" font-size="22" fill="{EMBER}">github.com/andrei-borcea/liyab</text>')
+    defs = (style(title, tagline + "".join(facts), "github.com/andrei-borcea/liyab") +
+            f'<defs><linearGradient id="bar"><stop offset="0" stop-color="{FLARE}"/><stop offset="0.5" stop-color="{EMBER}"/>'
+            f'<stop offset="1" stop-color="{GOLD}"/></linearGradient></defs>')
+    return svg(1280, 640, "".join(body), "Liyab: large open language models on the device in your pocket", defs)
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for name, make in (("liyab-banner.svg", banner), ("liyab-flame.svg", flame_only), ("liyab-states.svg", states),
-                       ("liyab-heat.svg", heat), ("liyab-palette.svg", palette)):
+                       ("liyab-heat.svg", heat), ("liyab-palette.svg", palette), ("liyab-social.svg", social)):
         data = make()
         (OUT / name).write_text(data)
         print(f"{name}: {len(data) / 1024:.0f} KiB")

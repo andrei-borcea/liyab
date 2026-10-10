@@ -1,0 +1,21 @@
+name: Feature request
+description: An idea for the engine, the app or the API.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: How it could work. Note whether it would change the model's output (lossy) or not.
+  - type: textarea
+    id: measure
+    attributes:
+      label: How to measure it
+      description: How we would know it helps (speed, latency, memory, energy, quality).

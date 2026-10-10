@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use Liyab in your work, please cite it as below."
+title: "Liyab: on-device inference for large open language models"
+abstract: >-
+  A C++20 inference engine for GGUF language models on phones and laptops: models larger than RAM streamed from
+  flash, thermal-aware pacing, context reuse and prefix caching for hybrid and mixture-of-experts models, and a
+  private on-device assistant built on it.
+authors:
+  - given-names: Andrei
+    family-names: Borcea
+repository-code: "https://github.com/andrei-borcea/liyab"
+license: Apache-2.0
+version: 0.1.0
+keywords:
+  - on-device AI
+  - LLM inference
+  - GGUF
+  - mixture of experts
+  - mobile
+  - Android
+  - iOS
+  - privacy
