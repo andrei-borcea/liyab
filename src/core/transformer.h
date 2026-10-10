@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "core/expert_store.h"
+#include "core/quant.h"
 #include "liyab/backend.h"
 #include "liyab/experimental/forward_hooks.h"
 #include "liyab/kv_cache.h"
@@ -185,6 +186,15 @@ public:
     static constexpr double kComfortableCache = 0.15;
     // KV memory the automatic context length is sized for.
     static constexpr size_t kKvBudgetBytes = size_t{256} << 20;
+    // Attention cuts each token's visible positions into min(kAttentionMaxSpans,
+    // visible / kAttentionMinSpan) equal spans (at least one) and merges them
+    // in order: a function of the token's own position, whatever the batch or
+    // the threads (see attention()). The spans are a decoding step's tasks, so
+    // they must split evenly among the threads: the 2 KV heads of Qwen3.6
+    // give 168 tasks at most, a multiple of 1-4 and 6-8 threads. With 32 tasks
+    // (16 spans), 7 threads took 5 tasks' time for 4.6 tasks' work.
+    static constexpr int32_t kAttentionMinSpan = 32;
+    static constexpr int32_t kAttentionMaxSpans = 84;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
@@ -420,6 +430,7 @@ private:
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
     std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
+    std::vector<quant::BlockQ8_0> q8_queries_;          // attention: Q8_0 queries for quantized caches
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch

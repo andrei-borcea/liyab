@@ -80,7 +80,8 @@ struct EngineConfig {
     // MoE with streamed experts: a chosen expert that is not in RAM yet is
     // skipped instead of waited for when, for every token using it, its
     // router weight is below this share of the token's experts (the others
-    // renormalized). Lossy, opt-in: cuts stalls on low-impact experts. 0: off.
+    // renormalized). Lossy, opt-in: cuts stalls on low-impact experts, and the
+    // output then depends on I/O timing. 0: off.
     float moe_skip_slow = 0.0f;
     // Prefix cache, MiB of RAM at most (0: off): contexts another
     // conversation's prompt replaced are kept (KV pages, recurrent states and
@@ -159,8 +160,11 @@ public:
     // of every prompt and prefill (Transformer::snapshot_state), so an edited
     // last reply or a dropped turn recomputes only what follows that point.
     // Output is the same as from a fresh context, except that a reused reply
-    // keeps the tokenization it was generated with. Not reentrant: a
-    // concurrent call returns ErrorCode::Busy.
+    // keeps the tokenization it was generated with. On the CPU backend it is
+    // also the same bits however the prompt was split into passes, however
+    // many threads ran and whatever the expert cache held or I/O timing did,
+    // so greedy decoding is reproducible (moe_skip_slow aside). Not
+    // reentrant: a concurrent call returns ErrorCode::Busy.
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
     // Same, with forced continuations (see ForceCallback; not with a draft

@@ -58,13 +58,16 @@ bool benchmarks_enabled() {
     return v == nullptr || std::strcmp(v, "0") != 0;
 }
 
+// Shared by the cases: written once, removed at exit (a device run must leave
+// nothing in TMPDIR).
 const std::string& tiny_model() {
-    static const std::string path = [] {
-        std::string p = temp_path("tiny.gguf");
-        test::write_tiny_model(p);
-        return p;
-    }();
-    return path;
+    struct Written {
+        std::string path = temp_path("tiny.gguf");
+        Written() { test::write_tiny_model(path); }
+        ~Written() { std::remove(path.c_str()); }
+    };
+    static const Written written;
+    return written.path;
 }
 
 std::unique_ptr<Transformer> load(const std::string& path, int32_t ctx = 0) {

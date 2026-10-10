@@ -387,8 +387,8 @@ float dot_q4_k(const BlockQ4_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
             part[2 * j + 1] = vdot(vdot(vzero, vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4)), q8bytes.val[2]),
                                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4)), q8bytes.val[3]);
         }
-        sum += y[i].d * (h2f(x[i].d) * static_cast<float>(scaled_sum8(part, scales)) -
-                         h2f(x[i].dmin) * static_cast<float>(k4_min_sum(mins, y[i].bsums)));
+        sum = epilogue_k4(sum, y[i].d, h2f(x[i].d), h2f(x[i].dmin), scaled_sum8(part, scales),
+                          k4_min_sum(mins, y[i].bsums));
     }
     return sum;
 }
@@ -423,8 +423,8 @@ float dot_q5_k(const BlockQ5_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
                 vdot(vdot(vzero, vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q5bits.val[0], 4), h2)), q8bytes.val[2]),
                      vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q5bits.val[1], 4), h3)), q8bytes.val[3]);
         }
-        sum += y[i].d * (h2f(x[i].d) * static_cast<float>(scaled_sum8(part, scales)) -
-                         h2f(x[i].dmin) * static_cast<float>(k4_min_sum(mins, y[i].bsums)));
+        sum = epilogue_k4(sum, y[i].d, h2f(x[i].d), h2f(x[i].dmin), scaled_sum8(part, scales),
+                          k4_min_sum(mins, y[i].bsums));
     }
     return sum;
 }
@@ -488,7 +488,7 @@ float dot_q6_k(const BlockQ6_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
         acc = vmlaq_s32(acc, t1, vmovl_s16(vget_high_s16(sc_lo)));
         acc = vmlaq_s32(acc, t2, vmovl_s16(vget_low_s16(sc_hi)));
         acc = vmlaq_s32(acc, t3, vmovl_s16(vget_high_s16(sc_hi)));
-        sum += y[i].d * h2f(x[i].d) * static_cast<float>(vaddvq_s32(acc) - 32 * vaddvq_s32(mins));
+        sum = epilogue_scaled(sum, y[i].d, h2f(x[i].d), static_cast<float>(vaddvq_s32(acc) - 32 * vaddvq_s32(mins)));
     }
     return sum;
 }
@@ -498,7 +498,8 @@ float dot_q6_k(const BlockQ6_K* x, const BlockQ8_K* y, int64_t nb) noexcept {
 // decoded once into int8 vectors and dotted with every row; sub-block scales
 // are applied right away, so a row needs one int32 accumulator and NR <= 4
 // fits the 32 NEON registers. Results equal NR calls of the single-row
-// kernel up to float summation order.
+// kernel bit for bit: both end each super-block with the same epilogue
+// (epilogue_k4 / epilogue_scaled, quant.h).
 template <int NR>
 void dot_q4_k_rows(const BlockQ4_K* x, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
     const uint8x16_t m4 = vdupq_n_u8(0xF);
@@ -527,8 +528,7 @@ void dot_q4_k_rows(const BlockQ4_K* x, const BlockQ8_K* const* y, int64_t nb, fl
         const float d = h2f(x[i].d);
         const float dmin = h2f(x[i].dmin);
         for (int r = 0; r < NR; ++r) {
-            sum[r] += y[r][i].d * (d * static_cast<float>(vaddvq_s32(acc[r])) -
-                                   dmin * static_cast<float>(k4_min_sum(mins, y[r][i].bsums)));
+            sum[r] = epilogue_k4(sum[r], y[r][i].d, d, dmin, vaddvq_s32(acc[r]), k4_min_sum(mins, y[r][i].bsums));
         }
     }
     for (int r = 0; r < NR; ++r) out[r] = sum[r];
@@ -571,8 +571,7 @@ void dot_q5_k_rows(const BlockQ5_K* x, const BlockQ8_K* const* y, int64_t nb, fl
         const float d = h2f(x[i].d);
         const float dmin = h2f(x[i].dmin);
         for (int r = 0; r < NR; ++r) {
-            sum[r] += y[r][i].d * (d * static_cast<float>(vaddvq_s32(acc[r])) -
-                                   dmin * static_cast<float>(k4_min_sum(mins, y[r][i].bsums)));
+            sum[r] = epilogue_k4(sum[r], y[r][i].d, d, dmin, vaddvq_s32(acc[r]), k4_min_sum(mins, y[r][i].bsums));
         }
     }
     for (int r = 0; r < NR; ++r) out[r] = sum[r];
@@ -627,7 +626,7 @@ void dot_q6_k_rows(const BlockQ6_K* x, const BlockQ8_K* const* y, int64_t nb, fl
         }
         const float d = h2f(x[i].d);
         for (int r = 0; r < NR; ++r) {
-            sum[r] += y[r][i].d * d * static_cast<float>(vaddvq_s32(acc[r]) - 32 * mins[r]);
+            sum[r] = epilogue_scaled(sum[r], y[r][i].d, d, static_cast<float>(vaddvq_s32(acc[r]) - 32 * mins[r]));
         }
     }
     for (int r = 0; r < NR; ++r) out[r] = sum[r];

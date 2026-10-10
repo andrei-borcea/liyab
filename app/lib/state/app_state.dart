@@ -136,11 +136,20 @@ class AppState extends ChangeNotifier implements ApiBackend {
   String? _released; // the model unloaded while idle
 
   void _leftScreen() {
-    _releaseTimer?.cancel();
     unawaited(_park());
+    _armRelease();
+  }
+
+  /// While hidden, the model is unloaded device.releaseAfterMinutes after the last use: leaving the screen, or a
+  /// request of another app through the local API (which loads the model again if it was released).
+  void _armRelease() {
+    _releaseTimer?.cancel();
     final minutes = device.releaseAfterMinutes;
     if (minutes > 0) _releaseTimer = Timer(Duration(minutes: minutes), _releaseIdle);
   }
+
+  /// Generations of the local API queued or running: the model is not released under them.
+  int _apiGenerations = 0;
 
   Future<void> _park() async {
     _parkRetry?.cancel();
@@ -166,7 +175,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<void> _releaseIdle() async {
     final path = modelPath;
     if (path == null || _released != null) return;
-    if (generating || loading || moving != null) {
+    if (generating || loading || moving != null || _apiGenerations > 0) {
       _releaseTimer = Timer(const Duration(minutes: 1), _releaseIdle); // busy: try again later
       return;
     }
@@ -304,6 +313,8 @@ class AppState extends ChangeNotifier implements ApiBackend {
     } else if (loading) {
       await _pendingLoad;
     }
+    // Hidden, the model would otherwise stay loaded (several GB in the background, which HyperOS stops apps for).
+    if (_away) _armRelease();
     if (!engine.loaded) throw const ApiError(503, 'no model is loaded in Liyab');
   }
 
@@ -313,7 +324,27 @@ class AppState extends ChangeNotifier implements ApiBackend {
   @override
   Generation generate(String prompt, SamplingOptions sampling) {
     _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
-    return engine.generate(prompt, sampling);
+    final generation = engine.generate(prompt, sampling);
+    ++_apiGenerations;
+    var ended = false;
+    void end() {
+      if (ended) return;
+      ended = true;
+      --_apiGenerations;
+      if (_away) _armRelease(); // counted from the last request
+    }
+
+    // The events pass through unchanged; their end (or the client going away) ends the request.
+    final events = StreamController<GenerationEvent>();
+    final source = generation.events.listen(events.add, onError: events.addError, onDone: () {
+      end();
+      events.close();
+    });
+    events.onCancel = () {
+      end();
+      return source.cancel();
+    };
+    return Generation(events.stream, generation.stop);
   }
 
   /// Whether the engine's context is this chat's once the commands queued so far have run (another app's request

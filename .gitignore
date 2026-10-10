@@ -10,3 +10,6 @@ compile_commands.json
 
 # Models are never committed
 *.gguf
+
+# Python bytecode (scripts importing scripts/)
+__pycache__/

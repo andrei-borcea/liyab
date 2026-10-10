@@ -9,7 +9,8 @@
 # APK is signed with build/liyab-debug.keystore (created here if missing):
 # keep it, an APK signed with another key cannot update the installed app.
 # --install never interrupts the app: it waits while Liyab is on screen or runs
-# a foreground service (a model download), then installs, which restarts it.
+# a foreground service (a model download), then installs; Liyab starts again
+# when it is next opened.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
 # macOS requires Flutter, Xcode, cmake. The engine is linked statically into
 # the app (app/macos/Runner/Configs/Engine.xcconfig); `flutter run -d macos`
@@ -83,6 +84,7 @@ if [[ "$INSTALL" == 1 ]]; then
     sleep 10
   done
   adb install -r "$APK"
-  adb shell monkey -p com.liyab.chat -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
-  echo "==> Installed and launched com.liyab.chat"
+  # Installing stops the app, and it stays stopped until opened: launched over another app it got in the owner's
+  # way, and launched with the screen off it never saw itself leave the screen, so it never released its model.
+  echo "==> Installed com.liyab.chat; open it once to start it again (its local API starts with it)"
 fi

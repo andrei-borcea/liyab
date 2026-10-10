@@ -42,4 +42,5 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release            # add -DLIYAB
 cmake --build build
 ctest --test-dir build --output-on-failure
 scripts/build_android.sh --experimental                             # then push build/android/arm64-v8a/test_* via adb
+scripts/phone_regression.py --note "what changed"                   # every build: device tests, CLI + app chat vs earlier runs
 ```

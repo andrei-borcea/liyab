@@ -96,7 +96,7 @@ typedef struct liyab_engine_config {
     float egls_threshold;         /* default 0.002 */
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
     const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
-    float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy); 0 off */
+    float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy; output then depends on I/O timing); 0 off */
     int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one; 0 off (see EngineConfig) */
     const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
@@ -205,7 +205,9 @@ typedef size_t (*liyab_force_callback)(const char* generated, size_t generated_l
                                        void* user_data);
 
 /* Blocking generation; `stats` may be NULL. Cancellation is not an error:
- * it returns LIYAB_OK with stats->cancelled = 1. */
+ * it returns LIYAB_OK with stats->cancelled = 1. On the CPU backend greedy
+ * output is reproducible: it does not depend on how the prompt was split,
+ * the threads, the expert cache or I/O timing (see Engine::generate). */
 LIYAB_C_API liyab_status liyab_engine_generate(liyab_engine* engine, const char* prompt,
                                                const liyab_sampling_params* params, liyab_token_callback callback,
                                                void* user_data, liyab_generation_stats* stats);

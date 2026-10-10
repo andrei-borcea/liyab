@@ -6,6 +6,7 @@
 #ifndef LIYAB_CORE_QUANT_H
 #define LIYAB_CORE_QUANT_H
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -69,6 +70,30 @@ static_assert(sizeof(BlockQ5_0) == 22, "Q5_0 block must match GGML layout");
 static_assert(sizeof(BlockQ5_1) == 24, "Q5_1 block must match GGML layout");
 static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block must match GGML layout");
 
+// Float epilogues of one block, shared by every CPU kernel of its format: the
+// single-row and multi-row kernels on the file's layout (quant.cpp,
+// quant_lowbit.cpp) and the repacked gemv / gemm (quant_repack.cpp, which
+// apply the same operations lane by lane with vfmsq_f32 / vfmaq_f32). From
+// the block's exact integer sums they take these fused multiply-adds in this
+// order, so a row's result does not depend on which kernel computed it: a
+// streamed expert's layout follows how it was read (I/O timing), and a
+// token's batch how its prompt was split. Any other rounding there made the
+// same prompt give two different greedy replies.
+//
+// Q4_K / Q5_K, per super-block: `sumi` = sum of scale x (values . activations),
+// `mins` = sum of min x (sum of the activations), `d8` the activations' scale.
+inline float epilogue_k4(float acc, float d8, float d, float dmin, int32_t sumi, int32_t mins) noexcept {
+    acc = std::fma(-static_cast<float>(mins), dmin * d8, acc);
+    return std::fma(static_cast<float>(sumi), d * d8, acc);
+}
+// Q6_K per super-block (`sum` = sum of scale x ((values - 32) . activations))
+// and Q8_0 per 32-value block (`sum` = values . activations): the exact
+// integer, converted to float (rounded to nearest above 2^24, exact below,
+// which a Q8_0 block always is, so its kernels may convert several at once).
+inline float epilogue_scaled(float acc, float d8, float d, float sum) noexcept {
+    return std::fma(sum, d * d8, acc);
+}
+
 float fp16_to_fp32(uint16_t h) noexcept;
 uint16_t fp32_to_fp16(float f) noexcept;
 
@@ -96,7 +121,7 @@ float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept;
 // The same Q8_0 weight row against `rows` activation rows (x[r] = row r's
-// blocks): out[r] = dot_q8_0_q8_0(w, x[r], n), up to float summation order.
+// blocks): out[r] = dot_q8_0_q8_0(w, x[r], n), bit for bit.
 void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
 float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept;
 float dot_f32(const float* a, const float* b, int64_t n) noexcept;

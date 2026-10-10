@@ -837,13 +837,35 @@ float dot_quantized(DType type, const void* row, const BlockQ8_0* x, const int32
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept {
     const int64_t nb = n / kBlock;
 #if defined(LIYAB_NEON)
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    for (int64_t i = 0; i < nb; ++i) {
-        int32x4_t s = dot_i8x16(vdupq_n_s32(0), vld1q_s8(w[i].qs), vld1q_s8(x[i].qs));
-        s = dot_i8x16(s, vld1q_s8(w[i].qs + 16), vld1q_s8(x[i].qs + 16));
-        acc = vmlaq_n_f32(acc, vcvtq_f32_s32(s), fp16_to_fp32(w[i].d) * fp16_to_fp32(x[i].d));
+    // Each block's exact integer sum, then the epilogue every Q8_0 kernel
+    // shares (quant.h), the repacked Q8_0_R4 ones included, block after block.
+    // Four blocks' sums are reduced together by pairwise integer adds and
+    // converted in one vector: exact below 2^24, so the same floats as one
+    // conversion per block, without a horizontal add and a trip through a
+    // general register for each (that cost the attention scores, which use
+    // this kernel on a Q8_0 KV cache, 19% at 3000 positions).
+    float acc = 0.0f;
+    int64_t i = 0;
+    for (; i + 4 <= nb; i += 4) {
+        int32x4_t s[4];
+        for (int k = 0; k < 4; ++k) {
+            const BlockQ8_0& a = w[i + k];
+            const BlockQ8_0& b = x[i + k];
+            s[k] = dot_i8x16(dot_i8x16(vdupq_n_s32(0), vld1q_s8(a.qs), vld1q_s8(b.qs)), vld1q_s8(a.qs + 16),
+                             vld1q_s8(b.qs + 16));
+        }
+        const float32x4_t sums = vcvtq_f32_s32(vpaddq_s32(vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3])));
+        acc = epilogue_scaled(acc, fp16_to_fp32(x[i].d), fp16_to_fp32(w[i].d), vgetq_lane_f32(sums, 0));
+        acc = epilogue_scaled(acc, fp16_to_fp32(x[i + 1].d), fp16_to_fp32(w[i + 1].d), vgetq_lane_f32(sums, 1));
+        acc = epilogue_scaled(acc, fp16_to_fp32(x[i + 2].d), fp16_to_fp32(w[i + 2].d), vgetq_lane_f32(sums, 2));
+        acc = epilogue_scaled(acc, fp16_to_fp32(x[i + 3].d), fp16_to_fp32(w[i + 3].d), vgetq_lane_f32(sums, 3));
     }
-    return vaddvq_f32(acc);
+    for (; i < nb; ++i) {
+        const int32x4_t s = dot_i8x16(dot_i8x16(vdupq_n_s32(0), vld1q_s8(w[i].qs), vld1q_s8(x[i].qs)),
+                                      vld1q_s8(w[i].qs + 16), vld1q_s8(x[i].qs + 16));
+        acc = epilogue_scaled(acc, fp16_to_fp32(x[i].d), fp16_to_fp32(w[i].d), static_cast<float>(vaddvq_s32(s)));
+    }
+    return acc;
 #else
     float sum = 0.0f;
     for (int64_t i = 0; i < nb; ++i) {
@@ -859,22 +881,30 @@ float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept 
 namespace {
 
 // dot_q8_0_q8_0 for NR activation rows: each weight block is loaded and its
-// scale converted once.
+// scale converted once. Lane r of `acc` runs row r's epilogue chain (quant.h),
+// acc_r = fma(sum_r, dw * d8_r, acc_r) block after block: the rows' block sums
+// are reduced together and converted in one vector (exact, see
+// dot_q8_0_q8_0), and one vector fused multiply-add serves them all.
 template <int NR>
 void dot_q8_0_rows_neon(const BlockQ8_0* w, const BlockQ8_0* const* x, int64_t nb, float* out) noexcept {
-    float32x4_t acc[NR];
-    for (int r = 0; r < NR; ++r) acc[r] = vdupq_n_f32(0.0f);
+    static_assert(NR >= 1 && NR <= 4);
+    float32x4_t acc = vdupq_n_f32(0.0f);
     for (int64_t i = 0; i < nb; ++i) {
         const int8x16_t lo = vld1q_s8(w[i].qs);
         const int8x16_t hi = vld1q_s8(w[i].qs + 16);
-        const float dw = fp16_to_fp32(w[i].d);
+        int32x4_t s[4] = {vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+        float d8[4] = {};
         for (int r = 0; r < NR; ++r) {
-            const int32x4_t s =
-                dot_i8x16(dot_i8x16(vdupq_n_s32(0), lo, vld1q_s8(x[r][i].qs)), hi, vld1q_s8(x[r][i].qs + 16));
-            acc[r] = vmlaq_n_f32(acc[r], vcvtq_f32_s32(s), dw * fp16_to_fp32(x[r][i].d));
+            s[r] = dot_i8x16(dot_i8x16(vdupq_n_s32(0), lo, vld1q_s8(x[r][i].qs)), hi, vld1q_s8(x[r][i].qs + 16));
+            d8[r] = fp16_to_fp32(x[r][i].d);
         }
+        const float32x4_t sums = vcvtq_f32_s32(vpaddq_s32(vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3])));
+        // d8_r * dw: the product epilogue_scaled forms as d * d8 (one rounding, commutative).
+        acc = vfmaq_f32(acc, sums, vmulq_n_f32(vld1q_f32(d8), fp16_to_fp32(w[i].d)));
     }
-    for (int r = 0; r < NR; ++r) out[r] = vaddvq_f32(acc[r]);
+    float lanes[4];
+    vst1q_f32(lanes, acc);
+    for (int r = 0; r < NR; ++r) out[r] = lanes[r];
 }
 
 }  // namespace

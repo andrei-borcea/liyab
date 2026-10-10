@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -41,14 +42,23 @@ test::TinyModelSpec f32_spec() {
     return s;
 }
 
+// The models the cases share, written once per process and removed at exit
+// (a device run must leave nothing in TMPDIR). A deque, so the paths handed
+// out stay valid as more models are written.
 const std::string& model_path(const std::string& name, const test::TinyModelSpec& spec) {
-    static std::vector<std::pair<std::string, std::string>> written;
-    for (const auto& [n, p] : written) {
+    struct Written {
+        std::deque<std::pair<std::string, std::string>> files;
+        ~Written() {
+            for (const auto& file : files) std::remove(file.second.c_str());
+        }
+    };
+    static Written written;
+    for (const auto& [n, p] : written.files) {
         if (n == name) return p;
     }
-    written.emplace_back(name, temp_path(name + ".gguf"));
-    test::write_tiny_model(written.back().second, spec);
-    return written.back().second;
+    written.files.emplace_back(name, temp_path(name + ".gguf"));
+    test::write_tiny_model(written.files.back().second, spec);
+    return written.files.back().second;
 }
 
 const std::string& mixed_model() { return model_path("mixed", {}); }
@@ -704,6 +714,109 @@ TEST_CASE("CPU backend on repacked weights: any batch size gives each row's sing
     }
 }
 
+// Reproducibility rests on this: whichever kernel computes a row (one
+// activation row or several, the file's layout or the repacked one a streamed
+// expert gets when read for a batched pass), the result is the same bits. The
+// same prompt otherwise gave two different greedy replies, since the layout
+// follows I/O timing and the batch follows how the prompt was split.
+TEST_CASE("Every weight format: a row's result is the same bits whatever the batch or the layout") {
+    std::vector<QuantVector> vectors;
+    if (!load_quant_vectors(vectors)) return;
+    std::mt19937 rng(43);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const bool i8mm = quant::repack_kernels_available() && detect_cpu().i8mm;
+    constexpr int64_t rows = 16;  // whole groups of every repacked layout (8 or 4 rows)
+    constexpr int32_t batch = 6;  // single-row, 2-4-row and 4 + remainder kernels
+    // The 24 reference formats, and F32 / F16 rows written here.
+    std::vector<std::pair<DType, std::vector<uint8_t>>> formats;
+    for (const QuantVector& qv : vectors) {
+        if (std::none_of(formats.begin(), formats.end(), [&](const auto& f) { return f.first == qv.type; })) {
+            formats.emplace_back(qv.type, qv.blocks);
+        }
+    }
+    for (const DType type : {DType::F32, DType::F16}) {
+        std::vector<float> v(256);
+        for (float& e : v) e = normal(rng);
+        std::vector<uint8_t> bytes(v.size() * dtype_traits(type).block_bytes);
+        quant::quantize_row(type, v.data(), bytes.data(), static_cast<int64_t>(v.size()));
+        formats.emplace_back(type, std::move(bytes));
+    }
+    int checked = 0;
+    for (const auto& [type, blocks] : formats) {
+        const DTypeTraits traits = dtype_traits(type);
+        const size_t block_bytes = traits.block_bytes;
+        const auto n_blocks = static_cast<int64_t>(blocks.size() / block_bytes);
+        const int64_t cols = n_blocks * traits.block_size;
+        // Row r: the blocks rotated by r, so the rows differ.
+        std::vector<uint8_t> file(static_cast<size_t>(rows) * blocks.size());
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                std::memcpy(file.data() + static_cast<size_t>(r * n_blocks + b) * block_bytes,
+                            blocks.data() + static_cast<size_t>((b + r) % n_blocks) * block_bytes, block_bytes);
+            }
+        }
+        TensorView w;
+        w.name = "w";
+        w.type = type;
+        w.n_dims = 2;
+        w.ne = {cols, rows, 1, 1};
+        w.data = file.data();
+        w.nbytes = file.size();
+        // Activations with a heavy tail, as real hidden states have.
+        std::vector<float> x(static_cast<size_t>(batch * cols));
+        for (float& v : x) v = normal(rng) * (rng() % 64 == 0 ? 8.0f : 1.0f);
+        std::vector<float> single(static_cast<size_t>(batch * rows));
+        for (int32_t t = 0; t < batch; ++t) {
+            REQUIRE(cpu->matmul(w, x.data() + t * cols, single.data() + t * rows, 1).is_ok());
+        }
+        auto same_bits = [&](const TensorView& m, int32_t n) {
+            std::vector<float> y(static_cast<size_t>(n * rows), -1.0f);
+            if (!cpu->matmul(m, x.data(), y.data(), n).is_ok()) return false;
+            return std::memcmp(y.data(), single.data(), y.size() * sizeof(float)) == 0;
+        };
+        const std::string name(traits.name);
+        for (int32_t n = 2; n <= batch; ++n) {
+            const bool same = same_bits(w, n);
+            if (!same) std::printf("  %s: %d rows at once differ from one at a time\n", name.c_str(), n);
+            CHECK(same);
+        }
+        // The formats with an i8mm layout: the repacked matrix gives the same bits too.
+        DType packed_type = type;
+        std::vector<uint8_t> packed(file.size());
+        if (i8mm && type == DType::Q4_K) {
+            quant::repack_q4_K_r8(reinterpret_cast<const quant::BlockQ4_K*>(file.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ4_Kx8*>(packed.data()));
+            packed_type = DType::Q4_K_R8;
+        } else if (i8mm && type == DType::Q5_K) {
+            quant::repack_q5_K_r8(reinterpret_cast<const quant::BlockQ5_K*>(file.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ5_Kx8*>(packed.data()));
+            packed_type = DType::Q5_K_R8;
+        } else if (i8mm && type == DType::Q6_K) {
+            quant::repack_q6_K_r8(reinterpret_cast<const quant::BlockQ6_K*>(file.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ6_Kx8*>(packed.data()));
+            packed_type = DType::Q6_K_R8;
+        } else if (i8mm && type == DType::Q8_0) {
+            quant::repack_q8_0_r4(reinterpret_cast<const quant::BlockQ8_0*>(file.data()), rows, cols,
+                                  reinterpret_cast<quant::BlockQ8_0x4*>(packed.data()));
+            packed_type = DType::Q8_0_R4;
+        }
+        if (packed_type != type) {
+            TensorView r = w;
+            r.type = packed_type;
+            r.data = packed.data();
+            for (int32_t n = 1; n <= batch; ++n) {
+                const bool same = same_bits(r, n);
+                if (!same) std::printf("  %s: the repacked layout differs (%d rows)\n", name.c_str(), n);
+                CHECK(same);
+            }
+        }
+        ++checked;
+    }
+    CHECK(checked == 26);
+}
+
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
     std::vector<QuantVector> vectors;
     if (!load_quant_vectors(vectors)) return;
@@ -1204,7 +1317,7 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
     for (size_t t = 0; t < tokens.size(); ++t) {
         auto one = stepwise->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::Last, route, pool);
         REQUIRE(one.has_value());
-        CHECK(max_abs_diff(one.value(), std::vector<float>(all_copy.begin() + t * vocab, all_copy.begin() + (t + 1) * vocab)) < 1e-4);
+        CHECK(max_abs_diff(one.value(), std::vector<float>(all_copy.begin() + t * vocab, all_copy.begin() + (t + 1) * vocab)) == 0.0);
     }
 
     // Roll back 4 positions and replay them: identical logits.
@@ -1212,7 +1325,7 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
     CHECK(batched->n_past() == 6);
     auto replay = batched->forward(std::span<const int32_t>(tokens).subspan(6), Transformer::Logits::All, route, pool);
     REQUIRE(replay.has_value());
-    CHECK(max_abs_diff(replay.value(), std::vector<float>(all_copy.begin() + 6 * vocab, all_copy.end())) < 1e-4);
+    CHECK(max_abs_diff(replay.value(), std::vector<float>(all_copy.begin() + 6 * vocab, all_copy.end())) == 0.0);
     CHECK(!batched->truncate(11).is_ok());
 }
 
@@ -1295,18 +1408,18 @@ static void check_repacked_model(DType ffn, DType packed, const char* name) {
     auto b = repacked->forward(tokens, Transformer::Logits::All, route, pool);
     REQUIRE(b.has_value());
     const std::vector<float> batched(b->begin(), b->end());
-    CHECK(max_abs_diff(batched, expected) < 1e-3);
+    CHECK(batched == expected);  // the repacked kernels round like the file-layout ones
     // One token at a time gives exactly the batch's logits (gemv == gemm).
     const auto vocab = static_cast<size_t>(stepwise->config().n_vocab);
     for (size_t t = 0; t < tokens.size(); ++t) {
         auto one = stepwise->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::Last, route, pool);
         REQUIRE(one.has_value());
         const std::vector<float> row(batched.begin() + t * vocab, batched.begin() + (t + 1) * vocab);
-        CHECK(max_abs_diff(*one, row) < 1e-4);
+        CHECK(max_abs_diff(*one, row) == 0.0);
     }
 }
 
-TEST_CASE("Streamed experts repacked on read (CPU i8mm): close to in-place experts, batch-size independent") {
+TEST_CASE("Streamed experts repacked on read (CPU i8mm): the same bits as in-place experts, whatever the batch") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");
         return;
@@ -1341,13 +1454,101 @@ TEST_CASE("Streamed experts repacked on read (CPU i8mm): close to in-place exper
     auto lb = b->forward(tokens, Transformer::Logits::All, route, pool);
     REQUIRE(lb.has_value());
     const std::vector<float> batched(lb->begin(), lb->end());
-    CHECK(max_abs_diff(batched, expected) < 1e-3);
+    // In place: the file's layout, plain resident matrices. Streamed: experts
+    // repacked as the batched pass reads them, resident matrices repacked at
+    // load. One token at a time (c), experts read for single-token passes
+    // stay in the file's layout. All three give the same bits.
+    CHECK(batched == expected);
     const auto vocab = static_cast<size_t>(c->config().n_vocab);
     for (size_t t = 0; t < tokens.size(); ++t) {
         auto one = c->forward(std::span<const int32_t>(&tokens[t], 1), Transformer::Logits::Last, route, pool);
         REQUIRE(one.has_value());
         const std::vector<float> row(batched.begin() + t * vocab, batched.begin() + (t + 1) * vocab);
-        CHECK(max_abs_diff(*one, row) < 1e-4);
+        CHECK(max_abs_diff(*one, row) == 0.0);
+    }
+}
+
+// A token's attention is cut into spans that follow its own position only. At a long context the logits are then the same bits
+// however the prompt was split into passes (typing ahead, chunked prefill,
+// speculative verification), whichever schedule ran the spans (a task per
+// span when decoding, a task per token in a large batch) and however many
+// threads the power manager left active; for every KV cache type, with a
+// sliding window and on a hybrid model too.
+TEST_CASE("Attention at a long context: the same bits whatever the batch, the threads or the KV cache type") {
+    test::TinyModelSpec attention_only;
+    attention_only.context_length = 2900;
+    test::TinyModelSpec hybrid = attention_only;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    // Tokens with 1 span, several, and the most a token gets.
+    const int32_t n = Transformer::kAttentionMinSpan * Transformer::kAttentionMaxSpans + 76;
+    std::vector<int32_t> tokens(static_cast<size_t>(n));
+    std::mt19937 rng(47);
+    for (int32_t& t : tokens) t = 3 + static_cast<int32_t>(rng() % 250);
+    const std::vector<int32_t> probes = {Transformer::kAttentionMinSpan - 1, 2 * Transformer::kAttentionMinSpan + 5,
+                                         700, n - 1};
+    struct Setup {
+        const char* model;
+        KvCacheType kv;
+        int32_t window;
+    };
+    std::vector<Setup> setups;
+    for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        setups.push_back({"long_attention", kv, 0});
+        setups.push_back({"long_attention", kv, 300});
+    }
+    setups.push_back({"long_hybrid", KvCacheType::Q8_0, 0});
+    for (const Setup& setup : setups) {
+        const bool is_hybrid = std::string_view(setup.model) == "long_hybrid";
+        const std::string& path = model_path(setup.model, is_hybrid ? hybrid : attention_only);
+        TransformerOptions options;
+        options.context_length = 2900;
+        options.kv_type = setup.kv;
+        options.sliding_window = setup.window;
+        options.sink_tokens = 4;
+        // The probes' logits, the tokens fed in passes of the `passes` sizes, then one at a time.
+        auto run = [&](ThreadPool& pool, const std::vector<int32_t>& passes) {
+            std::vector<std::vector<float>> out(probes.size());
+            auto model = load_transformer(path, options);
+            if (!model) return out;
+            auto cpu = make_cpu_backend(pool);
+            const Route route{cpu.get(), cpu.get(), cpu.get()};
+            const auto vocab = static_cast<size_t>(model->config().n_vocab);
+            int32_t at = 0;
+            size_t pass = 0;
+            while (at < n) {
+                const int32_t len = pass < passes.size() ? std::min(passes[pass++], n - at) : 1;
+                auto logits = model->forward(std::span<const int32_t>(tokens).subspan(static_cast<size_t>(at),
+                                                                                       static_cast<size_t>(len)),
+                                             Transformer::Logits::All, route, pool);
+                if (!logits) return out;
+                for (size_t p = 0; p < probes.size(); ++p) {
+                    if (probes[p] >= at && probes[p] < at + len) {
+                        const auto row = static_cast<size_t>(probes[p] - at);
+                        out[p].assign(logits->begin() + static_cast<std::ptrdiff_t>(row * vocab),
+                                      logits->begin() + static_cast<std::ptrdiff_t>((row + 1) * vocab));
+                    }
+                }
+                at += len;
+            }
+            return out;
+        };
+        ThreadPool four(4), one(1), shed(4);
+        shed.set_active_threads(2);
+        const auto whole = run(four, {n});                     // one pass: a task per (token, KV head)
+        const auto split = run(four, {1, 37, 255, 256, 1500});  // passes of every size, then decoding
+        const auto single = run(one, {300, 1700});             // one thread: other schedules
+        const auto shedded = run(shed, {2000});                // half the threads active, then decoding
+        for (size_t p = 0; p < probes.size(); ++p) {
+            REQUIRE(!whole[p].empty() && !split[p].empty() && !single[p].empty() && !shedded[p].empty());
+            const bool same = whole[p] == split[p] && whole[p] == single[p] && whole[p] == shedded[p];
+            if (!same) {
+                std::printf("  %s, kv %d, window %d: position %d differs\n", setup.model, static_cast<int>(setup.kv),
+                            setup.window, probes[p]);
+            }
+            CHECK(same);
+        }
     }
 }
 
@@ -1355,6 +1556,10 @@ TEST_CASE("Streamed experts repacked on read (CPU i8mm): close to in-place exper
 // query heads, 2 KV heads of 256): set LIYAB_BENCH_ATTENTION=1 to time it.
 TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
     if (std::getenv("LIYAB_BENCH_ATTENTION") == nullptr) return;
+    const int positions = std::max(1, std::atoi(std::getenv("LIYAB_BENCH_ATTENTION")) > 1
+                                          ? std::atoi(std::getenv("LIYAB_BENCH_ATTENTION"))
+                                          : 3000);  // LIYAB_BENCH_ATTENTION=N: N positions
+    const int steps = 20;
     test::TinyModelSpec spec;
     spec.arch = "qwen3";
     spec.n_layers = 1;
@@ -1362,18 +1567,15 @@ TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
     spec.n_ff = 64;
     spec.n_head = 16;
     spec.n_head_kv = 2;
-    spec.context_length = 4096;
+    spec.context_length = std::max(4096, positions + steps);
     const std::string& path = model_path("attention_bench", spec);
     ThreadPool pool(0);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
     TransformerOptions options;
-    options.context_length = 4096;
+    options.context_length = spec.context_length;
     auto model = load_transformer(path, options);
     REQUIRE(model != nullptr);
-    const int positions = std::max(1, std::atoi(std::getenv("LIYAB_BENCH_ATTENTION")) > 1
-                                          ? std::atoi(std::getenv("LIYAB_BENCH_ATTENTION"))
-                                          : 3000);  // LIYAB_BENCH_ATTENTION=N: N positions
     std::vector<int32_t> prompt;
     for (int32_t i = 0; i < positions; ++i) prompt.push_back(3 + (i * 37) % 250);
     for (size_t i = 0; i < prompt.size(); i += 512) {
@@ -1381,7 +1583,6 @@ TEST_CASE("Benchmark: attention at a long context (LIYAB_BENCH_ATTENTION=1)") {
         REQUIRE(model->forward(part, Transformer::Logits::None, route, pool).has_value());
     }
     const double before = model->phase_times().attention;
-    const int steps = 20;
     for (int i = 0; i < steps; ++i) {
         const int32_t t = 3 + i;
         REQUIRE(model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool).has_value());

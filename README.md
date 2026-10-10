@@ -225,8 +225,11 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 * **Paged KV cache.** Fixed 64-token pages, covering every layer, come from a pool on demand through a page table.
   Memory follows the positions actually used, and freed pages are reused exactly. Sliding windows keep the first
   `kv_sink_tokens` positions (attention sinks, default 8) plus the last *N*. Attention scores a KV head's whole query
-  group at once and splits long contexts into spans merged with log-sum-exp. Each V row is dequantized once per group.
-  On a 2,812-token context this cut attention from 67.6 to 44.4 ms per token on the 35B.
+  group at once, and each V row is dequantized once per group. On a 2,812-token context this cut attention from 67.6
+  to 44.4 ms per token on the 35B. Each token's visible positions are cut into up to 84 equal spans of at least 32
+  positions, merged in order with log-sum-exp. While decoding, the spans of the one token are the tasks every
+  thread shares (168 on two KV heads, an even split for 1 to 4 and 6 to 8 threads). The cut follows the token's own
+  position, never the batch or the threads, so its attention is the same bits however the prompt was split.
 * **Thread pool.** Workers wait for the next job in `WFE` on ARM64: the core sleeps until the job word changes, with
   no instructions issued, instead of spinning at full clock. They block on a condition variable after 300 µs idle. A
   job is split into 4 chunks per thread, claimed on demand, so a preempted core does not hold up a whole matmul.
@@ -270,8 +273,11 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     Q8_K activations, so a whole super-block accumulates in int32.
   * IQ4_NL and MXFP4 use table lookups.
   * With i8mm, resident Q4_K/Q5_K/Q6_K/Q8_0 matrices are rearranged losslessly at load into 8-row (4-row for Q8_0)
-    interleaved layouts. One SMMLA then multiplies 8 weight rows by 4 activation rows, and the single-row kernel
-    keeps identical sums, so logits do not depend on batch size.
+    interleaved layouts. One SMMLA then multiplies 8 weight rows by 4 activation rows.
+  * Every kernel of a format ends each block the same way: exact integer sums, then the same fused multiply-adds in
+    the same order. That holds on the file's layout or repacked, for one activation row or several. A row's result
+    is then the same bits whichever kernel computed it, so logits depend neither on the batch size nor on the layout
+    (tested for every format).
 * **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`, `qwen35`,
   `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp token for token, including special tokens,
   contractions, digits, accents, CJK and emoji.
@@ -312,8 +318,9 @@ available memory or of `memory_budget_mb`.
     thread as they arrive. Prefill runs in passes of 1,024 tokens, each reading the union of its tokens' experts
     once. Such passes give the experts no LFU credit, so a long prompt does not evict the experts a conversation
     keeps using.
-  * **Deterministic.** Each token's expert outputs are added in router order, whatever order they arrived in, so
-    results do not depend on I/O timing. Streamed and in-place runs give bit-identical logits (tested).
+  * **Deterministic.** Each token's expert outputs are added in router order, whatever order they arrived in, and a
+    repacked expert rounds like one in the file's layout. Results therefore depend neither on I/O timing nor on what
+    the cache held: streamed and in-place experts give bit-identical logits (tested).
 * **Memory plan.** `Engine::memory_plan()` reports the resident bytes, the experts' bytes, the expert cache and the
   budget at which 15% of the experts would be cached, so a front end can tell the user when a budget is too small.
   With `requant_bits = -1` (the app's default), resident Q8_0 matrices are converted to Q5_K or Q4_K at load **only**
@@ -323,7 +330,8 @@ available memory or of `memory_budget_mb`.
   * `requant_bits` 4/5: fewer resident bytes;
   * `moe_expert_mass`: run only the top experts covering a share of the router weight;
   * `moe_max_experts`: cap the experts per token;
-  * `moe_skip_slow`: skip a light expert that is not in RAM yet instead of waiting for it.
+  * `moe_skip_slow`: skip a light expert that is not in RAM yet instead of waiting for it (replies then depend on
+    I/O timing).
 
 ---
 
@@ -605,10 +613,14 @@ liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced cont
 liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
+liyab-cli -m model.gguf -p "$TURN1" --then "$TURN2"           # a follow-up turn that reuses the context, as a chat does
+liyab-cli -m model.gguf -p "..." --json                     # one JSON line per turn (stats, peak RSS, reply) for scripts
 liyab-cli --help                                            # every option
 ```
 
-For each generation, `liyab-cli` prints decode time per phase and the expert cache's behaviour.
+For each generation, `liyab-cli` prints the prompt tokens it reused, decode time per phase, the expert cache's
+behaviour and the process's peak resident memory. `--then TEXT` (repeatable) adds a turn whose prompt is the previous
+prompt, the reply to it and `TEXT`, so it measures what a follow-up message costs.
 
 ---
 
@@ -666,8 +678,10 @@ cancellation and live counters go straight to the C API, which makes them thread
   2. it empties the expert cache (2.4 GB on the 35B);
   3. it saves the conversation and, when it is the chat's, the engine's context.
 
-  After 5 minutes hidden (configurable) the model is unloaded. Coming back reloads it, restores the context and
-  warms the cache. While the model wakes up, the flame burns in the middle of the conversation.
+  After 5 minutes hidden (configurable) the model is unloaded. A request from another app through the
+  [local API](#local-api-one-model-for-every-app-on-the-device) loads it again, and it is unloaded again 5 minutes
+  after the last request. Coming back reloads it, restores the context and warms the cache. While the model wakes
+  up, the flame burns in the middle of the conversation.
 * **A new chat** restores the system prompt from its saved state (47 ms on the 35B), so its first message costs
   only its own tokens.
 
@@ -917,8 +931,9 @@ Every one of the 24 tensor formats decodes bit-exactly like the GGUF reference d
 the reference token ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
 reference implementation with the same argmax at every position. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
 at 98.9% of positions, and the remaining differences are the reference's own second choice. Streamed and in-place
-weights, batched and token-by-token prefill, and speculative and plain greedy decoding all give identical outputs
-(tested).
+weights, the file's layouts and the repacked ones, batched and token-by-token prefill, any thread count, and
+speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
+the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
 ### Charts
 
@@ -980,7 +995,7 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards |
-| `test_engine` | All 24 quant formats bit-exact; kernels; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1003,6 +1018,42 @@ adb push build/android/arm64-v8a/{libliyab.so,liyab-cli,test_*} /data/local/tmp/
 adb shell 'cd /data/local/tmp/liyab && export LD_LIBRARY_PATH=. TMPDIR=/data/local/tmp/liyab &&
            for t in test_*; do ./$t || exit 1; done'
 ```
+
+The tests remove the files they write, so repeated device runs leave nothing behind.
+
+### Regression run on the phone
+
+`scripts/phone_regression.py` is run on every build. It builds for Android, runs the unit tests on the phone, then
+plays one short chat (a system prompt and a question, then a follow-up that continues it) through `liyab-cli` and
+through the app's local API:
+
+* **Latency:** the load, the first token of the conversation (its whole prompt processed) and the first token of
+  the follow-up (only the new turn processed).
+* **Speed:** prompt and decode tokens per second, CLI and app.
+* **Correctness:** the greedy replies must equal the stored reference, the CLI's three runs must agree, and the
+  app's replies must equal the CLI's.
+* **Memory:** the peak resident memory of the CLI and of the app.
+
+```bash
+scripts/phone_regression.py --note "what changed"           # CLI part; models in /data/local/tmp/liyab (default moe.gguf)
+LIYAB_API_TOKEN=... scripts/phone_regression.py             # the app too, with the token from its Local API settings
+scripts/phone_regression.py --accept                        # after an intended change of the outputs
+```
+
+* **Same settings.** The CLI runs with the app's defaults (CPU, Balanced, 5,500 MiB, automatic requantization), so
+  the two compare directly. The log records whether the app had all the cores (its cpuset), because Android
+  confines background apps.
+* **History.** Every run is appended to `tests/device/runs.jsonl`, with its commit. The CLI numbers are the medians
+  of three runs (`--repeat`), and each number is compared with the median of the five runs before it. A change
+  counts only beyond a tolerance, so a warmer phone does not raise alarms. The references live in
+  `tests/device/references.json`. The exit status is 1 when a test failed, a reply changed or a number got worse.
+  On the reference phone the 35B's chat measures, in the CLI: first token 5.2 s (a 180-token prompt), follow-up first
+  token 1.5–1.6 s, decode ~10 tok/s, peak RSS 4.7 GB.
+* **Never in the way.** The phone is someone's phone, so the run waits while its screen is on. It also waits, before
+  a CLI run, while the app holds a model in RAM, and it waits for the battery to cool down before each measurement.
+  If the phone is picked up or unplugged mid-step, the step stops at once (a request to the app is closed, which ends
+  its generation) and runs again once the phone is idle and back. The app is never stopped or opened; when the OS
+  has frozen it in the background, the run says so instead of waiting for an API that cannot answer.
 
 ---
 
@@ -1040,6 +1091,9 @@ Implemented features are described above. These are next, in order:
 
 ## Known limitations
 
+* **Reproducibility on a GPU.** Replies are reproducible on the CPU backend, the default. With the GPU, a thermal
+  emergency moves the work to the CPU, whose kernels round differently from the GPU's, so a reply can change from
+  that token on.
 * **NPUs** are detected and ranked, but have no compute kernels yet; their work runs on the GPU or CPU.
 * **Vulkan:**
   * batched prefill runs the matvec kernel once per token (no tiled GEMM yet);
@@ -1057,9 +1111,12 @@ Implemented features are described above. These are next, in order:
 * **App:**
   * iOS is not built yet;
   * the local API is text only;
-  * Android may stop Liyab in the background (which stops the API too);
-  * on HyperOS a reply that goes on while Liyab is in the background runs several times slower (1.3 instead of
-    ~7 tok/s on the 35B): the system confines background apps to four of the eight cores;
+  * Android may stop Liyab in the background (which stops the API too). HyperOS also freezes it there (cgroup
+    freezer): a frozen Liyab runs no code, so its local API accepts no connection and an idle model is not released
+    until Liyab runs again;
+  * on HyperOS a reply that goes on while Liyab is in the background may get only four of the eight cores (the
+    background cpuset), and runs several times slower while another app is in use: 1.3 instead of ~7 tok/s on the
+    35B. With the screen off it measured 7.4 tok/s on four cores and ~10 on eight;
   * pages that need a full activity may not open from the assistant sheet's window;
   * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
     rebuild; other apps' notifications cannot be read;
@@ -1077,7 +1134,8 @@ src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neur
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, table/vector generators, benchmark and brand image generators
-tests/                  self-contained unit tests and benchmarks
+tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
+                        references and log (scripts/phone_regression.py)
 app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), lib/agent (tools),
                         lib/api (local OpenAI / Anthropic / gRPC API), lib/assist (phone sheet, desktop
                         command bar), proto/ (gRPC interface), android/ and macos/ (native runners: shortcut,
@@ -1085,7 +1143,7 @@ app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), l
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
-scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh
+scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py
 ```
 
 ## Contributing

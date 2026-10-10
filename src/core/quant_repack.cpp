@@ -12,11 +12,14 @@
 //     Licensed under the MIT License (see THIRD_PARTY_NOTICES.md).
 //
 // Changes: Liyab's block structs, row-group ranges for the thread pool, the
-// activation rows interleaved from already quantized Q8_K rows, and a
-// single-row kernel of our own (llama.cpp's gemv adds per 64 values in float)
-// that keeps the integer sums of a whole super-block and applies the same
-// float epilogue as the 4-row kernel, so a token's logits do not depend on how
-// many tokens share the matmul (speculative verification must match decoding).
+// activation rows interleaved from already quantized Q8_K rows, a single-row
+// kernel of our own (llama.cpp's gemv adds per 64 values in float) that keeps
+// the integer sums of a whole super-block, and one float epilogue per block
+// for every kernel: the one the file-layout kernels use too (epilogue_k4 /
+// epilogue_scaled in quant.h, here lane by lane). A token's logits then
+// depend neither on how many tokens share the matmul (speculative
+// verification must match decoding) nor on the layout a matrix is in (a
+// streamed expert is repacked only when read for a batched pass).
 // Q4_K and Q5_K share one pair of kernels (Q5_K adds the 5th bits as values
 // are unpacked).
 //
@@ -110,17 +113,18 @@ inline float f16_to_f32(uint16_t h) noexcept {
 }
 
 // Q8_0 epilogue shared by gemv and gemm, per activation row and 4 weight
-// rows: acc += sum * d * d8.
+// rows: epilogue_scaled (quant.h) lane by lane, acc += sum * (d * d8) fused.
 inline float32x4_t epilogue_q8_0(float32x4_t acc, const BlockQ8_0x4& w, float d8, int32x4_t sum) noexcept {
     const float32x4_t scale = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.d))), vdupq_n_f32(d8));
     return vfmaq_f32(acc, vcvtq_f32_s32(sum), scale);
 }
 
-// Q6_K epilogue shared by gemv and gemm (no minimums): acc += sum * d * d8.
+// Q6_K epilogue shared by gemv and gemm (no minimums): epilogue_scaled
+// (quant.h) lane by lane, acc += sum * (d * d8) fused.
 inline float32x4_t epilogue_q6(float32x4_t acc, const BlockQ6_Kx8& w, int j, float d8, int32x4_t sum) noexcept {
     const float32x4_t scale =
         vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.d + j * 4))), vdupq_n_f32(d8));
-    return vmlaq_f32(acc, vcvtq_f32_s32(sum), scale);
+    return vfmaq_f32(acc, vcvtq_f32_s32(sum), scale);
 }
 
 // The 12 packed bytes of 8 rows' sub-block -> 8 scales (int8) and 8 mins (int16).
@@ -137,14 +141,15 @@ inline void decode_scales_x8(const uint8_t* in, int16x8_t* mins, int8_t* scales)
 }
 
 // Float epilogue shared by gemv and gemm, per activation row and 4 weight
-// rows (half j of the 8): acc -= bias * dmin * d8; acc += sum * d * d8.
+// rows (half j of the 8): epilogue_k4 (quant.h) lane by lane, acc -= bias *
+// (dmin * d8) then acc += sum * (d * d8), both fused.
 template <typename Block>
 inline float32x4_t epilogue(float32x4_t acc, const Block& w, int j, float d8, int32x4_t sum, int32x4_t bias) noexcept {
     const float32x4_t q8_d = vdupq_n_f32(d8);
     const float32x4_t dmins = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.dmin + j * 4))), q8_d);
     const float32x4_t scale = vmulq_f32(vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(w.d + j * 4))), q8_d);
-    acc = vmlsq_f32(acc, vcvtq_f32_s32(bias), dmins);
-    return vmlaq_f32(acc, vcvtq_f32_s32(sum), scale);
+    acc = vfmsq_f32(acc, vcvtq_f32_s32(bias), dmins);
+    return vfmaq_f32(acc, vcvtq_f32_s32(sum), scale);
 }
 
 // Q5_K's 5th bits of one Q5_Kx8 super-block, held in registers:

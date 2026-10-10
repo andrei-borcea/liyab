@@ -1,0 +1,16 @@
+{
+ "moe.gguf:22134528992": {
+  "replies": [
+   "A refrigerator keeps food cold by moving heat from the inside to the outside using a cycle of compression and expansion of a refrigerant gas. Here is the step-by-step process:\n\n1.  **Evaporation (Inside the Fridge)**\n    *   Liquid refrigerant flows through coils inside the refrigerator compartment.\n",
+   "A refrigerator uses a special gas that absorbs heat from your food, making it cold. It then pushes that heat outside the fridge so your snacks stay fresh."
+  ],
+  "commit": "1d961da"
+ },
+ "app:Qwen3.6-35B-A3B-UD-Q4_K_M.gguf": {
+  "replies": [
+   "A refrigerator keeps food cold by moving heat from the inside to the outside using a cycle of compression and expansion of a refrigerant gas. Here is the step-by-step process:\n\n1.  **Evaporation (Inside the Fridge)**\n    *   Liquid refrigerant flows through coils inside the refrigerator compartment.\n",
+   "A refrigerator uses a special gas that absorbs heat from your food, making it cold. It then pushes that heat outside the fridge so your snacks stay fresh."
+  ],
+  "commit": "1d961da"
+ }
+}
