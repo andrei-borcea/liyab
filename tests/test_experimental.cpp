@@ -126,7 +126,7 @@ TEST_CASE("Early exit stops after the probed block and keeps the KV cache usable
 
     // Threshold above 1: never exits, output identical to no hooks.
     EarlyExit never({2.0f, 0, 1});
-    ForwardHooks hooks{&never, nullptr};
+    ForwardHooks hooks{.early_exit = &never};
     const int32_t tok = 290;
     auto a = model->forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool, &hooks);
     auto b = reference->forward(std::span<const int32_t>(&tok, 1), Transformer::Logits::Last, rig.route, rig.pool);
@@ -214,8 +214,8 @@ TEST_CASE("Head masks change attention output; an all-ones mask does not") {
     AllHeads all(c.n_head);
 
     const std::vector<int32_t> tokens = {1, 270, 300, 5, 290};
-    ForwardHooks all_hooks{nullptr, &all};
-    ForwardHooks prune_hooks{nullptr, &pruner.value()};
+    ForwardHooks all_hooks{.head_mask = &all};
+    ForwardHooks prune_hooks{.head_mask = &pruner.value()};
     auto a = base->forward(tokens, Transformer::Logits::Last, rig.route, rig.pool);
     const std::vector<float> la(a->begin(), a->end());
     auto b = ones->forward(tokens, Transformer::Logits::Last, rig.route, rig.pool, &all_hooks);
@@ -621,7 +621,11 @@ TEST_CASE("Engine with KV dedup reuses the prompt prefix across sessions") {
     p.max_tokens = 16;
     std::vector<int32_t> first, second;
     auto s1 = engine.value()->generate_tokens(prompt, p, [&](std::string_view, int32_t t) { first.push_back(t); return true; });
-    auto s2 = engine.value()->generate_tokens(prompt, p, [&](std::string_view, int32_t t) { second.push_back(t); return true; });
+    // A later session: a new engine, whose context starts empty (the same
+    // engine would continue its own context instead).
+    auto later = Engine::create(config);
+    REQUIRE(later.has_value());
+    auto s2 = later.value()->generate_tokens(prompt, p, [&](std::string_view, int32_t t) { second.push_back(t); return true; });
     REQUIRE(s1.has_value() && s2.has_value());
     CHECK(s1->cached_prefix_tokens == 0);
     CHECK(s2->cached_prefix_tokens == 128);
@@ -861,10 +865,10 @@ TEST_CASE("[bench] early exit and head pruning: decode throughput") {
 
     const DecodeResult base = bench_decode(*model, rig, 32, steps, nullptr);
     EarlyExit realistic({0.98f, -1, 2});
-    ForwardHooks h1{&realistic, nullptr};
+    ForwardHooks h1{.early_exit = &realistic};
     const DecodeResult ee = bench_decode(*model, rig, 32, steps, &h1);
     EarlyExit forced({-1.0f, -1, 2});
-    ForwardHooks h2{&forced, nullptr};
+    ForwardHooks h2{.early_exit = &forced};
     const DecodeResult ee_forced = bench_decode(*model, rig, 32, steps, &h2);
     std::printf("  early exit (12 blocks, d=512, ctx 32):\n"
                 "    baseline           %7.1f tok/s\n"
@@ -878,7 +882,7 @@ TEST_CASE("[bench] early exit and head pruning: decode throughput") {
     auto pruner = HeadPruner::create(wo, spec.n_head, spec.n_embd / spec.n_head, {0.5f});
     REQUIRE(pruner.has_value());
     pruner->set_active(true);
-    ForwardHooks h3{nullptr, &pruner.value()};
+    ForwardHooks h3{.head_mask = &pruner.value()};
     for (const int32_t ctx : {64, 1536}) {
         const DecodeResult full = bench_decode(*model, rig, ctx, steps, nullptr);
         const DecodeResult pruned = bench_decode(*model, rig, ctx, steps, &h3);
