@@ -2,12 +2,15 @@
     xmlns:tools="http://schemas.android.com/tools">
     <!-- Model downloads from Hugging Face; nothing else goes to the network. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Keep the CPU awake while a multi-GB download runs with the screen off. -->
+    <!-- Keep the CPU awake while a multi-GB download, or a reply with Liyab hidden, runs with the screen off. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Download progress, and running multi-GB downloads as a foreground data-sync job. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- WorkService: finishing a reply with Liyab hidden, shown as a Live Update where the system supports it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
     <!-- Agent tools, each enabled by the user in Settings: today's events, what to do next. Read on the phone only. -->
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <!-- permission_handler grants the calendar group only with both; writing serves "add an event" (confirmed by the user). -->
@@ -68,6 +71,15 @@
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
+        </service>
+        <!-- Held only while Liyab works with its window hidden (WorkService.kt). -->
+        <service
+            android:name=".WorkService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device language model inference the user started, finished with the app hidden" />
         </service>
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"

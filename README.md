@@ -682,6 +682,25 @@ cancellation and live counters go straight to the C API, which makes them thread
   [local API](#local-api-one-model-for-every-app-on-the-device) loads it again, and it is unloaded again 5 minutes
   after the last request. Coming back reloads it, restores the context and warms the cache. While the model wakes
   up, the flame burns in the middle of the conversation.
+* **Finishing work in the background (Android).** Android leaves a hidden app little: on HyperOS four of the eight
+  cores (a reply drops from ~7 to 1.3 tok/s on the 35B while another app is in use), and soon none, because its
+  cgroup freezer stops hidden apps. Leave Liyab while it works (a reply, a load, a model being moved, a request of
+  another app) and it holds a foreground service until that work and the park after it are done. The process keeps
+  all eight cores and is not frozen, and a partial wake lock lets the reply finish with the screen off. The service
+  computes nothing itself and starts only with work in hand, so leaving an idle Liyab costs nothing. On the
+  reference phone, Qwen3.6-35B-A3B:
+
+  | A reply while Liyab is hidden | Without the service | With it |
+  |-------------------------------|--------------------:|--------:|
+  | Another app in use            | 1.3 tok/s           | 8.2 tok/s |
+  | Phone locked                  | 7.4 tok/s (four cores) | 8.1–8.6 tok/s |
+
+  In Liyab itself the same chat ran at 7.5–7.6 tok/s. The service stopped within a second of the conversation being
+  saved, and HyperOS froze the idle process two seconds later. Its notification asks for a Live Update (Android
+  16): systems that support it show a chip in the status bar or their island (HyperOS 3 shows it in its Super
+  Island) and a card on the lock screen. It alerts once, without sound or vibration, on a channel with a
+  notification light; HyperOS plays no edge light for it. Android starts the service only while or just after
+  Liyab is on screen, or at any time when Liyab's battery use is unrestricted.
 * **A new chat** restores the system prompt from its saved state (47 ms on the 35B), so its first message costs
   only its own tokens.
 
@@ -1084,7 +1103,8 @@ Implemented features are described above. These are next, in order:
     * reliable message reading (persisted notification history, RCS);
     * local memory over your own data;
     * the screen content through a voice-interaction service.
-11. **Platforms.** The iOS app; the app on Linux and Windows (the same Flutter app and command bar as on macOS),
+11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
+    it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and command bar as on macOS),
     which first needs x86 SIMD kernels and a Windows port of the engine; NPU compute (QNN HTP, NeuroPilot); app
     localization.
 12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
@@ -1111,12 +1131,13 @@ Implemented features are described above. These are next, in order:
 * **App:**
   * iOS is not built yet;
   * the local API is text only;
-  * Android may stop Liyab in the background (which stops the API too). HyperOS also freezes it there (cgroup
-    freezer): a frozen Liyab runs no code, so its local API accepts no connection and an idle model is not released
-    until Liyab runs again;
-  * on HyperOS a reply that goes on while Liyab is in the background may get only four of the eight cores (the
-    background cpuset), and runs several times slower while another app is in use: 1.3 instead of ~7 tok/s on the
-    35B. With the screen off it measured 7.4 tok/s on four cores and ~10 on eight;
+  * Android may stop Liyab in the background (which stops the API too). Once Liyab's work is done, HyperOS also
+    freezes it there (cgroup freezer): a frozen Liyab runs no code, so its local API accepts no connection and an
+    idle model is not released until Liyab runs again;
+  * work that starts while Liyab is hidden (a request of another app) gets the foreground service only when Liyab's
+    battery use is unrestricted. Without it, on HyperOS it may get only four of the eight cores (the background
+    cpuset), and runs several times slower while another app is in use: 1.3 instead of ~7 tok/s on the 35B. With
+    the screen off it measured 7.4 tok/s on four cores and ~10 on eight;
   * pages that need a full activity may not open from the assistant sheet's window;
   * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
     rebuild; other apps' notifications cannot be read;

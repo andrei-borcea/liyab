@@ -7,6 +7,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter/widgets.dart' show AppLifecycleListener, AppLifecycleState;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -119,6 +120,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
         _leftScreen();
       }
     });
+    addListener(_updateWork); // the busy flags below change with a notification
   }
 
   // Leaving the screen. HyperOS stops a background app that holds several GB
@@ -129,13 +131,47 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // conversation is saved, messages and context, so a stopped process loses
   // nothing. After device.releaseAfterMinutes the model is unloaded too; it
   // loads again, chat kept, once Liyab is back.
+  //
+  // Work in hand while hidden (a reply, a load, a model being moved, a request
+  // of another app) would get four of the eight cores on HyperOS, and soon none:
+  // its cgroup freezer stops hidden apps. On Android the work service
+  // (WorkService.kt) keeps the process running at full speed until that work
+  // and the park after it are done. It starts only with work in hand, so
+  // leaving an idle Liyab costs nothing.
   late final AppLifecycleListener _lifecycle;
   bool _away = false; // off screen since the last park
   Timer? _parkRetry;
   Timer? _releaseTimer;
   String? _released; // the model unloaded while idle
+  bool _parkPending = false; // hidden, and the park not done yet
+
+  static const _work = MethodChannel('liyab/work');
+  bool _working = false; // the work service is asked for
+
+  /// Work that keeps the model loaded, and the work service up while Liyab is hidden.
+  bool get _busy => generating || loading || moving != null || _apiGenerations > 0;
+
+  void _updateWork() {
+    if (!Platform.isAndroid) return;
+    final want = _away && (_busy || (_working && _parkPending));
+    if (want == _working) return;
+    _working = want;
+    final text = generating
+        ? 'Finishing a reply'
+        : loading
+            ? 'Loading the model'
+            : moving != null
+                ? 'Moving $moving'
+                : 'Answering another app';
+    unawaited(_work.invokeMethod<bool>(want ? 'start' : 'stop', want ? text : null).then((started) {
+      // Android allows it only just after Liyab was on screen (or with its battery use unrestricted).
+      if (started == false) _log('Working hidden without the work service: Android did not allow it now');
+    }, onError: (Object e) => _log('Work service: $e')));
+  }
 
   void _leftScreen() {
+    _parkPending = true;
+    _updateWork();
     unawaited(_park());
     _armRelease();
   }
@@ -152,30 +188,38 @@ class AppState extends ChangeNotifier implements ApiBackend {
   int _apiGenerations = 0;
 
   Future<void> _park() async {
+    final waiting = _parkRetry != null;
     _parkRetry?.cancel();
-    if (!_away || !engine.loaded) return;
-    if (generating || loading) {
-      _log('In the background while ${generating ? 'answering' : 'loading'}: parking once done');
-      _parkRetry = Timer(const Duration(seconds: 5), _park);
+    _parkRetry = null;
+    if (_away && engine.loaded && (generating || loading)) {
+      if (!waiting) _log('In the background while ${generating ? 'answering' : 'loading'}: parking once done');
+      // Checked every second: the work service stays up until this park is done.
+      _parkRetry = Timer(const Duration(seconds: 1), _park);
       return;
     }
-    final watch = Stopwatch()..start();
     try {
-      await engine.saveExpertProfile(await _expertProfileFile()); // what was hot, to warm up again
-    } on EngineException catch (e) {
-      _log('Expert profile not saved: $e');
+      if (!_away || !engine.loaded) return;
+      final watch = Stopwatch()..start();
+      try {
+        await engine.saveExpertProfile(await _expertProfileFile()); // what was hot, to warm up again
+      } on EngineException catch (e) {
+        _log('Expert profile not saved: $e');
+      }
+      final bytes = await engine.trimMemory();
+      _cacheCold = bytes > 0;
+      _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in ${watch.elapsedMilliseconds} ms');
+      await _saveConversation(withContext: true);
+      if (messages.isNotEmpty) _log('Conversation saved in ${watch.elapsedMilliseconds} ms');
+    } finally {
+      _parkPending = false;
+      _updateWork();
     }
-    final bytes = await engine.trimMemory();
-    _cacheCold = bytes > 0;
-    _log('Freed ${(bytes / (1 << 30)).toStringAsFixed(2)} GB of cached experts in ${watch.elapsedMilliseconds} ms');
-    await _saveConversation(withContext: true);
-    if (messages.isNotEmpty) _log('Conversation saved in ${watch.elapsedMilliseconds} ms');
   }
 
   Future<void> _releaseIdle() async {
     final path = modelPath;
     if (path == null || _released != null) return;
-    if (generating || loading || moving != null || _apiGenerations > 0) {
+    if (_busy) {
       _releaseTimer = Timer(const Duration(minutes: 1), _releaseIdle); // busy: try again later
       return;
     }
@@ -199,8 +243,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   void _backOnScreen() {
     _parkRetry?.cancel();
+    _parkRetry = null;
     _releaseTimer?.cancel();
     _away = false;
+    _parkPending = false;
+    _updateWork();
     final path = _released;
     _released = null;
     if (path != null && File(path).existsSync()) unawaited(load(path, keepChat: true));
@@ -326,11 +373,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
     final generation = engine.generate(prompt, sampling);
     ++_apiGenerations;
+    _updateWork();
     var ended = false;
     void end() {
       if (ended) return;
       ended = true;
       --_apiGenerations;
+      _updateWork();
       if (_away) _armRelease(); // counted from the last request
     }
 

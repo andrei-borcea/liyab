@@ -283,9 +283,13 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
               contentPadding: EdgeInsets.zero,
               leading: Icon(granted ? Icons.notifications_active_outlined : Icons.notifications_off_outlined),
               title: const Text('Notifications'),
-              subtitle: Text(granted
-                  ? 'Allowed: downloads show their progress.'
-                  : 'Off: downloads still run, without a progress notification.'),
+              subtitle: Text(switch ((granted, Platform.isAndroid)) {
+                (true, true) => 'Allowed: downloads show their progress, and work Liyab finishes in the background '
+                    'shows in the status bar.',
+                (true, false) => 'Allowed: downloads show their progress.',
+                (false, true) => 'Off: downloads and work in the background still run, without a notification.',
+                (false, false) => 'Off: downloads still run, without a progress notification.',
+              }),
               trailing: granted
                   ? null
                   : TextButton(

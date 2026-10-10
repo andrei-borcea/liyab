@@ -9,8 +9,8 @@
 # APK is signed with build/liyab-debug.keystore (created here if missing):
 # keep it, an APK signed with another key cannot update the installed app.
 # --install never interrupts the app: it waits while Liyab is on screen or runs
-# a foreground service (a model download), then installs; Liyab starts again
-# when it is next opened.
+# a foreground service (a model download, or work it finishes hidden), then
+# installs; Liyab starts again when it is next opened.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
 # macOS requires Flutter, Xcode, cmake. The engine is linked statically into
 # the app (app/macos/Runner/Configs/Engine.xcconfig); `flutter run -d macos`
