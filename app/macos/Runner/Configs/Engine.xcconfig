@@ -1,0 +1,17 @@
+// The Liyab engine, linked statically into the app. scripts/build_flutter_app.sh
+// --macos builds it first (build/macos/engine/libliyab.a); for `flutter run -d
+// macos`, run that script once so the library exists.
+//
+// lib/engine/liyab_ffi.dart looks the C API up in the process itself
+// (DynamicLibrary.process()), as on iOS, so the C API's symbols must survive
+// linking: -force_load keeps every object of the archive (nothing references
+// them at link time), dead stripping is off for the same reason, and only
+// non-global symbols are stripped from the release binary.
+LIYAB_ENGINE_LIB = $(PROJECT_DIR)/../../build/macos/engine/libliyab.a
+OTHER_LDFLAGS = $(inherited) -force_load $(LIYAB_ENGINE_LIB) -lc++ -lobjc -framework Foundation -framework Metal
+DEAD_CODE_STRIPPING = NO
+STRIP_STYLE = non-global
+
+// Apple silicon only: the engine's CPU kernels and the Metal backend target
+// arm64 (there are no x86 SIMD kernels yet).
+ARCHS = arm64

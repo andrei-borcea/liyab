@@ -24,7 +24,8 @@ ctest --test-dir build --output-on-failure
 
 The tests generate small GGUF models on the fly, so nothing needs downloading. For Android, `scripts/build_android.sh
 --experimental` builds the library, `liyab-cli` and the tests for `arm64-v8a` (see the README's Testing section for
-running them over `adb`). The app builds with `scripts/build_flutter_app.sh`; check it with
+running them over `adb`). The app builds with `scripts/build_flutter_app.sh` (Android) or
+`scripts/build_flutter_app.sh --macos`; check it with
 `cd app && flutter analyze && flutter test`.
 
 ## Good places to start

@@ -85,7 +85,16 @@ class DeviceMonitor extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  static int? _readCpuTicks() {
+  /// CPU time of this process in 1/100 s: /proc/self/stat on Android and
+  /// Linux, the runner's getrusage (liyab/device "cpuTicks") on macOS.
+  static Future<int?> _readCpuTicks() async {
+    if (Platform.isMacOS) {
+      try {
+        return await _channel.invokeMethod<int>('cpuTicks');
+      } on PlatformException {
+        return null;
+      }
+    }
     try {
       // /proc/self/stat: fields 14 and 15 (utime, stime) after the ")" of the name.
       final stat = File('/proc/self/stat').readAsStringSync();
@@ -100,7 +109,7 @@ class DeviceMonitor extends ChangeNotifier with WidgetsBindingObserver {
     final now = DateTime.now();
     final dt = now.difference(_at).inMicroseconds / 1e6;
     _at = now;
-    final ticks = _readCpuTicks();
+    final ticks = await _readCpuTicks();
     final cpu = ticks != null && _cpuTicks != null && dt > 0
         ? ((ticks - _cpuTicks!) / 100 / dt / Platform.numberOfProcessors * 100).clamp(0.0, 100.0)
         : 0.0;
@@ -112,7 +121,7 @@ class DeviceMonitor extends ChangeNotifier with WidgetsBindingObserver {
         counters != null && prev != null && dt > 0 ? math.max(0, (f(counters) - f(prev)) / dt) : 0;
 
     Map<Object?, Object?> power = const {}, thermal = const {};
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isMacOS) {
       try {
         power = await _channel.invokeMethod<Map<Object?, Object?>>('power') ?? const {};
         thermal = await _channel.invokeMethod<Map<Object?, Object?>>('thermal') ?? const {};

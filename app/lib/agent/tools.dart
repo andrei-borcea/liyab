@@ -4,6 +4,8 @@
 // model. Results stay on the device and go back to the model as data, as
 // short text (ToolText).
 
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -42,6 +44,9 @@ abstract class AgentTool {
   /// Asks for the tool's permission; whether it is granted.
   Future<bool> requestPermission() async => true;
 
+  /// Where the user grants the permission by hand once it was refused.
+  Future<void> openSettings() async {}
+
   /// Runs the tool; the result is text for the model (JSON), and a short summary for the chat.
   Future<(String, String)> run(Map<String, Object?> args);
 
@@ -57,6 +62,28 @@ abstract class AgentTool {
 }
 
 const _data = MethodChannel('liyab/data');
+
+/// A permission-guarded source: Android's runtime permission, or on macOS the
+/// runner's liyab/data channel (macos/Runner/DataChannel.swift), where `kind`
+/// is calendar, contacts, or a Full Disk Access source (messages, calls, email).
+mixin _OsPermission on AgentTool {
+  Permission get android;
+  String get kind;
+
+  @override
+  Future<bool> permitted() async => Platform.isAndroid
+      ? android.isGranted
+      : await _data.invokeMethod<bool>('permission', {'kind': kind}) ?? false;
+
+  @override
+  Future<bool> requestPermission() async => Platform.isAndroid
+      ? (await android.request()).isGranted
+      : await _data.invokeMethod<bool>('requestPermission', {'kind': kind}) ?? false;
+
+  @override
+  Future<void> openSettings() async =>
+      Platform.isAndroid ? await openAppSettings() : await _data.invokeMethod<void>('openSettings', {'kind': kind});
+}
 
 String _two(int v) => v.toString().padLeft(2, '0');
 
@@ -152,6 +179,19 @@ abstract final class ToolText {
     return '$head$more, newest first:\n${lines.join('\n')}';
   }
 
+  /// Emails (DataChannel.email on macOS, newest first), at most `limit`.
+  static String emails(List<Map<Object?, Object?>> raw, DateTime since, String query, DateTime now, {int limit = 25}) {
+    final head = 'Emails since ${at(since, now)}${query.isEmpty ? '' : ' matching "$query"'}';
+    if (raw.isEmpty) return '$head: none.';
+    final lines = [
+      for (final m in raw.take(limit))
+        '- ${at(_time(m['time']), now)}${m['read'] == true ? '' : ' (unread)'} ${clip(m['from'], 40)}: '
+            '${clip(m['subject'] ?? '(no subject)', 120)}${clip(m['preview'], 200).isEmpty ? '' : ' - ${clip(m['preview'], 200)}'}'
+    ];
+    final more = raw.length > limit ? ' (newest $limit of ${raw.length})' : '';
+    return '$head$more, newest first:\n${lines.join('\n')}';
+  }
+
   /// Contacts (DataChannel.contacts): name, numbers, email addresses.
   static String contacts(List<Object?> raw, String query) {
     if (raw.isEmpty) return 'No contact matches "$query".';
@@ -162,7 +202,12 @@ abstract final class ToolText {
   }
 }
 
-class CalendarTool extends AgentTool {
+class CalendarTool extends AgentTool with _OsPermission {
+  @override
+  Permission get android => Permission.calendarFullAccess;
+  @override
+  String get kind => 'calendar';
+
   @override
   String get name => 'calendar_events';
 
@@ -182,11 +227,6 @@ class CalendarTool extends AgentTool {
   @override
   List<String> get required => const ['start', 'end'];
 
-  @override
-  Future<bool> permitted() => Permission.calendarFullAccess.isGranted;
-
-  @override
-  Future<bool> requestPermission() async => (await Permission.calendarFullAccess.request()).isGranted;
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -238,7 +278,11 @@ const _sinceParam = {
 
 String _plural(int n, String one) => '$n $one${n == 1 ? '' : 's'}';
 
-class ContactsTool extends AgentTool {
+class ContactsTool extends AgentTool with _OsPermission {
+  @override
+  Permission get android => Permission.contacts;
+  @override
+  String get kind => 'contacts';
   @override
   String get name => 'find_contact';
   @override
@@ -251,10 +295,6 @@ class ContactsTool extends AgentTool {
       };
   @override
   List<String> get required => const ['name'];
-  @override
-  Future<bool> permitted() => Permission.contacts.isGranted;
-  @override
-  Future<bool> requestPermission() async => (await Permission.contacts.request()).isGranted;
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -264,23 +304,24 @@ class ContactsTool extends AgentTool {
   }
 }
 
-class MessagesTool extends AgentTool {
+class MessagesTool extends AgentTool with _OsPermission {
+  @override
+  Permission get android => Permission.sms;
+  @override
+  String get kind => 'messages';
   @override
   String get name => 'read_sms';
   @override
   String get label => 'Read your text messages';
   @override
-  String get description =>
-      'SMS sent or received since a time, optionally with one person. Chat apps and email: read_notifications.';
+  String get description => Platform.isAndroid
+      ? 'SMS sent or received since a time, optionally with one person. Chat apps and email: read_notifications.'
+      : 'iMessage and SMS sent or received since a time, optionally with one person.';
   @override
   Map<String, Object?> get parameters => {
         ..._sinceParam,
         'from': {'type': 'string', 'description': 'name or number'},
       };
-  @override
-  Future<bool> permitted() => Permission.sms.isGranted;
-  @override
-  Future<bool> requestPermission() async => (await Permission.sms.request()).isGranted;
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -292,7 +333,11 @@ class MessagesTool extends AgentTool {
   }
 }
 
-class CallsTool extends AgentTool {
+class CallsTool extends AgentTool with _OsPermission {
+  @override
+  Permission get android => Permission.phone;
+  @override
+  String get kind => 'calls';
   @override
   String get name => 'recent_calls';
   @override
@@ -301,10 +346,6 @@ class CallsTool extends AgentTool {
   String get description => 'Phone calls since a time: who, when, missed or not, length.';
   @override
   Map<String, Object?> get parameters => _sinceParam;
-  @override
-  Future<bool> permitted() => Permission.phone.isGranted;
-  @override
-  Future<bool> requestPermission() async => (await Permission.phone.request()).isGranted;
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -351,20 +392,60 @@ class NotificationsTool extends AgentTool {
   }
 }
 
+class EmailTool extends AgentTool with _OsPermission {
+  @override
+  Permission get android => Permission.unknown; // macOS only (Apple Mail)
+  @override
+  String get kind => 'email';
+  @override
+  String get name => 'read_email';
+  @override
+  String get label => 'Read your email';
+  @override
+  String get description =>
+      'Emails received since a time (every account in Mail): sender, subject, preview; optionally only those whose '
+      'sender or subject contains a word.';
+  @override
+  Map<String, Object?> get parameters => {
+        ..._sinceParam,
+        'query': {'type': 'string', 'description': 'a sender or a word of the subject'},
+      };
+
+  @override
+  Future<(String, String)> run(Map<String, Object?> args) async {
+    final since = _since(args['since']);
+    final query = '${args['query'] ?? ''}';
+    final raw = await _data.invokeListMethod<Map<Object?, Object?>>(
+            'email', {'since': since.millisecondsSinceEpoch, 'query': query}) ??
+        const [];
+    return (ToolText.emails(raw, since, query, DateTime.now()), _plural(raw.length, 'email'));
+  }
+}
+
 /// The tools Liyab has, and which ones the user turned on.
 class Toolbox {
   Toolbox(this._prefs);
   final SharedPreferences _prefs;
 
-  final List<AgentTool> all = [CalendarTool(), NotificationsTool(), MessagesTool(), CallsTool(), ContactsTool(), ClipboardTool()];
+  /// The sources each platform's liyab/data channel reads. macOS has no API
+  /// for other apps' notifications; its email comes from Apple Mail (on
+  /// Android, email previews arrive as notifications). Elsewhere, only what
+  /// Flutter reaches on every platform.
+  final List<AgentTool> all = Platform.isAndroid
+      ? [CalendarTool(), NotificationsTool(), MessagesTool(), CallsTool(), ContactsTool(), ClipboardTool()]
+      : Platform.isMacOS
+      ? [CalendarTool(), EmailTool(), MessagesTool(), CallsTool(), ContactsTool(), ClipboardTool()]
+      : [ClipboardTool()];
 
   bool isOn(AgentTool t) => _prefs.getBool(t.setting) ?? false;
   Future<void> setOn(AgentTool t, bool on) => _prefs.setBool(t.setting, on);
 
   /// Tools turned on whose permission is granted: the ones offered to the model.
+  /// A tool whose check fails counts as not granted: it must not take the
+  /// other tools out of the system prompt with it.
   Future<List<AgentTool>> enabled() async => [
         for (final t in all)
-          if (isOn(t) && await t.permitted()) t
+          if (isOn(t) && await t.permitted().catchError((Object _) => false)) t
       ];
 
   AgentTool? byName(String name) => all.where((t) => t.name == name).firstOrNull;

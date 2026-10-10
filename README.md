@@ -119,8 +119,8 @@ These rules decide what goes into the code:
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
-| Liyab app (Flutter): chat, model library with Hugging Face downloads, activity meters, settings, system assistant sheet | ✅ Android · 🟡 iOS app not built yet (the engine builds for iOS) |
-| Agent tools: calendar, notifications (chats, email previews), SMS, calls, contacts, clipboard; each source opt-in | ✅ |
+| Liyab app (Flutter): chat, model library with Hugging Face downloads, activity meters, settings, system assistant sheet (phone) or command bar (computer) | ✅ Android · ✅ macOS (Apple silicon) · 🟡 iOS app not built yet (the engine builds for iOS) |
+| Agent tools: calendar, notifications (chats, email previews), SMS, calls, contacts, clipboard on Android; calendar, Apple Mail, Messages, calls, contacts, clipboard on macOS; each source opt-in | ✅ |
 | Local API for other apps on the device: OpenAI, Anthropic Messages, gRPC; loopback only, token-protected, off by default | ✅ text only for now |
 | Voice, actions (alarms, events, replies), local memory/RAG, embedding models | 🔜 [Roadmap](#roadmap) |
 | Experimental: early exit, head pruning, EGLS, 2:4 sparsity, JIT unpacker, persistent KV prefix files, io_uring | 🧪 `LIYAB_ENABLE_EXPERIMENTAL` |
@@ -152,6 +152,9 @@ scripts/build_ios.sh
 
 # The Liyab app: builds libliyab first, then the release APK; --install waits while the app is in use
 scripts/build_flutter_app.sh --install
+
+# The Liyab app for macOS (Apple silicon): app/build/macos/Build/Products/Release/Liyab.app
+scripts/build_flutter_app.sh --macos
 ```
 
 The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations. The
@@ -611,8 +614,9 @@ For each generation, `liyab-cli` prints decode time per phase and the expert cac
 
 ## The Liyab app
 
-`app/` is a Flutter app (Android today, iOS next) that calls the C ABI directly through `dart:ffi`. The bindings are
-hand-written in `app/lib/engine/liyab_ffi.dart`. Loads, prefills and generations run on a worker isolate, while
+`app/` is a Flutter app (Android and macOS today, iOS next) that calls the C ABI directly through `dart:ffi`. The
+bindings are hand-written in `app/lib/engine/liyab_ffi.dart`. On macOS the engine is linked statically into the app
+(`app/macos/Runner/Configs/Engine.xcconfig`) and looked up in the process, as on iOS. Loads, prefills and generations run on a worker isolate, while
 cancellation and live counters go straight to the C API, which makes them thread-safe.
 
 ### An assistant that replaces the cloud one
@@ -620,10 +624,18 @@ cancellation and live counters go straight to the C API, which makes them thread
 * **System assistant.** Liyab can be the default digital assistant. The assist gesture opens a sheet over the
   current app, with the living flame, a text field and the latest answer. Pulling the sheet up turns it into the full
   app, as Gemini's overlay does. Both windows share one engine, so the model is loaded once.
+* **On a Mac, a command bar.** **Option-Space** opens Liyab from any app, in the manner of Spotlight: a large input
+  with the living flame, the conversation under it, and a footer with the model and the keys (Return asks, ⌘N
+  starts a new chat, ⌘Return opens the app, Esc stops an answer or closes the bar). The bar grows downward as the
+  answer streams, over the system's blurred material; an aura of the flame's colours turns around it with the
+  assistant's state. It is the app's own window and engine in another mode, so the model is loaded once; closing it
+  returns to the app you were in. The app keeps running with its window closed, so the shortcut always works.
 * **Agent tools.** The assistant reads your own data to answer about your day:
-  * calendar events;
-  * notifications from every app (chat messages, email previews; kept in memory only);
-  * SMS, the call log, contacts and the clipboard.
+  * on Android: calendar events; notifications from every app (chat messages, email previews; kept in memory
+    only); SMS, the call log, contacts and the clipboard;
+  * on macOS: calendar events and contacts (after the system's prompt); email from every account in Apple Mail,
+    iMessage and SMS, and the Phone/FaceTime call history (these three read Apple's own databases, which need Full
+    Disk Access, granted in System Settings); the clipboard. macOS has no API for other apps' notifications.
 
   Each source is off until you turn it on, and only enabled sources are offered to the model.
 * **How tools are called.** Tools are described and called in the model's own format, read from its GGUF chat
@@ -706,7 +718,10 @@ curl http://127.0.0.1:8642/v1/chat/completions \
 * **Settings.**
   * Per model: sampling, context length (Auto by default) and system prompt.
   * Per device: CPU or GPU, the power profile (Fastest / Balanced / Coolest), the memory budget with its
-    recommendation, and the idle release time.
+    recommendation, and the idle release time. On a computer the memory budget is 5 GiB at most, whatever its RAM,
+    so the assistant stays a light app next to your work; larger models stream from the SSD. On an M4 Pro,
+    Qwen3.6-35B-A3B answers at 9.7–10.2 tok/s within that budget (4.8 GB resident), against 11.1–11.5 tok/s with
+    all 22 GB in RAM. The model stays loaded by default, so the command bar answers at once.
   * The permissions Liyab uses, and why.
   * An **Experimental** section exposes the engine's lossy or measurement-only options.
 * **The living flame.** The Liyab mark is drawn live as the assistant's presence: see
@@ -714,6 +729,7 @@ curl http://127.0.0.1:8642/v1/chat/completions \
 
 ```bash
 scripts/build_flutter_app.sh --install   # libliyab + release APK; never interrupts the app while it is in use
+scripts/build_flutter_app.sh --macos     # libliyab (static) + Liyab.app; then `flutter run -d macos` works too
 cd app && flutter analyze && flutter test
 ```
 
@@ -741,7 +757,9 @@ leaves the cores to the engine.
 Its colour is the device's temperature, read from the same thermal-headroom forecast that steers the engine:
 violet-cool while there is room, ember in normal use, red as throttling gets near. The work happening on the device
 stays visible without a single number on screen. The same colours light the edge of the assistant sheet and the input
-field while the model works.
+field while the model works. On a computer they turn as an aura around the command bar: it barely breathes at rest,
+wakes as you type, turns fast while the model reasons and flows while the answer streams, at most 30 frames a
+second like the flame.
 
 <p align="center"><img src="docs/brand/liyab-palette.svg" width="100%" alt="Liyab colour palette and typography"></p>
 
@@ -1015,7 +1033,9 @@ Implemented features are described above. These are next, in order:
     * reliable message reading (persisted notification history, RCS);
     * local memory over your own data;
     * the screen content through a voice-interaction service.
-11. **Platforms.** The iOS app, NPU compute (QNN HTP, NeuroPilot), x86 SIMD kernels for desktop, and app localization.
+11. **Platforms.** The iOS app; the app on Linux and Windows (the same Flutter app and command bar as on macOS),
+    which first needs x86 SIMD kernels and a Windows port of the engine; NPU compute (QNN HTP, NeuroPilot); app
+    localization.
 12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
 ## Known limitations
@@ -1040,7 +1060,10 @@ Implemented features are described above. These are next, in order:
   * Android may stop Liyab in the background (which stops the API too);
   * on HyperOS a reply that goes on while Liyab is in the background runs several times slower (1.3 instead of
     ~7 tok/s on the 35B): the system confines background apps to four of the eight cores;
-  * pages that need a full activity may not open from the assistant sheet's window.
+  * pages that need a full activity may not open from the assistant sheet's window;
+  * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
+    rebuild; other apps' notifications cannot be read;
+  * Linux and Windows are not built yet.
 
 ---
 
@@ -1056,7 +1079,9 @@ src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, table/vector generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks
 app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), lib/agent (tools),
-                        lib/api (local OpenAI / Anthropic / gRPC API), proto/ (gRPC interface)
+                        lib/api (local OpenAI / Anthropic / gRPC API), lib/assist (phone sheet, desktop
+                        command bar), proto/ (gRPC interface), android/ and macos/ (native runners: shortcut,
+                        command-bar window, device and data channels)
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)

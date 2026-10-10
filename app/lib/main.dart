@@ -1,8 +1,11 @@
-// Liyab: a private assistant that runs entirely on the phone.
+// Liyab: a private assistant that runs entirely on the device.
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'assist/assist_sheet.dart';
+import 'assist/command_bar.dart';
 import 'chat/chat_screen.dart';
 import 'state/app_state.dart';
 import 'ui/living_flame.dart';
@@ -33,6 +36,10 @@ class _LiyabAppState extends State<LiyabApp> {
         theme: liyabTheme(Brightness.light),
         darkTheme: liyabTheme(Brightness.dark),
         themeMode: ThemeMode.dark, // Liyab lives at night, by its own light
+        builder: (context, child) => ListenableBuilder(
+          listenable: _assist,
+          builder: (context, _) => _titleBarInset(context, child!),
+        ),
         home: FutureBuilder<AppState>(
           future: _app,
           builder: (context, snap) {
@@ -43,7 +50,7 @@ class _LiyabAppState extends State<LiyabApp> {
             return ListenableBuilder(
               listenable: Listenable.merge([app, _assist]),
               builder: (context, _) => _assist.value
-                  ? AssistSheet(app: app, mode: _assist)
+                  ? (Platform.isAndroid ? AssistSheet(app: app, mode: _assist) : CommandBar(app: app, mode: _assist))
                   : app.welcomed
                       ? ChatScreen(app: app)
                       : WelcomePage(app: app),
@@ -51,4 +58,19 @@ class _LiyabAppState extends State<LiyabApp> {
           },
         ),
       );
+
+  /// macOS: the window's content runs under its transparent title bar
+  /// (macos/Runner/MainFlutterWindow.swift). The bar's height becomes top
+  /// padding, as a status bar's is on a phone: app bars extend under the
+  /// traffic lights and their content starts below them. The assistant sheet
+  /// (a borderless panel) has no title bar.
+  Widget _titleBarInset(BuildContext context, Widget child) {
+    if (!Platform.isMacOS || _assist.value) return child;
+    final media = MediaQuery.of(context);
+    const inset = EdgeInsets.only(top: 28);
+    return MediaQuery(
+      data: media.copyWith(padding: media.padding + inset, viewPadding: media.viewPadding + inset),
+      child: child,
+    );
+  }
 }

@@ -108,6 +108,21 @@ void main() {
     expect(ToolText.notifications(raw, DateTime(2026, 10, 9, 8), 'gmail', now), endsWith('from gmail: none.'));
   });
 
+  test('emails are one line each: unread marked, preview after the subject', () {
+    final now = DateTime(2026, 10, 9, 13, 0);
+    int ms(DateTime t) => t.millisecondsSinceEpoch;
+    final raw = [
+      {'from': 'Banca', 'subject': 'Statement', 'preview': 'Your October statement', 'time': ms(DateTime(2026, 10, 9, 11, 5))},
+      {'from': 'Anna', 'subject': 'Dinner', 'read': true, 'time': ms(DateTime(2026, 10, 8, 19, 40))},
+    ];
+    expect(ToolText.emails(raw, DateTime(2026, 10, 8), '', now).split('\n'), [
+      'Emails since 2026-10-08 00:00, newest first:',
+      '- 11:05 (unread) Banca: Statement - Your October statement',
+      '- 2026-10-08 19:40 Anna: Dinner',
+    ]);
+    expect(ToolText.emails([], DateTime(2026, 10, 9, 8), 'bank', now), 'Emails since 08:00 matching "bank": none.');
+  });
+
   test('a saved message comes back as the model saw it', () {
     final m = ChatMessage('What do I have today?', '<think>\n\n</think>\n\n', promptUser: 'What do I have today?\n\n[Now: …]')
       ..done = 'call<tool_response>{}</tool_response>'

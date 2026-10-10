@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- No sandbox: models are opened from any folder the user picks and read
+	     with F_NOCACHE; the app downloads from Hugging Face and serves the
+	     local API. Distributed outside the App Store (Developer ID). -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- file_picker refuses to open its panel without this entitlement, sandbox or not. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<!-- The agent tools' sources (Settings > What Liyab can read), each also behind the system's prompt. -->
+	<key>com.apple.security.personal-information.calendars</key>
+	<true/>
+	<key>com.apple.security.personal-information.addressbook</key>
+	<true/>
+</dict>
+</plist>

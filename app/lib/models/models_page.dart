@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../engine/liyab_ffi.dart';
 import '../state/app_state.dart';
@@ -63,7 +64,13 @@ class _LocalTabState extends State<_LocalTab> {
   /// On Android the picker hands over a copy in the app's cache, which is
   /// renamed into place (same file system, no second copy).
   Future<void> _import() async {
-    final picked = await FilePicker.pickFiles(type: FileType.any);
+    final List<PlatformFile> picked;
+    try {
+      picked = await FilePicker.pickFiles(type: FileType.any);
+    } on PlatformException catch (e) {
+      if (mounted) _snack('Could not open the file picker: ${e.message ?? e.code}');
+      return;
+    }
     final path = picked.isEmpty ? null : picked.single.path;
     if (path == null) return;
     if (!path.toLowerCase().endsWith('.gguf')) {

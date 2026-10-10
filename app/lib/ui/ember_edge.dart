@@ -18,6 +18,7 @@ class EmberEdge extends StatefulWidget {
     required this.heat,
     required this.borderRadius,
     required this.child,
+    this.outerGlow = true,
   });
   final FlameState state;
 
@@ -27,6 +28,11 @@ class EmberEdge extends StatefulWidget {
   /// The shape of `child`, which the glow and the running light follow.
   final BorderRadius borderRadius;
   final Widget child;
+
+  /// The glow around the shape. Off where nothing can be drawn outside it
+  /// (the desktop command bar's window is exactly its size): the running
+  /// light along the top edge remains.
+  final bool outerGlow;
 
   @override
   State<EmberEdge> createState() => _EmberEdgeState();
@@ -87,11 +93,12 @@ class _EmberEdgeState extends State<EmberEdge> with SingleTickerProviderStateMix
         decoration: BoxDecoration(
           borderRadius: radius,
           boxShadow: [
-            BoxShadow(
-              color: glow.withValues(alpha: 0.28 + 0.32 * pulse),
-              blurRadius: 44 + 36 * pulse,
-              spreadRadius: -14 + 8 * pulse,
-            ),
+            if (widget.outerGlow)
+              BoxShadow(
+                color: glow.withValues(alpha: 0.28 + 0.32 * pulse),
+                blurRadius: 44 + 36 * pulse,
+                spreadRadius: -14 + 8 * pulse,
+              ),
           ],
         ),
         child: ClipRRect(

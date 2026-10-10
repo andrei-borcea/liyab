@@ -14,7 +14,8 @@ import '../ui/living_flame.dart';
 import '../ui/waking_up.dart';
 import '../ui/theme.dart';
 
-/// Whether the assistant sheet is showing, driven by AssistActivity.
+/// Whether the assistant is showing, driven by the native side: AssistActivity
+/// on Android (the sheet), AssistWindow on macOS (the command bar).
 class AssistMode extends ValueNotifier<bool> {
   AssistMode() : super(false) {
     _channel.setMethodCallHandler((call) async {
@@ -29,6 +30,12 @@ class AssistMode extends ValueNotifier<bool> {
   /// onPause), not here: switching now would draw the app's chat in the
   /// see-through window for the moment before it disappears.
   Future<void> close() => _channel.invokeMethod<void>('close');
+
+  /// Desktop: the window takes the command bar's height (logical pixels).
+  Future<void> resize(double height) => _channel.invokeMethod<void>('resize', {'height': height});
+
+  /// Desktop: closes the command bar and brings up the app's window.
+  Future<void> openApp() => _channel.invokeMethod<void>('openApp');
 }
 
 class AssistSheet extends StatefulWidget {

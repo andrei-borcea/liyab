@@ -1,28 +1,55 @@
 #!/usr/bin/env bash
-# Builds the Liyab Flutter app (app/) for Android: libliyab with the NDK (with
-# the experimental modules, which Settings > Experimental turns on; all off by
-# default), then the release APK, and optionally installs it.
+# Builds the Liyab Flutter app (app/) with the engine and its experimental
+# modules (Settings > Experimental turns them on; all off by default).
 #
-#   scripts/build_flutter_app.sh [--install]
+#   scripts/build_flutter_app.sh [--install]   Android: release APK, optionally installed
+#   scripts/build_flutter_app.sh --macos       macOS: Liyab.app (Apple silicon)
 #
-# Requires: Flutter, Android SDK (platform 36), NDK, JDK 17, cmake. The APK is
-# signed with build/liyab-debug.keystore (created here if missing): keep it, an
-# APK signed with another key cannot update the installed app.
+# Android requires Flutter, Android SDK (platform 36), NDK, JDK 17, cmake. The
+# APK is signed with build/liyab-debug.keystore (created here if missing):
+# keep it, an APK signed with another key cannot update the installed app.
 # --install never interrupts the app: it waits while Liyab is on screen or runs
 # a foreground service (a model download), then installs, which restarts it.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
+# macOS requires Flutter, Xcode, cmake. The engine is linked statically into
+# the app (app/macos/Runner/Configs/Engine.xcconfig); `flutter run -d macos`
+# works once this has built build/macos/engine/libliyab.a.
+# Output: app/build/macos/Build/Products/Release/Liyab.app
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL=0
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+MACOS=0
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --install) INSTALL=1; shift ;;
+    --macos) MACOS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ "$MACOS" == 1 ]]; then
+  [[ "$(uname)" == "Darwin" ]] || { echo "error: the macOS app builds on macOS only" >&2; exit 1; }
+  GENERATOR=()
+  command -v ninja >/dev/null && GENERATOR=(-G Ninja)
+  echo "==> libliyab (macOS arm64, static)"
+  cmake -S "$ROOT" -B "$ROOT/build/macos/engine" "${GENERATOR[@]}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+    -DLIYAB_BUILD_SHARED=OFF \
+    -DLIYAB_BUILD_TESTS=OFF \
+    -DLIYAB_BUILD_CLI=OFF \
+    -DLIYAB_ENABLE_EXPERIMENTAL=ON >/dev/null
+  cmake --build "$ROOT/build/macos/engine" --parallel >/dev/null
+  echo "==> Liyab.app"
+  (cd "$ROOT/app" && flutter build macos --release)
+  APP="$ROOT/app/build/macos/Build/Products/Release/Liyab.app"
+  echo "==> Built $APP ($(du -sh "$APP" | cut -f1))"
+  exit 0
+fi
 
 echo "==> libliyab"
 "$ROOT/scripts/build_android.sh" --no-tests --experimental >/dev/null

@@ -1,13 +1,15 @@
 // Settings: the loaded model's generation settings, this phone's limits, and
 // the permissions Liyab uses.
+import 'dart:io';
+
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:permission_handler/permission_handler.dart' show openAppSettings;
 
 import '../agent/tools.dart';
 import '../engine/engine_service.dart';
 import '../state/app_state.dart';
+import '../state/settings.dart';
 import 'api_section.dart';
 import 'experimental_section.dart';
 
@@ -51,8 +53,12 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       _permitted[tool.name] = granted;
       if (!granted && mounted && tool is! NotificationsTool) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: const Text('Android did not grant access. You can allow it in the app settings.'),
-          action: SnackBarAction(label: 'Open', onPressed: openAppSettings),
+          content: Text(Platform.isAndroid
+              ? 'Android did not grant access. You can allow it in the app settings.'
+              : _fullDiskAccess(tool)
+              ? 'Turn on Liyab in Full Disk Access, then come back: it turns on by itself.'
+              : 'macOS did not grant access. You can allow Liyab in Privacy & Security.'),
+          action: SnackBarAction(label: 'Open', onPressed: tool.openSettings),
         ));
       }
     }
@@ -188,20 +194,24 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
         ),
         const SizedBox(height: 4),
         Text(
-          const [
-            'Full speed; slows down only near Android\'s own heat limit.',
-            'Answers at reading speed or faster; as the phone warms up, tokens come a little slower at lower clocks.',
-            'Reacts to heat earliest, on half the cores: the phone stays cool, answers come slower.',
+          [
+            'Full speed; slows down only near the system\'s own heat limit.',
+            'Answers at reading speed or faster; as the ${Platform.isAndroid ? 'phone' : 'computer'} warms up, '
+                'tokens come a little slower at lower clocks.',
+            'Reacts to heat earliest, on half the cores: the ${Platform.isAndroid ? 'phone' : 'computer'} stays cool, '
+                'answers come slower.',
           ][app.device.powerProfile.clamp(0, 2)],
           style: muted,
         ),
         const SizedBox(height: 8),
         slider('Cool down above', app.device.thermalLimitC, 38, 60, 22, (v) => '${v.round()} °C',
             (v) => app.device.thermalLimitC = v.roundToDouble()),
-        slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048, 12288, 40,
+        slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048,
+            DeviceSettings.maxMemoryBudgetMb.toDouble(), (DeviceSettings.maxMemoryBudgetMb - 2048) ~/ 256,
             (v) => '${(v / 1024).toStringAsFixed(1)} GB', (v) => app.device.memoryBudgetMb = (v / 256).round() * 256),
         Text(
-            'HyperOS and MIUI close apps that use more than 6 GB. Both apply the next time the model loads.'
+            '${Platform.isAndroid ? 'HyperOS and MIUI close apps that use more than 6 GB.' : 'At most 5 GB, whatever the RAM: larger models stream from the SSD.'}'
+            ' Both apply the next time the model loads.'
             '${app.memory.recommendedBytes > 0 ? ' The loaded model runs well with about '
                 '${(app.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB.' : ''}',
             style: app.memory.tight ? muted?.copyWith(color: theme.colorScheme.error) : muted),
@@ -225,10 +235,14 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
               contentPadding: EdgeInsets.zero,
               leading: Icon(on ? Icons.assistant_rounded : Icons.assistant_outlined),
               title: const Text('Open Liyab from any app'),
-              subtitle: Text(on
-                  ? 'Liyab is your digital assistant: hold the power button to ask it anything.'
-                  : 'Make Liyab the default digital assistant, then hold the power button to open it over any app.'),
-              trailing: on
+              subtitle: Text(Platform.isMacOS
+                  ? (on
+                      ? 'Press Option-Space in any app to ask Liyab anything; Esc or a click elsewhere closes it.'
+                      : 'Option-Space is taken by another app, so Liyab cannot open from any app.')
+                  : on
+                      ? 'Liyab is your digital assistant: hold the power button to ask it anything.'
+                      : 'Make Liyab the default digital assistant, then hold the power button to open it over any app.'),
+              trailing: on || !Platform.isAndroid
                   ? null
                   : TextButton(
                       onPressed: () async {
@@ -244,8 +258,9 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
         Text(
           app.toolDialect.name == 'none' && app.modelName.isNotEmpty
               ? 'The loaded model cannot call tools; Qwen3, Qwen3.5 and Qwen3.6 can.'
-              : 'Turn on what the assistant may read to answer about your day. It reads on this phone, only when a '
-                  'question needs it, and nothing leaves the device.',
+              : 'Turn on what the assistant may read to answer about your day. It reads on this '
+                  '${Platform.isAndroid ? 'phone' : 'computer'}, only when a question needs it, and nothing leaves '
+                  'the device.',
           style: muted,
         ),
         for (final t in app.toolbox.all)
@@ -254,7 +269,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
             secondary: Icon(_toolIcon(t)),
             title: Text(_toolTitle(t)),
             subtitle: Text(app.toolbox.isOn(t) && !(_permitted[t.name] ?? true)
-                ? 'Waiting for Android\'s permission: tap to ask again.'
+                ? 'Waiting for ${Platform.isAndroid ? 'Android' : 'macOS'}\'s permission: tap to ask again.'
                 : _toolExample(t)),
             value: app.toolbox.isOn(t) && (_permitted[t.name] ?? false),
             onChanged: (v) => _toggleTool(t, v),
@@ -309,8 +324,12 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   }
 }
 
+/// macOS sources read from Apple's databases, which only Full Disk Access opens.
+bool _fullDiskAccess(AgentTool t) => t is MessagesTool || t is CallsTool || t is EmailTool;
+
 IconData _toolIcon(AgentTool t) => switch (t) {
       CalendarTool() => Icons.event_outlined,
+      EmailTool() => Icons.mail_outline_rounded,
       NotificationsTool() => Icons.notifications_outlined,
       MessagesTool() => Icons.sms_outlined,
       CallsTool() => Icons.call_outlined,
@@ -320,8 +339,9 @@ IconData _toolIcon(AgentTool t) => switch (t) {
 
 String _toolTitle(AgentTool t) => switch (t) {
       CalendarTool() => 'Calendar',
+      EmailTool() => 'Email (Apple Mail)',
       NotificationsTool() => 'Notifications (chats, email previews)',
-      MessagesTool() => 'Text messages',
+      MessagesTool() => Platform.isAndroid ? 'Text messages' : 'Messages (iMessage, SMS)',
       CallsTool() => 'Calls',
       ContactsTool() => 'Contacts',
       _ => 'Clipboard',
@@ -330,8 +350,15 @@ String _toolTitle(AgentTool t) => switch (t) {
 String _toolExample(AgentTool t) => switch (t) {
       CalendarTool() => '"What do I have today?" "Am I free at 5?"',
       NotificationsTool() => '"What did Marco write me?" "Any new email?" Android asks in its settings.',
-      MessagesTool() => '"What did the bank\'s SMS say?"',
-      CallsTool() => '"Who called me this morning?"',
+      EmailTool() => '"Any new email from the bank?" Needs Full Disk Access.',
+      MessagesTool() => Platform.isAndroid
+          ? '"What did the bank\'s SMS say?"'
+          : '"What did Anna write me?" Needs Full Disk Access.',
+      CallsTool() => Platform.isAndroid
+          ? '"Who called me this morning?"'
+          : '"Who called me this morning?" iPhone calls via Continuity. Needs Full Disk Access.',
       ContactsTool() => '"What is Anna\'s number?"',
-      _ => '"Summarize what I copied." Android shows a notice when it is read.',
+      _ => Platform.isAndroid
+          ? '"Summarize what I copied." Android shows a notice when it is read.'
+          : '"Summarize what I copied."',
     };
