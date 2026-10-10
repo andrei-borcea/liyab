@@ -82,12 +82,26 @@ struct EngineConfig {
     // router weight is below this share of the token's experts (the others
     // renormalized). Lossy, opt-in: cuts stalls on low-impact experts. 0: off.
     float moe_skip_slow = 0.0f;
-    // Prefix cache, MiB of RAM (0: off): contexts another conversation's
-    // prompt replaced are kept (KV pages and recurrent states, LRU) and
-    // restored when a prompt continues one, instead of processing it again.
-    // Taken out of memory_budget_mb. On Qwen3.6-35B-A3B a 2000-token
+    // Prefix cache, MiB of RAM at most (0: off): contexts another
+    // conversation's prompt replaced are kept (KV pages, recurrent states and
+    // the text they encode, LRU) and restored when a prompt continues one,
+    // instead of processing it again. Taken out of memory_budget_mb; on a MoE
+    // whose experts stream, only as far as the expert cache can spare: it
+    // never takes the cache under 10% of the experts, so it never causes a
+    // requantization (requant_bits -1). On Qwen3.6-35B-A3B a 2000-token
     // conversation costs ~85 MiB.
     int64_t prefix_cache_mb = 0;
+    // Prefix cache on storage: contexts set aside that RAM does not hold
+    // (prefix_cache_mb, possibly 0) are written to files in this directory
+    // (created if missing), up to prefix_cache_disk_mb (0: off), least
+    // recently used out first, and read back when a prompt continues one.
+    // No RAM spent: worth it wherever RAM is tight and storage is fast (UFS 4
+    // writes or reads a ~100 MB context in a fraction of a second; processing
+    // it again takes minutes on a large MoE). The engine owns the ctx-*.state
+    // files there: it removes its own when destroyed and, when created, those
+    // that processes which ended left behind.
+    std::string prefix_cache_dir;
+    int64_t prefix_cache_disk_mb = 0;
     // Most drafts per speculative step (k). 3 by default: a verification pass
     // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
     int32_t draft_tokens = 3;

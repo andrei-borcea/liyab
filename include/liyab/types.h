@@ -249,6 +249,7 @@ struct GenerationStats {
     int32_t expert_dropped = 0;     // wrong guesses removed from the read queue before being read
     int32_t expert_skipped = 0;     // chosen experts skipped instead of waited for (EngineConfig::moe_skip_slow)
     int32_t forced_tokens = 0;      // tokens of forced continuations (ForceCallback), not in generated_tokens
+    double forced_ms = 0.0;         // time of the batched passes over them (part of decode_ms)
     int32_t expert_predicted = 0;   // experts guessed one block ahead (cached ones included)
     int32_t expert_predicted_used = 0;  // ... that the router then chose (precision = used / predicted)
     DecodePhases decode_phases;

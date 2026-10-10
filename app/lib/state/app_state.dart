@@ -311,7 +311,16 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<int> countTokens(String text) => engine.countTokens(text);
 
   @override
-  Generation generate(String prompt, SamplingOptions sampling) => engine.generate(prompt, sampling);
+  Generation generate(String prompt, SamplingOptions sampling) {
+    _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
+    return engine.generate(prompt, sampling);
+  }
+
+  /// Whether the engine's context is this chat's once the commands queued so far have run (another app's request
+  /// replaces it; the engine keeps the chat's aside and restores it on the chat's next prompt). Parking saves the
+  /// context as the conversation's only then: another one saved in its place would be restored with the chat
+  /// after a restart, and the whole conversation processed again.
+  bool _chatContext = true;
 
   void _log(String line, {bool engine = false}) {
     log.add(LogLine(line, engine: engine));
@@ -369,6 +378,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
         skinThresholdC: device.thermalLimitC,
         memoryBudgetMb: device.memoryBudgetMb,
         powerProfile: device.powerProfile,
+        // A context another conversation replaces (other apps through the local API, a chat left for a new one)
+        // goes to storage, not RAM: it comes back in a fraction of a second when its conversation goes on, instead
+        // of being processed again (minutes on a large MoE), and the memory budget stays with the model.
+        prefixCacheDir: '${(await getApplicationSupportDirectory()).path}/prefix-cache',
+        // Bounded, and the engine removes the files as contexts come back, and all of them when the model unloads:
+        // room for the largest context of a 35B MoE (~320 MB at 24k tokens) and a smaller one.
+        prefixCacheDiskMb: 512,
         experimental: {
           ...experimental.toJson(),
           if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,
@@ -468,14 +484,15 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// Saves the conversation (removes it when there is none): the messages,
   /// and with `withContext` the engine's context (KV pages and recurrent
   /// states, ~200 MB on a 35B MoE: written when parking, not after every
-  /// reply). A context older than the messages is still a prefix of the next
-  /// prompt, so it only saves less work. Between generations only.
+  /// reply), when it is the chat's (_chatContext). A context older than the
+  /// messages is still a prefix of the next prompt, so it only saves less
+  /// work. Between generations only.
   Future<void> _saveConversation({bool withContext = false}) async {
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty) return _discardConversation();
     await File(chat).writeAsString(
         jsonEncode({'start': _historyStart, 'messages': [for (final m in messages) m.toJson()]}));
-    if (!withContext) return;
+    if (!withContext || !_chatContext) return; // checked as the save is queued: nothing can come in between
     try {
       await engine.saveState(state);
     } on EngineException catch (e) {
@@ -510,6 +527,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     if (messages.isNotEmpty && File(state).existsSync()) {
       final watch = Stopwatch()..start();
       try {
+        _chatContext = true;
         final n = await engine.loadState(state);
         _prepared = await _systemBlock(); // the conversation starts with it
         _log('Conversation restored (${messages.length} messages, $n tokens) in ${watch.elapsedMilliseconds} ms');
@@ -544,6 +562,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     final (dir, file) = await _stateFile(block);
     if (File(file).existsSync()) {
       try {
+        _chatContext = true;
         final n = await engine.loadState(file);
         _log('System prompt restored ($n tokens) in ${watch.elapsedMilliseconds} ms');
         return;
@@ -555,11 +574,16 @@ class AppState extends ChangeNotifier implements ApiBackend {
     try {
       // In the background: a message sent meanwhile goes first, and its
       // prompt (which starts with this block) continues the work done.
+      _chatContext = true;
       await engine.prefill(block, background: true);
       _log('System prompt prepared in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
+      // Saved only while the context is still the chat's: a request of another app queued meanwhile has replaced it.
+      if (!_chatContext) return;
       await engine.saveState(file);
+      // Older states of this model's system prompt go; its conversation and expert profile stay.
+      final older = RegExp('^${RegExp.escape(modelName)}\\.[0-9a-f]{16}\\.state\$');
       for (final old in dir.listSync().whereType<File>()) {
-        if (old.path != file && old.uri.pathSegments.last.startsWith('$modelName.')) old.deleteSync();
+        if (old.path != file && older.hasMatch(old.uri.pathSegments.last)) old.deleteSync();
       }
     } on EngineException catch (e) {
       _prepared = null; // prepared again (and saved) when the engine is free
@@ -652,6 +676,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
         final ids = await engine.tokenIds(stable, background: true);
         if (ids.length < whole.length && _isPrefix(ids, whole)) {
           final watch = Stopwatch()..start();
+          _chatContext = true;
           await engine.prefill(stable, background: true);
           _log('Draft prepared (${ids.length} tokens) in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(2)} s');
           _drafted = stable;
@@ -776,6 +801,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message,
       String Function(String)? force) async {
     var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
+    _chatContext = true;
     await for (final event in engine.generate(prompt, sampling, force: force).events) {
       switch (event) {
         case TextPiece(:final text):
@@ -790,8 +816,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
           _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
               'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, ${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
-              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}'
-              '${stats.forcedTokens > 0 ? ', ${stats.forcedTokens} forced' : ''}');
+              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}${_forced(stats)}');
           if (stats.generatedTokens >= 16) {
             final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5).map((e) => '${e.key} ${e.value.toStringAsFixed(1)}');
             final total = 1000 / (stats.tokensPerSecond > 0 ? stats.tokensPerSecond : 1);
@@ -802,6 +827,18 @@ class AppState extends ChangeNotifier implements ApiBackend {
       }
       notifyListeners();
     }
+  }
+
+  /// The forced tokens of a step, what their batched passes took, and what
+  /// sampling them one by one would have taken at the step's own decode
+  /// speed: the time structured output saved (or cost) in that step.
+  static String _forced(GenerationStats stats) {
+    if (stats.forcedTokens == 0) return '';
+    final passes = ', ${stats.forcedTokens} forced in ${(stats.forcedMs / 1000).toStringAsFixed(2)} s';
+    if (stats.generatedTokens == 0 || stats.tokensPerSecond <= 0) return passes;
+    final decodeMs = stats.generatedTokens * 1000 / stats.tokensPerSecond; // forced passes included
+    final perToken = (decodeMs - stats.forcedMs) / stats.generatedTokens;
+    return '$passes (sampled: ~${(stats.forcedTokens * perToken / 1000).toStringAsFixed(2)} s)';
   }
 
   Timer? _toolsSettle;
@@ -830,6 +867,12 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _drafted = '';
     _historyStart = 0;
     unawaited(_discardConversation());
+    // A hybrid model rewinds only to its state snapshots, and the old
+    // conversation's context has none at the system prompt's end once it was
+    // restored from a file: the system prompt comes back from its own saved
+    // state instead, so the first message costs only its own tokens.
+    _prepared = null;
+    _preparing = prepareSystemPrompt();
     notifyListeners();
   }
 

@@ -97,7 +97,9 @@ typedef struct liyab_engine_config {
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
     const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
     float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy); 0 off */
-    int64_t prefix_cache_mb;      /* RAM for contexts other conversations replaced, restored when a prompt continues one; 0 off */
+    int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one; 0 off (see EngineConfig) */
+    const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
+    int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -152,6 +154,7 @@ typedef struct liyab_generation_stats {
     int32_t expert_dropped;       /* wrong guesses removed from the read queue before being read */
     int32_t expert_skipped;       /* chosen experts skipped instead of waited for (moe_skip_slow) */
     int32_t forced_tokens;        /* tokens of forced continuations (liyab_engine_generate_forced) */
+    double forced_ms;             /* time of the batched passes over them (part of decode_ms) */
 } liyab_generation_stats;
 
 /*

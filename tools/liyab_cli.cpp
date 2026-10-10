@@ -63,7 +63,11 @@ void usage() {
                  "  --skip-slow W      MoE streaming: skip a chosen expert not yet in RAM whose router weight\n"
                  "                     share is below W (e.g. 0.1) for every token using it (lossy; default 0)\n"
                  "  --prefix-cache MB  keep contexts replaced by an unrelated prompt in an in-RAM LRU of\n"
-                 "                     this size, restored when a later prompt continues one (default 0)\n"
+                 "                     at most this size, restored when a later prompt continues one; with\n"
+                 "                     --memory-budget, MoE streaming gives it only what the expert cache\n"
+                 "                     can spare above 10%% of the experts (default 0)\n"
+                 "  --prefix-cache-disk MB DIR  keep such contexts that RAM does not hold in files in DIR,\n"
+                 "                     up to MB of storage (default 0: off)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -121,6 +125,10 @@ int main(int argc, char** argv) {
         else if (arg == "--experts") config.moe_max_experts = std::atoi(next());
         else if (arg == "--skip-slow") config.moe_skip_slow = static_cast<float>(std::atof(next()));
         else if (arg == "--prefix-cache") config.prefix_cache_mb = std::atoll(next());
+        else if (arg == "--prefix-cache-disk") {
+            config.prefix_cache_disk_mb = std::atoll(next());
+            config.prefix_cache_dir = next();
+        }
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;

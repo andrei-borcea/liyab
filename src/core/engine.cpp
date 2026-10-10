@@ -6,9 +6,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
+
+#include <unistd.h>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -63,13 +67,12 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
                                                 int32_t max_batch, bool repack_cpu) {
     LoaderOptions loader_options;
     loader_options.streaming = config.streaming;
-    // The prefix cache comes out of the memory budget (the expert cache gets the rest).
-    loader_options.memory_budget_bytes =
-        config.memory_budget_mb > 0
-            ? static_cast<uint64_t>(std::max<int64_t>(config.memory_budget_mb - std::max<int64_t>(config.prefix_cache_mb, 0),
-                                                      config.memory_budget_mb / 2))
-                  << 20
-            : 0;
+    // The prefix cache comes out of the memory budget: set aside when deciding
+    // whether the model fits, and on a MoE whose experts stream, taken only
+    // from what the expert cache can spare (TransformerOptions::reserve_bytes).
+    const int64_t budget_mb = std::max<int64_t>(config.memory_budget_mb, 0);
+    const int64_t reserve_mb = std::min(std::max<int64_t>(config.prefix_cache_mb, 0), budget_mb / 2);
+    loader_options.memory_budget_bytes = static_cast<uint64_t>(budget_mb - reserve_mb) << 20;
     auto file = MmapLoader::open(path, loader_options);
     if (!file) return file.status();
     TransformerOptions options;
@@ -80,6 +83,7 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.max_batch = max_batch;
     options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
+    options.reserve_bytes = static_cast<size_t>(reserve_mb) << 20;
     options.requant_bits = config.requant_bits;
     options.expert_mass = config.moe_expert_mass;
     options.max_experts = config.moe_max_experts;
@@ -106,31 +110,69 @@ struct Engine::Impl {
     // used with a draft model, whose cache moves in step with the target's
     // during speculation.
     std::vector<int32_t> context;
-    // The text `context` encodes, when known (valid): a prompt given as text
-    // followed by the pieces of the reply tokens generated after it.
+    // The text the first `context_text_tokens` tokens of `context` encode (0:
+    // not known): a prompt given as text, followed by the pieces of the reply
+    // tokens generated after it. Those tokens need not be the text's own
+    // encoding (a model may write a word in pieces the tokenizer would
+    // merge), so a prompt is matched against this text, not re-encoded
+    // (encode_continuation). The text outlives work that was cancelled or cut
+    // short, which leaves its tokens in place, and follows rewinds
+    // (cut_text): losing it made the next turn re-encode the conversation,
+    // diverge at the first such reply and, on a hybrid model, start over.
     std::string context_text;
-    bool context_text_valid = false;
+    size_t context_text_tokens = 0;
 
     void clear_context() {
         target->reset();
         if (draft) draft->reset();
         context.clear();
-        context_text_valid = false;
+        context_text.clear();
+        context_text_tokens = 0;
     }
 
-    // Tokens for `text`. When it starts with the text the context holds, the
-    // context's own tokens followed by the encoding of the rest: re-encoding
-    // the previous reply need not give back the tokens that were generated,
-    // and on a hybrid model any difference would recompute from the last
-    // state snapshot.
+    // Before `context` is cut to its first `n` tokens: the text of those
+    // tokens, by dropping the pieces of the others from the end of the text
+    // (not known when they do not end it).
+    void cut_text(size_t n) {
+        if (n >= context_text_tokens) return;
+        std::string tail;
+        for (size_t i = n; i < context_text_tokens; ++i) tail += tokenizer->piece(context[i]);
+        if (n > 0 && context_text.ends_with(tail)) {
+            context_text.resize(context_text.size() - tail.size());
+            context_text_tokens = n;
+        } else {
+            context_text.clear();
+            context_text_tokens = 0;
+        }
+    }
+
+    // Tokens for `text`. When it continues a text the engine knows (this
+    // context's, or a context set aside in the prefix cache, which running
+    // the prompt then restores), that text's own tokens followed by the
+    // encoding of the rest: re-encoding an earlier reply need not give back
+    // the tokens that were generated, and on a hybrid model any difference
+    // would recompute from a state snapshot before it.
     Result<std::vector<int32_t>> encode_continuation(std::string_view text, bool add_bos) const {
         const bool bos = add_bos && tokenizer->add_bos_default();
-        if (!draft && context_text_valid && !context.empty() && text.size() > context_text.size() &&
-            text.starts_with(context_text) &&
-            (static_cast<unsigned char>(text[context_text.size()]) & 0xC0) != 0x80) {  // not mid-character
-            auto rest = tokenizer->encode_continuation(text.substr(context_text.size()), context.back());
+        const std::vector<int32_t>* known = nullptr;
+        size_t known_tokens = 0, known_bytes = 0;
+        auto consider = [&](const std::vector<int32_t>& tokens, const std::string& known_text, size_t n) {
+            if (n > 0 && known_text.size() >= known_bytes && text.size() > known_text.size() &&
+                text.starts_with(known_text) &&
+                (static_cast<unsigned char>(text[known_text.size()]) & 0xC0) != 0x80) {  // not mid-character
+                known = &tokens;
+                known_tokens = n;
+                known_bytes = known_text.size();
+            }
+        };
+        if (!draft) {
+            for (const PrefixEntry& e : prefix_cache) consider(e.tokens, e.text, e.text_tokens);
+            consider(context, context_text, context_text_tokens);  // preferred on a tie: nothing to restore
+        }
+        if (known != nullptr) {
+            auto rest = tokenizer->encode_continuation(text.substr(known_bytes), (*known)[known_tokens - 1]);
             if (!rest) return rest.status();
-            std::vector<int32_t> tokens = context;
+            std::vector<int32_t> tokens(known->begin(), known->begin() + static_cast<std::ptrdiff_t>(known_tokens));
             tokens.insert(tokens.end(), rest->begin(), rest->end());
             return tokens;
         }
@@ -140,40 +182,115 @@ struct Engine::Impl {
     // After a run over `prompt` (the encoding of `text`): records the text the
     // context now holds, if the context still starts with the whole prompt.
     void remember_text(std::span<const int32_t> prompt, std::string_view text) {
-        context_text_valid = context.size() >= prompt.size() && std::equal(prompt.begin(), prompt.end(), context.begin());
-        if (!context_text_valid) return;
+        if (context.size() < prompt.size() || !std::equal(prompt.begin(), prompt.end(), context.begin())) {
+            context_text.clear();
+            context_text_tokens = 0;
+            return;
+        }
         context_text.assign(text);
         for (size_t i = prompt.size(); i < context.size(); ++i) context_text += tokenizer->piece(context[i]);
+        context_text_tokens = context.size();
     }
 
-    // Keeps the longest usable prefix of `tokens` already in the context and
-    // returns its length (at most `limit`); drops everything else.
-    // Prefix cache (EngineConfig::prefix_cache_mb): contexts set aside when
-    // a prompt from another conversation replaced them (the chat, the
-    // assistant sheet, a background agent, other apps through an API), kept
-    // as serialized states (KV pages and recurrent states) in an LRU of
-    // bounded size. A prompt that continues one of them restores it instead
-    // of processing it again. Only contexts the new prompt shares less than
-    // half of are set aside: edits within a conversation keep using the
-    // context's own snapshots.
+    // Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir):
+    // contexts set aside when a prompt from another conversation replaced
+    // them (the chat, the assistant sheet, a background agent, other apps
+    // through an API), kept as serialized states (KV pages and recurrent
+    // states) with the text they encode, in an LRU of bounded size. A prompt
+    // that continues one of them restores it instead of processing it again.
+    // Only contexts the new prompt shares less than half of are set aside:
+    // edits within a conversation keep using the context's own snapshots.
+    // RAM holds what prefix_cache_mb allows; the rest, or everything when it
+    // is 0, goes to files in prefix_cache_dir: a phone's RAM is better spent
+    // on weights, and its storage writes and reads back a ~100 MB context in
+    // a fraction of a second, where processing it again takes minutes.
     struct PrefixEntry {
         std::vector<int32_t> tokens;
-        std::string state;  // Transformer::write_state
+        std::string state;  // Transformer::write_state, while in RAM
+        std::string file;   // where the state is, once on storage (`state` empty)
+        size_t bytes = 0;   // the state's size
+        std::string text;   // what its first text_tokens tokens encode (see context_text)
+        size_t text_tokens = 0;
         uint64_t last_use = 0;
     };
     std::vector<PrefixEntry> prefix_cache;
-    size_t prefix_cache_budget = 0;
+    size_t prefix_cache_budget = 0;       // RAM, bytes
+    size_t prefix_cache_disk_budget = 0;  // storage, bytes (0: no storage tier)
+    std::string prefix_cache_dir;
     uint64_t prefix_clock = 0;
     static constexpr size_t kMinPrefixEntry = 128;  // shorter contexts are cheaper to process again
 
-    size_t prefix_cache_bytes() const {
+    [[nodiscard]] bool prefix_cache_on() const { return prefix_cache_budget > 0 || prefix_cache_disk_budget > 0; }
+
+    ~Impl() {
+        for (const PrefixEntry& e : prefix_cache) {
+            if (!e.file.empty()) std::remove(e.file.c_str());
+        }
+    }
+
+    size_t prefix_cache_bytes(bool on_storage) const {
         size_t bytes = 0;
-        for (const PrefixEntry& e : prefix_cache) bytes += e.state.size() + e.tokens.size() * sizeof(int32_t);
+        for (const PrefixEntry& e : prefix_cache) {
+            if (e.file.empty() != on_storage) bytes += e.bytes;
+        }
         return bytes;
     }
 
+    // The file of entry `id` (its last_use, unique in this engine): the
+    // process id keeps other processes (or an earlier one) from colliding,
+    // the engine's address the other engines of this one.
+    std::string prefix_file(uint64_t id) const {
+        return prefix_cache_dir + "/ctx-" + std::to_string(::getpid()) + "-" +
+               std::to_string(reinterpret_cast<uintptr_t>(this)) + "-" + std::to_string(id) + ".state";
+    }
+
+    // Writes entry `id`'s state to storage; the file, or empty when it could not be written.
+    std::string write_prefix_file(uint64_t id, const std::function<Status(std::ostream&)>& write) const {
+        const std::string path = prefix_file(id);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out && write(out).is_ok() && out.flush()) return path;
+        out.close();
+        std::remove(path.c_str());
+        LIYAB_LOG_WARN("prefix cache: cannot write %s", path.c_str());
+        return {};
+    }
+
+    void drop_prefix_entry(std::vector<PrefixEntry>::iterator it) {
+        if (!it->file.empty()) std::remove(it->file.c_str());
+        prefix_cache.erase(it);
+    }
+
+    // Least recently used entries over the RAM budget move to storage (or
+    // go, without it); over the storage budget, they go.
+    void trim_prefix_cache() {
+        auto oldest = [&](bool on_storage) {
+            auto best = prefix_cache.end();
+            for (auto it = prefix_cache.begin(); it != prefix_cache.end(); ++it) {
+                if (it->file.empty() != on_storage && (best == prefix_cache.end() || it->last_use < best->last_use)) {
+                    best = it;
+                }
+            }
+            return best;
+        };
+        while (prefix_cache_bytes(false) > prefix_cache_budget) {
+            const auto it = oldest(false);
+            if (prefix_cache_disk_budget >= it->bytes) {
+                it->file = write_prefix_file(it->last_use, [&](std::ostream& out) {
+                    out.write(it->state.data(), static_cast<std::streamsize>(it->state.size()));
+                    return out ? Status::ok() : Status(ErrorCode::IoError, "write failed");
+                });
+            }
+            if (it->file.empty()) {
+                prefix_cache.erase(it);
+            } else {
+                std::string().swap(it->state);
+            }
+        }
+        while (prefix_cache_bytes(true) > prefix_cache_disk_budget) drop_prefix_entry(oldest(true));
+    }
+
     void stash_context() {
-        if (prefix_cache_budget == 0 || context.size() < kMinPrefixEntry) return;
+        if (!prefix_cache_on() || context.size() < kMinPrefixEntry) return;
         // A hybrid model's recurrent state rewinds only to a snapshot: set the
         // context aside at its pinned one (the last prompt's end, which that
         // conversation's next prompt continues), dropping the reply after it.
@@ -181,19 +298,43 @@ struct Engine::Impl {
             const int32_t pinned = target->pinned_snapshot();
             if (pinned >= static_cast<int32_t>(kMinPrefixEntry) && pinned < target->n_past() &&
                 target->truncate(pinned).is_ok()) {
+                cut_text(static_cast<size_t>(pinned));
                 context.resize(static_cast<size_t>(pinned));
             }
         }
-        std::erase_if(prefix_cache, [&](const PrefixEntry& e) {  // an older copy of the same conversation
-            return e.tokens.size() <= context.size() && std::equal(e.tokens.begin(), e.tokens.end(), context.begin());
-        });
-        std::ostringstream out;
-        if (!target->write_state(out).is_ok()) return;
-        prefix_cache.push_back({context, std::move(out).str(), ++prefix_clock});
-        while (prefix_cache_bytes() > prefix_cache_budget && !prefix_cache.empty()) {
-            const auto oldest = std::min_element(prefix_cache.begin(), prefix_cache.end(),
-                                                 [](const PrefixEntry& a, const PrefixEntry& b) { return a.last_use < b.last_use; });
-            prefix_cache.erase(oldest);
+        for (auto it = prefix_cache.begin(); it != prefix_cache.end();) {  // an older copy of the same conversation
+            if (it->tokens.size() <= context.size() && std::equal(it->tokens.begin(), it->tokens.end(), context.begin())) {
+                if (!it->file.empty()) std::remove(it->file.c_str());
+                it = prefix_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        PrefixEntry entry{context, {}, {}, 0, context_text, context_text_tokens, ++prefix_clock};
+        const auto watch = Clock::now();
+        if (prefix_cache_budget > 0) {
+            std::ostringstream out;
+            if (!target->write_state(out).is_ok()) return;
+            entry.state = std::move(out).str();
+            entry.bytes = entry.state.size();
+        } else {  // storage only: no copy in RAM on the way
+            size_t written = 0;
+            entry.file = write_prefix_file(entry.last_use, [&](std::ostream& out) {
+                LIYAB_RETURN_IF_ERROR(target->write_state(out));
+                written = static_cast<size_t>(out.tellp());
+                return Status::ok();
+            });
+            if (entry.file.empty()) return;
+            entry.bytes = written;
+        }
+        const uint64_t id = entry.last_use;
+        const double mib = static_cast<double>(entry.bytes) / (1024.0 * 1024.0);
+        prefix_cache.push_back(std::move(entry));
+        trim_prefix_cache();
+        if (std::any_of(prefix_cache.begin(), prefix_cache.end(), [&](const PrefixEntry& e) { return e.last_use == id; })) {
+            LIYAB_LOG_INFO("prefix cache: set aside %zu tokens (%.0f MiB) in %.0f ms", context.size(), mib, ms_since(watch));
+        } else {
+            LIYAB_LOG_INFO("prefix cache: a context of %zu tokens (%.0f MiB) is larger than the cache", context.size(), mib);
         }
     }
 
@@ -214,14 +355,27 @@ struct Engine::Impl {
             }
         }
         if (best == nullptr || best_common <= have || best_common < kMinPrefixEntry) return 0;
-        std::istringstream in(best->state);
-        if (!target->read_state(in).is_ok()) {
-            target->reset();
+        const auto watch = Clock::now();
+        const auto it = prefix_cache.begin() + (best - prefix_cache.data());
+        Status read = Status::ok();
+        if (it->file.empty()) {
+            std::istringstream in(it->state);
+            read = target->read_state(in);
+        } else {
+            std::ifstream in(it->file, std::ios::binary);
+            read = in ? target->read_state(in) : Status(ErrorCode::IoError, "cannot read " + it->file);
+        }
+        if (!read.is_ok()) {
+            LIYAB_LOG_WARN("prefix cache: %s", read.to_string().c_str());
+            drop_prefix_entry(it);
+            clear_context();
             return 0;
         }
-        context = best->tokens;
-        context_text_valid = false;
-        prefix_cache.erase(prefix_cache.begin() + (best - prefix_cache.data()));  // it is the live context now
+        context = std::move(it->tokens);
+        context_text = std::move(it->text);
+        context_text_tokens = it->text_tokens;
+        const bool from_storage = !it->file.empty();
+        drop_prefix_entry(it);  // it is the live context now
         size_t keep = context.size();
         if (best_common < keep) {
             keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(best_common)));
@@ -229,9 +383,11 @@ struct Engine::Impl {
                 clear_context();
                 return 0;
             }
+            cut_text(keep);
             context.resize(keep);
         }
-        LIYAB_LOG_INFO("prefix cache: restored %zu tokens", keep);
+        LIYAB_LOG_INFO("prefix cache: restored %zu tokens from %s in %.0f ms", keep, from_storage ? "storage" : "RAM",
+                       ms_since(watch));
         return keep;
     }
 
@@ -244,16 +400,21 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
-        if (prefix_cache_budget > 0 && common < context.size() / 2) {
+        if (prefix_cache_on() && common < context.size() / 2) {
             stash_context();
             if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
+            if (context.empty()) return 0;  // a cached context failed to restore
         }
         // Attention-only models rewind to any position; hybrid ones to the
         // nearest recurrent-state checkpoint or snapshot below it.
         const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
+        // Diverging from the context costs a recomputation from `keep`: say
+        // where, so a slow turn can be traced to its cause.
+        LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, context.size(),
+                       keep);
         if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+            cut_text(keep);
             context.resize(keep);
-            context_text_valid = false;
             return keep;
         }
         clear_context();
@@ -641,7 +802,39 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 #endif
 
     impl->power = std::make_unique<PowerManager>(config.power);
+    // With a budget, a MoE whose experts stream gives the prefix cache only
+    // what its expert cache can spare (see load_model).
     impl->prefix_cache_budget = config.prefix_cache_mb > 0 ? static_cast<size_t>(config.prefix_cache_mb) << 20 : 0;
+    if (impl->prefix_cache_budget > 0 && config.memory_budget_mb > 0 && impl->target->expert_store() != nullptr) {
+        const size_t granted = impl->target->memory_plan().reserved_bytes;
+        if (granted < impl->prefix_cache_budget) {
+            LIYAB_LOG_INFO("prefix cache: %zu of %lld MiB (more would leave the expert cache under %.0f%% of the experts)",
+                           granted >> 20, static_cast<long long>(config.prefix_cache_mb),
+                           100.0 * Transformer::kTightCache);
+        }
+        impl->prefix_cache_budget = granted;
+    }
+    // Storage tier: the engine removes its files when destroyed, and when it
+    // starts, files left by processes that ended (other process ids).
+    if (config.prefix_cache_disk_mb > 0 && !config.prefix_cache_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(config.prefix_cache_dir, ec);
+        if (ec) {
+            LIYAB_LOG_WARN("prefix cache: cannot use %s: %s", config.prefix_cache_dir.c_str(), ec.message().c_str());
+        } else {
+            const std::string own = "ctx-" + std::to_string(::getpid()) + "-";
+            std::filesystem::directory_iterator it(config.prefix_cache_dir, ec), end;
+            for (; !ec && it != end; it.increment(ec)) {
+                const std::string name = it->path().filename().string();
+                std::error_code ignored;
+                if (name.starts_with("ctx-") && name.ends_with(".state") && !name.starts_with(own)) {
+                    std::filesystem::remove(it->path(), ignored);
+                }
+            }
+            impl->prefix_cache_dir = config.prefix_cache_dir;
+            impl->prefix_cache_disk_budget = static_cast<size_t>(config.prefix_cache_disk_mb) << 20;
+        }
+    }
     impl->power->poll_once();
     if (config.thermal_polling) impl->power->start();
     const Route route = impl->normal_route();
@@ -812,7 +1005,6 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     s.cancel_prefill.store(false, std::memory_order_relaxed);
     const std::vector<int32_t>& t = tokens.value();
     const size_t reused = s.reuse_prefix(t, t.size());
-    s.context_text_valid = false;
     const PowerPolicy policy = s.power->policy();
     s.apply_policy(policy);
     const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
@@ -855,13 +1047,22 @@ Status Engine::save_state(const std::string& path) {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
         LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
+        // After the model's state: magic, token count, tokens, then the text
+        // they encode (its length, UINT64_MAX when not known) and how many of
+        // the tokens it covers. Files written before that count was saved end
+        // after the text, which then covers every token.
         const auto n = static_cast<uint64_t>(s.context.size());
-        const uint64_t text = s.context_text_valid ? s.context_text.size() : UINT64_MAX;
+        const bool known = s.context_text_tokens > 0;
+        const uint64_t text = known ? s.context_text.size() : UINT64_MAX;
+        const auto covered = static_cast<uint64_t>(s.context_text_tokens);
         out.write(reinterpret_cast<const char*>(&kContextMagic), sizeof kContextMagic);
         out.write(reinterpret_cast<const char*>(&n), sizeof n);
         out.write(reinterpret_cast<const char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t)));
         out.write(reinterpret_cast<const char*>(&text), sizeof text);
-        if (s.context_text_valid) out.write(s.context_text.data(), static_cast<std::streamsize>(s.context_text.size()));
+        if (known) {
+            out.write(s.context_text.data(), static_cast<std::streamsize>(s.context_text.size()));
+            out.write(reinterpret_cast<const char*>(&covered), sizeof covered);
+        }
         if (!out.flush()) return Status(ErrorCode::IoError, "cannot write " + tmp);
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -899,7 +1100,13 @@ Result<int32_t> Engine::load_state(const std::string& path) {
         if (text > (uint64_t{1} << 30)) return damaged();
         s.context_text.resize(text);
         if (!in.read(s.context_text.data(), static_cast<std::streamsize>(text))) return damaged();
-        s.context_text_valid = true;
+        uint64_t covered = 0;
+        if (!in.read(reinterpret_cast<char*>(&covered), sizeof covered)) {
+            covered = n;  // written before the count was saved: the text covers every token
+        } else if (covered == 0 || covered > n) {
+            return damaged();
+        }
+        s.context_text_tokens = static_cast<size_t>(covered);
     }
     return static_cast<int32_t>(n);
 }
@@ -944,7 +1151,6 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     s.cancel.store(false, std::memory_order_relaxed);
     // The last prompt token seeds the decode loop, so it is never reused.
     const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
-    s.context_text_valid = false;  // set again once the run completes
     if (s.speculative) s.speculative->reset_stats();
     s.power->reset_pacing();
     {
@@ -1114,10 +1320,12 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                     std::vector<int32_t> batch{last};
                     batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - 1);
                     const ForwardHooks hooks = s.hooks(policy, false);
+                    const auto t_forced = Clock::now();
                     if (auto r = s.target->forward(batch, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
                         s.clear_context();
                         return r.status();
                     }
+                    stats.forced_ms += ms_since(t_forced);
                     s.context.insert(s.context.end(), batch.begin(), batch.end());
                     last = forced_tokens->back();
                     stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());

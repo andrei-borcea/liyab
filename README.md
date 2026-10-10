@@ -113,7 +113,7 @@ These rules decide what goes into the code:
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1), sliding window with attention sinks, grouped-query attention over spans | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
-| Prefix cache across conversations (LRU of serialized contexts in RAM) | ✅ |
+| Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
 | Structured output: forced continuations (tool-call syntax and names in the app) | ✅ |
 | Speculative decoding: draft model or n-gram lookup, adaptive draft count, hybrid models included | ✅ |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
@@ -332,15 +332,24 @@ each of those as a scheduling problem.
 * **Context reuse across turns.** When a prompt continues the text the engine already processed (the previous prompt
   plus its reply, which is how a chat grows), that text keeps the tokens it was processed as. Only the rest is
   computed, recurrent DeltaNet states included. Re-encoding a reply need not reproduce the generated tokens (around
-  `</think>`, for example), and that no longer forces a restart. Otherwise the longest common token prefix is kept:
-  any length on attention-only models, and back to the nearest state snapshot on hybrid ones. On the 35B, follow-up
-  turns start in ~1.1–1.6 s instead of reprocessing the conversation.
+  `</think>`, for example), and that no longer forces a restart. The engine keeps knowing which text its tokens
+  encode through work that is cancelled or cut short (a prefill typed ahead, a reply stopped while its prompt is
+  processed), through rewinds and through `save_state()`. Otherwise the longest common token prefix is kept: any
+  length on attention-only models, and back to the nearest state snapshot on hybrid ones; the log says at which
+  token a prompt left the context. On the 35B, follow-up turns start in ~1.1–1.6 s instead of reprocessing the
+  conversation.
 * **State snapshots for hybrid models.** Three are kept: the oldest one, the end of the last prompt (pinned, so
   background drafts cannot evict it), and a rolling one. They are set aside from the expert cache's budget.
 * **Prefix cache across conversations** (`prefix_cache_mb`). A context that an unrelated prompt replaces is kept in
-  RAM as a serialized state (KV pages plus recurrent states), in an LRU of that size. A later prompt that continues
-  it is restored, cut back to where the two diverge, instead of being processed again. The output equals a fresh
-  context's (tested on attention-only and hybrid models). A 2,000-token conversation on the 35B costs ~85 MiB.
+  RAM as a serialized state (KV pages plus recurrent states) with the text it encodes, in an LRU of at most that
+  size. A later prompt that continues that text is restored, cut back to where the two diverge, instead of being
+  processed again, even when its earlier replies would encode to other tokens. The output equals that of a context
+  never interrupted (tested on attention-only and hybrid models). A 2,000-token conversation on the 35B costs
+  ~85 MiB. In RAM (`prefix_cache_mb`) the cache comes out of the memory budget; on a MoE whose experts stream, only
+  as far as the expert cache can spare above 10% of the experts, so it never causes a requantization. On storage
+  (`prefix_cache_dir`, `prefix_cache_disk_mb`) it costs no RAM at all: contexts that RAM does not hold go to files,
+  least recently used out first. On the phone a 4,907-token chat on the 35B (114 MiB) was set aside in 81 ms and
+  restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user
   request therefore never waits behind background work.
@@ -356,7 +365,10 @@ each of those as a scheduling problem.
 * **Structured output.** `generate()` takes an optional `ForceCallback`. After each piece it sees the output so far
   and may return text the output must continue with. The engine runs that text through the model in one batched
   pass, like a short prefill, and emits it as output. The app uses this to force the fixed syntax of tool calls and
-  to complete a tool name as soon as only one fits. Forced tokens are counted apart from sampled ones.
+  to complete a tool name as soon as only one fits. Forced tokens are counted apart from sampled ones, with the time
+  their passes took. On the 35B with streamed experts, a tool call's 9 forced tokens took 1.52 s against ~1.66 s to
+  sample them: a batched pass reads the union of its tokens' experts, so what forcing buys there is a call that
+  always parses, not speed.
 
 ---
 
@@ -479,14 +491,15 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
-* prompt, cached-prefix, generated and forced tokens; time to first token;
+* prompt, cached-prefix, generated and forced tokens, and the time of the forced passes; time to first token;
 * decode time per phase: attention, DeltaNet, routers, experts, shared expert, dense FFN, LM head;
 * the expert cache's behaviour: hits, late prefetches, misses, bytes read, read-but-unused, prediction precision,
   dropped guesses, skipped experts, time waiting.
 
 `liyab_engine_config` exposes:
 * the backend, threads and power profile;
-* the memory budget, expert cache, `requant_bits`, `prefix_cache_mb` and context length;
+* the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
+  and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
 * KV type, sliding window and sinks;
 * speculative decoding;
 * the MoE trade-offs;
@@ -586,6 +599,7 @@ liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts
 liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the conversation itself
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model
 liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts in a 256 MiB LRU
+liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli --help                                            # every option
@@ -638,10 +652,12 @@ cancellation and live counters go straight to the C API, which makes them thread
 * **Leaving the screen.** HyperOS stops background apps that hold several GB. When Liyab is hidden, it parks:
   1. it saves the expert hot list;
   2. it empties the expert cache (2.4 GB on the 35B);
-  3. it saves the conversation and the engine's context.
+  3. it saves the conversation and, when it is the chat's, the engine's context.
 
   After 5 minutes hidden (configurable) the model is unloaded. Coming back reloads it, restores the context and
   warms the cache. While the model wakes up, the flame burns in the middle of the conversation.
+* **A new chat** restores the system prompt from its saved state (47 ms on the 35B), so its first message costs
+  only its own tokens.
 
 ### Local API: one model for every app on the device
 
@@ -673,6 +689,9 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   * A final assistant message is continued, like Anthropic's prefill.
 * **Fair and frugal.** Requests wait their turn with your own messages. A client that disconnects stops its
   generation, even while it is still queued or its prompt is being processed.
+* **Your chat keeps its place.** A request's prompt replaces the chat's context in the engine, which sets the chat's
+  aside on storage (the prefix cache: at most 512 MB, no RAM) and restores it on your next message: 95 ms for a
+  4,907-token chat on the 35B, where processing a 4,009-token one again had taken 163 s.
 * **Not yet.** Tools, images, `n` > 1 and logprobs are refused with an error, never silently ignored.
 
 ### Everything else
@@ -943,7 +962,7 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards |
-| `test_engine` | All 24 quant formats bit-exact; kernels; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse; prefix cache; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1019,6 +1038,8 @@ Implemented features are described above. These are next, in order:
   * iOS is not built yet;
   * the local API is text only;
   * Android may stop Liyab in the background (which stops the API too);
+  * on HyperOS a reply that goes on while Liyab is in the background runs several times slower (1.3 instead of
+    ~7 tok/s on the 35B): the system confines background apps to four of the eight cores;
   * pages that need a full activity may not open from the assistant sheet's window.
 
 ---

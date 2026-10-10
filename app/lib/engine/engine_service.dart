@@ -23,6 +23,8 @@ class LoadOptions {
     this.skinThresholdC = 50,
     this.memoryBudgetMb = 5500,
     this.powerProfile = LiyabPowerProfile.balanced,
+    this.prefixCacheDir,
+    this.prefixCacheDiskMb = 0,
     this.experimental = const {},
   });
 
@@ -34,6 +36,11 @@ class LoadOptions {
 
   /// LiyabPowerProfile: how early heat slows the engine down (Performance: near the OS's limit).
   final int powerProfile;
+
+  /// Where the engine keeps contexts that another conversation replaced, to restore them when that conversation
+  /// goes on (its prefix cache on storage, no RAM spent), and how much storage it may use for them (0: off).
+  final String? prefixCacheDir;
+  final int prefixCacheDiskMb;
 
   /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson (plus 'kvDedupDir');
   /// absent keys keep the engine's defaults.
@@ -96,6 +103,7 @@ class GenerationStats {
     this.expertHitRate = 0,
     this.expertStallMs = 0,
     this.forcedTokens = 0,
+    this.forcedMs = 0,
   });
 
   final int promptTokens;
@@ -115,6 +123,9 @@ class GenerationStats {
 
   /// Tokens the reply was forced to continue with (structured output), not sampled.
   final int forcedTokens;
+
+  /// Time of the batched passes over the forced tokens (part of the decode time), ms.
+  final double forcedMs;
 }
 
 /// A generation queued or running on the engine.
@@ -261,6 +272,7 @@ class EngineService {
             expertHitRate: s[8] as double,
             expertStallMs: s[9] as double,
             forcedTokens: s[10] as int,
+            forcedMs: s[11] as double,
           )))
           ..close();
       case 'error':
@@ -291,7 +303,8 @@ class EngineService {
   Future<LoadedModel> load(LoadOptions o) async {
     _engine = 0;
     final r = await _call<List<Object?>>(
-        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile]);
+        ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile,
+          o.prefixCacheDir, o.prefixCacheDiskMb]);
     _engine = r[0] as int;
     final plan = r[4] as List<Object?>;
     return LoadedModel(
@@ -422,9 +435,9 @@ void _worker(SendPort replies) {
               ..powerProfile = m[8] as int
               ..skinThresholdC = m[5] as double
               ..memoryBudgetMb = m[6] as int // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
-              // Contexts of other conversations (the sheet, an agent, the API) kept to come back to,
-              // out of the budget: worth it only when the budget leaves the expert cache room.
-              ..prefixCacheMb = (m[6] as int) >= 5000 ? 256 : 0;
+              ..prefixCacheDiskMb = m[10] as int;
+            final prefixDir = m[9] as String?;
+            if (prefixDir != null) config.ref.prefixCacheDir = prefixDir.toNativeUtf8(allocator: arena);
             _applyExperimental(config.ref, m[7] as Map<String, Object?>, arena);
             final out = arena<Pointer<Void>>();
             final watch = Stopwatch()..start();
@@ -618,6 +631,7 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
           }(),
           s.expertStallMs,
           s.forcedTokens,
+          s.forcedMs,
         ]
       ]);
     });

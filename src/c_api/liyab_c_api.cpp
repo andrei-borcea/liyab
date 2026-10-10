@@ -89,7 +89,8 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.expert_predicted_used,
                                         s.expert_dropped,
                                         s.expert_skipped,
-                                        s.forced_tokens};
+                                        s.forced_tokens,
+                                        s.forced_ms};
     }
     return LIYAB_OK;
 }
@@ -185,6 +186,8 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->moe_max_experts = d.moe_max_experts;
     config->moe_skip_slow = d.moe_skip_slow;
     config->prefix_cache_mb = d.prefix_cache_mb;
+    config->prefix_cache_dir = nullptr;
+    config->prefix_cache_disk_mb = d.prefix_cache_disk_mb;
     config->early_exit = d.experimental.early_exit ? 1 : 0;
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
@@ -244,6 +247,8 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         if (config->kv_dedup_dir != nullptr) c.experimental.kv_dedup_dir = config->kv_dedup_dir;
         c.moe_skip_slow = config->moe_skip_slow;
         c.prefix_cache_mb = config->prefix_cache_mb;
+        if (config->prefix_cache_dir != nullptr) c.prefix_cache_dir = config->prefix_cache_dir;
+        c.prefix_cache_disk_mb = config->prefix_cache_disk_mb;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

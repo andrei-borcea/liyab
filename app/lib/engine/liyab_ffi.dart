@@ -91,6 +91,9 @@ final class LiyabEngineConfig extends Struct {
   external double moeSkipSlow;
   @Int64()
   external int prefixCacheMb;
+  external Pointer<Utf8> prefixCacheDir;
+  @Int64()
+  external int prefixCacheDiskMb;
 }
 
 final class LiyabSamplingParams extends Struct {
@@ -185,6 +188,8 @@ final class LiyabGenerationStats extends Struct {
   external int expertSkipped;
   @Int32()
   external int forcedTokens;
+  @Double()
+  external double forcedMs;
 }
 
 final class LiyabMemoryPlan extends Struct {

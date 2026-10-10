@@ -329,8 +329,8 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
 
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(
-            model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.requant_bits,
-                                       options.repack_cpu && quant::repack_kernels_available()));
+            model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.reserve_bytes,
+                                       options.requant_bits, options.repack_cpu && quant::repack_kernels_available()));
     }
     model->file_->configure_layers(c.n_layers);
     LIYAB_LOG_INFO("%s: %d layers, d=%d, ff=%d, heads=%d/%d x %d, vocab=%d, ctx=%d%s, kv=%s, %.1f KiB/token",
@@ -1089,8 +1089,8 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
 // Expert streaming: the routed experts stay on storage and are read on
 // demand into a fixed RAM cache; every other tensor stays resident in the
 // mapping (paged in now, never swept by the streaming window).
-Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, int32_t requant_bits,
-                                        bool repack) {
+Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, size_t reserve,
+                                        int32_t requant_bits, bool repack) {
     if (budget_option == 0) return Status::ok();
     if (requant_bits != -1 && requant_bits != 0 && requant_bits != 4 && requant_bits != 5) {
         return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
@@ -1118,9 +1118,13 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     // (snapshot_state) come out of the cache too.
     const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
                           static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
+    // The budget came without the reserve (TransformerOptions::reserve_bytes),
+    // which the loader set aside when it decided to stream; the cache plans
+    // with it and hands back only what it can spare.
+    const uint64_t whole = memory_budget > 0 ? usable_memory_bytes(memory_budget + reserve) : available;
     auto cache_budget = [&](size_t resident) -> size_t {
         if (budget_option > 0) return static_cast<size_t>(budget_option);
-        return available > resident + margin ? static_cast<size_t>(available) - resident - margin : 0;
+        return whole > resident + margin ? static_cast<size_t>(whole) - resident - margin : 0;
     };
 
     // Optional lossy conversion of the resident Q8_0 matrices (the UD quants
@@ -1163,7 +1167,23 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
                        static_cast<double>(saved) / (1024.0 * 1024.0 * 1024.0));
     }
     const size_t resident_bytes = resident_q8 - saved;
-    const size_t budget = cache_budget(resident_bytes);
+    // The reserve gets only what the cache can spare above kTightCache, so it
+    // never decides the conversion above nor starves the cache; with an
+    // explicit cache size the rest of the budget is the embedder's anyway.
+    // The cache rounds each slot size class down to whole slots: a few
+    // slots' worth above the line keeps it above once rounded.
+    size_t largest_expert = 0;
+    for (const Layer& L : layers_) {
+        if (!L.moe) continue;
+        const size_t matrices = L.w[kGateExps]->nbytes + L.w[kUpExps]->nbytes + L.w[kDownExps]->nbytes;
+        largest_expert = std::max(largest_expert, matrices / static_cast<size_t>(c.n_expert));
+    }
+    const size_t cache_floor =
+        static_cast<size_t>(kTightCache * static_cast<double>(expert_bytes)) + 4 * largest_expert;
+    size_t budget = cache_budget(resident_bytes);
+    const size_t spare = budget > cache_floor ? budget - cache_floor : 0;
+    memory_plan_.reserved_bytes = budget_option > 0 ? reserve : std::min(reserve, spare);
+    if (budget_option <= 0) budget -= memory_plan_.reserved_bytes;
     memory_plan_.resident_bytes = resident_bytes;
     memory_plan_.expert_bytes = expert_bytes;
     memory_plan_.requant_bits = bits;

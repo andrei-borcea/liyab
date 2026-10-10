@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -1604,6 +1606,99 @@ TEST_CASE("The prefix cache brings back a conversation another one replaced, exa
     }
 }
 
+TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and removes its files") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("prefix_qwen35", spec));
+    config.backend = BackendKind::Cpu;
+    const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_prefix_files";
+    auto files = [&] {
+        size_t n = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) ++n;
+        return n;
+    };
+    auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+        std::string text;
+        auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+    std::string a, b;
+    for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens
+        a += i % 3 ? " hello" : " world";
+        b += i % 2 ? " world" : " hello world";
+    }
+    auto reference = Engine::create(config);
+    REQUIRE(reference.has_value());
+    config.prefix_cache_mb = 0;  // no RAM: storage only
+    config.prefix_cache_dir = dir;
+    config.prefix_cache_disk_mb = 64;
+    {
+        // A file an ended process left behind is removed; the engine's own go when it is destroyed.
+        std::filesystem::create_directories(dir);
+        std::ofstream(dir + "/ctx-1-1-1.state") << "stale";
+        auto cached = Engine::create(config);
+        REQUIRE(cached.has_value());
+        CHECK(files() == 0);
+        Engine& e = *cached.value();
+        const std::string reply_a = run(e, a);
+        run(e, b);  // A's context goes to storage
+        CHECK(files() == 1);
+        const std::string next_a = a + reply_a + " hello";
+        GenerationStats st{};
+        const std::string out = run(e, next_a, &st);
+        CHECK(files() == 1);  // A's file read back and removed; B's context went to storage in its place
+        GenerationStats held{};
+        REQUIRE(reference.value()->prefill(a, true).is_ok());
+        CHECK(out == run(*reference.value(), next_a, &held));
+        CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
+        run(e, b);  // B back from storage, A to it
+        CHECK(files() == 1);
+    }
+    CHECK(files() == 0);
+    // Little RAM, many conversations: the least recently used move from RAM
+    // to storage, each to its own file, and come back exactly from there.
+    config.prefix_cache_mb = 1;  // a dozen of these contexts
+    {
+        auto cached = Engine::create(config);
+        REQUIRE(cached.has_value());
+        std::vector<std::string> conversations, replies;
+        for (int c = 0; c < 40; ++c) {
+            std::string text = std::to_string(c);
+            for (int i = 0; i < 200; ++i) text += (i + c) % 3 ? " hello" : " world";
+            conversations.push_back(text);
+            replies.push_back(run(*cached.value(), text));
+        }
+        CHECK(files() >= 10);  // 39 set aside, a dozen or so in RAM
+        const std::string next = conversations[0] + replies[0] + " hello";
+        GenerationStats st{};
+        const std::string out = run(*cached.value(), next, &st);
+        auto fresh = Engine::create(engine_config(model_path("prefix_qwen35", spec)));
+        REQUIRE(fresh.has_value() && fresh.value()->prefill(conversations[0], true).is_ok());
+        GenerationStats held{};
+        CHECK(out == run(*fresh.value(), next, &held));
+        CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
+    }
+    CHECK(files() == 0);
+    // Storage too small for a context: nothing kept, nothing restored.
+    config.prefix_cache_mb = 0;
+    config.prefix_cache_disk_mb = 0;
+    {
+        auto cached = Engine::create(config);
+        REQUIRE(cached.has_value());
+        const std::string reply_a = run(*cached.value(), a);
+        run(*cached.value(), b);
+        CHECK(files() == 0);
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("A prefill cancelled mid-pass keeps its work and the output stays exact") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";
@@ -1640,6 +1735,151 @@ TEST_CASE("A prefill cancelled mid-pass keeps its work and the output stays exac
         CHECK(run(*e.value(), prompt) == expected);  // resumes from what the prefill kept
     }
     std::printf("  %d of 5 prefills were cancelled before they ended\n", cancelled);
+}
+
+// A context can hold other tokens than its text's own encoding, as after a
+// generated reply (a model may write a word in pieces the tokenizer would
+// merge): "hello world hel" processed, then continued with "lo …", leaves
+// "▁hel" + "lo" where encoding the text gives "▁hello". The next turn reuses
+// such a context only while the engine knows which text its tokens encode;
+// otherwise it re-encodes the prompt, diverges at the split word, and a
+// hybrid model, which rewinds only to its state snapshots, starts over.
+TEST_CASE("After cancelled work a turn still reuses a context whose text re-encodes differently") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    spec.context_length = 4096;
+    EngineConfig config = engine_config(model_path("hybrid_4k", spec));
+    config.backend = BackendKind::Cpu;
+    const std::string head = "hello world hel";
+    std::string conversation = head + "lo";
+    for (int i = 0; i < 40; ++i) conversation += i % 3 ? " world" : " hello";
+    std::string typed;  // long enough to be cancelled while it is processed
+    for (int i = 0; i < 1500; ++i) typed += i % 2 ? " hello" : " world";
+    const std::string next = conversation + typed + " hello";
+    auto prepare = [&](Engine& e) { return e.prefill(head, true).is_ok() && e.prefill(conversation, true).is_ok(); };
+    auto run = [](Engine& e, const std::string& prompt, GenerationStats* out) {
+        std::string text;
+        auto st = e.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+
+    // Never interrupted: the turn continues the tokens the context holds.
+    auto reference = Engine::create(config);
+    REQUIRE(reference.has_value() && prepare(*reference.value()));
+    GenerationStats st{};
+    const std::string expected = run(*reference.value(), next, &st);
+    const int32_t held = st.cached_prefix_tokens;
+    const auto own = reference.value()->tokenize(conversation, true);
+    REQUIRE(own.has_value());
+    REQUIRE(held == static_cast<int32_t>(own->size()) + 1);  // "▁hel" + "lo" instead of "▁hello"
+
+    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_split_state.bin";
+    // 0: a prefill typed ahead, cancelled for the user's message; 1: a
+    // generation stopped while its prompt is processed; 2: as 0, then the
+    // context saved and restored by a new engine (a later process).
+    for (int kind = 0; kind < 3; ++kind) {
+        // The work, true when it was cancelled before it ended.
+        auto work = [&](Engine& e) {
+            if (kind != 1) return e.prefill(conversation + typed, true).code() == ErrorCode::Cancelled;
+            auto r = e.generate(next + typed, greedy(8), nullptr);
+            return r.has_value() && r->cancelled && r->generated_tokens == 0;
+        };
+        // Stopped part way through: how long it takes uninterrupted sets when.
+        std::unique_ptr<Engine> e;
+        {
+            auto created = Engine::create(config);
+            REQUIRE(created.has_value() && prepare(*created.value()));
+            const auto start = std::chrono::steady_clock::now();
+            work(*created.value());
+            e = std::move(created).value();
+            const auto took = std::chrono::steady_clock::now() - start;
+            bool cancelled = false;
+            for (const double share : {0.5, 0.25, 0.75, 0.1}) {
+                auto fresh_engine = Engine::create(config);
+                REQUIRE(fresh_engine.has_value());
+                e = std::move(fresh_engine).value();
+                REQUIRE(prepare(*e));
+                std::thread stopper([&] {
+                    std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(took * share));
+                    kind == 1 ? e->cancel() : e->cancel_prefill();
+                });
+                cancelled = work(*e);
+                stopper.join();
+                if (cancelled) break;
+            }
+            REQUIRE(cancelled);
+        }
+        if (kind == 2) {
+            REQUIRE(e->save_state(file).is_ok());
+            auto created = Engine::create(config);
+            REQUIRE(created.has_value());
+            e = std::move(created).value();
+            REQUIRE(e->load_state(file).has_value());
+        }
+        GenerationStats after{};
+        CHECK(run(*e, next, &after) == expected);
+        CHECK(after.cached_prefix_tokens >= held);
+    }
+    std::remove(file.c_str());
+}
+
+TEST_CASE("The prefix cache brings back a conversation whose text re-encodes differently") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        EngineConfig config = engine_config(model_path(std::string("prefix_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        config.prefix_cache_mb = 64;
+        auto cached = Engine::create(config);
+        config.prefix_cache_mb = 0;
+        auto reference = Engine::create(config);
+        REQUIRE(cached.has_value() && reference.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        // Conversation A holds a split word (see the test above); B is another one.
+        const std::string head = "hello world hel";
+        std::string a = head + "lo", b;
+        for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        Engine& e = *cached.value();
+        REQUIRE(e.prefill(head, true).is_ok());
+        const std::string reply_a = run(e, a);
+        run(e, b);  // A's context goes to the prefix cache
+        const std::string next_a = a + reply_a + " hello";
+        GenerationStats st{};
+        const std::string out = run(e, next_a, &st);
+        // The reference holds the same tokens for A and was never interrupted.
+        // A hybrid model sets A aside at its pinned snapshot, the end of A's
+        // prompt but its last token (which decoding processes), and encodes the
+        // reply again; an attention-only one keeps the reply's tokens.
+        Engine& r = *reference.value();
+        REQUIRE(r.prefill(head, true).is_ok());
+        if (std::string(arch) == "qwen35") {
+            REQUIRE(r.prefill(a, true).is_ok());
+        } else {
+            CHECK(run(r, a) == reply_a);
+        }
+        GenerationStats held{};
+        CHECK(out == run(r, next_a, &held));
+        CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
+    }
 }
 
 TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapshot, exactly") {
