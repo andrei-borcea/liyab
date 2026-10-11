@@ -168,6 +168,33 @@ struct Engine::Impl {
         if (!draft) {
             for (const PrefixEntry& e : prefix_cache) consider(e.tokens, e.text, e.text_tokens);
             consider(context, context_text, context_text_tokens);  // preferred on a tie: nothing to restore
+            // A prompt that leaves this context's text partway (a draft edited,
+            // a message prepared ahead then typed over): the context's tokens
+            // up to the last one whose text the prompt still starts with,
+            // found by dropping pieces from the end of the text as cut_text()
+            // does. Re-encoding the whole prompt instead could diverge in an
+            // earlier reply and, on a hybrid model, go back past the draft's
+            // snapshots.
+            size_t same = 0;
+            const size_t most = std::min(text.size(), context_text.size());
+            while (same < most && text[same] == context_text[same]) ++same;
+            if (context_text_tokens > 0 && same < context_text.size() && same > known_bytes) {
+                size_t n = context_text_tokens, end = context_text.size();
+                while (n > 0 && end > same) {
+                    const std::string piece = tokenizer->piece(context[n - 1]);
+                    if (piece.empty() || piece.size() > end || context_text.compare(end - piece.size(), piece.size(), piece) != 0) {
+                        n = 0;  // the pieces do not spell the text: unknown
+                        break;
+                    }
+                    end -= piece.size();
+                    --n;
+                }
+                if (n > 0 && end > known_bytes && (static_cast<unsigned char>(text[end]) & 0xC0) != 0x80) {
+                    known = &context;
+                    known_tokens = n;
+                    known_bytes = end;
+                }
+            }
         }
         if (known != nullptr) {
             auto rest = tokenizer->encode_continuation(text.substr(known_bytes), (*known)[known_tokens - 1]);
@@ -1148,6 +1175,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
+    const auto t_start = Clock::now();
     Impl& s = *impl_;
     s.cancel.store(false, std::memory_order_relaxed);
     const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
@@ -1174,6 +1202,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     // Prefill everything but the last prompt token, which seeds the decode
     // loop (the speculative decoder expects it uncached).
     const auto t_prefill = Clock::now();
+    stats.context_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
     size_t first_uncached = reused;
     stats.cached_prefix_tokens = static_cast<int32_t>(reused);
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
@@ -1280,7 +1309,12 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
         }
 
-        if (stats.ttft_ms == 0.0) stats.ttft_ms = ms_since(t_prefill);
+        if (stats.ttft_ms == 0.0) {
+            stats.ttft_ms = ms_since(t_prefill);
+            if (const ExpertStore* store = s.target->expert_store()) {
+                stats.ttft_stall_ms = store->stats().stall_ms - experts_before.stall_ms;
+            }
+        }
         for (const int32_t token : next) {
             if (s.tokenizer->is_end_of_generation(token)) {
                 stop = true;

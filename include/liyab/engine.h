@@ -154,7 +154,9 @@ public:
     // reply, or a prefill()), that text keeps the tokens it was processed as
     // (re-encoding a reply need not reproduce the tokens that were generated)
     // and only the rest is processed, which makes chat turns start fast.
-    // Otherwise the longest common token prefix is kept: any length on
+    // A prompt that leaves that text partway keeps its tokens up to the last
+    // one whose text it still starts with. Otherwise the longest common token
+    // prefix is kept: any length on
     // attention-only models; on hybrid (DeltaNet) models, whose recurrent
     // states cannot rewind, up to the nearest state snapshot, taken at the end
     // of every prompt and prefill (Transformer::snapshot_state), so an edited

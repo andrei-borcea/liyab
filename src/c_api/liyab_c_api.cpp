@@ -90,7 +90,9 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.expert_dropped,
                                         s.expert_skipped,
                                         s.forced_tokens,
-                                        s.forced_ms};
+                                        s.forced_ms,
+                                        s.context_ms,
+                                        s.ttft_stall_ms};
     }
     return LIYAB_OK;
 }

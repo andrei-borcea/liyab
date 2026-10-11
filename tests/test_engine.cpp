@@ -2136,6 +2136,47 @@ TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapsho
     CHECK(after_drop == run(*fresh.value(), dropped));
 }
 
+TEST_CASE("Hybrid models keep a draft's words when its prepared whole message is typed over") {
+    // Typing ahead prepares a draft's words, then the whole message as it
+    // would be sent: typing on must go back to the words, not to the last
+    // prompt, and the output must equal that of the same conversation
+    // without drafts (the same tokens: the reply as generated).
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("hybrid", spec));
+    config.backend = BackendKind::Cpu;
+    auto run = [](Engine& en, const std::string& prompt, GenerationStats* st = nullptr) {
+        std::string text;
+        auto r = en.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (r && st != nullptr) *st = *r;
+        return r ? text : std::string("<error>");
+    };
+    const std::string system = "hello world hello";
+    const std::string turn1 = system + " world";
+    auto converse = [&](Engine& en) -> std::string {  // the system prompt, a first turn and its reply
+        return en.prefill(system, true).is_ok() ? run(en, turn1) : std::string("<error>");
+    };
+    auto engine = Engine::create(config);
+    auto plain = Engine::create(config);
+    REQUIRE(engine.has_value() && plain.has_value());
+    Engine& e = *engine.value();
+    const std::string head = turn1 + converse(e) + " hello";  // the history and the next turn's opening
+    converse(*plain.value());
+    const std::string words = head + " world world";
+    REQUIRE(e.prefill(words, true).is_ok());
+    REQUIRE(e.prefill(words + " hello world hello", true).is_ok());  // the whole message, prepared
+    const std::string typed_on = words + " world hello";
+    GenerationStats st{};
+    const std::string out = run(e, typed_on, &st);
+    CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(words, true)->size()));
+    CHECK(out == run(*plain.value(), typed_on));
+}
+
 TEST_CASE("C API log buffer keeps whole lines for polling UIs") {
     liyab_set_log_level(1);
     liyab_log_buffer_enable(1 << 16);
@@ -2256,6 +2297,10 @@ TEST_CASE("A saved hybrid context keeps its snapshots: a restored one reuses wha
         const std::string out = run(*loader.value(), prompt, &st);
         CHECK(st.cached_prefix_tokens == live_st.cached_prefix_tokens);
         CHECK(st.cached_prefix_tokens >= system_tokens);
+        // The rewind to a restored snapshot comes before the prefill: timed apart from the first token.
+        CHECK(st.context_ms > 0.0);
+        CHECK(st.ttft_ms > 0.0);
+        CHECK(st.ttft_stall_ms == 0.0);  // experts read in place: nothing to wait for
         fresh.value()->reset_context();
         CHECK(out == run(*fresh.value(), prompt));
     }

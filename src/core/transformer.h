@@ -250,14 +250,17 @@ public:
     // re-sends that prompt, and its end, the last reply or an edited turn,
     // may differ) and at the end of every prefill (a draft being typed ahead,
     // which changes as the user edits). At most kStateSnapshots are kept: the
-    // oldest (usually the system prompt), the last pinned one, and the newest
-    // other; their memory is set aside from the expert cache budget at load.
-    // Without a pinned slot, drafts typed ahead replaced the end of the
-    // conversation, and an edit before it fell back to the system prompt
-    // (2838 tokens processed again, 151 s on a 35B MoE). No-op without
-    // recurrent blocks or at position 0.
+    // oldest (usually the system prompt), the last pinned one, and the two
+    // newest others; their memory is set aside from the expert cache budget
+    // at load. Without a pinned slot, drafts typed ahead replaced the end of
+    // the conversation, and an edit before it fell back to the system prompt
+    // (2838 tokens processed again, 151 s on a 35B MoE). Two others, because
+    // a draft is prepared twice: its words, then the whole message as it
+    // would be sent (time line and reply opening included); typing on goes
+    // back to the words, not to the last prompt. No-op without recurrent
+    // blocks or at position 0.
     void snapshot_state(bool pin = false);
-    static constexpr int32_t kStateSnapshots = 3;
+    static constexpr int32_t kStateSnapshots = 4;
     // Writes what the context holds (n_past(), the KV pages of positions
     // [0, n_past()), the recurrent states and, below n_past(), the oldest and
     // the pinned state snapshots) with a fingerprint of the model and

@@ -257,7 +257,7 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 * **Hybrid models:** DeltaNet blocks keep a recurrent state: conv history plus one 128×128 matrix per value head.
   These models can roll back only:
   * inside a window of state checkpoints (used by speculative decoding), or
-  * to one of three state snapshots (the oldest, the end of the last prompt, and a rolling one).
+  * to one of four state snapshots (the oldest, the end of the last prompt, and the two newest others).
 * **Tensor types:** every format llama.cpp writes, mixed freely per tensor:
   * F32, F16, BF16;
   * Q4_0/Q4_1/Q5_0/Q5_1/Q8_0;
@@ -345,12 +345,14 @@ each of those as a scheduling problem.
   computed, recurrent DeltaNet states included. Re-encoding a reply need not reproduce the generated tokens (around
   `</think>`, for example), and that no longer forces a restart. The engine keeps knowing which text its tokens
   encode through work that is cancelled or cut short (a prefill typed ahead, a reply stopped while its prompt is
-  processed), through rewinds and through `save_state()`. Otherwise the longest common token prefix is kept: any
-  length on attention-only models, and back to the nearest state snapshot on hybrid ones; the log says at which
-  token a prompt left the context. On the 35B, follow-up turns start in ~1.1–1.6 s instead of reprocessing the
-  conversation.
-* **State snapshots for hybrid models.** Three are kept: the oldest one, the end of the last prompt (pinned, so
-  background drafts cannot evict it), and a rolling one. They are set aside from the expert cache's budget.
+  processed), through rewinds and through `save_state()`. A prompt that leaves that text partway (a draft edited, a
+  message prepared ahead then typed over) keeps its tokens up to where the texts part. Otherwise the longest common
+  token prefix is kept: any length on attention-only models, and back to the nearest state snapshot on hybrid ones;
+  the log says at which token a prompt left the context. On the 35B, follow-up turns start in ~1.1–1.6 s instead of
+  reprocessing the conversation.
+* **State snapshots for hybrid models.** Four are kept: the oldest one, the end of the last prompt (pinned, so
+  background drafts cannot evict it), and the two newest others (a draft's words and the whole draft after them).
+  They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
 * **Prefix cache across conversations** (`prefix_cache_mb`). A context that an unrelated prompt replaces is kept in
   RAM as a serialized state (KV pages plus recurrent states) with the text it encodes, in an LRU of at most that
   size. A later prompt that continues that text is restored, cut back to where the two diverge, instead of being
@@ -510,7 +512,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
-* prompt, cached-prefix, generated and forced tokens, and the time of the forced passes; time to first token;
+* prompt, cached-prefix, generated and forced tokens, and the time of the forced passes; time to first token, the
+  time before it spent matching or restoring the context, and the part of it spent waiting for expert reads;
 * decode time per phase: attention, DeltaNet, routers, experts, shared expert, dense FFN, LM head;
 * the expert cache's behaviour: hits, late prefetches, misses, bytes read, read-but-unused, prediction precision,
   dropped guesses, skipped experts, time waiting.
@@ -721,6 +724,9 @@ cancellation and live counters go straight to the C API, which makes them thread
   none. A model loaded that way warms its expert cache only once you write in Liyab again.
 * **A new chat** restores the system prompt from its saved state (47 ms on the 35B), so its first message costs
   only its own tokens.
+* **A first-token budget.** A reply's first token is due within 2 s of sending. A slower one is logged
+  ("Latency budget: …") with where the time went: the model waking up, waiting in line, restoring or rewinding the
+  context, the new prompt tokens and the first step, and expert reads.
 
 ### Local API: one model for every app on the device
 

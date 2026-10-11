@@ -581,15 +581,10 @@ void Transformer::snapshot_state(bool pin) {
     StateSnapshot snap;
     if (static_cast<int32_t>(snapshots_.size()) >= kStateSnapshots) {
         // Keep the oldest and the pinned one; recycle the buffer of the
-        // newest other (a draft's), else of the one after the oldest.
-        size_t victim = 0;
-        for (size_t i = snapshots_.size(); i-- > 1;) {
-            if (!snapshots_[i].pinned) {
-                victim = i;
-                break;
-            }
-        }
-        if (victim == 0) victim = 1;
+        // oldest other, so the newest ones stay (a draft's words and the
+        // whole draft after them).
+        size_t victim = 1;
+        while (victim + 1 < snapshots_.size() && snapshots_[victim].pinned) ++victim;
         snap = std::move(snapshots_[victim]);
         snapshots_.erase(snapshots_.begin() + static_cast<std::ptrdiff_t>(victim));
     }

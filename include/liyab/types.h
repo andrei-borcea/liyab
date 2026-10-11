@@ -224,6 +224,8 @@ struct GenerationStats {
     int32_t generated_tokens = 0;
     double prefill_ms = 0.0;
     double ttft_ms = 0.0;           // time to first token (prefill + first decode step)
+    double context_ms = 0.0;        // before the prefill: matching the context, a prefix-cache restore, a rewind
+    double ttft_stall_ms = 0.0;     // of ttft_ms: waiting for MoE expert reads
     int32_t cached_prefix_tokens = 0;  // prompt tokens not recomputed: kept from the previous context or a KV snapshot
     double decode_ms = 0.0;
     double tokens_per_second = 0.0;

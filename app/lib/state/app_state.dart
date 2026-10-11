@@ -738,11 +738,17 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   // Typing ahead: while the user writes, the stable part of the draft (whole
   // words, cut where its tokens are a prefix of the text so far) is processed
-  // in the background, so sending only costs the last words and the time line.
+  // in the background; then the whole message as it would be sent at that
+  // moment, time line and reply opening included (~30 tokens on ChatML), all
+  // but its last token. Sent unchanged within the same minute, a message then
+  // costs one decode step before its first token; edited or sent a minute
+  // later, it goes back to the words (the engine keeps a snapshot of both).
   // On a MoE whose experts stream from storage a prompt token costs about as
-  // much as a generated one, so this hides most of the wait before an answer.
-  // On hybrid models the engine reuses a context only up to its snapshot at
-  // the end of a prefill, hence the exact token-prefix check.
+  // much as a generated one (~15 tokens/s on a 35B, 48 tokens took 3-5 s to
+  // the first token), so this hides most of the wait before an answer, and
+  // reads the experts the answer starts with. On hybrid models the engine
+  // reuses a context only up to a snapshot at the end of a prefill, hence the
+  // exact token-prefix checks.
   Timer? _draftTimer;
   String _drafted = ''; // the prompt text last processed for the draft
   bool _drafting = false;
@@ -770,23 +776,39 @@ class AppState extends ChangeNotifier implements ApiBackend {
         cut = cut <= 0 ? 0 : text.lastIndexOf(RegExp(r'\s'), cut - 1);
         if (cut < 0) cut = 0;
         final stable = head + text.substring(0, cut);
-        if (_drafted.startsWith(stable)) return; // nothing new to process
+        if (_drafted.startsWith(stable)) break; // nothing new to process
         final ids = await engine.tokenIds(stable, background: true);
         if (ids.length < whole.length && _isPrefix(ids, whole)) {
-          final watch = Stopwatch()..start();
-          _chatContext = true;
-          await engine.prefill(stable, background: true);
-          _log('Draft prepared (${ids.length} tokens) in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(2)} s');
-          _drafted = stable;
+          await _prefillPart(stable, ids.length, 'Draft prepared');
+          break;
+        }
+        if (cut == 0) break;
+      }
+      // The message as send() would build it now, but its last token (which seeds the reply's first step).
+      final sent = await _prompt('$text\n\n${nowLine(DateTime.now())}');
+      final sentIds = await engine.tokenIds(sent, background: true);
+      for (var end = sent.length - 1; end > sent.length - 8 && end > 0; --end) {
+        final part = sent.substring(0, end);
+        if (_drafted == part) return;
+        final ids = await engine.tokenIds(part, background: true);
+        if (ids.length < sentIds.length && _isPrefix(ids, sentIds)) {
+          await _prefillPart(part, ids.length, 'Message prepared');
           return;
         }
-        if (cut == 0) return;
       }
     } on EngineException catch (e) {
       if (!_cancelled(e)) _log('Draft not prepared: $e');
     } finally {
       _drafting = false;
     }
+  }
+
+  Future<void> _prefillPart(String part, int tokens, String what) async {
+    final watch = Stopwatch()..start();
+    _chatContext = true;
+    await engine.prefill(part, background: true);
+    _log('$what ($tokens tokens) in ${(watch.elapsedMilliseconds / 1000).toStringAsFixed(2)} s');
+    _drafted = part;
   }
 
   static bool _isPrefix(List<int> a, List<int> b) {
@@ -818,6 +840,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   Future<void> send(String text) async {
     if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
+    final asked = Stopwatch()..start(); // the first token's latency (see _firstTokenBudgetMs)
     generating = true;
     _warmIfCold();
     _draftTimer?.cancel();
@@ -837,6 +860,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     }
     engine.preempt(); // a system prompt still being prepared yields to the message
     await _preparing;
+    final wakingMs = asked.elapsedMilliseconds; // the model loading again, or its context being prepared
     if (!engine.loaded) {
       message
         ..error = 'The model could not be loaded'
@@ -857,7 +881,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
         final force = tools.isEmpty || calls >= _maxToolCalls
             ? null
             : toolDialect.forcer(tools, thinking: message.prefix.endsWith('<think>\n'));
-        await _stream(head + message.exact, sampling, message, force);
+        await _stream(head + message.exact, sampling, message, force, latency: calls == 0 ? (asked, wakingMs) : null);
         final call = calls < _maxToolCalls && message.stats?.cancelled != true ? toolDialect.parse(message.raw) : null;
         final tool = call == null ? null : toolbox.byName(call.name);
         if (call == null) break;
@@ -896,19 +920,24 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// Streams one generation into the message's current segment. Redraws are
   /// batched (~15 a second): the engine runs on all but one core, and
   /// rebuilding the reply for every token would take CPU time from it.
+  /// `latency`, for a reply's first step: the watch started when the message was sent and the time the model took
+  /// to wake up, to check the first token against its budget.
   Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message,
-      String Function(String)? force) async {
+      String Function(String)? force, {(Stopwatch, int)? latency}) async {
     var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
+    int? firstMs;
     _chatContext = true;
     await for (final event in engine.generate(prompt, sampling, force: force).events) {
       switch (event) {
         case TextPiece(:final text):
+          firstMs ??= latency?.$1.elapsedMilliseconds;
           message.raw += text;
           final now = DateTime.now();
           if (now.difference(lastPaint) < const Duration(milliseconds: 66)) continue;
           lastPaint = now;
         case GenerationDone(:final stats):
           message.stats = stats;
+          if (latency != null && firstMs != null) _checkLatency(stats, firstMs, latency.$2);
           // One line per generation (a reply with tool calls has several), so the time of each step shows.
           final fresh = stats.promptTokens - stats.cachedPrefixTokens;
           _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
@@ -925,6 +954,28 @@ class AppState extends ChangeNotifier implements ApiBackend {
       }
       notifyListeners();
     }
+  }
+
+  /// A follow-up message's first token is due within this. A slower one is
+  /// logged with where its time went, so each kind of violation can be traced
+  /// and given another route (restoring instead of processing, a smaller
+  /// model) rather than a wait.
+  static const _firstTokenBudgetMs = 2000;
+
+  void _checkLatency(GenerationStats stats, int firstMs, int wakingMs) {
+    if (firstMs <= _firstTokenBudgetMs || stats.cancelled) return;
+    String s(num ms) => '${(ms / 1000).toStringAsFixed(2)} s';
+    // Prompt rendering, commands ahead of it in the engine, the trip between isolates.
+    final waiting = firstMs - wakingMs - stats.contextMs - stats.ttftMs;
+    final fresh = stats.promptTokens - stats.cachedPrefixTokens;
+    _log('Latency budget: first token after ${s(firstMs)} (budget ${s(_firstTokenBudgetMs)}): '
+        '${[
+          if (wakingMs >= 50) 'model waking up ${s(wakingMs)}',
+          if (waiting >= 50) 'waiting ${s(waiting)}',
+          if (stats.contextMs >= 50) 'context restore or rewind ${s(stats.contextMs)}',
+          '$fresh new prompt tokens and the first step ${s(stats.ttftMs - stats.ttftStallMs)}',
+          if (stats.ttftStallMs >= 50) 'expert reads ${s(stats.ttftStallMs)}',
+        ].join(', ')}');
   }
 
   /// The forced tokens of a step, what their batched passes took, and what

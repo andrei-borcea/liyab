@@ -104,6 +104,9 @@ class GenerationStats {
     this.expertStallMs = 0,
     this.forcedTokens = 0,
     this.forcedMs = 0,
+    this.prefillMs = 0,
+    this.contextMs = 0,
+    this.ttftStallMs = 0,
   });
 
   final int promptTokens;
@@ -126,6 +129,12 @@ class GenerationStats {
 
   /// Time of the batched passes over the forced tokens (part of the decode time), ms.
   final double forcedMs;
+
+  /// Where the first token's time went, ms: the prompt's new tokens (part of ttftMs), matching or restoring the
+  /// context before them (not part of ttftMs), and waiting for expert reads (part of ttftMs).
+  final double prefillMs;
+  final double contextMs;
+  final double ttftStallMs;
 }
 
 /// A generation queued or running on the engine.
@@ -273,6 +282,9 @@ class EngineService {
             expertStallMs: s[9] as double,
             forcedTokens: s[10] as int,
             forcedMs: s[11] as double,
+            prefillMs: s[12] as double,
+            contextMs: s[13] as double,
+            ttftStallMs: s[14] as double,
           )))
           ..close();
       case 'error':
@@ -632,6 +644,9 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
           s.expertStallMs,
           s.forcedTokens,
           s.forcedMs,
+          s.prefillMs,
+          s.contextMs,
+          s.ttftStallMs,
         ]
       ]);
     });

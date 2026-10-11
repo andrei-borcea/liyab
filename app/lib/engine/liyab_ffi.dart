@@ -190,6 +190,10 @@ final class LiyabGenerationStats extends Struct {
   external int forcedTokens;
   @Double()
   external double forcedMs;
+  @Double()
+  external double contextMs;
+  @Double()
+  external double ttftStallMs;
 }
 
 final class LiyabMemoryPlan extends Struct {

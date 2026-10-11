@@ -155,6 +155,9 @@ typedef struct liyab_generation_stats {
     int32_t expert_skipped;       /* chosen experts skipped instead of waited for (moe_skip_slow) */
     int32_t forced_tokens;        /* tokens of forced continuations (liyab_engine_generate_forced) */
     double forced_ms;             /* time of the batched passes over them (part of decode_ms) */
+    /* Before ttft_ms: matching the context, a prefix-cache restore, a rewind */
+    double context_ms;
+    double ttft_stall_ms;         /* of ttft_ms: waiting for expert reads */
 } liyab_generation_stats;
 
 /*
