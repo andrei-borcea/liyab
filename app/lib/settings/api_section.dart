@@ -66,8 +66,8 @@ class ApiSection extends StatelessWidget {
               child: TextButton(onPressed: app.newApiToken, child: const Text('New token (the old one stops working)')),
             ),
             Text(
-              'Requests wait their turn with your own messages. Android may stop Liyab in the background: keep it '
-              'open for long jobs.',
+              'Requests wait their turn with your own messages. On Android, a quiet notification keeps Liyab ready for '
+              'them while it is closed; it uses no CPU until a request comes.',
               style: muted,
             ),
           ],

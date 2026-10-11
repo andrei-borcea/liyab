@@ -27,6 +27,11 @@ import io.flutter.plugin.common.MethodChannel
  * screen off. The service computes nothing itself and the app stops it as soon
  * as the work is done, so an idle Liyab holds neither.
  *
+ * With the local API on, it also stays up while Liyab is hidden and idle, only
+ * listening: a frozen process never accepts the connection of another app, so
+ * the request would hang. Listening holds no wake lock and runs no code until a
+ * request comes; its notification has the lowest importance.
+ *
  * Its notification asks every Android for the same things, through standard
  * means, and each system shows what it supports:
  *  - a Live Update (Android 16): the system may promote it to a chip in the
@@ -38,7 +43,8 @@ import io.flutter.plugin.common.MethodChannel
  * Android allows starting it only while, or just after, Liyab is on screen, or
  * at any time when the user exempted Liyab from battery optimisation: work that
  * begins with Liyab hidden otherwise runs without it, and [start] reports that
- * by returning false.
+ * by returning false. A running service is updated in place, which Android
+ * always allows: a request that arrives while it listens gets the full service.
  */
 class WorkService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -49,34 +55,45 @@ class WorkService : Service() {
         // startForeground first, always: a service started with
         // startForegroundService() must call it within seconds, even when
         // stop() came in between, or Android stops the app.
-        val notification = notification(this, intent?.getStringExtra(EXTRA_TEXT) ?: "")
+        val notification = notification(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        running = true
         if (!wanted) {
             stopSelf()
-        } else if (wakeLock == null) {
+        } else {
+            instance = this
+            hold()
+        }
+        return START_NOT_STICKY
+    }
+
+    /** The partial wake lock while there is work in hand; none while only listening. */
+    private fun hold() {
+        if (busy && wakeLock == null) {
             // Not reference counted: release() is then safe after the timeout.
             wakeLock = getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "liyab:work")
                 .apply { setReferenceCounted(false); acquire(MAX_WAKE_MS) }
+        } else if (!busy) {
+            wakeLock?.release()
+            wakeLock = null
         }
-        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         wakeLock?.release()
         wakeLock = null
-        running = false
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "liyab-work"
         private const val CHANNEL_ID = "working"
+        private const val LISTENING_CHANNEL_ID = "listening"
         private const val LIGHT_COLOR = 0xFFFF7A3D.toInt() // the flame's orange
         private const val NOTIFICATION_ID = 42
         private const val EXTRA_TEXT = "text"
@@ -89,16 +106,31 @@ class WorkService : Service() {
         // app never stop the service.
         private const val MAX_WAKE_MS = 30 * 60 * 1000L
 
-        // Both touched on the main thread only (channel calls and service
+        // All touched on the main thread only (channel calls and service
         // callbacks), so a stop() that arrives before onStartCommand still wins.
         private var wanted = false
-        private var running = false
+        private var text = ""
+        private var busy = true
+        private var instance: WorkService? = null // the running service
 
-        /** Starts the service, or updates its text; false when Android does not allow it now. */
-        fun start(context: Context, text: String): Boolean {
+        /**
+         * Starts the service, or updates it: [busy] for work in hand (wake lock,
+         * Live Update), else only listening for other apps (a minimal
+         * notification, nothing held). False when Android does not allow it now.
+         */
+        fun start(context: Context, text: String, busy: Boolean): Boolean {
+            this.text = text
+            this.busy = busy
             wanted = true
+            instance?.let {
+                // Running already: updated in place. Another startForegroundService() would be checked against the
+                // background start restrictions again, which a request arriving while hidden would fail.
+                it.getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(it))
+                it.hold()
+                return true
+            }
             return try {
-                context.startForegroundService(Intent(context, WorkService::class.java).putExtra(EXTRA_TEXT, text))
+                context.startForegroundService(Intent(context, WorkService::class.java))
                 true
             } catch (e: IllegalStateException) {
                 // ForegroundServiceStartNotAllowedException (Android 12+): Liyab is in the background.
@@ -110,10 +142,10 @@ class WorkService : Service() {
 
         fun stop(context: Context) {
             wanted = false
-            if (running) context.stopService(Intent(context, WorkService::class.java))
+            if (instance != null) context.stopService(Intent(context, WorkService::class.java))
         }
 
-        private fun notification(context: Context, text: String): Notification {
+        private fun notification(context: Context): Notification {
             val manager = context.getSystemService(NotificationManager::class.java)
             if (manager.getNotificationChannel(CHANNEL_ID) == null) {
                 manager.deleteNotificationChannel("work") // an earlier build's channel, created without the light
@@ -130,19 +162,27 @@ class WorkService : Service() {
                             lightColor = LIGHT_COLOR
                         })
             }
+            if (manager.getNotificationChannel(LISTENING_CHANNEL_ID) == null) {
+                // The lowest importance: no status bar icon, folded at the bottom of the shade.
+                manager.createNotificationChannel(
+                    NotificationChannel(LISTENING_CHANNEL_ID, "Local API ready", NotificationManager.IMPORTANCE_MIN)
+                        .apply { description = "Shown while the local API waits for other apps with Liyab closed" })
+            }
             val open = PendingIntent.getActivity(
                 context, 0, Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE)
-            return Notification.Builder(context, CHANNEL_ID)
+            val builder = Notification.Builder(context, if (busy) CHANNEL_ID else LISTENING_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launcher_monochrome)
                 .setContentTitle("Liyab")
                 .setContentText(text)
                 .setContentIntent(open)
-                .setCategory(Notification.CATEGORY_PROGRESS)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 // At once: by default Android holds a service's notification back for 10 s.
                 .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+            if (!busy) return builder.setCategory(Notification.CATEGORY_SERVICE).build()
+            return builder
+                .setCategory(Notification.CATEGORY_PROGRESS)
                 .addExtras(Bundle().apply { putBoolean(EXTRA_REQUEST_PROMOTED_ONGOING, true) })
                 .apply { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) setShortCriticalText("Liyab") }
                 .build()
@@ -150,12 +190,13 @@ class WorkService : Service() {
     }
 }
 
-/** The "liyab/work" channel: Dart holds the service while it has work and Liyab is hidden. */
+/** The "liyab/work" channel: Dart holds the service while Liyab is hidden with work in hand or the local API on. */
 object WorkChannel {
     fun attach(context: Context, engine: FlutterEngine) {
         MethodChannel(engine.dartExecutor.binaryMessenger, "liyab/work").setMethodCallHandler { call, result ->
             when (call.method) {
-                "start" -> result.success(WorkService.start(context, call.arguments as? String ?: ""))
+                "start" -> result.success(
+                    WorkService.start(context, call.argument<String>("text") ?: "", call.argument<Boolean>("busy") ?: true))
                 "stop" -> {
                     WorkService.stop(context)
                     result.success(null)

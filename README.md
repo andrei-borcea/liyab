@@ -701,6 +701,16 @@ cancellation and live counters go straight to the C API, which makes them thread
   Island) and a card on the lock screen. It alerts once, without sound or vibration, on a channel with a
   notification light; HyperOS plays no edge light for it. Android starts the service only while or just after
   Liyab is on screen, or at any time when Liyab's battery use is unrestricted.
+
+  With the [local API](#local-api-one-model-for-every-app-on-the-device) on, the service also stays while Liyab is
+  hidden and idle, only listening: a frozen process never accepts a connection, and on HyperOS a request to a
+  hidden Liyab hung for 10 minutes without an answer. Listening holds no wake lock and runs no code (0 CPU ticks
+  in 2 minutes; 382 MB resident once the idle model is released) and shows a notification of the lowest
+  importance. A request updates the running service in place, which Android allows at any time: the wake lock and
+  the Live Update come with it, and it goes back to listening when the request ends. On the reference phone a
+  request to a hidden Liyab whose 35B had been released loaded it in 2.3–3.4 s and answered 200 tokens at
+  10.9–11.1 tok/s. Releasing the model again a minute later took about 1 s of CPU, and the 2 minutes after it
+  none. A model loaded that way warms its expert cache only once you write in Liyab again.
 * **A new chat** restores the system prompt from its saved state (47 ms on the 35B), so its first message costs
   only its own tokens.
 
@@ -1132,12 +1142,10 @@ Implemented features are described above. These are next, in order:
   * iOS is not built yet;
   * the local API is text only;
   * Android may stop Liyab in the background (which stops the API too). Once Liyab's work is done, HyperOS also
-    freezes it there (cgroup freezer): a frozen Liyab runs no code, so its local API accepts no connection and an
-    idle model is not released until Liyab runs again;
-  * work that starts while Liyab is hidden (a request of another app) gets the foreground service only when Liyab's
-    battery use is unrestricted. Without it, on HyperOS it may get only four of the eight cores (the background
-    cpuset), and runs several times slower while another app is in use: 1.3 instead of ~7 tok/s on the 35B. With
-    the screen off it measured 7.4 tok/s on four cores and ~10 on eight;
+    freezes it there (cgroup freezer): a frozen Liyab runs no code, so an idle model is not released until Liyab
+    runs again. The local API escapes this only while its listening service runs, which Android starts when Liyab
+    leaves the screen: a process Android started in the background (to read notifications, say) gets no listening
+    service, so its API may not answer until Liyab is opened;
   * pages that need a full activity may not open from the assistant sheet's window;
   * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
     rebuild; other apps' notifications cannot be read;

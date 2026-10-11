@@ -137,7 +137,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // its cgroup freezer stops hidden apps. On Android the work service
   // (WorkService.kt) keeps the process running at full speed until that work
   // and the park after it are done. It starts only with work in hand, so
-  // leaving an idle Liyab costs nothing.
+  // leaving an idle Liyab costs nothing; with the local API on it also stays
+  // while Liyab is hidden, only listening (no wake lock, no code running), as
+  // a frozen process never accepts another app's request.
   late final AppLifecycleListener _lifecycle;
   bool _away = false; // off screen since the last park
   Timer? _parkRetry;
@@ -146,26 +148,40 @@ class AppState extends ChangeNotifier implements ApiBackend {
   bool _parkPending = false; // hidden, and the park not done yet
 
   static const _work = MethodChannel('liyab/work');
-  bool _working = false; // the work service is asked for
+  String? _workText; // the work service's notification, null while it is stopped
+  bool _workBusy = false; // with work in hand (wake lock), not only listening
 
   /// Work that keeps the model loaded, and the work service up while Liyab is hidden.
   bool get _busy => generating || loading || moving != null || _apiGenerations > 0;
 
   void _updateWork() {
     if (!Platform.isAndroid) return;
-    final want = _away && (_busy || (_working && _parkPending));
-    if (want == _working) return;
-    _working = want;
-    final text = generating
-        ? 'Finishing a reply'
-        : loading
-            ? 'Loading the model'
-            : moving != null
-                ? 'Moving $moving'
-                : 'Answering another app';
-    unawaited(_work.invokeMethod<bool>(want ? 'start' : 'stop', want ? text : null).then((started) {
+    String? text;
+    if (_away) {
+      text = generating
+          ? 'Finishing a reply'
+          : loading
+              ? 'Loading the model'
+              : moving != null
+                  ? 'Moving $moving'
+                  : _apiGenerations > 0
+                      ? 'Answering another app'
+                      : _workBusy && _parkPending
+                          ? _workText // the park after that work: the same notification
+                          : null;
+    }
+    final busy = text != null;
+    // Listening: a frozen process would never accept another app's connection.
+    if (_away && !busy && apiRunning) text = 'Ready for other apps';
+    if (text == _workText && busy == _workBusy) return;
+    _workText = text;
+    _workBusy = busy;
+    final call = text == null
+        ? _work.invokeMethod<bool>('stop')
+        : _work.invokeMethod<bool>('start', {'text': text, 'busy': busy});
+    unawaited(call.then((started) {
       // Android allows it only just after Liyab was on screen (or with its battery use unrestricted).
-      if (started == false) _log('Working hidden without the work service: Android did not allow it now');
+      if (started == false) _log('Hidden without the work service: Android did not allow it now');
     }, onError: (Object e) => _log('Work service: $e')));
   }
 
@@ -514,13 +530,15 @@ class AppState extends ChangeNotifier implements ApiBackend {
   String? _prepared; // the system block the engine last processed
 
   /// After a load: the hot list a previous process saved, warmed at once (a fresh process has an empty cache).
+  /// Loaded hidden, for another app's request, it is warmed only once the user writes again: the warming would run
+  /// after that request (commands run in order), reading GBs for a model soon released.
   Future<void> _loadExpertProfile() async {
     final file = File(await _expertProfileFile());
     if (!file.existsSync()) return;
     try {
       await engine.loadExpertProfile(file.path);
       _cacheCold = true;
-      _warmIfCold();
+      if (!_away) _warmIfCold();
     } on EngineException catch (e) {
       _log('Expert profile not usable: $e');
     }

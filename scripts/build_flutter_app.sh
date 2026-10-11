@@ -9,8 +9,9 @@
 # APK is signed with build/liyab-debug.keystore (created here if missing):
 # keep it, an APK signed with another key cannot update the installed app.
 # --install never interrupts the app: it waits while Liyab is on screen or runs
-# a foreground service (a model download, or work it finishes hidden), then
-# installs; Liyab starts again when it is next opened.
+# a foreground service for work (a model download, or work it finishes hidden;
+# not the one that only keeps its local API listening), then installs; Liyab
+# starts again when it is next opened.
 # Output: app/build/app/outputs/flutter-apk/app-release.apk
 # macOS requires Flutter, Xcode, cmake. The engine is linked statically into
 # the app (app/macos/Runner/Configs/Engine.xcconfig); `flutter run -d macos`
@@ -21,7 +22,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL=0
 MACOS=0
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --install) INSTALL=1; shift ;;
@@ -77,7 +78,7 @@ if [[ "$INSTALL" == 1 ]]; then
   in_use() {
     { adb shell dumpsys power | grep -q 'mWakefulness=Awake' &&
       adb shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat; } ||
-      adb shell dumpsys activity services com.liyab.chat | grep -q 'isForeground=true'
+      adb shell dumpsys activity services com.liyab.chat | grep 'isForeground=true' | grep -qv 'channel=listening'
   }
   while in_use; do
     echo "    Liyab is in use on the phone; waiting for it to go to the background…"
