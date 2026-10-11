@@ -580,9 +580,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
   }
 
   /// Saves the conversation (removes it when there is none): the messages,
-  /// and with `withContext` the engine's context (KV pages and recurrent
-  /// states, ~200 MB on a 35B MoE: written when parking, not after every
-  /// reply), when it is the chat's (_chatContext). A context older than the
+  /// and with `withContext` the engine's context (KV pages, recurrent
+  /// states and two of their snapshots, ~330 MB on a 35B MoE: written when
+  /// parking, not after every reply), when it is the chat's (_chatContext). A context older than the
   /// messages is still a prefix of the next prompt, so it only saves less
   /// work. Between generations only.
   Future<void> _saveConversation({bool withContext = false}) async {

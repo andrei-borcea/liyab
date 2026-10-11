@@ -369,7 +369,11 @@ each of those as a scheduling problem.
   and 4,096 on a dense 4B.
 * **Save and restore.** `save_state()` / `load_state()` write the context to a file (KV pages, recurrent states, and
   the tokens and text they encode) and restore it in a later process. This works only for the same model file and
-  cache layout, which a fingerprint checks. A long system prompt is processed once, not after every start.
+  cache layout, which a fingerprint checks. A long system prompt is processed once, not after every start. On hybrid
+  models the file also keeps two state snapshots, the oldest and the last prompt's end (62.8 MiB each on the 35B), so
+  a restored context rewinds where the live one would. The next prompt re-sends the last reply as text, which may
+  encode differently from the tokens generated; without that snapshot the whole conversation was processed again
+  (a 1,436-token chat: 60 s to the first token).
 * **Giving memory back.** `trim_memory()` empties the expert cache while idle; the model and its context stay
   loaded. Its hot list survives: `warm_memory()` refills the cache in one background pass of large reads (~0.7 s for
   2.4 GB), and `save_expert_profile()` / `load_expert_profile()` carry the list to a later process.
@@ -1028,7 +1032,7 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |

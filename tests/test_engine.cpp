@@ -2210,6 +2210,58 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     std::remove((dir + "/liyab_" + std::to_string(getpid()) + "_state.bin").c_str());
 }
 
+TEST_CASE("A saved hybrid context keeps its snapshots: a restored one reuses what the live one would") {
+    // After a restart, the next prompt re-sends the last reply as text, which
+    // may encode differently from the tokens generated (or be edited): the
+    // restored context must rewind where the live one does (the last prompt's
+    // snapshot, or the system prompt's for an earlier edit), never to nothing.
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("hybrid", spec));
+    config.backend = BackendKind::Cpu;
+    auto run = [](Engine& e, const std::string& prompt, GenerationStats* st = nullptr) {
+        std::string text;
+        auto r = e.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (r && st != nullptr) *st = *r;
+        return r ? text : std::string("<error>");
+    };
+    const std::string system = "hello world hello";
+    const std::string turn1 = system + " world";
+    auto converse = [&](Engine& e) {  // the system prompt, then a first turn and its reply
+        REQUIRE(e.prefill(system, true).is_ok());
+        run(e, turn1);
+    };
+    auto saver = Engine::create(config);
+    auto fresh = Engine::create(config);
+    REQUIRE(saver.has_value() && fresh.has_value());
+    converse(*saver.value());
+    const auto system_tokens = static_cast<int32_t>(saver.value()->tokenize(system, true)->size());
+    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_snapshots.bin";
+    REQUIRE(saver.value()->save_state(file).is_ok());
+
+    for (const std::string& prompt : {turn1 + "hello world" + " hello", system + " hello"}) {
+        auto live = Engine::create(config);
+        auto loader = Engine::create(config);
+        REQUIRE(live.has_value() && loader.has_value());
+        converse(*live.value());
+        GenerationStats live_st{};
+        run(*live.value(), prompt, &live_st);
+        REQUIRE(loader.value()->load_state(file).has_value());
+        GenerationStats st{};
+        const std::string out = run(*loader.value(), prompt, &st);
+        CHECK(st.cached_prefix_tokens == live_st.cached_prefix_tokens);
+        CHECK(st.cached_prefix_tokens >= system_tokens);
+        fresh.value()->reset_context();
+        CHECK(out == run(*fresh.value(), prompt));
+    }
+    std::remove(file.c_str());
+}
+
 TEST_CASE("Engine routes to CPU when forced and matches the default route") {
     EngineConfig cpu_config = engine_config(mixed_model());
     cpu_config.backend = BackendKind::Cpu;

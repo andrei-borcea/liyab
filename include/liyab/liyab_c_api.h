@@ -261,7 +261,8 @@ LIYAB_C_API void liyab_engine_cancel_prefill(liyab_engine* engine);
 LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
 /* Saves the context (e.g. a prefilled system prompt) to `path`, and restores
  * it for the same model file loaded with the same cache settings, so a later
- * prompt continuing its text starts at once. load writes the tokens restored
+ * prompt continuing its text starts at once (on hybrid models with its state
+ * snapshots, so a diverging prompt keeps as much). load writes the tokens restored
  * to *out_tokens (may be NULL). See Engine::save_state / load_state. */
 LIYAB_C_API liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path);
 LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens);

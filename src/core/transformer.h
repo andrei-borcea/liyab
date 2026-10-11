@@ -259,14 +259,17 @@ public:
     void snapshot_state(bool pin = false);
     static constexpr int32_t kStateSnapshots = 3;
     // Writes what the context holds (n_past(), the KV pages of positions
-    // [0, n_past()), the recurrent states) with a fingerprint of the model and
+    // [0, n_past()), the recurrent states and, below n_past(), the oldest and
+    // the pinned state snapshots) with a fingerprint of the model and
     // the cache settings, so read_state() accepts it only for the same model
     // file loaded the same way. Unsupported with a sliding window (released
     // positions are gone). IoError when the stream fails.
     Status write_state(std::ostream& out) const;
-    // Replaces the context with one write_state() saved, and takes a state
-    // snapshot at its end (truncate() can return there). InvalidArgument when
-    // the fingerprint differs; the context is empty after any failure.
+    // Replaces the context with one write_state() saved, its snapshots
+    // included (truncate() returns to them as in the context that was saved),
+    // and takes a state snapshot at its end (pinned unless a saved one is).
+    // Reads the format without snapshots too. InvalidArgument when the
+    // fingerprint differs; the context is empty after any failure.
     Status read_state(std::istream& in);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them

@@ -607,7 +607,8 @@ void Transformer::snapshot_state(bool pin) {
 namespace {
 
 constexpr uint32_t kStateMagic = 0x5453594C;  // "LYST"
-constexpr uint32_t kStateVersion = 1;
+// 2: the recurrent-state snapshots follow the states (1 had none).
+constexpr uint32_t kStateVersion = 2;
 
 template <typename T>
 void put(std::ostream& out, const T& v) {
@@ -650,6 +651,24 @@ Status Transformer::write_state(std::ostream& out) const {
         out.write(reinterpret_cast<const char*>(st.conv.data()), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
         out.write(reinterpret_cast<const char*>(st.ssm.data()), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
     }
+    // The snapshots below the end (one at the end is the states above), so a
+    // restored context rewinds where the live one would: the next prompt
+    // re-sends the last reply as text, which may encode differently, and
+    // without the last prompt's snapshot a hybrid model would keep nothing.
+    // The oldest (the system prompt's end) and the pinned one are enough; a
+    // draft's is not worth its size (62.8 MiB each on a 35B).
+    std::vector<const StateSnapshot*> kept;
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) kept.push_back(&snap);
+    }
+    put(out, static_cast<int32_t>(kept.size()));
+    for (const StateSnapshot* snap : kept) {
+        put(out, snap->pos);
+        put(out, static_cast<uint8_t>(snap->pinned));
+        put(out, static_cast<uint64_t>(snap->data.size()));
+        out.write(reinterpret_cast<const char*>(snap->data.data()),
+                  static_cast<std::streamsize>(snap->data.size() * sizeof(float)));
+    }
     return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
 }
 
@@ -660,7 +679,7 @@ Status Transformer::read_state(std::istream& in) {
         return Status(code, why);
     };
     uint32_t magic = 0, version = 0;
-    if (!get(in, magic) || !get(in, version) || magic != kStateMagic || version != kStateVersion) {
+    if (!get(in, magic) || !get(in, version) || magic != kStateMagic || version < 1 || version > kStateVersion) {
         return fail(ErrorCode::InvalidArgument, "not a Liyab context state (or another version)");
     }
     for (const int64_t expected : state_fingerprint()) {
@@ -694,8 +713,32 @@ Status Transformer::read_state(std::istream& in) {
             return fail(ErrorCode::IoError, "the state's recurrent states are truncated");
         }
     }
+    int32_t snapshots = 0;
+    if (version >= 2 && (!get(in, snapshots) || snapshots < 0 || snapshots >= kStateSnapshots)) {
+        return fail(ErrorCode::InvalidArgument, "the state's snapshots do not match");
+    }
+    const size_t floats = recurrent_state_bytes() / sizeof(float);
+    for (int32_t i = 0; i < snapshots; ++i) {
+        StateSnapshot snap;
+        uint8_t pinned = 0;
+        uint64_t size = 0;
+        if (!get(in, snap.pos) || !get(in, pinned) || !get(in, size) || size != floats || snap.pos <= 0 ||
+            snap.pos >= n || (!snapshots_.empty() && snap.pos <= snapshots_.back().pos)) {
+            return fail(ErrorCode::InvalidArgument, "the state's snapshots do not match");
+        }
+        snap.pinned = pinned != 0;
+        snap.data.resize(floats);
+        if (!in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
+            return fail(ErrorCode::IoError, "the state's snapshots are truncated");
+        }
+        snapshots_.push_back(std::move(snap));
+    }
     n_past_ = n;
-    snapshot_state(/*pin=*/true);  // a restored context is where the next prompt continues
+    // One at the end too, so a draft typed ahead can be dropped back to it. It
+    // is where the next prompt continues: pinned, unless the last prompt's end
+    // came back pinned (a state saved after a reply).
+    snapshot_state(/*pin=*/std::none_of(snapshots_.begin(), snapshots_.end(),
+                                         [](const StateSnapshot& snap) { return snap.pinned; }));
     return Status::ok();
 }
 
