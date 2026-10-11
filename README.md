@@ -388,10 +388,14 @@ each of those as a scheduling problem.
 A phone that gets hot slows down by itself, and gets slower still once the OS steps in. Liyab steers before that
 happens.
 
-* **Forecast, not reaction.** A polling thread reads the following once a second:
+* **Forecast, not reaction.** While the engine processes a prompt or generates, a polling thread reads the
+  following once a second:
   * the OS thermal status (Android `AThermal_*`, Apple `NSProcessInfo.thermalState`);
   * Android's thermal-headroom forecast 10 s ahead (Android 12+, smoothed);
   * the sysfs skin and SoC zones.
+
+  Idle, it reads nothing. One reading costs ~10 ms of CPU and ~25 wakeups on a Snapdragon 8 Elite, which a loaded
+  but unused model would otherwise pay every second (about 1% of a core, the screen off included).
 
   The forecast becomes a pressure from 0 to 1 over a band set by the power profile: Performance 0.75–0.95, Balanced
   0.65–0.90, LowPower 0.35–0.60. A cooler profile reacts earlier.
@@ -1023,7 +1027,7 @@ downloaded.
 | Suite | Covers |
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
-| `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards |
+| `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |

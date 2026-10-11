@@ -124,6 +124,32 @@ TEST_CASE("read_sysfs_thermal classifies skin and SoC zones") {
     std::system(("rm -rf '" + root + "'").c_str());
 }
 
+TEST_CASE("PowerManager samples only while work is in hand") {
+    std::atomic<int> samples{0};
+    PowerConfig config;
+    config.poll_interval = std::chrono::milliseconds(2);
+    PowerManager pm(config, [&] {
+        samples.fetch_add(1);
+        return ThermalSample{};
+    });
+    pm.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(samples.load() == 0);  // idle: no sampling at all
+    {
+        const PowerManager::Work outer(pm);
+        const PowerManager::Work inner(pm);  // nested work keeps it going
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const int during = samples.load();
+    CHECK(during >= 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // a sample already started may finish
+    const int after = samples.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(samples.load() == after);  // idle again
+    CHECK(after <= during + 1);
+    pm.stop();
+}
+
 TEST_CASE("PowerManager throttles on skin temperature and OS thermal status") {
     ThermalSample sample;
     PowerConfig config;
@@ -255,20 +281,6 @@ TEST_CASE("Cooler profiles react earlier and slow tokens down before throttling"
     CHECK(p.throttled);
     CHECK_NEAR(p.slowdown, 2.0, 1e-6);
     CHECK_NEAR(p.target_tps, 3.0, 1e-9);  // its 6 tok/s cap, halved
-}
-
-TEST_CASE("PowerManager polling thread samples the sensor") {
-    std::atomic<int> calls{0};
-    PowerConfig config;
-    config.poll_interval = std::chrono::milliseconds(5);
-    PowerManager pm(config, [&] {
-        ++calls;
-        return ThermalSample{};
-    });
-    pm.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    pm.stop();
-    CHECK(calls.load() >= 3);
 }
 
 TEST_CASE("pace_token duty-cycles output to the target rate without bursts") {

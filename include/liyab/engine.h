@@ -119,7 +119,7 @@ struct EngineConfig {
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing
-    bool thermal_polling = true;         // background thermal sampling thread
+    bool thermal_polling = true;         // background thermal sampling thread (while prefilling or generating)
     ExperimentalConfig experimental;
 };
 

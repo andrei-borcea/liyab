@@ -6,7 +6,9 @@
 //   on a phone).
 // * Thermal telemetry: a polling thread samples the OS thermal status
 //   (Android AThermal API, Apple NSProcessInfo.thermalState) and the sysfs
-//   thermal zones (skin and SoC temperatures, where the sandbox allows it).
+//   thermal zones (skin and SoC temperatures, where the sandbox allows it),
+//   only while work is in hand (begin_work/end_work): an idle engine never
+//   wakes the CPU for it.
 // * Thermal control: the main input is the OS's thermal-headroom forecast
 //   (Android AThermal_getThermalHeadroom, 10 s ahead; 1.0 = severe
 //   throttling), smoothed, turned into a pressure from 0 to 1 over a band of
@@ -92,9 +94,31 @@ public:
     PowerManager(const PowerManager&) = delete;
     PowerManager& operator=(const PowerManager&) = delete;
 
-    // Background polling every config.poll_interval. Idempotent.
+    // Starts the background polling thread. Idempotent. It samples every
+    // config.poll_interval while work is in hand (see begin_work) and waits
+    // without a timer otherwise.
     void start();
     void stop();
+    // Work that reads policy(): from the first begin_work() after idle until
+    // the matching end_work(), the polling thread samples (the first sample at
+    // once). Idle, it does not: a sample reads every thermal zone and makes two
+    // binder calls, ~10 ms of CPU and ~25 wakeups on a Snapdragon 8 Elite,
+    // which a loaded but unused model would pay every second. Until the first
+    // fresh sample, policy() keeps the one from the end of the last work.
+    // Nestable; thread-safe.
+    void begin_work();
+    void end_work();
+    // begin_work() for its scope.
+    class Work {
+    public:
+        explicit Work(PowerManager& pm) : pm_(pm) { pm_.begin_work(); }
+        ~Work() { pm_.end_work(); }
+        Work(const Work&) = delete;
+        Work& operator=(const Work&) = delete;
+
+    private:
+        PowerManager& pm_;
+    };
     // Takes one sample synchronously.
     void poll_once();
 
@@ -143,6 +167,7 @@ private:
     std::thread thread_;
     std::condition_variable cv_;
     bool stop_ = false;
+    int32_t active_ = 0;  // begin_work() calls not yet ended
 
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_{};

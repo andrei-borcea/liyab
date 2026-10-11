@@ -1003,6 +1003,7 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     auto tokens = s.encode_continuation(text, add_bos);
     if (!tokens) return tokens.status();
     s.cancel_prefill.store(false, std::memory_order_relaxed);
+    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
     const std::vector<int32_t>& t = tokens.value();
     const size_t reused = s.reuse_prefix(t, t.size());
     const PowerPolicy policy = s.power->policy();
@@ -1149,6 +1150,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
 
     Impl& s = *impl_;
     s.cancel.store(false, std::memory_order_relaxed);
+    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
     // The last prompt token seeds the decode loop, so it is never reused.
     const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
     if (s.speculative) s.speculative->reset_stats();

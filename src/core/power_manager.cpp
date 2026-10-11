@@ -285,9 +285,24 @@ void PowerManager::poll_once() {
     }
 }
 
+void PowerManager::begin_work() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_++ > 0) return;
+    }
+    cv_.notify_all();
+}
+
+void PowerManager::end_work() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    --active_;
+}
+
 void PowerManager::poll_loop() {
     std::unique_lock<std::mutex> lock(mutex_);
     while (!stop_) {
+        cv_.wait(lock, [this] { return stop_ || active_ > 0; });  // idle: no timer, no wakeups
+        if (stop_) break;
         lock.unlock();
         poll_once();
         lock.lock();

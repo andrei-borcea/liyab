@@ -80,7 +80,7 @@ typedef struct liyab_engine_config {
     liyab_power_profile power_profile;
     float skin_threshold_c;       /* thermal throttle threshold, default 40 */
     double target_tps;            /* > 0 overrides the profile's pacing rate */
-    int32_t thermal_polling;      /* nonzero: background thermal sampling */
+    int32_t thermal_polling;      /* nonzero: background thermal sampling while prefilling or generating */
     int32_t triple_buffer_loading; /* nonzero: stream blocks through 3 rotating buffers */
     int64_t expert_cache_mb;      /* MoE: -1 auto (default), 0 never stream experts, > 0 cache size in MiB */
     int64_t memory_budget_mb;     /* > 0: cap on resident memory in MiB (e.g. per-app OS limits); 0: free RAM only */
