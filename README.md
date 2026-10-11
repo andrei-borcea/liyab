@@ -676,8 +676,12 @@ cancellation and live counters go straight to the C API, which makes them thread
 * **Context-aware chat.** History is cut by the token budget, and past replies are replayed exactly as generated, so
   each message reuses the engine's context. The system block is restored from a state saved the first time it was
   processed.
-* **Typing ahead.** While you write, the stable part of the draft is processed in the background. Sending then costs
-  only the last words.
+* **Typing ahead.** While you write, the draft's words are processed in the background as each one ends. When you
+  pause, so is the whole message as it would be sent, time line and reply opening included, all but its last token.
+  On the 35B a message sent after a pause started its answer in 0.38 s (1 new prompt token), and short messages
+  typed and sent at once in 0.68–0.91 s (9–10 new tokens), where they had taken 3.5–5.6 s (~48).
+* **The time, when it changed.** A message carries the current date and time (`[Now: …]`, ~20 tokens) only when the
+  history holds none from the last half hour of the same day; in a quick exchange the last one still holds.
 * **A priority scheduler.** Your requests (loading, generating) go before background work (typed-ahead prefills,
   preparation, saves, cache warming). A request that arrives during a background prefill cancels it and continues
   from the work already done.
@@ -726,7 +730,8 @@ cancellation and live counters go straight to the C API, which makes them thread
   only its own tokens.
 * **A first-token budget.** A reply's first token is due within 2 s of sending. A slower one is logged
   ("Latency budget: …") with where the time went: the model waking up, waiting in line, restoring or rewinding the
-  context, the new prompt tokens and the first step, and expert reads.
+  context, the new prompt tokens and the first step, and expert reads. Every step's log line also gives the time
+  from sending to its first token.
 
 ### Local API: one model for every app on the device
 

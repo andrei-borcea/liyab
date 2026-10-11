@@ -25,13 +25,16 @@ import 'models_store.dart';
 import 'settings.dart';
 
 class ChatMessage {
-  ChatMessage(this.user, this.prefix, {String? promptUser}) : promptUser = promptUser ?? user;
+  ChatMessage(this.user, this.prefix, {String? promptUser, this.stamped}) : promptUser = promptUser ?? user;
 
   /// What the user wrote (shown).
   final String user;
 
-  /// The user turn as the model saw it (with the current date and time).
+  /// The user turn as the model saw it (with the current date and time when it carries the time line).
   final String promptUser;
+
+  /// The time promptUser's time line gives; null without one (or when saved by a build that did not record it).
+  final DateTime? stamped;
 
   /// What the template put at the start of the current reply segment (thinking control).
   String prefix;
@@ -76,6 +79,7 @@ class ChatMessage {
   Map<String, Object?> toJson() => {
         'user': user,
         'promptUser': promptUser,
+        if (stamped != null) 'stamped': stamped!.millisecondsSinceEpoch,
         'prefix': prefix,
         'raw': raw,
         'done': done,
@@ -84,7 +88,8 @@ class ChatMessage {
       };
 
   factory ChatMessage.fromJson(Map<String, Object?> o) => ChatMessage(o['user'] as String, o['prefix'] as String,
-      promptUser: o['promptUser'] as String?)
+      promptUser: o['promptUser'] as String?,
+      stamped: o['stamped'] is num ? DateTime.fromMillisecondsSinceEpoch((o['stamped'] as num).toInt()) : null)
     ..raw = o['raw'] as String? ?? ''
     ..done = o['done'] as String? ?? ''
     ..steps.addAll([
@@ -738,9 +743,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   // Typing ahead: while the user writes, the stable part of the draft (whole
   // words, cut where its tokens are a prefix of the text so far) is processed
-  // in the background; then the whole message as it would be sent at that
-  // moment, time line and reply opening included (~30 tokens on ChatML), all
-  // but its last token. Sent unchanged within the same minute, a message then
+  // in the background as each word ends; once typing pauses, the whole
+  // message as it would be sent at that moment, time line and reply opening
+  // included (~30 tokens on ChatML), all but its last token. Sent unchanged within the same minute, a message then
   // costs one decode step before its first token; edited or sent a minute
   // later, it goes back to the words (the engine keeps a snapshot of both).
   // On a MoE whose experts stream from storage a prompt token costs about as
@@ -752,17 +757,26 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Timer? _draftTimer;
   String _drafted = ''; // the prompt text last processed for the draft
   bool _drafting = false;
+  (String, bool)? _draftNext; // asked for while a draft was being prepared: prepared after it
 
   /// Called on every edit of the composer's text.
   void draftChanged(String text) {
     _draftTimer?.cancel();
     if (text.trim().isEmpty) return;
     _warmIfCold();
+    // A word just ended: its words at once (a message sent without a pause then costs only its last word and the
+    // turn's end); the whole message once typing pauses.
+    if (text.endsWith(' ') || text.endsWith('\n')) unawaited(_prefillDraft(text, message: false));
     _draftTimer = Timer(const Duration(milliseconds: 600), () => unawaited(_prefillDraft(text)));
   }
 
-  Future<void> _prefillDraft(String text) async {
-    if (_drafting || generating || loading || _away || !engine.loaded) return;
+  /// The draft's words, then with `message` the whole message as it would be sent now.
+  Future<void> _prefillDraft(String text, {bool message = true}) async {
+    if (generating || loading || _away || !engine.loaded) return;
+    if (_drafting) {
+      _draftNext = (text, message); // the latest request wins
+      return;
+    }
     _drafting = true;
     try {
       await _preparing;
@@ -784,8 +798,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
         }
         if (cut == 0) break;
       }
+      if (!message) return;
       // The message as send() would build it now, but its last token (which seeds the reply's first step).
-      final sent = await _prompt('$text\n\n${nowLine(DateTime.now())}');
+      final sent = await _prompt(_turnText(text, DateTime.now()).$1);
       final sentIds = await engine.tokenIds(sent, background: true);
       for (var end = sent.length - 1; end > sent.length - 8 && end > 0; --end) {
         final part = sent.substring(0, end);
@@ -800,6 +815,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
       if (!_cancelled(e)) _log('Draft not prepared: $e');
     } finally {
       _drafting = false;
+      final next = _draftNext;
+      _draftNext = null;
+      if (next != null) unawaited(_prefillDraft(next.$1, message: next.$2));
     }
   }
 
@@ -824,7 +842,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     'July', 'August', 'September', 'October', 'November', 'December'
   ];
 
-  /// "[Now: Friday 9 October 2026, 13:40, UTC+02:00]": appended to each user
+  /// "[Now: Friday 9 October 2026, 13:40, UTC+02:00]": appended to a user
   /// turn so "today" or "in two hours" mean something (the system prompt stays
   /// fixed, so its context is reused).
   static String nowLine(DateTime t) {
@@ -838,17 +856,39 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// At most this many tool calls per reply.
   static const _maxToolCalls = 4;
 
+  /// A time line stays valid this long (within the same day).
+  static const _timeLineValid = Duration(minutes: 30);
+
+  (String, DateTime?) _turnText(String text, DateTime now) =>
+      turnText(text, now, messages.skip(_historyStart.clamp(0, messages.length)));
+
+  /// The user turn for `text` sent at `now` after `history` (the messages the model sees), and the time its time
+  /// line gives (null without one). The line goes with a message when the history holds none from the last half
+  /// hour of the same day: in a quick exchange the last one still holds, and leaving it out saves ~20 prompt
+  /// tokens, ~1.3 s before the first token on a 35B MoE.
+  static (String, DateTime?) turnText(String text, DateTime now, Iterable<ChatMessage> history) {
+    for (final m in history.toList().reversed) {
+      final at = m.stamped;
+      if (m.error != null || m.streaming || at == null) continue; // not in the history, or no line
+      final sameDay = at.year == now.year && at.month == now.month && at.day == now.day;
+      if (sameDay && now.difference(at) < _timeLineValid) return (text, null);
+      break;
+    }
+    return ('$text\n\n${nowLine(now)}', now);
+  }
+
   Future<void> send(String text) async {
     if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
     final asked = Stopwatch()..start(); // the first token's latency (see _firstTokenBudgetMs)
     generating = true;
     _warmIfCold();
     _draftTimer?.cancel();
+    _draftNext = null;
     _drafted = '';
     // The time line ends the turn: placed first (where typing ahead could
     // process it too), Qwen3.6 copied it at the start of its replies.
-    final promptUser = '$text\n\n${nowLine(DateTime.now())}';
-    final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser);
+    final (promptUser, stamped) = _turnText(text, DateTime.now());
+    final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser, stamped: stamped);
     messages.add(message); // shown at once, also while the model wakes up
     notifyListeners();
     // Unloaded while idle, or still loading: wait for the model, then for its context.
@@ -941,7 +981,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
           // One line per generation (a reply with tool calls has several), so the time of each step shows.
           final fresh = stats.promptTokens - stats.cachedPrefixTokens;
           _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
-              'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, ${stats.generatedTokens} tokens at '
+              'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s'
+              '${firstMs != null && latency != null ? ' (${(firstMs / 1000).toStringAsFixed(2)} s after sending)' : ''}, '
+              '${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
               '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}${_forced(stats)}');
           if (stats.generatedTokens >= 16) {

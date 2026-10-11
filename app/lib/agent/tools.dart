@@ -93,7 +93,7 @@ String _two(int v) => v.toString().padLeft(2, '0');
 /// items as lines take about half the tokens. Lists are capped, newest first,
 /// and long texts cut. Dates are ISO 8601 (no day or month names, which the
 /// model could carry into an answer in another language); today's times stand
-/// alone, since each user turn ends with the current date and weekday.
+/// alone, since the user turns carry the current date and weekday (at most half an hour old).
 abstract final class ToolText {
   static String day(DateTime t) => '${t.year}-${_two(t.month)}-${_two(t.day)}';
   static String hm(DateTime t) => '${_two(t.hour)}:${_two(t.minute)}';

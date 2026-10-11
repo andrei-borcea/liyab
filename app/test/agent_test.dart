@@ -77,6 +77,26 @@ void main() {
     expect(AppState.nowLine(DateTime(2026, 10, 9, 13, 5)), startsWith('[Now: Friday 9 October 2026, 13:05, UTC'));
   });
 
+  test('The time line goes with a message only when the last one is over half an hour old or from another day', () {
+    final at = DateTime(2026, 10, 9, 13, 5);
+    ChatMessage sent(DateTime? stamped) =>
+        ChatMessage('Hi', '', promptUser: stamped == null ? 'Hi' : 'Hi\n\n${AppState.nowLine(stamped)}', stamped: stamped)
+          ..streaming = false;
+    expect(AppState.turnText('Now?', at, const []), ('Now?\n\n${AppState.nowLine(at)}', at));
+    final history = [sent(at), sent(null)];
+    expect(AppState.turnText('And now?', at.add(const Duration(minutes: 29)), history).$2, isNull);
+    final later = at.add(const Duration(minutes: 30));
+    expect(AppState.turnText('And now?', later, history), ('And now?\n\n${AppState.nowLine(later)}', later));
+    final midnight = DateTime(2026, 10, 10, 0, 1);
+    expect(AppState.turnText('Hi', midnight, [sent(DateTime(2026, 10, 9, 23, 59))]).$2, midnight);
+    // A message that failed is not in the model's history.
+    expect(AppState.turnText('Hi', at, [sent(at)..error = 'failed']).$2, at);
+    // Saved before the time was recorded: a line is added.
+    expect(AppState.turnText('Hi', at, [ChatMessage('Hi', '', promptUser: 'Hi\n\n[Now: …]')..streaming = false]).$2, at);
+    final round = ChatMessage.fromJson(sent(at).toJson());
+    expect(round.stamped, at);
+  });
+
   test('tool results are short lines, days shown only when not today', () {
     final now = DateTime(2026, 10, 9, 13, 0);
     int ms(DateTime t) => t.millisecondsSinceEpoch;
