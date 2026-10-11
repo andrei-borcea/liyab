@@ -695,8 +695,9 @@ cancellation and live counters go straight to the C API, which makes them thread
 
   After 5 minutes hidden (configurable) the model is unloaded. A request from another app through the
   [local API](#local-api-one-model-for-every-app-on-the-device) loads it again, and it is unloaded again 5 minutes
-  after the last request. Coming back reloads it, restores the context and warms the cache. While the model wakes
-  up, the flame burns in the middle of the conversation.
+  after the last request. Coming back reloads it, restores the context and warms the cache; with the model still
+  loaded (back from copying something in another app, say), it warms the cache at once. While the model wakes up,
+  the flame burns in the middle of the conversation.
 * **Finishing work in the background (Android).** Android leaves a hidden app little: on HyperOS four of the eight
   cores (a reply drops from ~7 to 1.3 tok/s on the 35B while another app is in use), and soon none, because its
   cgroup freezer stops hidden apps. Leave Liyab while it works (a reply, a load, a model being moved, a request of

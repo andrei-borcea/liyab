@@ -271,7 +271,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _updateWork();
     final path = _released;
     _released = null;
-    if (path != null && File(path).existsSync()) unawaited(load(path, keepChat: true));
+    if (path != null && File(path).existsSync()) {
+      unawaited(load(path, keepChat: true)); // warms the cache once loaded
+    } else {
+      _warmIfCold();
+    }
   }
 
   final EngineService engine;
@@ -553,8 +557,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
   bool _cacheCold = false;
 
   /// Refills the expert cache in the background with what was hot before it
-  /// was emptied, as soon as the user starts writing: one pass of large reads
-  /// while they type, instead of a wait per expert in the first answer.
+  /// was emptied, as soon as Liyab is back on screen (or the user writes): one
+  /// pass of large reads (~0.7 s for 1.9 GB on a 35B) before the next message,
+  /// instead of a wait per expert in its answer. Waiting for the first
+  /// keystroke left a message pasted from another app and sent at once with
+  /// 1.5 s of expert reads before its first token.
   void _warmIfCold() {
     if (!_cacheCold || !engine.loaded) return;
     _cacheCold = false;
@@ -1004,8 +1011,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// model) rather than a wait.
   static const _firstTokenBudgetMs = 2000;
 
+  /// Checked for every reply that got its first token, stopped ones too (the send button stops a reply while it
+  /// is written, so the next message often stops the last one).
   void _checkLatency(GenerationStats stats, int firstMs, int wakingMs) {
-    if (firstMs <= _firstTokenBudgetMs || stats.cancelled) return;
+    if (firstMs <= _firstTokenBudgetMs) return;
     String s(num ms) => '${(ms / 1000).toStringAsFixed(2)} s';
     // Prompt rendering, commands ahead of it in the engine, the trip between isolates.
     final waiting = firstMs - wakingMs - stats.contextMs - stats.ttftMs;
