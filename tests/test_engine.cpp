@@ -1800,9 +1800,9 @@ TEST_CASE("The prefix cache brings back a conversation another one replaced, exa
         GenerationStats st{};
         const std::string out = run(e, next_a, &st);
         const auto a_tokens = static_cast<int32_t>(e.tokenize(a, true)->size());
-        // A's prompt but its last token, which decoding processes: a hybrid
-        // model's pinned snapshot sits there.
-        CHECK(st.cached_prefix_tokens >= a_tokens - 1);
+        // A's prompt and its reply as generated, but the reply's last token,
+        // which was sampled and never processed: nothing of A done again.
+        CHECK(st.cached_prefix_tokens == a_tokens + 5);
         CHECK(out == run(*fresh.value(), next_a));
     }
 }
@@ -2161,20 +2161,24 @@ TEST_CASE("Hybrid models keep a draft's words when its prepared whole message is
     auto converse = [&](Engine& en) -> std::string {  // the system prompt, a first turn and its reply
         return en.prefill(system, true).is_ok() ? run(en, turn1) : std::string("<error>");
     };
-    auto engine = Engine::create(config);
-    auto plain = Engine::create(config);
-    REQUIRE(engine.has_value() && plain.has_value());
-    Engine& e = *engine.value();
-    const std::string head = turn1 + converse(e) + " hello";  // the history and the next turn's opening
-    converse(*plain.value());
-    const std::string words = head + " world world";
-    REQUIRE(e.prefill(words, true).is_ok());
-    REQUIRE(e.prefill(words + " hello world hello", true).is_ok());  // the whole message, prepared
-    const std::string typed_on = words + " world hello";
-    GenerationStats st{};
-    const std::string out = run(e, typed_on, &st);
-    CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(words, true)->size()));
-    CHECK(out == run(*plain.value(), typed_on));
+    // Plain text, then turns closed by a special token as a chat template's
+    // are ("</s>" here; "<|im_end|>" on ChatML), which decodes to "".
+    for (const std::string end : {"", "</s>"}) {
+        auto engine = Engine::create(config);
+        auto plain = Engine::create(config);
+        REQUIRE(engine.has_value() && plain.has_value());
+        Engine& e = *engine.value();
+        const std::string head = turn1 + converse(e) + end + "hello";  // the history and the next turn's opening
+        converse(*plain.value());
+        const std::string words = head + " world world";
+        REQUIRE(e.prefill(words, true).is_ok());
+        REQUIRE(e.prefill(words + " hello" + end + "world hello", true).is_ok());  // the whole message, prepared
+        const std::string typed_on = words + " world" + end + "hello";
+        GenerationStats st{};
+        const std::string out = run(e, typed_on, &st);
+        CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(words, true)->size()));
+        CHECK(out == run(*plain.value(), typed_on));
+    }
 }
 
 TEST_CASE("C API log buffer keeps whole lines for polling UIs") {

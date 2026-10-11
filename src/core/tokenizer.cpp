@@ -220,6 +220,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             tok.merge_rank_.emplace(std::string(merges->strings[r]), static_cast<int32_t>(r));
         }
     }
+    tok.special_.assign(n, false);
+    for (const int32_t id : tok.control_) tok.special_[static_cast<size_t>(id)] = true;
     std::sort(tok.control_.begin(), tok.control_.end(), [&](int32_t a, int32_t b) {
         return tok.texts_[static_cast<size_t>(a)].size() > tok.texts_[static_cast<size_t>(b)].size();
     });
@@ -248,6 +250,17 @@ bool Tokenizer::is_end_of_generation(int32_t id) const {
 const std::string& Tokenizer::piece(int32_t id) const {
     static const std::string empty;
     return id >= 0 && static_cast<size_t>(id) < pieces_.size() ? pieces_[static_cast<size_t>(id)] : empty;
+}
+
+bool Tokenizer::is_special(int32_t id) const noexcept {
+    return id >= 0 && static_cast<size_t>(id) < special_.size() && special_[static_cast<size_t>(id)];
+}
+
+std::string_view Tokenizer::prompt_text(int32_t id, bool segment_start) const {
+    if (is_special(id)) return texts_[static_cast<size_t>(id)];
+    std::string_view text = piece(id);
+    if (segment_start && kind_ == Kind::Spm && add_space_prefix_ && text.starts_with(' ')) text.remove_prefix(1);
+    return text;
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {

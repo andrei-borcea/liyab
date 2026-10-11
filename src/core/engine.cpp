@@ -130,15 +130,33 @@ struct Engine::Impl {
         context_text_tokens = 0;
     }
 
+    // Moves `end` back over the text that context[i] stands for at the end
+    // of text[0, end): a prompt's tokens as encode() matched them (a special
+    // token's own text, such as a chat template's "<|im_end|>"), a reply's as
+    // their pieces (a special one generated decodes to ""). False when the
+    // text does not end with the token's.
+    bool step_back(std::string_view text, size_t& end, size_t i) const {
+        const int32_t id = context[i];
+        const bool segment_start = i == 0 || tokenizer->is_special(context[i - 1]);
+        for (const std::string_view t : {tokenizer->prompt_text(id, segment_start), std::string_view(tokenizer->piece(id))}) {
+            if (t.size() <= end && text.substr(end - t.size(), t.size()) == t) {
+                end -= t.size();
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Before `context` is cut to its first `n` tokens: the text of those
-    // tokens, by dropping the pieces of the others from the end of the text
-    // (not known when they do not end it).
+    // tokens, by stepping back over the others from the end of the text (not
+    // known when it does not end with them).
     void cut_text(size_t n) {
         if (n >= context_text_tokens) return;
-        std::string tail;
-        for (size_t i = n; i < context_text_tokens; ++i) tail += tokenizer->piece(context[i]);
-        if (n > 0 && context_text.ends_with(tail)) {
-            context_text.resize(context_text.size() - tail.size());
+        size_t end = context_text.size();
+        bool known = n > 0;
+        for (size_t i = context_text_tokens; known && i-- > n;) known = step_back(context_text, end, i);
+        if (known) {
+            context_text.resize(end);
             context_text_tokens = n;
         } else {
             context_text.clear();
@@ -171,7 +189,7 @@ struct Engine::Impl {
             // A prompt that leaves this context's text partway (a draft edited,
             // a message prepared ahead then typed over): the context's tokens
             // up to the last one whose text the prompt still starts with,
-            // found by dropping pieces from the end of the text as cut_text()
+            // found by stepping back from the end of the text as cut_text()
             // does. Re-encoding the whole prompt instead could diverge in an
             // earlier reply and, on a hybrid model, go back past the draft's
             // snapshots.
@@ -181,12 +199,10 @@ struct Engine::Impl {
             if (context_text_tokens > 0 && same < context_text.size() && same > known_bytes) {
                 size_t n = context_text_tokens, end = context_text.size();
                 while (n > 0 && end > same) {
-                    const std::string piece = tokenizer->piece(context[n - 1]);
-                    if (piece.empty() || piece.size() > end || context_text.compare(end - piece.size(), piece.size(), piece) != 0) {
-                        n = 0;  // the pieces do not spell the text: unknown
+                    if (!step_back(context_text, end, n - 1)) {
+                        n = 0;  // the tokens do not spell the text: unknown
                         break;
                     }
-                    end -= piece.size();
                     --n;
                 }
                 if (n > 0 && end > known_bytes && (static_cast<unsigned char>(text[end]) & 0xC0) != 0x80) {
@@ -318,17 +334,11 @@ struct Engine::Impl {
 
     void stash_context() {
         if (!prefix_cache_on() || context.size() < kMinPrefixEntry) return;
-        // A hybrid model's recurrent state rewinds only to a snapshot: set the
-        // context aside at its pinned one (the last prompt's end, which that
-        // conversation's next prompt continues), dropping the reply after it.
-        if (target->config().hybrid()) {
-            const int32_t pinned = target->pinned_snapshot();
-            if (pinned >= static_cast<int32_t>(kMinPrefixEntry) && pinned < target->n_past() &&
-                target->truncate(pinned).is_ok()) {
-                cut_text(static_cast<size_t>(pinned));
-                context.resize(static_cast<size_t>(pinned));
-            }
-        }
+        // The whole context, the last reply included: that conversation's next
+        // prompt re-sends it, and on a hybrid model a reply that encodes
+        // differently goes back to the pinned snapshot the state keeps (the
+        // last prompt's end). Setting it aside at that snapshot instead made
+        // every return process the last reply again (123 tokens, 8 s on a 35B).
         for (auto it = prefix_cache.begin(); it != prefix_cache.end();) {  // an older copy of the same conversation
             if (it->tokens.size() <= context.size() && std::equal(it->tokens.begin(), it->tokens.end(), context.begin())) {
                 if (!it->file.empty()) std::remove(it->file.c_str());

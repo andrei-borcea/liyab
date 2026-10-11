@@ -355,13 +355,14 @@ each of those as a scheduling problem.
   They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
 * **Prefix cache across conversations** (`prefix_cache_mb`). A context that an unrelated prompt replaces is kept in
   RAM as a serialized state (KV pages plus recurrent states) with the text it encodes, in an LRU of at most that
-  size. A later prompt that continues that text is restored, cut back to where the two diverge, instead of being
-  processed again, even when its earlier replies would encode to other tokens. The output equals that of a context
-  never interrupted (tested on attention-only and hybrid models). A 2,000-token conversation on the 35B costs
-  ~85 MiB. In RAM (`prefix_cache_mb`) the cache comes out of the memory budget; on a MoE whose experts stream, only
-  as far as the expert cache can spare above 10% of the experts, so it never causes a requantization. On storage
-  (`prefix_cache_dir`, `prefix_cache_disk_mb`) it costs no RAM at all: contexts that RAM does not hold go to files,
-  least recently used out first. On the phone a 4,907-token chat on the 35B (114 MiB) was set aside in 81 ms and
+  size. The whole context is kept, the last reply included, with a hybrid model's state snapshots (the last
+  prompt's end among them). A later prompt that continues that text is restored, cut back to where the two diverge,
+  instead of being processed again, even when its earlier replies would encode to other tokens. The output equals
+  that of a context never interrupted (tested on attention-only and hybrid models). A 2,000-token conversation on
+  the 35B costs ~85 MiB, plus 62.8 MiB per state snapshot kept. In RAM (`prefix_cache_mb`) the cache comes out of
+  the memory budget; on a MoE whose experts stream, only as far as the expert cache can spare above 10% of the
+  experts, so it never causes a requantization. On storage (`prefix_cache_dir`, `prefix_cache_disk_mb`) it costs no
+  RAM at all: contexts that RAM does not hold go to files, least recently used out first. On the phone a 4,907-token chat on the 35B (114 MiB) was set aside in 81 ms and
   restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user

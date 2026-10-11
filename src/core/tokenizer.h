@@ -35,6 +35,15 @@ public:
     // Raw bytes for one token; control tokens decode to "". A multi-byte
     // UTF-8 character may span several tokens.
     [[nodiscard]] const std::string& piece(int32_t id) const;
+    // Whether encode() recognises the token's own text in raw text (control
+    // and user-defined tokens such as "<|im_end|>").
+    [[nodiscard]] bool is_special(int32_t id) const noexcept;
+    // The text that token `id` stands for in a prompt given to encode(): a
+    // special token's own text, else its piece, without the space a
+    // SentencePiece vocabulary adds at the start of a segment
+    // (`segment_start`: the token starts the text or follows a special one).
+    // Used to find which tokens of a context a text still spells.
+    [[nodiscard]] std::string_view prompt_text(int32_t id, bool segment_start) const;
 
     [[nodiscard]] Kind kind() const noexcept { return kind_; }
     [[nodiscard]] int32_t vocab_size() const noexcept { return static_cast<int32_t>(texts_.size()); }
@@ -53,6 +62,7 @@ private:
     std::unordered_map<std::string_view, int32_t> lookup_;
     std::vector<int32_t> end_of_generation_;
     std::vector<int32_t> control_;  // control tokens with text, longest first
+    std::vector<bool> special_;     // per token: in control_
 
     enum class PreTokenizer { None, Qwen2, Qwen35, Llama3 };
     PreTokenizer pre_ = PreTokenizer::None;
