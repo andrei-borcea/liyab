@@ -98,7 +98,10 @@ def note(text):
 
 # What the adb client prints when the phone went away (unplugged, rebooted, USB debugging off); a command's own
 # output is never taken for one of these, since the phone must also be missing when it is checked.
-ADB_GONE = ("no devices/emulators found", "device offline", "device unauthorized", "error: closed", "error: device '")
+# What adb says when the phone went away (its wording differs between versions: "error: device 'X' not found",
+# "adb: device 'X' not found").
+ADB_GONE = ("no devices/emulators found", "device offline", "device unauthorized", "error: closed", "error: device '",
+            "adb: device '")
 
 
 class Phone:
