@@ -592,19 +592,26 @@ class AppState extends ChangeNotifier implements ApiBackend {
   }
 
   /// Saves the conversation (removes it when there is none): the messages,
-  /// and with `withContext` the engine's context (KV pages, recurrent
-  /// states and two of their snapshots, ~330 MB on a 35B MoE: written when
-  /// parking, not after every reply), when it is the chat's (_chatContext). A context older than the
-  /// messages is still a prefix of the next prompt, so it only saves less
-  /// work. Between generations only.
+  /// and with `withContext` the chat's context (KV pages, recurrent states
+  /// and two of their snapshots, ~330 MB on a 35B MoE: written when parking,
+  /// not after every reply): the engine's when it is the chat's
+  /// (_chatContext), else the copy the prefix cache set aside. A context
+  /// older than the messages is still a prefix of the next prompt, so it only
+  /// saves less work. Between generations only.
   Future<void> _saveConversation({bool withContext = false}) async {
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty) return _discardConversation();
     await File(chat).writeAsString(
         jsonEncode({'start': _historyStart, 'messages': [for (final m in messages) m.toJson()]}));
-    if (!withContext || !_chatContext) return; // checked as the save is queued: nothing can come in between
+    if (!withContext) return;
     try {
-      await engine.saveState(state);
+      if (_chatContext) {
+        await engine.saveState(state); // checked as the save is queued: nothing can come in between
+      } else {
+        // Another app's request replaced it: the copy the prefix cache set aside, written as kept. Without it a
+        // restart would bring the chat back from an older save and process its last turns again.
+        await engine.saveState(state, continuing: await _turnHead());
+      }
     } on EngineException catch (e) {
       _log('Conversation context not saved: $e');
     }
@@ -787,9 +794,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _drafting = true;
     try {
       await _preparing;
-      const marker = '\u0000';
-      final template = await _prompt(marker);
-      final head = template.substring(0, template.indexOf(marker));
+      final head = await _turnHead();
       final whole = await engine.tokenIds(head + text, background: true);
       var cut = text.length;
       for (var tries = 0; tries < 3; ++tries) {
@@ -826,6 +831,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
       _draftNext = null;
       if (next != null) unawaited(_prefillDraft(next.$1, message: next.$2));
     }
+  }
+
+  /// The prompt up to where the next user message goes: the conversation so far and the next turn's opening.
+  Future<String> _turnHead() async {
+    const marker = '\u0000';
+    final prompt = await _prompt(marker);
+    return prompt.substring(0, prompt.indexOf(marker));
   }
 
   Future<void> _prefillPart(String part, int tokens, String what) async {

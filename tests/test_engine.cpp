@@ -1807,6 +1807,49 @@ TEST_CASE("The prefix cache brings back a conversation another one replaced, exa
     }
 }
 
+TEST_CASE("A conversation the prefix cache set aside is saved as kept, and restores whole") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen35";
+    spec.n_layers = 4;
+    spec.delta_net_interval = 2;
+    EngineConfig config = engine_config(model_path("prefix_qwen35", spec));
+    config.backend = BackendKind::Cpu;
+    config.prefix_cache_dir = test::temp_dir();
+    for (const int ram_mb : {64, 0}) {  // the copy in RAM, then on storage
+        config.prefix_cache_mb = ram_mb;
+        config.prefix_cache_disk_mb = ram_mb > 0 ? 0 : 64;
+        auto engine = Engine::create(config);
+        auto loader = Engine::create(config);
+        REQUIRE(engine.has_value() && loader.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string a, b;
+        for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        Engine& e = *engine.value();
+        const std::string next_a = a + run(e, a) + " hello";
+        run(e, b);  // another conversation: A's context goes to the prefix cache
+        const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_set_aside.bin";
+        CHECK(!e.save_state(file, "unrelated text").is_ok());
+        REQUIRE(e.save_state(file, next_a).is_ok());
+        REQUIRE(loader.value()->load_state(file).has_value());
+        GenerationStats st{};
+        run(*loader.value(), next_a, &st);
+        // A's prompt and its reply, but the reply's last token (sampled, never processed).
+        CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(a, true)->size()) + 5);
+        std::remove(file.c_str());
+    }
+}
+
 TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and removes its files") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";

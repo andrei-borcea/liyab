@@ -275,6 +275,8 @@ final class LiyabLib {
             'liyab_log_buffer_take'),
         saveState = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>), int Function(Pointer<Void>, Pointer<Utf8>)>(
             'liyab_engine_save_state'),
+        saveStateOf = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Size),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int)>('liyab_engine_save_state_of'),
         loadState = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>),
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>)>('liyab_engine_load_state'),
         trimMemory = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint64>),
@@ -323,6 +325,7 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<LiyabEngineCounters>) getCounters;
   final int Function(Pointer<Utf8>, int) supportedArchitectures;
   final int Function(Pointer<Void>, Pointer<Utf8>) saveState;
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int) saveStateOf;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
   final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
   final int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>) memoryPlan;

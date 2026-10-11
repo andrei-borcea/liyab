@@ -386,6 +386,16 @@ liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path) {
     }
 }
 
+liyab_status liyab_engine_save_state_of(liyab_engine* engine, const char* path, const char* text, size_t text_len) {
+    if (engine == nullptr || path == nullptr || (text == nullptr && text_len > 0)) return LIYAB_ERR_INVALID_ARGUMENT;
+    try {
+        const liyab::Status s = engine->engine->save_state(path, std::string_view(text, text_len));
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    } catch (...) {
+        return LIYAB_ERR_INTERNAL;
+    }
+}
+
 int32_t liyab_engine_context_length(const liyab_engine* engine) {
     return engine == nullptr ? 0 : engine->engine->context_length();
 }

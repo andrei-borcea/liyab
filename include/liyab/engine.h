@@ -192,6 +192,12 @@ public:
     // one. Unsupported with a draft model or a sliding window. Busy while a
     // generation runs.
     Status save_state(const std::string& path);
+    // Saves the context that `text` continues (a conversation's text so far):
+    // the live one when it does, else the longest one the prefix cache set
+    // aside for it, written as kept (nothing is restored or processed), so a
+    // conversation another prompt replaced (a request through an app's API)
+    // can still be saved. InvalidArgument when no context continues `text`.
+    Status save_state(const std::string& path, std::string_view text);
     // Replaces the context with one save_state() wrote for this model file
     // loaded with the same cache settings, so the next prompt that continues
     // its text starts at once instead of being processed again (on a 35B MoE a

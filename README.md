@@ -503,6 +503,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_cancel` / `_cancel_prefill` | Stop a generation / a background prefill (thread-safe) |
 | `liyab_engine_prefill` / `_reset_context` | Process a prefix ahead of time / forget the context |
 | `liyab_engine_save_state` / `_load_state` | Persist and restore the context across processes |
+| `liyab_engine_save_state_of` | Persist the context a text continues, also one the prefix cache set aside |
 | `liyab_engine_trim_memory` / `_warm_memory` | Give the expert cache back while idle / refill it from its hot list |
 | `liyab_engine_save_expert_profile` / `_load_expert_profile` | Carry the expert hot list to a later process |
 | `liyab_engine_memory_plan` / `_context_length` | How the model uses memory; the resolved context length |
@@ -692,7 +693,8 @@ cancellation and live counters go straight to the C API, which makes them thread
 * **Leaving the screen.** HyperOS stops background apps that hold several GB. When Liyab is hidden, it parks:
   1. it saves the expert hot list;
   2. it empties the expert cache (2.4 GB on the 35B);
-  3. it saves the conversation and, when it is the chat's, the engine's context.
+  3. it saves the conversation and its context: the engine's, or, when another app's request replaced it, the copy
+     the prefix cache set aside (written as kept, nothing processed).
 
   After 5 minutes hidden (configurable) the model is unloaded. A request from another app through the
   [local API](#local-api-one-model-for-every-app-on-the-device) loads it again, and it is unloaded again 5 minutes

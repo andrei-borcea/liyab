@@ -1075,31 +1075,39 @@ namespace {
 constexpr uint32_t kContextMagic = 0x5458434C;  // "LCXT": the engine's part after the model's state
 }
 
-Status Engine::save_state(const std::string& path) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    Impl& s = *impl_;
-    if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+namespace {
+
+// After the model's state: magic, token count, tokens, then the text they
+// encode (its length, UINT64_MAX when not known) and how many of the tokens it
+// covers. Files written before that count was saved end after the text, which
+// then covers every token.
+void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, const std::string& text,
+                        size_t text_tokens) {
+    const auto n = static_cast<uint64_t>(tokens.size());
+    const bool known = text_tokens > 0;
+    const uint64_t length = known ? text.size() : UINT64_MAX;
+    const auto covered = static_cast<uint64_t>(text_tokens);
+    out.write(reinterpret_cast<const char*>(&kContextMagic), sizeof kContextMagic);
+    out.write(reinterpret_cast<const char*>(&n), sizeof n);
+    out.write(reinterpret_cast<const char*>(tokens.data()), static_cast<std::streamsize>(n * sizeof(int32_t)));
+    out.write(reinterpret_cast<const char*>(&length), sizeof length);
+    if (known) {
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.write(reinterpret_cast<const char*>(&covered), sizeof covered);
+    }
+}
+
+// Writes `write`'s output to `path` through a temporary file, so `path` is
+// either the old file or the new one.
+Status write_replacing(const std::string& path, const std::function<Status(std::ostream&)>& write) {
     const std::string tmp = path + ".tmp";
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
-        LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
-        // After the model's state: magic, token count, tokens, then the text
-        // they encode (its length, UINT64_MAX when not known) and how many of
-        // the tokens it covers. Files written before that count was saved end
-        // after the text, which then covers every token.
-        const auto n = static_cast<uint64_t>(s.context.size());
-        const bool known = s.context_text_tokens > 0;
-        const uint64_t text = known ? s.context_text.size() : UINT64_MAX;
-        const auto covered = static_cast<uint64_t>(s.context_text_tokens);
-        out.write(reinterpret_cast<const char*>(&kContextMagic), sizeof kContextMagic);
-        out.write(reinterpret_cast<const char*>(&n), sizeof n);
-        out.write(reinterpret_cast<const char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t)));
-        out.write(reinterpret_cast<const char*>(&text), sizeof text);
-        if (known) {
-            out.write(s.context_text.data(), static_cast<std::streamsize>(s.context_text.size()));
-            out.write(reinterpret_cast<const char*>(&covered), sizeof covered);
+        if (Status s = write(out); !s.is_ok()) {
+            out.close();
+            std::remove(tmp.c_str());
+            return s;
         }
         if (!out.flush()) return Status(ErrorCode::IoError, "cannot write " + tmp);
     }
@@ -1108,6 +1116,53 @@ Status Engine::save_state(const std::string& path) {
         return Status(ErrorCode::IoError, "cannot replace " + path);
     }
     return Status::ok();
+}
+
+}  // namespace
+
+Status Engine::save_state(const std::string& path) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+    return write_replacing(path, [&s](std::ostream& out) {
+        LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
+        write_context_tail(out, s.context, s.context_text, s.context_text_tokens);
+        return Status::ok();
+    });
+}
+
+Status Engine::save_state(const std::string& path, std::string_view text) {
+    {
+        std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+        if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+        Impl& s = *impl_;
+        if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+        const bool live = s.context_text_tokens > 0 && text.starts_with(s.context_text);
+        if (!live) {
+            // The longest context set aside for this text, written as it is
+            // kept: nothing is restored or processed.
+            const Impl::PrefixEntry* best = nullptr;
+            for (const Impl::PrefixEntry& e : s.prefix_cache) {
+                if (e.text_tokens > 0 && text.starts_with(e.text) && (best == nullptr || e.text_tokens > best->text_tokens)) {
+                    best = &e;
+                }
+            }
+            if (best == nullptr) return Status(ErrorCode::InvalidArgument, "no context continues this text");
+            return write_replacing(path, [best](std::ostream& out) {
+                if (best->file.empty()) {
+                    out.write(best->state.data(), static_cast<std::streamsize>(best->state.size()));
+                } else {
+                    std::ifstream in(best->file, std::ios::binary);
+                    if (!in) return Status(ErrorCode::IoError, "cannot read " + best->file);
+                    out << in.rdbuf();
+                }
+                write_context_tail(out, best->tokens, best->text, best->text_tokens);
+                return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
+            });
+        }
+    }
+    return save_state(path);
 }
 
 Result<int32_t> Engine::load_state(const std::string& path) {

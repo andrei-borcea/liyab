@@ -343,8 +343,10 @@ class EngineService {
   Future<void> prefill(String text, {bool background = false}) =>
       _call<Object?>(['prefill', text], background: background);
 
-  /// Saves the context (e.g. the prefilled system prompt) to `path`.
-  Future<void> saveState(String path) => _call<Object?>(['saveState', path]);
+  /// Saves the context (e.g. the prefilled system prompt) to `path`. With `continuing`, the context that text
+  /// continues: the live one, or one the prefix cache set aside for it (a conversation another app's request
+  /// replaced); an EngineException when none does.
+  Future<void> saveState(String path, {String? continuing}) => _call<Object?>(['saveState', path, continuing]);
 
   /// Restores a context saveState() wrote for this model; the tokens restored.
   Future<int> loadState(String path) => _call<int>(['loadState', path]);
@@ -520,9 +522,18 @@ void _worker(SendPort replies) {
         case 'saveState':
           if (engine.address == 0) return fail('no model loaded');
           using((arena) {
-            lib.saveState(engine, (m[2] as String).toNativeUtf8(allocator: arena)) == LiyabStatus.ok
-                ? replies.send(['ok', id])
-                : fail();
+            final path = (m[2] as String).toNativeUtf8(allocator: arena);
+            final continuing = m[3] as String?;
+            final int status;
+            if (continuing == null) {
+              status = lib.saveState(engine, path);
+            } else {
+              final bytes = utf8.encode(continuing);
+              final text = arena<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+              text.asTypedList(bytes.length).setAll(0, bytes);
+              status = lib.saveStateOf(engine, path, text, bytes.length);
+            }
+            status == LiyabStatus.ok ? replies.send(['ok', id]) : fail();
           });
         case 'loadState':
           if (engine.address == 0) return fail('no model loaded');

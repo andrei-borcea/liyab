@@ -269,6 +269,13 @@ LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
  * to *out_tokens (may be NULL). See Engine::save_state / load_state. */
 LIYAB_C_API liyab_status liyab_engine_save_state(liyab_engine* engine, const char* path);
 LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens);
+/* Saves the context that the `text_len` bytes of `text` continue (a
+ * conversation's text so far): the live one, or the longest one the prefix
+ * cache set aside for it, written as kept, so a conversation another prompt
+ * replaced can still be saved. LIYAB_ERR_INVALID_ARGUMENT when none does.
+ * See Engine::save_state. */
+LIYAB_C_API liyab_status liyab_engine_save_state_of(liyab_engine* engine, const char* path, const char* text,
+                                                    size_t text_len);
 /* Gives memory back to the OS while the engine is idle (an app in the
  * background): empties the MoE expert cache; the model and its context stay
  * loaded, and the next generation refills the cache from storage. Writes the
