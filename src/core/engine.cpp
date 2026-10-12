@@ -130,14 +130,14 @@ struct Engine::Impl {
         context_text_tokens = 0;
     }
 
-    // Moves `end` back over the text that context[i] stands for at the end
-    // of text[0, end): a prompt's tokens as encode() matched them (a special
+    // Moves `end` back over the text that tokens[i] stands for at the end of
+    // text[0, end): a prompt's tokens as encode() matched them (a special
     // token's own text, such as a chat template's "<|im_end|>"), a reply's as
     // their pieces (a special one generated decodes to ""). False when the
     // text does not end with the token's.
-    bool step_back(std::string_view text, size_t& end, size_t i) const {
-        const int32_t id = context[i];
-        const bool segment_start = i == 0 || tokenizer->is_special(context[i - 1]);
+    bool step_back(std::span<const int32_t> tokens, std::string_view text, size_t& end, size_t i) const {
+        const int32_t id = tokens[i];
+        const bool segment_start = i == 0 || tokenizer->is_special(tokens[i - 1]);
         for (const std::string_view t : {tokenizer->prompt_text(id, segment_start), std::string_view(tokenizer->piece(id))}) {
             if (t.size() <= end && text.substr(end - t.size(), t.size()) == t) {
                 end -= t.size();
@@ -154,7 +154,7 @@ struct Engine::Impl {
         if (n >= context_text_tokens) return;
         size_t end = context_text.size();
         bool known = n > 0;
-        for (size_t i = context_text_tokens; known && i-- > n;) known = step_back(context_text, end, i);
+        for (size_t i = context_text_tokens; known && i-- > n;) known = step_back(context, context_text, end, i);
         if (known) {
             context_text.resize(end);
             context_text_tokens = n;
@@ -174,13 +174,30 @@ struct Engine::Impl {
         const bool bos = add_bos && tokenizer->add_bos_default();
         const std::vector<int32_t>* known = nullptr;
         size_t known_tokens = 0, known_bytes = 0;
+        // The rest of the prompt is encoded from a character's first byte:
+        // when the known text ends inside a character (a reply's byte-level
+        // pieces may split one between two tokens), the tokens step back to
+        // the last one ending on a character boundary. Refusing the match
+        // instead re-encoded the whole conversation and, on a hybrid model,
+        // processed it again.
+        auto mid_character = [&](size_t at) { return (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80; };
+        auto to_boundary = [&](std::span<const int32_t> tokens, std::string_view known_text, size_t& n, size_t& end) {
+            while (n > 0 && end < text.size() && mid_character(end)) {
+                if (!step_back(tokens, known_text, end, n - 1)) {
+                    n = 0;
+                    return;
+                }
+                --n;
+            }
+        };
         auto consider = [&](const std::vector<int32_t>& tokens, const std::string& known_text, size_t n) {
-            if (n > 0 && known_text.size() >= known_bytes && text.size() > known_text.size() &&
-                text.starts_with(known_text) &&
-                (static_cast<unsigned char>(text[known_text.size()]) & 0xC0) != 0x80) {  // not mid-character
+            if (n == 0 || text.size() <= known_text.size() || !text.starts_with(known_text)) return;
+            size_t end = known_text.size();
+            to_boundary(tokens, known_text, n, end);
+            if (n > 0 && end >= known_bytes) {
                 known = &tokens;
                 known_tokens = n;
-                known_bytes = known_text.size();
+                known_bytes = end;
             }
         };
         if (!draft) {
@@ -199,13 +216,14 @@ struct Engine::Impl {
             if (context_text_tokens > 0 && same < context_text.size() && same > known_bytes) {
                 size_t n = context_text_tokens, end = context_text.size();
                 while (n > 0 && end > same) {
-                    if (!step_back(context_text, end, n - 1)) {
+                    if (!step_back(context, context_text, end, n - 1)) {
                         n = 0;  // the tokens do not spell the text: unknown
                         break;
                     }
                     --n;
                 }
-                if (n > 0 && end > known_bytes && (static_cast<unsigned char>(text[end]) & 0xC0) != 0x80) {
+                to_boundary(context, context_text, n, end);
+                if (n > 0 && end > known_bytes) {
                     known = &context;
                     known_tokens = n;
                     known_bytes = end;

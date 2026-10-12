@@ -346,7 +346,9 @@ each of those as a scheduling problem.
   `</think>`, for example), and that no longer forces a restart. The engine keeps knowing which text its tokens
   encode through work that is cancelled or cut short (a prefill typed ahead, a reply stopped while its prompt is
   processed), through rewinds and through `save_state()`. A prompt that leaves that text partway (a draft edited, a
-  message prepared ahead then typed over) keeps its tokens up to where the texts part. Otherwise the longest common
+  message prepared ahead then typed over) keeps its tokens up to where the texts part. When that text ends inside a
+  character (a model may write one in two byte-level tokens), the tokens step back to the last whole character
+  instead of the prompt being encoded again. Otherwise the longest common
   token prefix is kept: any length on attention-only models, and back to the nearest state snapshot on hybrid ones;
   the log says at which token a prompt left the context. On the 35B, follow-up turns start in ~1.1–1.6 s instead of
   reprocessing the conversation.

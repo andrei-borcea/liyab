@@ -2220,6 +2220,54 @@ TEST_CASE("The prefix cache brings back a conversation whose text re-encodes dif
     }
 }
 
+// A reply's byte-level pieces may split a character between two tokens, so
+// a context's text can end inside a character. A prompt continuing it must
+// still reuse the context (up to the token before), from the live context
+// and from the prefix cache alike; it used to be re-encoded whole, which on a
+// hybrid model processed the conversation again.
+TEST_CASE("A conversation whose last token ends inside a character is reused, live or from the prefix cache") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        EngineConfig config = engine_config(model_path(std::string("split_char_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        config.prefix_cache_mb = 64;
+        auto created = Engine::create(config);
+        REQUIRE(created.has_value());
+        Engine& e = *created.value();
+        std::string a, b;
+        for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        // The context holds "hel" + "lo" (prefilled apart, as typing ahead
+        // does), so encoding its text again gives other tokens and only the
+        // text it remembers finds it. That text ends inside "é": its first byte
+        // is the last token the context holds (a byte token; the one token
+        // sampled is not processed). A reply's pieces end that way when the
+        // model writes a character in two tokens; a prompt is the simplest way.
+        const std::string split = "hello world hel";
+        const std::string head = split + "lo" + a + "\xC3";
+        const auto prompt = e.tokenize(head, true);
+        REQUIRE(prompt.has_value());
+        const auto held = static_cast<int32_t>(prompt->size()) - 1;  // all but the split character's first byte
+        for (const bool set_aside : {false, true}) {
+            e.reset_context();
+            REQUIRE(e.prefill(split, true).is_ok());
+            REQUIRE(e.generate(head, greedy(1), nullptr).has_value());
+            // Another conversation replaces it: it comes back from the prefix cache.
+            if (set_aside) REQUIRE(e.generate(b, greedy(1), nullptr).has_value());
+            // The conversation goes on with "é" whole: the text continues with
+            // the character's second byte.
+            auto next = e.generate(head + "\xA9 hello", greedy(1), nullptr);
+            REQUIRE(next.has_value());
+            CHECK(next->cached_prefix_tokens >= held);
+        }
+    }
+}
+
 TEST_CASE("Hybrid models reuse the context up to the last prompt's state snapshot, exactly") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";
