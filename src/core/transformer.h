@@ -1,15 +1,16 @@
 // Liyab — decoder-only transformer over memory-mapped GGUF weights (internal).
 //
-// The block structure is resolved per layer from the file, not hard-coded per
-// model: each block has a token mixer — softmax attention (GQA, RoPE normal or
-// NeoX, optional QKV bias, per-head Q/K norm, optional sigmoid output gate) or a
-// Gated DeltaNet linear-attention recurrence — followed by a SwiGLU FFN. Which
-// mixer a block uses, and which optional tensors it has, is decided by the
-// tensors present, so hybrid models (Qwen3.5: three DeltaNet blocks per
-// attention block) and plain transformers (Llama, Mistral, Qwen2/3) share one
-// forward pass. The FFN is dense SwiGLU or a mixture of experts (router +
-// top-k routed experts + optional gated shared expert), again per block. Architectures only contribute a small traits row (RoPE style).
-// Tensor precision is per tensor, so mixed-precision files run unconverted.
+// What the model is comes from describe_model() (core/architecture.h): the
+// architecture's row of facts the tensors cannot tell, the hyperparameters,
+// and one BlockPlan per block resolved from the tensors present. This class
+// binds the weights to those plans and runs them: each block has a token
+// mixer — softmax attention (GQA, RoPE in either pairing, optional QKV bias,
+// per-head Q/K norm, optional sigmoid output gate) or a Gated DeltaNet
+// linear-attention recurrence — followed by a dense SwiGLU FFN or a mixture of
+// experts (router + top-k routed experts + optional gated shared expert). So
+// hybrid models (Qwen3.5: three DeltaNet blocks per attention block) and plain
+// transformers (Llama, Mistral, Qwen2/3) share one forward pass. Tensor
+// precision is per tensor, so mixed-precision files run unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
 
@@ -21,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "core/architecture.h"
 #include "core/expert_store.h"
 #include "core/quant.h"
 #include "liyab/backend.h"
@@ -32,53 +34,6 @@
 namespace liyab {
 
 class ThreadPool;
-
-// How a mixture-of-experts router turns logits into expert probabilities.
-enum class MoeGating : uint8_t { Softmax, Sigmoid };
-
-// Token mixer of one block.
-enum class MixerKind : uint8_t {
-    Attention,  // softmax attention over the KV cache
-    DeltaNet,   // Gated DeltaNet: causal conv + delta-rule recurrent state, no KV cache
-};
-
-struct ModelConfig {
-    std::string arch;
-    int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
-    int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention (they own the KV cache)
-    int32_t n_embd = 0;
-    int32_t n_ff = 0;
-    int32_t n_head = 0;
-    int32_t n_head_kv = 0;
-    int32_t head_dim = 0;
-    int32_t rope_dim = 0;
-    int32_t n_vocab = 0;
-    int32_t n_ctx_train = 0;
-    float rms_eps = 1e-5f;
-    float rope_base = 10000.0f;
-    float rope_scale = 1.0f;  // linear position scaling
-    bool rope_neox = false;
-    std::vector<MixerKind> mixers;  // per block
-
-    // Gated DeltaNet geometry (zero when every block is attention).
-    int32_t ssm_conv_kernel = 0;  // causal depthwise conv width
-    int32_t ssm_head_dim = 0;     // key and value head size (ssm.state_size)
-    int32_t ssm_k_heads = 0;      // query/key heads (ssm.group_count)
-    int32_t ssm_v_heads = 0;      // value heads = recurrent states per block (ssm.time_step_rank)
-
-    // Mixture of experts (zero when every FFN is dense).
-    int32_t n_expert = 0;        // routed experts per MoE block
-    int32_t n_expert_used = 0;   // experts selected per token (top-k)
-    int32_t n_ff_expert = 0;     // hidden size of one routed expert
-    int32_t n_ff_shared = 0;     // hidden size of the shared expert (0: none)
-    MoeGating moe_gating = MoeGating::Softmax;
-    bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
-    float moe_weights_scale = 1.0f;
-
-    // True when some block keeps a recurrent state: such models cannot roll
-    // back to an arbitrary earlier position (only to 0 or the current one).
-    [[nodiscard]] bool hybrid() const noexcept { return ssm_v_heads > 0; }
-};
 
 // Which backend runs which matmuls for one forward pass. `cpu` is the
 // fallback when a backend reports Unsupported for a tensor.
@@ -315,18 +270,16 @@ private:
         kGateShared, kUpShared, kDownShared,     // MoE: shared expert
         kWeightRoles
     };
+    // The bound weights of one block (its structure is config_.blocks[layer]).
     struct Layer {
-        MixerKind mixer = MixerKind::Attention;
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
         int32_t state_slot = -1;  // index into states_ (DeltaNet)
-        bool attn_gate = false;   // attention output multiplied by sigmoid(gate)
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> conv1d;   // [channel][kernel] taps
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
         std::vector<float> ssm_dt;   // per value head: decay bias
         std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
-        bool moe = false;                 // FFN is a mixture of experts
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
     };

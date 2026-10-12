@@ -75,6 +75,7 @@ add_library(liyab_core OBJECT
   src/core/triple_buffer_loader.cpp
   src/core/tokenizer.cpp
   src/core/sampling.cpp
+  src/core/architecture.cpp
   src/core/transformer.cpp
   src/core/expert_store.cpp
   src/core/direct_io.cpp

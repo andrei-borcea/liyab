@@ -1037,6 +1037,66 @@ TEST_CASE("Transformer matches the float reference for every query-group size") 
     }
 }
 
+// describe_model() reads what a model is from its metadata and tensor names:
+// the architecture's row, then one plan per block. It never reads weights.
+TEST_CASE("describe_model plans every block from the tensors present, and names what it cannot run") {
+    {
+        test::TinyModelSpec spec;
+        spec.arch = "qwen35moe";
+        spec.n_layers = 4;
+        spec.delta_net_interval = 2;  // blocks 1 and 3 are attention
+        spec.attn_gate = true;
+        spec.n_expert = 4;
+        spec.n_expert_used = 2;
+        spec.n_ff_shared = 96;
+        auto file = MmapLoader::open(model_path("describe_hybrid_moe", spec));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(described.has_value());
+        const ModelConfig& c = *described;
+        CHECK(c.spec == find_architecture("qwen35moe"));
+        CHECK(c.spec->rope == RopeLayout::Halves);
+        CHECK(c.n_vocab == static_cast<int32_t>(test::tiny_vocab().size()));
+        REQUIRE(c.blocks.size() == 4);
+        CHECK(c.n_attn_layers == 2);
+        for (size_t l = 0; l < c.blocks.size(); ++l) {
+            const BlockPlan& b = c.blocks[l];
+            const bool attention = l % 2 == 1;
+            CHECK(b.mixer == (attention ? MixerKind::Attention : MixerKind::DeltaNet));
+            CHECK(b.attn_gate == attention);
+            CHECK(b.ffn == FfnKind::Moe);
+            CHECK(b.shared_expert);
+        }
+        CHECK(c.hybrid());
+    }
+    {
+        auto file = MmapLoader::open(f32_model());
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(described.has_value());
+        CHECK(described->spec->rope == RopeLayout::Adjacent);
+        for (const BlockPlan& b : described->blocks) {
+            CHECK(b.mixer == MixerKind::Attention);
+            CHECK(!b.attn_gate);
+            CHECK(b.ffn == FfnKind::Dense);
+        }
+        CHECK(!described->hybrid());
+    }
+    {
+        test::TinyModelSpec spec;
+        spec.arch = "gemma2";
+        auto file = MmapLoader::open(model_path("describe_unknown", spec));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(!described.has_value());
+        CHECK(described.status().code() == ErrorCode::Unsupported);
+        // The message names the architecture and every supported one.
+        const std::string message = described.status().to_string();
+        CHECK(message.find("'gemma2'") != std::string::npos);
+        for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
+    }
+}
+
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
     test::TinyModelSpec dense = f32_spec();
     dense.arch = "qwen3";

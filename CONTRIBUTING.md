@@ -31,8 +31,9 @@ running them over `adb`). The app builds with `scripts/build_flutter_app.sh` (An
 ## Good places to start
 
 * **Model support.** An architecture made of the existing pieces (softmax attention or Gated DeltaNet; dense or MoE
-  FFN) needs only a traits row; the rest is detected from the tensors. Open a *Model support* issue with the GGUF's
-  `general.architecture` and tensor names first.
+  FFN) needs only a row in `src/core/architecture.cpp`; each block's structure is planned from the tensors. Prove it
+  with a `test_golden` case and a conformance run against the Hugging Face model (README, *Adding a model*). Open a
+  *Model support* issue with the GGUF's `general.architecture` and tensor names first.
 * **Kernels.** Faster NEON / i8mm paths for formats that still use the generic decode (TQ1_0, NVFP4, lattice
   I-quants), x86 SIMD kernels, Vulkan and Metal kernels. Every kernel is checked against the reference decoder.
 * **Measurements on your device.** `liyab-cli --device` and a run of `liyab-cli` with the phase breakdown on a phone

@@ -292,7 +292,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_k.bias", {kv}, DType::F32, random(kv, 0.1f));
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
-        w.add_tensor(p + "ffn_norm.weight", {d}, DType::F32, norm_weights(d));
+        // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
+        const bool post_attention = a == "qwen35" || a == "qwen35moe";
+        w.add_tensor(p + (post_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), {d}, DType::F32,
+                     norm_weights(d));
         const std::vector<float> gate = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> up = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> down = random(s.n_ff * d, s.weight_scale);

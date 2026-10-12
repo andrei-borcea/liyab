@@ -1142,17 +1142,20 @@ scripts/phone_regression.py --accept                        # after an intended 
 
 Implemented features are described above. These are next, in order:
 
-1. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
+1. **Model support as data** (in progress). In place: an architecture is one row of facts its tensors cannot tell
+   (`src/core/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
+   pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
+   Hugging Face (`liyab-kl`). Next:
+   * more block parts described as data (norm placement, RoPE variants such as YaRN, MLA, fused expert tensors),
+     then Gemma, Phi, DeepSeek and Hunyuan;
+   * pre-tokenizers from a table instead of code, and the chat template read from the model;
+   * later, multimodal, embedding, reranking and classification models.
+2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
    and fewer fork/joins per CPU block.
-2. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
-3. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
+3. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
+4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need, plus suffix decoding next to lookup.
-4. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
-5. **Automatic architecture mapping.** Declarative per-architecture descriptions built from GGUF metadata and tensor
-   names, so adding a model takes a few lines instead of engine code. This should cover:
-   * decoder-only, MoE and hybrid state-space (Mamba, DeltaNet) models;
-   * multimodal models;
-   * embedding, reranking and classification models.
+5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
 6. **Grammar-constrained decoding.** A token mask from a JSON schema, so tool *arguments* are constrained too; then
    tools through the local API.
 7. **Pooling models** for local memory and retrieval (embeddings, reranker, intent router), next to generative ones.
@@ -1209,8 +1212,9 @@ Implemented features are described above. These are next, in order:
 
 ```
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
-src/core/               engine, transformer, loader, KV cache, expert store, direct I/O, triple buffer,
-                        quant kernels, tokenizer, sampler, power manager, device detection, thread pool
+src/core/               engine, architecture registry and model description, transformer, loader, KV cache,
+                        expert store, direct I/O, triple buffer, quant kernels, tokenizer, sampler, power
+                        manager, device detection, thread pool
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
@@ -1238,10 +1242,12 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   * Speed claims come from alternating A/B runs on a real device.
   * Documentation changes in the same commit as the code it describes: this README, the headers in
     `include/liyab/`, and `--help` texts.
-* **Adding a model.** Today an architecture whose blocks are made of the pieces above (attention or Gated DeltaNet,
-  dense or MoE FFN) needs only a traits row: RoPE style and MoE renormalization default. The mixer and the optional
-  tensors are detected from the file. New kinds of blocks need engine code until the
-  [architecture mapping layer](#roadmap) lands.
+* **Adding a model.** An architecture whose blocks are made of the pieces above (attention or Gated DeltaNet, dense
+  or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`: how RoPE pairs dimensions, the name
+  of the norm before the FFN, the MoE renormalization default. `describe_model()` plans each block from the tensors
+  present (mixer, gated attention, dense or MoE FFN, shared expert) and binds optional tensors where they exist.
+  Add a `test_golden` case and check a BF16/F16 GGUF against its Hugging Face model (`tools/conform_reference.py`,
+  then `liyab-kl --compare … --kv f16`). New kinds of blocks still need engine code (see the [roadmap](#roadmap)).
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64
   device for kernel changes, and `flutter analyze && flutter test` in `app/` for app changes.
 
