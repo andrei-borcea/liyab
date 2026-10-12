@@ -991,4 +991,14 @@ void axpy_row(DType type, const void* row, float a, float* y, int64_t n) noexcep
     }
 }
 
+const char* kernel_isa() noexcept {
+#if defined(LIYAB_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    return "neon+dotprod";
+#elif defined(LIYAB_NEON)
+    return "neon";
+#else
+    return "scalar";
+#endif
+}
+
 }  // namespace liyab::quant

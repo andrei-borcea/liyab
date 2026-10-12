@@ -7,7 +7,7 @@
 // prefill returning every row's logits, then single-token decoding steps) and
 // hashes the bits of every logit it returned. The hashes are pinned in
 // tests/data/golden_logits.txt per platform, because the kernels a build
-// compiles in (scalar, NEON, dot product, i8mm) are free to round differently
+// compiles in (scalar, NEON, dot product) are free to round differently
 // from one another but never from one run to the next.
 //
 // Why: the model-support layer moves how architectures are described out of
@@ -18,6 +18,7 @@
 // note, so a new CPU target never fails before its hashes are recorded.
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "core/quant.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
@@ -40,25 +42,20 @@ using namespace liyab;
 
 namespace {
 
-// The kernel set this build compiled in: the hashes of one platform hold for
-// every machine that runs that build, whatever its thread count.
+// The kernel set the library was compiled with (its flags, not this test's):
+// the hashes of one platform hold for every machine that runs those kernels,
+// whatever its thread count. The repacked i8mm kernels give the same bits
+// (test_engine), so they need no hashes of their own.
 std::string platform() {
 #if defined(__aarch64__)
-    std::string s = "arm64";
+    std::string s = "arm64-";
 #elif defined(__x86_64__)
-    std::string s = "x86_64";
+    std::string s = "x86_64-";
 #else
-    std::string s = "other";
+    std::string s = "other-";
 #endif
-#if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
-    s += "-neon";
-#endif
-#if defined(__ARM_FEATURE_DOTPROD)
-    s += "-dotprod";
-#endif
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-    s += "-i8mm";
-#endif
+    s += quant::kernel_isa();
+    std::replace(s.begin(), s.end(), '+', '-');
     return s;
 }
 

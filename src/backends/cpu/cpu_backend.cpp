@@ -46,17 +46,7 @@ public:
     [[nodiscard]] BackendKind kind() const noexcept override { return BackendKind::Cpu; }
 
     [[nodiscard]] std::string description() const override {
-        std::string isa =
-#if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
-#if defined(__ARM_FEATURE_DOTPROD)
-            "neon+dotprod";
-#else
-            "neon";
-#endif
-#else
-            "scalar";
-#endif
-        return "cpu (" + isa + ", " + std::to_string(pool_.active_threads()) + " threads)";
+        return std::string("cpu (") + quant::kernel_isa() + ", " + std::to_string(pool_.active_threads()) + " threads)";
     }
 
     [[nodiscard]] bool supports(DType) const noexcept override { return true; }

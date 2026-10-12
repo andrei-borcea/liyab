@@ -267,6 +267,12 @@ struct BlockQ8_0x4 {
 };
 static_assert(sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0), "Q8_0_R4 keeps Q8_0's size");
 
+// The instruction set the CPU kernels were compiled for: "scalar", "neon" or
+// "neon+dotprod" (the repacked i8mm kernels give the same bits as these;
+// repack_kernels_available() tells whether they are built in). Kernels for
+// different sets may round differently, the same set never from one run to
+// the next: tests/test_golden.cpp pins the logits per set.
+const char* kernel_isa() noexcept;
 // Whether the repacked kernels are built in (they also need the CPU's i8mm).
 bool repack_kernels_available() noexcept;
 // Rearranges `rows` (a multiple of 8) Q4_K rows of `cols` values into Q4_K_R8.
