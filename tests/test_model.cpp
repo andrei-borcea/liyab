@@ -204,7 +204,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
         w.add_u32(a + ".expert_used_count", static_cast<uint32_t>(s.n_expert_used));
         w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
-        w.add_bool(a + ".expert_weights_norm", true);
+        if (s.expert_weights_norm >= 0) w.add_bool(a + ".expert_weights_norm", s.expert_weights_norm != 0);
+        if (s.n_ff_shared > 0) w.add_u32(a + ".expert_shared_feed_forward_length", static_cast<uint32_t>(s.n_ff_shared));
+        if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
     }
     const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
     if (s.delta_net_interval > 0) {
@@ -216,6 +218,11 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
     w.add_f32(a + ".rope.freq_base", 10000.0f);
+    if (s.rope_dim > 0) w.add_u32(a + ".rope.dimension_count", static_cast<uint32_t>(s.rope_dim));
+    if (s.rope_scale > 0.0f) {
+        w.add_string(a + ".rope.scaling.type", "linear");
+        w.add_f32(a + ".rope.scaling.factor", s.rope_scale);
+    }
     w.add_string("tokenizer.ggml.model", "llama");
     w.add_string_array("tokenizer.ggml.tokens", vocab);
     w.add_f32_array("tokenizer.ggml.scores", scores);
@@ -245,6 +252,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, random(d * n_vocab, 0.5f));
     w.add_tensor("output_norm.weight", {d}, DType::F32, norm_weights(d));
     if (!s.tied_output) w.add_tensor("output.weight", {d, n_vocab}, s.output_type, random(d * n_vocab, s.weight_scale));
+    if (s.rope_freqs) {
+        const int64_t pairs = (s.rope_dim > 0 ? s.rope_dim : hd) / 2;
+        std::vector<float> factors(static_cast<size_t>(pairs));
+        for (size_t i = 0; i < factors.size(); ++i) factors[i] = 1.0f + static_cast<float>(i % 4);  // 1..4
+        w.add_tensor("rope_freqs.weight", {pairs}, DType::F32, factors);
+    }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
         w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
@@ -264,10 +277,15 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ssm_dt.bias", {ssm_hv}, DType::F32, random(ssm_hv, 0.5f));
             w.add_tensor(p + "ssm_norm.weight", {ssm_hd}, DType::F32, norm_weights(ssm_hd));
         } else {
-            w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
+            w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
             w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            if (s.qk_norm) {
+                w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
+                w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, norm_weights(hd));
+            }
         }
         if (a == "qwen2") {
             w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
@@ -302,6 +320,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));
         for (float& x : router) x = normal(router_rng) * 0.5f;
         w.add_tensor(p + "ffn_gate_inp.weight", {d, s.n_expert}, DType::F32, router);
+        if (s.expert_bias) w.add_tensor(p + "exp_probs_b.bias", {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
+        if (s.n_ff_shared > 0) {
+            const int64_t sh = s.n_ff_shared;
+            w.add_tensor(p + "ffn_gate_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));
+            w.add_tensor(p + "ffn_up_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));
+            w.add_tensor(p + "ffn_down_shexp.weight", {sh, d}, s.ffn_type, random(sh * d, s.weight_scale));
+            if (s.shared_gate) w.add_tensor(p + "ffn_gate_inp_shexp.weight", {d}, DType::F32, random(d, s.weight_scale));
+        }
     }
     w.write(path);
 }

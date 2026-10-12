@@ -66,6 +66,22 @@ struct TinyModelSpec {
     // block is attention and the others are Gated DeltaNet (2 key heads, 4
     // value heads of 16, convolution kernel 4).
     int32_t delta_net_interval = 0;
+
+    // Optional features, each one a separate path of the forward pass. Off by
+    // default, and drawn from the generator only when on, so every model
+    // written before these existed keeps its exact weights.
+    bool qk_norm = false;        // per-head RMSNorm of Q and K (attn_q_norm / attn_k_norm)
+    bool attn_gate = false;      // attention output gated per head: attn_q is [q | gate], twice as tall
+    int32_t rope_dim = 0;        // rotated dimensions per head (partial RoPE); 0: the whole head
+    bool rope_freqs = false;     // per-pair RoPE frequency factors (rope_freqs.weight, Llama 3.x)
+    float rope_scale = 0.0f;     // > 0: linear RoPE position scaling with this factor
+    int32_t n_ff_shared = 0;     // MoE: shared expert of this hidden size (0: none)
+    bool shared_gate = false;    // MoE: sigmoid gate of the shared expert (ffn_gate_inp_shexp)
+    bool expert_bias = false;    // MoE: selection bias added to the router probabilities (exp_probs_b)
+    bool sigmoid_gating = false; // MoE: sigmoid instead of softmax router (expert_gating_func = 2)
+    // MoE: expert_weights_norm metadata: 1 true, 0 false, -1 absent (the
+    // architecture's default applies).
+    int32_t expert_weights_norm = 1;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

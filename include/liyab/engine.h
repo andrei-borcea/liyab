@@ -41,8 +41,11 @@ struct EngineConfig {
     int32_t context_length = 0;       // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the training context
     int32_t sliding_window = 0;       // 0: full attention; else attend to the last N tokens
     int32_t kv_sink_tokens = 8;       // with a sliding window: first N tokens stay visible (attention sinks)
-    // Paged KV cache format. Q8_0 is the quality default; Q4_0 / Q4_1 (INT4,
-    // -72% / -69% vs F16) trade some accuracy for memory on long contexts.
+    // Paged KV cache format. Q8_0 (the default) halves F16's memory at a
+    // cost that depends on the model's keys: negligible on Llama 3.2 and the
+    // Qwen3.5 hybrids, measurable on Qwen2.5 / Qwen3, whose keys carry large
+    // outliers (README, Correctness); F16 avoids it. Q4_0 / Q4_1 (INT4,
+    // -72% / -69% vs F16) trade more accuracy for memory on long contexts.
     KvCacheType kv_cache_type = KvCacheType::Q8_0;
     // Stream transformer blocks through the triple-buffered loader (3 block
     // buffers: fetch | prepare | execute) instead of reading the mmap in place.

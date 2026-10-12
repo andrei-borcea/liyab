@@ -256,7 +256,7 @@ endif()
 
 if(LIYAB_BUILD_TESTS)
   enable_testing()
-  set(_liyab_tests test_mmap test_device_detect test_engine test_kv_cache test_backends)
+  set(_liyab_tests test_mmap test_device_detect test_engine test_kv_cache test_backends test_golden)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()

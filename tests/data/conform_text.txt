@@ -1,0 +1,18 @@
+The lighthouse keeper wrote in her log every evening at 19:45, whatever the weather. On 3 March 2024 the entry read: "Wind NNE, 27 knots; visibility 2.5 km; the supply boat is late again (third time this month)." She didn't mind. She'd learned that the sea keeps its own schedule, and that patience costs less than fuel.
+
+Il giorno dopo arrivò una lettera da Napoli. «Cara Giulia,» cominciava, «ti scrivo perché l'officina chiude a fine anno e non so più a chi lasciare gli attrezzi di papà.» Lei rilesse la frase due volte, poi spense la lampada e guardò il porto: c'erano più gabbiani che barche, e l'aria sapeva di sale e di caffè bruciato.
+
+def moving_average(values: list[float], window: int = 3) -> list[float]:
+    """Return the mean of each run of `window` consecutive values."""
+    if window <= 0:
+        raise ValueError(f"window must be positive, got {window}")
+    return [sum(values[i:i + window]) / window for i in range(len(values) - window + 1)]
+
+Prices rose by 12.5% between Q1 and Q3 (from $1,299.00 to $1,461.38), while the index fell 0.75 points; see https://example.org/report?id=42&lang=en for details. Email: keeper@lighthouse.example — reply within 48h!
+
+東京の朝は静かだった。駅のホームで、彼女は温かいお茶を一口飲んだ。北京的冬天很冷，但是街上的人们依然忙碌。서울에서는 비가 내리고 있었다.
+
+Ünïcödé öddities: naïve café, façade, Ångström, Ελληνικά, русский текст, עברית, العربية, emoji 🚢🌊⚓ and math ∑ x² ≤ ∞.
+
+    Indented line with	a tab, trailing spaces
+Line after a blank one, then numbers: 0, 7, 42, 1234567890, 3.14159, -0.001, 1e-9.

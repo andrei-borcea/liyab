@@ -1003,6 +1003,40 @@ TEST_CASE("Transformer matches the float reference (F32 weights, F16 KV)") {
     }
 }
 
+// Grouped-query attention scores a KV head's query group together: every
+// group size must give the reference's logits, odd and prime ones included
+// (Qwen2.5-0.5B has 7 query heads per KV head).
+TEST_CASE("Transformer matches the float reference for every query-group size") {
+    struct Heads {
+        int32_t n_head, n_head_kv;
+    };
+    for (const Heads h : {Heads{4, 4}, Heads{4, 2}, Heads{6, 2}, Heads{14, 2}, Heads{5, 1}, Heads{12, 4}}) {
+        test::TinyModelSpec spec = f32_spec();
+        spec.n_head = h.n_head;
+        spec.n_head_kv = h.n_head_kv;
+        spec.n_embd = 32 * h.n_head;  // head_dim 32
+        TransformerOptions options;
+        options.kv_type = KvCacheType::F16;
+        const std::string name = "heads_" + std::to_string(h.n_head) + "_" + std::to_string(h.n_head_kv);
+        auto model = load_transformer(model_path(name, spec), options);
+        REQUIRE(model != nullptr);
+        ThreadPool pool(4);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(logits.has_value());
+        const auto expected = Reference(model->file()).logits(tokens);
+        const auto vocab = static_cast<size_t>(model->config().n_vocab);
+        double worst = 0.0;
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            worst = std::max(worst, static_cast<double>(max_abs_diff(logits->subspan(t * vocab, vocab), expected[t])));
+        }
+        if (worst >= 2e-2) std::printf("  %d query heads over %d KV heads: max |diff| %g\n", h.n_head, h.n_head_kv, worst);
+        CHECK(worst < 2e-2);
+    }
+}
+
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
     test::TinyModelSpec dense = f32_spec();
     dense.arch = "qwen3";

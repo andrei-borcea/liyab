@@ -987,6 +987,20 @@ weights, the file's layouts and the repacked ones, batched and token-by-token pr
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
+**Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
+float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every tokenizer gave the
+reference's ids for the whole text. With an F16 KV cache the forward passes agree:
+
+| Model (architecture) | Tokens | Mean KL | Top-1 agreement | With the default Q8_0 KV cache |
+| :--- | ---: | ---: | ---: | :--- |
+| Llama-3.2-1B-Instruct (`llama`) | 499 | 0.00000 | 99.80% | KL 0.0009, top-1 97.2% |
+| Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% | KL 0.070, top-1 86.9% |
+| Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% | KL 0.051, top-1 88.6% |
+| Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% | KL 0.00007, top-1 99.2% |
+
+The Q8_0 KV cache costs little on Llama and the Qwen3.5 hybrids but measurably on Qwen2.5 and Qwen3, whose keys
+carry large outliers (Qwen2.5's key biases reach 130); `--kv f16` avoids it at twice the KV memory.
+
 ### Charts
 
 ![Qwen3.6-35B-A3B decode speed by engine version](docs/benchmarks/moe_35b_decode.svg)
@@ -1047,7 +1061,8 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per platform in `tests/data/golden_logits.txt`: one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1056,10 +1071,24 @@ downloaded.
 Benchmarks and tools built with the tests:
 
 * `liyab-bench`: CPU matvec throughput on a MoE's decode shapes, against the RAM read ceiling.
-* `liyab-kl`: the price of a lossy option. It saves teacher-forced next-token distributions from the lossless path,
-  then reports KL divergence, top-1 agreement and perplexity for a lossy run. The two runs are separate processes,
-  so a model that fills the RAM fits once.
+* `liyab-kl`: teacher-forced next-token distributions compared against a reference, for two uses.
+  * **The price of a lossy option.** It saves the distributions from the lossless path, then reports KL divergence,
+    top-1 agreement and perplexity for a lossy run. The two runs are separate processes, so a model that fills the
+    RAM fits once.
+  * **Conformance with another implementation.** `tools/conform_reference.py` writes the same reference from
+    Hugging Face transformers (needs `torch` and `transformers`). The comparison first checks that the text encodes
+    into the same token ids, printing the first difference, then measures the forward pass; `--max-kl` and
+    `--min-top1` make it a pass/fail gate, `--ref-tokens` measures the model on the reference's ids while a
+    tokenizer still differs, and `--kv f16` keeps the KV cache's own rounding out of the measurement. `tests/data/conform_text.txt` is the text used (prose, Italian, code, numbers, URLs,
+    CJK, Greek, Cyrillic, Hebrew, Arabic, emoji, tabs and trailing spaces).
+
+  ```bash
+  tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
+  build/liyab-kl -m Qwen3-0.6B-BF16.gguf -f tests/data/conform_text.txt --compare qwen3.ref --max-kl 0.01 --min-top1 97
+  ```
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
+* `LIYAB_GOLDEN_UPDATE=1 test_golden`: records this platform's logit hashes, after a change meant to move outputs
+  (say why in the commit). A platform with no hashes yet is skipped with a note.
 
 On a device:
 
@@ -1185,7 +1214,8 @@ src/core/               engine, transformer, loader, KV cache, expert store, dir
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, table/vector generators, benchmark and brand image generators
+tools/                  liyab-cli, liyab-bench, liyab-kl, conform_reference.py (Hugging Face references for
+                        liyab-kl), table/vector generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
 app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), lib/agent (tools),
