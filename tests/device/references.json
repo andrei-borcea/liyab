@@ -12,5 +12,19 @@
    "A refrigerator uses a special gas that absorbs heat from your food, making it cold. It then pushes that heat outside the fridge so your snacks stay fresh."
   ],
   "commit": "1d961da"
+ },
+ "qwen35-4b-q4km.gguf:2740937888": {
+  "replies": [
+   "A refrigerator keeps food cold through a cycle that moves heat from inside the fridge to the outside. Here are the key steps:\n\n1.  **Evaporation**: A refrigerant gas circulates through an evaporator coil inside the fridge. As it passes through, it absorbs heat from the air and food, turning into",
+   "A refrigerator works like a magic machine that pulls heat out of the inside and pushes it outside. It uses a special cold gas that gets cold when it goes in and warm when it comes out, keeping your food fresh."
+  ],
+  "commit": "617317b"
+ },
+ "app:Qwen3.5-4B-Q4_K_M.gguf": {
+  "replies": [
+   "A refrigerator keeps food cold through a cycle that moves heat from inside the fridge to the outside. Here are the key steps:\n\n1.  **Evaporation**: A refrigerant gas circulates through an evaporator coil inside the fridge. As it passes through, it absorbs heat from the air and food, turning into",
+   "A refrigerator works like a magic machine that pulls heat out of the inside and pushes it outside. It uses a special cold gas that gets cold when it goes in and warm when it comes out, keeping your food fresh."
+  ],
+  "commit": "617317b"
  }
 }
