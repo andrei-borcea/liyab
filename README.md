@@ -719,6 +719,8 @@ cancellation and live counters go straight to the C API, which makes them thread
   processed.
 * **Typing ahead.** While you write, the draft's words are processed in the background as each one ends. When you
   pause, so is the whole message as it would be sent, time line and reply opening included, all but its last token.
+  Text that arrives all at once (a paste, dictation, text shared into the composer: 12 or more characters in one
+  edit) is prepared whole right away, without waiting for the pause.
   On the 35B a message sent after a pause started its answer in 0.38 s (1 new prompt token), and short messages
   typed and sent at once in 0.68–0.91 s (9–10 new tokens), where they had taken 3.5–5.6 s (~48).
 * **The time, when it changed.** A message carries the current date and time (`[Now: …]`, ~20 tokens) only when the
@@ -1117,7 +1119,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats and forced continuations; chat history replay; the local API's OpenAI, Anthropic and gRPC servers over real sockets |
+| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); the local API's OpenAI, Anthropic and gRPC servers over real sockets |
 
 Benchmarks and tools built with the tests:
 

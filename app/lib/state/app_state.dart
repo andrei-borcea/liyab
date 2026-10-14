@@ -23,6 +23,7 @@ import '../models/downloads.dart';
 import 'device_monitor.dart';
 import 'models_store.dart';
 import 'settings.dart';
+import 'typing_ahead.dart';
 
 class ChatMessage {
   ChatMessage(this.user, this.prefix, {String? promptUser, this.stamped}) : promptUser = promptUser ?? user;
@@ -761,7 +762,8 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // words, cut where its tokens are a prefix of the text so far) is processed
   // in the background as each word ends; once typing pauses, the whole
   // message as it would be sent at that moment, time line and reply opening
-  // included (~30 tokens on ChatML), all but its last token. Sent unchanged within the same minute, a message then
+  // included (~30 tokens on ChatML), all but its last token; a paste prepares
+  // both at once (TypingAhead decides when). Sent unchanged within the same minute, a message then
   // costs one decode step before its first token; edited or sent a minute
   // later, it goes back to the words (the engine keeps a snapshot of both).
   // On a MoE whose experts stream from storage a prompt token costs about as
@@ -770,20 +772,15 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // reads the experts the answer starts with. On hybrid models the engine
   // reuses a context only up to a snapshot at the end of a prefill, hence the
   // exact token-prefix checks.
-  Timer? _draftTimer;
+  late final _typingAhead = TypingAhead((text, {required message}) => unawaited(_prefillDraft(text, message: message)));
   String _drafted = ''; // the prompt text last processed for the draft
   bool _drafting = false;
   (String, bool)? _draftNext; // asked for while a draft was being prepared: prepared after it
 
   /// Called on every edit of the composer's text.
   void draftChanged(String text) {
-    _draftTimer?.cancel();
-    if (text.trim().isEmpty) return;
-    _warmIfCold();
-    // A word just ended: its words at once (a message sent without a pause then costs only its last word and the
-    // turn's end); the whole message once typing pauses.
-    if (text.endsWith(' ') || text.endsWith('\n')) unawaited(_prefillDraft(text, message: false));
-    _draftTimer = Timer(const Duration(milliseconds: 600), () => unawaited(_prefillDraft(text)));
+    if (text.trim().isNotEmpty) _warmIfCold(); // the expert reads go first, the draft's work after them
+    _typingAhead.changed(text);
   }
 
   /// The draft's words, then with `message` the whole message as it would be sent now.
@@ -903,7 +900,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     final asked = Stopwatch()..start(); // the first token's latency (see _firstTokenBudgetMs)
     generating = true;
     _warmIfCold();
-    _draftTimer?.cancel();
+    _typingAhead.cancel();
     _draftNext = null;
     _drafted = '';
     // The time line ends the turn: placed first (where typing ahead could
