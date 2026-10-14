@@ -306,6 +306,43 @@ TEST_CASE("Engine reports early exits and pruned steps") {
     CHECK(stats->head_pruned_steps > 0);
 }
 
+// A forced pass normally samples the next token from its last row; early
+// exit and EGLS run in decoding steps only, so with them the token after a
+// forced text keeps its own step (one pass more per forced text).
+TEST_CASE("With decoding-only hooks a forced text's next token keeps its own step") {
+    for (const bool early_exit : {true, false}) {
+        EngineConfig config;
+        config.model_path = tiny_model();
+        config.backend = BackendKind::Cpu;
+        config.thermal_polling = false;
+        config.power.target_tps = 10000.0;  // effectively unpaced
+        config.experimental.early_exit = early_exit;
+        config.experimental.early_exit_threshold = -1.0f;
+        config.experimental.early_exit_min_layer = 0;
+        config.experimental.egls = !early_exit;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        SamplingParams p;
+        p.temperature = 0.0f;
+        p.max_tokens = 6;
+        const std::string forced = " hello world";
+        int calls = 0;
+        std::string text;
+        auto stats = engine.value()->generate(
+            "hello world", p,
+            [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            },
+            [&](std::string_view) { return ++calls == 1 ? forced : std::string(); });
+        REQUIRE(stats.has_value());
+        REQUIRE(stats->generated_tokens == p.max_tokens);
+        CHECK(text.find(forced) != std::string::npos);
+        CHECK(stats->forced_tokens > 0);
+        CHECK(stats->decode_passes == stats->generated_tokens + 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EGLS
 // ---------------------------------------------------------------------------

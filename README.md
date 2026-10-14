@@ -414,9 +414,14 @@ each of those as a scheduling problem.
   2.4 GB), and `save_expert_profile()` / `load_expert_profile()` carry the list to a later process.
 * **Structured output.** `generate()` takes an optional `ForceCallback`. After each piece it sees the output so far
   and may return text the output must continue with. The engine runs that text through the model in one batched
-  pass, like a short prefill, and emits it as output. The app uses this to force the fixed syntax of tool calls and
-  to complete a tool name as soon as only one fits. Forced tokens are counted apart from sampled ones, with the time
-  their passes took. On the 35B with streamed experts, a tool call's 9 forced tokens took 1.52 s against ~1.66 s to
+  pass, like a short prefill, and emits it as output. That pass also gives the logits of the token after the forced
+  text, which is sampled from them, so forced text costs no decoding step of its own (the CPU backend computes a row
+  the same bits in any batch, so the output is the same as with a separate step). The app uses this to force the
+  fixed syntax of tool calls and to complete a tool name as soon as only one fits. It works with speculative
+  decoding too: the callback is asked after every token, and tokens a step verified past a forced point are rolled
+  back. Forced text that ends inside a character is emitted up to it, the rest with the token that completes it.
+  Forced tokens are counted apart from sampled ones, with the time their passes took, and
+  `GenerationStats::decode_passes` counts the model's passes while decoding. On the 35B with streamed experts, a tool call's 9 forced tokens took 1.52 s against ~1.66 s to
   sample them: a batched pass reads the union of its tokens' experts, so what forcing buys there is a call that
   always parses, not speed.
 
@@ -1107,7 +1112,7 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |

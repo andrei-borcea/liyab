@@ -2085,6 +2085,166 @@ TEST_CASE("Forced continuations are emitted, counted, and decoding continues exa
     CHECK(st2->cached_prefix_tokens >= static_cast<int32_t>(prompt->size()) - 1);
 }
 
+namespace {
+
+// The engine's rule for emitting pieces: up to the last whole character.
+size_t whole_utf8_prefix(std::string_view s) {
+    const size_t n = s.size();
+    for (size_t back = 1; back <= std::min<size_t>(4, n); ++back) {
+        const auto c = static_cast<unsigned char>(s[n - back]);
+        if ((c & 0xC0) == 0x80) continue;
+        const size_t need = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+        return back >= need ? n : n - back;
+    }
+    return n;
+}
+
+// Forced text by call: the force callback's n-th call (1-based) forces
+// plan[n]. Calls come after every sampled token that ends a whole character.
+using ForcePlan = std::vector<std::pair<int, std::string>>;
+
+std::string planned(const ForcePlan& plan, int call) {
+    for (const auto& [n, text] : plan) {
+        if (n == call) return text;
+    }
+    return {};
+}
+
+// What generate() with `plan` must produce, built one sampled token at a
+// time with plain greedy decoding (a fresh generate_tokens() per token) and
+// the forced tokens appended to the prompt: the output text and whether
+// generation ended on an end-of-generation token.
+struct ForcedReference {
+    std::string text;
+    std::vector<int32_t> tokens;  // the prompt's, the sampled and the forced ones
+    int32_t sampled = 0;
+    int32_t forced_tokens = 0;
+    bool ended = false;
+};
+
+void forced_reference(Engine& e, const std::string& prompt, int32_t max_tokens, const ForcePlan& plan,
+                      ForcedReference& ref) {
+    auto seq = e.tokenize(prompt, true);
+    REQUIRE(seq.has_value());
+    e.reset_context();
+    std::string generated, pending;
+    int call = 0;
+    while (ref.sampled < max_tokens) {
+        int32_t token = -1;
+        auto st = e.generate_tokens(*seq, greedy(1), [&](std::string_view, int32_t t) {
+            token = t;
+            return true;
+        });
+        REQUIRE(st.has_value());
+        if (st->generated_tokens == 0) {  // end of generation
+            ref.ended = true;
+            break;
+        }
+        REQUIRE(token >= 0);  // a token whose piece is empty would not be seen
+        ++ref.sampled;
+        seq->push_back(token);
+        pending += e.token_to_piece(token);
+        const size_t ready = whole_utf8_prefix(pending);
+        generated += pending.substr(0, ready);
+        pending.erase(0, ready);
+        if (ref.sampled >= max_tokens || !pending.empty()) continue;
+        const std::string forced = planned(plan, ++call);
+        if (forced.empty()) continue;
+        const auto forced_tokens = e.tokenize(forced, false);
+        REQUIRE(forced_tokens.has_value());
+        seq->insert(seq->end(), forced_tokens->begin(), forced_tokens->end());
+        ref.forced_tokens += static_cast<int32_t>(forced_tokens->size());
+        const size_t whole = whole_utf8_prefix(forced);
+        generated += forced.substr(0, whole);
+        pending = forced.substr(whole);
+    }
+    ref.text = generated + pending;
+    ref.tokens = *seq;
+}
+
+}  // namespace
+
+// The forced tokens and the token sampled after them share one pass: the
+// last forced token no longer needs a decoding step of its own. Same output
+// as appending the forced text to the prompt, on attention-only and hybrid
+// models, with plain decoding and with speculative decoding (lookup and a
+// draft model, whose steps return several tokens and are cut where the
+// output is forced), and with forced text that ends inside a character.
+TEST_CASE("Forced continuations share their pass with the next token: one pass less, the same output") {
+    test::TinyModelSpec hybrid;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    const std::string prompt = "hello world hello world hello world hello world hello";
+    // A plain forced text, one that ends inside "é" (its first byte only: a
+    // cut buffer), one with a whole "é".
+    const ForcePlan plan = {{1, " world hello"}, {3, " hel\xC3"}, {4, " w\xC3\xA9rld"}, {6, " hello"}};
+    constexpr int32_t kMaxTokens = 16;
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+        EngineConfig plain = engine_config(path);
+        plain.backend = BackendKind::Cpu;
+        auto reference_engine = Engine::create(plain);
+        REQUIRE(reference_engine.has_value());
+        ForcedReference ref;
+        forced_reference(*reference_engine.value(), prompt, kMaxTokens, plan, ref);
+        REQUIRE(ref.forced_tokens > 0);
+
+        EngineConfig lookup = plain;
+        lookup.lookup_drafts = true;
+        lookup.adaptive_drafts = false;  // every step drafts
+        EngineConfig drafted = lookup;
+        drafted.lookup_drafts = false;
+        drafted.draft_model_path = path;  // the target itself: every draft accepted, steps of 4 tokens
+        for (const EngineConfig* config : {&plain, &lookup, &drafted}) {
+            const bool speculative = config != &plain;
+            std::printf("  %s, %s\n", path.c_str(), config == &plain ? "plain" : config == &lookup ? "lookup" : "draft model");
+            auto engine = Engine::create(*config);
+            REQUIRE(engine.has_value());
+            std::string text;
+            std::vector<std::string> pieces;
+            int calls = 0;
+            auto st = engine.value()->generate(
+                prompt, greedy(kMaxTokens),
+                [&](std::string_view piece, int32_t) {
+                    text += piece;
+                    pieces.emplace_back(piece);
+                    return true;
+                },
+                [&](std::string_view) { return planned(plan, ++calls); });
+            REQUIRE(st.has_value());
+            CHECK(text == ref.text);
+            CHECK(st->generated_tokens == ref.sampled);
+            CHECK(st->forced_tokens == ref.forced_tokens);
+            // Whole characters only: " hel" is emitted at once, its cut "é"
+            // (the byte 0xC3) with the next token's piece.
+            const auto hel = std::find(pieces.begin(), pieces.end(), " hel");
+            REQUIRE(hel != pieces.end() && hel + 1 != pieces.end());
+            CHECK((hel + 1)->starts_with("\xC3"));
+            // One pass per sampled token (and one for an end-of-generation
+            // token): none for the forced texts. Speculative steps verify
+            // several tokens per pass.
+            const int32_t sampled_passes = st->generated_tokens + (ref.ended ? 1 : 0);
+            if (config == &drafted) {
+                CHECK(st->decode_passes < sampled_passes);
+                CHECK(st->draft_tokens_accepted > 0);
+            } else if (speculative) {
+                CHECK(st->decode_passes <= sampled_passes);
+                CHECK(st->draft_tokens_proposed > 0);
+            } else {
+                CHECK(st->decode_passes == sampled_passes);
+            }
+
+            // The context holds the forced tokens: continuing it keeps all of
+            // it (all but the last token sampled, which is never processed).
+            if (config != &drafted) {
+                auto st2 = engine.value()->generate_tokens(ref.tokens, greedy(1), nullptr);
+                REQUIRE(st2.has_value());
+                CHECK(st2->cached_prefix_tokens == static_cast<int32_t>(ref.tokens.size()) - 1);
+            }
+        }
+    }
+}
+
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
     for (const char* arch : {"llama", "qwen35"}) {
         test::TinyModelSpec spec;

@@ -147,9 +147,16 @@ using TokenCallback = std::function<bool(std::string_view piece, int32_t token)>
 // Structured output: called after each decoded piece with the output so far;
 // returns text the output must continue with (empty: none). The engine runs
 // it through the model in one batched pass, as cheap as a short prefill, and
-// emits it like generated text; decoding resumes after it. Used for the fixed
-// parts of a tool call and to complete a name once only one is possible.
-// Called on the generating thread, only at whole-UTF-8 boundaries; forced
+// emits it like generated text; decoding resumes after it. That pass also
+// yields the next token's logits, so forced text costs no decoding step of
+// its own (on the CPU backend the next token is the same bits a separate step
+// would give; with the experimental early exit or EGLS the next token keeps
+// its own step). Used for the fixed parts of a tool call and to complete a
+// name once only one is possible. Called on the generating thread, only at
+// whole-UTF-8 boundaries, after every token that ends one, also with
+// speculative decoding: tokens a speculative step returned past that point
+// are dropped. Forced text that ends inside a character (a cut buffer) is
+// emitted up to it, and the rest with the token that completes it. Forced
 // tokens count in GenerationStats::forced_tokens, not generated_tokens.
 using ForceCallback = std::function<std::string(std::string_view generated)>;
 
@@ -181,8 +188,8 @@ public:
     // reentrant: a concurrent call returns ErrorCode::Busy.
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
-    // Same, with forced continuations (see ForceCallback; not with a draft
-    // model or lookup speculation, where it is ignored).
+    // Same, with forced continuations (see ForceCallback), with or without
+    // speculative decoding (draft model or lookup).
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token, const ForceCallback& force);
     // Same, from token ids (for vocabularies whose text encoder Liyab lacks);

@@ -589,6 +589,17 @@ struct Engine::Impl {
 #endif
         return h;
     }
+    // Whether a decoding step runs hooks a batched pass does not (early exit,
+    // EGLS: both experimental and lossy). Then a forced pass cannot also
+    // produce the next token's logits without changing them, and the next
+    // token keeps its own decoding step.
+    [[nodiscard]] bool decode_only_hooks() const noexcept {
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+        return early_exit != nullptr || egls != nullptr;
+#else
+        return false;
+#endif
+    }
 
     // Heterogeneous routing: attention projections on the GPU, FFN + output
     // head on the NPU (highest TOPS/W for large integer matmuls), each
@@ -1463,6 +1474,9 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     std::string generated;  // the output so far, kept for `force`
     std::vector<float> probs;
     int32_t last = prompt.back();
+    // The next token when a forced pass already sampled it from its last row:
+    // the next step emits it instead of running a pass of its own.
+    std::optional<int32_t> presampled;
     bool stop = false;
     std::chrono::microseconds idle{0};
 
@@ -1474,21 +1488,26 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         const PowerPolicy policy = s.power->policy();
         s.apply_policy(policy);
         const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
-        if (policy.throttled) ++stats.thermal_reroutes;
 
         std::vector<int32_t> next;
-        if (s.speculative) {
+        if (presampled) {
+            next.push_back(*presampled);
+            presampled.reset();
+        } else if (s.speculative) {
+            if (policy.throttled) ++stats.thermal_reroutes;
             auto r = s.speculative->step(last, s.context, sampler, route, s.draft_route(), *s.pool);
             if (!r) {
                 s.clear_context();
                 return r.status();
             }
+            ++stats.decode_passes;
             next = std::move(r).value();
             if (!s.draft) {  // the target now caches `last` and every returned token but the final one
                 s.context.push_back(last);
                 s.context.insert(s.context.end(), next.begin(), next.end() - 1);
             }
         } else {
+            if (policy.throttled) ++stats.thermal_reroutes;
             const ForwardHooks hooks = s.hooks(policy, true);
             auto logits =
                 s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
@@ -1496,6 +1515,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 s.clear_context();
                 return logits.status();
             }
+            ++stats.decode_passes;
             s.context.push_back(last);
             if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
             stats.ffn_blocks_skipped += s.target->last_ffn_skips();
@@ -1514,7 +1534,12 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 stats.ttft_stall_ms = store->stats().stall_ms - experts_before.stall_ms;
             }
         }
-        for (const int32_t token : next) {
+        // Tokens of `next` the output keeps: all of them, unless the caller
+        // forces text after an earlier one (a speculative step returns several).
+        size_t kept = next.size();
+        std::string forced;
+        for (size_t i = 0; i < next.size(); ++i) {
+            const int32_t token = next[i];
             if (s.tokenizer->is_end_of_generation(token)) {
                 stop = true;
                 break;
@@ -1540,33 +1565,92 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 stop = true;
                 break;
             }
+            // Structured output: asked after every token that ends a whole
+            // character, so the model never writes past a point the caller
+            // fixes, whatever number of tokens a step returned.
+            if (force != nullptr && pending_utf8.empty()) {
+                forced = (*force)(generated);
+                if (!forced.empty()) {
+                    kept = i + 1;
+                    break;
+                }
+            }
+        }
+        if (kept < next.size()) {
+            // A speculative step went past that point: drop its tokens after
+            // it. The caches hold `last` and every returned token but the
+            // final one, all from the step's own verification pass, so a
+            // hybrid model returns from that pass's checkpoints.
+            const auto dropped = static_cast<int32_t>(next.size() - kept);
+            const int32_t keep = s.target->n_past() - dropped;
+            Status rolled_back = s.target->truncate(keep);
+            if (rolled_back.is_ok() && s.draft) rolled_back = s.draft->truncate(keep);
+            if (!rolled_back.is_ok()) {
+                s.clear_context();
+                return rolled_back;
+            }
+            if (!s.draft) s.context.resize(s.context.size() - static_cast<size_t>(dropped));
+            next.resize(kept);
         }
         last = next.back();
 
-        // Forced continuation (structured output): text the caller requires
-        // next (a tool call's fixed syntax, a name it completes) goes through
-        // the model in one batched pass with the token just sampled, at a
-        // fraction of decoding it token by token, and is emitted as output.
-        if (!stop && force != nullptr && !s.speculative && pending_utf8.empty()) {
-            const std::string forced = (*force)(generated);
-            if (!forced.empty()) {
-                auto forced_tokens = s.tokenizer->encode(forced, false);
-                if (forced_tokens && !forced_tokens->empty()) {
-                    std::vector<int32_t> batch{last};
-                    batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - 1);
-                    const ForwardHooks hooks = s.hooks(policy, false);
-                    const auto t_forced = Clock::now();
-                    if (auto r = s.target->forward(batch, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+        // Forced continuation (structured output): the text the caller
+        // requires next (a tool call's fixed syntax, a name it completes) goes
+        // through the model in one batched pass with the token just sampled,
+        // at a fraction of decoding it token by token, and is emitted as
+        // output. The pass's last row is the next token's logits: it is
+        // sampled here, so forced text costs no decoding step of its own
+        // (one per tool call segment, a whole pass over the weights on a
+        // large MoE). The CPU backend computes a row the same bits in any
+        // batch, so this is the token the step would have sampled. Decoding hooks a batched pass does not run
+        // (experimental early exit, EGLS) would change those logits: with
+        // them the last forced token seeds the next step instead, as before.
+        if (!stop && !forced.empty()) {
+            auto forced_tokens = s.tokenizer->encode(forced, false);
+            if (forced_tokens && !forced_tokens->empty()) {
+                const bool sample_next = s.speculative != nullptr || !s.decode_only_hooks();
+                std::vector<int32_t> batch{last};
+                batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - (sample_next ? 0 : 1));
+                // Speculative steps run without hooks; the experimental ones
+                // apply to plain decoding only.
+                const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, false);
+                // Forced tokens are never rolled back: no recurrent-state
+                // checkpoints (the next speculative step turns them back on).
+                if (s.speculative) s.target->set_checkpointing(false);
+                const auto t_forced = Clock::now();
+                auto logits = s.target->forward(batch, sample_next ? Transformer::Logits::Last : Transformer::Logits::None,
+                                                route, *s.pool, &hooks);
+                if (!logits) {
+                    s.clear_context();
+                    return logits.status();
+                }
+                ++stats.decode_passes;
+                if (sample_next) {
+                    if (policy.throttled) ++stats.thermal_reroutes;
+                    if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+                    if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
+                    sampler.probabilities(*logits, probs);
+                    presampled = sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs);
+                }
+                if (s.draft) {  // the draft model reads the same tokens, so both caches stay aligned
+                    if (auto r = s.draft->forward(batch, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
                         s.clear_context();
                         return r.status();
                     }
-                    stats.forced_ms += ms_since(t_forced);
+                } else {
                     s.context.insert(s.context.end(), batch.begin(), batch.end());
-                    last = forced_tokens->back();
-                    stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
-                    generated += forced;
-                    if (on_token && !on_token(forced, last)) stop = true;
                 }
+                stats.forced_ms += ms_since(t_forced);
+                last = forced_tokens->back();
+                stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
+                // Whole characters are emitted now. Forced text that ends
+                // inside one (a C callback's buffer cut it) keeps the rest
+                // pending until the next token completes it, as a sampled
+                // piece would: pieces stay whole UTF-8.
+                const size_t ready = complete_utf8_prefix(forced);
+                pending_utf8.assign(forced, ready);
+                generated.append(forced, 0, ready);
+                if (ready > 0 && on_token && !on_token(std::string_view(forced).substr(0, ready), last)) stop = true;
             }
         }
     }
