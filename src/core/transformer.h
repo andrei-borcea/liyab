@@ -4,13 +4,17 @@
 // architecture's row of facts the tensors cannot tell, the hyperparameters,
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
-// mixer — softmax attention (GQA, RoPE in either pairing, optional QKV bias,
-// per-head Q/K norm before or after RoPE, optional sigmoid output gate) or a Gated DeltaNet
-// linear-attention recurrence — followed by a dense SwiGLU FFN or a mixture of
-// experts (router + top-k routed experts + optional gated shared expert). So
-// hybrid models (Qwen3.5: three DeltaNet blocks per attention block) and plain
-// transformers (Llama, Mistral, Qwen2/3) share one forward pass. Tensor
-// precision is per tensor, so mixed-precision files run unconverted.
+// mixer — softmax attention (GQA, RoPE in either pairing with a per-block
+// table, optional QKV bias, per-head Q/K norm before or after RoPE, optional
+// sigmoid output gate, optional sliding window) or a Gated DeltaNet
+// linear-attention recurrence — followed by a gated dense FFN (SwiGLU or
+// GeGLU) or a mixture of experts (router + top-k routed experts + optional
+// gated shared expert), each optionally followed by its own norm before the
+// residual add. So hybrid models (Qwen3.5: three DeltaNet blocks per
+// attention block), models that alternate windowed and global attention
+// (Gemma 3) and plain transformers (Llama, Mistral, Qwen2/3) share one
+// forward pass. Tensor precision is per tensor, so mixed-precision files run
+// unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
 
@@ -291,8 +295,11 @@ private:
     struct Layer {
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
         int32_t state_slot = -1;  // index into states_ (DeltaNet)
+        int32_t window = 0;       // attention: visible positions (BlockPlan::windowed); 0: all
+        int32_t rope_table = 0;   // attention: index into rope_tables_
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
+        std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
         std::vector<float> conv1d;   // [channel][kernel] taps
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
         std::vector<float> ssm_dt;   // per value head: decay bias
@@ -313,9 +320,17 @@ private:
     // layer source is attached. Releases the slot on destruction.
     class BlockWeights;
 
+    // How one group of blocks rotates queries and keys: pair i turns by
+    // inv_freq[i] / scale radians per position. Most models have one table;
+    // windowed blocks with ModelConfig::rope_base_swa have a second.
+    struct RopeTable {
+        std::vector<float> inv_freq;  // per rotary pair, frequency factors included
+        float scale = 1.0f;           // linear position scaling
+    };
+
     Transformer() = default;
     Status bind_weights();
-    void rope(float* vec, int32_t n_heads, int32_t pos) const;
+    void rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const;
     // Mixers: read the normalized input from xb_, leave the block output (before
     // the residual add) in xb_.
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
@@ -339,7 +354,10 @@ private:
     void predict_experts(int32_t layer, int32_t n, const Route& route);
     Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, size_t reserve, int32_t requant_bits,
                                bool repack);
-    void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    // Softmax attention of the batch's queries (q_) over the cached keys and
+    // values of attention block `kv_slot`; `window` > 0 limits each query to
+    // its last `window` positions (within what the KV cache keeps visible).
+    void attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
     // nullptr: none) and keys (n_head_kv heads), where the block has them.
@@ -410,7 +428,7 @@ private:
     int32_t max_experts_ = 0;           // TransformerOptions::max_experts
     float skip_slow_ = 0.0f;            // TransformerOptions::skip_slow
     std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
-    std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
+    std::vector<RopeTable> rope_tables_;  // [0]: every block's but the windowed ones with their own base
     std::vector<float> key_scale_;          // per (attention block, KV head, channel); empty: none
     std::unique_ptr<KeyRanges> key_ranges_;  // while calibrate_keys() runs
 

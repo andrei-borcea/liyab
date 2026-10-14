@@ -41,7 +41,8 @@ private:
 
 struct TinyModelSpec {
     // Any registered architecture: "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3", "qwen3moe",
-    // "qwen35"/"qwen35moe" (post_attention_norm before the FFN), "hunyuan-dense" (Q/K norms after RoPE)...
+    // "qwen35"/"qwen35moe" (post_attention_norm before the FFN), "hunyuan-dense" (Q/K norms after RoPE),
+    // "gemma3" (scaled embeddings, GeGLU, windowed blocks; with post_norms)...
     std::string arch = "llama";
     int32_t n_layers = 2;
     int32_t n_embd = 128;
@@ -92,6 +93,9 @@ struct TinyModelSpec {
     // k_norm_outlier (large key channels made by the norm itself, as Qwen3
     // and Hunyuan have); the other weights are unchanged.
     float k_norm_outlier = 0.0f;
+    float rope_base = 10000.0f;  // rope.freq_base (of the global blocks when some are windowed)
+    int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
+    bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

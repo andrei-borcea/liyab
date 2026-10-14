@@ -155,6 +155,22 @@ std::vector<GoldenCase> cases() {
     add("hunyuan-dense", s);
     s.k_norm_outlier = 60.0f;  // large key channels from the norm, measured through it (key scaling)
     add("hunyuan-dense-keyscaled", s, {}, true);
+
+    s = {};
+    s.arch = "gemma3";  // scaled embeddings, GeGLU, norms after the attention and the FFN
+    s.n_layers = 6;     // five windowed blocks (RoPE base 10000), then a global one
+    s.sliding_window = 8;
+    s.rope_base = 1e6f;
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.tied_output = true;
+    add("gemma3", s);
+    TransformerOptions engine_window;  // the engine's own window and sinks over the model's windowed blocks
+    engine_window.sliding_window = 12;
+    engine_window.sink_tokens = 2;
+    add("gemma3-sliding", s, engine_window);
+    s.k_norm_outlier = 60.0f;  // key scaling with two RoPE tables
+    add("gemma3-keyscaled", s, {}, true);
     return out;
 }
 

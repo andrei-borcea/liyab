@@ -1,5 +1,6 @@
 #include "core/architecture.h"
 
+#include <cmath>
 #include <cstdio>
 
 #include "liyab/engine.h"
@@ -22,6 +23,21 @@ constexpr ArchSpec kArchitectures[] = {
     // Hunyuan dense (Hunyuan-MT, Hunyuan 0.5B-7B): Q/K norms after RoPE. The
     // converter folds the dynamic-NTK "alpha" scaling into rope.freq_base.
     {"hunyuan-dense", RopeLayout::Halves, "ffn_norm", false, QkNormOrder::AfterRope},
+    // Gemma 3: embeddings scaled by sqrt(d), GeGLU, norms after the attention
+    // and the FFN, Q/K norms; every sixth block attends globally with RoPE
+    // base rope.freq_base, the others through the sliding window with base
+    // 10000. The converter stores RMSNorm weights as 1 + w, so they are plain
+    // RMSNorms here.
+    {.name = "gemma3",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 6,
+     .rope_base_swa = 10000.0f},
 };
 
 }  // namespace
@@ -108,6 +124,35 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.rope_scale = static_cast<float>(f.get_float(key("rope.scaling.factor")).value_or(1.0));
         if (c.rope_scale <= 0.0f) return Status(ErrorCode::InvalidModel, "invalid rope scaling factor");
     }
+    // As the reference scales them: sqrt(d) rounded once to float.
+    if (c.spec->scale_embeddings) c.embd_scale = static_cast<float>(std::sqrt(static_cast<double>(c.n_embd)));
+
+    // Sliding-window attention blocks: the architecture's period, or the
+    // file's own pattern (a period, or one flag per block).
+    std::vector<bool> windowed(static_cast<size_t>(c.n_layers), false);
+    const int64_t window = c.spec->swa_period > 0 ? f.get_int(key("attention.sliding_window")).value_or(0) : 0;
+    if (window < 0 || window > (int64_t{1} << 30)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("attention.sliding_window"));
+    }
+    if (window > 0) {
+        c.sliding_window = static_cast<int32_t>(window);
+        c.rope_base_swa = static_cast<float>(f.get_float(key("rope.freq_base_swa")).value_or(c.spec->rope_base_swa));
+        int64_t period = c.spec->swa_period;
+        const GgufValue* pattern = f.metadata(key("attention.sliding_window_pattern"));
+        if (pattern != nullptr && pattern->type == GgufValue::Type::Array) {
+            if (pattern->array_type != GgufValue::Type::Bool || pattern->array_size < static_cast<uint64_t>(c.n_layers)) {
+                return Status(ErrorCode::InvalidModel, "invalid " + key("attention.sliding_window_pattern"));
+            }
+            for (size_t l = 0; l < windowed.size(); ++l) windowed[l] = pattern->array_data[l] != 0;
+            period = 0;
+        } else if (pattern != nullptr) {
+            period = pattern->as_int().value_or(0);
+            if (period <= 0) return Status(ErrorCode::InvalidModel, "invalid " + key("attention.sliding_window_pattern"));
+        }
+        for (int64_t l = 0; period > 0 && l < c.n_layers; ++l) {
+            windowed[static_cast<size_t>(l)] = period == 1 || (l + 1) % period != 0;
+        }
+    }
 
     if (c.n_head_kv <= 0 || c.n_head % c.n_head_kv != 0) {
         return Status(ErrorCode::InvalidModel, "head_count must be a multiple of head_count_kv");
@@ -134,6 +179,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             ++c.n_attn_layers;
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = wq != nullptr && wq->rows() == 2 * q_dim;
+            b.windowed = windowed[static_cast<size_t>(l)];
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
