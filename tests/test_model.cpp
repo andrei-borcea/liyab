@@ -217,7 +217,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(ssm_hv * ssm_hd));
     }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
-    w.add_f32(a + ".rope.freq_base", 10000.0f);
+    w.add_f32(a + ".rope.freq_base", s.rope_base);
+    if (s.sliding_window > 0) w.add_u32(a + ".attention.sliding_window", static_cast<uint32_t>(s.sliding_window));
     if (s.rope_dim > 0) w.add_u32(a + ".rope.dimension_count", static_cast<uint32_t>(s.rope_dim));
     if (s.rope_scale > 0.0f) {
         w.add_string(a + ".rope.scaling.type", "linear");
@@ -308,6 +309,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         const bool post_attention = a == "qwen35" || a == "qwen35moe";
         w.add_tensor(p + (post_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), {d}, DType::F32,
                      norm_weights(d));
+        if (s.post_norms) {  // Gemma: post_attention_norm is the norm after the attention, not before the FFN
+            w.add_tensor(p + "post_attention_norm.weight", {d}, DType::F32, norm_weights(d));
+            w.add_tensor(p + "post_ffw_norm.weight", {d}, DType::F32, norm_weights(d));
+        }
         const std::vector<float> gate = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> up = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> down = random(s.n_ff * d, s.weight_scale);

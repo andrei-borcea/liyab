@@ -4,16 +4,18 @@
 // forward pass never looks anything up by name:
 //
 //  * ArchSpec: the facts about an architecture that its tensors cannot tell
-//    (how RoPE pairs a head's dimensions, which tensor holds the norm before
-//    the FFN, where Q/K norms sit relative to RoPE, a default the metadata
-//    may omit). One row per architecture in
-//    architecture.cpp: a model whose blocks are built from parts the engine
-//    already runs needs only its row.
+//    (how RoPE pairs a head's dimensions, which tensors hold the norms before
+//    the FFN and after the mixer and the FFN, the FFN's activation, where Q/K
+//    norms sit relative to RoPE, whether embeddings are scaled, which blocks
+//    attend through a sliding window, a default the metadata may omit). One
+//    row per architecture in architecture.cpp: a model whose blocks are built
+//    from parts the engine already runs needs only its row.
 //  * ModelConfig and one BlockPlan per block: the hyperparameters from the
 //    metadata, and each block's structure from the tensors present (which
-//    token mixer, a gated attention output, a dense or mixture-of-experts FFN,
-//    a shared expert). Optional per-element tensors (QKV biases, Q/K norms,
-//    the shared expert's gate, the router's selection bias) are bound where
+//    token mixer, a gated attention output, a windowed attention, a dense or
+//    mixture-of-experts FFN, a shared expert). Optional per-element tensors
+//    (QKV biases, Q/K norms, the norms after the mixer and the FFN, the
+//    shared expert's gate, the router's selection bias) are bound where
 //    present and need no plan entry.
 //
 // describe_model() is a pure function of the file: it reads metadata and
@@ -41,8 +43,14 @@ enum class RopeLayout : uint8_t {
 
 // Where a block's per-head Q/K norms (attn_q_norm / attn_k_norm) are applied.
 enum class QkNormOrder : uint8_t {
-    BeforeRope,  // normalize, then rotate: Qwen3
+    BeforeRope,  // normalize, then rotate: Qwen3, Gemma 3
     AfterRope,   // rotate, then normalize: Hunyuan
+};
+
+// Activation of a gated FFN's gate projection: down(act(gate) * up).
+enum class FfnActivation : uint8_t {
+    SiLU,      // SwiGLU: Llama, Qwen, Hunyuan
+    GeluTanh,  // GeGLU, with the tanh approximation of GELU: Gemma
 };
 
 // The facts about one architecture that its tensors cannot tell. The fields
@@ -58,6 +66,27 @@ struct ArchSpec {
     // the file has no <arch>.expert_weights_norm.
     bool moe_norm_weights;
     QkNormOrder qk_norm = QkNormOrder::BeforeRope;
+    FfnActivation ffn_activation = FfnActivation::SiLU;
+    // Suffixes of the norms applied to the mixer's and the FFN's outputs
+    // before their residual adds ("sandwich" norms: Gemma's
+    // post_attention_norm and post_ffw_norm). Bound where a block has them;
+    // empty: the architecture has none.
+    std::string_view post_mixer_norm = {};
+    std::string_view post_ffn_norm = {};
+    // Token embeddings are multiplied by sqrt(n_embd) before the first block.
+    bool scale_embeddings = false;
+    // Which attention blocks see only the last <arch>.attention.sliding_window
+    // positions when the file sets a window: 0 none (the key is ignored), 1
+    // every block, N > 1 all but every N-th (blocks N-1, 2N-1, ... attend
+    // globally). <arch>.attention.sliding_window_pattern, when present,
+    // overrides it (a period, or one bool per block: true = windowed).
+    int32_t swa_period = 0;
+    // > 0: RoPE base of the windowed blocks when the file has no
+    // <arch>.rope.freq_base_swa. They then rotate with a table of their own:
+    // that base, no position scaling, no frequency factors (Gemma 3: 10000 in
+    // windowed blocks, 1M, linearly scaled on the larger models, in global
+    // ones). 0: windowed blocks rotate like the others.
+    float rope_base_swa = 0.0f;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -79,8 +108,8 @@ enum class MixerKind : uint8_t {
 
 // Feed-forward network of one block.
 enum class FfnKind : uint8_t {
-    Dense,  // SwiGLU
-    Moe,    // router + top-k routed SwiGLU experts
+    Dense,  // gated: down(act(gate) * up), act = ArchSpec::ffn_activation
+    Moe,    // router + top-k routed gated experts
 };
 
 // The structure of one block, from the tensors present.
@@ -89,6 +118,10 @@ struct BlockPlan {
     // Attention: attn_q projects [q | gate] per head (twice as tall) and the
     // attention output is multiplied by sigmoid(gate).
     bool attn_gate = false;
+    // Attention: sees only the last ModelConfig::sliding_window positions
+    // (ArchSpec::swa_period), and rotates with ModelConfig::rope_base_swa
+    // when that is set.
+    bool windowed = false;
     FfnKind ffn = FfnKind::Dense;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
@@ -110,6 +143,13 @@ struct ModelConfig {
     float rms_eps = 1e-5f;
     float rope_base = 10000.0f;
     float rope_scale = 1.0f;  // linear position scaling
+    // Blocks with BlockPlan::windowed see this many positions, the query's
+    // own included (0: no windowed block); rope_base_swa > 0 gives them a
+    // RoPE table of their own (ArchSpec::rope_base_swa).
+    int32_t sliding_window = 0;
+    float rope_base_swa = 0.0f;
+    // Multiplies the token embeddings: sqrt(n_embd) with ArchSpec::scale_embeddings, else 1.
+    float embd_scale = 1.0f;
     std::vector<BlockPlan> blocks;  // per executed block
 
     // Gated DeltaNet geometry (zero when every block is attention).

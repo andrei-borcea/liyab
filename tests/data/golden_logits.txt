@@ -1,5 +1,8 @@
 # Logit hashes pinned by tests/test_golden.cpp: <platform> <case> <FNV-1a of the logits' bits>.
 # Rewritten with LIYAB_GOLDEN_UPDATE=1 when a change is meant to move outputs (say why in the commit).
+arm64-neon-dotprod gemma3 19faef709b9415e5
+arm64-neon-dotprod gemma3-keyscaled 3052ae0686acb23e
+arm64-neon-dotprod gemma3-sliding 3d832e8030b226d2
 arm64-neon-dotprod hunyuan-dense bf9bc86f774ab834
 arm64-neon-dotprod hunyuan-dense-keyscaled d978284019236bcd
 arm64-neon-dotprod llama 843d1f69e41d69be

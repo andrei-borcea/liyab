@@ -31,6 +31,22 @@ void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
+
+// GELU with the tanh approximation (PyTorch's gelu(approximate="tanh")):
+// 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))).
+float gelu_tanh(float x) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    return 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + 0.044715f * x * x * x)));
+}
+
+// The gated FFN's elementwise step: out[i] = act(gate[i]) * up[i] (out may be gate).
+void gated_activation(FfnActivation act, const float* gate, const float* up, float* out, size_t n) {
+    if (act == FfnActivation::GeluTanh) {
+        for (size_t i = 0; i < n; ++i) out[i] = gelu_tanh(gate[i]) * up[i];
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) out[i] = silu(gate[i]) * up[i];
+}
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }  // ggml's threshold
 
@@ -214,10 +230,28 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         }
         quant::dequantize_row(DType::F32, rf->data, factors.data(), rf->elements());
     }
-    model->inv_freq_.resize(factors.size());
-    for (size_t i = 0; i < factors.size(); ++i) {
-        const double freq = std::pow(static_cast<double>(c.rope_base), -2.0 * static_cast<double>(i) / c.rope_dim);
-        model->inv_freq_[i] = static_cast<float>(freq / factors[i]);
+    auto table = [&](float base, float scale, const std::vector<float>& divisors) {
+        RopeTable t;
+        t.scale = scale;
+        t.inv_freq.resize(divisors.size());
+        for (size_t i = 0; i < divisors.size(); ++i) {
+            const double freq = std::pow(static_cast<double>(base), -2.0 * static_cast<double>(i) / c.rope_dim);
+            t.inv_freq[i] = static_cast<float>(freq / divisors[i]);
+        }
+        return t;
+    };
+    model->rope_tables_.push_back(table(c.rope_base, c.rope_scale, factors));
+    // Windowed blocks with a base of their own rotate unscaled, without the
+    // global frequency factors (Gemma 3's local RoPE).
+    if (c.rope_base_swa > 0.0f) {
+        model->rope_tables_.push_back(table(c.rope_base_swa, 1.0f, std::vector<float>(factors.size(), 1.0f)));
+    }
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        Layer& L = model->layers_[static_cast<size_t>(l)];
+        const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
+        if (plan.mixer != MixerKind::Attention || !plan.windowed) continue;
+        L.window = c.sliding_window;
+        if (c.rope_base_swa > 0.0f) L.rope_table = 1;
     }
 
     if (c.n_expert > 0) {
@@ -333,6 +367,14 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
         }
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd, true, L.ffn_norm));
+        if (!c.spec->post_mixer_norm.empty()) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
+                                      false, L.post_mixer_norm));
+        }
+        if (!c.spec->post_ffn_norm.empty()) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_ffn_norm) + ".weight"), c.n_embd,
+                                      false, L.post_ffn_norm));
+        }
         if (plan.ffn == FfnKind::Dense) {
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
@@ -661,14 +703,14 @@ void Transformer::set_rollback_window(int32_t positions) {
         st.checkpoints.shrink_to_fit();
     }
 }
-void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
+void Transformer::rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const {
     const int32_t half = config_.rope_dim / 2;
     const bool halves = config_.spec->rope == RopeLayout::Halves;
-    const float p = static_cast<float>(pos) / config_.rope_scale;
+    const float p = static_cast<float>(pos) / table.scale;
     for (int32_t h = 0; h < n_heads; ++h) {
         float* x = vec + static_cast<size_t>(h) * static_cast<size_t>(config_.head_dim);
         for (int32_t i = 0; i < half; ++i) {
-            const float theta = p * inv_freq_[static_cast<size_t>(i)];
+            const float theta = p * table.inv_freq[static_cast<size_t>(i)];
             const float cs = std::cos(theta);
             const float sn = std::sin(theta);
             const int32_t a = halves ? i : 2 * i;
@@ -705,7 +747,13 @@ void Transformer::rope(float* vec, int32_t n_heads, int32_t pos) const {
 // 1024-token pass at a 20k context would need over a GB of them). On a
 // 2838-token context the per-head loop this replaced took 48 ms of a 161 ms
 // decode step.
-void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
+//
+// A windowed block (`window` > 0) sees, of what the cache keeps visible, only
+// the positions [pos - window + 1, pos]: the sinks drop out once the window
+// has passed them. Its spans follow its own visible count, so they too depend
+// only on the position. The KV pages still hold every block's rows, so a
+// windowed block saves compute, not memory.
+void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
@@ -739,9 +787,23 @@ void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const 
     auto spans_for = [](int32_t n_visible) {
         return std::clamp(n_visible / kAttentionMinSpan, 1, kAttentionMaxSpans);
     };
+    // Positions a query at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
+    struct Seen {
+        int32_t sink_begin, sink_end, first;
+    };
+    auto seen = [&](int32_t pos) {
+        const KvCache::Visible vis = kv_->visible(pos);
+        Seen s{0, vis.sink_end, vis.first};
+        if (window > 0) {
+            const int32_t lo = pos - window + 1;
+            s.first = std::max(s.first, lo);
+            s.sink_begin = std::clamp(lo, 0, s.sink_end);
+        }
+        return s;
+    };
     auto spans_of = [&](int32_t t) {
-        const KvCache::Visible vis = kv_->visible(n_past_ + t);
-        return spans_for(vis.sink_end + (n_past_ + t - vis.first + 1));
+        const Seen s = seen(n_past_ + t);
+        return spans_for(s.sink_end - s.sink_begin + (n_past_ + t - s.first + 1));
     };
 
     // Span sp of token t for the query heads of KV head g. For head j of the
@@ -754,10 +816,11 @@ void Transformer::attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const 
         thread_local std::vector<float> dots;    // one K row against the group's queries
         thread_local std::vector<const quant::BlockQ8_0*> queries;  // the group's Q8_0 queries
         const int32_t pos = n_past_ + t;
-        // Visible positions: attention sinks [0, sink_end) + [first, pos].
-        const KvCache::Visible vis = kv_->visible(pos);
-        const int32_t n_visible = vis.sink_end + (pos - vis.first + 1);
-        auto position = [&](int32_t i) { return i < vis.sink_end ? i : vis.first + (i - vis.sink_end); };
+        // Visible positions: attention sinks [sink_begin, sink_end) + [first, pos].
+        const Seen vis = seen(pos);
+        const int32_t n_sinks = vis.sink_end - vis.sink_begin;
+        const int32_t n_visible = n_sinks + (pos - vis.first + 1);
+        auto position = [&](int32_t i) { return i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks); };
         const int32_t spans = spans_for(n_visible);
         const auto i0 = static_cast<int32_t>(int64_t{n_visible} * sp / spans);
         const auto i1 = static_cast<int32_t>(int64_t{n_visible} * (sp + 1) / spans);
@@ -947,7 +1010,7 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
         if (!norm_after_rope) qk_norm(L, nullptr, k_.data());
-        rope(k_.data(), c.n_head_kv, pos);
+        rope(k_.data(), c.n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
         if (norm_after_rope) qk_norm(L, nullptr, k_.data());
         scale_keys(L.kv_slot, nullptr, k_.data());
         kv_->store(L.kv_slot, pos, k_.data(), v_.data());
@@ -961,8 +1024,13 @@ KeyScalingShape Transformer::key_scaling_shape() const {
     // so every process gets the same factors (and the same replies).
     const int32_t positions = c.n_ctx_train > 0 ? std::min(c.n_ctx_train, kKeyRangePositions) : kKeyRangePositions;
     KeyScalingShape shape{c.n_attn_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim, c.spec->rope, {}, positions};
-    // Transformer::rope: pair i turns by inv_freq_[i] / rope_scale per position.
-    for (const float f : inv_freq_) shape.pair_speed.push_back(f / c.rope_scale);
+    // Transformer::rope: pair i of an attention block turns by
+    // inv_freq[i] / scale of the block's table per position.
+    for (const Layer& L : layers_) {
+        if (L.kv_slot < 0) continue;  // attention blocks only, in KV slot order
+        const RopeTable& t = rope_tables_[static_cast<size_t>(L.rope_table)];
+        for (const float f : t.inv_freq) shape.pair_speed.push_back(f / t.scale);
+    }
     return shape;
 }
 
@@ -1098,6 +1166,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
     const size_t hd = static_cast<size_t>(c.head_dim);
     const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
+    const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (gated) qg_.resize(un * 2 * q_dim);
@@ -1126,13 +1195,13 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         if (!norm_after_rope) qk_norm(L, q, k);
         const int32_t pos = n_past_ + static_cast<int32_t>(t);
         if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-        rope(q, c.n_head, pos);
-        rope(k, c.n_head_kv, pos);
+        rope(q, c.n_head, pos, rope_table);
+        rope(k, c.n_head_kv, pos, rope_table);
         if (norm_after_rope) qk_norm(L, q, k);
         scale_keys(L.kv_slot, q, k);
         kv_->store(L.kv_slot, pos, k, v);
     }
-    attention(L.kv_slot, n, pool, head_mask);
+    attention(L.kv_slot, L.window, n, pool, head_mask);
     if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
@@ -1453,7 +1522,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
     }
-    for (size_t i = 0; i < rows; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+    gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows);
     return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
 }
 
@@ -1580,7 +1649,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         const TensorView* gate_up[] = {&w[kGateShared], &w[kUpShared]};
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
-        for (size_t i = 0; i < un * sh; ++i) hb_[i] = silu(hb_[i]) * hb2_[i];
+        gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), un * sh);
         shared_out_.resize(un * d);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), shared_out_.data(), n));
         // The gate scale is applied when the output is added (below), in one
@@ -1690,7 +1759,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             release_wave();
             return st;
         }
-        for (size_t i = 0; i < rows_total * ff; ++i) eh_[i] = silu(eh_[i]) * eh2_[i];
+        gated_activation(c.spec->ffn_activation, eh_.data(), eh2_.data(), eh_.data(), rows_total * ff);
         items.clear();
         for (size_t i = 0; i < wave.size(); ++i) {
             const auto rows = static_cast<int32_t>(assigned[static_cast<size_t>(wave[i])].size());
@@ -1785,6 +1854,17 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     for (size_t t = 0; t < un; ++t) {
         quant::dequantize_row(token_embd_->type, token_embd_->row(tokens[t]), x_.data() + t * d, c.n_embd);
     }
+    if (c.embd_scale != 1.0f) {
+        for (float& v : x_) v *= c.embd_scale;
+    }
+    // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
+    auto post_norm = [&](const std::vector<float>& weight) {
+        if (weight.empty()) return;
+        for (size_t t = 0; t < un; ++t) {
+            float* row = xb_.data() + t * d;
+            rmsnorm(row, weight.data(), row, c.n_embd, c.rms_eps);
+        }
+    };
 
     for (int32_t l = 0; l < c.n_layers; ++l) {
         if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
@@ -1815,6 +1895,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
             LIYAB_RETURN_IF_ERROR(
                 attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
         }
+        post_norm(L.post_mixer_norm);
         for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         // A MoE block predicts the next one once its own experts are queued (moe_ffn).
         if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
@@ -1833,6 +1914,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
                 const PhaseTimer timer(phases_.dense_ffn);
                 LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
             }
+            post_norm(L.post_ffn_norm);
             for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
         }
 
