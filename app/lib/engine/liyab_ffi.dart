@@ -295,7 +295,11 @@ final class LiyabLib {
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
             'liyab_supported_architectures'),
         getCounters = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabEngineCounters>),
-            int Function(Pointer<Void>, Pointer<LiyabEngineCounters>)>('liyab_engine_get_counters');
+            int Function(Pointer<Void>, Pointer<LiyabEngineCounters>)>('liyab_engine_get_counters'),
+        renderChat = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int)>('liyab_engine_render_chat'),
+        chatFormat = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int)>('liyab_engine_chat_format');
 
   /// libliyab.so from the APK on Android; linked into the app on iOS.
   static final LiyabLib instance =
@@ -335,6 +339,11 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>) saveExpertProfile;
   final int Function(Pointer<Void>, Pointer<Utf8>) loadExpertProfile;
   final void Function(int) logBufferEnable;
+
+  /// The model's chat template: a conversation rendered (request JSON in), and
+  /// its layout of turns (probe JSON in, ChatFormat JSON out). -1 on failure.
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int) renderChat;
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int) chatFormat;
   final int Function(Pointer<Utf8>, int) logBufferTake;
 
   /// Engine log lines buffered since the last call ("I message", "W message"…).
@@ -356,6 +365,18 @@ final class LiyabLib {
       readText((b, s) => supportedArchitectures(b, s)).split(',').where((a) => a.isNotEmpty).toSet();
 
   String errorMessage() => lastError().toDartString();
+
+  /// Reads a size-returning text API that returns -1 on failure; null then.
+  static String? readTextOrNull(int Function(Pointer<Utf8> buffer, int size) call) {
+    final needed = call(nullptr, 0);
+    if (needed < 0) return null;
+    final buffer = calloc<Uint8>(needed + 1).cast<Utf8>();
+    try {
+      return call(buffer, needed + 1) < 0 ? null : buffer.toDartString(length: needed);
+    } finally {
+      calloc.free(buffer);
+    }
+  }
 
   /// Reads a size-returning text API (describe, metadata) into a Dart string.
   static String readText(int Function(Pointer<Utf8> buffer, int size) call) {

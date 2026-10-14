@@ -6,6 +6,8 @@
 //     liyab-tok -m model.gguf -f text.txt                    # print the ids
 //     liyab-tok -m model.gguf -f text.txt --ids ref.ids      # compare (exit 1 on a difference)
 //     liyab-tok -m model.gguf -f text.txt --bench 50         # encoding speed
+//     liyab-tok -m model.gguf --render request.json           # the model's chat template applied
+//     liyab-tok -m model.gguf --format '{"enable_thinking": false}'   # its layout of turns
 //
 // tools/tokenizer_reference.py writes the reference ids with the model's own
 // Hugging Face tokenizer. Both sides encode the text without BOS/EOS by
@@ -13,6 +15,10 @@
 // adds a BOS by the model's rule (tokenizer.ggml.add_bos_token), to compare
 // with a reference written with --special. On a difference the first
 // differing position is printed with the pieces around it.
+//
+// --render renders a chat request (Engine::render_chat's JSON) with the
+// GGUF's tokenizer.chat_template; --format prints Engine::chat_format's
+// result for a probe (template variables, optional reply_prefix).
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS).
 #include <chrono>
@@ -24,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "core/chat_template.h"
 #include "core/tokenizer.h"
 #include "liyab/mmap_loader.h"
 
@@ -32,10 +39,13 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: liyab-tok -m model.gguf -f text.txt [--ids REF] [--bos] [--bench N] [--quiet]\n"
+                 "       liyab-tok -m model.gguf (--render REQUEST.json | --format PROBE_JSON)\n"
                  "  --ids REF   compare with reference ids (tools/tokenizer_reference.py); exit 1 on a difference\n"
                  "  --bos       add a BOS by the model's rule (compare with a reference written with --special)\n"
                  "  --bench N   encode the text N times and print the speed\n"
-                 "  --quiet     do not print the ids\n");
+                 "  --quiet     do not print the ids\n"
+                 "  --render F  print the chat request in file F rendered with the model's chat template\n"
+                 "  --format J  print the template's layout of turns for probe J (JSON; '' for none)\n");
     return 2;
 }
 
@@ -79,7 +89,8 @@ std::string shown(const liyab::Tokenizer& tok, int32_t id) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, text_path, ids_path;
+    std::string model_path, text_path, ids_path, render_path, format_probe;
+    bool format = false;
     bool bos = false, quiet = false;
     int bench = 0;
     for (int i = 1; i < argc; ++i) {
@@ -89,11 +100,77 @@ int main(int argc, char** argv) {
         else if (a == "-f" && i + 1 < argc) text_path = next();
         else if (a == "--ids" && i + 1 < argc) ids_path = next();
         else if (a == "--bench" && i + 1 < argc) bench = std::atoi(next());
+        else if (a == "--render" && i + 1 < argc) render_path = next();
+        else if (a == "--format" && i + 1 < argc) {
+            format_probe = next();
+            format = true;
+        }
         else if (a == "--bos") bos = true;
         else if (a == "--quiet") quiet = true;
         else return usage();
     }
-    if (model_path.empty() || text_path.empty()) return usage();
+    if (model_path.empty() || (text_path.empty() && render_path.empty() && !format)) return usage();
+    if (!render_path.empty() || format) {
+        auto file = liyab::MmapLoader::open(model_path);
+        if (!file) {
+            std::fprintf(stderr, "%s\n", file.status().to_string().c_str());
+            return 2;
+        }
+        auto tok = liyab::Tokenizer::load(**file);
+        const auto source = (*file)->get_string("tokenizer.chat_template");
+        if (!tok || !source) {
+            std::fprintf(stderr, "the model has no %s\n", tok ? "chat template" : "tokenizer");
+            return 2;
+        }
+        auto tmpl = liyab::ChatTemplate::parse(*source);
+        if (!tmpl) {
+            std::fprintf(stderr, "%s\n", tmpl.status().message().c_str());
+            return 1;
+        }
+        // The special-token variables, as the engine passes them.
+        liyab::jinja::Value special = liyab::jinja::Value::object();
+        for (const auto& [name, key] : {std::pair{"bos_token", "tokenizer.ggml.bos_token_id"},
+                                        std::pair{"eos_token", "tokenizer.ggml.eos_token_id"},
+                                        std::pair{"unk_token", "tokenizer.ggml.unknown_token_id"},
+                                        std::pair{"pad_token", "tokenizer.ggml.padding_token_id"}}) {
+            const auto id = (*file)->get_int(key);
+            if (id && *id >= 0 && *id < tok->vocab_size()) {
+                special.fields().set(name, liyab::jinja::Value(std::string(tok->token_text(static_cast<int32_t>(*id)))));
+            }
+        }
+        if (format) {
+            auto f = tmpl->format(format_probe, special);
+            if (!f) {
+                std::fprintf(stderr, "%s\n", f.status().message().c_str());
+                return 1;
+            }
+            auto show_field = [](const char* name, const std::string& v) {
+                std::printf("%-18s %s\n", name, liyab::jinja::Value(v).repr().c_str());
+            };
+            std::printf("prefix_stable      %s\n", f->prefix_stable ? "true" : ("false (" + f->reason + ")").c_str());
+            show_field("system_prefix", f->system_prefix);
+            show_field("system_suffix", f->system_suffix);
+            show_field("first_user_prefix", f->first_user_prefix);
+            show_field("no_system_head", f->no_system_head);
+            show_field("user_prefix", f->user_prefix);
+            show_field("user_suffix", f->user_suffix);
+            show_field("generation_prompt", f->generation_prompt);
+            show_field("assistant_end", f->assistant_end);
+            return f->prefix_stable ? 0 : 1;
+        }
+        std::string request;
+        if (!read_file(render_path, request)) {
+            std::fprintf(stderr, "cannot read %s\n", render_path.c_str());
+            return 2;
+        }
+        auto out = tmpl->render_chat(request, special);
+        if (!out) {
+            std::fprintf(stderr, "%s\n", out.status().message().c_str());
+            return 1;
+        }
+        std::fwrite(out->data(), 1, out->size(), stdout);
+        return 0;
+    }
 
     std::string text;
     if (!read_file(text_path, text)) {

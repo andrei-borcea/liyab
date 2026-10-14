@@ -9,6 +9,7 @@
 #include <new>
 #include <string>
 
+#include "core/chat_template.h"
 #include "core/log.h"
 #include "liyab/liyab.h"
 
@@ -488,6 +489,49 @@ size_t liyab_describe_device(char* buffer, size_t size) {
     } catch (...) {
         return copy_out("", buffer, size);
     }
+}
+
+int64_t liyab_engine_render_chat(const liyab_engine* engine, const char* request_json, char* buffer, size_t size) {
+    if (engine == nullptr || request_json == nullptr) {
+        fail(LIYAB_ERR_INVALID_ARGUMENT, "null argument");
+        return -1;
+    }
+    int64_t length = -1;
+    const liyab_status status = guarded([&] {
+        auto text = engine->engine->render_chat(request_json);
+        if (!text) return fail(text.status());
+        length = static_cast<int64_t>(copy_out(*text, buffer, size));
+        return LIYAB_OK;
+    });
+    return status == LIYAB_OK ? length : -1;
+}
+
+int64_t liyab_engine_chat_format(const liyab_engine* engine, const char* probe_json, char* buffer, size_t size) {
+    if (engine == nullptr) {
+        fail(LIYAB_ERR_INVALID_ARGUMENT, "null engine");
+        return -1;
+    }
+    int64_t length = -1;
+    const liyab_status status = guarded([&] {
+        auto format = engine->engine->chat_format(probe_json == nullptr ? "" : probe_json);
+        if (!format) return fail(format.status());
+        using liyab::jinja::Value;
+        Value out = Value::object();
+        auto& o = out.fields();
+        o.set("prefix_stable", Value(format->prefix_stable));
+        o.set("reason", Value(format->reason));
+        o.set("system_prefix", Value(format->system_prefix));
+        o.set("system_suffix", Value(format->system_suffix));
+        o.set("first_user_prefix", Value(format->first_user_prefix));
+        o.set("no_system_head", Value(format->no_system_head));
+        o.set("user_prefix", Value(format->user_prefix));
+        o.set("user_suffix", Value(format->user_suffix));
+        o.set("generation_prompt", Value(format->generation_prompt));
+        o.set("assistant_end", Value(format->assistant_end));
+        length = static_cast<int64_t>(copy_out(out.to_json(), buffer, size));
+        return LIYAB_OK;
+    });
+    return status == LIYAB_OK ? length : -1;
 }
 
 }  // extern "C"

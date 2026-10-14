@@ -533,7 +533,7 @@ def main():
                                                                       if os.path.exists(os.path.join(BUILD, t))])
     phone.shell(f"mkdir -p {WORK}/data")
     phone.adb("push", *[os.path.join(BUILD, f) for f in files], WORK, timeout=600)
-    for data in ("quant_vectors.bin", "golden_logits.txt", "text_cases.txt"):
+    for data in ("quant_vectors.bin", "golden_logits.txt", "text_cases.txt", "chat_templates.json"):
         phone.adb("push", os.path.join(ROOT, "tests", "data", data), WORK + "/data")
 
     references = load_json(REFERENCES, {})

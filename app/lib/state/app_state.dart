@@ -510,12 +510,22 @@ class AppState extends ChangeNotifier implements ApiBackend {
           if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,
         },
       ));
-      final (detected, thinks) = await ChatTemplate.detect(engine);
-      template = detected;
-      thinkingSupported = thinks;
+      // The model's own chat template when it keeps each turn's prompt a prefix of the next one's (context
+      // reuse needs it), else the built-in format its vocabulary implies.
+      final source = model.metadata['tokenizer.chat_template'] ?? '';
+      final (own, ownThinks, why) = await ChatTemplate.fromModel(engine, source);
+      if (own != null) {
+        template = own;
+        thinkingSupported = ownThinks;
+      } else {
+        final (detected, thinks) = await ChatTemplate.detect(engine);
+        template = detected;
+        thinkingSupported = thinks;
+        if (source.isNotEmpty) _log('Chat template of the model not used ($why): ${detected.label} instead');
+      }
       settings = ModelSettings.resolve(prefs, name, model.metadata);
-      toolDialect =
-          template == ChatTemplate.chatml ? ToolDialect.of(model.metadata['tokenizer.chat_template'] ?? '') : ToolDialect.none;
+      // The tool formats are ChatML's: offered when the prompt pieces are ChatML's.
+      toolDialect = template.isChatML ? ToolDialect.of(source) : ToolDialect.none;
       modelPath = path;
       modelName = name;
       description = model.description;

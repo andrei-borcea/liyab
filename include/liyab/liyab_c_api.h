@@ -321,6 +321,31 @@ LIYAB_C_API liyab_status liyab_engine_get_counters(const liyab_engine* engine, l
  * buffer contract as liyab_engine_describe. */
 LIYAB_C_API size_t liyab_supported_architectures(char* buffer, size_t size);
 
+/*
+ * Chat template: the loaded model's tokenizer.chat_template, rendered as
+ * transformers' apply_chat_template renders it (Engine::render_chat).
+ * `request_json` is a JSON object: "messages" (role / content objects),
+ * optional "tools", optional "add_generation_prompt" (default false), any
+ * other key a template variable (e.g. "enable_thinking"). Writes the
+ * NUL-terminated prompt into `buffer` (truncated to `size`) and returns the
+ * length the full text needs, excluding NUL; -1 on failure (no template, bad
+ * JSON, or the template refused the conversation: liyab_last_error says
+ * which). Thread-safe; does not touch the context.
+ */
+LIYAB_C_API int64_t liyab_engine_render_chat(const liyab_engine* engine, const char* request_json, char* buffer,
+                                             size_t size);
+/*
+ * How the template lays out a conversation (Engine::chat_format), as a JSON
+ * object: {"prefix_stable": bool, "reason", "system_prefix", "system_suffix",
+ * "first_user_prefix", "no_system_head", "user_prefix", "user_suffix",
+ * "generation_prompt", "assistant_end"} (strings). `probe_json`: template
+ * variables to render with plus an optional "reply_prefix" (NULL or "" for
+ * none). Same buffer contract as liyab_engine_render_chat; -1 when the model
+ * has no usable template.
+ */
+LIYAB_C_API int64_t liyab_engine_chat_format(const liyab_engine* engine, const char* probe_json, char* buffer,
+                                             size_t size);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,5 @@
 // Text processing: the regex engine, the pre-tokenizer table, NFC
-// normalization and byte-level BPE encoding. Splits and normalizations are
+// normalization, byte-level BPE encoding and chat templates. Splits and normalizations are
 // checked against tests/data/text_cases.txt (tools/gen_text_tests.py: Python's
 // regex and unicodedata, cross-checked against the Hugging Face tokenizers).
 #include <array>
@@ -14,11 +14,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/chat_template.h"
 #include "core/pre_tokenizer.h"
 #include "core/regex.h"
 #include "core/tokenizer.h"
 #include "core/unicode.h"
+#include "liyab/engine.h"
+#include "liyab/liyab_c_api.h"
 #include "liyab/mmap_loader.h"
+#include "test_model.h"
 #include "test_util.h"
 
 using namespace liyab;
@@ -522,6 +526,286 @@ TEST_CASE("Byte-level BPE: an unknown pre-tokenizer loads but cannot encode, nam
     CHECK(ids.status().code() == ErrorCode::Unsupported);
     CHECK(ids.status().message().find("'made-up-pre'") != std::string::npos);
     CHECK(ids.status().message().find("qwen35") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Chat templates
+// ---------------------------------------------------------------------------
+namespace {
+
+// tests/data/chat_templates.json (tools/chat_template_reference.py).
+std::optional<jinja::Value> chat_cases() {
+    std::string dir = LIYAB_TEST_DATA_DIR;
+    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
+    std::ifstream in(dir + "/chat_templates.json", std::ios::binary);
+    if (!in) {
+        std::printf("  skipped: %s/chat_templates.json not found (set LIYAB_TEST_DATA)\n", dir.c_str());
+        return std::nullopt;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto v = jinja::parse_json(ss.str());
+    if (!v) {
+        std::printf("  %s\n", v.status().message().c_str());
+        return std::nullopt;
+    }
+    return std::move(v).value();
+}
+
+std::string first_difference(const std::string& got, const std::string& want) {
+    size_t i = 0;
+    while (i < got.size() && i < want.size() && got[i] == want[i]) ++i;
+    const size_t from = i > 40 ? i - 40 : 0;
+    return "at byte " + std::to_string(i) + ":\n    got  " + jinja::Value(got.substr(from, 100)).repr() +
+           "\n    want " + jinja::Value(want.substr(from, 100)).repr();
+}
+
+}  // namespace
+
+TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_template") {
+    const auto data = chat_cases();
+    if (!data) return;
+    size_t rendered = 0, refused = 0;
+    for (const auto& [name, entry] : data->fields().entries) {
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        if (!tmpl) std::printf("  %s: %s\n", name.c_str(), tmpl.status().message().c_str());
+        REQUIRE(tmpl.has_value());
+        const jinja::Value& special = *entry.fields().find("special");
+        size_t index = 0;
+        for (const jinja::Value& c : entry.fields().find("cases")->items()) {
+            const std::string request = c.fields().find("request")->to_json();
+            auto out = tmpl->render_chat(request, special);
+            if (const jinja::Value* want = c.fields().find("output")) {
+                if (!out) std::printf("  %s case %zu: %s\n", name.c_str(), index, out.status().message().c_str());
+                else if (*out != want->as_string()) {
+                    std::printf("  %s case %zu differs %s\n", name.c_str(), index, first_difference(*out, want->as_string()).c_str());
+                }
+                CHECK(out.has_value() && *out == want->as_string());
+                ++rendered;
+            } else {
+                if (out) std::printf("  %s case %zu: rendered, but transformers refused it\n", name.c_str(), index);
+                CHECK(!out.has_value());
+                ++refused;
+            }
+            ++index;
+        }
+    }
+    CHECK(rendered > 100);
+    CHECK(refused >= 1);
+}
+
+TEST_CASE("Chat templates: prefix stability and the layout of turns") {
+    const auto data = chat_cases();
+    if (!data) return;
+    auto format = [&](const char* name, const char* probe) {
+        const jinja::Value& entry = *data->fields().find(name);
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        auto f = tmpl->format(probe, *entry.fields().find("special"));
+        if (!f) std::printf("  %s: %s\n", name, f.status().message().c_str());
+        return f.has_value() ? *f : ChatFormat{};
+    };
+    // Qwen3.6 with the reasoning of past replies kept: exactly the ChatML
+    // pieces the app has always written (its saved contexts stay valid).
+    const ChatFormat q36 = format("qwen3.6", R"({"enable_thinking": false, "preserve_thinking": true})");
+    CHECK(q36.prefix_stable);
+    CHECK(q36.system_prefix == "<|im_start|>system\n" && q36.system_suffix == "<|im_end|>\n");
+    CHECK(q36.first_user_prefix == "<|im_start|>user\n" && q36.user_prefix == "<|im_start|>user\n");
+    CHECK(q36.no_system_head == "<|im_start|>user\n");
+    CHECK(q36.user_suffix == "<|im_end|>\n" && q36.assistant_end == "<|im_end|>\n");
+    CHECK(q36.generation_prompt == "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    const ChatFormat q36_on =
+        format("qwen3.6", R"({"enable_thinking": true, "preserve_thinking": true, "reply_prefix": "Reasoning.\n</think>\n\n"})");
+    CHECK(q36_on.prefix_stable && q36_on.generation_prompt == "<|im_start|>assistant\n<think>\n");
+    // Qwen3 and Qwen3.5 drop the reasoning of earlier replies: not prefix stable.
+    const ChatFormat q35 = format("qwen3.5", R"({"enable_thinking": false})");
+    CHECK(!q35.prefix_stable && !q35.reason.empty());
+    CHECK(!format("qwen3", R"({"enable_thinking": false})").prefix_stable);
+    // Llama 3: the date lines and the user header belong to the first turn.
+    const ChatFormat llama = format("llama3.2", R"({"date_string": "26 Jul 2024"})");
+    CHECK(llama.prefix_stable);
+    CHECK(llama.system_prefix == "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: "
+                                 "December 2023\nToday Date: 26 Jul 2024\n\n");
+    CHECK(llama.generation_prompt == "<|start_header_id|>assistant<|end_header_id|>\n\n" && llama.assistant_end == "<|eot_id|>");
+    // Gemma 3: the system text opens the first user turn.
+    const ChatFormat gemma = format("gemma3", "");
+    CHECK(gemma.prefix_stable);
+    CHECK(gemma.system_prefix == "<bos><start_of_turn>user\n" && gemma.system_suffix == "\n\n" && gemma.first_user_prefix.empty());
+    CHECK(gemma.no_system_head == "<bos><start_of_turn>user\n" && gemma.generation_prompt == "<start_of_turn>model\n");
+    for (const char* name : {"qwen2.5", "phi3.5", "phi4-mini", "hunyuan-mt"}) {
+        const ChatFormat f = format(name, "");
+        if (!f.prefix_stable) std::printf("  %s: %s\n", name, f.reason.c_str());
+        CHECK(f.prefix_stable);
+    }
+}
+
+TEST_CASE("Chat templates: Jinja semantics transformers relies on") {
+    auto render = [](const char* source, const char* json = "{}") {
+        auto t = ChatTemplate::parse(source);
+        if (!t) return "PARSE: " + t.status().message();
+        auto ctx = jinja::parse_json(json);
+        auto out = t->render(*ctx);
+        return out ? *out : "ERROR: " + out.status().message();
+    };
+    // trim_blocks and lstrip_blocks, '-' markers, the source's trailing newline dropped.
+    CHECK(render("a\n  {% if true %}\n  x\n  {% endif %}\nb\n") == "a\n  x\nb");
+    CHECK(render("{%- if true -%}  a  {%- endif -%}  b {#- c -#}  d") == "abd");
+    // A variable set in a loop lives for one iteration; in an if, it leaks.
+    CHECK(render(R"({% for i in range(3) %}{% if i == 0 %}{% set x = "a" %}{% endif %}[{{ x }}]{% endfor %}<{{ x }}>)") ==
+          "[a][][]<>");
+    CHECK(render("{% set x = 1 %}{% if true %}{% set x = 2 %}{% endif %}{{ x }}") == "2");
+    CHECK(render("{% set ns = namespace(a=1) %}{% for i in [1, 2] %}{% set ns.a = ns.a + i %}{% endfor %}{{ ns.a }}") == "4");
+    // Python's printing and arithmetic.
+    CHECK(render(R"({{ none }}|{{ true }}|{{ 1.0 }}|{{ [1, "a", none] }}|{{ {"a": 1} }}|{{ 1/2 }}|{{ -7//2 }}|{{ -7 % 3 }}|{{ 1e20 }}|{{ 1e-05 }})") ==
+          "None|True|1.0|[1, 'a', None]|{'a': 1}|0.5|-4|2|1e+20|1e-05");
+    CHECK(render(R"({{ "abc"[::-1] }}{{ [1,2,3][-1] }}{{ "a b  c".split() }}{{ " x ".strip() }}{{ "a,b,c".split(",", 1) }})") ==
+          "cba3['a', 'b', 'c']x['a', 'b,c']");
+    // transformers' tojson: keys in order, non-ASCII kept, ", " / ": " separators.
+    CHECK(render(R"({{ {"b": 1, "a": [1, 2.5, "é\n"]}|tojson }}|{{ {"a": {}}|tojson(indent=2) }})") ==
+          "{\"b\": 1, \"a\": [1, 2.5, \"\xC3\xA9\\n\"]}|{\n  \"a\": {}\n}");
+    // Macros with defaults and keyword arguments; loop variables; filters in expressions.
+    CHECK(render("{% macro m(a, b=2) %}{{a}}{{b}}{% endmacro %}{{ m(1) }}{{ m(1, b=3) }}{{ m(b=5, a=4) }}") == "121345");
+    CHECK(render("{% for x in [1,2,3] if x > 1 %}{{ loop.index }}{{ x }}{{ loop.length }}{% else %}E{% endfor %}") == "122232");
+    CHECK(render("{% for m in [1,2,3] %}{{ loop.previtem }}/{{ loop.nextitem }};{% endfor %}") == "/2;1/3;2/;");
+    CHECK(render(R"({{ 'a' + ' b ' | trim + 'c' }})") == "abc");
+    // Errors name what failed: raise_exception, undefined access, sandboxed mutation.
+    CHECK(render(R"({{ raise_exception("No user query found.") }})") == "ERROR: chat template: No user query found.");
+    CHECK(render("{{ x.y }}").starts_with("ERROR: chat template: 'x' is undefined"));
+    CHECK(render(R"({% set d = {} %}{% set _ = d.update({"a": 1}) %})").find("unsafe") != std::string::npos);
+    CHECK(render("{% while true %}{% endwhile %}").starts_with("PARSE: chat template: unsupported statement"));
+    CHECK(render(R"({{ "a" + 1 }})").starts_with("ERROR: chat template: unsupported operand"));
+}
+
+namespace {
+
+// Appends string key/values to a GGUF's metadata in place. The inserted bytes
+// are a multiple of 32 (a padding key absorbs the rest), so the tensor data
+// keeps its alignment and offsets.
+bool add_metadata(const std::string& path, const std::vector<std::pair<std::string, std::string>>& kvs) {
+    std::ifstream in(path, std::ios::binary);
+    std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (file.size() < 24 || file.compare(0, 4, "GGUF") != 0) return false;
+    auto u32 = [&](size_t at) { uint32_t v; std::memcpy(&v, file.data() + at, 4); return v; };
+    auto u64 = [&](size_t at) { uint64_t v; std::memcpy(&v, file.data() + at, 8); return v; };
+    const uint64_t n_kv = u64(16);
+    size_t pos = 24;
+    auto skip_value = [&](auto& self, uint32_t type) -> void {
+        static const size_t sizes[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+        if (type == 8) {
+            pos += 8 + u64(pos);
+        } else if (type == 9) {
+            const uint32_t et = u32(pos);
+            const uint64_t count = u64(pos + 4);
+            pos += 12;
+            for (uint64_t i = 0; i < count; ++i) self(self, et);
+        } else {
+            pos += sizes[type];
+        }
+    };
+    for (uint64_t i = 0; i < n_kv; ++i) {
+        pos += 8 + u64(pos);  // key
+        const uint32_t type = u32(pos);
+        pos += 4;
+        skip_value(skip_value, type);
+    }
+    std::string added;
+    auto put_kv = [&](const std::string& key, const std::string& value) {
+        auto put64 = [&](uint64_t v) { added.append(reinterpret_cast<const char*>(&v), 8); };
+        put64(key.size());
+        added += key;
+        const uint32_t type = 8;
+        added.append(reinterpret_cast<const char*>(&type), 4);
+        put64(value.size());
+        added += value;
+    };
+    for (const auto& [k, v] : kvs) put_kv(k, v);
+    const std::string pad_key = "liyab.test.padding";
+    const size_t base = added.size() + 8 + pad_key.size() + 4 + 8;
+    put_kv(pad_key, std::string((32 - base % 32) % 32, ' '));
+    file.insert(pos, added);
+    const uint64_t total = n_kv + kvs.size() + 1;
+    std::memcpy(file.data() + 16, &total, 8);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(file.data(), static_cast<std::streamsize>(file.size()));
+    return static_cast<bool>(out);
+}
+
+constexpr const char* kTinyTemplate =
+    "{{ bos_token }}{% for m in messages %}{% if m.role == 'tool' %}{{ raise_exception('no tools here') }}{% endif %}"
+    "<|{{ m.role }}|>{{ m.content }}{{ eos_token }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}";
+
+}  // namespace
+
+TEST_CASE("Engine and C API: the model's chat template renders, describes its turns, and keeps one BOS") {
+    const std::string path = test::temp_dir() + "/liyab_text_templated.gguf";
+    test::write_tiny_model(path);
+    REQUIRE(add_metadata(path, {{"tokenizer.chat_template", kTinyTemplate}}));
+    EngineConfig config;
+    config.model_path = path;
+    config.backend = BackendKind::Cpu;
+    config.thermal_polling = false;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    Engine& e = **engine;
+    CHECK(e.has_chat_template());
+    auto text = e.render_chat(R"({"messages": [{"role": "system", "content": "Be brief."},
+                                               {"role": "user", "content": "hello"}], "add_generation_prompt": true})");
+    REQUIRE(text.has_value());
+    CHECK(*text == "<s><|system|>Be brief.</s><|user|>hello</s><|assistant|>");
+    // The template wrote the BOS: tokenizing with add_bos adds no second one.
+    auto ids = e.tokenize(*text, true);
+    REQUIRE(ids.has_value());
+    CHECK(ids->size() > 2 && (*ids)[0] == 1 && (*ids)[1] != 1);
+    CHECK(e.tokenize("hello", true).value() == e.tokenize("<s>hello", true).value());
+
+    auto format = e.chat_format("");
+    REQUIRE(format.has_value());
+    CHECK(format->prefix_stable);
+    CHECK(format->system_prefix == "<s><|system|>" && format->system_suffix == "</s>");
+    CHECK(format->first_user_prefix == "<|user|>" && format->user_prefix == "<|user|>" && format->user_suffix == "</s>");
+    CHECK(format->no_system_head == "<s><|user|>");
+    CHECK(format->generation_prompt == "<|assistant|>" && format->assistant_end == "</s>");
+
+    auto refused = e.render_chat(R"({"messages": [{"role": "tool", "content": "x"}]})");
+    CHECK(!refused.has_value() && refused.status().message().find("no tools here") != std::string::npos);
+    CHECK(!e.render_chat("{not json").has_value());
+
+    // The C ABI: the length needed, the text, -1 and liyab_last_error on failure.
+    liyab_engine_config c;
+    liyab_engine_config_default(&c);
+    c.model_path = path.c_str();
+    c.backend = LIYAB_BACKEND_CPU;
+    c.thermal_polling = 0;
+    liyab_engine* handle = nullptr;
+    REQUIRE(liyab_engine_create(&c, &handle) == LIYAB_OK);
+    const char* request = R"({"messages": [{"role": "user", "content": "hi"}], "add_generation_prompt": true})";
+    const int64_t need = liyab_engine_render_chat(handle, request, nullptr, 0);
+    CHECK(need == static_cast<int64_t>(std::strlen("<s><|user|>hi</s><|assistant|>")));
+    std::vector<char> buffer(static_cast<size_t>(need) + 1);
+    CHECK(liyab_engine_render_chat(handle, request, buffer.data(), buffer.size()) == need);
+    CHECK(std::string(buffer.data()) == "<s><|user|>hi</s><|assistant|>");
+    CHECK(liyab_engine_render_chat(handle, "[1", buffer.data(), buffer.size()) == -1);
+    CHECK(std::string(liyab_last_error()).find("JSON") != std::string::npos);
+    char json[2048];
+    CHECK(liyab_engine_chat_format(handle, nullptr, json, sizeof json) > 0);
+    auto parsed = jinja::parse_json(json);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->fields().find("prefix_stable")->as_bool());
+    CHECK(parsed->fields().find("generation_prompt")->as_string() == "<|assistant|>");
+    liyab_engine_destroy(handle);
+    engine->reset();
+    std::remove(path.c_str());
+
+    // Without a template: Unsupported, and the C ABI says so.
+    const std::string plain = test::temp_dir() + "/liyab_text_plain.gguf";
+    test::write_tiny_model(plain);
+    config.model_path = plain;
+    auto bare = Engine::create(config);
+    REQUIRE(bare.has_value());
+    CHECK(!(*bare)->has_chat_template());
+    auto none = (*bare)->render_chat(R"({"messages": []})");
+    CHECK(!none.has_value() && none.status().code() == ErrorCode::Unsupported);
+    bare->reset();
+    std::remove(plain.c_str());
 }
 
 TEST_MAIN()
