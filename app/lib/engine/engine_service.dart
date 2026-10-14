@@ -337,6 +337,17 @@ class EngineService {
     await _call<Object?>(['unload']);
   }
 
+  /// Renders a conversation with the model's own chat template (Engine::render_chat): `request` holds
+  /// `messages`, optional `tools` and `add_generation_prompt`, and template variables such as `enable_thinking`.
+  /// An EngineException when the model has no template or the template refuses the conversation.
+  Future<String> renderChat(Map<String, Object?> request) => _call<String>(['renderChat', jsonEncode(request)]);
+
+  /// How the model's chat template lays out turns (Engine::chat_format): `prefix_stable`, `reason` and the
+  /// pieces (system_prefix, user_prefix, generation_prompt, ...). `probe` holds template variables and an
+  /// optional `reply_prefix`.
+  Future<Map<String, Object?>> chatFormat(Map<String, Object?> probe) async =>
+      jsonDecode(await _call<String>(['chatFormat', jsonEncode(probe)])) as Map<String, Object?>;
+
   /// Number of tokens `text` encodes to (special-token texts count as one).
   Future<int> countTokens(String text) => _call<int>(['tokenize', text]);
 
@@ -508,6 +519,15 @@ void _worker(SendPort replies) {
             final path = (m[2] as String).toNativeUtf8(allocator: arena);
             final status = kind == 'saveProfile' ? lib.saveExpertProfile(engine, path) : lib.loadExpertProfile(engine, path);
             status == LiyabStatus.ok ? replies.send(['ok', id]) : fail();
+          });
+        case 'renderChat':
+        case 'chatFormat':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final json = (m[2] as String).toNativeUtf8(allocator: arena);
+            final text = LiyabLib.readTextOrNull((b, s) =>
+                kind == 'renderChat' ? lib.renderChat(engine, json, b, s) : lib.chatFormat(engine, json, b, s));
+            text == null ? fail() : replies.send(['ok', id, text]);
           });
         case 'tokenIds':
           if (engine.address == 0) return fail('no model loaded');

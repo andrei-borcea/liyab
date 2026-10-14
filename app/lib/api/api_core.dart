@@ -122,12 +122,18 @@ class ApiCore {
         ? Thinking.none
         : (r.thinking && !continued ? Thinking.on : Thinking.off);
     final p = StringBuffer();
+    var system = false, users = 0;
     for (final (i, m) in r.messages.indexed) {
-      if (!const {'system', 'user', 'assistant'}.contains(m.role)) throw ApiError(400, 'unsupported role: ${m.role}');
-      if (continued && i == r.messages.length - 1) {
-        p.write(t.reply(thinking) + m.content);
-      } else {
-        p.write(t.message(m.role, m.content));
+      switch (m.role) {
+        case 'system':
+          p.write(t.system(m.content));
+          system = system || i == 0;
+        case 'user':
+          p.write(t.user(m.content, first: users++ == 0, afterSystem: system));
+        case 'assistant':
+          p.write(continued && i == r.messages.length - 1 ? t.reply(thinking) + m.content : t.assistant(m.content));
+        default:
+          throw ApiError(400, 'unsupported role: ${m.role}');
       }
     }
     if (!continued) p.write(t.reply(thinking));

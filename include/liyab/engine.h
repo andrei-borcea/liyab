@@ -153,6 +153,34 @@ using TokenCallback = std::function<bool(std::string_view piece, int32_t token)>
 // tokens count in GenerationStats::forced_tokens, not generated_tokens.
 using ForceCallback = std::function<std::string(std::string_view generated)>;
 
+// How a model's chat template lays out a conversation, found by rendering
+// probe conversations (Engine::chat_format). A front end that keeps a
+// conversation's context between turns builds each prompt from these pieces
+// instead of rendering the whole conversation again, so the prompt of one
+// turn is always a prefix of the next one's (replies are kept exactly as
+// generated):
+//
+//   with a system message:    system_prefix + SYSTEM + system_suffix + first_user_prefix
+//   without one:              no_system_head
+//   then the first user turn: USER + user_suffix + generation_prompt + REPLY + assistant_end,
+//   every later user turn:    user_prefix + USER + user_suffix + generation_prompt + REPLY + assistant_end
+//
+// Only valid when prefix_stable: the template renders n turns as a prefix
+// of n + 1 turns, every reply as generation_prompt + reply + assistant_end,
+// and every user turn alike. Templates that render earlier turns differently
+// once the conversation goes on (Qwen3 / Qwen3.5 drop the reasoning of past
+// replies) are not, and `reason` says what differs.
+struct ChatFormat {
+    bool prefix_stable = false;
+    std::string reason;
+    std::string system_prefix, system_suffix;
+    std::string first_user_prefix;  // between the system block and the first user text
+    std::string no_system_head;     // before the first user text when there is no system message
+    std::string user_prefix, user_suffix;
+    std::string generation_prompt;  // what add_generation_prompt appends: the reply's opening
+    std::string assistant_end;      // what closes a reply
+};
+
 class LIYAB_API Engine {
 public:
     static Result<std::unique_ptr<Engine>> create(const EngineConfig& config);
@@ -260,7 +288,9 @@ public:
     // foreground request that follows.
     void cancel_prefill() noexcept;
 
-    // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token).
+    // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token),
+    // and not to a text that already starts with the BOS token's text (a
+    // chat template wrote it).
     [[nodiscard]] Result<std::vector<int32_t>> tokenize(std::string_view text, bool add_bos) const;
     [[nodiscard]] std::string token_to_piece(int32_t token) const;
 
@@ -282,6 +312,31 @@ public:
     // numbers in decimal, booleans as "true"/"false"), e.g. the publisher's
     // recommended "general.sampling.temp". nullopt when absent or an array.
     [[nodiscard]] std::optional<std::string> model_metadata(std::string_view key) const;
+
+    // ---- Chat template (the model's tokenizer.chat_template) ----------------
+    // Rendered by Liyab's own Jinja interpreter (core/chat_template.h), as
+    // transformers' apply_chat_template renders it. False when the model has
+    // no template or Liyab cannot parse it (the load log says why).
+    [[nodiscard]] bool has_chat_template() const noexcept;
+    // Renders a conversation. `request_json` is a JSON object: `messages`
+    // (role / content objects, also tool_calls and tool turns where the
+    // template supports them), optional `tools` (a list of tool schemas),
+    // optional `add_generation_prompt` (default false), and any other key as
+    // a template variable (`enable_thinking`, `preserve_thinking`...). The
+    // special-token variables (bos_token, eos_token...) come from the model.
+    // The text starts with the BOS token's text when the template writes it
+    // (Llama 3, Gemma); tokenize() and generate() then add no second BOS.
+    // InvalidArgument for malformed JSON, a raise_exception() of the template
+    // or an evaluation error, with the message; Unsupported without a
+    // template. Thread-safe; does not touch the context.
+    [[nodiscard]] Result<std::string> render_chat(std::string_view request_json) const;
+    // The template's layout (see ChatFormat). `probe_json`: a JSON object of
+    // template variables to render with (as in render_chat; "" for none),
+    // plus an optional `reply_prefix`, the text a reply starts with after the
+    // generation prompt in that mode (e.g. reasoning closed by "</think>"
+    // when thinking is on). A template that is not prefix stable is not an
+    // error: the result says so. Unsupported without a template. Thread-safe.
+    [[nodiscard]] Result<ChatFormat> chat_format(std::string_view probe_json) const;
 
 private:
     struct Impl;

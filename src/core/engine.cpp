@@ -15,6 +15,7 @@
 
 #include <unistd.h>
 
+#include "core/chat_template.h"
 #include "core/log.h"
 #include "core/quant.h"
 #include "core/sampling.h"
@@ -563,6 +564,50 @@ struct Engine::Impl {
     std::unique_ptr<TripleBufferLoader> weight_loader;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
+    // The model's chat template (Engine::render_chat) and the special-token
+    // variables it renders with; empty when the model has none or it does
+    // not parse (chat_template_error says why).
+    std::optional<ChatTemplate> chat_template;
+    Status chat_template_error;
+    jinja::Value chat_special;
+    void load_chat_template() {
+        const auto source = target->file().get_string("tokenizer.chat_template");
+        if (!source) {
+            chat_template_error = Status(ErrorCode::Unsupported, "the model has no chat template");
+            return;
+        }
+        // The special-token variables transformers passes (bos_token...).
+        chat_special = jinja::Value::object();
+        auto special = [&](const char* name, std::optional<int32_t> id) {
+            if (id && *id >= 0 && *id < tokenizer->vocab_size()) {
+                chat_special.fields().set(name, jinja::Value(std::string(tokenizer->token_text(*id))));
+            }
+        };
+        auto id_of = [&](std::string_view key) -> std::optional<int32_t> {
+            const auto v = target->file().get_int(key);
+            return v ? std::optional<int32_t>(static_cast<int32_t>(*v)) : std::nullopt;
+        };
+        special("bos_token", id_of("tokenizer.ggml.bos_token_id"));
+        special("eos_token", id_of("tokenizer.ggml.eos_token_id"));
+        special("unk_token", id_of("tokenizer.ggml.unknown_token_id"));
+        special("pad_token", id_of("tokenizer.ggml.padding_token_id"));
+        auto parsed = ChatTemplate::parse(*source);
+        if (!parsed) {
+            chat_template_error = parsed.status();
+            LIYAB_LOG_WARN("%s", parsed.status().message().c_str());
+            return;
+        }
+        chat_template.emplace(std::move(parsed).value());
+        // Whether the template lays out turns as a prefix of the next ones
+        // (ChatFormat): front ends that keep a context between turns need it.
+        auto format = chat_template->format("", chat_special);
+        if (format && format->prefix_stable) {
+            LIYAB_LOG_INFO("chat template: prefix-stable across turns");
+        } else {
+            LIYAB_LOG_INFO("chat template: not prefix-stable across turns (%s)",
+                           format ? format->reason.c_str() : format.status().message().c_str());
+        }
+    }
     std::unique_ptr<PowerManager> power;
     std::atomic<bool> cancel{false};
     std::atomic<bool> cancel_prefill{false};  // Engine::cancel_prefill: prefill() only
@@ -910,6 +955,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     auto tokenizer = Tokenizer::load(impl->target->file());
     if (!tokenizer) return tokenizer.status();
     impl->tokenizer.emplace(std::move(tokenizer).value());
+    impl->load_chat_template();
     LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->target));
 
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
@@ -1609,6 +1655,18 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     }
     if (text != nullptr && !s.draft) s.remember_text(prompt, *text);
     return stats;
+}
+
+bool Engine::has_chat_template() const noexcept { return impl_->chat_template.has_value(); }
+
+Result<std::string> Engine::render_chat(std::string_view request_json) const {
+    if (!impl_->chat_template) return impl_->chat_template_error;
+    return impl_->chat_template->render_chat(request_json, impl_->chat_special);
+}
+
+Result<ChatFormat> Engine::chat_format(std::string_view probe_json) const {
+    if (!impl_->chat_template) return impl_->chat_template_error;
+    return impl_->chat_template->format(probe_json, impl_->chat_special);
 }
 
 }  // namespace liyab

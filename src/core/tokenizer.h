@@ -24,6 +24,8 @@ public:
     static Result<Tokenizer> load(const MmapLoader& model);
 
     // Text → token ids, as the model's Hugging Face tokenizer encodes them.
+    // `add_bos` adds no BOS to a text that starts with the BOS token's own
+    // text (a rendered chat template wrote it).
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
     // and byte-level BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
@@ -52,6 +54,10 @@ public:
     // (`segment_start`: the token starts the text or follows a special one).
     // Used to find which tokens of a context a text still spells.
     [[nodiscard]] std::string_view prompt_text(int32_t id, bool segment_start) const;
+
+    // The vocabulary entry of a token as the GGUF stores it (a special
+    // token's own text, e.g. "<|begin_of_text|>").
+    [[nodiscard]] std::string_view token_text(int32_t id) const;
 
     [[nodiscard]] Kind kind() const noexcept { return kind_; }
     [[nodiscard]] int32_t vocab_size() const noexcept { return static_cast<int32_t>(texts_.size()); }

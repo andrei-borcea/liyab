@@ -106,6 +106,7 @@ These rules decide what goes into the code:
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe` | ✅ cross-checked against llama.cpp |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma) | ✅ token-identical to each model's Hugging Face tokenizer |
+| Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
 | CPU backend: NEON + SDOT; i8mm (SMMLA) layouts for Q4_K/Q5_K/Q6_K/Q8_0; WFE-waiting thread pool with chunks claimed on demand | ✅ |
@@ -329,7 +330,27 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   * **Speed.** Tokenizing sits on the typing path (prompts are encoded while the user writes). Merges compare token
     ids through a heap, never strings, so a long piece costs O(n log n). On an Apple M4 Pro a 68 KB text encodes in
     2.4–3.6 ms (19–28 MB/s, Qwen3, Qwen3.5, Llama 3.2) and an 80 KB conversation full of special tokens in 2.5–3.2 ms.
-* **Prompts are used as given.** Apply the model's chat template in the front end; the app reads it from the GGUF.
+* **Chat templates from the model.** Every GGUF carries the Jinja chat template of its Hugging Face tokenizer
+  (`tokenizer.chat_template`). Liyab's own Jinja interpreter (`src/core/chat_template.cpp`) renders it the way
+  transformers' `apply_chat_template` does: the same whitespace rules, Python's printing, `tojson`,
+  `raise_exception`, `strftime_now`, loops with `loop.previtem` / `nextitem`, macros, namespaces, string methods and
+  the usual filters and tests, and the sandbox's refusal of methods that change a list or dict.
+  * `Engine::render_chat` (C: `liyab_engine_render_chat`) takes the request as JSON: `messages`, optional `tools`
+    and `add_generation_prompt`, and any template variable such as `enable_thinking`. A text that starts with the
+    BOS token's own text (Llama 3, Gemma) gets no second BOS when tokenized.
+  * `Engine::chat_format` (C: `liyab_engine_chat_format`) renders probe conversations and reports how the template
+    lays out turns: the system block, what opens and closes a user turn, the generation prompt and what ends a
+    reply. It also says whether the template is **prefix-stable**: rendering *n* turns, then the reply, must be the
+    start of rendering *n* + 1 turns, which context reuse across turns needs. Llama 3, Qwen2.5, Gemma 3, Phi-3.5,
+    Phi-4-mini, Hunyuan-MT, DeepSeek V3.1, and Qwen3.6 with `preserve_thinking`, are. Qwen3 and Qwen3.5 are not:
+    they drop the reasoning of earlier replies once the conversation goes on. The load log says which.
+  * Checked byte for byte against transformers on 14 conversations per template (system, user, assistant and tool
+    turns, tools, inline and separate reasoning, thinking on and off, no system message, non-ASCII and white space
+    at the edges), for Qwen2.5, Qwen3, Qwen3.5, Qwen3.6, Llama 3.2, Gemma 3, Phi-3.5, Phi-4-mini, Hunyuan-MT,
+    Hunyuan-0.5B, Hunyuan-A13B and DeepSeek V3.1: 165 renders identical, and the 3 conversations transformers
+    refuses refused too (`tests/data/chat_templates.json`, written by `tools/chat_template_reference.py`). The
+    templates the GGUFs themselves carry gave the same 168 results.
+* **Prompts are used as given** by `generate()` and `prefill()`: render them with the template first (the app does).
 
 ---
 
@@ -563,6 +584,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_get_counters` | Live counters for monitoring UIs (thread-safe) |
 | `liyab_engine_metadata` / `_describe` / `liyab_describe_device` | GGUF metadata (e.g. recommended sampling), engine and device descriptions |
 | `liyab_supported_architectures` | Architectures this build runs |
+| `liyab_engine_render_chat` / `_chat_format` | The model's chat template applied to a conversation (JSON); its layout of turns and whether it is prefix-stable |
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
@@ -726,6 +748,14 @@ cancellation and live counters go straight to the C API, which makes them thread
   * Results are compact text with ISO dates. On Qwen3.6's tokenizer, 6 events take 190 tokens instead of 428 as
     JSON, which saves ~18 s of prefill on the 35B.
   * The system prompt tells the model to treat tool results as data, not instructions.
+* **Prompts in the model's own format.** At load the app asks the engine how the model's chat template lays out
+  turns (`chat_format`), in each thinking mode it uses and with `preserve_thinking`, since past replies are replayed
+  with their reasoning. When the template is prefix-stable, prompts are built from its pieces, so each turn's prompt
+  continues the previous one and only the new message is processed. Otherwise (Qwen3, Qwen3.5), or without a
+  template, the built-in format of the model's family is used (ChatML, Llama 3, Zephyr) and the log says why. For
+  Qwen3.6 the template's pieces are exactly the built-in ChatML ones, so its prompts and saved contexts are
+  unchanged. Llama 3's template writes today's date into the system block, so its context is prepared again
+  once a day. Tools are offered when the format is ChatML's, whose tool-call formats the app knows.
 
 ### Fast where users feel it
 
@@ -812,7 +842,8 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   Every call needs the token shown in Settings: `Authorization: Bearer`, `x-api-key` for Anthropic clients, or gRPC
   metadata. **New token** revokes the old one.
 * **Compatibility.**
-  * Prompts are built with the loaded model's own chat template.
+  * Prompts are built with the loaded model's own chat template when it is prefix-stable, else with the built-in
+    format of its family (see [the app](#an-assistant-that-replaces-the-cloud-one)).
   * Streaming (server-sent events), sampling, `max_tokens`, stop sequences and usage are supported. Usage includes
     the reused prompt tokens.
   * Thinking is off unless requested, through `reasoning_effort`, `chat_template_kwargs.enable_thinking` or
@@ -1151,13 +1182,13 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers |
+| `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats and forced continuations; chat history replay; the local API's OpenAI, Anthropic and gRPC servers over real sockets |
+| `app/test` | Tool-call formats and forced continuations; chat history replay; prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets |
 
 Benchmarks and tools built with the tests:
 
@@ -1191,7 +1222,10 @@ Benchmarks and tools built with the tests:
   tools/tokenizer_reference.py --model tencent/Hunyuan-0.5B-Instruct --text tests/data/tokenizer_edge.txt --out hunyuan.ids
   build/liyab-tok -m hunyuan.gguf -f tests/data/tokenizer_edge.txt --ids hunyuan.ids
   ```
-* `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`).
+  `liyab-tok -m model.gguf --render request.json` applies the GGUF's chat template to a request, and `--format
+  PROBE` prints its layout of turns and whether it is prefix-stable.
+* `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
+  `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
 * `LIYAB_GOLDEN_UPDATE=1 test_golden`: records the logit hashes of the kernel set this build runs (CPU architecture and `scalar` / `neon` / `neon+dotprod`), after a change meant to move outputs
   (say why in the commit). A platform with no hashes yet is skipped with a note.
@@ -1256,7 +1290,6 @@ Implemented features are described above. These are next, in order:
    Hugging Face (`liyab-kl`). Next:
    * more block parts described as data (norm placement, RoPE variants such as YaRN, MLA, fused expert tensors),
      then Gemma, Phi, DeepSeek and Hunyuan;
-   * the chat template read from the model;
    * later, multimodal, embedding, reranking and classification models.
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
    and fewer fork/joins per CPU block.
@@ -1323,13 +1356,14 @@ Implemented features are described above. These are next, in order:
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
 src/core/               engine, architecture registry and model description, transformer, loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
-                        (pre-tokenizer table, regex engine, Unicode tables),
+                        (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
                         sampler, power manager, device detection, thread pool
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py and
-                        tokenizer_reference.py (Hugging Face references for liyab-kl / liyab-tok), gguf_vocab.py,
+tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py,
+                        tokenizer_reference.py and chat_template_reference.py (Hugging Face references),
+                        gguf_vocab.py,
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)

@@ -279,7 +279,14 @@ std::string_view Tokenizer::prompt_text(int32_t id, bool segment_start) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
+    if (add_bos && bos_ >= 0 && special_[static_cast<size_t>(bos_)] && text.starts_with(texts_[static_cast<size_t>(bos_)])) {
+        add_bos = false;  // the text spells its BOS (a chat template wrote it): no second one
+    }
     return encode_from(text, add_bos, true);
+}
+
+std::string_view Tokenizer::token_text(int32_t id) const {
+    return id >= 0 && static_cast<size_t>(id) < texts_.size() ? texts_[static_cast<size_t>(id)] : std::string_view();
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode_continuation(std::string_view text, int32_t previous) const {

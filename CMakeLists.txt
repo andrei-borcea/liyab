@@ -77,6 +77,7 @@ add_library(liyab_core OBJECT
   src/core/regex.cpp
   src/core/pre_tokenizer.cpp
   src/core/tokenizer.cpp
+  src/core/chat_template.cpp
   src/core/sampling.cpp
   src/core/architecture.cpp
   src/core/key_scaling.cpp
