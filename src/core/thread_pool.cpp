@@ -12,6 +12,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 namespace liyab {
 
@@ -155,6 +158,17 @@ int32_t ThreadPool::current_thread_id() noexcept {
 
 void ThreadPool::worker_loop(int32_t index) {
     worker_tids_[static_cast<size_t>(index)].store(current_thread_id(), std::memory_order_release);
+    // A name of its own (a thread otherwise inherits its creator's: the CLI's,
+    // or a Dart isolate's in the app), so per-thread CPU readings tell the
+    // decode workers apart (scripts/thread_cpu.py). At most 15 characters.
+    {
+        const std::string name = "liyab-worker-" + std::to_string(index + 1);
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), name.c_str());
+#elif defined(__APPLE__)
+        pthread_setname_np(name.c_str());
+#endif
+    }
     uint64_t seen = 0;
     const int32_t participant = index + 1;  // the caller is participant 0
     for (;;) {

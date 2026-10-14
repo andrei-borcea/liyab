@@ -1198,6 +1198,25 @@ scripts/phone_regression.py --accept                        # after an intended 
   its generation) and runs again once the phone is idle and back. The app is never stopped or opened; when the OS
   has frozen it in the background, the run says so instead of waiting for an API that cannot answer.
 
+### Where a process spends its cores
+
+`scripts/thread_cpu.py` samples a process on the phone over adb: every few seconds it reads
+`/proc/<pid>/task/*/stat` in one call, turns each thread's user + system time since the last sample into CPU % of
+one core, and prints the busiest threads with the core each last ran on. It starts with the cores the process may
+use (`Cpus_allowed_list`) and its cpuset, since Android confines background apps. `--out` keeps a capture as JSON
+and `--compare` sets two captures side by side, per thread name. The engine's decode workers are named
+`liyab-worker-N`; the thread that calls the engine also decodes (in the app a Dart thread, in the CLI its main
+thread). It only reads `/proc`: it never starts or stops an app.
+
+```bash
+scripts/thread_cpu.py --app com.liyab.chat --duration 30 --out app.json    # while the app answers
+scripts/thread_cpu.py --name liyab-cli --duration 30 --out cli.json        # while the CLI decodes the same prompt
+scripts/thread_cpu.py --compare app.json cli.json                          # average CPU % per thread name, A vs B
+```
+
+It is the tool for the gap between the app's decode speed and the CLI's on the same model: whether the app's
+workers get fewer cores or slower ones, or other threads (Flutter's UI and raster threads, Dart) compete with them.
+
 ---
 
 ## Roadmap
@@ -1293,7 +1312,7 @@ app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), l
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
-scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py
+scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py, thread_cpu.py
 ```
 
 ## Contributing
