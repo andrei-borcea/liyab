@@ -1,13 +1,18 @@
-// Liyab — GGUF vocabulary: SentencePiece-BPE encoding, byte-level decoding (internal).
+// Liyab — GGUF vocabulary: SentencePiece-BPE and byte-level BPE encoding,
+// decoding (internal). Byte-level BPE pre-tokenizers come from a table keyed
+// by tokenizer.ggml.pre (core/pre_tokenizer.h).
 #ifndef LIYAB_CORE_TOKENIZER_H
 #define LIYAB_CORE_TOKENIZER_H
 
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include "core/pre_tokenizer.h"
 #include "liyab/mmap_loader.h"
 
 namespace liyab {
@@ -18,12 +23,15 @@ public:
 
     static Result<Tokenizer> load(const MmapLoader& model);
 
-    // Text → token ids, matching llama.cpp. SentencePiece vocabularies
-    // ("llama": Llama 2, Mistral, TinyLlama) and byte-level BPE ("gpt2") with
-    // the Qwen2 / Llama 3 pre-tokenizers (tokenizer.ggml.pre = qwen2,
-    // deepseek-r1-qwen, llama-bpe, llama3); other BPE pre-tokenizers return
-    // Unsupported. Special tokens written in the text (e.g. "</s>",
-    // "<|im_start|>") map to their ids.
+    // Text → token ids, as the model's Hugging Face tokenizer encodes them.
+    // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
+    // and byte-level BPE ("gpt2") with the pre-tokenizers of
+    // PreTokenizer::supported_names(); a BPE vocabulary with another
+    // tokenizer.ggml.pre returns Unsupported naming it and the supported
+    // ones (the model still loads, and runs on token ids). Special tokens
+    // written in the text (e.g. "</s>", "<|im_start|>") map to their ids;
+    // the text between them is normalized (NFC for the Qwen families) and
+    // pre-tokenized on its own.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
     // Encodes `text` that directly follows already-encoded text ending with
     // token `previous` (a prompt that continues the context): no BOS and, for
@@ -63,11 +71,24 @@ private:
     std::vector<int32_t> end_of_generation_;
     std::vector<int32_t> control_;  // control tokens with text, longest first
     std::vector<bool> special_;     // per token: in control_
+    std::vector<bool> rstrip_;      // per token: white space after it in a text is dropped (kRstripRules)
+    // Special-token search (find_special): control_ by first byte, the byte
+    // pairs that start one, and the bytes that are one on their own.
+    std::array<std::vector<int32_t>, 256> special_by_byte_;
+    std::vector<uint64_t> special_pairs_;
+    std::array<bool, 256> special_single_{};
+    // The earliest special token's text at or after `from` (the longest one
+    // there): its offset and id, or npos.
+    size_t find_special(std::string_view text, size_t from, int32_t& id) const;
 
-    enum class PreTokenizer { None, Qwen2, Qwen35, Llama3 };
-    PreTokenizer pre_ = PreTokenizer::None;
-    std::string pre_name_;
-    std::unordered_map<std::string, int32_t> merge_rank_;  // "left right" -> rank (BPE)
+    std::optional<PreTokenizer> pre_;  // byte-level BPE: the scheme of tokenizer.ggml.pre
+    Status pre_error_;                 // why pre_ is empty for a BPE vocabulary
+    struct Merge {
+        int32_t rank;  // position in tokenizer.ggml.merges: lower merges first
+        int32_t id;    // the token the pair becomes
+    };
+    std::unordered_map<uint64_t, Merge> merges_;  // BPE: (left id << 32 | right id) -> merge
+    std::array<int32_t, 256> byte_token_{};       // BPE: each byte's token, -1 when the vocabulary lacks it
 
     void encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const;
     void encode_bpe(std::string_view text, std::vector<int32_t>& out) const;

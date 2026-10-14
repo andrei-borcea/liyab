@@ -1,0 +1,41 @@
+I'm sure you'll see they've said it's fine; we'd known, he'll go. DON'T SHOUT, IT'S LOUD, WE'RE HERE, I'D, YOU'VE, THEY'LL.
+Mixed: It'S, iT'd, O'Neil's 'twas rock'n'roll 's 'S 'll 'LL x'ſ y'K ' alone '' ''' l'amour dell'anno.
+Curly: it’s don’t ‘quoted’ “double”.
+Digits: 1 12 123 1234 12345 1234567890 3.14159 1,000,000 -42 +7 0x1F 1e-9 2024-03-03 19:45:07.
+Other digits: ١٢٣٤ १२३ １２３４ x²+y³ Ⅻ ½ ⅓ ①② 𝟎𝟏.
+Spaces:  two   three    four     five		tabs	 	 mixed  
+Trailing   
+   leading
+
+
+blank lines
+windows
+
+end  nbsp　ideographic em thin ​zero-width
+    indented line
+        deeper
+ 
+  
+	
+中文测试：今天天气很好。我们去公园吧！
+日本語のテキスト、カタカナとひらがな。ﾊﾝｶｸ
+한국어 문장입니다. 한글 (decomposed jamo)
+Emoji: 😀 👍🏽 👨‍👩‍👧‍👦 🇮🇹 ❤️ 1️⃣ 🏳️‍🌈 ☕🚀🔥
+Accents: café café naïve naïve Å Å Å ộ ộ ệ Việt Nam việt
+Marks: क्ष हिन्दी ภาษาไทย ́lead x̀́̂̃ Z͓͔͑͒
+RTL: שָׁלוֹם עולם السَّلامُ عليكم ‏mark‎ ‫embed‬ 123 ١٢
+def f(x, *args, **kw):
+    return {'a': [1, 2, 3], "b": x ** 2}  # comment
+if (a != b && c <= d) { std::vector<int> v{1,2}; v.push_back(a->b); }
+const re = /^(?:[a-z0-9_-]+)\.json$/i; // regex
+SELECT name, COUNT(*) FROM users WHERE id >= 10 GROUP BY name;
+<div class="x">&nbsp;&lt;tag&gt;</div> https://example.com/path?q=1&r=two#frag user@mail.org
+```bash
+$ ls -la ~/dir | grep '\.txt$' >> out.log 2>&1
+```
+a=b+c;d-=e*f/g%h^i|j&k~l!m?n:o@p#q$r\s`t'u"v
+----- ===== ..... ,,,,, !!!!! ????? ;;;;; ::::: ___ ***
+Greek Αθήνα ιστορία; Cyrillic Москва ёж; Armenian Հայաստան; Georgian საქართველო
+Title case ǅ ǈ ǋ ligatures ﬁ ﬂ ß ẞ long ſ KÅ
+¿Qué? ¡Sí! « guillemets » — em–en … • § ¶ © ® ™ €100 £5 ¥ ₹
+end without newline

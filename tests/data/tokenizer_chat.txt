@@ -1,0 +1,21 @@
+<|im_start|>system
+You are kind.<|im_end|>
+<|im_start|>user
+Hi there!<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Hello.<|im_end|>
+<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+Hi <|eot_id|><bos><start_of_turn>user
+Hi<end_of_turn>
+<start_of_turn>model
+Yes<end_of_turn>
+<|system|>
+Be brief.<|end|>
+<|user|>
+ Hi<|end|>
+<|assistant|>Ok<|end|><|endoftext|>tail <s>[INST] x [/INST]</s> <｜User｜>Hi<｜Assistant｜>Yo<｜end▁of▁sentence｜><|startoftext|>Hi<|extra_0|>x<|eos|> end <|im_end|><|im_end|>  <|im_start|>
