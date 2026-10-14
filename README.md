@@ -103,7 +103,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe` | ✅ cross-checked against llama.cpp |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE (Qwen2/3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ token-identical to llama.cpp |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
@@ -209,8 +209,9 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   `newBufferWithBytesNoCopy`, so the GPU reads the page cache directly.
 * **One forward pass for every architecture.** The transformer is not written per model. For each block the loader
   picks the token mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, otherwise softmax attention) and
-  detects optional pieces (QKV biases, Q/K norms, an attention output gate, the pre-FFN norm). The FFN is a mixture
-  of experts when the block has a router. See [Supported models](#supported-models).
+  detects optional pieces (QKV biases, Q/K norms, an attention output gate, the pre-FFN norm). The facts the tensors
+  cannot tell, such as whether Q/K norms come before or after RoPE, are one row per architecture. The FFN is a
+  mixture of experts when the block has a router. See [Supported models](#supported-models).
 * **Per-operation routing.** Attention projections can go to the GPU and the FFN to the NPU. A backend that reports
   `Unsupported` for a matmul falls back to the next one for that matmul only.
 * **Vulkan on phones.** Mobile drivers lack `VK_EXT_external_memory_host` (Adreno 830 included), so mapped weights
@@ -274,7 +275,10 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   * `llama` (Llama 1/2/3.x, Mistral, TinyLlama…), `mistral`, `qwen2`, `qwen3`;
   * `qwen35`: Qwen3.5 / Qwen3.8 hybrids, with three Gated DeltaNet blocks per gated-attention block. The
     multi-token-prediction head is skipped;
-  * mixture-of-experts: `qwen3moe` (Qwen3-30B-A3B…) and `qwen35moe` (Qwen3.5/3.6-35B-A3B…).
+  * mixture-of-experts: `qwen3moe` (Qwen3-30B-A3B…) and `qwen35moe` (Qwen3.5/3.6-35B-A3B…);
+  * `hunyuan-dense` (Hunyuan-MT-7B, Hunyuan 0.5B–7B): Q/K norms after RoPE. Its dynamic-NTK "alpha" RoPE scaling
+    is already folded into `rope.freq_base` by the GGUF converter. Its BPE pre-tokenizer is not supported yet, so
+    prompts go in as token ids; the model expects its BOS token first (the GGUF does not ask for one).
 
   Linear RoPE scaling and Llama 3.x `rope_freqs` are supported. YaRN is rejected with a clear error.
   `liyab_supported_architectures()` lists what a build runs, so front ends can filter downloads.
@@ -1022,8 +1026,9 @@ speculative and plain greedy decoding all give bit-identical logits (tested for 
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
 **Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
-float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every tokenizer gave the
-reference's ids for the whole text. With an F16 KV cache the forward passes agree:
+float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every supported tokenizer
+gave the reference's ids for the whole text; a model whose pre-tokenizer is not supported yet was measured on the
+reference's ids (`--ref-tokens`). With an F16 KV cache the forward passes agree:
 
 | Model (architecture) | Tokens | Mean KL | Top-1 agreement |
 | :--- | ---: | ---: | ---: |
@@ -1031,6 +1036,7 @@ reference's ids for the whole text. With an F16 KV cache the forward passes agre
 | Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% |
 | Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% |
 | Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% |
+| Hunyuan-0.5B-Instruct (`hunyuan-dense`, reference ids, text after its BOS) | 500 | 0.00000 | 100.00% |
 
 The quantized KV caches against the same references (Qwen3-4B Q4_K_M against its own F16-cache run), with keys
 stored as computed and with [key scaling](#architecture) (the default), as mean KL and top-1 agreement:
@@ -1108,7 +1114,7 @@ downloaded.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
-| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE), sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1126,7 +1132,7 @@ Benchmarks and tools built with the tests:
     Hugging Face transformers (needs `torch` and `transformers`). The comparison first checks that the text encodes
     into the same token ids, printing the first difference, then measures the forward pass; `--max-kl` and
     `--min-top1` make it a pass/fail gate, `--ref-tokens` measures the model on the reference's ids while a
-    tokenizer still differs, and `--kv f16` keeps the KV cache's own rounding out of the measurement. `tests/data/conform_text.txt` is the text used (prose, Italian, code, numbers, URLs,
+    tokenizer still differs (or cannot encode the text yet), and `--kv f16` keeps the KV cache's own rounding out of the measurement. `tests/data/conform_text.txt` is the text used (prose, Italian, code, numbers, URLs,
     CJK, Greek, Cyrillic, Hebrew, Arabic, emoji, tabs and trailing spaces).
 
   ```bash
@@ -1196,7 +1202,7 @@ Implemented features are described above. These are next, in order:
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
    Hugging Face (`liyab-kl`). Next:
    * more block parts described as data (norm placement, RoPE variants such as YaRN, MLA, fused expert tensors),
-     then Gemma, Phi, DeepSeek and Hunyuan;
+     then Gemma, Phi and DeepSeek;
    * pre-tokenizers from a table instead of code, and the chat template read from the model;
    * later, multimodal, embedding, reranking and classification models.
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
@@ -1293,7 +1299,7 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
     `include/liyab/`, and `--help` texts.
 * **Adding a model.** An architecture whose blocks are made of the pieces above (attention or Gated DeltaNet, dense
   or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`: how RoPE pairs dimensions, the name
-  of the norm before the FFN, the MoE renormalization default. `describe_model()` plans each block from the tensors
+  of the norm before the FFN, the MoE renormalization default, whether Q/K norms come before or after RoPE. `describe_model()` plans each block from the tensors
   present (mixer, gated attention, dense or MoE FFN, shared expert) and binds optional tensors where they exist.
   Add a `test_golden` case and check a BF16/F16 GGUF against its Hugging Face model (`tools/conform_reference.py`,
   then `liyab-kl --compare … --kv f16`). New kinds of blocks still need engine code (see the [roadmap](#roadmap)).

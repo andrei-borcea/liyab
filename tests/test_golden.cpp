@@ -148,6 +148,13 @@ std::vector<GoldenCase> cases() {
     s.n_ff_shared = 96;
     s.shared_gate = true;
     add("qwen35moe", s);
+
+    s = {};
+    s.arch = "hunyuan-dense";  // Q/K norms after RoPE
+    s.qk_norm = true;
+    add("hunyuan-dense", s);
+    s.k_norm_outlier = 60.0f;  // large key channels from the norm, measured through it (key scaling)
+    add("hunyuan-dense-keyscaled", s, {}, true);
     return out;
 }
 

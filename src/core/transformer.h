@@ -5,7 +5,7 @@
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
 // mixer — softmax attention (GQA, RoPE in either pairing, optional QKV bias,
-// per-head Q/K norm, optional sigmoid output gate) or a Gated DeltaNet
+// per-head Q/K norm before or after RoPE, optional sigmoid output gate) or a Gated DeltaNet
 // linear-attention recurrence — followed by a dense SwiGLU FFN or a mixture of
 // experts (router + top-k routed experts + optional gated shared expert). So
 // hybrid models (Qwen3.5: three DeltaNet blocks per attention block) and plain
@@ -341,6 +341,12 @@ private:
                                bool repack);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
+    // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
+    // nullptr: none) and keys (n_head_kv heads), where the block has them.
+    void qk_norm(const Layer& L, float* q, float* k) const;
+    // Calibration (key_ranges_ set): one token's unrotated queries and keys of
+    // block `L`, as the ranges need them whatever the Q/K norm order.
+    void add_key_ranges(const Layer& L, const float* q, const float* k);
     // Divides one token's keys (n_head_kv heads) by the key scales of
     // attention block `kv_slot` and multiplies its queries (n_head heads;
     // nullptr: none) by them. No-op without scales.

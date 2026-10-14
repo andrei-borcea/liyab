@@ -23,7 +23,8 @@
 // bound of the full-vocabulary KL that is tight when the top 32 carry nearly
 // all the mass), the top-1 agreement and both perplexities. --ref-tokens
 // teacher-forces the reference's ids instead of this build's encoding, so a
-// model is measured even while its tokenizer differs. Text is encoded with the
+// model is measured even while its tokenizer differs (or cannot encode the
+// text yet: an unsupported BPE pre-tokenizer). Text is encoded with the
 // model's own BOS rule (tokenizer.ggml.add_bos_token). A quantized KV cache
 // stores keys per-channel scaled, as the engine does (core/key_scaling.h);
 // --no-key-scaling stores them as computed, to measure what the scaling saves.
@@ -195,11 +196,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     auto encoded = tokenizer->encode(text.str(), tokenizer->add_bos_default());
-    if (!encoded || encoded->size() < 2) {
+    std::vector<int32_t> tokens;
+    if (encoded) {
+        tokens = std::move(encoded).value();
+    } else if (ref_tokens) {
+        // A tokenizer this build cannot run yet (an unsupported pre-tokenizer):
+        // the reference's ids are measured instead, so the model still is.
+        std::printf("tokens: this build cannot encode the text (%s)\n", encoded.status().to_string().c_str());
+    }
+    if (tokens.size() < 2 && !(ref_tokens && !encoded)) {
         std::fprintf(stderr, "the text must encode to at least 2 tokens\n");
         return 1;
     }
-    std::vector<int32_t> tokens = std::move(encoded).value();
     if (tokens.size() > static_cast<size_t>(max_tokens)) tokens.resize(static_cast<size_t>(max_tokens));
 
     Reference ref;
@@ -212,7 +220,9 @@ int main(int argc, char** argv) {
         const size_t common = std::min(tokens.size(), ref.tokens.size());
         size_t first_diff = 0;
         while (first_diff < common && tokens[first_diff] == ref.tokens[first_diff]) ++first_diff;
-        if (first_diff == common && tokens.size() == ref.tokens.size()) {
+        if (tokens.empty()) {
+            // Not encoded here (see above): nothing to compare.
+        } else if (first_diff == common && tokens.size() == ref.tokens.size()) {
             std::printf("tokens: %zu, identical to the reference\n", tokens.size());
         } else {
             auto at = [&](const std::vector<int32_t>& ids) {
@@ -242,7 +252,7 @@ int main(int argc, char** argv) {
     liyab::ThreadPool pool(threads);
     auto cpu = liyab::make_cpu_backend(pool);
     const liyab::Route route{cpu.get(), cpu.get(), cpu.get()};
-    if (key_scaling) {
+    if (key_scaling && kv_type != liyab::KvCacheType::F16) {  // an F16 cache stores keys as computed
         auto calibration = tokenizer->encode(liyab::key_calibration_text(), tokenizer->add_bos_default());
         const liyab::Status s = calibration ? model->calibrate_keys(*calibration, route, pool) : calibration.status();
         if (!s.is_ok()) {
