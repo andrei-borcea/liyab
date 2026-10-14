@@ -1,0 +1,2 @@
+# Byte-exact test texts: the edge-case corpus keeps its "\r\n" line endings.
+tests/data/tokenizer_edge.txt -text

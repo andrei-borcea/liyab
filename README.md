@@ -105,7 +105,7 @@ These rules decide what goes into the code:
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe` | ✅ cross-checked against llama.cpp |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
-| Tokenizers: SentencePiece and byte-level BPE (Qwen2/3, Qwen3.5, Llama 3 pre-tokenizers) | ✅ token-identical to llama.cpp |
+| Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
 | CPU backend: NEON + SDOT; i8mm (SMMLA) layouts for Q4_K/Q5_K/Q6_K/Q8_0; WFE-waiting thread pool with chunks claimed on demand | ✅ |
@@ -306,9 +306,29 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     the same order. That holds on the file's layout or repacked, for one activation row or several. A row's result
     is then the same bits whichever kernel computed it, so logits depend neither on the batch size nor on the layout
     (tested for every format).
-* **Tokenizers:** SentencePiece (`llama`) and byte-level BPE (`gpt2`) with the `qwen2`, `deepseek-r1-qwen`, `qwen35`,
-  `llama-bpe` and `llama3` pre-tokenizers. Both match llama.cpp token for token, including special tokens,
-  contractions, digits, accents, CJK and emoji.
+* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3) and byte-level BPE (`gpt2`).
+  * **Pre-tokenizers are data.** Before merging, a byte-level BPE tokenizer cuts the text into pieces with regular
+    expressions. Each scheme is one row of a table keyed by the GGUF's `tokenizer.ggml.pre`
+    (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
+    asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan). Rows: `default` /
+    `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`, `hunyuan`,
+    `hunyuan-dense` / `deepseek-v3`, `deepseek-llm` and `gpt-4o` (Phi-4-mini). A GGUF without the key uses
+    `default`. Any other value is an error naming it and the supported list; the model still loads and runs on
+    token ids.
+  * **Liyab's own regex engine** (`src/core/regex.cpp`) runs the patterns: Unicode general categories (`\p{L}`,
+    `\p{Lu}`, `\P{N}`…), classes, alternation, greedy, lazy and possessive quantifiers, case-insensitive groups,
+    lookahead and atomic groups. It decodes the text once into code points with a category key each, so a class
+    test is a bit lookup. The Unicode data (categories, NFC tables) is generated into `src/core/unicode_tables.inc`
+    by `tools/gen_unicode_tables.py`.
+  * **Special tokens** written in the text map to their ids, found in one pass over the text. Those of the Phi-3
+    family (Phi-3/3.5, Phi-4-mini) swallow the white space after them, as their Hugging Face tokenizer does. A
+    byte a vocabulary lacks (Hunyuan's dense models have no `\r`) is left out before merging, as there.
+  * **Checked token for token** against each model's Hugging Face tokenizer, special tokens, contractions,
+    digits, white-space runs, composed and decomposed accents, CJK, emoji and right-to-left text included
+    ([Correctness](#correctness)).
+  * **Speed.** Tokenizing sits on the typing path (prompts are encoded while the user writes). Merges compare token
+    ids through a heap, never strings, so a long piece costs O(n log n). On an Apple M4 Pro a 68 KB text encodes in
+    2.4–3.6 ms (19–28 MB/s, Qwen3, Qwen3.5, Llama 3.2) and an 80 KB conversation full of special tokens in 2.5–3.2 ms.
 * **Prompts are used as given.** Apply the model's chat template in the front end; the app reads it from the GGUF.
 
 ---
@@ -1014,7 +1034,7 @@ KV memory per token for a Llama-3-8B-class shape:
 ### Correctness
 
 Every one of the 24 tensor formats decodes bit-exactly like the GGUF reference decoder, and the tokenizers produce
-the reference token ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
+the Hugging Face tokenizers' ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
 reference implementation with the same argmax at every position. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
 at 98.9% of positions, and the remaining differences are the reference's own second choice. Streamed and in-place
 weights, the file's layouts and the repacked ones, batched and token-by-token prefill, any thread count, and
@@ -1031,6 +1051,30 @@ reference's ids for the whole text. With an F16 KV cache the forward passes agre
 | Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% |
 | Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% |
 | Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% |
+
+**Tokenizers against Hugging Face.** `liyab-tok` compared Liyab's ids with those of each model's own
+`tokenizer.json`, run by the Hugging Face `tokenizers` library (`tools/tokenizer_reference.py`), on three texts:
+`conform_text.txt`, `tokenizer_edge.txt` (contractions in both cases, digit runs, white-space runs, `\r\n`, CJK,
+decomposed Hangul, emoji sequences, composed and decomposed accents, Devanagari, Thai, Hebrew and Arabic with marks,
+code) and `tokenizer_chat.txt` (the chat special tokens of several families in one text). Vocabularies without a
+local model came from the first megabytes of a published GGUF (`tools/gguf_vocab.py`). Every one gave the same ids:
+
+| Tokenizer (`tokenizer.ggml.pre`) | Model | Tokens: conform / edge / chat |
+| :--- | :--- | ---: |
+| SentencePiece | Gemma-3-270m-it | 523 / 801 / 211 |
+| SentencePiece | Phi-3.5-mini-instruct | 644 / 1,053 / 246 |
+| `gpt-2` | GPT-2 | 655 / 1,077 / 276 |
+| `default` (GPT-2 scheme) | Phi-2 | 641 / 1,056 / 276 |
+| `llama-bpe` | Llama-3.2-1B-Instruct | 498 / 797 / 202 |
+| `qwen2` | Qwen2.5-0.5B-Instruct | 524 / 804 / 181 |
+| `qwen2` | Qwen3-0.6B | 524 / 804 / 179 |
+| `qwen35` | Qwen3.5-0.8B | 510 / 790 / 186 |
+| `gpt-4o` | Phi-4-mini-instruct | 484 / 725 / 198 |
+| `deepseek-llm` | DeepSeek-LLM-7B-chat | 618 / 1,013 / 241 |
+| `deepseek-v3` | DeepSeek-V3.1 | 485 / 783 / 215 |
+| `hunyuan` | Hunyuan-MT-7B | 546 / 890 / 204 |
+| `hunyuan` | Hunyuan-A13B-Instruct | 546 / 890 / 204 |
+| `hunyuan-dense` | Hunyuan-0.5B-Instruct | 499 / 818 / 194 |
 
 The quantized KV caches against the same references (Qwen3-4B Q4_K_M against its own F16-cache run), with keys
 stored as computed and with [key scaling](#architecture) (the default), as mean KL and top-1 agreement:
@@ -1107,6 +1151,7 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
+| `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
@@ -1133,6 +1178,20 @@ Benchmarks and tools built with the tests:
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
   build/liyab-kl -m Qwen3-0.6B-BF16.gguf -f tests/data/conform_text.txt --compare qwen3.ref --max-kl 0.01 --min-top1 97
   ```
+* `liyab-tok`: a model's tokenizer on its own, from the full GGUF or a vocabulary-only one. It prints the ids of a
+  text, compares them with reference ids (first difference shown with the pieces around it, exit status 1), or
+  measures encoding speed (`--bench N`). `tools/tokenizer_reference.py` writes the reference from the model's
+  `tokenizer.json` (needs `tokenizers`), and `tools/gguf_vocab.py` writes a vocabulary-only GGUF from the header
+  of a local or published GGUF, read with HTTP range requests, so a tokenizer is checked without downloading
+  weights.
+
+  ```bash
+  tools/gguf_vocab.py --repo bartowski/tencent_Hunyuan-0.5B-Instruct-GGUF \
+      --filename tencent_Hunyuan-0.5B-Instruct-IQ2_M.gguf --out hunyuan.gguf      # ~5 MB of the file
+  tools/tokenizer_reference.py --model tencent/Hunyuan-0.5B-Instruct --text tests/data/tokenizer_edge.txt --out hunyuan.ids
+  build/liyab-tok -m hunyuan.gguf -f tests/data/tokenizer_edge.txt --ids hunyuan.ids
+  ```
+* `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`).
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
 * `LIYAB_GOLDEN_UPDATE=1 test_golden`: records the logit hashes of the kernel set this build runs (CPU architecture and `scalar` / `neon` / `neon+dotprod`), after a change meant to move outputs
   (say why in the commit). A platform with no hashes yet is skipped with a note.
@@ -1197,7 +1256,7 @@ Implemented features are described above. These are next, in order:
    Hugging Face (`liyab-kl`). Next:
    * more block parts described as data (norm placement, RoPE variants such as YaRN, MLA, fused expert tensors),
      then Gemma, Phi, DeepSeek and Hunyuan;
-   * pre-tokenizers from a table instead of code, and the chat template read from the model;
+   * the chat template read from the model;
    * later, multimodal, embedding, reranking and classification models.
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
    and fewer fork/joins per CPU block.
@@ -1237,7 +1296,8 @@ Implemented features are described above. These are next, in order:
 * **Kernels:** TQ1_0 and NVFP4 use a generic decode path on the CPU. Lattice I-quants are 2–3× slower than Q4_K. Only
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
 * **Architectures not supported yet:** Gemma, Phi, DeepSeek V3/V4, fused `ffn_gate_up_exps` tensors and YaRN RoPE
-  scaling. BPE pre-tokenizers beyond those listed are not supported either.
+  scaling. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not supported either (a
+  new one is a table row).
 * **DeltaNet** runs its recurrence token by token on the CPU, also during prefill: no chunked parallel scan or GPU
   kernel yet.
 * **Split GGUF:** dense split models use the older `mmap` streaming window. A split model opened through the system
@@ -1262,13 +1322,15 @@ Implemented features are described above. These are next, in order:
 ```
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
 src/core/               engine, architecture registry and model description, transformer, loader, KV cache and
-                        its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer,
+                        its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
+                        (pre-tokenizer table, regex engine, Unicode tables),
                         sampler, power manager, device detection, thread pool
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, conform_reference.py (Hugging Face references for
-                        liyab-kl), table/vector generators, benchmark and brand image generators
+tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py and
+                        tokenizer_reference.py (Hugging Face references for liyab-kl / liyab-tok), gguf_vocab.py,
+                        table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
 app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), lib/agent (tools),

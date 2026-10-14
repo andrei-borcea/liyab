@@ -50,8 +50,8 @@ PHONE_DIR = "/data/local/tmp/liyab"  # the models
 WORK = PHONE_DIR + "/reg"  # this script's binaries and scratch files
 APP = "com.liyab.chat"
 API_PORT = 8642
-TESTS = ["test_mmap", "test_device_detect", "test_kv_cache", "test_backends", "test_engine", "test_golden",
-         "test_experimental"]
+TESTS = ["test_mmap", "test_device_detect", "test_kv_cache", "test_backends", "test_engine", "test_text",
+         "test_golden", "test_experimental"]
 MAX_TOKENS = 64  # per turn
 # The app's defaults (Settings): CPU, Balanced, 50 °C skin limit, 5500 MiB budget, automatic requantization. Like
 # the app, the CLI keeps what it measures once per model (the KV cache's key scales) in a cache directory (run_cli),
@@ -533,7 +533,7 @@ def main():
                                                                       if os.path.exists(os.path.join(BUILD, t))])
     phone.shell(f"mkdir -p {WORK}/data")
     phone.adb("push", *[os.path.join(BUILD, f) for f in files], WORK, timeout=600)
-    for data in ("quant_vectors.bin", "golden_logits.txt"):
+    for data in ("quant_vectors.bin", "golden_logits.txt", "text_cases.txt"):
         phone.adb("push", os.path.join(ROOT, "tests", "data", data), WORK + "/data")
 
     references = load_json(REFERENCES, {})

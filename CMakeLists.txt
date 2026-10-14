@@ -73,6 +73,9 @@ add_library(liyab_core OBJECT
   src/core/power_manager.cpp
   src/core/kv_cache.cpp
   src/core/triple_buffer_loader.cpp
+  src/core/unicode.cpp
+  src/core/regex.cpp
+  src/core/pre_tokenizer.cpp
   src/core/tokenizer.cpp
   src/core/sampling.cpp
   src/core/architecture.cpp
@@ -258,7 +261,7 @@ endif()
 
 if(LIYAB_BUILD_TESTS)
   enable_testing()
-  set(_liyab_tests test_mmap test_device_detect test_engine test_kv_cache test_backends test_golden)
+  set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()
@@ -278,4 +281,8 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-kl tools/liyab_kl.cpp)
   target_link_libraries(liyab-kl PRIVATE liyab_core)
   target_include_directories(liyab-kl PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # A tokenizer on its own: ids, comparison with reference ids, encoding speed.
+  add_executable(liyab-tok tools/liyab_tok.cpp)
+  target_link_libraries(liyab-tok PRIVATE liyab_core)
+  target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
