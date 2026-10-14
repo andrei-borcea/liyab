@@ -5,7 +5,8 @@
 //
 //  * ArchSpec: the facts about an architecture that its tensors cannot tell
 //    (how RoPE pairs a head's dimensions, which tensor holds the norm before
-//    the FFN, a default the metadata may omit). One row per architecture in
+//    the FFN, where Q/K norms sit relative to RoPE, a default the metadata
+//    may omit). One row per architecture in
 //    architecture.cpp: a model whose blocks are built from parts the engine
 //    already runs needs only its row.
 //  * ModelConfig and one BlockPlan per block: the hyperparameters from the
@@ -38,7 +39,14 @@ enum class RopeLayout : uint8_t {
     Halves,    // (i, i + rope_dim / 2): GPT-NeoX style, the Qwen families
 };
 
-// The facts about one architecture that its tensors cannot tell.
+// Where a block's per-head Q/K norms (attn_q_norm / attn_k_norm) are applied.
+enum class QkNormOrder : uint8_t {
+    BeforeRope,  // normalize, then rotate: Qwen3
+    AfterRope,   // rotate, then normalize: Hunyuan
+};
+
+// The facts about one architecture that its tensors cannot tell. The fields
+// after moe_norm_weights default to a plain pre-norm transformer.
 struct ArchSpec {
     std::string_view name;      // general.architecture, also the prefix of its metadata keys
     RopeLayout rope;
@@ -49,6 +57,7 @@ struct ArchSpec {
     // MoE: whether the top-k router weights are renormalized to sum to 1 when
     // the file has no <arch>.expert_weights_norm.
     bool moe_norm_weights;
+    QkNormOrder qk_norm = QkNormOrder::BeforeRope;
 };
 
 // Every architecture Liyab runs, in registry order.

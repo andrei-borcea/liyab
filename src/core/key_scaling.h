@@ -92,8 +92,12 @@ class KeyRanges {
 public:
     explicit KeyRanges(KeyScalingShape shape);
     // One token of attention block `block`, before RoPE: q [n_head * head_dim]
-    // and k [n_head_kv * head_dim].
-    void add(int32_t block, const float* q, const float* k);
+    // and k [n_head_kv * head_dim]. `q_gain` / `k_gain` (head_dim each,
+    // shared by every head; nullptr: none) multiply each channel after the
+    // rotation: the weights of Q/K norms applied after RoPE, for which the
+    // caller passes q and k already multiplied by their heads' RMS factors.
+    void add(int32_t block, const float* q, const float* k, const float* q_gain = nullptr,
+             const float* k_gain = nullptr);
     // The largest key channel's range over its head's median channel, the
     // largest over all heads: how far the model's keys are from even.
     [[nodiscard]] float outlier_ratio() const;
@@ -102,8 +106,9 @@ public:
     [[nodiscard]] std::vector<float> factors() const;
 
 private:
-    // Folds `heads` unrotated head vectors into their per-channel maxima.
-    void update(const float* rows, int32_t heads, float* max) const;
+    // Folds `heads` unrotated head vectors into their per-channel maxima,
+    // each channel multiplied by |gain| after the rotation (nullptr: 1).
+    void update(const float* rows, int32_t heads, float* max, const float* gain) const;
     KeyScalingShape shape_;
     std::vector<float> key_max_;    // [block][kv head][channel]
     std::vector<float> query_max_;  // [block][query head][channel]

@@ -40,7 +40,9 @@ private:
 };
 
 struct TinyModelSpec {
-    std::string arch = "llama";  // "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3" or "qwen3moe"
+    // Any registered architecture: "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3", "qwen3moe",
+    // "qwen35"/"qwen35moe" (post_attention_norm before the FFN), "hunyuan-dense" (Q/K norms after RoPE)...
+    std::string arch = "llama";
     int32_t n_layers = 2;
     int32_t n_embd = 128;
     int32_t n_ff = 256;
@@ -86,6 +88,10 @@ struct TinyModelSpec {
     // large constant key channels of Qwen2.5 that quantized KV caches round
     // badly); the other weights are unchanged.
     float key_outlier = 0.0f;
+    // qk_norm: > 0 sets two channels of every attn_k_norm weight to
+    // k_norm_outlier (large key channels made by the norm itself, as Qwen3
+    // and Hunyuan have); the other weights are unchanged.
+    float k_norm_outlier = 0.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

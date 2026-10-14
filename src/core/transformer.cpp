@@ -18,10 +18,15 @@ namespace liyab {
 
 namespace {
 
-void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
+// The factor RMSNorm multiplies x by before its weight: 1 / sqrt(mean(x^2) + eps).
+float rms_scale(const float* x, int32_t n, float eps) {
     double ss = 0.0;
     for (int32_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
-    const auto scale = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+    return static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+}
+
+void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
+    const float scale = rms_scale(x, n, eps);
     for (int32_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
 }
 
@@ -940,13 +945,10 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kV], xb_.data(), v_.data(), 1));
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
-        if (!L.k_norm.empty()) {
-            for (int32_t h = 0; h < c.n_head_kv; ++h) {
-                float* kh = k_.data() + static_cast<size_t>(h) * c.head_dim;
-                rmsnorm(kh, L.k_norm.data(), kh, c.head_dim, c.rms_eps);
-            }
-        }
+        const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
+        if (!norm_after_rope) qk_norm(L, nullptr, k_.data());
         rope(k_.data(), c.n_head_kv, pos);
+        if (norm_after_rope) qk_norm(L, nullptr, k_.data());
         scale_keys(L.kv_slot, nullptr, k_.data());
         kv_->store(L.kv_slot, pos, k_.data(), v_.data());
     }
@@ -962,6 +964,49 @@ KeyScalingShape Transformer::key_scaling_shape() const {
     // Transformer::rope: pair i turns by inv_freq_[i] / rope_scale per position.
     for (const float f : inv_freq_) shape.pair_speed.push_back(f / c.rope_scale);
     return shape;
+}
+
+void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
+    const ModelConfig& c = config_;
+    const auto hd = static_cast<size_t>(c.head_dim);
+    if (q != nullptr && !L.q_norm.empty()) {
+        for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
+            rmsnorm(q + h * hd, L.q_norm.data(), q + h * hd, c.head_dim, c.rms_eps);
+        }
+    }
+    if (!L.k_norm.empty()) {
+        for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
+            rmsnorm(k + h * hd, L.k_norm.data(), k + h * hd, c.head_dim, c.rms_eps);
+        }
+    }
+}
+
+void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k) {
+    const ModelConfig& c = config_;
+    const bool after = c.spec->qk_norm == QkNormOrder::AfterRope;
+    if (!after || (L.q_norm.empty() && L.k_norm.empty())) {
+        key_ranges_->add(L.kv_slot, q, k);
+        return;
+    }
+    // Norms after RoPE: a head's stored vector is rope(x) * s * w, s the RMS
+    // factor, the same for every rotation (a rotation keeps the norm). So the
+    // ranges see x * s, unrotated, and the norm weight w as a gain applied
+    // after the rotation (KeyRanges::add).
+    const auto hd = static_cast<size_t>(c.head_dim);
+    auto scaled = [&](const float* x, int32_t heads, bool normed, std::vector<float>& out) {
+        out.assign(x, x + static_cast<size_t>(heads) * hd);
+        if (!normed) return;
+        for (size_t h = 0; h < static_cast<size_t>(heads); ++h) {
+            float* xh = out.data() + h * hd;
+            const float s = rms_scale(xh, c.head_dim, c.rms_eps);
+            for (size_t i = 0; i < hd; ++i) xh[i] *= s;
+        }
+    };
+    std::vector<float> qs, ks;
+    scaled(q, c.n_head, !L.q_norm.empty(), qs);
+    scaled(k, c.n_head_kv, !L.k_norm.empty(), ks);
+    key_ranges_->add(L.kv_slot, qs.data(), ks.data(), L.q_norm.empty() ? nullptr : L.q_norm.data(),
+                     L.k_norm.empty() ? nullptr : L.k_norm.data());
 }
 
 void Transformer::scale_keys(int32_t kv_slot, float* q, float* k) const {
@@ -1052,6 +1097,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
     const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
     const size_t hd = static_cast<size_t>(c.head_dim);
+    const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (gated) qg_.resize(un * 2 * q_dim);
@@ -1077,22 +1123,12 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
         for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
-        if (!L.q_norm.empty()) {
-            for (int32_t h = 0; h < c.n_head; ++h) {
-                float* qh = q + static_cast<size_t>(h) * hd;
-                rmsnorm(qh, L.q_norm.data(), qh, c.head_dim, c.rms_eps);
-            }
-        }
-        if (!L.k_norm.empty()) {
-            for (int32_t h = 0; h < c.n_head_kv; ++h) {
-                float* kh = k + static_cast<size_t>(h) * hd;
-                rmsnorm(kh, L.k_norm.data(), kh, c.head_dim, c.rms_eps);
-            }
-        }
+        if (!norm_after_rope) qk_norm(L, q, k);
         const int32_t pos = n_past_ + static_cast<int32_t>(t);
-        if (key_ranges_ != nullptr) key_ranges_->add(L.kv_slot, q, k);  // unrotated: ranges cover every position
+        if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
         rope(q, c.n_head, pos);
         rope(k, c.n_head_kv, pos);
+        if (norm_after_rope) qk_norm(L, q, k);
         scale_keys(L.kv_slot, q, k);
         kv_->store(L.kv_slot, pos, k, v);
     }

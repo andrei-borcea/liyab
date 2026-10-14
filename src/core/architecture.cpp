@@ -19,6 +19,9 @@ constexpr ArchSpec kArchitectures[] = {
     {"qwen35", RopeLayout::Halves, "post_attention_norm", false},
     {"qwen3moe", RopeLayout::Halves, "ffn_norm", true},
     {"qwen35moe", RopeLayout::Halves, "post_attention_norm", true},
+    // Hunyuan dense (Hunyuan-MT, Hunyuan 0.5B-7B): Q/K norms after RoPE. The
+    // converter folds the dynamic-NTK "alpha" scaling into rope.freq_base.
+    {"hunyuan-dense", RopeLayout::Halves, "ffn_norm", false, QkNormOrder::AfterRope},
 };
 
 }  // namespace

@@ -284,7 +284,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
             if (s.qk_norm) {
                 w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
-                w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, norm_weights(hd));
+                std::vector<float> k_norm = norm_weights(hd);
+                if (s.k_norm_outlier > 0.0f) {
+                    k_norm[static_cast<size_t>(hd / 2 - 1)] = s.k_norm_outlier;
+                    k_norm[static_cast<size_t>(hd - 3)] = s.k_norm_outlier;
+                }
+                w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, k_norm);
             }
         }
         if (a == "qwen2") {
