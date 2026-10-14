@@ -41,11 +41,13 @@ struct EngineConfig {
     int32_t context_length = 0;       // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the training context
     int32_t sliding_window = 0;       // 0: full attention; else attend to the last N tokens
     int32_t kv_sink_tokens = 8;       // with a sliding window: first N tokens stay visible (attention sinks)
-    // Paged KV cache format. Q8_0 (the default) halves F16's memory at a
-    // cost that depends on the model's keys: negligible on Llama 3.2 and the
-    // Qwen3.5 hybrids, measurable on Qwen2.5 / Qwen3, whose keys carry large
-    // outliers (README, Correctness); F16 avoids it. Q4_0 / Q4_1 (INT4,
-    // -72% / -69% vs F16) trade more accuracy for memory on long contexts.
+    // Paged KV cache format. Q8_0 (the default) halves F16's memory. For
+    // models whose keys carry channels far larger than the rest (Qwen2.5,
+    // Qwen3), keys are stored with per-channel scales measured once per model
+    // (see cache_dir), which takes their mean KL against F16 from 0.05-0.07 to
+    // ~0.002; other models keep their keys as computed (README, KV cache). F16
+    // needs no scales. Q4_0 / Q4_1 (INT4, -72% / -69% vs F16) are scaled the
+    // same way and still trade accuracy for memory on long contexts.
     KvCacheType kv_cache_type = KvCacheType::Q8_0;
     // Stream transformer blocks through the triple-buffered loader (3 block
     // buffers: fetch | prepare | execute) instead of reading the mmap in place.
@@ -106,6 +108,13 @@ struct EngineConfig {
     // that processes which ended left behind.
     std::string prefix_cache_dir;
     int64_t prefix_cache_disk_mb = 0;
+    // What the engine measures once per model and keeps, in this directory
+    // (created if missing): today the key scales of a quantized KV cache
+    // (README, KV cache), a few KB per model, at most 16 models, least
+    // recently used out first. Empty: measured again at every load (on the
+    // reference phone 0.27 s for a 4B model, 1.4 s for a 35B MoE whose experts
+    // stream, 7.4 s for a dense 27B larger than RAM).
+    std::string cache_dir;
     // Most drafts per speculative step (k). 3 by default: a verification pass
     // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
     int32_t draft_tokens = 3;

@@ -24,7 +24,9 @@
 // all the mass), the top-1 agreement and both perplexities. --ref-tokens
 // teacher-forces the reference's ids instead of this build's encoding, so a
 // model is measured even while its tokenizer differs. Text is encoded with the
-// model's own BOS rule (tokenizer.ggml.add_bos_token).
+// model's own BOS rule (tokenizer.ggml.add_bos_token). A quantized KV cache
+// stores keys per-channel scaled, as the engine does (core/key_scaling.h);
+// --no-key-scaling stores them as computed, to measure what the scaling saves.
 // The two runs are separate processes: a 35B MoE does not fit twice in RAM.
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS), on the CPU
@@ -66,7 +68,9 @@ int usage() {
                  "usage: liyab-kl -m model.gguf -f text.txt (--save REF | --compare REF)\n"
                  "                [--requant 4|5] [--expert-mass P] [--memory-budget MB] [--expert-cache MB]\n"
                  "                [--experts N] [--threads N] [--max-tokens N (default 512)]\n"
-                 "                [--kv f16|q8_0|q4_0|q4_1 (default q8_0)] [--ref-tokens] [--max-kl KL] [--min-top1 PERCENT]\n"
+                 "                [--kv f16|q8_0|q4_0|q4_1 (default q8_0)] [--no-key-scaling] [--ref-tokens]\n"
+                 "                [--max-kl KL] [--min-top1 PERCENT]\n"
+                 "  --no-key-scaling   quantized caches: store keys as computed, not per-channel scaled\n"
                  "  --ref-tokens       compare on the reference's token ids, not this build's encoding\n"
                  "  --max-kl KL        fail (exit 1) when the mean KL divergence exceeds KL\n"
                  "  --min-top1 P       fail (exit 1) when the top-1 agreement is below P percent\n");
@@ -121,6 +125,7 @@ int main(int argc, char** argv) {
     int32_t max_experts = 0;
     int64_t budget_mb = 0, expert_cache_mb = -1;
     bool ref_tokens = false;
+    bool key_scaling = true;
     liyab::KvCacheType kv_type = liyab::KvCacheType::Q8_0;
     double max_kl = -1.0, min_top1 = -1.0;  // < 0: no gate
     for (int i = 1; i < argc; ++i) {
@@ -138,6 +143,7 @@ int main(int argc, char** argv) {
         else if (arg == "--threads") threads = std::atoi(next());
         else if (arg == "--max-tokens") max_tokens = std::atoi(next());
         else if (arg == "--ref-tokens") ref_tokens = true;
+        else if (arg == "--no-key-scaling") key_scaling = false;
         else if (arg == "--kv") {
             const std::string v = next();
             if (v == "f16") kv_type = liyab::KvCacheType::F16;
@@ -236,6 +242,14 @@ int main(int argc, char** argv) {
     liyab::ThreadPool pool(threads);
     auto cpu = liyab::make_cpu_backend(pool);
     const liyab::Route route{cpu.get(), cpu.get(), cpu.get()};
+    if (key_scaling) {
+        auto calibration = tokenizer->encode(liyab::key_calibration_text(), tokenizer->add_bos_default());
+        const liyab::Status s = calibration ? model->calibrate_keys(*calibration, route, pool) : calibration.status();
+        if (!s.is_ok()) {
+            std::fprintf(stderr, "key calibration: %s\n", s.to_string().c_str());
+            return 1;
+        }
+    }
     const auto vocab = static_cast<size_t>(model->config().n_vocab);
 
     // Teacher-forced pass: position t predicts tokens[t + 1].

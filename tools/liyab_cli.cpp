@@ -212,6 +212,8 @@ void usage() {
                  "                     can spare above 10%% of the experts (default 0)\n"
                  "  --prefix-cache-disk MB DIR  keep such contexts that RAM does not hold in files in DIR,\n"
                  "                     up to MB of storage (default 0: off)\n"
+                 "  --cache-dir DIR    keep what is measured once per model in DIR (the key scales of a\n"
+                 "                     quantized KV cache), so later runs skip it (default: measured each run)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -277,6 +279,7 @@ int main(int argc, char** argv) {
             config.prefix_cache_disk_mb = std::atoll(next());
             config.prefix_cache_dir = next();
         }
+        else if (arg == "--cache-dir") config.cache_dir = next();
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;

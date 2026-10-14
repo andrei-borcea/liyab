@@ -10,6 +10,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <sstream>
 
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
 #include "core/direct_io.h"
+#include "core/key_scaling.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
 #include "liyab/mmap_loader.h"
@@ -43,6 +45,89 @@ using Clock = std::chrono::steady_clock;
 
 double ms_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+// Key scales kept in EngineConfig::cache_dir, one file per model:
+// "keys-<id>.bin" = magic, kKeyScalingVersion, id, count, factors. The id
+// covers what the factors depend on: the model file, the rule's version, the
+// cache format (the measurement runs through it) and the kernel set.
+constexpr char kKeyScalesMagic[4] = {'L', 'Y', 'K', 'S'};
+constexpr size_t kKeptKeyScales = 16;  // files in cache_dir at most, least recently used out first
+
+uint64_t key_scales_id(const Transformer& model) {
+    const uint64_t parts[] = {model_fingerprint(model.file().file()), kKeyScalingVersion,
+                              static_cast<uint64_t>(model.kv_cache().dtype())};
+    const std::string_view isa = quant::kernel_isa();
+    return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+}
+
+std::string key_scales_path(const std::string& dir, uint64_t id) {
+    char name[32];
+    std::snprintf(name, sizeof name, "keys-%016llx.bin", static_cast<unsigned long long>(id));
+    return (std::filesystem::path(dir) / name).string();
+}
+
+// The factors kept at `path` for `id` (empty: the model needs none);
+// nothing when no file was kept or it is damaged (they are then measured again).
+std::optional<std::vector<float>> read_key_scales(const std::string& path, uint64_t id) {
+    std::ifstream in(path, std::ios::binary);
+    char magic[4] = {};
+    uint32_t version = 0;
+    uint64_t stored_id = 0, count = 0;
+    in.read(magic, sizeof magic);
+    in.read(reinterpret_cast<char*>(&version), sizeof version);
+    in.read(reinterpret_cast<char*>(&stored_id), sizeof stored_id);
+    in.read(reinterpret_cast<char*>(&count), sizeof count);
+    if (!in || std::memcmp(magic, kKeyScalesMagic, sizeof magic) != 0 || version != kKeyScalingVersion ||
+        stored_id != id || count > (uint64_t{1} << 24)) {
+        return std::nullopt;
+    }
+    std::vector<float> scales(static_cast<size_t>(count));
+    in.read(reinterpret_cast<char*>(scales.data()), static_cast<std::streamsize>(count * sizeof(float)));
+    if (!in) return std::nullopt;
+    return scales;
+}
+
+// Writes the factors (temporary file, then renamed) and keeps the directory
+// to its kKeptKeyScales most recently used files. Failures only cost a new
+// measurement at the next load: logged, not returned.
+void keep_key_scales(const std::string& dir, uint64_t id, std::span<const float> scales) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = key_scales_path(dir, id);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        const uint32_t version = kKeyScalingVersion;
+        const uint64_t count = scales.size();
+        out.write(kKeyScalesMagic, sizeof kKeyScalesMagic);
+        out.write(reinterpret_cast<const char*>(&version), sizeof version);
+        out.write(reinterpret_cast<const char*>(&id), sizeof id);
+        out.write(reinterpret_cast<const char*>(&count), sizeof count);
+        out.write(reinterpret_cast<const char*>(scales.data()), static_cast<std::streamsize>(scales.size_bytes()));
+        if (!out) {
+            LIYAB_LOG_WARN("keys: cannot write %s", tmp.c_str());
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        LIYAB_LOG_WARN("keys: cannot keep the key scales in %s: %s", dir.c_str(), ec.message().c_str());
+        return;
+    }
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
+    std::filesystem::directory_iterator it(dir, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.starts_with("keys-") && name.ends_with(".bin")) {
+            std::error_code ignored;
+            kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
+        }
+    }
+    if (kept.size() <= kKeptKeyScales) return;
+    std::sort(kept.begin(), kept.end());  // oldest first
+    for (size_t i = 0; i + kKeptKeyScales < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
 }
 
 // Length of the longest prefix of `s` that ends on a UTF-8 character
@@ -522,6 +607,33 @@ struct Engine::Impl {
     }
     [[nodiscard]] Route draft_route() const { return {cpu.get(), cpu.get(), cpu.get()}; }
 
+    // Key scales of a quantized KV cache (core/key_scaling.h): the ones kept
+    // in config.cache_dir for this model, else measured on the CPU, so they
+    // depend on the model and the kernel set only, whatever the backends,
+    // and kept there.
+    Status prepare_key_scales(Transformer& model) {
+        if (!quant::is_block_quantized(model.kv_cache().dtype())) return Status::ok();
+        const uint64_t id = key_scales_id(model);
+        if (!config.cache_dir.empty()) {
+            const std::string path = key_scales_path(config.cache_dir, id);
+            const auto kept = read_key_scales(path, id);
+            if (kept && model.set_key_scales(*kept).is_ok()) {
+                std::error_code ignored;
+                std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ignored);
+                LIYAB_LOG_INFO("keys: %s (%s)", kept->empty() ? "no scaling needed" : "per-channel scales",
+                               path.c_str());
+                return Status::ok();
+            }
+        }
+        auto tokens = tokenizer->encode(key_calibration_text(), tokenizer->add_bos_default());
+        if (!tokens) return tokens.status();
+        const auto start = Clock::now();
+        LIYAB_RETURN_IF_ERROR(model.calibrate_keys(*tokens, draft_route(), *pool));
+        LIYAB_LOG_INFO("keys: calibrated in %.0f ms", ms_since(start));
+        if (!config.cache_dir.empty()) keep_key_scales(config.cache_dir, id, model.key_scales());
+        return Status::ok();
+    }
+
     Status select_backends() {
         std::vector<BackendKind> order = device.backend_order;
         if (config.backend) order = {*config.backend, BackendKind::Cpu};
@@ -798,6 +910,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     auto tokenizer = Tokenizer::load(impl->target->file());
     if (!tokenizer) return tokenizer.status();
     impl->tokenizer.emplace(std::move(tokenizer).value());
+    LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->target));
 
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
         auto draft = load_model(config.draft_model_path, config, max_batch, repack_cpu);
@@ -810,6 +923,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         impl->target->set_rollback_window(config.draft_tokens + 1);
         draft.value()->set_rollback_window(config.draft_tokens + 1);
         impl->draft = std::move(draft).value();
+        LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->draft));  // same vocabulary: the target's tokenizer
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
     } else if (config.lookup_drafts && config.draft_tokens > 0) {
         impl->target->set_rollback_window(config.draft_tokens + 1);
@@ -837,8 +951,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
                        static_cast<double>(impl->tdss->dense_bytes()) / (1024.0 * 1024.0));
     }
     if (!x.kv_dedup_dir.empty()) {
+        // Snapshots hold keys as stored, so they are keyed by the key scales too.
+        const std::span<const float> scales = impl->target->key_scales();
         auto dedup = experimental::KvDedup::create(
-            x.kv_dedup_dir, experimental::model_fingerprint(impl->target->file().file()));
+            x.kv_dedup_dir, xxhash64(scales.data(), scales.size_bytes(), model_fingerprint(impl->target->file().file())));
         if (!dedup) return dedup.status();
         impl->kv_dedup = std::move(dedup).value();
     }

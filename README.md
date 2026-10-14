@@ -110,7 +110,7 @@ These rules decide what goes into the code:
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
 | CPU backend: NEON + SDOT; i8mm (SMMLA) layouts for Q4_K/Q5_K/Q6_K/Q8_0; WFE-waiting thread pool with chunks claimed on demand | ✅ |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
-| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1), sliding window with attention sinks, grouped-query attention over spans | ✅ |
+| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
@@ -230,6 +230,34 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   positions, merged in order with log-sum-exp. While decoding, the spans of the one token are the tasks every
   thread shares (168 on two KV heads, an even split for 1 to 4 and 6 to 8 threads). The cut follows the token's own
   position, never the batch or the threads, so its attention is the same bits however the prompt was split.
+* **Key scaling for quantized KV caches.** A quantized cache stores each key row in blocks of 32 values that share
+  one scale, set by the block's largest value. Some model families carry a few key channels far larger than the
+  rest and nearly constant across tokens: about −130 where the others are about 1 on Qwen2.5, up to ~300 on Qwen3.
+  The small values sharing their block were then rounded with a step a hundred times too coarse, and almost all of
+  a Q8_0 cache's error came from there. Attention only needs q·k, and q·k = (q∘t)·(k/t) for any positive
+  per-channel t, so keys are stored divided by t and queries multiplied by it. Each channel then has the same range
+  on both sides and the products are unchanged.
+  * **Measured once per model**, on a short fixed text (about 45 tokens: prose, code, numbers, several scripts).
+    For each channel, t takes the largest value the keys and queries reach at any position up to 32,768: RoPE turns
+    each pair of channels by a known angle per position, so that range is exact even though the text covers only a
+    few positions. Ranges are floored at a quarter of their head's median and t is bounded, so a channel the text
+    barely reached cannot get an extreme factor.
+  * **Only where it helps.** A model is scaled when some head's largest key channel reaches 12 times its median
+    channel: Qwen3-0.6B 107×, Qwen3-4B 87×, Qwen2.5-0.5B 52×. Below that (Qwen3.5-0.8B 10.5×, the Qwen3.6-35B
+    MoE 7.4×, Qwen3.5-4B 7.5×, Llama 3.2 6.3×) scaling moved the KL against F16 only within noise, sometimes up,
+    so those models keep their keys as computed, bit for bit. The first 12 tokens decide for most models; the
+    rest of the text is processed only for those that need factors.
+  * **Cost.** On the phone: 0.27 s for Qwen3.5-4B, 1.4 s for the 35B MoE (its experts are read from storage), 7.4
+    s for a dense 27B larger than RAM, 1.4 s for Qwen3-4B, which is scaled. `EngineConfig::cache_dir` keeps the
+    result (a few KB per model, the 16 most recently used models), so only a model's first load pays for it. The
+    factors depend only on the model, the cache format and the kernel set, never on the backends or the configured
+    context, so a prompt gets the same reply in every process. With the factors kept, speed is unchanged (A/B on
+    the phone, 35B: decode 10.2 vs 10.0 tok/s, first token 5.8 vs 6.0 s).
+  * **Saved contexts** carry the factors their keys were stored with; one saved with others (or before key scaling
+    existed) is converted when loaded instead of being processed again.
+
+  Measured against F16 ([Correctness](#correctness)): Q8_0 keys went from a mean KL of 0.070 to 0.0018 on
+  Qwen2.5, 0.051 to 0.0021 on Qwen3-0.6B and 0.015 to 0.0063 on Qwen3-4B, with the same memory and kernels.
 * **Thread pool.** Workers wait for the next job in `WFE` on ARM64: the core sleeps until the job word changes, with
   no instructions issued, instead of spinning at full clock. They block on a condition variable after 300 µs idle. A
   job is split into 4 chunks per thread, claimed on demand, so a preempted core does not hold up a whole matmul.
@@ -378,7 +406,9 @@ each of those as a scheduling problem.
   models the file also keeps two state snapshots, the oldest and the last prompt's end (62.8 MiB each on the 35B), so
   a restored context rewinds where the live one would. The next prompt re-sends the last reply as text, which may
   encode differently from the tokens generated; without that snapshot the whole conversation was processed again
-  (a 1,436-token chat: 60 s to the first token).
+  (a 1,436-token chat: 60 s to the first token). The file also records the key scales its KV pages were stored with;
+  a context saved with other scales, or before key scaling existed, has its keys converted when loaded, so an
+  upgrade does not process saved conversations again.
 * **Giving memory back.** `trim_memory()` empties the expert cache while idle; the model and its context stay
   loaded. Its hot list survives: `warm_memory()` refills the cache in one background pass of large reads (~0.7 s for
   2.4 GB), and `save_expert_profile()` / `load_expert_profile()` carry the list to a later process.
@@ -526,6 +556,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 * the backend, threads and power profile;
 * the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
+* `cache_dir`, where what is measured once per model is kept (the KV cache's key scales);
 * KV type, sliding window and sinks;
 * speculative decoding;
 * the MoE trade-offs;
@@ -628,6 +659,7 @@ liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced cont
 liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
+liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
 liyab-cli -m model.gguf -p "$TURN1" --then "$TURN2"           # a follow-up turn that reuses the context, as a chat does
 liyab-cli -m model.gguf -p "..." --json                     # one JSON line per turn (stats, peak RSS, reply) for scripts
 liyab-cli --help                                            # every option
@@ -993,15 +1025,27 @@ the phone, nine runs of the same chat on the 35B gave the same greedy replies, a
 float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every tokenizer gave the
 reference's ids for the whole text. With an F16 KV cache the forward passes agree:
 
-| Model (architecture) | Tokens | Mean KL | Top-1 agreement | With the default Q8_0 KV cache |
-| :--- | ---: | ---: | ---: | :--- |
-| Llama-3.2-1B-Instruct (`llama`) | 499 | 0.00000 | 99.80% | KL 0.0009, top-1 97.2% |
-| Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% | KL 0.070, top-1 86.9% |
-| Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% | KL 0.051, top-1 88.6% |
-| Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% | KL 0.00007, top-1 99.2% |
+| Model (architecture) | Tokens | Mean KL | Top-1 agreement |
+| :--- | ---: | ---: | ---: |
+| Llama-3.2-1B-Instruct (`llama`) | 499 | 0.00000 | 99.80% |
+| Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% |
+| Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% |
+| Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% |
 
-The Q8_0 KV cache costs little on Llama and the Qwen3.5 hybrids but measurably on Qwen2.5 and Qwen3, whose keys
-carry large outliers (Qwen2.5's key biases reach 130); `--kv f16` avoids it at twice the KV memory.
+The quantized KV caches against the same references (Qwen3-4B Q4_K_M against its own F16-cache run), with keys
+stored as computed and with [key scaling](#architecture) (the default), as mean KL and top-1 agreement:
+
+| Model (largest key channel / median) | Q8_0, keys as computed | Q8_0, default | Q4_1, keys as computed | Q4_1, default |
+| :--- | ---: | ---: | ---: | ---: |
+| Qwen2.5-0.5B-Instruct (52×, scaled) | 0.070, 86.9% | 0.0018, 97.7% | 2.51, 29.2% | 0.47, 63.2% |
+| Qwen3-0.6B (107×, scaled) | 0.051, 88.7% | 0.0021, 97.9% | 3.23, 19.6% | 0.11, 81.2% |
+| Qwen3-4B Q4_K_M (87×, scaled) | 0.015, 94.3% | 0.0063, 96.3% | 0.63, 69.5% | 0.10, 87.1% |
+| Llama-3.2-1B-Instruct (6.3×, as computed) | 0.00090, 97.2% | same | 0.078, 79.7% | same |
+| Qwen3.5-0.8B (10.5×, as computed) | 0.00007, 99.2% | same | 0.010, 92.5% | same |
+
+What remains on Qwen3-4B is the 8-bit rounding itself: rounding only its values to Q8_0 costs as much as rounding
+only its scaled keys. Measured on the phone the same way, Q8_0 costs Qwen3.5-4B 0.0019 (97.0%) and the Qwen3.6-35B
+MoE 0.0056 (95.7%), whose keys need no scaling. `--kv f16` removes the remaining difference at twice the KV memory.
 
 ### Charts
 
@@ -1063,8 +1107,8 @@ downloaded.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves; prefix cache in RAM and on storage; cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
-| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations; speculative decoding; Metal vs CPU; C API |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1076,7 +1120,8 @@ Benchmarks and tools built with the tests:
 * `liyab-kl`: teacher-forced next-token distributions compared against a reference, for two uses.
   * **The price of a lossy option.** It saves the distributions from the lossless path, then reports KL divergence,
     top-1 agreement and perplexity for a lossy run. The two runs are separate processes, so a model that fills the
-    RAM fits once.
+    RAM fits once. A quantized KV cache stores keys scaled, as the engine does; `--no-key-scaling` stores them
+    as computed, to measure what the scaling saves.
   * **Conformance with another implementation.** `tools/conform_reference.py` writes the same reference from
     Hugging Face transformers (needs `torch` and `transformers`). The comparison first checks that the text encodes
     into the same token ids, printing the first difference, then measures the forward pass; `--max-kl` and
@@ -1124,14 +1169,16 @@ scripts/phone_regression.py --accept                        # after an intended 
 ```
 
 * **Same settings.** The CLI runs with the app's defaults (CPU, Balanced, 5,500 MiB, automatic requantization), so
-  the two compare directly. The log records whether the app had all the cores (its cpuset), because Android
+  the two compare directly. Like the app, it keeps the KV cache's key scales in a cache directory, so only a
+  model's first run measures them. The log records whether the app had all the cores (its cpuset), because Android
   confines background apps.
 * **History.** Every run is appended to `tests/device/runs.jsonl`, with its commit. The CLI numbers are the medians
   of three runs (`--repeat`), and each number is compared with the median of the five runs before it. A change
   counts only beyond a tolerance, so a warmer phone does not raise alarms. The references live in
   `tests/device/references.json`. The exit status is 1 when a test failed, a reply changed or a number got worse.
-  On the reference phone the 35B's chat measures, in the CLI: first token 5.2 s (a 180-token prompt), follow-up first
-  token 1.5–1.6 s, decode ~10 tok/s, peak RSS 4.7 GB.
+  On the reference phone the 35B's chat measures, in the CLI: first token 5.0–5.2 s (a 180-token prompt), follow-up
+  first token 1.5–1.6 s (27 new tokens), decode ~10.3 tok/s, peak RSS 4.6–4.7 GB; Qwen3.5-4B: first token ~4 s,
+  follow-up 0.75–0.84 s, decode ~11.9 tok/s in the CLI and 14–16 tok/s in the app, peak RSS 2.9 GB.
 * **Never in the way.** The phone is someone's phone, so the run waits while its screen is on. It also waits, before
   a CLI run, while the app holds a model in RAM, and it waits for the battery to cool down before each measurement.
   If the phone is picked up or unplugged mid-step, the step stops at once (a request to the app is closed, which ends
@@ -1214,9 +1261,9 @@ Implemented features are described above. These are next, in order:
 
 ```
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
-src/core/               engine, architecture registry and model description, transformer, loader, KV cache,
-                        expert store, direct I/O, triple buffer, quant kernels, tokenizer, sampler, power
-                        manager, device detection, thread pool
+src/core/               engine, architecture registry and model description, transformer, loader, KV cache and
+                        its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer,
+                        sampler, power manager, device detection, thread pool
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation

@@ -82,6 +82,10 @@ struct TinyModelSpec {
     // MoE: expert_weights_norm metadata: 1 true, 0 false, -1 absent (the
     // architecture's default applies).
     int32_t expert_weights_norm = 1;
+    // qwen2: > 0 sets two key-bias channels per KV head to +-key_outlier (the
+    // large constant key channels of Qwen2.5 that quantized KV caches round
+    // badly); the other weights are unchanged.
+    float key_outlier = 0.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

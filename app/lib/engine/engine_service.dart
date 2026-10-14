@@ -25,6 +25,7 @@ class LoadOptions {
     this.powerProfile = LiyabPowerProfile.balanced,
     this.prefixCacheDir,
     this.prefixCacheDiskMb = 0,
+    this.cacheDir,
     this.experimental = const {},
   });
 
@@ -41,6 +42,10 @@ class LoadOptions {
   /// goes on (its prefix cache on storage, no RAM spent), and how much storage it may use for them (0: off).
   final String? prefixCacheDir;
   final int prefixCacheDiskMb;
+
+  /// Where the engine keeps what it measures once per model (the key scales of its KV cache, a few KB each), so
+  /// later loads skip the measurement; null: measured at every load.
+  final String? cacheDir;
 
   /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson (plus 'kvDedupDir');
   /// absent keys keep the engine's defaults.
@@ -316,7 +321,7 @@ class EngineService {
     _engine = 0;
     final r = await _call<List<Object?>>(
         ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile,
-          o.prefixCacheDir, o.prefixCacheDiskMb]);
+          o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir]);
     _engine = r[0] as int;
     final plan = r[4] as List<Object?>;
     return LoadedModel(
@@ -452,6 +457,8 @@ void _worker(SendPort replies) {
               ..prefixCacheDiskMb = m[10] as int;
             final prefixDir = m[9] as String?;
             if (prefixDir != null) config.ref.prefixCacheDir = prefixDir.toNativeUtf8(allocator: arena);
+            final cacheDir = m[11] as String?;
+            if (cacheDir != null) config.ref.cacheDir = cacheDir.toNativeUtf8(allocator: arena);
             _applyExperimental(config.ref, m[7] as Map<String, Object?>, arena);
             final out = arena<Pointer<Void>>();
             final watch = Stopwatch()..start();

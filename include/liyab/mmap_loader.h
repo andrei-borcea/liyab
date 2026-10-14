@@ -210,6 +210,13 @@ private:
     std::atomic<uint64_t> prefetched_bytes_{0};
 };
 
+// xxHash64 (Yann Collet's XXH64).
+LIYAB_API uint64_t xxhash64(const void* data, size_t length, uint64_t seed = 0) noexcept;
+// Fingerprint of a model file: size + hash of its first MiB (GGUF header,
+// metadata and tensor table, which change whenever the weights do). Keys what
+// the engine derives once per model and keeps on storage.
+LIYAB_API uint64_t model_fingerprint(const MappedFile& file) noexcept;
+
 // Physical memory the process can still use without being killed, in bytes.
 LIYAB_API uint64_t available_memory_bytes() noexcept;
 

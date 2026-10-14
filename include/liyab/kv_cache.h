@@ -71,6 +71,12 @@ public:
     [[nodiscard]] const uint8_t* k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     [[nodiscard]] const uint8_t* v_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
 
+    // Multiplies channel c of the keys of positions [0, end) of layer l, KV
+    // head h by factors[(l * n_head_kv + h) * head_dim + c], requantizing each
+    // row (a saved context brought to other per-channel key scales). Owned
+    // pages only: InvalidArgument when a position's page is unmapped or
+    // external, or for the wrong number of factors.
+    Status scale_keys(int32_t end, std::span<const float> factors);
     // Forgets positions >= n (rollback). Fails when a query at n would need
     // positions whose pages were already released.
     Status truncate(int32_t n);

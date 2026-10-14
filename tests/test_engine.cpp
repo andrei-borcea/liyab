@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1095,6 +1097,229 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
         CHECK(message.find("'gemma2'") != std::string::npos);
         for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Key scaling for quantized KV caches (core/key_scaling.h)
+// ---------------------------------------------------------------------------
+TEST_CASE("Key ranges: outlier channels get large factors, ordinary ones stay near 1, all bounded; even keys get none") {
+    KeyScalingShape shape;
+    shape.blocks = 1;
+    shape.n_head = 2;
+    shape.n_head_kv = 1;
+    shape.head_dim = 32;
+    shape.rope_dim = 32;
+    shape.rope = RopeLayout::Halves;
+    shape.positions = 1000;
+    shape.pair_speed.assign(16, 0.0f);  // no pair turns: each channel keeps its own range
+    shape.pair_speed[2] = 1.0f;         // pair 2 = channels (2, 18) turns fully over the context
+    KeyRanges ranges(shape);
+    std::mt19937 rng(5);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (int t = 0; t < 20; ++t) {
+        std::vector<float> q(64), k(32);
+        for (float& x : q) x = normal(rng);
+        for (float& x : k) x = normal(rng);
+        k[5] = 100.0f;   // a large constant key channel
+        k[2] = 50.0f;    // another, in a pair that turns: channel 18 reaches it too
+        k[9] = 1e7f;     // beyond the clamp
+        q[7] = q[32 + 7] = 0.0f;  // a query channel never reached: floored, not infinite
+        ranges.add(0, q.data(), k.data());
+    }
+    const std::vector<float> t = ranges.factors();
+    REQUIRE(t.size() == 32);
+    CHECK(t[5] > 5.0f);
+    CHECK(t[2] > 3.0f && std::fabs(t[18] - t[2]) < 0.5f);
+    CHECK(t[9] == kMaxKeyScale);
+    CHECK(std::isfinite(t[7]) && t[7] <= 4.0f);
+    for (const int i : {0, 1, 3, 10, 20, 31}) CHECK(t[i] > 0.4f && t[i] < 2.5f);
+    for (const float f : t) CHECK(f >= 1.0f / kMaxKeyScale && f <= kMaxKeyScale);
+    CHECK(ranges.outlier_ratio() >= kOutlierRatio);
+
+    // Keys without such channels: nothing to fix, every factor stays 1.
+    KeyRanges even(shape);
+    for (int t2 = 0; t2 < 20; ++t2) {
+        std::vector<float> q(64), k(32);
+        for (float& x : q) x = normal(rng);
+        for (float& x : k) x = normal(rng);
+        even.add(0, q.data(), k.data());
+    }
+    CHECK(even.outlier_ratio() < kOutlierRatio);
+    const std::vector<float> ones = even.factors();
+    CHECK(std::all_of(ones.begin(), ones.end(), [](float f) { return f == 1.0f; }));
+}
+
+namespace {
+
+// Logits of every position of a fixed sequence (Logits::All) through `model`.
+std::vector<float> all_logits(Transformer& model, ThreadPool& pool) {
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens = {1};
+    for (int32_t i = 1; i < 40; ++i) tokens.push_back(3 + (i * 53) % (model.config().n_vocab - 3));
+    model.reset();
+    auto out = model.forward(tokens, Transformer::Logits::All, route, pool);
+    return out ? std::vector<float>(out->begin(), out->end()) : std::vector<float>();
+}
+
+std::vector<int32_t> calibration_tokens(const Transformer& model) {
+    std::vector<int32_t> tokens = {1};
+    for (int32_t i = 1; i < 48; ++i) tokens.push_back(3 + (i * 29) % (model.config().n_vocab - 3));
+    return tokens;
+}
+
+test::TinyModelSpec outlier_spec() {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen2";
+    spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+    spec.key_outlier = 60.0f;
+    return spec;
+}
+
+}  // namespace
+
+TEST_CASE("Key scaling brings a quantized KV cache close to F16 on keys with large channels") {
+    const std::string& path = model_path("key_outlier", outlier_spec());
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    TransformerOptions f16;
+    f16.kv_type = KvCacheType::F16;
+    auto reference = load_transformer(path, f16);
+    TransformerOptions q8;
+    q8.kv_type = KvCacheType::Q8_0;
+    auto plain = load_transformer(path, q8);
+    auto scaled = load_transformer(path, q8);
+    REQUIRE(reference && plain && scaled);
+    REQUIRE(scaled->calibrate_keys(calibration_tokens(*scaled), route, pool).is_ok());
+    REQUIRE(scaled->key_scales().size() ==
+            static_cast<size_t>(scaled->config().n_layers * scaled->config().n_head_kv * scaled->config().head_dim));
+    // F16 caches need no factors, nor do keys without large channels.
+    REQUIRE(reference->calibrate_keys(calibration_tokens(*reference), route, pool).is_ok());
+    CHECK(reference->key_scales().empty());
+    TransformerOptions q8_even;
+    q8_even.kv_type = KvCacheType::Q8_0;
+    auto even = load_transformer(f32_model(), q8_even);
+    REQUIRE(even);
+    REQUIRE(even->calibrate_keys(calibration_tokens(*even), route, pool).is_ok());
+    CHECK(even->key_scales().empty());
+
+    const std::vector<float> want = all_logits(*reference, pool);
+    const std::vector<float> got_plain = all_logits(*plain, pool);
+    const std::vector<float> got_scaled = all_logits(*scaled, pool);
+    REQUIRE(!want.empty() && got_plain.size() == want.size() && got_scaled.size() == want.size());
+    const double err_plain = max_abs_diff(got_plain, want);
+    const double err_scaled = max_abs_diff(got_scaled, want);
+    std::printf("  Q8_0 KV vs F16: max logit error %.4f plain, %.4f with key scaling\n", err_plain, err_scaled);
+    CHECK(err_scaled * 4 < err_plain);
+
+    // set_key_scales: the same factors give the same bits; wrong ones are refused.
+    auto again = load_transformer(path, q8);
+    REQUIRE(again);
+    REQUIRE(again->set_key_scales(scaled->key_scales()).is_ok());
+    const std::vector<float> got_again = all_logits(*again, pool);
+    CHECK(got_again == got_scaled);
+    std::vector<float> bad(scaled->key_scales().begin(), scaled->key_scales().end());
+    CHECK(again->set_key_scales(std::span<const float>(bad).first(bad.size() - 1)).code() == ErrorCode::InvalidArgument);
+    bad[0] = 0.0f;
+    CHECK(again->set_key_scales(bad).code() == ErrorCode::InvalidArgument);
+    CHECK(reference->set_key_scales(scaled->key_scales()).code() == ErrorCode::InvalidArgument);  // F16 cache
+}
+
+TEST_CASE("A saved context is converted to the key scales in use when it was stored with others") {
+    const std::string& path = model_path("key_outlier", outlier_spec());
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    TransformerOptions q8;
+    q8.kv_type = KvCacheType::Q8_0;
+    auto scaled = load_transformer(path, q8);
+    auto plain = load_transformer(path, q8);
+    REQUIRE(scaled && plain);
+    REQUIRE(scaled->calibrate_keys(calibration_tokens(*scaled), route, pool).is_ok());
+    std::vector<int32_t> prompt = {1};
+    for (int32_t i = 1; i < 30; ++i) prompt.push_back(3 + (i * 31) % (scaled->config().n_vocab - 3));
+    const std::vector<int32_t> next = {270, 300};
+    // Saved without scales (as before them), loaded with: converted, then
+    // close to the scaled model's own continuation.
+    REQUIRE(plain->forward(prompt, Transformer::Logits::None, route, pool).has_value());
+    std::stringstream without;
+    REQUIRE(plain->write_state(without).is_ok());
+    REQUIRE(scaled->forward(prompt, Transformer::Logits::None, route, pool).has_value());
+    auto own = scaled->forward(next, Transformer::Logits::All, route, pool);
+    REQUIRE(own.has_value());
+    const std::vector<float> want(own->begin(), own->end());
+    REQUIRE(scaled->read_state(without).is_ok());
+    CHECK(scaled->n_past() == static_cast<int32_t>(prompt.size()));
+    auto converted = scaled->forward(next, Transformer::Logits::All, route, pool);
+    REQUIRE(converted.has_value());
+    const double err = max_abs_diff(*converted, want);
+    std::printf("  converted context vs the scaled model's own: max logit error %.4f\n", err);
+    CHECK(err < 0.25);
+    // Saved with scales, loaded with the same: bit for bit.
+    scaled->reset();
+    REQUIRE(scaled->forward(prompt, Transformer::Logits::None, route, pool).has_value());
+    std::stringstream with;
+    REQUIRE(scaled->write_state(with).is_ok());
+    REQUIRE(scaled->read_state(with).is_ok());
+    auto same = scaled->forward(next, Transformer::Logits::All, route, pool);
+    REQUIRE(same.has_value());
+    CHECK(std::vector<float>(same->begin(), same->end()) == want);
+}
+
+TEST_CASE("Key scales are measured once and kept in cache_dir: the same replies, damaged files measured again") {
+    const std::string dir = temp_path("engine_cache");
+    std::filesystem::remove_all(dir);
+    EngineConfig config = engine_config(model_path("key_outlier", outlier_spec()));
+    config.backend = BackendKind::Cpu;
+    auto reply = [](const EngineConfig& c) {
+        auto e = Engine::create(c);
+        std::string text;
+        if (!e) return std::string("<error>");
+        auto st = e.value()->generate("hello world", greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        return st ? text : std::string("<error>");
+    };
+    const std::string measured = reply(config);  // no cache_dir: measured at load
+    config.cache_dir = dir;
+    CHECK(reply(config) == measured);  // measured and kept
+    std::vector<std::filesystem::path> kept;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) kept.push_back(entry.path());
+    REQUIRE(kept.size() == 1);
+    CHECK(kept[0].filename().string().starts_with("keys-"));
+    CHECK(reply(config) == measured);  // read back
+    {
+        std::ofstream damaged(kept[0], std::ios::binary | std::ios::trunc);
+        damaged << "not key scales";
+    }
+    CHECK(reply(config) == measured);  // measured again, and kept again
+    CHECK(std::filesystem::file_size(kept[0]) > 64);
+    // At most 16 models' files: the least recently used go.
+    for (int i = 0; i < 20; ++i) {
+        std::ofstream(dir + "/keys-old" + std::to_string(i) + ".bin") << "x";
+        std::filesystem::last_write_time(dir + "/keys-old" + std::to_string(i) + ".bin",
+                                         std::filesystem::file_time_type::clock::now() - std::chrono::hours(1 + i));
+    }
+    std::filesystem::remove(kept[0]);
+    CHECK(reply(config) == measured);
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) files += entry.path().filename() == kept[0].filename() ? 100 : 1;
+    CHECK(files == 100 + 15);  // this model's file kept, 15 of the old ones
+    // A model whose keys need no scaling keeps that result too (no factors),
+    // so its later loads measure nothing either.
+    std::filesystem::remove_all(dir);
+    EngineConfig even = engine_config(f32_model());
+    even.backend = BackendKind::Cpu;
+    even.cache_dir = dir;
+    const std::string plain = reply(even);
+    std::vector<std::filesystem::path> none;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) none.push_back(entry.path());
+    REQUIRE(none.size() == 1);
+    CHECK(std::filesystem::file_size(none[0]) == 24);  // header only: magic, version, id, count 0
+    CHECK(reply(even) == plain);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {

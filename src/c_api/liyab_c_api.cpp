@@ -190,6 +190,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->prefix_cache_mb = d.prefix_cache_mb;
     config->prefix_cache_dir = nullptr;
     config->prefix_cache_disk_mb = d.prefix_cache_disk_mb;
+    config->cache_dir = nullptr;
     config->early_exit = d.experimental.early_exit ? 1 : 0;
     config->early_exit_threshold = d.experimental.early_exit_threshold;
     config->head_pruning = d.experimental.head_pruning ? 1 : 0;
@@ -251,6 +252,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.prefix_cache_mb = config->prefix_cache_mb;
         if (config->prefix_cache_dir != nullptr) c.prefix_cache_dir = config->prefix_cache_dir;
         c.prefix_cache_disk_mb = config->prefix_cache_disk_mb;
+        if (config->cache_dir != nullptr) c.cache_dir = config->cache_dir;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

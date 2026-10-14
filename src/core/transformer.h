@@ -24,6 +24,7 @@
 
 #include "core/architecture.h"
 #include "core/expert_store.h"
+#include "core/key_scaling.h"
 #include "core/quant.h"
 #include "liyab/backend.h"
 #include "liyab/experimental/forward_hooks.h"
@@ -214,18 +215,34 @@ public:
     // blocks or at position 0.
     void snapshot_state(bool pin = false);
     static constexpr int32_t kStateSnapshots = 4;
+    // Quantized KV caches: per-channel key scaling (core/key_scaling.h).
+    // Measures the factors on `tokens` (key_calibration_text(), encoded) and
+    // uses them from then on. Forgets the context. With an F16 cache or no
+    // attention block there is nothing to measure and no factors are set.
+    Status calibrate_keys(std::span<const int32_t> tokens, const Route& route, ThreadPool& pool);
+    // The factors in use, KeyScalingShape order; empty: keys stored as computed.
+    [[nodiscard]] std::span<const float> key_scales() const noexcept { return key_scale_; }
+    // Uses factors calibrate_keys() measured earlier on this model (e.g. in
+    // another process); empty turns scaling off. The context must be empty.
+    // InvalidArgument for the wrong count, a factor outside
+    // [1/kMaxKeyScale, kMaxKeyScale], a quantized-cache-only call on an F16
+    // cache, or a non-empty context.
+    Status set_key_scales(std::span<const float> scales);
     // Writes what the context holds (n_past(), the KV pages of positions
-    // [0, n_past()), the recurrent states and, below n_past(), the oldest and
-    // the pinned state snapshots) with a fingerprint of the model and
-    // the cache settings, so read_state() accepts it only for the same model
-    // file loaded the same way. Unsupported with a sliding window (released
-    // positions are gone). IoError when the stream fails.
+    // [0, n_past()), the key scales they were stored with, the recurrent
+    // states and, below n_past(), the oldest and the pinned state snapshots)
+    // with a fingerprint of the model and the cache settings, so read_state()
+    // accepts it only for the same model file loaded the same way.
+    // Unsupported with a sliding window (released positions are gone).
+    // IoError when the stream fails.
     Status write_state(std::ostream& out) const;
     // Replaces the context with one write_state() saved, its snapshots
     // included (truncate() returns to them as in the context that was saved),
     // and takes a state snapshot at its end (pinned unless a saved one is).
-    // Reads the format without snapshots too. InvalidArgument when the
-    // fingerprint differs; the context is empty after any failure.
+    // Reads the formats without snapshots or key scales too. Keys stored with
+    // other scales than the ones in use (an older file: none) are converted
+    // to them. InvalidArgument when the fingerprint differs; the context is
+    // empty after any failure.
     Status read_state(std::istream& in);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
@@ -323,6 +340,11 @@ private:
     Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, size_t reserve, int32_t requant_bits,
                                bool repack);
     void attention(int32_t kv_slot, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    [[nodiscard]] KeyScalingShape key_scaling_shape() const;
+    // Divides one token's keys (n_head_kv heads) by the key scales of
+    // attention block `kv_slot` and multiplies its queries (n_head heads;
+    // nullptr: none) by them. No-op without scales.
+    void scale_keys(int32_t kv_slot, float* q, float* k) const;
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
@@ -383,6 +405,8 @@ private:
     float skip_slow_ = 0.0f;            // TransformerOptions::skip_slow
     std::vector<int32_t> experts_kept_;  // per token of the current batch: top-k ranks run
     std::vector<float> inv_freq_;  // per rotary pair, includes rope_freqs factors
+    std::vector<float> key_scale_;          // per (attention block, KV head, channel); empty: none
+    std::unique_ptr<KeyRanges> key_ranges_;  // while calibrate_keys() runs
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;

@@ -474,7 +474,8 @@ namespace {
 
 constexpr uint32_t kStateMagic = 0x5453594C;  // "LYST"
 // 2: the recurrent-state snapshots follow the states (1 had none).
-constexpr uint32_t kStateVersion = 2;
+// 3: the key scales the pages were stored with follow the fingerprint.
+constexpr uint32_t kStateVersion = 3;
 
 template <typename T>
 void put(std::ostream& out, const T& v) {
@@ -501,6 +502,9 @@ Status Transformer::write_state(std::ostream& out) const {
     put(out, kStateMagic);
     put(out, kStateVersion);
     for (const int64_t v : state_fingerprint()) put(out, v);
+    put(out, static_cast<uint64_t>(key_scale_.size()));
+    out.write(reinterpret_cast<const char*>(key_scale_.data()),
+              static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
     put(out, n_past_);
     const int32_t pages = (n_past_ + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
     put(out, static_cast<uint64_t>(kv_->page_bytes()));
@@ -554,6 +558,18 @@ Status Transformer::read_state(std::istream& in) {
             return fail(ErrorCode::InvalidArgument, "the state was saved for another model or other cache settings");
         }
     }
+    // Key scales the pages were stored with (none before version 3).
+    std::vector<float> stored;
+    if (version >= 3) {
+        uint64_t count = 0;
+        if (!get(in, count) || (count != 0 && count != key_scaling_shape().factors())) {
+            return fail(ErrorCode::InvalidArgument, "the state's key scales do not match");
+        }
+        stored.resize(static_cast<size_t>(count));
+        if (!in.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(count * sizeof(float)))) {
+            return fail(ErrorCode::IoError, "the state's key scales are truncated");
+        }
+    }
     int32_t n = 0, pages = 0;
     uint64_t page_bytes = 0;
     if (!get(in, n) || !get(in, page_bytes) || !get(in, pages) || n < 0 || n > context_length_ ||
@@ -566,6 +582,17 @@ Status Transformer::read_state(std::istream& in) {
         if (data == nullptr || !in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(page_bytes))) {
             return fail(ErrorCode::IoError, "the state's cache pages are truncated");
         }
+    }
+    // Keys stored with other scales (an older file: none, i.e. 1) are brought
+    // to the ones in use: k_now = k_stored * t_stored / t_now, requantized. The
+    // values and the rest of the context are unchanged.
+    if (stored != key_scale_) {
+        std::vector<float> ratio(key_scaling_shape().factors());
+        for (size_t i = 0; i < ratio.size(); ++i) {
+            ratio[i] = (stored.empty() ? 1.0f : stored[i]) / (key_scale_.empty() ? 1.0f : key_scale_[i]);
+        }
+        if (Status s = kv_->scale_keys(n, ratio); !s.is_ok()) return fail(s.code(), "cannot convert the state's keys");
+        LIYAB_LOG_INFO("state: keys of %d positions converted to this model's key scales", n);
     }
     int32_t count = 0;
     if (!get(in, count) || count != static_cast<int32_t>(states_.size())) {
@@ -920,8 +947,99 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
             }
         }
         rope(k_.data(), c.n_head_kv, pos);
+        scale_keys(L.kv_slot, nullptr, k_.data());
         kv_->store(L.kv_slot, pos, k_.data(), v_.data());
     }
+    return Status::ok();
+}
+
+KeyScalingShape Transformer::key_scaling_shape() const {
+    const ModelConfig& c = config_;
+    // The horizon depends on the model only, never on the configured context,
+    // so every process gets the same factors (and the same replies).
+    const int32_t positions = c.n_ctx_train > 0 ? std::min(c.n_ctx_train, kKeyRangePositions) : kKeyRangePositions;
+    KeyScalingShape shape{c.n_attn_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim, c.spec->rope, {}, positions};
+    // Transformer::rope: pair i turns by inv_freq_[i] / rope_scale per position.
+    for (const float f : inv_freq_) shape.pair_speed.push_back(f / c.rope_scale);
+    return shape;
+}
+
+void Transformer::scale_keys(int32_t kv_slot, float* q, float* k) const {
+    if (key_scale_.empty()) return;
+    const ModelConfig& c = config_;
+    const auto hd = static_cast<size_t>(c.head_dim);
+    const auto group = static_cast<size_t>(c.n_head / c.n_head_kv);
+    const float* t = key_scale_.data() + static_cast<size_t>(kv_slot) * static_cast<size_t>(c.n_head_kv) * hd;
+    for (size_t g = 0; g < static_cast<size_t>(c.n_head_kv); ++g) {
+        const float* tg = t + g * hd;
+        float* kg = k + g * hd;
+        for (size_t i = 0; i < hd; ++i) kg[i] /= tg[i];
+        if (q == nullptr) continue;
+        for (size_t j = 0; j < group; ++j) {
+            float* qh = q + (g * group + j) * hd;
+            for (size_t i = 0; i < hd; ++i) qh[i] *= tg[i];
+        }
+    }
+}
+
+Status Transformer::calibrate_keys(std::span<const int32_t> tokens, const Route& route, ThreadPool& pool) {
+    key_scale_.clear();
+    if (!quant::is_block_quantized(kv_->dtype()) || config_.n_attn_layers == 0) return Status::ok();
+    if (tokens.empty()) return Status(ErrorCode::InvalidArgument, "key calibration needs tokens");
+    reset();
+    key_ranges_ = std::make_unique<KeyRanges>(key_scaling_shape());
+    // A probe first: the outlier channels are nearly constant, so a few
+    // tokens show whether the model has them, and fewer tokens only raise the
+    // ratio (lower medians). Most models stop there; the rest of the text is
+    // processed only to measure their factors, and decides again.
+    Status status;
+    float ratio = 0.0f;
+    size_t measured = 0;
+    while (measured < tokens.size() && status.is_ok()) {
+        const size_t limit = measured == 0 ? std::min(tokens.size(), kKeyProbeTokens) : tokens.size();
+        const auto n = std::min(limit - measured, static_cast<size_t>(max_batch_));
+        status = forward(tokens.subspan(measured, n), Logits::None, route, pool).status();
+        measured += n;
+        if (!status.is_ok() || measured < limit) continue;
+        ratio = key_ranges_->outlier_ratio();
+        if (ratio < kOutlierRatio) break;
+    }
+    if (status.is_ok() && ratio >= kOutlierRatio) key_scale_ = key_ranges_->factors();
+    key_ranges_.reset();
+    reset();
+    if (!status.is_ok()) return status;
+    if (ratio < kOutlierRatio) {
+        LIYAB_LOG_INFO("keys: largest channel %.1fx its head's median over %zu tokens: no scaling needed", ratio,
+                       measured);
+        return Status::ok();
+    }
+    const auto largest = std::max_element(key_scale_.begin(), key_scale_.end());
+    const auto per_block = static_cast<size_t>(config_.n_head_kv) * static_cast<size_t>(config_.head_dim);
+    LIYAB_LOG_INFO("keys: largest channel %.1fx its head's median over %zu tokens: per-channel scales for the %s "
+                   "cache (largest %.1f, attention block %zu)",
+                   ratio, measured, std::string(dtype_traits(kv_->dtype()).name).c_str(),
+                   static_cast<double>(*largest), static_cast<size_t>(largest - key_scale_.begin()) / per_block);
+    return Status::ok();
+}
+
+Status Transformer::set_key_scales(std::span<const float> scales) {
+    if (n_past_ != 0) return Status(ErrorCode::InvalidArgument, "key scales change only with an empty context");
+    if (scales.empty()) {
+        key_scale_.clear();
+        return Status::ok();
+    }
+    if (!quant::is_block_quantized(kv_->dtype())) {
+        return Status(ErrorCode::InvalidArgument, "key scales apply to quantized KV caches only");
+    }
+    if (scales.size() != key_scaling_shape().factors()) {
+        return Status(ErrorCode::InvalidArgument, "key scales of another model");
+    }
+    for (const float t : scales) {
+        if (!(t >= 1.0f / kMaxKeyScale && t <= kMaxKeyScale)) {
+            return Status(ErrorCode::InvalidArgument, "key scale out of range");
+        }
+    }
+    key_scale_.assign(scales.begin(), scales.end());
     return Status::ok();
 }
 
@@ -972,8 +1090,10 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             }
         }
         const int32_t pos = n_past_ + static_cast<int32_t>(t);
+        if (key_ranges_ != nullptr) key_ranges_->add(L.kv_slot, q, k);  // unrotated: ranges cover every position
         rope(q, c.n_head, pos);
         rope(k, c.n_head_kv, pos);
+        scale_keys(L.kv_slot, q, k);
         kv_->store(L.kv_slot, pos, k, v);
     }
     attention(L.kv_slot, n, pool, head_mask);

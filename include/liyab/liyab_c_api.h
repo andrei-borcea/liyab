@@ -100,6 +100,7 @@ typedef struct liyab_engine_config {
     int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one; 0 off (see EngineConfig) */
     const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
+    const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

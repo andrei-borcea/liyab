@@ -53,7 +53,9 @@ API_PORT = 8642
 TESTS = ["test_mmap", "test_device_detect", "test_kv_cache", "test_backends", "test_engine", "test_golden",
          "test_experimental"]
 MAX_TOKENS = 64  # per turn
-# The app's defaults (Settings): CPU, Balanced, 50 °C skin limit, 5500 MiB budget, automatic requantization.
+# The app's defaults (Settings): CPU, Balanced, 50 °C skin limit, 5500 MiB budget, automatic requantization. Like
+# the app, the CLI keeps what it measures once per model (the KV cache's key scales) in a cache directory (run_cli),
+# so only a model's first run measures it.
 CLI_SETTINGS = "--backend cpu --profile balanced --skin-threshold 50 --memory-budget 5500 --requant -1"
 HISTORY = 5  # earlier runs a number is compared with (their median)
 
@@ -300,7 +302,8 @@ def run_cli(phone, model, wait):
         note(f"liyab-cli on {model} (battery {temp:.1f} °C)")
         out = phone.guarded_shell(
             f"cd {WORK} && LD_LIBRARY_PATH=. ./liyab-cli -m {PHONE_DIR}/{model} -p {q(TURN1)} --then {q(TURN2)} "
-            f"-n {MAX_TOKENS} --temp 0 --json {CLI_SETTINGS} 2>{WORK}/cli.err; echo \"exit=$?\"", "./liyab-cli -m")
+            f"-n {MAX_TOKENS} --temp 0 --json {CLI_SETTINGS} --cache-dir {WORK}/cache 2>{WORK}/cli.err; echo \"exit=$?\"",
+            "./liyab-cli -m")
     write_log(f"cli-{model}.log", phone.shell(f"cat {WORK}/cli.err", check=False))
     lines = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
     if "exit=0" not in out or len(lines) != 3:

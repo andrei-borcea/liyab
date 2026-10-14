@@ -289,7 +289,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
         if (a == "qwen2") {
             w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
-            w.add_tensor(p + "attn_k.bias", {kv}, DType::F32, random(kv, 0.1f));
+            std::vector<float> k_bias = random(kv, 0.1f);
+            // A few large, constant key channels, as Qwen2.5's K bias has
+            // (the slowest-turning RoPE pair of each KV head).
+            for (int64_t h = 0; h < kv / hd && s.key_outlier != 0.0f; ++h) {
+                k_bias[static_cast<size_t>(h * hd + hd / 2 - 1)] = s.key_outlier;
+                k_bias[static_cast<size_t>(h * hd + hd - 1)] = -s.key_outlier;
+            }
+            w.add_tensor(p + "attn_k.bias", {kv}, DType::F32, k_bias);
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).

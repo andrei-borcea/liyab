@@ -490,6 +490,8 @@ class AppState extends ChangeNotifier implements ApiBackend {
         // Bounded, and the engine removes the files as contexts come back, and all of them when the model unloads:
         // room for the largest context of a 35B MoE (~320 MB at 24k tokens) and a smaller one.
         prefixCacheDiskMb: 512,
+        // Measured once per model (0.3 s on a 4B, 1.4 s on the 35B MoE), then read back at every load.
+        cacheDir: '${(await getApplicationSupportDirectory()).path}/engine-cache',
         experimental: {
           ...experimental.toJson(),
           if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,

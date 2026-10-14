@@ -33,12 +33,9 @@
 
 namespace liyab::experimental {
 
-// xxHash64 (Yann Collet's XXH64), for snapshot keys.
-LIYAB_API uint64_t xxhash64(const void* data, size_t length, uint64_t seed = 0) noexcept;
-
-// Fingerprint of a model file: size + hash of its first MiB (GGUF header,
-// metadata and tensor table, which change whenever the weights do).
-LIYAB_API uint64_t model_fingerprint(const MappedFile& file) noexcept;
+// Snapshot keys use the core's hash and model fingerprint (liyab/mmap_loader.h).
+using liyab::model_fingerprint;
+using liyab::xxhash64;
 
 class LIYAB_API KvDedup {
 public:

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <new>
+#include <vector>
 
 #include "core/quant.h"
 
@@ -129,6 +130,30 @@ void KvCache::store(int32_t layer, int32_t pos, const float* k, const float* v) 
         quant::quantize_row(dtype_, k + g * config_.head_dim, row(layer, pos, g, false), config_.head_dim);
         quant::quantize_row(dtype_, v + g * config_.head_dim, row(layer, pos, g, true), config_.head_dim);
     }
+}
+
+Status KvCache::scale_keys(int32_t end, std::span<const float> factors) {
+    const auto hd = static_cast<size_t>(config_.head_dim);
+    if (factors.size() != static_cast<size_t>(config_.n_layers) * static_cast<size_t>(config_.n_head_kv) * hd) {
+        return Status(ErrorCode::InvalidArgument, "one key factor per layer, KV head and channel");
+    }
+    for (int32_t p = 0; p * config_.page_tokens < end; ++p) {
+        if (mutable_page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "keys on a page that is not owned");
+    }
+    std::vector<float> row_values(hd);
+    for (int32_t layer = 0; layer < config_.n_layers; ++layer) {
+        for (int32_t g = 0; g < config_.n_head_kv; ++g) {
+            const float* f = factors.data() + (static_cast<size_t>(layer) * static_cast<size_t>(config_.n_head_kv) +
+                                               static_cast<size_t>(g)) * hd;
+            for (int32_t pos = 0; pos < end; ++pos) {
+                uint8_t* r = row(layer, pos, g, false);
+                quant::dequantize_row(dtype_, r, row_values.data(), config_.head_dim);
+                for (size_t i = 0; i < hd; ++i) row_values[i] *= f[i];
+                quant::quantize_row(dtype_, row_values.data(), r, config_.head_dim);
+            }
+        }
+    }
+    return Status::ok();
 }
 
 const uint8_t* KvCache::k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept {

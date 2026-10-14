@@ -2,8 +2,8 @@
 //
 // Each case writes a small synthetic model that takes one combination of the
 // paths the forward pass can follow (architecture, token mixer, dense or MoE
-// FFN, optional tensors, RoPE variants, KV cache type, sliding window,
-// streamed experts), runs a fixed token sequence through it (a batched
+// FFN, optional tensors, RoPE variants, KV cache type, key scaling, sliding
+// window, streamed experts), runs a fixed token sequence through it (a batched
 // prefill returning every row's logits, then single-token decoding steps) and
 // hashes the bits of every logit it returned. The hashes are pinned in
 // tests/data/golden_logits.txt per platform, because the kernels a build
@@ -69,6 +69,7 @@ struct GoldenCase {
     const char* name;
     test::TinyModelSpec spec;
     TransformerOptions options;
+    bool scale_keys = false;  // quantized KV cache: per-channel key scales, measured first (calibrate_keys)
 };
 
 test::TinyModelSpec moe_spec(const char* arch) {
@@ -84,8 +85,8 @@ test::TinyModelSpec moe_spec(const char* arch) {
 // and metadata key the loader reads for the supported architectures.
 std::vector<GoldenCase> cases() {
     std::vector<GoldenCase> out;
-    auto add = [&](const char* name, test::TinyModelSpec spec, TransformerOptions options = {}) {
-        out.push_back({name, std::move(spec), options});
+    auto add = [&](const char* name, test::TinyModelSpec spec, TransformerOptions options = {}, bool scale_keys = false) {
+        out.push_back({name, std::move(spec), options, scale_keys});
     };
     test::TinyModelSpec s;
 
@@ -108,6 +109,8 @@ std::vector<GoldenCase> cases() {
     s = {};
     s.arch = "qwen2";
     add("qwen2", s);
+    s.key_outlier = 60.0f;  // large constant key channels, scaled before the Q8_0 cache
+    add("qwen2-keyscaled", s, {}, true);
     s = {};
     s.arch = "qwen3";
     s.qk_norm = true;
@@ -190,6 +193,14 @@ bool run_case(const GoldenCase& c, uint64_t& hash) {
     const Route route{cpu.get(), cpu.get(), cpu.get()};
 
     const int32_t vocab = model->config().n_vocab;
+    if (c.scale_keys) {
+        std::vector<int32_t> calibration = {1};
+        for (int32_t i = 1; i < 48; ++i) calibration.push_back(3 + (i * 29) % (vocab - 3));
+        if (Status s = model->calibrate_keys(calibration, route, pool); !s.is_ok() || model->key_scales().empty()) {
+            std::printf("  %s: key calibration failed: %s\n", c.name, s.to_string().c_str());
+            return false;
+        }
+    }
     std::vector<int32_t> tokens = {1};  // BOS
     for (int32_t i = 1; i < 26; ++i) tokens.push_back(3 + (i * 37) % (vocab - 3));
     hash = 0xcbf29ce484222325ull;
