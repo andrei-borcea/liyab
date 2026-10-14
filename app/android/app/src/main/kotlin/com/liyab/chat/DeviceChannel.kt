@@ -1,6 +1,5 @@
 package com.liyab.chat
 
-import android.app.Activity
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
@@ -16,20 +15,23 @@ import kotlin.math.abs
 /**
  * The "liyab/device" channel: what only the Android SDK exposes (power draw,
  * thermal state, the default-assistant role). The engine itself is reached
- * from Dart through dart:ffi. Attached by every activity that hosts the shared
- * engine, so calls go to the visible one.
+ * from Dart through dart:ffi. Attached once, when the shared engine is created
+ * (LiyabEngine), with the application context: it needs no activity, so it
+ * also serves an engine running without a window.
  */
 object DeviceChannel {
-    fun attach(activity: Activity, engine: FlutterEngine) {
+    fun attach(context: Context, engine: FlutterEngine) {
         MethodChannel(engine.dartExecutor.binaryMessenger, "liyab/device").setMethodCallHandler { call, result ->
             when (call.method) {
-                "power" -> result.success(power(activity))
-                "thermal" -> result.success(thermal(activity))
-                "isAssistant" -> result.success(isAssistant(activity))
+                "power" -> result.success(power(context))
+                "thermal" -> result.success(thermal(context))
+                "isAssistant" -> result.success(isAssistant(context))
                 "openAssistantSettings" -> {
                     // The assistant role cannot be requested with a dialog; the
                     // user picks it in the system's default-apps settings.
-                    activity.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+                    // (From the application context: a task of its own.)
+                    context.startActivity(
+                        Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     result.success(null)
                 }
                 else -> result.notImplemented()

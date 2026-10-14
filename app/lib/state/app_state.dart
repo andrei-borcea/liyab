@@ -320,15 +320,27 @@ class AppState extends ChangeNotifier implements ApiBackend {
     notifyListeners();
   }
 
-  static Future<AppState> create() async {
+  /// `hidden`: Android started Liyab without a window, for the local API (see
+  /// main). Then it only listens: the last model counts as released while
+  /// hidden, so the first request loads it (ensureLoaded) and opening Liyab
+  /// loads it with its conversation (_backOnScreen), and the work service
+  /// keeps the process listening (_updateWork).
+  static Future<AppState> create({bool hidden = false}) async {
     LiyabLib.instance
       ..setLogLevel(1) // info: loads, streaming, warnings
       ..logBufferEnable(256 * 1024);
     final state = AppState._(
         await EngineService.start(), await SharedPreferences.getInstance(), await Downloads.start());
     final last = state.device.lastModel;
-    // keepChat: the last conversation comes back if the OS stopped Liyab.
-    if (last != null && File(last).existsSync()) unawaited(state.load(last, keepChat: true));
+    final usable = last != null && File(last).existsSync();
+    if (hidden) {
+      state._away = true;
+      if (usable) state._released = last;
+      state._log('Started without a window for the local API: the model loads for the first request');
+    } else if (usable) {
+      // keepChat: the last conversation comes back if the OS stopped Liyab.
+      unawaited(state.load(last, keepChat: true));
+    }
     if (state.device.apiEnabled) unawaited(state._startApi());
     return state;
   }

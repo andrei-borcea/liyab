@@ -12,21 +12,42 @@ import 'ui/living_flame.dart';
 import 'ui/theme.dart';
 import 'ui/welcome_page.dart';
 
-Future<void> main() async {
+/// `args` holds "hidden" when Android started the engine without a window
+/// (LiyabEngine.startForApi in the Android app: the local API is on and the
+/// system started the process for the notification listener).
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-  runApp(const LiyabApp());
+  final hidden = args.contains('hidden');
+  void edgeToEdge() => SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  if (hidden) {
+    // The system UI mode belongs to a window: set once one shows Liyab
+    // (without a window the call has nothing to reach).
+    var shown = false;
+    AppLifecycleListener(onStateChange: (state) {
+      if (state != AppLifecycleState.resumed || shown) return;
+      shown = true;
+      edgeToEdge();
+    });
+  } else {
+    edgeToEdge();
+  }
+  // Created here, not by a widget: without a window no frame may ever build
+  // the tree, and the local API must start all the same.
+  runApp(LiyabApp(app: AppState.create(hidden: hidden)));
 }
 
 class LiyabApp extends StatefulWidget {
-  const LiyabApp({super.key});
+  const LiyabApp({super.key, required this.app});
+
+  /// The app's state, being created (model, settings, the local API).
+  final Future<AppState> app;
 
   @override
   State<LiyabApp> createState() => _LiyabAppState();
 }
 
 class _LiyabAppState extends State<LiyabApp> {
-  final Future<AppState> _app = AppState.create();
+  late final Future<AppState> _app = widget.app;
   final _assist = AssistMode(); // the system assist gesture opened the sheet
 
   @override

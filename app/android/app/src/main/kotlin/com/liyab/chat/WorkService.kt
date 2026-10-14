@@ -40,10 +40,11 @@ import io.flutter.plugin.common.MethodChannel
  *    new-notification effects (the always-on display's pulse or edge light,
  *    where the phone has them) mark the start; updates do not alert again.
  *
- * Android allows starting it only while, or just after, Liyab is on screen, or
- * at any time when the user exempted Liyab from battery optimisation: work that
- * begins with Liyab hidden otherwise runs without it, and [start] reports that
- * by returning false. A running service is updated in place, which Android
+ * Android allows starting it only while, or just after, Liyab is on screen,
+ * while the system binds Liyab's notification listener (a process it started
+ * for the listener, see LiyabEngine.startForApi), or at any time when the user
+ * exempted Liyab from battery optimisation: work that begins with Liyab hidden
+ * otherwise runs without it, and [start] reports that by returning false. A running service is updated in place, which Android
  * always allows: a request that arrives while it listens gets the full service.
  */
 class WorkService : Service() {

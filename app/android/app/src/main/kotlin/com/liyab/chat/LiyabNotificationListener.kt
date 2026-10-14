@@ -40,6 +40,10 @@ class LiyabNotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
         // What is already in the shade when access is granted or the service restarts.
         activeNotifications?.forEach { record(it) }
+        // The system binds the listener on its own (at boot, after the process
+        // was stopped): with the local API on, a process started this way
+        // listens for other apps too, not only once Liyab is opened.
+        LiyabEngine.startForApi(this)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) = record(sbn)

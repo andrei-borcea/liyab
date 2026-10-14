@@ -811,6 +811,12 @@ curl http://127.0.0.1:8642/v1/chat/completions \
 * **Your chat keeps its place.** A request's prompt replaces the chat's context in the engine, which sets the chat's
   aside on storage (the prefix cache: at most 512 MB, no RAM) and restores it on your next message: 95 ms for a
   4,907-token chat on the 35B, where processing a 4,009-token one again had taken 163 s.
+* **Listening without Liyab open.** With notification access granted, Android binds Liyab's notification listener
+  on its own (at boot, after it stopped the process), which starts Liyab's process without a window. With the local
+  API on, that process starts the app's Dart side and the API listens at once, under its listening service; the
+  model loads for the first request (and unloads again after the idle delay). Android allows that service although
+  Liyab was never on screen: the system binds the listener as a foreground binding, which lets the process start
+  foreground services. With the API off, such a process starts nothing.
 * **Not yet.** Tools, images, `n` > 1 and logprobs are refused with an error, never silently ignored.
 
 ### Everything else
@@ -1254,9 +1260,11 @@ Implemented features are described above. These are next, in order:
   * the local API is text only;
   * Android may stop Liyab in the background (which stops the API too). Once Liyab's work is done, HyperOS also
     freezes it there (cgroup freezer): a frozen Liyab runs no code, so an idle model is not released until Liyab
-    runs again. The local API escapes this only while its listening service runs, which Android starts when Liyab
-    leaves the screen: a process Android started in the background (to read notifications, say) gets no listening
-    service, so its API may not answer until Liyab is opened;
+    runs again. The local API escapes this only while its listening service runs. Android starts that service when
+    Liyab leaves the screen, and in a process it started for the notification listener (see the local API). A
+    process Android started in the background for another reason (a download job) does not listen until Liyab is
+    opened, nor does any process when notification access is off or the system does not start the listener's
+    process on its own (HyperOS may require Autostart for that);
   * pages that need a full activity may not open from the assistant sheet's window;
   * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
     rebuild; other apps' notifications cannot be read;
