@@ -18,7 +18,7 @@
 //    next to a forward pass;
 //  * earlier sequences, set aside when the live one stops continuing them (a
 //    new conversation, a regenerated reply, an edited turn), are kept with a
-//    suffix array each, sorted on their first kMaxMatch tokens (prefix
+//    suffix array each, sorted on their first kMaxMatch + 1 tokens (prefix
 //    doubling with radix sorts, O(n log kMaxMatch)), so the occurrences of a
 //    pattern are a binary search away. They are bounded: at most
 //    Limits::max_stored_tokens tokens (8 bytes each with the suffix array) in

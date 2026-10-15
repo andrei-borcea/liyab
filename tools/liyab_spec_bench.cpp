@@ -3,13 +3,15 @@
 // and suffix drafts, greedy, on one model.
 //
 //   liyab-spec-bench -m model.gguf [--modes plain,lookup,suffix,suffix:8]
-//                    [--tasks code,summary,tool,chat,again] [-n 512] [--threads N]
-//                    [--backend cpu|metal|auto]|metal|auto]
+//                    [--tasks code,summary,tool,chat,again] [-n 512] [--repeat R]
+//                    [--threads N] [--backend cpu|metal|auto]
 //
 // A mode is plain, lookup or suffix, optionally with its most drafts per step
-// (":K", default EngineConfig::draft_tokens). Every mode runs on a fresh
-// engine, in this order, each task a new conversation formatted by the
-// model's chat template (thinking off where the template has the switch):
+// (":K", default EngineConfig::draft_tokens); the first mode is the reference
+// (plain). Every mode has an engine of its own, unpaced, and the tasks run in
+// this order, each on all modes back to back (so the modes share the load of
+// the host), each a new conversation formatted by the model's chat template
+// (thinking off where the template has the switch):
 //   code     the model rewrites a code block with one change;
 //   summary  a summary of a pasted text;
 //   tool     two turns, each with the same tool output, the second asking
@@ -20,11 +22,14 @@
 // For each task and mode it prints the reply's tokens, decode tok/s, the
 // speed-up over plain decoding, the share of drafts accepted, tokens per
 // verification pass and whether the reply is the plain one (it must be:
-// greedy speculative decoding is exact).
+// greedy speculative decoding is exact). --repeat R runs it all R times on
+// fresh engines and prints medians (speed-ups taken within each run).
 //
 // Uses only the public C++ API; built with the tests (LIYAB_BUILD_TESTS).
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -196,7 +201,8 @@ bool run(Engine& engine, const Task& task, int32_t max_tokens, Result& result) {
 void usage() {
     std::fprintf(stderr,
                  "usage: liyab-spec-bench -m MODEL.gguf [--modes plain,lookup,suffix,suffix:8] [-n 512]\n"
-                 "                        [--tasks code,summary,tool,chat,again] [--threads N] [--backend cpu|metal|auto]\n");
+                 "                        [--tasks code,summary,tool,chat,again] [--repeat R] [--threads N]\n"
+                 "                        [--backend cpu|metal|auto]\n");
 }
 
 }  // namespace
@@ -209,6 +215,7 @@ int main(int argc, char** argv) {
     std::string modes_arg = "plain,lookup,suffix";
     std::string tasks_arg;  // empty: all
     int32_t max_tokens = 512;
+    int32_t repeats = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -222,6 +229,7 @@ int main(int argc, char** argv) {
         else if (arg == "--modes") modes_arg = next();
         else if (arg == "--tasks") tasks_arg = next();
         else if (arg == "-n") max_tokens = std::atoi(next().c_str());
+        else if (arg == "--repeat") repeats = std::max(1, std::atoi(next().c_str()));
         else if (arg == "--threads") base.n_threads = std::atoi(next().c_str());
         else if (arg == "--backend") {
             const std::string b = next();
@@ -266,36 +274,62 @@ int main(int argc, char** argv) {
     if (!tasks_arg.empty()) {
         std::erase_if(tasks, [&](const Task& t) { return ("," + tasks_arg + ",").find("," + t.name + ",") == std::string::npos; });
     }
-    // results[mode][task]
-    std::vector<std::vector<Result>> results(modes.size(), std::vector<Result>(tasks.size()));
-    for (size_t m = 0; m < modes.size(); ++m) {
-        EngineConfig config = base;
-        config.lookup_drafts = modes[m].lookup;
-        config.suffix_drafts = modes[m].suffix;
-        if (modes[m].draft_tokens > 0) config.draft_tokens = modes[m].draft_tokens;
-        auto engine = Engine::create(config);
-        if (!engine) {
-            std::fprintf(stderr, "%s\n", engine.status().to_string().c_str());
-            return 1;
+    // results[rep][mode][task]. Every mode has its engine for the whole
+    // repetition (each keeps what its conversations left), and each task runs
+    // on all modes back to back, so the modes see the same load on the host.
+    std::vector<std::vector<std::vector<Result>>> results(
+        static_cast<size_t>(repeats), std::vector<std::vector<Result>>(modes.size(), std::vector<Result>(tasks.size())));
+    for (int32_t rep = 0; rep < repeats; ++rep) {
+        std::vector<std::unique_ptr<Engine>> engines;
+        for (const Mode& mode : modes) {
+            EngineConfig config = base;
+            config.lookup_drafts = mode.lookup;
+            config.suffix_drafts = mode.suffix;
+            if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
+            auto engine = Engine::create(config);
+            if (!engine) {
+                std::fprintf(stderr, "%s\n", engine.status().to_string().c_str());
+                return 1;
+            }
+            engines.push_back(std::move(engine).value());
         }
         for (size_t t = 0; t < tasks.size(); ++t) {
-            if (!run(*engine.value(), tasks[t], max_tokens, results[m][t])) return 1;
-            std::fprintf(stderr, "%s / %s: %d tokens\n", modes[m].name.c_str(), tasks[t].name.c_str(),
-                         results[m][t].tokens);
+            for (size_t m = 0; m < modes.size(); ++m) {
+                Result& r = results[static_cast<size_t>(rep)][m][t];
+                if (!run(*engines[m], tasks[t], max_tokens, r)) return 1;
+                std::fprintf(stderr, "run %d, %s / %s: %d tokens, %.1f tok/s\n", rep + 1, tasks[t].name.c_str(),
+                             modes[m].name.c_str(), r.tokens, r.tokens * 1000.0 / r.decode_ms);
+            }
         }
     }
 
+    // Medians over the repetitions; the speed-up is taken within each one.
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+    };
     std::printf("%-8s %-10s %7s %8s %8s %8s %10s %5s\n", "task", "mode", "tokens", "tok/s", "speedup", "accept",
                 "tok/pass", "same");
     for (size_t t = 0; t < tasks.size(); ++t) {
-        const double plain_rate = results[0][t].tokens * 1000.0 / results[0][t].decode_ms;
         for (size_t m = 0; m < modes.size(); ++m) {
-            const Result& r = results[m][t];
-            const double rate = r.tokens * 1000.0 / r.decode_ms;
-            std::printf("%-8s %-10s %7d %8.1f %7.2fx %7.0f%% %10.2f %5s\n", tasks[t].name.c_str(), modes[m].name.c_str(),
-                        r.tokens, rate, rate / plain_rate, r.proposed > 0 ? 100.0 * r.accepted / r.proposed : 0.0,
-                        r.passes > 0 ? static_cast<double>(r.tokens) / r.passes : 0.0,
-                        r.replies == results[0][t].replies ? "yes" : "NO");
+            std::vector<double> rates, speedups;
+            int32_t tokens = 0, passes = 0, proposed = 0, accepted = 0;
+            bool same = true;
+            for (const auto& run_results : results) {
+                const Result& r = run_results[m][t];
+                const Result& plain = run_results[0][t];
+                rates.push_back(r.tokens * 1000.0 / r.decode_ms);
+                speedups.push_back(rates.back() / (plain.tokens * 1000.0 / plain.decode_ms));
+                tokens += r.tokens;
+                passes += r.passes;
+                proposed += r.proposed;
+                accepted += r.accepted;
+                same = same && r.replies == results[0][0][t].replies;
+            }
+            std::printf("%-8s %-10s %7d %8.1f %7.2fx %7.0f%% %10.2f %5s\n", tasks[t].name.c_str(),
+                        modes[m].name.c_str(), tokens / repeats, median(rates), median(speedups),
+                        proposed > 0 ? 100.0 * accepted / proposed : 0.0,
+                        passes > 0 ? static_cast<double>(tokens) / passes : 0.0, same ? "yes" : "NO");
         }
     }
     return 0;
