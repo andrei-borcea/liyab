@@ -170,7 +170,9 @@ struct VocabTrie {
 // generating thread.
 class StateTable {
 public:
-    explicit StateTable(std::shared_ptr<const Program> program);
+    // `max_states`: how many states compact() lets the table hold (tests
+    // lower it; memory is bounded too, at 32 MiB).
+    explicit StateTable(std::shared_ptr<const Program> program, size_t max_states = size_t{1} << 16);
 
     [[nodiscard]] const std::shared_ptr<const Program>& program() const noexcept { return program_; }
 
@@ -246,6 +248,7 @@ private:
     size_t masks_ = 0;  // states holding a mask
     size_t bytes_ = 0;  // memory held, approximately (kept as states, rows and masks are added)
     bool overflow_ = false;
+    size_t max_states_;
 };
 
 }  // namespace liyab::grammar

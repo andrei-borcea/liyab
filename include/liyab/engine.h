@@ -179,8 +179,9 @@ using ForceCallback = std::function<std::string(std::string_view generated)>;
 //  * max_tokens and cancellation can still cut a match short; the caller
 //    sees it from GenerationStats (generated_tokens == max_tokens,
 //    cancelled).
-//  * The engine keeps each grammar's states, transitions and masks (the 16
-//    most recently used grammars, 64 MiB together), so a grammar used again
+//  * The engine keeps each grammar's states, transitions and masks (at most
+//    32 MiB per grammar; the 16 most recently used grammars, 64 MiB together
+//    between generations), so a grammar used again
 //    (a request with the same tools) does not pay for its masks twice.
 //    GenerationStats::constrained_tokens and grammar_ms report the cost.
 

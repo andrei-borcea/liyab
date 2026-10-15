@@ -550,10 +550,12 @@ namespace {
 constexpr size_t kMaxStackDepth = 2048;
 constexpr size_t kMaxStacks = 1024;
 constexpr int kMaxCloseDepth = 4096;
-// Cache bounds: past these, compact() starts over (keeping the live state).
-constexpr size_t kMaxStates = 1 << 16;
-constexpr size_t kMaxTableBytes = size_t{48} << 20;
-constexpr size_t kMaxMaskBytes = size_t{32} << 20;
+// Memory bounds: past these (or StateTable's max_states), compact() starts
+// over, keeping the live state.
+// Together at most 32 MiB per grammar: a tool call's grammar holds a few
+// hundred states and some dozens of masks (19 KiB each for 151,000 tokens).
+constexpr size_t kMaxTableBytes = size_t{20} << 20;
+constexpr size_t kMaxMaskBytes = size_t{12} << 20;
 }  // namespace
 
 size_t StateTable::KeyHash::operator()(const std::vector<uint32_t>& k) const noexcept {
@@ -562,7 +564,8 @@ size_t StateTable::KeyHash::operator()(const std::vector<uint32_t>& k) const noe
     return static_cast<size_t>(h ^ (h >> 29));
 }
 
-StateTable::StateTable(std::shared_ptr<const Program> program) : program_(std::move(program)) {}
+StateTable::StateTable(std::shared_ptr<const Program> program, size_t max_states)
+    : program_(std::move(program)), max_states_(max_states) {}
 
 void StateTable::close(std::vector<uint32_t>& stack, std::vector<std::vector<uint32_t>>& out, int depth) {
     const Program& p = *program_;
@@ -847,7 +850,7 @@ size_t StateTable::apply_mask(int32_t state, const VocabTrie& trie, std::span<fl
 }
 
 int32_t StateTable::compact(int32_t keep) {
-    if (states_.size() <= kMaxStates && bytes_ <= kMaxTableBytes + kMaxMaskBytes) return keep;
+    if (states_.size() <= max_states_ && bytes_ <= kMaxTableBytes + kMaxMaskBytes) return keep;
     const std::vector<uint32_t> key = *states_[static_cast<size_t>(keep)].key;
     states_.clear();
     index_.clear();

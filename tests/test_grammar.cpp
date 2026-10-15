@@ -300,6 +300,32 @@ t1 ::= "now>\n" "")");
                        "</function>\n</tool_call>"));
 }
 
+TEST_CASE("grammar: a table past its bound starts over and keeps following the input") {
+    // Each position of a bounded string is its own state: 300 positions, a table of at most 40.
+    const Grammar g = schema(R"({"type": "string", "maxLength": 300})");
+    grammar::StateTable t(g.program(), 40);
+    int32_t s = t.initial();
+    size_t most = 0;
+    std::string text = "\"";
+    s = t.advance(s, "\"");
+    for (int i = 0; i < 300; ++i) {
+        const std::string c = i % 7 == 0 ? "\xC3\xA9" : "x";  // é split byte by byte
+        for (const char b : c) {
+            s = t.advance(s, std::string_view(&b, 1));
+            REQUIRE(s >= 0);
+            s = t.compact(s);
+            most = std::max(most, t.size());
+        }
+        text += c;
+    }
+    CHECK(most <= 41);
+    CHECK(t.advance(s, "x") < 0);  // the 301st character is refused
+    s = t.advance(s, "\"");
+    REQUIRE(s >= 0);
+    CHECK(t.accepting(s) && !t.extendable(s));
+    CHECK(g.matches(text + "\""));
+}
+
 TEST_CASE("grammar: forced text stops at a choice and at partial characters") {
     const Grammar g = schema(R"({"type": "object", "properties": {"city": {"type": "string"}, "unit": {"enum": ["°C", "°F"]}},
         "required": ["city", "unit"]})");
@@ -878,6 +904,49 @@ TEST_CASE("real models: tool-call arguments validate; masking cost per token") {
                         again_ms / std::max(1, again_tokens));
         }
         CHECK(valid_count == runs);
+        // A tool call as the app's local API makes one: the model's own
+        // format, `<tool_call>` forced (tool_choice required), then the call
+        // as one span with the grammar the app writes (ToolDialect).
+        {
+            auto engine = Engine::create(config);
+            REQUIRE(engine.has_value());
+            const auto tmpl = engine.value()->model_metadata("tokenizer.chat_template");
+            const bool xml = tmpl && tmpl->find("<function=") != std::string::npos;
+            const bool hermes = !xml && tmpl && tmpl->find("<tool_call>") != std::string::npos;
+            if (xml || hermes) {
+                const char* tool = R"({"type": "function", "function": {"name": "get_weather", "description": "Weather forecast for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "unit": {"enum": ["celsius", "fahrenheit"]}, "days": {"type": "integer", "minimum": 1, "maximum": 14}}, "required": ["city"]}}})";
+                const std::string system =
+                    xml ? std::string("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n") +
+                              tool + "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+                        : std::string("<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n") +
+                              tool + "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
+                const std::string prompt = system +
+                    "<|im_start|>user\nWhat will the weather be in Lisbon over the next 3 days, in celsius?<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+                const Grammar call = text_grammar(
+                    xml ? R"(root ::= "\n" "<function=" (t0) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=city>\n" %until "\n</parameter>" "\n"
+p0-1 ::= "<parameter=unit>\n" %string {"enum":["celsius","fahrenheit"]} "\n</parameter>\n"
+p0-2 ::= "<parameter=days>\n" %schema {"type":"integer","minimum":1,"maximum":14} "\n</parameter>\n"
+t0 ::= "get_weather>\n" p0-0 p0-1? p0-2?)"
+                        : R"(root ::= "\n" "{\"name\": " (t0) "}\n</tool_call>"
+t0 ::= "\"get_weather\", \"arguments\": " %schema {"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["celsius","fahrenheit"]},"days":{"type":"integer","minimum":1,"maximum":14}},"required":["city"]})");
+                for (const float temperature : {0.0f, 0.7f}) {
+                    SamplingParams p = sampling(temperature, 11, 120);
+                    p.top_k = 20;
+                    const Output out = generate(*engine.value(), prompt, p, GenerateOptions{.continuation = [&](std::string_view so_far) {
+                        return so_far.empty() ? Continuation{"<tool_call>", call} : Continuation{};
+                    }});
+                    REQUIRE(out.text.starts_with("<tool_call>"));
+                    const size_t end = out.text.find("</tool_call>");
+                    REQUIRE(end != std::string::npos);
+                    const std::string body = out.text.substr(11, end + 12 - 11);
+                    CHECK(call.matches(body));
+                    std::printf("  %s, %s call: %s\n", path.c_str() + path.rfind('/') + 1, xml ? "XML" : "JSON",
+                                out.text.substr(0, end + 12).c_str());
+                }
+            }
+        }
         std::printf("  %s: trie + first token %.0f ms; %d/%d valid; decode step %.2f ms\n",
                     path.c_str() + path.rfind('/') + 1, trie_ms, valid_count, runs, decode_ms / std::max(1, sampled));
     }
