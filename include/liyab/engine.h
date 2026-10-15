@@ -326,11 +326,13 @@ public:
     Result<int32_t> load_state(const std::string& path);
 
     // Gives memory back to the OS while the engine is idle (e.g. the app is in
-    // the background): empties the MoE expert cache. The model stays loaded,
+    // the background): empties the MoE expert cache, and drops constrained
+    // decoding's caches (vocabulary trie, grammar states and masks; rebuilt
+    // on the next constrained generation). The model stays loaded,
     // context included; the next generation reads its experts from storage
     // again, so its first tokens are slower until the cache refills. Returns
-    // the bytes released (0 for models without streamed experts). Call it
-    // between generations, from the thread that generates.
+    // the expert cache's bytes released (0 for models without streamed
+    // experts). Call it between generations, from the thread that generates.
     size_t trim_memory();
 
     // How a MoE model with streamed experts uses memory; all zero otherwise.
