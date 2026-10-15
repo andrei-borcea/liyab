@@ -269,6 +269,37 @@ TEST_CASE("json schema: refused schemas say why") {
     CHECK(Grammar::from_json_schema(R"({"type": "string", "description": "d", "title": "t", "x-custom": 1, "format": "email"})"));
 }
 
+// The grammars the app's local API writes for a tool call after
+// `<tool_call>` (ToolDialect.callGrammar; app/test/api_test.dart expects
+// these exact texts), for Hermes JSON calls and Qwen XML calls.
+TEST_CASE("grammar: the app's tool-call grammars accept valid calls only") {
+    const Grammar hermes = text_grammar(R"(root ::= "\n" "{\"name\": " (t0 | t1) "}\n</tool_call>"
+t0 ::= "\"get_weather\", \"arguments\": " %schema {"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["celsius","fahrenheit"]},"days":{"type":"integer","minimum":1,"maximum":14}},"required":["city"]}
+t1 ::= "\"now\", \"arguments\": " "{}")");
+    CHECK(hermes.matches("\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>"));
+    CHECK(hermes.matches("\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call>"));
+    CHECK(!hermes.matches("\n{\"name\": \"get_weather\", \"arguments\": {\"days\": 3}}\n</tool_call>"));
+    CHECK(!hermes.matches("\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 30}}\n</tool_call>"));
+    CHECK(!hermes.matches("\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call>"));
+    grammar::StateTable t(hermes.program());
+    CHECK(t.forced_text(t.initial()) == "\n{\"name\": \"");
+    const int32_t after_name = t.advance(t.initial(), "\n{\"name\": \"n");
+    CHECK(t.forced_text(after_name) == "ow\", \"arguments\": {}}\n</tool_call>");
+
+    const Grammar xml = text_grammar(R"(root ::= "<function=" (t0 | t1) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=city>\n" %until "\n</parameter>" "\n"
+p0-1 ::= "<parameter=unit>\n" %string {"enum":["celsius","fahrenheit"]} "\n</parameter>\n"
+p0-2 ::= "<parameter=days>\n" %schema {"type":"integer","minimum":1,"maximum":14} "\n</parameter>\n"
+t0 ::= "get_weather>\n" p0-0 p0-1? p0-2?
+t1 ::= "now>\n" "")");
+    CHECK(xml.matches("<function=get_weather>\n<parameter=city>\nSão Paulo\nor so\n</parameter>\n<parameter=days>\n7\n</parameter>\n"
+                      "</function>\n</tool_call>"));
+    CHECK(xml.matches("<function=now>\n</function>\n</tool_call>"));
+    CHECK(!xml.matches("<function=get_weather>\n<parameter=days>\n7\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(!xml.matches("<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=unit>\nkelvin\n</parameter>\n"
+                       "</function>\n</tool_call>"));
+}
+
 TEST_CASE("grammar: forced text stops at a choice and at partial characters") {
     const Grammar g = schema(R"({"type": "object", "properties": {"city": {"type": "string"}, "unit": {"enum": ["°C", "°F"]}},
         "required": ["city", "unit"]})");
