@@ -523,13 +523,16 @@ each of those as a scheduling problem.
     writes it (`", "` and `": "`) by default, so the model samples only values and choices; any white space is an
     option. End-of-generation tokens are allowed only where the grammar accepts, and a whole-output grammar ends the
     generation as soon as its match is complete.
-  * **Cost.** On an M4 Pro (Qwen3-0.6B, Llama 3.2 1B, Qwen2.5-0.5B), constrained decoding cost 0.14–0.24 ms per
-    token greedy, 0.25–0.42 ms with top-k sampling and 0.10–0.12 ms with whole masks once a state's mask is cached,
-    against decode steps of 19–92 ms. A state's first mask takes 1.5–1.9 ms (inside a string, where nearly every
-    token is allowed); the vocabulary trie (~330,000 nodes for Qwen's 151,000 tokens) is built in ~25 ms on the
-    first constrained token. The engine keeps the states and masks of the 16 grammars used last (64 MiB at most), so
-    a request with the same tools does not pay for them again. `GenerationStats::constrained_tokens` and
-    `grammar_ms` report the cost of each generation.
+  * **Cost.** On an M4 Pro (Qwen3-0.6B, Qwen3.5-0.8B, Llama 3.2 1B, Qwen2.5-0.5B), constrained decoding cost
+    0.14–0.24 ms per token greedy, 0.25–0.62 ms with top-k sampling, and 0.09–0.12 ms with whole masks once a
+    state's mask is cached, against decode steps of 18–92 ms. A state's first whole mask takes 1.5–2.7 ms (inside a
+    string, where nearly every token is allowed). The vocabulary trie is built on the first constrained token:
+    333,000 nodes in ~30 ms for Qwen3's 151,000 tokens, 592,000 nodes in ~45 ms for Qwen3.5's 248,000. The engine
+    keeps the states and masks of the 16 grammars used last (32 MiB per grammar, 64 MiB together), so a request with
+    the same tools does not pay for them again. `GenerationStats::constrained_tokens` and `grammar_ms` report the
+    cost of each generation, and `test_grammar` measures it on any GGUF (`LIYAB_GRAMMAR_MODEL`), together with a
+    tool call made the way the local API makes one: Qwen3-0.6B (JSON calls) and Qwen3.5-0.8B (XML calls) wrote
+    valid calls in every run.
   * **Speculative decoding** is off while a grammar is active (drafts would need a mask at every verified position);
     the unconstrained parts of the same generation use it.
 
