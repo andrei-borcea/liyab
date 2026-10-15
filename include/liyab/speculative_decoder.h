@@ -48,8 +48,8 @@
 // continuation tree, not the tree (that needs tree attention masks).
 //
 // This is an engine component: Engine wires it up when
-// EngineConfig::draft_model_path is set, or EngineConfig::suffix_drafts or
-// EngineConfig::lookup_drafts.
+// EngineConfig::draft_model_path is set, or EngineConfig::lookup_drafts
+// (suffix drafts or context lookup, by EngineConfig::suffix_drafts).
 #ifndef LIYAB_SPECULATIVE_DECODER_H
 #define LIYAB_SPECULATIVE_DECODER_H
 

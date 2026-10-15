@@ -2418,6 +2418,7 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
 
         EngineConfig lookup = plain;
         lookup.lookup_drafts = true;
+        lookup.suffix_drafts = false;     // context lookup
         lookup.adaptive_drafts = false;  // every step drafts
         EngineConfig drafted = lookup;
         drafted.lookup_drafts = false;
@@ -3251,6 +3252,7 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
 
         EngineConfig lookup = plain;
         lookup.lookup_drafts = true;
+        lookup.suffix_drafts = false;  // context lookup
         lookup.draft_tokens = 3;
         lookup.adaptive_drafts = false;  // exercise every draft, not the learned count
         auto engine = Engine::create(lookup);
@@ -3274,6 +3276,7 @@ TEST_CASE("Adaptive draft counts keep greedy output identical") {
     const auto expected = run(*base_engine.value(), prompt, greedy(48));
     EngineConfig adaptive = plain;
     adaptive.lookup_drafts = true;
+    adaptive.suffix_drafts = false;  // context lookup with the learned count
     adaptive.draft_tokens = 4;  // adaptive_drafts is the default
     auto engine = Engine::create(adaptive);
     REQUIRE(engine.has_value());
@@ -3474,8 +3477,7 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
         for (const bool adaptive : {false, true}) {
             for (const int32_t k : {3, 6}) {
                 EngineConfig suffix = plain;
-                suffix.suffix_drafts = true;
-                suffix.lookup_drafts = true;  // suffix drafts take precedence
+                suffix.lookup_drafts = true;  // suffix drafts: the default drafter
                 suffix.draft_tokens = k;
                 suffix.adaptive_drafts = adaptive;
                 auto engine = Engine::create(suffix);

@@ -540,11 +540,10 @@ happens.
 
 ## Speculative decoding
 
-A small draft model proposes *k* tokens, or the text itself does, with no extra weights and for any model:
+A small draft model proposes *k* tokens, or, with `lookup_drafts`, the text itself does, with no extra weights and
+for any model. Two drafters:
 
-* **Lookup** (`lookup_drafts`): the tokens that followed the most recent earlier occurrence of the last 4…2 tokens of
-  the conversation.
-* **Suffix drafts** (`suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that occurred before, in
+* **Suffix drafts** (the default, `suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that occurred before, in
   this conversation or in earlier ones of the same engine, and the continuation most of its occurrences agree on.
   Earlier conversations are kept with a suffix array each, so finding a match is a binary search. They are set
   aside when a prompt stops continuing them (a new conversation, a regenerated reply) and are bounded: 262,144
@@ -554,6 +553,8 @@ A small draft model proposes *k* tokens, or the text itself does, with no extra 
   conversation itself supports it. A step verifies as many drafts as give the most expected tokens per millisecond
   at the measured cost of a step per draft count. A confident draft is verified at full length (`draft_tokens` at
   most) and a doubtful one not at all.
+* **Context lookup** (`suffix_drafts = false`): the tokens that followed the most recent earlier occurrence of the
+  last 4…2 tokens of the conversation.
 
 The target verifies the drafts in one batched pass, reading its weights once for *k* + 1 tokens. Verification is
 linear: the suffix drafts' best branch, not their whole tree, which would need tree attention masks.
@@ -565,8 +566,10 @@ linear: the suffix drafts' best branch, not their whole tree, which would need t
   forced continuation cut a step short.
 * **Hybrid models included.** Both models keep copies of their recurrent states for the last *k* + 1 tokens, so
   rejected tokens roll back exactly.
-* **Self-tuning.** How many drafts to verify is learned on the device: tokens per millisecond per draft count, the
-  best one used, and losing counts retried after a doubling wait.
+* **Self-tuning.** How many drafts to verify is learned on the device. With a draft model or context lookup, it is
+  the draft count with the most tokens per millisecond, and losing counts are retried after a doubling wait. With
+  suffix drafts, it is chosen for each draft from its acceptance probabilities and each count's step time (the
+  median of its last 8 steps). Counts are tried upwards, one more draft at a time.
 * **When it pays.** It pays on dense models with i8mm tiles, where 4 rows cost ~1.7× one row. Qwen3-4B on the
   phone went from 11.2 to 12.6 tok/s on a code edit, with 65% of drafts accepted. It does not pay on a MoE whose
   experts stream from flash, because a pass reads the union of its tokens' experts. That is why it is off by
@@ -753,8 +756,8 @@ liyab-cli -m model.gguf -p "Once upon a time" -n 128 --temp 0.8
 liyab-cli -m moe.gguf -p "..." --memory-budget 5500         # stay within a per-app memory limit
 liyab-cli -m moe.gguf -p "..." --expert-cache 3000          # MoE: experts through a 3000 MiB cache (-1 auto)
 liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts covering 90% of router weight
-liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the conversation itself
-liyab-cli -m model.gguf -p "..." --suffix                   # ... from suffix drafts (this and earlier conversations)
+liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the text itself (suffix drafts)
+liyab-cli -m model.gguf -p "..." --context-lookup           # ... by context lookup instead
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model
 liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts in a 256 MiB LRU
 liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM

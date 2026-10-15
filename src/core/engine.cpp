@@ -982,7 +982,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         impl->draft = std::move(draft).value();
         LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->draft));  // same vocabulary: the target's tokenizer
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
-    } else if ((config.suffix_drafts || config.lookup_drafts) && config.draft_tokens > 0) {
+    } else if (config.lookup_drafts && config.draft_tokens > 0) {
         impl->target->set_rollback_window(config.draft_tokens + 1);
         impl->speculative = std::make_unique<SpeculativeDecoder>(
             *impl->target, config.draft_tokens,
