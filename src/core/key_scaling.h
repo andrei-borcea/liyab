@@ -81,6 +81,9 @@ struct KeyScalingShape {
     // block, block after block (blocks with a RoPE table of their own, such
     // as Gemma's windowed ones, turn at their own speeds).
     std::vector<float> pair_speed;
+    // Per block: what RoPE multiplies the rotated channels by (LongRoPE's
+    // attention factor); empty: 1 everywhere.
+    std::vector<float> rope_magnitude;
     int32_t positions = 0;  // context length: the positions a key can take
     // Factors per scaled model: blocks * n_head_kv * head_dim.
     [[nodiscard]] size_t factors() const noexcept {
@@ -109,9 +112,11 @@ public:
 
 private:
     // Folds `heads` unrotated head vectors of one block, whose pairs turn at
-    // `speed` (rope_dim / 2 entries), into their per-channel maxima, each
-    // channel multiplied by |gain| after the rotation (nullptr: 1).
-    void update(const float* rows, int32_t heads, float* max, const float* speed, const float* gain) const;
+    // `speed` (rope_dim / 2 entries) and are multiplied by `magnitude`, into
+    // their per-channel maxima, each channel multiplied by |gain| after the
+    // rotation (nullptr: 1).
+    void update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
+                const float* gain) const;
     KeyScalingShape shape_;
     std::vector<float> key_max_;    // [block][kv head][channel]
     std::vector<float> query_max_;  // [block][query head][channel]

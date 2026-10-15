@@ -22,6 +22,7 @@ public:
     void add_string_array(const std::string& key, const std::vector<std::string>& v);
     void add_f32_array(const std::string& key, const std::vector<float>& v);
     void add_i32_array(const std::string& key, const std::vector<int32_t>& v);
+    void add_bool_array(const std::string& key, const std::vector<bool>& v);
     // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
     void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
     // Writes the file; aborts the test binary on I/O failure.
@@ -96,6 +97,15 @@ struct TinyModelSpec {
     float rope_base = 10000.0f;  // rope.freq_base (of the global blocks when some are windowed)
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
+    bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
+    bool fused_gate_up = false;  // ffn_up holds [gate | up], no ffn_gate (Phi-3)
+    // > 0: LongRoPE (Phi-3) with this original context: rope_factors_short /
+    // rope_factors_long and an attention factor of 1.19.
+    int32_t longrope_ctx = 0;
+    // attention.sliding_window_pattern: > 0 writes it as a period; a
+    // non-empty swa_layers writes one flag per block (true: windowed) instead.
+    int32_t swa_pattern = 0;
+    std::vector<bool> swa_layers;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

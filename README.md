@@ -103,7 +103,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma3`, `phi3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -286,10 +286,14 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     prompts go in as token ids; the model expects its BOS token first (the GGUF does not ask for one);
   * `gemma3` (Gemma 3 text models): embeddings scaled by √d, GeGLU, norms after the attention and the FFN, Q/K
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
-    stores its RMSNorm weights as 1 + w already.
+    stores its RMSNorm weights as 1 + w already;
+  * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE.
 
-  Linear RoPE scaling and Llama 3.x `rope_freqs` are supported, and windowed blocks can rotate with a RoPE base of
-  their own. YaRN is rejected with a clear error.
+  Linear RoPE scaling, Llama 3.x `rope_freqs` and LongRoPE are supported, and windowed blocks can rotate with a RoPE
+  base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the model's
+  original context (4,096 on Phi-3.5), where the result is the reference's, and the long ones beyond it from the
+  first position on (the reference switches when the sequence grows past it, rotating earlier keys again). YaRN is
+  rejected with a clear error.
   `liyab_supported_architectures()` lists what a build runs, so front ends can filter downloads.
 * **MoE details:**
   * softmax or sigmoid gating, optional selection bias, top-k, renormalization and scale from the metadata;
@@ -1111,6 +1115,8 @@ reference's ids (`--ref-tokens`). With an F16 KV cache the forward passes agree:
 | Hunyuan-0.5B-Instruct (`hunyuan-dense`, reference ids, text after its BOS) | 500 | 0.00000 | 100.00% |
 | gemma-3-270m-it (`gemma3`) | 512 | 0.00000 | 100.00% |
 | gemma-3-270m-it, a longer text: 4 times its 512-position window | 2,048 | 0.00000 | 99.95% |
+| Phi-3.5-mini-instruct (`phi3`, LongRoPE short factors) | 512 | 0.00000 | 99.80% |
+| Phi-3.5-mini-instruct, a longer text past its 4,096-position original context (long factors) | 4,200 | 0.00000 | 99.95% |
 
 **Tokenizers against Hugging Face.** `liyab-tok` compared Liyab's ids with those of each model's own
 `tokenizer.json`, run by the Hugging Face `tokenizers` library (`tools/tokenizer_reference.py`), on three texts:
@@ -1212,8 +1218,8 @@ downloaded.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
-| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases; F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE); streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases; fused QKV and gate/up projections, LongRoPE short and long factors; F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1336,8 +1342,9 @@ Implemented features are described above. These are next, in order:
    (`src/core/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
    Hugging Face (`liyab-kl`). Next:
-   * more block parts described as data (norm placement, RoPE variants such as YaRN, MLA, fused expert tensors),
-     then Phi and DeepSeek;
+   * more block parts described as data (YaRN RoPE, MLA, fused expert tensors, logit soft-capping), then
+     DeepSeek and Gemma 2;
+   * per-block KV caches, so blocks with a sliding window keep only their window's rows;
    * later, multimodal, embedding, reranking and classification models.
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
    and fewer fork/joins per CPU block.
@@ -1376,9 +1383,9 @@ Implemented features are described above. These are next, in order:
 * **Metal** submits one command buffer per matmul.
 * **Kernels:** TQ1_0 and NVFP4 use a generic decode path on the CPU. Lattice I-quants are 2–3× slower than Q4_K. Only
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
-* **Architectures not supported yet:** Gemma 2 and 3n, Phi, DeepSeek V3/V4, fused `ffn_gate_up_exps` tensors and
-  YaRN RoPE scaling. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not supported
-  either (a new one is a table row).
+* **Architectures not supported yet:** Gemma 2 and 3n, Phi-1/2 and Phi MoE, DeepSeek V3/V4, fused
+  `ffn_gate_up_exps` tensors and YaRN RoPE scaling. BPE pre-tokenizers beyond those of
+  [Supported models](#supported-models) are not supported either (a new one is a table row).
 * **Gemma 3:** the windowed blocks' keys stay in the cache for the whole context (the pages are shared by every
   block), so a long context costs Gemma 3 the KV memory of full attention. Gemma 3 27B scales its queries by
   1/√(d/heads), which its GGUF does not record: it is not supported (it runs with 1/√head_dim).
@@ -1444,8 +1451,9 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`: how RoPE pairs dimensions, the names
   of the norms before the FFN and after the attention and the FFN, the MoE renormalization default, whether Q/K norms
   come before or after RoPE, the FFN's activation, whether embeddings are scaled, which blocks use the sliding window
-  and their RoPE base. `describe_model()` plans each block from the tensors present (mixer, gated or windowed
-  attention, dense or MoE FFN, shared expert) and binds optional tensors where they exist.
+  and their RoPE base. `describe_model()` plans each block from the tensors present (mixer, separate or fused
+  projections, gated or windowed attention, dense or MoE FFN, shared expert) and binds optional tensors where they
+  exist.
   Add a `test_golden` case and check a BF16/F16 GGUF against its Hugging Face model (`tools/conform_reference.py`,
   then `liyab-kl --compare … --kv f16`). New kinds of blocks still need engine code (see the [roadmap](#roadmap)).
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64

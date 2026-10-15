@@ -69,6 +69,7 @@ struct TdssConfig {
 class LIYAB_API Tdss final : public FfnMatmulHook {
 public:
     // `ffn` holds {gate, up, down} for every block. `pool` must outlive this.
+    // Unsupported when a block lacks one of them (a fused [gate | up] matrix).
     static Result<std::unique_ptr<Tdss>> create(std::span<const std::array<const TensorView*, 3>> ffn,
                                                 ThreadPool& pool, TdssConfig config = {});
 

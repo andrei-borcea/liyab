@@ -4,17 +4,18 @@
 // architecture's row of facts the tensors cannot tell, the hyperparameters,
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
-// mixer — softmax attention (GQA, RoPE in either pairing with a per-block
-// table, optional QKV bias, per-head Q/K norm before or after RoPE, optional
-// sigmoid output gate, optional sliding window) or a Gated DeltaNet
-// linear-attention recurrence — followed by a gated dense FFN (SwiGLU or
-// GeGLU) or a mixture of experts (router + top-k routed experts + optional
-// gated shared expert), each optionally followed by its own norm before the
-// residual add. So hybrid models (Qwen3.5: three DeltaNet blocks per
-// attention block), models that alternate windowed and global attention
-// (Gemma 3) and plain transformers (Llama, Mistral, Qwen2/3) share one
-// forward pass. Tensor precision is per tensor, so mixed-precision files run
-// unconverted.
+// mixer — softmax attention (GQA, separate or fused QKV projections, RoPE in
+// either pairing with a per-block table and LongRoPE factors, optional QKV
+// bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
+// optional sliding window) or a Gated DeltaNet linear-attention recurrence —
+// followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and
+// up projections) or a mixture of experts (router + top-k routed experts +
+// optional gated shared expert), each optionally followed by its own norm
+// before the residual add. So hybrid models (Qwen3.5: three DeltaNet blocks
+// per attention block), models that alternate windowed and global attention
+// (Gemma 3), models with fused projections (Phi-3) and plain transformers
+// (Llama, Mistral, Qwen2/3) share one forward pass. Tensor precision is per
+// tensor, so mixed-precision files run unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
 
@@ -119,7 +120,9 @@ public:
     [[nodiscard]] const TensorView* attn_output(int32_t layer) const {
         return layers_[static_cast<size_t>(layer)].w[kO];
     }
-    // FFN projections {gate, up, down} of block `layer` (experimental sparsification).
+    // FFN projections {gate, up, down} of block `layer` (experimental
+    // sparsification). With BlockPlan::fused_gate_up, gate is nullptr and up
+    // is the fused [gate | up] matrix; MoE blocks have none of them.
     [[nodiscard]] std::array<const TensorView*, 3> ffn_weights(int32_t layer) const {
         const Layer& L = layers_[static_cast<size_t>(layer)];
         return {L.w[kGate], L.w[kUp], L.w[kDown]};
@@ -326,6 +329,7 @@ private:
     struct RopeTable {
         std::vector<float> inv_freq;  // per rotary pair, frequency factors included
         float scale = 1.0f;           // linear position scaling
+        float magnitude = 1.0f;       // multiplies the rotated dimensions (ModelConfig::rope_magnitude)
     };
 
     Transformer() = default;
@@ -336,6 +340,9 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // BlockPlan::fused_qkv: projects xb_ through the block's attn_qkv on
+    // `backend` and splits each token's [q | k | v] into q_, k_ and v_.
+    Status project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
@@ -437,6 +444,7 @@ private:
     std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
     std::vector<quant::BlockQ8_0> q8_queries_;          // attention: Q8_0 queries for quantized caches
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
+    std::vector<float> qkv_;                           // fused attention projection: raw [q | k | v] rows
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
