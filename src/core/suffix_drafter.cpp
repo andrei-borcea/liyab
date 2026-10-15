@@ -18,7 +18,7 @@ constexpr size_t kMaxStoredOccurrences = 128;
 // of verified drafts at which a bin halves its counts (it follows the text
 // and the sampling settings instead of averaging all of history).
 constexpr float kPriorWeight = 2.0f;
-constexpr float kBinHalfLife = 512.0f;
+constexpr float kBinHalfLife = 64.0f;
 
 }  // namespace
 

@@ -118,29 +118,31 @@ struct EngineConfig {
     // Most drafts per speculative step (k). 3 by default: a verification pass
     // then holds 4 tokens, exactly one tile of the repacked CPU kernels.
     int32_t draft_tokens = 3;
-    // Without a draft model: draft up to draft_tokens tokens by looking the
-    // last tokens up in the conversation (SpeculativeDecoder::lookup). Same
-    // output distribution, no extra weights, any model; pays off when the text
-    // repeats its context and on models that verify k tokens for about the
-    // cost of one (dense models in RAM).
+    // Without a draft model: draft up to draft_tokens tokens from the text
+    // itself, by the suffix drafter or by context lookup (suffix_drafts).
+    // Same output distribution, no extra weights, any model; pays off when
+    // the text repeats earlier text and on models that verify k tokens for
+    // about the cost of one (dense models in RAM).
     bool lookup_drafts = false;
     // Learn on the device how many drafts per step pay off (0..draft_tokens;
     // see SpeculativeDecoder). false: always draft_tokens, which keeps sampled
     // output reproducible for a fixed seed.
     bool adaptive_drafts = true;
-    // Without a draft model: draft from the suffix drafter instead of context
-    // lookup (core/suffix_drafter.h): the longest earlier match (2..32
-    // tokens) in this conversation or in earlier ones of this engine, and the
+    // How lookup_drafts drafts. true (the default, measured ahead of context
+    // lookup on every task, README "Speculative decoding"): the suffix drafter
+    // (core/suffix_drafter.h), the longest earlier match (2..32 tokens) in
+    // this conversation or in earlier ones of this engine and the
     // continuation most of its occurrences agree on, verified at a length
     // chosen per step from calibrated acceptance probabilities and the
-    // measured cost of a step per draft count (adaptive_drafts). Takes
-    // precedence over lookup_drafts. Earlier conversations are kept in RAM
-    // for the engine's lifetime, at most 262144 tokens (~2 MiB) in at most 64
-    // sequences, least recently used out first. Sampled output is the same
-    // tokens as plain decoding draws from the seed (CPU backend), adaptive or
-    // not. draft_tokens is the most drafts per step, and hybrid models keep
-    // draft_tokens + 1 recurrent-state checkpoints.
-    bool suffix_drafts = false;
+    // measured cost of a step per draft count (adaptive_drafts). Earlier
+    // conversations are kept in RAM for the engine's lifetime, at most 262144
+    // tokens (~2 MiB) in at most 64 sequences, least recently used out first.
+    // Sampled output is the same tokens as plain decoding draws from the seed
+    // (CPU backend), adaptive or not. false: context lookup
+    // (SpeculativeDecoder::lookup). No effect without lookup_drafts or with a
+    // draft model. Either way draft_tokens is the most drafts per step, and
+    // hybrid models keep draft_tokens + 1 recurrent-state checkpoints.
+    bool suffix_drafts = true;
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing

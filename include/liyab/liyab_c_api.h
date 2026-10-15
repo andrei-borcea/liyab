@@ -73,7 +73,7 @@ typedef struct liyab_engine_config {
     int32_t sliding_window;       /* 0: full attention */
     int32_t kv_sink_tokens;       /* attention sinks kept with a sliding window (default 8) */
     int32_t draft_tokens;         /* tokens proposed per speculative step */
-    int32_t lookup_drafts;        /* nonzero, no draft model: draft by context lookup (n-gram) */
+    int32_t lookup_drafts;        /* nonzero, no draft model: draft from the text itself (suffix drafts or context lookup, see suffix_drafts) */
     int32_t adaptive_drafts;      /* nonzero (default): learn how many drafts per step pay off; 0: always draft_tokens */
     liyab_kv_cache_type kv_cache_type;
     liyab_backend backend;
@@ -101,7 +101,7 @@ typedef struct liyab_engine_config {
     const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
-    int32_t suffix_drafts;        /* nonzero, no draft model: draft from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most) instead of context lookup; takes precedence over lookup_drafts (see EngineConfig) */
+    int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

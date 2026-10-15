@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
         std::vector<std::unique_ptr<Engine>> engines;
         for (const Mode& mode : modes) {
             EngineConfig config = base;
-            config.lookup_drafts = mode.lookup;
+            config.lookup_drafts = mode.lookup || mode.suffix;
             config.suffix_drafts = mode.suffix;
             if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
             config.adaptive_drafts = !mode.fixed;

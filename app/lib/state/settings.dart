@@ -133,7 +133,7 @@ class ExperimentalSettings {
   int tdss = 0; // 2:4 sparse FFN weights: 0 off, 1 while hot, 2 always
   bool kvDedup = false; // persistent prefix KV cache on storage
   bool lookupDrafts = false; // speculative decoding from the conversation's own text
-  bool suffixDrafts = false; // ... from suffix drafts (this and earlier conversations) instead of lookup
+  bool suffixDrafts = true; // ... by suffix drafts (this and earlier conversations); false: context lookup
   int draftTokens = 3;
   double expertMass = 1.0; // MoE: fewest top experts covering this router mass
   int maxExperts = 0; // MoE: experts per token cap; 0 = the model's
