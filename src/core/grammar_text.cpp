@@ -318,10 +318,10 @@ private:
                 if (!json_) json_ = json_value(b_, JsonFormat{});
                 return *json_;
             }
-            if (word == "schema") {
+            if (word == "schema" || word == "string") {
                 auto extent = json_extent();
                 if (!extent) return extent.status();
-                auto node = json_schema(b_, *extent, JsonFormat{});
+                auto node = word == "schema" ? json_schema(b_, *extent, JsonFormat{}) : raw_string(b_, *extent);
                 if (!node) return Status(node.status().code(), error(node.status().message()).message());
                 return node;
             }

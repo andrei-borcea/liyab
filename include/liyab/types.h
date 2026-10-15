@@ -259,6 +259,11 @@ struct GenerationStats {
     int32_t expert_predicted = 0;   // experts guessed one block ahead (cached ones included)
     int32_t expert_predicted_used = 0;  // ... that the router then chose (precision = used / predicted)
     DecodePhases decode_phases;
+    // Constrained decoding (GenerateOptions): tokens sampled under a grammar
+    // (forced ones are in forced_tokens), and the time spent computing and
+    // applying their masks and following the grammar (part of decode_ms).
+    int32_t constrained_tokens = 0;
+    double grammar_ms = 0.0;
     bool cancelled = false;
 };
 

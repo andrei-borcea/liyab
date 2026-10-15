@@ -139,6 +139,8 @@ private:
 // are added to the builder as needed.
 Result<Builder::Node> json_schema(Builder& b, std::string_view schema_json, const JsonFormat& format);
 Builder::Node json_value(Builder& b, const JsonFormat& format);
+// A string schema's value as raw text: no quotes, no escapes (%string).
+Result<Builder::Node> raw_string(Builder& b, std::string_view schema_json);
 // Grammar text (core/grammar_text.cpp): defines its rules; returns `root`.
 Result<uint32_t> parse_text(Builder& b, std::string_view text);
 
@@ -155,6 +157,8 @@ struct VocabTrie {
     std::vector<Node> nodes;
     std::vector<int32_t> tokens;
     std::vector<int32_t> end_of_generation;
+    enum class Kind : uint8_t { None, Text, EndOfGeneration };
+    std::vector<Kind> kinds;  // per token id
     int32_t vocab_size = 0;
     uint16_t max_depth = 0;
 
@@ -193,12 +197,25 @@ public:
     // Sets the logits of disallowed tokens to -infinity; returns how many
     // tokens stay allowed.
     size_t apply_mask(int32_t state, const VocabTrie& trie, std::span<float> logits);
+    // Whether the state allows `token` (its piece, or an end-of-generation
+    // token where the state accepts).
+    bool allows(int32_t state, int32_t token, const Tokenizer& tokenizer, const VocabTrie& trie);
+    // Leaves only the `k` highest logits among allowed tokens (ties: the
+    // lower id first) and sets every other logit to -infinity: what masking
+    // and then keeping the top k leaves, found by checking the most likely
+    // tokens one by one instead of building the state's whole mask. Greedy
+    // and top-k sampling then cost a few token checks per step even in a
+    // state never seen before (a bounded string has one per position).
+    // Returns false, logits untouched, when fewer than k of the 1024 most
+    // likely tokens are allowed: the caller masks in full.
+    bool keep_top_allowed(int32_t state, const Tokenizer& tokenizer, const VocabTrie& trie, std::span<float> logits,
+                          size_t k);
 
     // Bounds memory: when the table holds more than its limits, forgets every
     // state but `keep` (returned with its new id); call between tokens.
     int32_t compact(int32_t keep);
     [[nodiscard]] size_t size() const noexcept { return states_.size(); }
-    [[nodiscard]] size_t memory_bytes() const noexcept;
+    [[nodiscard]] size_t memory_bytes() const noexcept { return bytes_; }
     // True once a state set exceeded the depth / width limits (the grammar
     // is too ambiguous); such stacks were dropped.
     [[nodiscard]] bool overflowed() const noexcept { return overflow_; }
@@ -218,6 +235,7 @@ private:
     static constexpr int32_t kUnknown = -2;
 
     int32_t intern(std::vector<std::vector<uint32_t>>& stacks);
+    int32_t* row(int32_t state);  // the state's transitions, allocated on first use
     void close(std::vector<uint32_t>& stack, std::vector<std::vector<uint32_t>>& out, int depth);
     int32_t compute(int32_t state, uint8_t byte);
 
@@ -226,6 +244,7 @@ private:
     std::unordered_map<std::vector<uint32_t>, int32_t, KeyHash> index_;
     int32_t initial_ = kUnknown;
     size_t masks_ = 0;  // states holding a mask
+    size_t bytes_ = 0;  // memory held, approximately (kept as states, rows and masks are added)
     bool overflow_ = false;
 };
 

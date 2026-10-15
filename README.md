@@ -115,7 +115,7 @@ These rules decide what goes into the code:
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
-| Structured output: forced continuations (tool-call syntax and names in the app) | ✅ |
+| Structured output: grammar-constrained decoding (JSON Schema, grammar text) and forced continuations (tool-call syntax and names in the app) | ✅ |
 | Speculative decoding: draft model or n-gram lookup, adaptive draft count, hybrid models included | ✅ |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
@@ -188,7 +188,7 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   │ Engine                                                                      │
   │  ├─ Context manager ── turn-to-turn reuse, state snapshots, prefix cache,   │
   │  │                     cancellable chunked prefill, save/restore            │
-  │  ├─ Generation ─────── sampler, forced continuations, speculative decoding  │
+  │  ├─ Generation ─────── sampler, grammars, forced text, speculative decoding │
   │  ├─ PowerManager ───── headroom forecast, pacing, performance hints, guards │
   │  ├─ DeviceDetect ───── SoC + accelerator probes → backend ranking           │
   │  └─ Transformer ────── per block: mixer (attention | Gated DeltaNet)        │
@@ -465,6 +465,35 @@ each of those as a scheduling problem.
   `GenerationStats::decode_passes` counts the model's passes while decoding. On the 35B with streamed experts, a tool call's 9 forced tokens took 1.52 s against ~1.66 s to
   sample them: a batched pass reads the union of its tokens' experts, so what forcing buys there is a call that
   always parses, not speed.
+* **Constrained decoding.** `generate()` also takes `GenerateOptions`: a grammar the whole output must match, or a
+  `ContinuationCallback` that forces text and opens constrained spans where it chooses (a tool call's arguments,
+  between forced syntax). While a grammar is active, every token whose bytes it cannot accept is masked before
+  sampling, so the output always matches. Grammars come from a JSON Schema (the subset tool parameters and response
+  formats use: objects, required and optional properties, enums, `$ref`, integer and number ranges, string lengths
+  and formats; see `include/liyab/grammar.h`), any JSON, or grammar text in a GBNF-like syntax with `%json`,
+  `%schema`, `%string` and `%until`. A schema keyword Liyab cannot enforce (`pattern`, `uniqueItems`...) is refused
+  with an error naming it and where it is, never ignored.
+  * **How.** Liyab's own grammar engine lowers rules to a byte-level pushdown automaton: UTF-8 classes become byte
+    sequences, so a token may end inside a character, and a matched text is always valid UTF-8. The set of parse
+    stacks the output allows is interned as a state, and byte transitions between states are cached: inside a
+    string a transition is one table lookup. The vocabulary is a trie in depth-first order; a state's mask is one
+    pass over it that skips every subtree whose prefix the state rejects, and is cached per state. Greedy and top-k
+    sampling skip the mask altogether: the likeliest tokens are checked one by one until the k best allowed ones
+    are found, which leaves exactly what masking then keeping the top k would.
+  * **Forced, not sampled.** Text every continuation shares (keys, separators, brackets, the rest of the only enum
+    value that fits) is forced in one batched pass, as forced continuations are. JSON is laid out as `json.dumps`
+    writes it (`", "` and `": "`) by default, so the model samples only values and choices; any white space is an
+    option. End-of-generation tokens are allowed only where the grammar accepts, and a whole-output grammar ends the
+    generation as soon as its match is complete.
+  * **Cost.** On an M4 Pro (Qwen3-0.6B, Llama 3.2 1B, Qwen2.5-0.5B), constrained decoding cost 0.14–0.24 ms per
+    token greedy, 0.25–0.42 ms with top-k sampling and 0.10–0.12 ms with whole masks once a state's mask is cached,
+    against decode steps of 19–92 ms. A state's first mask takes 1.5–1.9 ms (inside a string, where nearly every
+    token is allowed); the vocabulary trie (~330,000 nodes for Qwen's 151,000 tokens) is built in ~25 ms on the
+    first constrained token. The engine keeps the states and masks of the 16 grammars used last (64 MiB at most), so
+    a request with the same tools does not pay for them again. `GenerationStats::constrained_tokens` and
+    `grammar_ms` report the cost of each generation.
+  * **Speculative decoding** is off while a grammar is active (drafts would need a mask at every verified position);
+    the unconstrained parts of the same generation use it.
 
 ---
 
@@ -550,6 +579,17 @@ int main() {
 }
 ```
 
+Constrained decoding: the reply is a JSON value valid against a schema.
+
+```cpp
+auto schema = liyab::Grammar::from_json_schema(R"({"type": "object", "properties": {
+    "city": {"type": "string"}, "days": {"type": "integer", "minimum": 1, "maximum": 14}},
+    "required": ["city"]})");
+liyab::GenerateOptions options;
+options.grammar = *schema;  // or options.continuation: forced text and constrained spans where you choose
+auto stats = engine.value()->generate(prompt, params, on_piece, options);
+```
+
 `Engine::cancel()` is thread-safe and stops at the next token. `prefill(text)` processes a prefix ahead of time,
 such as a system prompt right after loading. `reset_context()` forgets everything. The public headers in
 `include/liyab/` document each function's contract: preconditions, ownership, thread safety and error cases.
@@ -578,6 +618,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | :--- | :--- |
 | `liyab_engine_generate` / `_generate_tokens` | Blocking generation from text or token ids; pieces are whole UTF-8 |
 | `liyab_engine_generate_forced` | Generation with forced continuations (structured output) |
+| `liyab_grammar_from_json_schema` / `_parse` / `_matches` / `_destroy` | Grammars for constrained decoding: from a JSON Schema or grammar text |
+| `liyab_engine_generate_structured` | Generation constrained by a grammar, or forced text and constrained spans from a callback |
 | `liyab_engine_cancel` / `_cancel_prefill` | Stop a generation / a background prefill (thread-safe) |
 | `liyab_engine_prefill` / `_reset_context` | Process a prefix ahead of time / forget the context |
 | `liyab_engine_save_state` / `_load_state` | Persist and restore the context across processes |
@@ -1197,7 +1239,7 @@ downloaded.
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
-| `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters |
+| `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
@@ -1366,6 +1408,8 @@ Implemented features are described above. These are next, in order:
   new one is a table row).
 * **DeltaNet** runs its recurrence token by token on the CPU, also during prefill: no chunked parallel scan or GPU
   kernel yet.
+* **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as
+  `anyOf` (overlapping branches are not told apart); speculative decoding pauses while a grammar is active.
 * **Split GGUF:** dense split models use the older `mmap` streaming window. A split model opened through the system
   picker cannot find its other parts.
 * **App:**
