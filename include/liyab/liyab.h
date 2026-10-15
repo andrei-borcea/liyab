@@ -15,6 +15,7 @@
 #include "liyab/backend.h"
 #include "liyab/device_detect.h"
 #include "liyab/engine.h"
+#include "liyab/grammar.h"
 #include "liyab/mmap_loader.h"
 #include "liyab/power_manager.h"
 #include "liyab/types.h"
