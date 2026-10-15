@@ -206,8 +206,10 @@ float SuffixDrafter::prior(int32_t match, float share) {
 }
 
 float SuffixDrafter::acceptance(uint16_t bin, int32_t match, float share) const {
+    const Bin& c = coarse_[bin / kFinePerCoarse];
+    const float coarse = (c.accepted + kPriorWeight * prior(match, share)) / (c.verified + kPriorWeight);
     const Bin& b = bins_[bin];
-    return (b.accepted + kPriorWeight * prior(match, share)) / (b.verified + kPriorWeight);
+    return (b.accepted + kPriorWeight * coarse) / (b.verified + kPriorWeight);
 }
 
 const SuffixDrafter::Draft& SuffixDrafter::propose(int32_t max_tokens) {
@@ -319,12 +321,14 @@ void SuffixDrafter::feedback(const Draft& draft, int32_t verified, int32_t accep
     verified = std::min(verified, static_cast<int32_t>(draft.bins.size()));
     // Draft i was tested only if every one before it was accepted.
     for (int32_t i = 0; i < verified && i <= accepted; ++i) {
-        Bin& b = bins_[draft.bins[static_cast<size_t>(i)]];
-        b.verified += 1.0f;
-        if (i < accepted) b.accepted += 1.0f;
-        if (b.verified >= kBinHalfLife) {
-            b.verified *= 0.5f;
-            b.accepted *= 0.5f;
+        const uint16_t bin = draft.bins[static_cast<size_t>(i)];
+        for (Bin* b : {&bins_[bin], &coarse_[bin / kFinePerCoarse]}) {
+            b->verified += 1.0f;
+            if (i < accepted) b->accepted += 1.0f;
+            if (b->verified >= kBinHalfLife) {
+                b->verified *= 0.5f;
+                b->accepted *= 0.5f;
+            }
         }
     }
 }

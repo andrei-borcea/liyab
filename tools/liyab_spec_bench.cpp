@@ -7,8 +7,9 @@
 //                    [--threads N] [--backend cpu|metal|auto]
 //
 // A mode is plain, lookup or suffix, optionally with its most drafts per step
-// (":K", default EngineConfig::draft_tokens); the first mode is the reference
-// (plain). Every mode has an engine of its own, unpaced, and the tasks run in
+// (":K", default EngineConfig::draft_tokens) and ":fixed" to verify every
+// draft on offer instead of a learned count (acceptance and tokens per pass
+// then do not depend on timing); the first mode is the reference (plain). Every mode has an engine of its own, unpaced, and the tasks run in
 // this order, each on all modes back to back (so the modes share the load of
 // the host), each a new conversation formatted by the model's chat template
 // (thinking off where the template has the switch):
@@ -23,7 +24,8 @@
 // speed-up over plain decoding, the share of drafts accepted, tokens per
 // verification pass and whether the reply is the plain one (it must be:
 // greedy speculative decoding is exact). --repeat R runs it all R times on
-// fresh engines and prints medians (speed-ups taken within each run).
+// fresh engines and prints the median tok/s and speed-up (taken within each
+// run) next to the best run's (the least disturbed on a shared host).
 //
 // Uses only the public C++ API; built with the tests (LIYAB_BUILD_TESTS).
 #include <algorithm>
@@ -157,6 +159,7 @@ struct Mode {
     std::string name;
     bool lookup = false, suffix = false;
     int32_t draft_tokens = 0;  // 0: the default
+    bool fixed = false;        // always the most drafts on offer (EngineConfig::adaptive_drafts off)
 };
 
 // Runs one conversation; returns the replies and the decode statistics of all its turns.
@@ -256,6 +259,7 @@ int main(int argc, char** argv) {
         if (colon != std::string::npos) m.draft_tokens = std::atoi(m.name.c_str() + colon + 1);
         m.lookup = kind == "lookup";
         m.suffix = kind == "suffix";
+        m.fixed = m.name.ends_with(":fixed");
         if (!m.lookup && !m.suffix && kind != "plain") {
             usage();
             return 2;
@@ -286,6 +290,7 @@ int main(int argc, char** argv) {
             config.lookup_drafts = mode.lookup;
             config.suffix_drafts = mode.suffix;
             if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
+            config.adaptive_drafts = !mode.fixed;
             auto engine = Engine::create(config);
             if (!engine) {
                 std::fprintf(stderr, "%s\n", engine.status().to_string().c_str());
@@ -308,8 +313,15 @@ int main(int argc, char** argv) {
         std::sort(v.begin(), v.end());
         return v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
     };
-    std::printf("%-8s %-10s %7s %8s %8s %8s %10s %5s\n", "task", "mode", "tokens", "tok/s", "speedup", "accept",
-                "tok/pass", "same");
+    std::printf("%-8s %-10s %7s %8s %8s %9s %9s %8s %10s %5s\n", "task", "mode", "tokens", "tok/s", "best", "speedup",
+                "best-x", "accept", "tok/pass", "same");
+    auto best_rate = [&](size_t m, size_t t) {
+        double best = 0.0;
+        for (const auto& run_results : results) {
+            best = std::max(best, run_results[m][t].tokens * 1000.0 / run_results[m][t].decode_ms);
+        }
+        return best;
+    };
     for (size_t t = 0; t < tasks.size(); ++t) {
         for (size_t m = 0; m < modes.size(); ++m) {
             std::vector<double> rates, speedups;
@@ -326,8 +338,9 @@ int main(int argc, char** argv) {
                 accepted += r.accepted;
                 same = same && r.replies == results[0][0][t].replies;
             }
-            std::printf("%-8s %-10s %7d %8.1f %7.2fx %7.0f%% %10.2f %5s\n", tasks[t].name.c_str(),
-                        modes[m].name.c_str(), tokens / repeats, median(rates), median(speedups),
+            std::printf("%-8s %-10s %7d %8.1f %8.1f %8.2fx %8.2fx %7.0f%% %10.2f %5s\n", tasks[t].name.c_str(),
+                        modes[m].name.c_str(), tokens / repeats, median(rates), best_rate(m, t), median(speedups),
+                        best_rate(m, t) / best_rate(0, t),
                         proposed > 0 ? 100.0 * accepted / proposed : 0.0,
                         passes > 0 ? static_cast<double>(tokens) / passes : 0.0, same ? "yes" : "NO");
         }

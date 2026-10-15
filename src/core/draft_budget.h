@@ -17,12 +17,15 @@
 // per draft count it picks the count with the most expected tokens per
 // millisecond for this very draft, so a confident draft is verified at length
 // and a doubtful one not at all, also on a model where drafting does not pay
-// on average.
+// on average. A count's step time is the median of its last kWindow steps,
+// never below a count with fewer drafts: a step slowed by other work on the
+// cores, or a lucky one, does not move it.
 //
 // Not thread-safe: owned by one SpeculativeDecoder.
 #ifndef LIYAB_CORE_DRAFT_BUDGET_H
 #define LIYAB_CORE_DRAFT_BUDGET_H
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -39,9 +42,10 @@ public:
     // probability that its drafts 0..i are all accepted (non-increasing):
     // the count j <= survival.size() maximizing
     // (1 + survival[0] + ... + survival[j - 1]) / cost(j). Plain decoding is
-    // measured first. A count not measured yet is costed as the dearest
-    // fewer-drafts count measured (a step never costs less with more drafts),
-    // so it is tried only where it could win. A count not measured for longer
+    // measured first. A step never costs less with more drafts, so a count
+    // costs at least the dearest fewer-drafts count measured; one not measured
+    // yet costs just that, so it is tried only where it could win. A count not
+    // measured for longer
     // than its wait (kFirstRetry steps, doubling up to kMaxRetry with each
     // such try) is measured again when it comes within kRetryShare of the
     // best count's rate.
@@ -58,6 +62,8 @@ public:
     static constexpr uint64_t kFirstRetry = 16;
     static constexpr uint64_t kMaxRetry = 1024;
     static constexpr double kRetryShare = 0.9;
+    // Step times per count that choose(survival) takes the median of.
+    static constexpr int32_t kWindow = 8;
 
 private:
     struct Arm {
@@ -65,7 +71,9 @@ private:
         int32_t samples = 0;
         uint64_t backoff = 0;   // current retry interval; 0 while it leads
         uint64_t retry_at = 0;  // step from which it may be tried again
-        double ms = 0.0;               // step time, for choose(survival)
+        double ms = 0.0;               // step time (median of `recent`), for choose(survival)
+        std::array<float, kWindow> recent{};  // the last step times, a ring
+        uint8_t filled = 0, next = 0;
         uint64_t sampled_at = 0;       // step of the last sample
         uint64_t wait = kFirstRetry;   // steps after which that time is measured again if it nearly wins
     };

@@ -1,6 +1,7 @@
 #include "core/draft_budget.h"
 
 #include <algorithm>
+#include <array>
 
 namespace liyab {
 
@@ -45,12 +46,14 @@ int32_t DraftBudget::choose(std::span<const float> survival) {
     int32_t choice = 0;
     rates_[0] = 1.0 / std::max(arms_[0].ms, 1e-9);
     double tokens = 1.0;
-    double floor = arms_[0].ms;  // the dearest fewer-drafts step: a lower bound for an unknown time
+    // The dearest fewer-drafts step: a step never costs less with more
+    // drafts, so this bounds an unknown time and a time measured too low.
+    double floor = arms_[0].ms;
     for (int32_t j = 1; j <= offered; ++j) {
         tokens += survival[static_cast<size_t>(j - 1)];
         const Arm& arm = arms_[static_cast<size_t>(j)];
-        const double ms = std::max(arm.samples == 0 ? floor : arm.ms, 1e-9);
-        if (arm.samples > 0) floor = std::max(floor, arm.ms);
+        floor = std::max(floor, arm.samples == 0 ? 0.0 : arm.ms);
+        const double ms = std::max(floor, 1e-9);
         rates_[static_cast<size_t>(j)] = tokens / ms;
         if (rates_[static_cast<size_t>(j)] > rates_[static_cast<size_t>(choice)]) choice = j;
     }
@@ -76,7 +79,15 @@ void DraftBudget::record(int32_t drafts, int32_t tokens, double ms) {
     Arm& arm = arms_[static_cast<size_t>(drafts)];
     const double sample = static_cast<double>(tokens) / ms;
     arm.rate = arm.samples == 0 ? sample : arm.rate + kDecay * (sample - arm.rate);
-    arm.ms = arm.samples == 0 ? ms : arm.ms + kDecay * (ms - arm.ms);
+    // Step time: the median of the last kWindow steps, so neither a step
+    // another process slowed nor a lucky one moves it (an average was pulled
+    // around for ten steps by each).
+    arm.recent[arm.next] = static_cast<float>(ms);
+    arm.next = static_cast<uint8_t>((arm.next + 1) % kWindow);
+    arm.filled = static_cast<uint8_t>(std::min<int32_t>(arm.filled + 1, kWindow));
+    std::array<float, kWindow> sorted = arm.recent;
+    std::sort(sorted.begin(), sorted.begin() + arm.filled);
+    arm.ms = arm.filled % 2 ? sorted[arm.filled / 2] : 0.5 * (sorted[arm.filled / 2 - 1] + sorted[arm.filled / 2]);
     arm.sampled_at = step_;
     // A count measured again only because its time was old waits twice as
     // long before the next such try.
