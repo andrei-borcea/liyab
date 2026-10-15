@@ -1191,6 +1191,10 @@ size_t Engine::trim_memory() {
         if (ExpertStore* store = impl_->draft->expert_store()) released += store->trim();
     }
     if (released > 0) LIYAB_LOG_INFO("trimmed %.2f GiB of cached experts", released / (1024.0 * 1024.0 * 1024.0));
+    // Constrained decoding's caches are rebuilt on the next constrained
+    // generation (the trie in tens of ms): not worth keeping while idle.
+    impl_->grammar_tables.clear();
+    impl_->vocab_trie.reset();
     return released;
 }
 

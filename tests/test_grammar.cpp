@@ -693,6 +693,8 @@ TEST_CASE("constrained generation: deterministic, and unconstrained generation u
         const Output a = generate(e, "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});
         const Output b = generate(e, "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});
         CHECK(a.text == b.text);
+        (void)e.trim_memory();  // drops the trie and the grammar's states: rebuilt, same output
+        CHECK(generate(e, "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g}).text == a.text);
         auto other = Engine::create(config_for(tiny_model()));
         REQUIRE(other.has_value());
         const Output c = generate(*other.value(), "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});

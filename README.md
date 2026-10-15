@@ -450,8 +450,8 @@ each of those as a scheduling problem.
   (a 1,436-token chat: 60 s to the first token). The file also records the key scales its KV pages were stored with;
   a context saved with other scales, or before key scaling existed, has its keys converted when loaded, so an
   upgrade does not process saved conversations again.
-* **Giving memory back.** `trim_memory()` empties the expert cache while idle; the model and its context stay
-  loaded. Its hot list survives: `warm_memory()` refills the cache in one background pass of large reads (~0.7 s for
+* **Giving memory back.** `trim_memory()` empties the expert cache while idle, and drops constrained decoding's
+  caches (rebuilt on the next constrained generation); the model and its context stay loaded. Its hot list survives: `warm_memory()` refills the cache in one background pass of large reads (~0.7 s for
   2.4 GB), and `save_expert_profile()` / `load_expert_profile()` carry the list to a later process.
 * **Structured output.** `generate()` takes an optional `ForceCallback`. After each piece it sees the output so far
   and may return text the output must continue with. The engine runs that text through the model in one batched
