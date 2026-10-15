@@ -282,6 +282,11 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-kl tools/liyab_kl.cpp)
   target_link_libraries(liyab-kl PRIVATE liyab_core)
   target_include_directories(liyab-kl PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Routed experts of a MoE model: routing/activation capture, a Q8_0-expert copy of a GGUF,
+  # dequantization (the cold-expert study, docs/research/cold-experts.md).
+  add_executable(liyab-experts tools/liyab_experts.cpp)
+  target_link_libraries(liyab-experts PRIVATE liyab_core)
+  target_include_directories(liyab-experts PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # A tokenizer on its own: ids, comparison with reference ids, encoding speed.
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)
