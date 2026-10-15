@@ -16,7 +16,8 @@ This tool measures what smaller representations of the routed experts cost in ac
 Representations (all our own implementations, built from the GGUF's dequantized weights; column importances
 come from the calibration capture's input second moments, the only "calibration" used):
 
-  q3k       uniform 3-bit, Q3_K-like: 16-value sub-blocks, signed levels -4..3, 6-bit scales      3.44 bpw
+  q3k       the standard Q3_K format (the engine already decodes it), our own encoder: uniform 3-bit,
+            16-value sub-blocks, signed levels -4..3, 6-bit scales                                 3.44 bpw
   q2k       uniform 2-bit, Q2_K-like: 16-value sub-blocks, 4-bit scale and min                    2.63 bpw
   nu3       non-uniform 3-bit: an 8-level codebook per tensor (weighted Lloyd), 8-bit scale / 32   3.31 bpw
   nu3s16    the same with 6-bit scales per 16 values (Q3_K's bit budget)                          3.44 bpw
@@ -26,12 +27,13 @@ come from the calibration capture's input second moments, the only "calibration"
             W ~ diag(h) sign(U) diag(l) sign(V)^T diag(g), initialized from a truncated SVD of the
             importance-weighted matrix, then refined locally by alternating least squares on h, g, l
             and coordinate descent on the signs (no training through the model)
+  lbiN      the same, its SVD-based initialization only (scales by least squares, no sign search)
   svdN      truncated SVD with fp16 factors at N bits/weight (reference for "low rank")
   zero      the expert removed (0 bits): its output is dropped
   Suffix "w": the representation is fitted to the importance-weighted error (input second moments).
 
 Dequantization uses the gguf package's numpy decoders (gguf-py); `check-dequant` compares them with the engine's
-own decoder (`liyab-experts dequant`). Requires numpy, torch and gguf (pip install gguf).
+own decoder (`liyab-experts dequant`), and `check-encoders` decodes our IQ3_XXS and Q3_K blocks with both. Requires numpy, torch and gguf (pip install gguf).
 """
 from __future__ import annotations
 
@@ -157,15 +159,17 @@ def _f16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float16).to(torch.float32)
 
 
-def q3k(W: torch.Tensor, cw: torch.Tensor) -> torch.Tensor:
-    """Uniform 3-bit like Q3_K: x = d * sc * q, q in -4..3 per 16 values, sc 6-bit signed per 16, d fp16 per 256."""
+def q3k_encode(W: torch.Tensor, cw: torch.Tensor):
+    """Encodes W [B, m, n] as Q3_K: x = d * sc * q, q in -4..3 per value, sc a signed 6-bit scale per 16 values,
+    d fp16 per 256. Per 16 values the scale is the best of a few candidates (largest value mapped near level
+    -4, by weighted squared error). Returns (reconstruction, raw blocks uint8 [B, m, n/256, 110])."""
     B, m, n = W.shape
     x = W.reshape(B, m, n // 16, 16)
     w = cw.reshape(B, 1, n // 16, 16).expand_as(x)
     amax_idx = x.abs().argmax(-1, keepdim=True)
     vmax = torch.gather(x, -1, amax_idx)  # signed value of largest magnitude
     best_err, best_s = None, None
-    for t in (-4.5, -4.25, -4.0, -3.75, -3.5, -3.25, -3.0):  # the largest value maps near level -4
+    for t in (-4.5, -4.25, -4.0, -3.75, -3.5, -3.25, -3.0):
         s = vmax / t
         s = torch.where(s == 0, torch.full_like(s, 1e-12), s)
         q = torch.clamp(torch.round(x / s), -4, 3)
@@ -180,10 +184,35 @@ def q3k(W: torch.Tensor, cw: torch.Tensor) -> torch.Tensor:
     s = best_s.reshape(B, m, n // QK, QK // 16)
     d = _f16(s.abs().amax(-1, keepdim=True) / 31.0)
     d = torch.where(d == 0, torch.full_like(d, 1e-12), d)
-    sq = (torch.clamp(torch.round(s / d), -32, 31) * d).reshape(B, m, n // 16, 1)
-    sq = torch.where(sq == 0, torch.full_like(sq, 1e-12), sq)
-    q = torch.clamp(torch.round(x / sq), -4, 3)
-    return (q * sq).reshape(B, m, n)
+    sc = torch.clamp(torch.round(s / d), -32, 31)
+    sq = (sc * d).reshape(B, m, n // 16, 1)
+    q = torch.clamp(torch.round(x / torch.where(sq == 0, torch.ones_like(sq), sq)), -4, 3)
+    q = torch.where(sq == 0, torch.zeros_like(q), q)
+    recon = (q * sq).reshape(B, m, n)
+
+    # raw blocks, GGML's block_q3_K: hmask[32] | qs[64] | scales[12] | d (fp16)
+    L = (q + 4).to(torch.int64).reshape(-1, QK).cpu().numpy()            # 0..7
+    nb = L.shape[0]
+    hi = (L > 3).reshape(nb, 8, 32)                                     # element j: bit j / 32 of hmask[j % 32]
+    hmask = (hi.astype(np.uint16) << np.arange(8, dtype=np.uint16)[None, :, None]).sum(1).astype(np.uint8)
+    low = (L & 3).reshape(nb, 2, 4, 32)                                 # j = 128 h + 32 k + l
+    qs = (low << (2 * np.arange(4))[None, None, :, None]).sum(2).astype(np.uint8).reshape(nb, 64)
+    ls = (sc.reshape(nb, 16).to(torch.int64) + 32).cpu().numpy()       # 0..63
+    scales = np.zeros((nb, 12), dtype=np.uint8)
+    for j in range(16):
+        lo4, hi2 = ls[:, j] & 0xF, ls[:, j] >> 4
+        if j < 8:
+            scales[:, j] |= lo4.astype(np.uint8)
+        else:
+            scales[:, j - 8] |= (lo4 << 4).astype(np.uint8)
+        scales[:, j % 4 + 8] |= (hi2 << (2 * (j // 4))).astype(np.uint8)
+    out = np.concatenate([hmask, qs, scales, d.reshape(-1).cpu().numpy().astype(np.float16).view(np.uint8)
+                          .reshape(nb, 2)], axis=1)
+    return recon, out.reshape(B, m, n // QK, 110)
+
+
+def q3k(W: torch.Tensor, cw: torch.Tensor) -> torch.Tensor:
+    return q3k_encode(W, cw)[0]
 
 
 def q2k(W: torch.Tensor, cw: torch.Tensor) -> torch.Tensor:
@@ -231,40 +260,66 @@ def q2k(W: torch.Tensor, cw: torch.Tensor) -> torch.Tensor:
 
 
 def _quantize_scales(s: torch.Tensor, B: int, m: int, n: int, sub: int, bits: int) -> torch.Tensor:
-    """Positive sub-block scales [B, m, n/sub, 1] to `bits` bits relative to a per-256 fp16 maximum."""
-    levels = (1 << bits) - 1
+    """Signed sub-block scales [B, m, n/sub, 1]: a sign bit and `bits` - 1 bits of magnitude relative to a
+    per-256 fp16 maximum (the sign flips the codebook, a free second, mirrored codebook per block)."""
+    levels = (1 << (bits - 1)) - 1
     sb = s.reshape(B, m, n // QK, QK // sub)
-    d = _f16(sb.amax(-1, keepdim=True) / levels).clamp(min=1e-12)
-    return (torch.clamp(torch.round(sb / d), 1, levels) * d).reshape(B, m, n // sub, 1)
+    d = _f16(sb.abs().amax(-1, keepdim=True) / levels).clamp(min=1e-12)
+    mag = torch.clamp(torch.round(sb.abs() / d), 1, levels) * d
+    return (torch.where(sb < 0, -mag, mag)).reshape(B, m, n // sub, 1)
+
+
+_FACTORS = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8)
+
+
+def _search_scale(x, w, rms, quant, dims):
+    """Per block, the best of a few scales (both signs) around the block's RMS for the reconstruction
+    quant(x / s) * s, by weighted squared error. dims: the block's value axes."""
+    best_err = best_s = None
+    for sign in (1.0, -1.0):
+        for f in _FACTORS:
+            s = rms * (sign * f)
+            err = (w * (x - quant(x / s) * s) ** 2).sum(dims, keepdim=True)
+            if best_err is None:
+                best_err, best_s = err, s
+            else:
+                b = err < best_err
+                best_err = torch.where(b, err, best_err)
+                best_s = torch.where(b, s, best_s)
+    return best_s
 
 
 def nonuniform(W: torch.Tensor, cw: torch.Tensor, sub: int = 32, scale_bits: int = 8, levels: int = 8,
-               iters: int = 8) -> torch.Tensor:
+               iters: int = 6) -> torch.Tensor:
     """Scalar non-uniform quantization: x = s_b * c[q], one codebook c (levels entries) for the whole batch
-    (a tensor's experts), s_b per `sub` values; codebook and scales by weighted Lloyd iterations."""
+    (a tensor's experts), a signed s_b per `sub` values. Alternates: per-block scale search (both signs, so
+    each block may use the codebook mirrored) with a least-squares refinement, then a weighted Lloyd update
+    of the codebook."""
     B, m, n = W.shape
     x = W.reshape(B, m, n // sub, sub)
     w = cw.reshape(B, 1, n // sub, sub).expand_as(x)
-    s = torch.sqrt((w * x * x).sum(-1, keepdim=True) / w.sum(-1, keepdim=True)).clamp(min=1e-12)
-    # init codebook from quantiles of normalized values
-    z = (x / s).flatten()
-    sample = z[torch.randint(0, z.numel(), (min(z.numel(), 1 << 20),), device=z.device)]
-    c = torch.quantile(sample.cpu(), torch.linspace(0.5 / levels, 1 - 0.5 / levels, levels)).to(W.device)
+    rms = torch.sqrt((w * x * x).sum(-1, keepdim=True) / w.sum(-1, keepdim=True)).clamp(min=1e-12)
+    # init: Lloyd-Max levels of a unit Gaussian (8 levels), else quantiles
+    if levels == 8:
+        c = torch.tensor([-2.152, -1.344, -0.756, -0.245, 0.245, 0.756, 1.344, 2.152], device=W.device)
+    else:
+        c = torch.distributions.Normal(0, 1).icdf(torch.linspace(0.5 / levels, 1 - 0.5 / levels, levels)).to(W.device)
 
     def assign(xs: torch.Tensor, cc: torch.Tensor) -> torch.Tensor:
         mid = (cc[1:] + cc[:-1]) / 2
         return torch.bucketize(xs.contiguous(), mid)
 
     for it in range(iters):
+        s = _search_scale(x, w, rms, lambda z: c[assign(z, c)], (-1,))
         q = assign(x / s, c)
         cq = c[q]
-        s = ((w * x * cq).sum(-1, keepdim=True) / (w * cq * cq).sum(-1, keepdim=True).clamp(min=1e-20)).clamp(min=1e-12)
+        s_ls = (w * x * cq).sum(-1, keepdim=True) / (w * cq * cq).sum(-1, keepdim=True).clamp(min=1e-20)
+        s = torch.where(s_ls.abs() > 1e-12, s_ls, s)
+        q = assign(x / s, c)
         if it == iters - 1:
             break
-        q = assign(x / s, c)
-        ws2 = (w * s * s).flatten()
         num = torch.zeros(levels, device=W.device).index_add_(0, q.flatten(), (w * s * x).flatten())
-        den = torch.zeros(levels, device=W.device).index_add_(0, q.flatten(), ws2)
+        den = torch.zeros(levels, device=W.device).index_add_(0, q.flatten(), (w * s * s).flatten())
         c = torch.where(den > 0, num / den.clamp(min=1e-30), c)
         c, _ = torch.sort(c)
     c = _f16(c)
@@ -274,15 +329,16 @@ def nonuniform(W: torch.Tensor, cw: torch.Tensor, sub: int = 32, scale_bits: int
 
 
 def vq2(W: torch.Tensor, cw: torch.Tensor, sub: int = 32, scale_bits: int = 8, entries: int = 64,
-        iters: int = 8) -> torch.Tensor:
-    """2-D vector quantization of adjacent pairs: x_pair = s_b * C[q], C entries x 2 for the batch, s_b per `sub`."""
+        iters: int = 6) -> torch.Tensor:
+    """2-D vector quantization of adjacent pairs: x_pair = s_b * C[q], one codebook C (entries x 2) for the
+    batch, a signed s_b per `sub` values; scale search + least squares, then a weighted Lloyd update."""
     B, m, n = W.shape
     x = W.reshape(B, m, n // sub, sub // 2, 2)
     w = cw.reshape(B, 1, n // sub, sub // 2, 2).expand_as(x)
-    s = torch.sqrt((w * x * x).sum((-1, -2), keepdim=True) / w.sum((-1, -2), keepdim=True)).clamp(min=1e-12)
-    z = (x / s).reshape(-1, 2)
-    g = torch.Generator(device="cpu").manual_seed(0)
-    C = z[torch.randint(0, z.shape[0], (entries,), generator=g).to(z.device)].clone()
+    rms = torch.sqrt((w * x * x).sum((-1, -2), keepdim=True) / w.sum((-1, -2), keepdim=True)).clamp(min=1e-12)
+    # init: a product of the 8-level Gaussian Lloyd-Max grid (64 points)
+    g1 = torch.tensor([-2.152, -1.344, -0.756, -0.245, 0.245, 0.756, 1.344, 2.152], device=W.device)
+    C = torch.stack(torch.meshgrid(g1, g1, indexing="ij"), -1).reshape(-1, 2)[:entries].clone()
 
     def assign(xs: torch.Tensor, ws: torch.Tensor, CC: torch.Tensor) -> torch.Tensor:
         flat, wf = xs.reshape(-1, 2), ws.reshape(-1, 2)
@@ -296,16 +352,15 @@ def vq2(W: torch.Tensor, cw: torch.Tensor, sub: int = 32, scale_bits: int = 8, e
         return out.reshape(xs.shape[:-1])
 
     for it in range(iters):
-        q = assign(x / s, w, C)
-        Cq = C[q]
-        s = ((w * x * Cq).sum((-1, -2), keepdim=True) /
-             (w * Cq * Cq).sum((-1, -2), keepdim=True).clamp(min=1e-20)).clamp(min=1e-12)
+        s = _search_scale(x, w, rms, lambda z: C[assign(z, w, C)], (-1, -2))
+        Cq = C[assign(x / s, w, C)]
+        s_ls = (w * x * Cq).sum((-1, -2), keepdim=True) / (w * Cq * Cq).sum((-1, -2), keepdim=True).clamp(min=1e-20)
+        s = torch.where(s_ls.abs() > 1e-12, s_ls, s)
         if it == iters - 1:
             break
         q = assign(x / s, w, C).flatten()
-        ws2 = (w * s * s).reshape(-1, 2)
         num = torch.zeros(entries, 2, device=W.device).index_add_(0, q, (w * s * x).reshape(-1, 2))
-        den = torch.zeros(entries, 2, device=W.device).index_add_(0, q, ws2)
+        den = torch.zeros(entries, 2, device=W.device).index_add_(0, q, (w * s * s).expand_as(x).reshape(-1, 2))
         C = torch.where(den > 0, num / den.clamp(min=1e-30), C)
     C = _f16(C)
     sq = _quantize_scales(s.reshape(B, m, n // sub, 1), B, m, n, sub, scale_bits).reshape(B, m, n // sub, 1, 1)
@@ -513,7 +568,7 @@ def bits_per_weight(method: str, m: int, n: int) -> float:
     if base in fixed:
         return fixed[base]
     if base.startswith("lb"):
-        return lb_bits(m, n, lb_rank(m, n, float(base[2:]))) / (m * n)
+        return lb_bits(m, n, lb_rank(m, n, float(base.lstrip("lbi")))) / (m * n)
     if base.startswith("svd"):
         r = max(1, int(float(base[3:]) * m * n // (16 * (m + n))))
         return 16 * r * (m + n) / (m * n)
@@ -540,6 +595,8 @@ def reconstruct(method: str, W: torch.Tensor, cw: torch.Tensor | None) -> torch.
         return vq2(W, c)
     if base == "iq3xxs":
         return iq3xxs(W, c)
+    if base.startswith("lbi"):  # the SVD-based initialization only (scales by least squares, no sign search)
+        return littlebit(W, c, float(base[3:]), rounds=0)
     if base.startswith("lb"):
         return littlebit(W, c, float(base[2:]))
     if base.startswith("svd"):
@@ -572,25 +629,27 @@ def cmd_check_dequant(args):
               f"{np.abs(ours - ref).max():.3g} over {ref.size} values")
 
 
-def cmd_check_iq3(args):
-    """Encodes a few experts as IQ3_XXS and decodes the blocks with gguf-py and with the engine."""
+def cmd_check_encoders(args):
+    """Encodes a few experts as IQ3_XXS and Q3_K and decodes the blocks with gguf-py and with the engine."""
     model = Model(args.model)
     dev = device()
     W = torch.tensor(model.experts(args.layer, "gate", [0, 1]), device=dev)
-    recon, blocks = iq3xxs_encode(W, torch.ones(W.shape[0], W.shape[2], device=dev))
-    raw = Path(args.work) / "iq3.bin"
-    blocks.tofile(raw)
-    ref = gq.dequantize(blocks.reshape(-1, 98), gguf.GGMLQuantizationType.IQ3_XXS).reshape(-1)
-    out = Path(args.work) / "iq3.f32"
-    subprocess.run([args.experts_tool, "dequant-raw", "--type", "18", "--cols", str(W.shape[2]), "-i", str(raw),
-                    "-o", str(out)], check=True)
-    eng = np.fromfile(out, np.float32)
-    r = recon.reshape(-1).cpu().numpy()
-    raw.unlink()
-    out.unlink()
-    print(f"IQ3_XXS: max |encoder - gguf-py| = {np.abs(r - ref).max():.3g}, max |gguf-py - engine| = "
-          f"{np.abs(ref - eng).max():.3g}; relative error vs the weights "
-          f"{np.linalg.norm(r - W.reshape(-1).cpu().numpy()) / np.linalg.norm(W.cpu().numpy()):.4f}")
+    ones = torch.ones(W.shape[0], W.shape[2], device=dev)
+    for name, ggml_type, encode, size in (("IQ3_XXS", 18, iq3xxs_encode, 98), ("Q3_K", 11, q3k_encode, 110)):
+        recon, blocks = encode(W, ones)
+        raw = Path(args.work) / "blocks.bin"
+        blocks.tofile(raw)
+        ref = gq.dequantize(blocks.reshape(-1, size), gguf.GGMLQuantizationType(ggml_type)).reshape(-1)
+        out = Path(args.work) / "blocks.f32"
+        subprocess.run([args.experts_tool, "dequant-raw", "--type", str(ggml_type), "--cols", str(W.shape[2]),
+                        "-i", str(raw), "-o", str(out)], check=True)
+        eng = np.fromfile(out, np.float32)
+        r = recon.reshape(-1).cpu().numpy()
+        raw.unlink()
+        out.unlink()
+        print(f"{name}: max |encoder - gguf-py| = {np.abs(r - ref).max():.3g}, max |gguf-py - engine| = "
+              f"{np.abs(ref - eng).max():.3g}; relative error vs the weights "
+              f"{np.linalg.norm(r - W.reshape(-1).cpu().numpy()) / np.linalg.norm(W.cpu().numpy()):.4f}")
 
 
 def effective_rank(s: np.ndarray) -> float:
@@ -867,12 +926,12 @@ def main():
     p.add_argument("--q6-layer", type=int, default=39, help="a block whose down experts are Q6_K")
     p.set_defaults(fn=cmd_check_dequant)
 
-    p = sub.add_parser("check-iq3", help="our IQ3_XXS encoder, decoded by gguf-py and by the engine")
+    p = sub.add_parser("check-encoders", help="our IQ3_XXS and Q3_K encoders, decoded by gguf-py and the engine")
     p.add_argument("--model", required=True)
     p.add_argument("--experts-tool", required=True)
     p.add_argument("--work", required=True)
     p.add_argument("--layer", type=int, default=20)
-    p.set_defaults(fn=cmd_check_iq3)
+    p.set_defaults(fn=cmd_check_encoders)
 
     p = sub.add_parser("spectra", help="singular-value spectra and effective ranks")
     p.add_argument("--model", required=True)
