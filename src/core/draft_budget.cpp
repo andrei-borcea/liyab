@@ -56,12 +56,19 @@ int32_t DraftBudget::choose(std::span<const float> survival) {
         const double ms = std::max(floor, 1e-9);
         rates_[static_cast<size_t>(j)] = tokens / ms;
         if (rates_[static_cast<size_t>(j)] > rates_[static_cast<size_t>(choice)]) choice = j;
+        // Counts are measured upwards, one more draft at a time: a doubtful
+        // draft never tries a long length whose time is unknown, and a sure
+        // one reaches its length in a few steps.
+        if (arm.samples == 0) {
+            rates_.resize(static_cast<size_t>(j) + 1);
+            break;
+        }
     }
     // A count whose time is old and that nearly wins is measured again (its
     // time may have changed with heat or context length); one that is far
     // behind would not win anyway.
     int32_t retry = -1;
-    for (int32_t j = 0; j <= offered; ++j) {
+    for (int32_t j = 0; j < static_cast<int32_t>(rates_.size()); ++j) {
         const Arm& arm = arms_[static_cast<size_t>(j)];
         if (j == choice || arm.samples == 0 || step_ - arm.sampled_at <= arm.wait) continue;
         if (rates_[static_cast<size_t>(j)] < kRetryShare * rates_[static_cast<size_t>(choice)]) continue;

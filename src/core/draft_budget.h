@@ -43,8 +43,10 @@ public:
     // the count j <= survival.size() maximizing
     // (1 + survival[0] + ... + survival[j - 1]) / cost(j). Plain decoding is
     // measured first. A step never costs less with more drafts, so a count
-    // costs at least the dearest fewer-drafts count measured; one not measured
-    // yet costs just that, so it is tried only where it could win. A count not
+    // costs at least the dearest fewer-drafts count measured. Counts are
+    // measured upwards: only the first one not measured yet is a candidate,
+    // costed as that bound, so it is tried only where it could win and a
+    // doubtful draft never tries a long unknown length. A count not
     // measured for longer
     // than its wait (kFirstRetry steps, doubling up to kMaxRetry with each
     // such try) is measured again when it comes within kRetryShare of the
