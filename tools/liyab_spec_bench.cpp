@@ -6,10 +6,13 @@
 //                    [--tasks code,summary,tool,chat,again] [-n 512] [--repeat R]
 //                    [--threads N] [--backend cpu|metal|auto]
 //
-// A mode is plain, lookup or suffix, optionally with its most drafts per step
-// (":K", default EngineConfig::draft_tokens) and ":fixed" to verify every
-// draft on offer instead of a learned count (acceptance and tokens per pass
-// then do not depend on timing); the first mode is the reference (plain). Every mode has an engine of its own, unpaced, and the tasks run in
+// A mode is plain, lookup, suffix or self (the target as its own draft
+// model: every draft accepted, a check of batched verification), optionally
+// with its most drafts per step (":K", default EngineConfig::draft_tokens)
+// and ":fixed" to verify every draft on offer instead of a learned count
+// (acceptance and tokens per pass then do not depend on timing; self always
+// is). The first mode is the reference (plain). Every mode has an engine of
+// its own, unpaced, and the tasks run in
 // this order, each on all modes back to back (so the modes share the load of
 // the host), each a new conversation formatted by the model's chat template
 // (thinking off where the template has the switch):
@@ -23,7 +26,8 @@
 // For each task and mode it prints the reply's tokens, decode tok/s, the
 // speed-up over plain decoding, the share of drafts accepted, tokens per
 // verification pass and whether the reply is the plain one (it must be:
-// greedy speculative decoding is exact). --repeat R runs it all R times on
+// greedy speculative decoding is exact; where it differs, stderr shows
+// where). --repeat R runs it all R times on
 // fresh engines and prints the median tok/s and speed-up (taken within each
 // run) next to the best run's (the least disturbed on a shared host).
 //
@@ -157,7 +161,7 @@ struct Result {
 
 struct Mode {
     std::string name;
-    bool lookup = false, suffix = false;
+    bool lookup = false, suffix = false, self = false;
     int32_t draft_tokens = 0;  // 0: the default
     bool fixed = false;        // always the most drafts on offer (EngineConfig::adaptive_drafts off)
 };
@@ -259,8 +263,9 @@ int main(int argc, char** argv) {
         if (colon != std::string::npos) m.draft_tokens = std::atoi(m.name.c_str() + colon + 1);
         m.lookup = kind == "lookup";
         m.suffix = kind == "suffix";
-        m.fixed = m.name.ends_with(":fixed");
-        if (!m.lookup && !m.suffix && kind != "plain") {
+        m.self = kind == "self";
+        m.fixed = m.name.ends_with(":fixed") || m.self;
+        if (!m.lookup && !m.suffix && !m.self && kind != "plain") {
             usage();
             return 2;
         }
@@ -291,6 +296,7 @@ int main(int argc, char** argv) {
             config.suffix_drafts = mode.suffix;
             if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
             config.adaptive_drafts = !mode.fixed;
+            if (mode.self) config.draft_model_path = base.model_path;
             auto engine = Engine::create(config);
             if (!engine) {
                 std::fprintf(stderr, "%s\n", engine.status().to_string().c_str());
@@ -337,6 +343,21 @@ int main(int argc, char** argv) {
                 proposed += r.proposed;
                 accepted += r.accepted;
                 same = same && r.replies == results[0][0][t].replies;
+                const auto& reference = results[0][0][t].replies;
+                for (size_t turn = 0; turn < std::min(reference.size(), r.replies.size()); ++turn) {
+                    const std::string &a = reference[turn], &b = r.replies[turn];
+                    if (a == b) continue;
+                    const size_t at = static_cast<size_t>(
+                        std::mismatch(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(std::min(a.size(), b.size())),
+                                      b.begin())
+                            .first -
+                        a.begin());
+                    const size_t from = at > 60 ? at - 60 : 0;
+                    std::fprintf(stderr, "%s / %s: turn %zu differs from plain at byte %zu\n  plain: %s\n  this:  %s\n",
+                                 tasks[t].name.c_str(), modes[m].name.c_str(), turn + 1, at,
+                                 json_string(a.substr(from, 160)).c_str(), json_string(b.substr(from, 160)).c_str());
+                    break;
+                }
             }
             std::printf("%-8s %-10s %7d %8.1f %8.1f %8.2fx %8.2fx %7.0f%% %10.2f %5s\n", tasks[t].name.c_str(),
                         modes[m].name.c_str(), tokens / repeats, median(rates), best_rate(m, t), median(speedups),

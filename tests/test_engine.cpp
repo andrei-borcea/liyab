@@ -3279,6 +3279,59 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
     }
 }
 
+TEST_CASE("A speculative turn that stops partway through a step leaves the context plain decoding leaves") {
+    // A step returns several tokens; when the output stops at an earlier one
+    // (here max_tokens; an end of generation alike), the context must end
+    // there as with plain decoding, the last token sampled but not processed.
+    // Tokens past the stop once stayed in it, and the next turn's prompt
+    // (after an end token that a stored conversation continued past) then
+    // matched it differently than plain decoding and diverged.
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    const std::vector<int32_t> other = {1, 260, 261, 262, 263, 5, 290, 77};
+    test::TinyModelSpec hybrid;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+        EngineConfig plain = engine_config(path);
+        plain.backend = BackendKind::Cpu;
+        EngineConfig suffix = plain;
+        suffix.lookup_drafts = true;
+        suffix.draft_tokens = 6;
+        suffix.adaptive_drafts = false;
+        for (int32_t n = 3; n <= 11; ++n) {
+            auto reference = Engine::create(plain);
+            auto engine = Engine::create(suffix);
+            REQUIRE(reference.has_value());
+            REQUIRE(engine.has_value());
+            // The conversation once in full, then another one (the first is
+            // stored), then the first again stopped at n tokens: its drafts
+            // come from the stored copy and are all accepted, so steps run
+            // past the stop.
+            for (Engine* e : {reference.value().get(), engine.value().get()}) {
+                run(*e, prompt, greedy(40));
+                run(*e, other, greedy(8));
+            }
+            GenerationStats expected_stats, stats;
+            const auto reply = run(*reference.value(), prompt, greedy(n), &expected_stats);
+            CHECK(run(*engine.value(), prompt, greedy(n), &stats) == reply);
+            CHECK(stats.draft_tokens_accepted > 0);
+            // The next turn continues the reply: the same tokens reused, the same output.
+            std::vector<int32_t> next = prompt;
+            next.insert(next.end(), reply.begin(), reply.end());
+            next.insert(next.end(), {260, 261, 262});
+            const auto expected = run(*reference.value(), next, greedy(12), &expected_stats);
+            CHECK(run(*engine.value(), next, greedy(12), &stats) == expected);
+            // A hybrid model may return closer than plain decoding when the
+            // prompt leaves the context (to a verification checkpoint instead
+            // of the prompt's snapshot), so the reused prefix is compared on
+            // the attention-only model.
+            if (path == mixed_model()) CHECK(stats.cached_prefix_tokens == expected_stats.cached_prefix_tokens);
+        }
+    }
+}
+
 TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft models") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
     test::TinyModelSpec target_spec;

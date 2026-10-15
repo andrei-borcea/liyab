@@ -1582,14 +1582,17 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 stats.ttft_stall_ms = store->stats().stall_ms - experts_before.stall_ms;
             }
         }
-        // Tokens of `next` the output keeps: all of them, unless the caller
-        // forces text after an earlier one (a speculative step returns several).
+        // Tokens of `next` the output keeps: all of them, unless the output
+        // stops at an earlier one (end of generation, max_tokens, the
+        // callback, cancel) or the caller forces text after it (a
+        // speculative step returns several).
         size_t kept = next.size();
         std::string forced;
         for (size_t i = 0; i < next.size(); ++i) {
             const int32_t token = next[i];
             if (s.tokenizer->is_end_of_generation(token)) {
                 stop = true;
+                kept = i + 1;
                 break;
             }
             // Duty cycling: hold this token until its slot at the target
@@ -1605,12 +1608,14 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 pending_utf8.erase(0, ready);
                 if (!keep_going) {
                     stop = true;
+                    kept = i + 1;
                     break;
                 }
             }
             if (stats.generated_tokens >= params.max_tokens || s.cancel.load(std::memory_order_relaxed)) {
                 stats.cancelled = s.cancel.load(std::memory_order_relaxed);
                 stop = true;
+                kept = i + 1;
                 break;
             }
             // Structured output: asked after every token that ends a whole
@@ -1628,7 +1633,11 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             // A speculative step went past that point: drop its tokens after
             // it. The caches hold `last` and every returned token but the
             // final one, all from the step's own verification pass, so a
-            // hybrid model returns from that pass's checkpoints.
+            // hybrid model returns from that pass's checkpoints. At a stop,
+            // the context then ends as plain decoding leaves it (the last
+            // token sampled, not processed): tokens past an end of generation
+            // stayed in it, and their text in the text it remembers, so the
+            // next turn's prompt matched an end token twice and diverged.
             const auto dropped = static_cast<int32_t>(next.size() - kept);
             const int32_t keep = s.target->n_past() - dropped;
             Status rolled_back = s.target->truncate(keep);
