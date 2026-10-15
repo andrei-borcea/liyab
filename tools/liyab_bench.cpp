@@ -10,6 +10,9 @@
 //
 //   liyab-bench [--threads 1,2,4,8] [--seconds 1.0]
 //
+// The kernel set in use is printed first; on x86-64, LIYAB_KERNELS=scalar runs
+// the scalar kernels in place of the AVX2 ones, for a comparison.
+//
 // A last table times one matmul over 1, 2, 4 and 5 activation rows (the
 // shape of speculative verification and prefill) on every thread, in the
 // file's layouts and, on i8mm CPUs, in the repacked ones the CPU backend
@@ -102,6 +105,7 @@ int main(int argc, char** argv) {
     for (float& v : x) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
     std::vector<float> y(size_t{1} << 20);
 
+    std::printf("kernels: %s\n", liyab::quant::kernel_isa());
     std::printf("%-28s", "case");
     for (const int32_t t : threads) std::printf(" | %2d thr GB/s (us)", t);
     std::printf("\n");

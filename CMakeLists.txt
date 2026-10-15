@@ -50,6 +50,7 @@ endif()
 
 option(LIYAB_USE_NEON "ARM NEON SIMD kernels (arm64 only)" ${LIYAB_ARM64})
 option(LIYAB_ARM_DOTPROD "Target ARMv8.2-A dot-product (SDOT) for the INT8/INT4 kernels" ${LIYAB_ARM64})
+option(LIYAB_USE_AVX2 "x86-64 AVX2/FMA/F16C kernels, chosen at run time by CPUID (x86-64 only)" ${LIYAB_X86_64})
 option(LIYAB_USE_METAL "Apple GPU backend (Metal)" ${APPLE})
 option(LIYAB_USE_VULKAN "Vulkan runtime probe (Adreno / Mali / Xclipse)" ${_liyab_android})
 option(LIYAB_USE_QNN "Qualcomm QNN HTP runtime probe" ${_liyab_android})
@@ -70,6 +71,10 @@ endif()
 if(LIYAB_USE_NEON AND NOT LIYAB_ARM64)
   message(STATUS "liyab: LIYAB_USE_NEON ignored on ${CMAKE_SYSTEM_PROCESSOR}")
   set(LIYAB_USE_NEON OFF)
+endif()
+if(LIYAB_USE_AVX2 AND NOT LIYAB_X86_64)
+  message(STATUS "liyab: LIYAB_USE_AVX2 ignored on ${CMAKE_SYSTEM_PROCESSOR}")
+  set(LIYAB_USE_AVX2 OFF)
 endif()
 
 # --------------------------------------------------------------------------
@@ -130,7 +135,7 @@ target_include_directories(liyab_core
   PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-foreach(flag NEON METAL VULKAN QNN NEUROPILOT)
+foreach(flag NEON AVX2 METAL VULKAN QNN NEUROPILOT)
   if(LIYAB_USE_${flag})
     target_compile_definitions(liyab_core PUBLIC LIYAB_USE_${flag}=1)
   endif()
@@ -161,6 +166,16 @@ endif()
 #    library still loads and runs on older dot-product CPUs.
 if(LIYAB_USE_NEON AND LIYAB_ARM_DOTPROD)
   set_source_files_properties(src/core/quant_repack.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16+i8mm")
+endif()
+
+# x86-64 SIMD. The library keeps the x86-64 baseline (SSE2), so one binary
+# runs on any x86-64 CPU; quant_x86.cpp marks its kernels with
+# __attribute__((target("avx2,fma,f16c"))) (not a file-wide -mavx2, see the
+# file's header) and they run only when CPUID reports AVX2, FMA and F16C with
+# OS support. That set covers Intel Haswell (2013) and later and AMD Zen
+# (2017) and later; older CPUs run the scalar kernels.
+if(LIYAB_USE_AVX2)
+  target_sources(liyab_core PRIVATE src/core/quant_x86.cpp)
 endif()
 
 find_package(Threads REQUIRED)

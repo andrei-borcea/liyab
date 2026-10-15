@@ -13,7 +13,8 @@
 // This path is the reference and the portable fallback. On AArch64 NEON the
 // CPU backend runs most of these formats through the faster kernels in
 // quant_lowbit.cpp (Q8_K activations for the 256-value formats, see
-// quant::uses_q8_K; dot_quantized dispatches IQ4_NL and MXFP4 there too).
+// quant::uses_q8_K; dot_quantized dispatches IQ4_NL and MXFP4 there too); on
+// x86-64 with AVX2, IQ4_XS, IQ4_NL, MXFP4 and BF16 have kernels in quant_x86.cpp.
 #include <cmath>
 #include <cstring>
 
@@ -23,6 +24,9 @@
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define LIYAB_EXT_NEON 1
+#endif
+#if defined(LIYAB_USE_AVX2)
+#include "core/quant_x86.h"
 #endif
 
 namespace liyab::quant {
@@ -366,6 +370,9 @@ float bf16_to_fp32(uint16_t h) noexcept {
 }
 
 float dot_bf16_f32(const uint16_t* w, const float* x, int64_t n) noexcept {
+#if defined(LIYAB_USE_AVX2)
+    if (x86::avx2_enabled()) return x86::dot_bf16_f32(w, x, n);
+#endif
     int64_t i = 0;
     float sum = 0.0f;
 #if defined(LIYAB_EXT_NEON)

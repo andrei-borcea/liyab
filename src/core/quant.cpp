@@ -8,6 +8,12 @@
 #include <arm_neon.h>
 #define LIYAB_NEON 1
 #endif
+// x86-64: AVX2 kernels chosen at run time (core/quant_x86.h); every entry
+// point below keeps its scalar code for CPUs without them.
+#if defined(LIYAB_USE_AVX2)
+#include "core/quant_x86.h"
+#define LIYAB_AVX2_DISPATCH 1
+#endif
 
 namespace liyab::quant {
 
@@ -68,6 +74,9 @@ uint16_t fp32_to_fp16(float f) noexcept {
 }
 
 void quantize_row_q8_0(const float* x, BlockQ8_0* y, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::quantize_row_q8_0(x, y, n);
+#endif
     const int64_t nb = n / kBlock;
     for (int64_t i = 0; i < nb; ++i) {
         const float* xb = x + i * kBlock;
@@ -134,6 +143,12 @@ void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept {
             break;
         case DType::F16: {
             auto* h = static_cast<uint16_t*>(dst);
+#if defined(LIYAB_AVX2_DISPATCH)
+            if (x86::avx2_enabled()) {
+                x86::fp32_to_fp16_row(x, h, n);
+                break;
+            }
+#endif
             for (int64_t i = 0; i < n; ++i) h[i] = fp32_to_fp16(x[i]);
             break;
         }
@@ -412,6 +427,20 @@ void unpack_k_block(DType type, const void* block, int8_t* q, float* scale16, fl
 }
 
 void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    // The KV cache formats (V rows are decoded once per position and query
+    // group) and the token embeddings: the same values as the scalar decode.
+    if (x86::avx2_enabled()) {
+        switch (type) {
+            case DType::F16: return x86::fp16_to_fp32_row(static_cast<const uint16_t*>(src), y, n);
+            case DType::BF16: return x86::bf16_to_fp32_row(static_cast<const uint16_t*>(src), y, n);
+            case DType::Q8_0: return x86::dequantize_q8_0(static_cast<const BlockQ8_0*>(src), y, n);
+            case DType::Q4_0: return x86::dequantize_q4_0(static_cast<const BlockQ4_0*>(src), y, n);
+            case DType::Q4_1: return x86::dequantize_q4_1(static_cast<const BlockQ4_1*>(src), y, n);
+            default: break;
+        }
+    }
+#endif
     switch (type) {
         case DType::F32:
             std::memcpy(y, src, static_cast<size_t>(n) * sizeof(float));
@@ -522,6 +551,9 @@ inline int32x4_t dot_i8x16(int32x4_t acc, int8x16_t a, int8x16_t b) noexcept {
 #endif
 
 float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_q4_0_q8_0(w, x, n);
+#endif
     const int64_t nb = n / kBlock;
 #if defined(LIYAB_NEON)
     const uint8x16_t mask = vdupq_n_u8(0x0F);
@@ -559,6 +591,9 @@ float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, int64_t n) noexcept 
 
 // sum_j (q_j * dw + mw) * (x_j * dx) = dw * dx * sum(q_j * x_j) + mw * dx * sum(x_j)
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_q4_1_q8_0(w, x, n);
+#endif
     const int64_t nb = n / kBlock;
     float sum = 0.0f;
     int64_t i = 0;
@@ -779,6 +814,9 @@ float dot_k_q8_0(DType type, const void* row, const BlockQ8_0* x, const int32_t*
 // Q5_0 / Q5_1 row · Q8_0 activations (Q5_1 also needs the block sums for its min).
 float dot_q5_q8_0(DType type, const void* row, const BlockQ8_0* x, const int32_t* xsums, int64_t n) noexcept {
     const bool symmetric = type == DType::Q5_0;
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_q5_q8_0(symmetric, row, x, n);
+#endif
     const size_t block_bytes = symmetric ? sizeof(BlockQ5_0) : sizeof(BlockQ5_1);
     float sum = 0.0f;
 #if defined(LIYAB_NEON)
@@ -835,6 +873,9 @@ float dot_quantized(DType type, const void* row, const BlockQ8_0* x, const int32
 }
 
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_q8_0_q8_0(w, x, n);
+#endif
     const int64_t nb = n / kBlock;
 #if defined(LIYAB_NEON)
     // Each block's exact integer sum, then the epilogue every Q8_0 kernel
@@ -911,6 +952,9 @@ void dot_q8_0_rows_neon(const BlockQ8_0* w, const BlockQ8_0* const* x, int64_t n
 #endif
 
 void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_q8_0_q8_0_rows(w, x, rows, n, out);
+#endif
     int32_t r = 0;
 #if defined(LIYAB_NEON)
     const int64_t nb = n / kBlock;
@@ -925,6 +969,9 @@ void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t r
 }
 
 float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_f16_f32(w, x, n);
+#endif
     int64_t i = 0;
     float sum = 0.0f;
 #if defined(LIYAB_NEON)
@@ -942,6 +989,9 @@ float dot_f16_f32(const uint16_t* w, const float* x, int64_t n) noexcept {
 }
 
 float dot_f32(const float* a, const float* b, int64_t n) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    if (x86::avx2_enabled()) return x86::dot_f32(a, b, n);
+#endif
     int64_t i = 0;
     float sum = 0.0f;
 #if defined(LIYAB_NEON)
@@ -996,8 +1046,23 @@ const char* kernel_isa() noexcept {
     return "neon+dotprod";
 #elif defined(LIYAB_NEON)
     return "neon";
+#elif defined(LIYAB_AVX2_DISPATCH)
+    return x86::avx2_enabled() ? "avx2" : "scalar";
 #else
     return "scalar";
+#endif
+}
+
+bool use_simd_kernels(bool on) noexcept {
+#if defined(LIYAB_AVX2_DISPATCH)
+    x86::set_avx2_enabled(on);
+    return x86::avx2_enabled();
+#elif defined(LIYAB_NEON)
+    (void)on;
+    return true;  // compiled in: no scalar alternative to switch to
+#else
+    (void)on;
+    return false;
 #endif
 }
 

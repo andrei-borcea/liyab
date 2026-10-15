@@ -110,6 +110,7 @@ These rules decide what goes into the code:
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
 | CPU backend: NEON + SDOT; i8mm (SMMLA) layouts for Q4_K/Q5_K/Q6_K/Q8_0; WFE-waiting thread pool with chunks claimed on demand | ✅ |
+| CPU backend on x86-64: AVX2 + FMA + F16C kernels chosen at run time by CPUID, scalar fallback in the same binary | 🟡 tested under Rosetta 2 only |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
@@ -138,6 +139,12 @@ iOS: Xcode 15+. The app: Flutter 3.x, Android SDK platform 36, JDK 17.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release   # add -DLIYAB_ENABLE_EXPERIMENTAL=ON for experimental modules
 cmake --build build
 ctest --test-dir build --output-on-failure
+
+# x86-64 build on an Apple-silicon Mac, run under Rosetta 2. Rosetta executes AVX2 but reports it in CPUID only
+# with ROSETTA_ADVERTISE_AVX=1; without it the scalar kernels run
+cmake -S . -B build-x86 -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-x86
+ROSETTA_ADVERTISE_AVX=1 ctest --test-dir build-x86 --output-on-failure
 
 # Run a model
 ./build/liyab-cli -m model.gguf -p "Explain unified memory in one paragraph." -n 128
@@ -168,6 +175,7 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 | :--- | :--- | :--- |
 | `LIYAB_USE_NEON` | ON on arm64 | NEON intrinsics kernels |
 | `LIYAB_ARM_DOTPROD` | ON on arm64 | `-march=armv8.2-a+dotprod+fp16` on Android/iOS/Linux (SDOT) |
+| `LIYAB_USE_AVX2` | ON on x86-64 | AVX2 + FMA + F16C kernels, used when CPUID reports them (the library itself keeps the x86-64 baseline) |
 | `LIYAB_USE_METAL` | ON on Apple | Metal GPU backend |
 | `LIYAB_USE_VULKAN` | ON on Android | Vulkan GPU backend and probe (loader opened with `dlopen`; shaders need `glslc` from the NDK or the Vulkan SDK) |
 | `LIYAB_USE_QNN` / `LIYAB_USE_NEUROPILOT` | ON on Android | NPU runtime probes (no SDK needed) |
@@ -196,7 +204,7 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   └──────────┬───────────────────────────────────────────┬──────────────────────┘
              │ weights                                   │ matmuls (per-op route)
   ┌──────────▼─────────────────────────────┐   ┌─────────▼────────────────────────────┐
-  │ MmapLoader      zero-copy GGUF, splits │   │ CPU   NEON · SDOT · i8mm   ✅        │
+  │ MmapLoader      zero-copy GGUF, splits │   │ CPU   NEON · SDOT · i8mm · AVX2 ✅   │
   │ DirectFile      parallel O_DIRECT      │   │ GPU   Metal ✅ · Vulkan ✅            │
   │ TripleBuffer    streamed dense blocks  │   │ NPU   QNN · NeuroPilot (probe) 🟡    │
   │ ExpertStore     MoE expert cache:      │   │ fallback per matmul: NPU → GPU → CPU │
@@ -259,11 +267,23 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 
   Measured against F16 ([Correctness](#correctness)): Q8_0 keys went from a mean KL of 0.070 to 0.0018 on
   Qwen2.5, 0.051 to 0.0021 on Qwen3-0.6B and 0.015 to 0.0063 on Qwen3-4B, with the same memory and kernels.
+* **x86-64 kernels.** One binary runs on any x86-64 CPU. The library is compiled for the x86-64 baseline; the AVX2
+  kernels (`src/core/quant_x86.cpp`) carry a per-function `target("avx2,fma,f16c")` attribute and run only when
+  CPUID reports AVX2, FMA and F16C and the OS saves the 256-bit registers (Intel Haswell and AMD Zen onwards).
+  The choice is made once per process; `LIYAB_KERNELS=scalar` forces the scalar set and `quant::kernel_isa()`
+  reports `avx2` or `scalar`. They cover Q8_0 (single and multi-row), Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL and MXFP4
+  against Q8_0 activations; Q4_K, Q5_K, Q6_K (1 to 4 rows per weight decode) and IQ4_XS against Q8_K; F32, F16
+  and BF16 dots; Q8_0 / Q8_K activation quantization; F16 encoding and the F16, BF16, Q8_0, Q4_0, Q4_1 decodes
+  of the KV cache and embeddings. The int8 products use `VPMADDUBSW` (|w| times x with w's sign, which cannot
+  saturate because activations stay in [-127, 127]) and `VPMADDWD` against the sub-block scale, so a K-quant
+  super-block accumulates exactly in int32. Q8_0 and the K-quants then apply the same float epilogues as the NEON
+  kernels in the same order, so a row's result does not depend on the batch, and activation quantization and
+  decoding give the scalar code's bits.
 * **Thread pool.** Workers wait for the next job in `WFE` on ARM64: the core sleeps until the job word changes, with
-  no instructions issued, instead of spinning at full clock. They block on a condition variable after 300 µs idle. A
-  job is split into 4 chunks per thread, claimed on demand, so a preempted core does not hold up a whole matmul.
-  Matmuls that share an input run as one group, and MoE experts run in waves: two fork/joins per wave instead of two
-  per expert.
+  no instructions issued, instead of spinning at full clock; on x86-64 they spin with `PAUSE`. They block on a
+  condition variable after 300 µs idle. A job is split into 4 chunks per thread, claimed on demand, so a preempted
+  core does not hold up a whole matmul. Matmuls that share an input run as one group, and MoE experts run in waves:
+  two fork/joins per wave instead of two per expert.
 
 ---
 
@@ -1196,7 +1216,7 @@ downloaded.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
@@ -1205,7 +1225,8 @@ downloaded.
 
 Benchmarks and tools built with the tests:
 
-* `liyab-bench`: CPU matvec throughput on a MoE's decode shapes, against the RAM read ceiling.
+* `liyab-bench`: CPU matvec throughput on a MoE's decode shapes, against the RAM read ceiling. It prints the kernel
+  set first; on x86-64, `LIYAB_KERNELS=scalar` runs the same cases on the scalar kernels.
 * `liyab-kl`: teacher-forced next-token distributions compared against a reference, for two uses.
   * **The price of a lossy option.** It saves the distributions from the lossless path, then reports KL divergence,
     top-1 agreement and perplexity for a lossy run. The two runs are separate processes, so a model that fills the
@@ -1240,7 +1261,7 @@ Benchmarks and tools built with the tests:
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
-* `LIYAB_GOLDEN_UPDATE=1 test_golden`: records the logit hashes of the kernel set this build runs (CPU architecture and `scalar` / `neon` / `neon+dotprod`), after a change meant to move outputs
+* `LIYAB_GOLDEN_UPDATE=1 test_golden`: records the logit hashes of the kernel set this build runs (CPU architecture and `scalar` / `neon` / `neon+dotprod` / `avx2`; on x86-64 run it once with `LIYAB_KERNELS=scalar` too), after a change meant to move outputs
   (say why in the commit). A platform with no hashes yet is skipped with a note.
 
 On a device:
@@ -1343,7 +1364,8 @@ Implemented features are described above. These are next, in order:
     * the screen content through a voice-interaction service.
 11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
     it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and command bar as on macOS),
-    which first needs x86 SIMD kernels and a Windows port of the engine; NPU compute (QNN HTP, NeuroPilot); app
+    which first needs a Windows port of the engine (the x86-64 AVX2 kernels are in place) and validation of those
+    kernels on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP, NeuroPilot); app
     localization.
 12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
@@ -1360,6 +1382,18 @@ Implemented features are described above. These are next, in order:
 * **Metal** submits one command buffer per matmul.
 * **Kernels:** TQ1_0 and NVFP4 use a generic decode path on the CPU. Lattice I-quants are 2–3× slower than Q4_K. Only
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
+* **x86-64:**
+  * the AVX2 kernels have been run only under Rosetta 2 on Apple silicon, not yet on an Intel or AMD CPU, and the
+    `x86_64-*` golden hashes come from there (macOS libm); Linux and Windows builds are not tested;
+  * their native speed is not measured. Rosetta's timings do not carry over: it translates `VPSIGNB` (~13 ns) and
+    `VPSHUFB` (~12 ns) into long sequences, so there the AVX2 set is 2.3–4.3× faster than the scalar one on Q4_K
+    and F32 but 1.5–2.5× slower on Q8_0, Q4_0 and Q6_K, whose scalar loops the compiler vectorizes with SSE2.
+    Decoding there (4 threads, best of 3) went from 7.5 to 14.6 tok/s on Qwen3-0.6B BF16 and from 21 to 24 on
+    Qwen2.5-0.5B F16, and stayed at 33 on its Q8_0, with the same greedy text;
+  * Q2_K, Q3_K, TQ1_0/TQ2_0, NVFP4 and the lattice I-quants (IQ1–IQ3) have no AVX2 kernel and use the generic
+    decode path; there are no AVX-VNNI, AVX-512 or repacked layouts, and CPUs without AVX2 run scalar kernels;
+  * the transformer's element-wise loops (norms, softmax, RoPE) are plain C++ left to the compiler, and the DeltaNet
+    recurrence has a NEON path but no x86 one.
 * **Architectures not supported yet:** Gemma, Phi, DeepSeek V3/V4, fused `ffn_gate_up_exps` tensors and YaRN RoPE
   scaling. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not supported either (a
   new one is a table row).
@@ -1392,7 +1426,8 @@ src/core/               engine, architecture registry and model description, tra
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
                         sampler, power manager, device detection, thread pool
-src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
+src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*), metal/, vulkan/ (+ shaders/),
+                        qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py,
