@@ -79,6 +79,9 @@ add_library(liyab_core OBJECT
   src/core/tokenizer.cpp
   src/core/chat_template.cpp
   src/core/sampling.cpp
+  src/core/grammar.cpp
+  src/core/grammar_text.cpp
+  src/core/json_schema.cpp
   src/core/architecture.cpp
   src/core/key_scaling.cpp
   src/core/transformer.cpp
@@ -262,7 +265,7 @@ endif()
 
 if(LIYAB_BUILD_TESTS)
   enable_testing()
-  set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden)
+  set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden test_grammar)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()
