@@ -498,16 +498,19 @@ Result<Program> Builder::build(uint32_t root) const {
 std::unique_ptr<VocabTrie> VocabTrie::build(const Tokenizer& tokenizer) {
     auto trie = std::make_unique<VocabTrie>();
     trie->vocab_size = tokenizer.vocab_size();
+    trie->kinds.assign(static_cast<size_t>(trie->vocab_size), Kind::None);
     std::vector<std::pair<std::string_view, int32_t>> pieces;
     pieces.reserve(static_cast<size_t>(trie->vocab_size));
     for (int32_t id = 0; id < trie->vocab_size; ++id) {
         if (tokenizer.is_end_of_generation(id)) {
             trie->end_of_generation.push_back(id);
+            trie->kinds[static_cast<size_t>(id)] = Kind::EndOfGeneration;
             continue;
         }
         const std::string& piece = tokenizer.piece(id);
         if (piece.empty() || piece.size() > std::numeric_limits<uint16_t>::max()) continue;
         pieces.emplace_back(piece, id);
+        trie->kinds[static_cast<size_t>(id)] = Kind::Text;
     }
     std::sort(pieces.begin(), pieces.end());
     std::vector<uint32_t> path;  // node per depth - 1
@@ -618,6 +621,7 @@ int32_t StateTable::intern(std::vector<std::vector<uint32_t>>& stacks) {
     for (const uint64_t w : st.next) count += std::popcount(w);
     st.next_count = static_cast<uint16_t>(count);
     const auto id = static_cast<int32_t>(states_.size());
+    bytes_ += sizeof(State) + key.size() * sizeof(uint32_t) + 64;  // the key in the index and its hash node
     const auto [it, inserted] = index_.emplace(std::move(key), id);
     st.key = &it->first;
     states_.push_back(std::move(st));
@@ -655,18 +659,22 @@ int32_t StateTable::compute(int32_t state, uint8_t byte) {
     return intern(stacks);
 }
 
-int32_t StateTable::advance(int32_t state, uint8_t byte) {
+int32_t* StateTable::row(int32_t state) {
     State& st = states_[static_cast<size_t>(state)];
-    if (!has_byte(st.next, byte)) return kDead;
     if (!st.row) {
         st.row = std::make_unique<int32_t[]>(256);
         std::fill_n(st.row.get(), 256, kUnknown);
+        bytes_ += 256 * sizeof(int32_t);
     }
-    int32_t to = st.row[byte];
+    return st.row.get();  // stays valid: interning moves State objects, not their rows
+}
+
+int32_t StateTable::advance(int32_t state, uint8_t byte) {
+    int32_t* r = row(state);
+    int32_t to = r[byte];
     if (to != kUnknown) return to;
-    int32_t* row = st.row.get();  // stays valid: interning moves State objects, not their rows
-    to = compute(state, byte);
-    row[byte] = to;
+    to = has_byte(states_[static_cast<size_t>(state)].next, byte) ? compute(state, byte) : kDead;
+    r[byte] = to;
     return to;
 }
 
@@ -716,28 +724,42 @@ const std::vector<uint64_t>& StateTable::mask(int32_t state, const VocabTrie& tr
     if (!states_[static_cast<size_t>(state)].mask.empty()) return states_[static_cast<size_t>(state)].mask;
     const size_t words = (static_cast<size_t>(trie.vocab_size) + 63) / 64;
     if ((masks_ + 1) * words * 8 > kMaxMaskBytes) {  // drop every cached mask: they are rebuilt on demand
-        for (State& st : states_) std::vector<uint64_t>().swap(st.mask);
+        for (State& st : states_) {
+            bytes_ -= st.mask.size() * sizeof(uint64_t);
+            std::vector<uint64_t>().swap(st.mask);
+        }
         masks_ = 0;
     }
     std::vector<uint64_t> bits(words, 0);
     // One pass over the trie in depth-first order: `at[d]` is the state after
     // the first d bytes of the current node's path; a rejected byte skips its
     // whole subtree.
-    std::vector<int32_t> at(static_cast<size_t>(trie.max_depth) + 1);
+    // `rows[d]` is that state's transition row, so a transition already
+    // computed is one load; only nodes with children record their state.
+    const size_t depth = static_cast<size_t>(trie.max_depth) + 1;
+    std::vector<int32_t> at(depth);
+    std::vector<const int32_t*> rows(depth);
     at[0] = state;
+    rows[0] = row(state);
     const VocabTrie::Node* nodes = trie.nodes.data();
+    const int32_t* tokens = trie.tokens.data();
     const auto n = static_cast<uint32_t>(trie.nodes.size());
     for (uint32_t i = 0; i < n;) {
         const VocabTrie::Node& node = nodes[i];
-        const int32_t to = advance(at[node.depth - 1], node.byte);
+        const size_t d = node.depth;
+        int32_t to = rows[d - 1][node.byte];
+        if (to == kUnknown) to = advance(at[d - 1], node.byte);
         if (to < 0) {
             i = node.subtree_end;
             continue;
         }
-        at[node.depth] = to;
         for (uint32_t t = node.tok_begin; t < node.tok_end; ++t) {
-            const auto id = static_cast<uint32_t>(trie.tokens[t]);
+            const auto id = static_cast<uint32_t>(tokens[t]);
             bits[id >> 6] |= uint64_t{1} << (id & 63);
+        }
+        if (node.subtree_end != i + 1) {
+            at[d] = to;
+            rows[d] = row(to);
         }
         ++i;
     }
@@ -747,8 +769,61 @@ const std::vector<uint64_t>& StateTable::mask(int32_t state, const VocabTrie& tr
         }
     }
     ++masks_;
+    bytes_ += bits.size() * sizeof(uint64_t);
     states_[static_cast<size_t>(state)].mask = std::move(bits);
     return states_[static_cast<size_t>(state)].mask;
+}
+
+bool StateTable::allows(int32_t state, int32_t token, const Tokenizer& tokenizer, const VocabTrie& trie) {
+    if (token < 0 || token >= trie.vocab_size) return false;
+    switch (trie.kinds[static_cast<size_t>(token)]) {
+        case VocabTrie::Kind::EndOfGeneration:
+            return accepting(state);
+        case VocabTrie::Kind::None:
+            return false;
+        case VocabTrie::Kind::Text:
+            break;
+    }
+    const std::vector<uint64_t>& cached = states_[static_cast<size_t>(state)].mask;
+    if (!cached.empty()) return (cached[static_cast<uint32_t>(token) >> 6] >> (token & 63)) & 1;
+    return advance(state, tokenizer.piece(token)) >= 0;
+}
+
+bool StateTable::keep_top_allowed(int32_t state, const Tokenizer& tokenizer, const VocabTrie& trie,
+                                  std::span<float> logits, size_t k) {
+    const size_t n = logits.size();
+    // Candidates in the order masking then sorting would see them: highest
+    // logit first, ties by lower id. A min-heap keeps the best `c` in one pass.
+    auto better = [&](uint32_t a, uint32_t b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); };
+    std::vector<uint32_t> heap, kept;
+    size_t checked = 0;
+    for (const size_t budget : {std::max<size_t>(64, 4 * k), size_t{1024}}) {
+        const size_t c = std::min(budget, n);
+        if (c <= checked) break;
+        heap.clear();
+        for (uint32_t i = 0; i < n; ++i) {
+            if (heap.size() < c) {
+                heap.push_back(i);
+                std::push_heap(heap.begin(), heap.end(), better);
+            } else if (better(i, heap.front())) {
+                std::pop_heap(heap.begin(), heap.end(), better);
+                heap.back() = i;
+                std::push_heap(heap.begin(), heap.end(), better);
+            }
+        }
+        std::sort(heap.begin(), heap.end(), better);
+        for (size_t i = checked; i < heap.size() && kept.size() < k; ++i) {
+            if (allows(state, static_cast<int32_t>(heap[i]), tokenizer, trie)) kept.push_back(heap[i]);
+        }
+        checked = heap.size();
+        if (kept.size() == k) break;
+    }
+    if (kept.size() < k) return false;
+    std::vector<float> values(kept.size());
+    for (size_t i = 0; i < kept.size(); ++i) values[i] = logits[kept[i]];
+    std::fill(logits.begin(), logits.end(), -std::numeric_limits<float>::infinity());
+    for (size_t i = 0; i < kept.size(); ++i) logits[kept[i]] = values[i];
+    return true;
 }
 
 size_t StateTable::apply_mask(int32_t state, const VocabTrie& trie, std::span<float> logits) {
@@ -771,20 +846,13 @@ size_t StateTable::apply_mask(int32_t state, const VocabTrie& trie, std::span<fl
     return allowed;
 }
 
-size_t StateTable::memory_bytes() const noexcept {
-    size_t bytes = 0;
-    for (const State& st : states_) {
-        bytes += sizeof(State) + st.key->size() * 8 + (st.row ? 1024 : 0) + st.mask.size() * 8;
-    }
-    return bytes;
-}
-
 int32_t StateTable::compact(int32_t keep) {
-    if (states_.size() <= kMaxStates && memory_bytes() <= kMaxTableBytes) return keep;
+    if (states_.size() <= kMaxStates && bytes_ <= kMaxTableBytes + kMaxMaskBytes) return keep;
     const std::vector<uint32_t> key = *states_[static_cast<size_t>(keep)].key;
     states_.clear();
     index_.clear();
     masks_ = 0;
+    bytes_ = 0;
     initial_ = kUnknown;
     std::vector<std::vector<uint32_t>> stacks;
     for (size_t i = 0; i < key.size();) {

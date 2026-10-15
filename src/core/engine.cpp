@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -16,6 +17,7 @@
 #include <unistd.h>
 
 #include "core/chat_template.h"
+#include "core/grammar.h"
 #include "core/log.h"
 #include "core/quant.h"
 #include "core/sampling.h"
@@ -570,6 +572,39 @@ struct Engine::Impl {
     std::optional<ChatTemplate> chat_template;
     Status chat_template_error;
     jinja::Value chat_special;
+    // Constrained decoding (GenerateOptions): the vocabulary as a trie, built
+    // on first use, and the state tables of the grammars used most recently
+    // (most recent first), so a grammar used again keeps its transitions and
+    // masks. At most 16 tables and 64 MiB together; the newest always stays.
+    std::unique_ptr<grammar::VocabTrie> vocab_trie;
+    std::list<std::unique_ptr<grammar::StateTable>> grammar_tables;
+    const grammar::VocabTrie& trie() {
+        if (!vocab_trie) {
+            const auto t0 = Clock::now();
+            vocab_trie = grammar::VocabTrie::build(*tokenizer);
+            LIYAB_LOG_INFO("grammar: vocabulary trie of %zu nodes built in %.1f ms", vocab_trie->nodes.size(),
+                           ms_since(t0));
+        }
+        return *vocab_trie;
+    }
+    grammar::StateTable& grammar_table(const Grammar& g) {
+        for (auto it = grammar_tables.begin(); it != grammar_tables.end(); ++it) {
+            const auto& p = (*it)->program();
+            if (p == g.program() || p->same(*g.program())) {
+                grammar_tables.splice(grammar_tables.begin(), grammar_tables, it);
+                return *grammar_tables.front();
+            }
+        }
+        grammar_tables.push_front(std::make_unique<grammar::StateTable>(g.program()));
+        size_t total = 0;
+        for (const auto& t : grammar_tables) total += t->memory_bytes();
+        constexpr size_t kMaxTables = 16, kMaxBytes = size_t{64} << 20;
+        while (grammar_tables.size() > 1 && (grammar_tables.size() > kMaxTables || total > kMaxBytes)) {
+            total -= grammar_tables.back()->memory_bytes();
+            grammar_tables.pop_back();
+        }
+        return *grammar_tables.front();
+    }
     void load_chat_template() {
         const auto source = target->file().get_string("tokenizer.chat_template");
         if (!source) {
@@ -1420,6 +1455,19 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
     return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
 }
 
+Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
+                                         const TokenCallback& on_token, const GenerateOptions& options) {
+    if (options.grammar && options.continuation) {
+        return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
+    }
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
+    if (!tokens) return tokens.status();
+    const bool structured = options.grammar.has_value() || static_cast<bool>(options.continuation);
+    return generate_locked(*tokens, params, on_token, &prompt, nullptr, structured ? &options : nullptr);
+}
+
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
     std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
@@ -1429,7 +1477,7 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
 
 Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token, const std::string_view* text,
-                                                const ForceCallback* force) {
+                                                const ForceCallback* force, const GenerateOptions* options) {
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
@@ -1519,7 +1567,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     const auto t_decode = Clock::now();
     const Transformer::PhaseTimes phases_before = s.target->phase_times();
     std::string pending_utf8;
-    std::string generated;  // the output so far, kept for `force`
+    std::string generated;  // the output so far, kept for `force` / `continuation`
     std::vector<float> probs;
     int32_t last = prompt.back();
     // The next token when a forced pass already sampled it from its last row:
@@ -1527,6 +1575,171 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     std::optional<int32_t> presampled;
     bool stop = false;
     std::chrono::microseconds idle{0};
+
+    // Constrained decoding (GenerateOptions). `span` follows the output from
+    // where its grammar started (`whole`: the start of the output); its state
+    // set is the table's state id.
+    const ContinuationCallback* continuation =
+        options != nullptr && options->continuation ? &options->continuation : nullptr;
+    struct Span {
+        grammar::StateTable* table;
+        int32_t state;
+    };
+    std::optional<Span> span;
+    const bool whole = options != nullptr && options->grammar.has_value();
+    bool span_started = false;  // set by structure() when it opened a span
+    bool output_done = false;   // the whole output's grammar matched completely
+    std::vector<float> masked;
+    auto start_span = [&](const Grammar& g) {
+        span.reset();
+        grammar::StateTable& table = s.grammar_table(g);
+        span = Span{&table, table.initial()};
+        span_started = true;
+    };
+    if (whole) start_span(*options->grammar);
+    // What the output must continue with here: the active span's forced text
+    // and, each time a span completes, the callback's next continuation. The
+    // guard bounds a callback that keeps opening spans that complete at once.
+    auto structure = [&](std::string_view so_far) -> std::string {
+        const auto t0 = Clock::now();
+        std::string out;
+        span_started = false;
+        for (int guard = 0; guard < 64; ++guard) {
+            if (span) {
+                const grammar::StateTable& t = *span->table;
+                if (t.accepting(span->state) && !t.extendable(span->state)) {
+                    span.reset();
+                    if (whole) {
+                        output_done = true;
+                        break;
+                    }
+                    continue;
+                }
+                std::string f = span->table->forced_text(span->state);
+                if (f.empty()) break;
+                span->state = span->table->advance(span->state, f);
+                out += f;
+                continue;
+            }
+            if (continuation == nullptr) break;
+            std::string text_so_far(so_far);
+            text_so_far += out;
+            Continuation c = (*continuation)(text_so_far);
+            out += c.text;
+            if (!c.grammar) break;
+            start_span(*c.grammar);
+        }
+        stats.grammar_ms += ms_since(t0);
+        return out;
+    };
+    // Samples the next token from `logits`, masked by the active span.
+    auto sample_next_token = [&](std::span<const float> logits) -> Result<int32_t> {
+        if (!span) {
+            sampler.probabilities(logits, probs);
+            return sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs);
+        }
+        const auto t0 = Clock::now();
+        masked.assign(logits.begin(), logits.end());
+        // Greedy and top-k keep only the best allowed tokens, found among the
+        // most likely ones; the state's whole mask is built (and cached) only
+        // when they are not there or every allowed token counts (top_k 0).
+        const size_t k = sampler.greedy() ? 1 : params.top_k > 0 ? static_cast<size_t>(params.top_k) : 0;
+        size_t allowed = k;
+        if (k == 0 || !span->table->keep_top_allowed(span->state, *s.tokenizer, s.trie(), masked, k)) {
+            allowed = span->table->apply_mask(span->state, s.trie(), masked);
+        }
+        stats.grammar_ms += ms_since(t0);
+        if (allowed == 0) {
+            return Status(ErrorCode::InvalidArgument,
+                          "grammar: no token of the vocabulary can continue the output here");
+        }
+        ++stats.constrained_tokens;
+        sampler.probabilities(masked, probs);
+        return sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs);
+    };
+
+    // Forced continuation (structured output): the text the caller
+    // requires next (a tool call's fixed syntax, a name it completes) goes
+    // through the model in one batched pass with the token just sampled,
+    // at a fraction of decoding it token by token, and is emitted as
+    // output. The pass's last row is the next token's logits: it is
+    // sampled here, so forced text costs no decoding step of its own
+    // (one per tool call segment, a whole pass over the weights on a
+    // large MoE). The CPU backend computes a row the same bits in any
+    // batch, so this is the token the step would have sampled. Decoding hooks a batched pass does not run
+    // (experimental early exit, EGLS) would change those logits: with
+    // them the last forced token seeds the next step instead, as before.
+    // With GenerateOptions the forced text is encoded as a continuation of
+    // the token before it, so its tokens spell exactly the text emitted (no
+    // SentencePiece space prefix), which is what a grammar follows; a
+    // ForceCallback's text keeps the encoding it always had (the same
+    // tokens on byte-level BPE vocabularies).
+    auto run_forced = [&](const std::string& forced, const PowerPolicy& policy, const Route& route) -> Status {
+        auto forced_tokens =
+            options != nullptr ? s.tokenizer->encode_continuation(forced, last) : s.tokenizer->encode(forced, false);
+        if (!forced_tokens) return forced_tokens.status();
+        if (forced_tokens->empty()) return Status::ok();
+        const bool sample_next = (s.speculative != nullptr || !s.decode_only_hooks()) && !output_done;
+        std::vector<int32_t> batch{last};
+        batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - (sample_next ? 0 : 1));
+        // Speculative steps run without hooks; the experimental ones
+        // apply to plain decoding only.
+        const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, false);
+        // Forced tokens are never rolled back: no recurrent-state
+        // checkpoints (the next speculative step turns them back on).
+        if (s.speculative) s.target->set_checkpointing(false);
+        const auto t_forced = Clock::now();
+        auto logits = s.target->forward(batch, sample_next ? Transformer::Logits::Last : Transformer::Logits::None,
+                                        route, *s.pool, &hooks);
+        if (!logits) {
+            s.clear_context();
+            return logits.status();
+        }
+        ++stats.decode_passes;
+        if (sample_next) {
+            if (policy.throttled) ++stats.thermal_reroutes;
+            if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+            if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
+            auto token = sample_next_token(*logits);
+            if (!token) {
+                s.clear_context();
+                return token.status();
+            }
+            presampled = *token;
+        }
+        if (s.draft) {  // the draft model reads the same tokens, so both caches stay aligned
+            if (auto r = s.draft->forward(batch, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
+                s.clear_context();
+                return r.status();
+            }
+        } else {
+            s.context.insert(s.context.end(), batch.begin(), batch.end());
+        }
+        stats.forced_ms += ms_since(t_forced);
+        last = forced_tokens->back();
+        stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
+        // Whole characters are emitted now. Forced text that ends inside
+        // one (a C callback's buffer cut it) keeps the rest pending until
+        // the next token completes it, as a sampled piece would: pieces
+        // stay whole UTF-8.
+        const size_t ready = complete_utf8_prefix(forced);
+        pending_utf8.assign(forced, ready);
+        generated.append(forced, 0, ready);
+        if (ready > 0 && on_token && !on_token(std::string_view(forced).substr(0, ready), last)) stop = true;
+        return Status::ok();
+    };
+
+    // The output may have to start with forced text (a grammar's fixed
+    // opening, a callback's text) or a constrained span.
+    if (whole || continuation != nullptr) {
+        const std::string forced = structure("");
+        if (!forced.empty()) {
+            const PowerPolicy policy = s.power->policy();
+            s.apply_policy(policy);
+            LIYAB_RETURN_IF_ERROR(run_forced(forced, policy, policy.throttled ? s.throttled_route() : s.normal_route()));
+        }
+        if (output_done) stop = true;
+    }
 
     while (!stop) {
         if (s.cancel.load(std::memory_order_relaxed)) {
@@ -1541,7 +1754,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         if (presampled) {
             next.push_back(*presampled);
             presampled.reset();
-        } else if (s.speculative) {
+        } else if (s.speculative && !span) {
             if (policy.throttled) ++stats.thermal_reroutes;
             auto r = s.speculative->step(last, s.context, sampler, route, s.draft_route(), *s.pool);
             if (!r) {
@@ -1555,8 +1768,12 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 s.context.insert(s.context.end(), next.begin(), next.end() - 1);
             }
         } else {
+            // A plain step; also with speculative decoding while a grammar
+            // constrains the output (one token at a time, no hooks, no
+            // rollback checkpoints, the draft model fed the same token).
             if (policy.throttled) ++stats.thermal_reroutes;
-            const ForwardHooks hooks = s.hooks(policy, true);
+            const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, true);
+            if (s.speculative) s.target->set_checkpointing(false);
             auto logits =
                 s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
             if (!logits) {
@@ -1564,7 +1781,16 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 return logits.status();
             }
             ++stats.decode_passes;
-            s.context.push_back(last);
+            if (s.draft) {
+                if (auto r = s.draft->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::None,
+                                              s.draft_route(), *s.pool);
+                    !r) {
+                    s.clear_context();
+                    return r.status();
+                }
+            } else {
+                s.context.push_back(last);
+            }
             if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
             stats.ffn_blocks_skipped += s.target->last_ffn_skips();
             if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
@@ -1572,8 +1798,17 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 ++stats.early_exits;
                 stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - exit_layer;
             }
-            sampler.probabilities(*logits, probs);
-            next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
+            if (span) {
+                auto token = sample_next_token(*logits);
+                if (!token) {
+                    s.clear_context();
+                    return token.status();
+                }
+                next.push_back(*token);
+            } else {
+                sampler.probabilities(*logits, probs);
+                next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
+            }
         }
 
         if (stats.ttft_ms == 0.0) {
@@ -1601,10 +1836,20 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             ++stats.generated_tokens;
             s.tokens_generated.fetch_add(1, std::memory_order_relaxed);
             pending_utf8 += s.tokenizer->piece(token);
+            if (span) {  // the mask allowed only tokens the grammar accepts here
+                const auto t0 = Clock::now();
+                span->state = span->table->advance(span->state, s.tokenizer->piece(token));
+                if (span->state < 0) {
+                    s.clear_context();
+                    return Status(ErrorCode::Internal, "grammar: a sampled token left the grammar");
+                }
+                span->state = span->table->compact(span->state);
+                stats.grammar_ms += ms_since(t0);
+            }
             const size_t ready = complete_utf8_prefix(pending_utf8);
             if (ready > 0) {
                 const bool keep_going = on_token ? on_token(std::string_view(pending_utf8).substr(0, ready), token) : true;
-                if (force != nullptr) generated.append(pending_utf8, 0, ready);
+                if (force != nullptr || continuation != nullptr) generated.append(pending_utf8, 0, ready);
                 pending_utf8.erase(0, ready);
                 if (!keep_going) {
                     stop = true;
@@ -1624,6 +1869,16 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             if (force != nullptr && pending_utf8.empty()) {
                 forced = (*force)(generated);
                 if (!forced.empty()) {
+                    kept = i + 1;
+                    break;
+                }
+            }
+            // Constrained decoding: the span's forced text, its end, the
+            // callback's next continuation; past a new span or forced text,
+            // a speculative step's later tokens are not the output's.
+            if ((span || continuation != nullptr) && pending_utf8.empty()) {
+                forced = structure(generated);
+                if (!forced.empty() || span_started || output_done) {
                     kept = i + 1;
                     break;
                 }
@@ -1651,65 +1906,8 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         }
         last = next.back();
 
-        // Forced continuation (structured output): the text the caller
-        // requires next (a tool call's fixed syntax, a name it completes) goes
-        // through the model in one batched pass with the token just sampled,
-        // at a fraction of decoding it token by token, and is emitted as
-        // output. The pass's last row is the next token's logits: it is
-        // sampled here, so forced text costs no decoding step of its own
-        // (one per tool call segment, a whole pass over the weights on a
-        // large MoE). The CPU backend computes a row the same bits in any
-        // batch, so this is the token the step would have sampled. Decoding hooks a batched pass does not run
-        // (experimental early exit, EGLS) would change those logits: with
-        // them the last forced token seeds the next step instead, as before.
-        if (!stop && !forced.empty()) {
-            auto forced_tokens = s.tokenizer->encode(forced, false);
-            if (forced_tokens && !forced_tokens->empty()) {
-                const bool sample_next = s.speculative != nullptr || !s.decode_only_hooks();
-                std::vector<int32_t> batch{last};
-                batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - (sample_next ? 0 : 1));
-                // Speculative steps run without hooks; the experimental ones
-                // apply to plain decoding only.
-                const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, false);
-                // Forced tokens are never rolled back: no recurrent-state
-                // checkpoints (the next speculative step turns them back on).
-                if (s.speculative) s.target->set_checkpointing(false);
-                const auto t_forced = Clock::now();
-                auto logits = s.target->forward(batch, sample_next ? Transformer::Logits::Last : Transformer::Logits::None,
-                                                route, *s.pool, &hooks);
-                if (!logits) {
-                    s.clear_context();
-                    return logits.status();
-                }
-                ++stats.decode_passes;
-                if (sample_next) {
-                    if (policy.throttled) ++stats.thermal_reroutes;
-                    if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
-                    if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
-                    sampler.probabilities(*logits, probs);
-                    presampled = sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs);
-                }
-                if (s.draft) {  // the draft model reads the same tokens, so both caches stay aligned
-                    if (auto r = s.draft->forward(batch, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
-                        s.clear_context();
-                        return r.status();
-                    }
-                } else {
-                    s.context.insert(s.context.end(), batch.begin(), batch.end());
-                }
-                stats.forced_ms += ms_since(t_forced);
-                last = forced_tokens->back();
-                stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
-                // Whole characters are emitted now. Forced text that ends
-                // inside one (a C callback's buffer cut it) keeps the rest
-                // pending until the next token completes it, as a sampled
-                // piece would: pieces stay whole UTF-8.
-                const size_t ready = complete_utf8_prefix(forced);
-                pending_utf8.assign(forced, ready);
-                generated.append(forced, 0, ready);
-                if (ready > 0 && on_token && !on_token(std::string_view(forced).substr(0, ready), last)) stop = true;
-            }
-        }
+        if (!stop && !forced.empty()) LIYAB_RETURN_IF_ERROR(run_forced(forced, policy, route));
+        if (output_done) stop = true;
     }
     if (!pending_utf8.empty() && on_token) on_token(pending_utf8, last);
 

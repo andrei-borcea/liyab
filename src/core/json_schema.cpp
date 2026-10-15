@@ -436,7 +436,9 @@ private:
         return object_schema(o, path);
     }
 
-    Result<Node> string_schema(const jinja::Object& o, const std::string& path) {
+    // `raw`: the string's characters as they are, without quotes or escapes
+    // (a value inside markup, such as an XML tool call's parameter).
+    Result<Node> string_schema(const jinja::Object& o, const std::string& path, bool raw = false) {
         auto min = count(o, "minLength", 0, path);
         if (!min) return min.status();
         auto max = count(o, "maxLength", kUnbounded, path);
@@ -457,11 +459,43 @@ private:
                 if (o.find("minLength") || o.find("maxLength")) {
                     return fail(ErrorCode::Unsupported, path, "minLength / maxLength with format '" + name + "' is not supported");
                 }
-                return b_.seq({b_.literal("\""), *body, b_.literal("\"")});
+                return raw ? *body : b_.seq({b_.literal("\""), *body, b_.literal("\"")});
             }
         }
-        return string(*min, *max);
+        return raw ? b_.repeat(b_.any_char(), *min, *max) : string(*min, *max);
     }
+
+public:
+    // A string schema's value as raw text (grammar text's %string).
+    Result<Node> raw_string(const Value& s, const std::string& path) {
+        if (!s.is_object()) return fail(ErrorCode::InvalidArgument, path, "%string needs a schema object");
+        const jinja::Object& o = s.fields();
+        for (const auto& [key, value] : o.entries) {
+            if (kUnsupported.contains(key)) return fail(ErrorCode::Unsupported, path, "keyword '" + key + "' is not supported");
+        }
+        auto literal_of = [&](const Value& v) -> Result<Node> {
+            if (!v.is_string()) return fail(ErrorCode::InvalidArgument, path, "%string values must be strings");
+            return b_.literal(v.as_string());
+        };
+        if (const Value* c = o.find("const")) return literal_of(*c);
+        if (const Value* e = o.find("enum")) {
+            if (!e->is_array() || e->items().empty()) return fail(ErrorCode::InvalidArgument, path, "'enum' must be a non-empty array");
+            std::vector<Node> alts;
+            for (const Value& v : e->items()) {
+                auto n = literal_of(v);
+                if (!n) return n;
+                alts.push_back(*n);
+            }
+            return b_.alt(std::move(alts));
+        }
+        const Value* t = o.find("type");
+        if (t == nullptr || !t->is_string() || t->as_string() != "string") {
+            return fail(ErrorCode::InvalidArgument, path, "%string needs a schema of type \"string\"");
+        }
+        return string_schema(o, path, true);
+    }
+
+private:
 
     Result<Node> number_schema(const jinja::Object& o, bool integer, const std::string& path) {
         std::optional<int64_t> lo, hi;
@@ -634,6 +668,13 @@ Result<Builder::Node> json_schema(Builder& b, std::string_view schema_json, cons
     auto node = compiler.compile(*parsed, "#");
     if (!node) return node;
     return compiler.root(*node);
+}
+
+Result<Builder::Node> raw_string(Builder& b, std::string_view schema_json) {
+    auto parsed = jinja::parse_json(schema_json);
+    if (!parsed) return Status(ErrorCode::InvalidArgument, "JSON schema: " + parsed.status().message());
+    SchemaCompiler compiler(b, JsonFormat{}, *parsed);
+    return compiler.raw_string(*parsed, "#");
 }
 
 Builder::Node json_value(Builder& b, const JsonFormat& format) {

@@ -11,10 +11,15 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "core/chat_template.h"
 #include "core/grammar.h"
+#include "core/tokenizer.h"
 #include "liyab/engine.h"
+#include "liyab/mmap_loader.h"
 #include "liyab/grammar.h"
+#include "liyab/liyab_c_api.h"
 #include "test_model.h"
 #include "test_util.h"
 
@@ -92,6 +97,15 @@ TEST_CASE("grammar: %until, %json, %schema and errors") {
     CHECK(j.matches(R"({"a": [1, 2.5, -3e+2, true, null, "x\"yé"], "b": {}})"));
     CHECK(!j.matches(R"({"a":1})"));  // the default layout: ": " and ", "
     CHECK(!j.matches("01"));
+
+    // %string: a string schema's raw text (no quotes, no escapes).
+    const Grammar raw = text_grammar(R"(root ::= "<p>" %string {"type": "string", "maxLength": 4} "</p>" %string {"enum": ["a b", "\"q\""]} "|" %string {"type": "string", "format": "date"})");
+    CHECK(raw.matches("<p>a\"\n<</p>a b|2026-10-15"));
+    CHECK(raw.matches("<p></p>\"q\"|2026-01-31"));
+    CHECK(!raw.matches("<p>abcde</p>a b|2026-10-15"));
+    CHECK(!raw.matches("<p>x</p>\"a b\"|2026-10-15"));
+    CHECK(!raw.matches("<p>x</p>a b|\"2026-10-15\""));
+    CHECK(!Grammar::parse(R"(root ::= %string {"type": "integer"})"));
 
     auto undefined = Grammar::parse("root ::= missing");
     CHECK(!undefined && undefined.status().message().find("missing") != std::string::npos);
@@ -277,6 +291,565 @@ TEST_CASE("grammar: forced text stops at a choice and at partial characters") {
     const Grammar split = text_grammar(R"(root ::= "é" | "è")");
     grammar::StateTable t2(split.program());
     CHECK(t2.forced_text(t2.initial()).empty());
+}
+
+// ---------------------------------------------------------------------------
+// With a vocabulary and the engine
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string temp_path(const std::string& name) {
+    return test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_grammar_" + name;
+}
+
+// The tiny model (SentencePiece: byte tokens, letters, pieces of "▁hello"
+// and "▁world"), written once per process and removed at exit.
+const std::string& tiny_model(bool hybrid = false) {
+    struct Written {
+        std::string plain, hybrid;
+        ~Written() {
+            if (!plain.empty()) std::remove(plain.c_str());
+            if (!hybrid.empty()) std::remove(hybrid.c_str());
+        }
+    };
+    static Written w;
+    std::string& path = hybrid ? w.hybrid : w.plain;
+    if (path.empty()) {
+        test::TinyModelSpec spec;
+        if (hybrid) {
+            spec.arch = "qwen35";
+            spec.n_layers = 4;
+            spec.delta_net_interval = 2;
+        }
+        path = temp_path(hybrid ? "hybrid.gguf" : "plain.gguf");
+        test::write_tiny_model(path, spec);
+    }
+    return path;
+}
+
+EngineConfig config_for(const std::string& path) {
+    EngineConfig c;
+    c.model_path = path;
+    c.n_threads = 4;
+    c.thermal_polling = false;
+    c.backend = BackendKind::Cpu;
+    c.power.profile = PowerProfile::Performance;
+    return c;
+}
+
+SamplingParams sampling(float temperature, uint64_t seed, int32_t max_tokens) {
+    SamplingParams p;
+    p.temperature = temperature;
+    p.top_k = 0;
+    p.top_p = 1.0f;
+    p.seed = seed;
+    p.max_tokens = max_tokens;
+    return p;
+}
+
+struct Output {
+    std::string text;
+    GenerationStats stats;
+};
+
+Output generate(Engine& e, const std::string& prompt, const SamplingParams& p, const GenerateOptions& options) {
+    Output out;
+    auto st = e.generate(prompt, p, [&](std::string_view piece, int32_t) {
+        out.text += piece;
+        return true;
+    }, options);
+    if (!st) {
+        std::printf("  generate failed: %s\n", st.status().to_string().c_str());
+        std::abort();
+    }
+    out.stats = *st;
+    return out;
+}
+
+// An independent check of a value against the schema subset the tests use
+// (not the grammar: the grammar is what is under test).
+bool valid(const jinja::Value& v, const jinja::Value& s) {
+    using T = jinja::Value::Type;
+    if (!s.is_object()) return true;
+    const jinja::Object& o = s.fields();
+    if (const jinja::Value* e = o.find("enum")) {
+        bool any = false;
+        for (const jinja::Value& x : e->items()) any = any || x.to_json() == v.to_json();
+        if (!any) return false;
+    }
+    if (const jinja::Value* c = o.find("const"); c != nullptr && c->to_json() != v.to_json()) return false;
+    if (const jinja::Value* any = o.find("anyOf")) {
+        bool ok = false;
+        for (const jinja::Value& b : any->items()) ok = ok || valid(v, b);
+        if (!ok) return false;
+    }
+    const jinja::Value* type = o.find("type");
+    if (type == nullptr) return true;
+    const std::string& t = type->as_string();
+    if (t == "null") return v.is_none();
+    if (t == "boolean") return v.type() == T::Bool;
+    if (t == "integer" || t == "number") {
+        if (t == "integer" ? v.type() != T::Int : (v.type() != T::Int && v.type() != T::Float)) return false;
+        if (const jinja::Value* m = o.find("minimum"); m != nullptr && v.as_float() < m->as_float()) return false;
+        if (const jinja::Value* m = o.find("maximum"); m != nullptr && v.as_float() > m->as_float()) return false;
+        return true;
+    }
+    if (t == "string") {
+        if (!v.is_string()) return false;
+        size_t chars = 0;
+        for (const char c : v.as_string()) chars += (static_cast<unsigned char>(c) & 0xC0) != 0x80;
+        if (const jinja::Value* m = o.find("maxLength"); m != nullptr && chars > static_cast<size_t>(m->as_int())) return false;
+        if (const jinja::Value* m = o.find("minLength"); m != nullptr && chars < static_cast<size_t>(m->as_int())) return false;
+        return true;
+    }
+    if (t == "array") {
+        if (!v.is_array()) return false;
+        if (const jinja::Value* m = o.find("maxItems"); m != nullptr && v.items().size() > static_cast<size_t>(m->as_int())) return false;
+        if (const jinja::Value* m = o.find("minItems"); m != nullptr && v.items().size() < static_cast<size_t>(m->as_int())) return false;
+        if (const jinja::Value* items = o.find("items")) {
+            for (const jinja::Value& x : v.items()) {
+                if (!valid(x, *items)) return false;
+            }
+        }
+        return true;
+    }
+    if (!v.is_object()) return false;
+    const jinja::Value* props = o.find("properties");
+    if (const jinja::Value* req = o.find("required")) {
+        for (const jinja::Value& name : req->items()) {
+            if (v.fields().find(name.as_string()) == nullptr) return false;
+        }
+    }
+    for (const auto& [key, value] : v.fields().entries) {
+        const jinja::Value* ps = props != nullptr ? props->fields().find(key) : nullptr;
+        if (ps == nullptr) {
+            const jinja::Value* add = o.find("additionalProperties");
+            if (add != nullptr && add->type() == T::Bool && !add->as_bool()) return false;
+            continue;
+        }
+        if (!valid(value, *ps)) return false;
+    }
+    return true;
+}
+
+const char* const kToolSchema = R"({"type": "object", "properties": {
+    "city": {"type": "string", "maxLength": 12},
+    "days": {"type": "integer", "minimum": 1, "maximum": 14},
+    "unit": {"enum": ["celsius", "fahrenheit"]},
+    "hourly": {"type": "boolean"},
+    "tags": {"type": "array", "items": {"type": "string", "maxLength": 4}, "maxItems": 3},
+    "note": {"anyOf": [{"type": "null"}, {"type": "string", "maxLength": 6}]}},
+    "required": ["city", "unit"], "additionalProperties": false})";
+
+}  // namespace
+
+TEST_CASE("masks: the vocabulary trie, split UTF-8, EOS only where the grammar accepts") {
+    auto file = MmapLoader::open(tiny_model());
+    REQUIRE(file.has_value());
+    auto tok = Tokenizer::load(*file.value());
+    REQUIRE(tok.has_value());
+    auto trie = grammar::VocabTrie::build(*tok);
+    const int32_t eos = tok->eos();
+    const Grammar g = text_grammar(R"(root ::= "é"+ "!"?)");
+    grammar::StateTable t(g.program());
+    auto allowed = [&](int32_t state) {
+        std::set<std::string> pieces;
+        const std::vector<uint64_t>& bits = t.mask(state, *trie);
+        for (int32_t id = 0; id < tok->vocab_size(); ++id) {
+            if ((bits[static_cast<size_t>(id) >> 6] >> (id & 63)) & 1) pieces.insert(id == eos ? "<eos>" : tok->piece(id));
+        }
+        return pieces;
+    };
+    // Only the byte tokens can spell "é" in this vocabulary: first C3, then A9.
+    int32_t s = t.initial();
+    CHECK(allowed(s) == std::set<std::string>{"\xC3"});
+    s = t.advance(s, "\xC3");
+    CHECK(allowed(s) == std::set<std::string>{"\xA9"});
+    s = t.advance(s, "\xA9");
+    CHECK(allowed(s) == (std::set<std::string>{"\xC3", "!", "<eos>"}));
+    s = t.advance(s, "!");
+    CHECK(allowed(s) == std::set<std::string>{"<eos>"});
+    // Longer pieces: every token whose whole piece fits.
+    const Grammar w = text_grammar(R"(root ::= " world" | " wo" [a-z] "x")");
+    grammar::StateTable tw(w.program());
+    const std::vector<uint64_t>& bits = tw.mask(tw.initial(), *trie);
+    for (const char* piece : {"\xE2\x96\x81world", "\xE2\x96\x81wor", "\xE2\x96\x81w", "\xE2\x96\x81"}) {
+        const int32_t id = test::tiny_token(piece);
+        REQUIRE(id >= 0);
+        CHECK(((bits[static_cast<size_t>(id) >> 6] >> (id & 63)) & 1) == 1);
+    }
+    const int32_t hello = test::tiny_token("\xE2\x96\x81hello");
+    CHECK(((bits[static_cast<size_t>(hello) >> 6] >> (hello & 63)) & 1) == 0);
+    // apply_mask leaves allowed logits as they were and the rest at -inf.
+    std::vector<float> logits(static_cast<size_t>(tok->vocab_size()) + 3, 1.5f);
+    const size_t n = tw.apply_mask(tw.initial(), *trie, logits);
+    size_t finite = 0;
+    for (const float l : logits) finite += std::isfinite(l) ? 1 : 0;
+    CHECK(n == finite);
+    CHECK(std::isinf(logits.back()));  // beyond the vocabulary
+}
+
+TEST_CASE("constrained generation: every sampled output parses and validates") {
+    auto engine = Engine::create(config_for(tiny_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    auto schema_value = jinja::parse_json(kToolSchema);
+    REQUIRE(schema_value.has_value());
+    const Grammar tool = schema(kToolSchema);
+    const Grammar loose = schema(kToolSchema, JsonFormat{.any_whitespace = true});
+    int complete = 0;
+    for (uint64_t seed = 1; seed <= 24; ++seed) {
+        const Grammar& g = seed % 3 == 0 ? loose : tool;
+        // Hot sampling over random weights: the model alone would write noise.
+        const Output out = generate(e, "hello world", sampling(1.5f, seed, 300), GenerateOptions{.grammar = g});
+        if (out.stats.generated_tokens >= 300) {  // cut by max_tokens: still a prefix of a match
+            CHECK(g.accepts_prefix(out.text));
+            continue;
+        }
+        ++complete;
+        CHECK(g.matches(out.text));
+        auto parsed = jinja::parse_json(out.text);
+        if (!parsed) {
+            std::printf("  not JSON: %s\n", out.text.c_str());
+            CHECK(false);
+            continue;
+        }
+        if (!valid(*parsed, *schema_value)) {
+            std::printf("  invalid: %s\n", out.text.c_str());
+            CHECK(false);
+        }
+        CHECK(out.stats.constrained_tokens > 0);
+        CHECK(out.stats.forced_tokens > 0);  // keys and separators
+    }
+    CHECK(complete >= 20);
+    // Free-form JSON and a grammar text, greedy and sampled.
+    const Grammar json = Grammar::json();
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        const Output out = generate(e, "hello", sampling(seed == 1 ? 0.0f : 1.2f, seed, 200), GenerateOptions{.grammar = json});
+        CHECK(out.stats.generated_tokens >= 200 ? json.accepts_prefix(out.text) : json.matches(out.text));
+    }
+    const Grammar words = text_grammar(R"(root ::= ("hello" | "world") (" " [a-z]{1,8}){2,4} ".")");
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        const Output out = generate(e, "hello world", sampling(1.0f, seed, 100), GenerateOptions{.grammar = words});
+        CHECK(words.matches(out.text));
+    }
+}
+
+TEST_CASE("constrained generation: the output ends where the grammar does, EOS only when it accepts") {
+    auto engine = Engine::create(config_for(tiny_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    // Fully determined: forced in one pass, nothing sampled, no EOS needed.
+    const Output fixed = generate(e, "hello", sampling(0.0f, 1, 50), GenerateOptions{.grammar = text_grammar(R"(root ::= "{\"ok\": true}")")});
+    CHECK(fixed.text == R"({"ok": true})");
+    CHECK(fixed.stats.generated_tokens == 0);
+    CHECK(fixed.stats.forced_tokens > 0);
+    // Open-ended: ends with an end-of-generation token only where the grammar
+    // accepts, else at max_tokens; never in the middle of a character.
+    const Grammar open = text_grammar(R"(root ::= [a-z]+ ("é" [a-z]*)*)");
+    int ended = 0;
+    for (uint64_t seed = 1; seed <= 16; ++seed) {
+        const Output out = generate(e, "hello world", sampling(1.0f, seed, 40), GenerateOptions{.grammar = open});
+        if (out.stats.generated_tokens < 40) {
+            ++ended;
+            CHECK(open.matches(out.text));
+        } else {
+            CHECK(open.accepts_prefix(out.text));
+        }
+    }
+    std::printf("  %d of 16 ended with EOS before max_tokens\n", ended);
+    // Errors: both options at once.
+    GenerateOptions both{.grammar = open, .continuation = [](std::string_view) { return Continuation{}; }};
+    auto st = e.generate("hello", sampling(0.0f, 1, 4), nullptr, both);
+    CHECK(!st && st.status().code() == ErrorCode::InvalidArgument);
+}
+
+TEST_CASE("constrained generation: forced text and constrained spans, any decoding, same output") {
+    const Grammar args = schema(kToolSchema);
+    auto schema_value = jinja::parse_json(kToolSchema);
+    REQUIRE(schema_value.has_value());
+    // A tool call: "<call>" forced after the first word, the arguments
+    // constrained, "</call>" forced when they close; the text after it is free.
+    auto callback = [&](int& calls) {
+        return [&args, &calls](std::string_view generated) {
+            ++calls;
+            Continuation c;
+            if (generated.ends_with("</call>") || generated.find("<call>") != std::string_view::npos) {
+                if (generated.find("</call>") == std::string_view::npos) c.text = "</call>";
+                return c;
+            }
+            if (generated.size() >= 3) {
+                c.text = " <call>";
+                c.grammar = args;
+            }
+            return c;
+        };
+    };
+    for (const bool hybrid : {false, true}) {
+        const std::string& path = tiny_model(hybrid);
+        EngineConfig plain = config_for(path);
+        EngineConfig lookup = plain;
+        lookup.lookup_drafts = true;
+        lookup.adaptive_drafts = false;
+        EngineConfig drafted = plain;
+        drafted.draft_model_path = path;
+        drafted.adaptive_drafts = false;
+        std::string reference;
+        for (const EngineConfig* config : {&plain, &lookup, &drafted}) {
+            auto engine = Engine::create(*config);
+            REQUIRE(engine.has_value());
+            int calls = 0;
+            const Output out = generate(*engine.value(), "hello world hello world", sampling(0.0f, 1, 120),
+                                        GenerateOptions{.continuation = callback(calls)});
+            const size_t open = out.text.find(" <call>");
+            const size_t close = out.text.find("</call>");
+            REQUIRE(open != std::string::npos);
+            CHECK(close != std::string::npos);  // every value is bounded: the call ends within max_tokens
+            if (close == std::string::npos) {
+                CHECK(args.accepts_prefix(out.text.substr(open + 7)));
+            } else {
+                const std::string call = out.text.substr(open + 7, close - open - 7);
+                CHECK(args.matches(call));
+                auto parsed = jinja::parse_json(call);
+                CHECK(parsed.has_value() && valid(*parsed, *schema_value));
+            }
+            CHECK(out.stats.constrained_tokens > 0);
+            CHECK(calls > 0);
+            // Greedy: the same text with plain, lookup and draft-model decoding.
+            if (config == &plain) {
+                reference = out.text;
+            } else {
+                CHECK(out.text == reference);
+                if (out.text != reference) std::printf("  %s\n  %s\n", reference.c_str(), out.text.c_str());
+            }
+        }
+    }
+}
+
+TEST_CASE("constrained generation: deterministic, and unconstrained generation unchanged") {
+    auto engine = Engine::create(config_for(tiny_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    const Grammar g = schema(kToolSchema);
+    for (uint64_t seed : {3u, 9u}) {
+        const Output a = generate(e, "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});
+        const Output b = generate(e, "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});
+        CHECK(a.text == b.text);
+        auto other = Engine::create(config_for(tiny_model()));
+        REQUIRE(other.has_value());
+        const Output c = generate(*other.value(), "hello world", sampling(1.0f, seed, 200), GenerateOptions{.grammar = g});
+        CHECK(a.text == c.text);  // a fresh engine: no cached state changes the output
+    }
+    // Empty options: the plain path, token for token.
+    std::string plain, with_options;
+    REQUIRE(e.generate("hello world", sampling(0.9f, 5, 40), [&](std::string_view p, int32_t) {
+        plain += p;
+        return true;
+    }).has_value());
+    with_options = generate(e, "hello world", sampling(0.9f, 5, 40), GenerateOptions{}).text;
+    CHECK(plain == with_options);
+}
+
+TEST_CASE("C API: grammars, a constrained whole output and constrained spans") {
+    liyab_grammar* bad = nullptr;
+    CHECK(liyab_grammar_from_json_schema(R"({"type": "string", "pattern": "x"})", 0, &bad) == LIYAB_ERR_UNSUPPORTED);
+    CHECK(bad == nullptr && std::strstr(liyab_last_error(), "pattern") != nullptr);
+    liyab_grammar* args = nullptr;
+    REQUIRE(liyab_grammar_from_json_schema(kToolSchema, 0, &args) == LIYAB_OK);
+    liyab_grammar* text = nullptr;
+    REQUIRE(liyab_grammar_parse("root ::= \"<\" [a-z]{2,5} \">\"", &text) == LIYAB_OK);
+    CHECK(liyab_grammar_matches(text, "<abc>", 5) == 1);
+    CHECK(liyab_grammar_matches(text, "<a>", 3) == 0);
+
+    liyab_engine_config config;
+    liyab_engine_config_default(&config);
+    config.model_path = tiny_model().c_str();
+    config.n_threads = 4;
+    config.thermal_polling = 0;
+    liyab_engine* engine = nullptr;
+    REQUIRE(liyab_engine_create(&config, &engine) == LIYAB_OK);
+    liyab_sampling_params params;
+    liyab_sampling_params_default(&params);
+    params.temperature = 1.0f;
+    params.seed = 3;
+    params.max_tokens = 200;
+    struct Ctx {
+        std::string out;
+        liyab_grammar* args;
+        int calls = 0;
+    } ctx{{}, args};
+    auto on_piece = [](const char* piece, size_t len, int32_t, void* user) -> int32_t {
+        static_cast<Ctx*>(user)->out.append(piece, len);
+        return 1;
+    };
+    liyab_generation_stats stats;
+    liyab_grammar_stats gstats;
+    REQUIRE(liyab_engine_generate_structured(engine, "hello", &params, on_piece, args, nullptr, &ctx, &stats, &gstats) ==
+            LIYAB_OK);
+    CHECK(stats.generated_tokens >= params.max_tokens || liyab_grammar_matches(args, ctx.out.data(), ctx.out.size()) == 1);
+    CHECK(gstats.constrained_tokens == stats.generated_tokens);
+
+    // A span after forced text, then forced text again when it completes.
+    ctx.out.clear();
+    auto continuation = [](const char* generated, size_t len, char* out, size_t cap, const liyab_grammar** grammar,
+                           void* user) -> size_t {
+        Ctx& c = *static_cast<Ctx*>(user);
+        ++c.calls;
+        const std::string_view so_far(generated, len);
+        const char* text = nullptr;
+        if (so_far.empty()) {
+            text = "call ";
+            *grammar = c.args;
+        } else if (so_far.find(" end") == std::string_view::npos) {
+            text = " end";
+        }
+        if (text == nullptr || std::strlen(text) > cap) return 0;
+        std::memcpy(out, text, std::strlen(text));
+        return std::strlen(text);
+    };
+    params.temperature = 0.0f;
+    REQUIRE(liyab_engine_generate_structured(engine, "hello", &params, on_piece, nullptr, continuation, &ctx, &stats,
+                                             nullptr) == LIYAB_OK);
+    REQUIRE(ctx.out.starts_with("call "));
+    const size_t end = ctx.out.find(" end");
+    REQUIRE(end != std::string::npos);
+    CHECK(liyab_grammar_matches(args, ctx.out.data() + 5, end - 5) == 1);
+    CHECK(ctx.calls >= 2);
+    // Both at once: refused.
+    CHECK(liyab_engine_generate_structured(engine, "hello", &params, on_piece, args, continuation, &ctx, nullptr,
+                                           nullptr) == LIYAB_ERR_INVALID_ARGUMENT);
+    liyab_engine_destroy(engine);
+    liyab_grammar_destroy(args);
+    liyab_grammar_destroy(text);
+}
+
+// Real models (LIYAB_GRAMMAR_MODEL=path.gguf[,path2.gguf...]): every output
+// of a tool call's arguments validates, and the cost of the masks per token
+// against a decode step.
+TEST_CASE("real models: tool-call arguments validate; masking cost per token") {
+    const char* env = std::getenv("LIYAB_GRAMMAR_MODEL");
+    if (env == nullptr) {
+        std::printf("  skipped: set LIYAB_GRAMMAR_MODEL to GGUF paths (comma-separated)\n");
+        return;
+    }
+    const char* const schemas[] = {
+        kToolSchema,
+        R"({"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "since": {"type": "string", "format": "date"}}, "required": ["query"]})",
+        R"({"type": "object", "properties": {"title": {"type": "string"}, "attendees": {"type": "array", "items": {"type": "object",
+            "properties": {"name": {"type": "string"}, "email": {"type": "string"}}, "required": ["name"]}},
+            "start": {"type": "string", "format": "date-time"}, "minutes": {"type": "number", "minimum": 0}},
+            "required": ["title", "start"]})",
+    };
+    std::string paths = env;
+    for (size_t at = 0; at < paths.size();) {
+        const size_t comma = paths.find(',', at);
+        const std::string path = paths.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        at = comma == std::string::npos ? paths.size() : comma + 1;
+        {
+            // One mask from scratch (every byte transition computed too), in
+            // the states that allow the most tokens: inside a string, in free
+            // text, and at a structural choice.
+            auto file = MmapLoader::open(path);
+            REQUIRE(file.has_value());
+            auto tok = Tokenizer::load(*file.value());
+            REQUIRE(tok.has_value());
+            const auto t0 = std::chrono::steady_clock::now();
+            auto trie = grammar::VocabTrie::build(*tok);
+            const double build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            struct Probe {
+                const char* what;
+                const char* grammar;
+                const char* prefix;
+            };
+            const Probe probes[] = {
+                {"inside a JSON string", "root ::= %schema {\"type\": \"string\"}", "\"ab"},
+                {"free text (%until)", "root ::= %until \"</think>\"", "hm"},
+                {"a choice of JSON values", "root ::= %json", ""},
+            };
+            for (const Probe& p : probes) {
+                const Grammar g = text_grammar(p.grammar);
+                double first = 0, again = 0;
+                size_t allowed = 0;
+                for (int rep = 0; rep < 3; ++rep) {
+                    grammar::StateTable t(g.program());
+                    const int32_t s = t.advance(t.initial(), p.prefix);
+                    const auto a = std::chrono::steady_clock::now();
+                    const std::vector<uint64_t>& bits = t.mask(s, *trie);
+                    const auto b = std::chrono::steady_clock::now();
+                    std::vector<float> logits(static_cast<size_t>(tok->vocab_size()), 0.0f);
+                    const auto c = std::chrono::steady_clock::now();
+                    allowed = t.apply_mask(s, *trie, logits);
+                    const auto d = std::chrono::steady_clock::now();
+                    (void)bits;
+                    if (rep > 0) {  // the first repetition warms the caches
+                        first += std::chrono::duration<double, std::milli>(b - a).count() / 2;
+                        again += std::chrono::duration<double, std::milli>(d - c).count() / 2;
+                    }
+                }
+                std::printf("  %s: %s mask %.2f ms from scratch, %.3f ms cached (%zu tokens allowed, trie %zu nodes, built in %.0f ms)\n",
+                            path.c_str() + path.rfind('/') + 1, p.what, first, again, allowed, trie->nodes.size(), build_ms);
+            }
+        }
+        EngineConfig config = config_for(path);
+        config.n_threads = 0;
+        config.backend.reset();
+        double trie_ms = 0;
+        // Per sampling mode: greedy, top-k sampling as models recommend
+        // (checks the likeliest tokens), and top_k 0 (whole masks).
+        struct Mode {
+            const char* name;
+            float temperature;
+            int32_t top_k;
+            float top_p;
+        };
+        const Mode modes[] = {{"greedy", 0.0f, 0, 1.0f}, {"top-k 20", 0.7f, 20, 0.8f}, {"top_k 0", 0.7f, 0, 0.8f}};
+        int valid_count = 0, runs = 0;
+        double decode_ms = 0;
+        int32_t sampled = 0;
+        for (const Mode& mode : modes) {
+            // A new engine per mode, so a schema's first use is a first use.
+            auto engine = Engine::create(config);
+            REQUIRE(engine.has_value());
+            Engine& e = *engine.value();
+            const auto t_trie = std::chrono::steady_clock::now();
+            // The first constrained token builds the vocabulary trie.
+            (void)generate(e, "Hi", sampling(0.0f, 1, 2), GenerateOptions{.grammar = text_grammar("root ::= [a-z]+")});
+            trie_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_trie).count();
+            double first_ms = 0, again_ms = 0;
+            int32_t first_tokens = 0, again_tokens = 0;
+            for (const char* text : schemas) {
+                auto schema_value = jinja::parse_json(text);
+                REQUIRE(schema_value.has_value());
+                const Grammar g = schema(text);
+                for (const bool again : {false, true}) {  // a grammar's first use, then the same request again
+                    const std::string prompt = std::string(
+                        "<|im_start|>user\nCall the tool for a trip to Lisbon next week. Arguments as JSON matching ") +
+                        text + "<|im_end|>\n<|im_start|>assistant\n";
+                    SamplingParams p = sampling(mode.temperature, 7, 160);
+                    p.top_k = mode.top_k;
+                    p.top_p = mode.top_p;
+                    const Output out = generate(e, prompt, p, GenerateOptions{.grammar = g});
+                    ++runs;
+                    auto parsed = jinja::parse_json(out.text);
+                    const bool ok = out.stats.generated_tokens < 160 && parsed.has_value() && valid(*parsed, *schema_value);
+                    valid_count += ok ? 1 : 0;
+                    if (!ok) std::printf("  invalid: %s\n", out.text.c_str());
+                    (again ? again_ms : first_ms) += out.stats.grammar_ms;
+                    (again ? again_tokens : first_tokens) += out.stats.constrained_tokens;
+                    decode_ms += out.stats.decode_ms - out.stats.forced_ms - out.stats.grammar_ms;
+                    sampled += out.stats.generated_tokens;
+                }
+            }
+            std::printf("  %s, %s: grammar %.3f ms/token on a schema's first use, %.3f ms/token again\n",
+                        path.c_str() + path.rfind('/') + 1, mode.name, first_ms / std::max(1, first_tokens),
+                        again_ms / std::max(1, again_tokens));
+        }
+        CHECK(valid_count == runs);
+        std::printf("  %s: trie + first token %.0f ms; %d/%d valid; decode step %.2f ms\n",
+                    path.c_str() + path.rfind('/') + 1, trie_ms, valid_count, runs, decode_ms / std::max(1, sampled));
+    }
 }
 
 TEST_MAIN()

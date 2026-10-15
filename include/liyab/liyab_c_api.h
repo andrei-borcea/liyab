@@ -347,6 +347,59 @@ LIYAB_C_API int64_t liyab_engine_render_chat(const liyab_engine* engine, const c
 LIYAB_C_API int64_t liyab_engine_chat_format(const liyab_engine* engine, const char* probe_json, char* buffer,
                                              size_t size);
 
+/*
+ * Constrained decoding (structured output; liyab/grammar.h has the JSON
+ * Schema subset and the grammar syntax). While a grammar is active, tokens
+ * it cannot accept are masked before sampling, so the output matches it.
+ *
+ * A grammar is independent of engines: compile it once, use it with any
+ * engine and from any thread, destroy it when no generation still needs it
+ * (an engine keeps its own reference while it uses one).
+ */
+typedef struct liyab_grammar liyab_grammar;
+
+/* A JSON value valid against `schema_json`. any_whitespace 0: json.dumps'
+ * layout (", " and ": " only), which lets every character that is the only
+ * one possible be forced; 1: any JSON white space. On failure *out_grammar
+ * is NULL and liyab_last_error() says why (LIYAB_ERR_UNSUPPORTED names a
+ * keyword Liyab does not enforce, and where it is). */
+LIYAB_C_API liyab_status liyab_grammar_from_json_schema(const char* schema_json, int32_t any_whitespace,
+                                                        liyab_grammar** out_grammar);
+/* Grammar text (GBNF-like rules from `root`, with %json, %schema and %until). */
+LIYAB_C_API liyab_status liyab_grammar_parse(const char* text, liyab_grammar** out_grammar);
+LIYAB_C_API void liyab_grammar_destroy(liyab_grammar* grammar);
+/* 1 when the `len` bytes of `text` are a complete match, else 0. */
+LIYAB_C_API int32_t liyab_grammar_matches(const liyab_grammar* grammar, const char* text, size_t len);
+
+/* Called with the output so far before the first token and, while no
+ * constrained span is active, after every token that ends a whole
+ * character. Writes up to out_cap (4096) bytes of text the output must
+ * continue with into `out` and returns their length (0: none); may set
+ * *out_grammar to a grammar the output continues with after that text (a
+ * span, which ends when its match is complete and nothing can follow; then
+ * the callback is asked again). See Engine's ContinuationCallback. */
+typedef size_t (*liyab_continuation_callback)(const char* generated, size_t generated_len, char* out, size_t out_cap,
+                                              const liyab_grammar** out_grammar, void* user_data);
+
+typedef struct liyab_grammar_stats {
+    int32_t constrained_tokens; /* tokens sampled under a grammar (forced ones: stats->forced_tokens) */
+    double grammar_ms;          /* masks and grammar bookkeeping, part of decode_ms */
+} liyab_grammar_stats;
+
+/* Generation with constrained decoding. `grammar` (may be NULL) constrains
+ * the whole output: generation ends once its match is complete and nothing
+ * can follow, or at an end-of-generation token where it accepts.
+ * `continuation` (may be NULL) forces text and opens constrained spans at
+ * points it chooses. At most one of the two (both: LIYAB_ERR_INVALID_ARGUMENT);
+ * neither: liyab_engine_generate. Speculative decoding is off while a grammar
+ * is active. `stats` and `grammar_stats` may be NULL. */
+LIYAB_C_API liyab_status liyab_engine_generate_structured(liyab_engine* engine, const char* prompt,
+                                                          const liyab_sampling_params* params,
+                                                          liyab_token_callback callback, const liyab_grammar* grammar,
+                                                          liyab_continuation_callback continuation, void* user_data,
+                                                          liyab_generation_stats* stats,
+                                                          liyab_grammar_stats* grammar_stats);
+
 #ifdef __cplusplus
 }
 #endif

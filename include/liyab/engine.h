@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "liyab/device_detect.h"
+#include "liyab/grammar.h"
 #include "liyab/power_manager.h"
 #include "liyab/types.h"
 
@@ -175,6 +176,57 @@ using TokenCallback = std::function<bool(std::string_view piece, int32_t token)>
 // tokens count in GenerationStats::forced_tokens, not generated_tokens.
 using ForceCallback = std::function<std::string(std::string_view generated)>;
 
+// Constrained decoding (structured output, see liyab/grammar.h). While a
+// grammar is active, every token whose bytes it cannot accept at that point
+// is masked before sampling (the sampler's temperature / top-k / top-p see
+// only allowed tokens), so the output matches it: a JSON Schema's valid
+// values, any JSON, a grammar text. Details:
+//  * End-of-generation tokens are allowed only where the grammar accepts.
+//  * Text every continuation shares (a schema's keys, separators, brackets,
+//    the rest of a unique enum value) is forced, not sampled: it goes through
+//    the model in one batched pass, as ForceCallback text does, and counts in
+//    GenerationStats::forced_tokens. Forcing stops at a choice and never ends
+//    inside a character.
+//  * Speculative decoding (a draft model or lookup drafts) is off while a
+//    grammar is active: tokens are decoded one at a time, since drafts would
+//    need a mask at every verified position. Unconstrained stretches of the
+//    same generation use it as usual.
+//  * max_tokens and cancellation can still cut a match short; the caller
+//    sees it from GenerationStats (generated_tokens == max_tokens,
+//    cancelled).
+//  * The engine keeps each grammar's states, transitions and masks (the 16
+//    most recently used grammars, 64 MiB together), so a grammar used again
+//    (a request with the same tools) does not pay for its masks twice.
+//    GenerationStats::constrained_tokens and grammar_ms report the cost.
+
+// A continuation of a structured generation (ContinuationCallback): `text`
+// is forced, as ForceCallback's is; then, when `grammar` is set, the output
+// continues with a span that matches it. A span ends when its match is
+// complete and nothing more can follow (e.g. the closing brace of a JSON
+// object), and the callback is asked again at once: its next text and span
+// join the same forced pass.
+struct Continuation {
+    std::string text;
+    std::optional<Grammar> grammar;
+};
+// Called with the output so far before the first token (empty output) and,
+// while no span is active, after every token that ends a whole character
+// (as ForceCallback), also with speculative decoding (tokens a step returned
+// past that point are dropped). Called on the generating thread.
+using ContinuationCallback = std::function<Continuation(std::string_view generated)>;
+
+// Options of Engine::generate. At most one of the two is set (both:
+// InvalidArgument).
+struct GenerateOptions {
+    // The whole output matches this grammar. Generation ends as soon as the
+    // match is complete and nothing can follow (no end-of-generation token is
+    // needed), or at an end-of-generation token where the grammar accepts.
+    std::optional<Grammar> grammar;
+    // Forced text and constrained spans at chosen points of the output (a
+    // tool call's syntax forced, its arguments constrained by their schema).
+    ContinuationCallback continuation;
+};
+
 // How a model's chat template lays out a conversation, found by rendering
 // probe conversations (Engine::chat_format). A front end that keeps a
 // conversation's context between turns builds each prompt from these pieces
@@ -235,6 +287,9 @@ public:
     // speculative decoding (draft model or lookup).
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token, const ForceCallback& force);
+    // Same, with constrained decoding (see GenerateOptions).
+    Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
+                                     const TokenCallback& on_token, const GenerateOptions& options);
     // Same, from token ids (for vocabularies whose text encoder Liyab lacks);
     // reuse follows token prefixes only.
     Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
@@ -367,7 +422,8 @@ private:
     // text `prompt` encodes, remembered for the next call's reuse.
     Result<GenerationStats> generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
                                             const TokenCallback& on_token, const std::string_view* text,
-                                            const ForceCallback* force = nullptr);
+                                            const ForceCallback* force = nullptr,
+                                            const GenerateOptions* options = nullptr);
     std::unique_ptr<Impl> impl_;
 };
 

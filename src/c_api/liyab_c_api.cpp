@@ -17,6 +17,10 @@ struct liyab_engine {
     std::unique_ptr<liyab::Engine> engine;
 };
 
+struct liyab_grammar {
+    liyab::Grammar grammar;
+};
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -534,6 +538,72 @@ int64_t liyab_engine_chat_format(const liyab_engine* engine, const char* probe_j
         return LIYAB_OK;
     });
     return status == LIYAB_OK ? length : -1;
+}
+
+liyab_status liyab_grammar_from_json_schema(const char* schema_json, int32_t any_whitespace, liyab_grammar** out_grammar) {
+    return guarded([&]() -> liyab_status {
+        if (out_grammar == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "out_grammar is required");
+        *out_grammar = nullptr;
+        if (schema_json == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "schema_json is required");
+        auto g = liyab::Grammar::from_json_schema(schema_json, liyab::JsonFormat{.any_whitespace = any_whitespace != 0});
+        if (!g) return fail(g.status());
+        *out_grammar = new liyab_grammar{std::move(g).value()};
+        return LIYAB_OK;
+    });
+}
+
+liyab_status liyab_grammar_parse(const char* text, liyab_grammar** out_grammar) {
+    return guarded([&]() -> liyab_status {
+        if (out_grammar == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "out_grammar is required");
+        *out_grammar = nullptr;
+        if (text == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "text is required");
+        auto g = liyab::Grammar::parse(text);
+        if (!g) return fail(g.status());
+        *out_grammar = new liyab_grammar{std::move(g).value()};
+        return LIYAB_OK;
+    });
+}
+
+void liyab_grammar_destroy(liyab_grammar* grammar) { delete grammar; }
+
+int32_t liyab_grammar_matches(const liyab_grammar* grammar, const char* text, size_t len) {
+    if (grammar == nullptr || (text == nullptr && len > 0)) return 0;
+    int32_t matched = 0;
+    (void)guarded([&] {
+        matched = grammar->grammar.matches(std::string_view(text == nullptr ? "" : text, len)) ? 1 : 0;
+        return LIYAB_OK;
+    });
+    return matched;
+}
+
+liyab_status liyab_engine_generate_structured(liyab_engine* engine, const char* prompt,
+                                              const liyab_sampling_params* params, liyab_token_callback callback,
+                                              const liyab_grammar* grammar, liyab_continuation_callback continuation,
+                                              void* user_data, liyab_generation_stats* stats,
+                                              liyab_grammar_stats* grammar_stats) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || prompt == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and prompt are required");
+        liyab::GenerateOptions options;
+        if (grammar != nullptr) options.grammar = grammar->grammar;
+        if (continuation != nullptr) {
+            options.continuation = [continuation, user_data](std::string_view generated) {
+                // Room for a tool call's whole fixed opening; a callback whose
+                // text does not fit returns 0 rather than cut it.
+                char out[4096];
+                const liyab_grammar* next = nullptr;
+                const size_t n = continuation(generated.data(), generated.size(), out, sizeof out, &next, user_data);
+                liyab::Continuation c;
+                c.text.assign(out, std::min(n, sizeof out));
+                if (next != nullptr) c.grammar = next->grammar;
+                return c;
+            };
+        }
+        auto result = engine->engine->generate(prompt, to_cpp(params), wrap(callback, user_data), options);
+        if (result && grammar_stats != nullptr) {
+            *grammar_stats = liyab_grammar_stats{result->constrained_tokens, result->grammar_ms};
+        }
+        return finish_generation(result, stats);
+    });
 }
 
 }  // extern "C"

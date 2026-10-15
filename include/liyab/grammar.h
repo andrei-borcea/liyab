@@ -31,8 +31,9 @@
 //     counting as one), format "date", "time", "date-time" (RFC 3339) and
 //     "uuid"; other formats are annotations and are not checked;
 //   * integer: minimum, maximum, exclusiveMinimum, exclusiveMaximum (any
-//     64-bit bounds); number: minimum / exclusiveMinimum 0 (non-negative /
-//     positive numbers), other bounds on non-integer numbers are refused;
+//     64-bit bounds); number: integral minimum / maximum (then written
+//     without an exponent), exclusiveMinimum 0 (positive numbers); other
+//     bounds on numbers are refused;
 //   * anyOf, oneOf (the output matches at least one branch: oneOf branches
 //     that overlap are not told apart), allOf with one schema, nullable
 //     (OpenAPI), $ref to any JSON pointer in the document ("#",
@@ -64,6 +65,9 @@
 //   x* x+ x?      repetition; x{n} x{n,} x{n,m} (bounds <= 10000)
 //   %json         any JSON value (json.dumps' layout, as JsonFormat{})
 //   %schema {..}  a JSON value valid against the JSON Schema that follows
+//   %string {..}  the raw text of a value of a string schema (type "string",
+//                 or an enum / const of strings): no quotes, no escapes, any
+//                 character; for values inside markup (XML tool calls)
 //   %until "s"    any text that does not contain s, then s (e.g. reasoning
 //                 up to its closing tag)
 //
