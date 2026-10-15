@@ -150,6 +150,10 @@ int main(int argc, char** argv) {
         {"Q6_K expert 2048x512", liyab::DType::Q6_K, 2048, 512},
         {"Q4_K expert down 512x2048", liyab::DType::Q4_K, 512, 2048},
         {"Q6_K expert down 512x2048", liyab::DType::Q6_K, 512, 2048},
+        // Candidate formats for a smaller tier of streamed experts (docs/research/cold-experts.md):
+        {"Q3_K expert 2048x512", liyab::DType::Q3_K, 2048, 512},
+        {"IQ3_XXS expert 2048x512", liyab::DType::IQ3_XXS, 2048, 512},
+        {"Q2_K expert 2048x512", liyab::DType::Q2_K, 2048, 512},
     };
     for (const Case& c : cases) {
         liyab::TensorView w;
