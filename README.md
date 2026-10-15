@@ -1244,7 +1244,9 @@ Benchmarks and tools built with the tests:
   repeated tool output over two turns, free chat, and that tool conversation again as a new one). It compares
   plain decoding with lookup and suffix drafts, greedy and unpaced, each task on every mode back to back so they
   share the host's load, and reports tok/s, accepted drafts, tokens per pass and whether each reply equals the
-  plain one (`--repeat R`: medians of R runs).
+  plain one (`--repeat R`: medians of R runs, and the best run, the least disturbed on a shared host). A mode
+  `lookup:K:fixed` or `suffix:K:fixed` verifies every draft on offer, so its acceptance and tokens per pass do not
+  depend on timing.
 
   ```bash
   build/liyab-spec-bench -m Qwen3-0.6B-BF16.gguf --modes plain,lookup,suffix,suffix:8

@@ -29,9 +29,11 @@
 //
 // Confidence: each drafted token falls in a bin by match length, the share
 // and number of occurrences that agree on it and whether the live sequence
-// supports it; per bin, the accepted / verified counts (with a prior from the
-// share and the match length, halved now and then so it follows the text)
-// give the probability. Calibrated from the verification outcomes reported
+// supports it; per bin, the accepted / verified counts give the probability.
+// Two levels, so a few verifications already tell: a coarse bin (match length
+// and share only, its prior from the two) is the prior of the fine bins in
+// it. Counts are halved now and then, so they follow the text and the
+// sampling settings. Calibrated from the verification outcomes reported
 // through feedback(), on every device and model alike.
 //
 // Drafts never change the output: the decoder verifies them. Not thread-safe:
@@ -140,7 +142,8 @@ private:
         float accepted = 0.0f;
         float verified = 0.0f;
     };
-    static constexpr size_t kBins = 5 * 4 * 3 * 2;
+    static constexpr size_t kBins = 5 * 4 * 3 * 2;  // match x share x support x live
+    static constexpr size_t kFinePerCoarse = 3 * 2;    // support x live
 
     void store(std::span<const int32_t> sequence);
     [[nodiscard]] bool shadowed(const Stored& s) const noexcept {
@@ -159,6 +162,7 @@ private:
     int64_t stored_tokens_ = 0;
     uint64_t tick_ = 0;
     std::array<Bin, kBins> bins_{};
+    std::array<Bin, kBins / kFinePerCoarse> coarse_{};  // by match and share only
     Draft draft_;
     std::vector<Occurrence> occurrences_;  // scratch
     std::vector<Tally> tally_;             // scratch
