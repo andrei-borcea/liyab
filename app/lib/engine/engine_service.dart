@@ -599,6 +599,7 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   c.eglsThreshold = n('eglsThreshold') ?? c.eglsThreshold;
   c.tdss = i('tdss') ?? c.tdss;
   if (x.containsKey('lookupDrafts')) c.lookupDrafts = flag('lookupDrafts');
+  if (x.containsKey('suffixDrafts')) c.suffixDrafts = flag('suffixDrafts');
   c.draftTokens = i('draftTokens') ?? c.draftTokens;
   c.moeExpertMass = n('expertMass') ?? c.moeExpertMass;
   c.moeMaxExperts = i('maxExperts') ?? c.moeMaxExperts;

@@ -36,11 +36,52 @@ int32_t DraftBudget::choose() {
     return due >= 0 ? due : leader;
 }
 
+int32_t DraftBudget::choose(std::span<const float> survival) {
+    ++step_;
+    retrying_ = -1;
+    if (arms_[0].samples == 0) return 0;  // plain decoding first: every other count is costed against it
+    const int32_t offered = std::min(static_cast<int32_t>(survival.size()), static_cast<int32_t>(arms_.size()) - 1);
+    rates_.assign(static_cast<size_t>(offered) + 1, 0.0);
+    int32_t choice = 0;
+    rates_[0] = 1.0 / std::max(arms_[0].ms, 1e-9);
+    double tokens = 1.0;
+    double floor = arms_[0].ms;  // the dearest fewer-drafts step: a lower bound for an unknown time
+    for (int32_t j = 1; j <= offered; ++j) {
+        tokens += survival[static_cast<size_t>(j - 1)];
+        const Arm& arm = arms_[static_cast<size_t>(j)];
+        const double ms = std::max(arm.samples == 0 ? floor : arm.ms, 1e-9);
+        if (arm.samples > 0) floor = std::max(floor, arm.ms);
+        rates_[static_cast<size_t>(j)] = tokens / ms;
+        if (rates_[static_cast<size_t>(j)] > rates_[static_cast<size_t>(choice)]) choice = j;
+    }
+    // A count whose time is old and that nearly wins is measured again (its
+    // time may have changed with heat or context length); one that is far
+    // behind would not win anyway.
+    int32_t retry = -1;
+    for (int32_t j = 0; j <= offered; ++j) {
+        const Arm& arm = arms_[static_cast<size_t>(j)];
+        if (j == choice || arm.samples == 0 || step_ - arm.sampled_at <= arm.wait) continue;
+        if (rates_[static_cast<size_t>(j)] < kRetryShare * rates_[static_cast<size_t>(choice)]) continue;
+        if (retry < 0 || rates_[static_cast<size_t>(j)] > rates_[static_cast<size_t>(retry)]) retry = j;
+    }
+    if (retry >= 0) {
+        retrying_ = retry;
+        return retry;
+    }
+    return choice;
+}
+
 void DraftBudget::record(int32_t drafts, int32_t tokens, double ms) {
     if (drafts < 0 || static_cast<size_t>(drafts) >= arms_.size() || ms <= 0.0) return;
     Arm& arm = arms_[static_cast<size_t>(drafts)];
     const double sample = static_cast<double>(tokens) / ms;
     arm.rate = arm.samples == 0 ? sample : arm.rate + kDecay * (sample - arm.rate);
+    arm.ms = arm.samples == 0 ? ms : arm.ms + kDecay * (ms - arm.ms);
+    arm.sampled_at = step_;
+    // A count measured again only because its time was old waits twice as
+    // long before the next such try.
+    if (drafts == retrying_ && arm.samples > 0) arm.wait = std::min(2 * arm.wait, kMaxRetry);
+    retrying_ = -1;
     ++arm.samples;
     // A count that is not the best waits twice as long before its next try
     // each time it loses again; winning makes it the leader (always used).
@@ -50,6 +91,11 @@ void DraftBudget::record(int32_t drafts, int32_t tokens, double ms) {
     } else {
         arm.backoff = 0;
     }
+}
+
+double DraftBudget::cost(int32_t drafts) const {
+    if (drafts < 0 || static_cast<size_t>(drafts) >= arms_.size()) return 0.0;
+    return arms_[static_cast<size_t>(drafts)].ms;
 }
 
 double DraftBudget::rate(int32_t drafts) const {

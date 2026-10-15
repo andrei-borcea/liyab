@@ -95,6 +95,8 @@ final class LiyabEngineConfig extends Struct {
   @Int64()
   external int prefixCacheDiskMb;
   external Pointer<Utf8> cacheDir;
+  @Int32()
+  external int suffixDrafts;
 }
 
 final class LiyabSamplingParams extends Struct {

@@ -5,6 +5,7 @@
 
 #include "core/draft_budget.h"
 #include "core/sampling.h"
+#include "core/suffix_drafter.h"
 #include "core/transformer.h"
 
 namespace liyab {
@@ -22,8 +23,9 @@ SpeculativeDecoder::SpeculativeDecoder(Transformer& target, Transformer& draft, 
     : target_(target), draft_(&draft), draft_tokens_(std::max(1, draft_tokens)),
       budget_(std::make_unique<DraftBudget>(draft_tokens_)) {}
 
-SpeculativeDecoder::SpeculativeDecoder(Transformer& target, int32_t draft_tokens)
-    : target_(target), draft_tokens_(std::max(1, draft_tokens)), budget_(std::make_unique<DraftBudget>(draft_tokens_)) {}
+SpeculativeDecoder::SpeculativeDecoder(Transformer& target, int32_t draft_tokens, TextDrafts drafts)
+    : target_(target), draft_tokens_(std::max(1, draft_tokens)), budget_(std::make_unique<DraftBudget>(draft_tokens_)),
+      suffix_(drafts == TextDrafts::Suffix ? std::make_unique<SuffixDrafter>() : nullptr) {}
 
 SpeculativeDecoder::~SpeculativeDecoder() = default;
 
@@ -58,6 +60,7 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     int32_t k = std::min(draft_tokens_, target_.max_batch() - 1);
     if (target_.kv_cache().window() == 0) k = std::min(k, target_.context_length() - base - 1);
     if (draft_ != nullptr && draft_->kv_cache().window() == 0) k = std::min(k, draft_->context_length() - base - 1);
+    if (suffix_ != nullptr) return suffix_step(last, context, sampler, std::max(0, k), target_route, pool, t0);
     if (budget_ != nullptr) k = std::min(k, budget_->choose());
 
     // 1. Draft up to k tokens: from the draft model (with its distributions),
@@ -149,6 +152,57 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     const int32_t keep = base + 1 + n_accepted;
     LIYAB_RETURN_IF_ERROR(target_.truncate(keep));
     if (draft_ != nullptr) LIYAB_RETURN_IF_ERROR(draft_->truncate(keep));
+    if (budget_ != nullptr) {
+        budget_->record(k, static_cast<int32_t>(out.size()),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    return out;
+}
+
+}  // namespace liyab
+
+namespace liyab {
+
+Result<std::vector<int32_t>> SpeculativeDecoder::suffix_step(int32_t last, std::span<const int32_t> context,
+                                                             Sampler& sampler, int32_t room, const Route& target_route,
+                                                             ThreadPool& pool,
+                                                             std::chrono::steady_clock::time_point t0) {
+    const int32_t base = target_.n_past();
+    const int32_t n_vocab = target_.config().n_vocab;
+    history_.assign(context.begin(), context.end());
+    history_.push_back(last);
+    suffix_->sync(history_);
+    const SuffixDrafter::Draft& draft = suffix_->propose(room);
+    // Adaptive: as many drafts as the expected tokens per millisecond favour;
+    // fixed: all the drafter offers.
+    int32_t k = static_cast<int32_t>(draft.tokens.size());
+    if (budget_ != nullptr) k = std::min(k, budget_->choose(draft.survival));
+    std::vector<int32_t> verify{last};
+    verify.insert(verify.end(), draft.tokens.begin(), draft.tokens.begin() + k);
+    proposed_ += k;
+
+    target_.set_checkpointing(k > 0);
+    auto logits = target_.forward(verify, k > 0 ? Transformer::Logits::All : Transformer::Logits::Last, target_route, pool);
+    if (!logits) return logits.status();
+
+    // Each row is sampled as plain decoding samples it (one draw per token),
+    // and a draft is kept while it equals the sample: the tokens are plain
+    // decoding's whatever was drafted, and a draft d is kept with
+    // probability p(d), as Leviathan et al. keep a deterministic draft.
+    std::vector<int32_t> out;
+    int32_t n_accepted = 0;
+    for (int32_t i = 0; i <= k; ++i) {
+        const auto row = logits->subspan(static_cast<size_t>(i) * static_cast<size_t>(n_vocab), static_cast<size_t>(n_vocab));
+        sampler.probabilities(row, p_);
+        const int32_t token = sampler.greedy() ? Sampler::argmax(p_) : sampler.sample(p_);
+        out.push_back(token);
+        if (i == k || token != verify[static_cast<size_t>(i) + 1]) break;
+        ++n_accepted;
+    }
+    accepted_ += n_accepted;
+    suffix_->feedback(draft, k, n_accepted);
+
+    LIYAB_RETURN_IF_ERROR(target_.truncate(base + 1 + n_accepted));
     if (budget_ != nullptr) {
         budget_->record(k, static_cast<int32_t>(out.size()),
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

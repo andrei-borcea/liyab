@@ -12,11 +12,19 @@
 // to 1024 steps), so a count that never pays costs almost nothing. Output
 // does not depend on it (speculation is lossless).
 //
+// A drafter that knows how likely each draft is to be accepted (the suffix
+// drafter) asks choose(survival) instead: from the measured time of a step
+// per draft count it picks the count with the most expected tokens per
+// millisecond for this very draft, so a confident draft is verified at length
+// and a doubtful one not at all, also on a model where drafting does not pay
+// on average.
+//
 // Not thread-safe: owned by one SpeculativeDecoder.
 #ifndef LIYAB_CORE_DRAFT_BUDGET_H
 #define LIYAB_CORE_DRAFT_BUDGET_H
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace liyab {
@@ -27,15 +35,29 @@ public:
 
     // Most drafts to verify in the next step that has drafts to offer.
     [[nodiscard]] int32_t choose();
+    // Most drafts to verify of a draft whose survival[i] is the estimated
+    // probability that its drafts 0..i are all accepted (non-increasing):
+    // the count j <= survival.size() maximizing
+    // (1 + survival[0] + ... + survival[j - 1]) / cost(j). Plain decoding is
+    // measured first. A count not measured yet is costed as the dearest
+    // fewer-drafts count measured (a step never costs less with more drafts),
+    // so it is tried only where it could win. A count not measured for longer
+    // than its wait (kFirstRetry steps, doubling up to kMaxRetry with each
+    // such try) is measured again when it comes within kRetryShare of the
+    // best count's rate.
+    [[nodiscard]] int32_t choose(std::span<const float> survival);
     // A step verified `drafts` drafted tokens (0: plain decoding), produced
     // `tokens` tokens and took `ms` milliseconds.
     void record(int32_t drafts, int32_t tokens, double ms);
     // Tokens per ms measured for `drafts`; 0 before the first sample.
     [[nodiscard]] double rate(int32_t drafts) const;
+    // Milliseconds per step measured for `drafts`; 0 before the first sample.
+    [[nodiscard]] double cost(int32_t drafts) const;
 
     // Steps before a losing count is tried again, first and at most.
     static constexpr uint64_t kFirstRetry = 16;
     static constexpr uint64_t kMaxRetry = 1024;
+    static constexpr double kRetryShare = 0.9;
 
 private:
     struct Arm {
@@ -43,10 +65,15 @@ private:
         int32_t samples = 0;
         uint64_t backoff = 0;   // current retry interval; 0 while it leads
         uint64_t retry_at = 0;  // step from which it may be tried again
+        double ms = 0.0;               // step time, for choose(survival)
+        uint64_t sampled_at = 0;       // step of the last sample
+        uint64_t wait = kFirstRetry;   // steps after which that time is measured again if it nearly wins
     };
     [[nodiscard]] int32_t best() const;  // the count with the highest rate
     std::vector<Arm> arms_;
     uint64_t step_ = 0;
+    int32_t retrying_ = -1;      // the count choose(survival) measures again this step
+    std::vector<double> rates_;  // choose(survival) scratch: expected tokens per ms per count
 };
 
 }  // namespace liyab

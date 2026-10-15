@@ -157,13 +157,15 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const std::strin
         "\"generated_tokens\":%d,\"forced_tokens\":%d,\"decode_ms\":%.3f,\"tokens_per_second\":%.3f,"
         "\"paced_idle_ms\":%.3f,\"thermal_reroutes\":%d,\"cancelled\":%s,\"kv_cache_bytes\":%llu,"
         "\"expert_hits\":%d,\"expert_late\":%d,\"expert_misses\":%d,\"expert_bytes_read\":%llu,"
-        "\"expert_stall_ms\":%.3f,\"phases_ms\":{\"attention\":%.3f,\"delta_net\":%.3f,\"router\":%.3f,"
+        "\"expert_stall_ms\":%.3f,\"draft_tokens_proposed\":%d,\"draft_tokens_accepted\":%d,"
+        "\"phases_ms\":{\"attention\":%.3f,\"delta_net\":%.3f,\"router\":%.3f,"
         "\"experts\":%.3f,\"shared_expert\":%.3f,\"dense_ffn\":%.3f,\"lm_head\":%.3f},\"peak_rss_mib\":%.1f,"
         "\"text\":%s}\n",
         turn, s.prompt_tokens, s.cached_prefix_tokens, s.prefill_ms, s.ttft_ms, s.generated_tokens, s.forced_tokens,
         s.decode_ms, s.tokens_per_second, s.paced_idle_ms, s.thermal_reroutes, s.cancelled ? "true" : "false",
         static_cast<unsigned long long>(s.kv_cache_bytes), s.expert_hits, s.expert_late, s.expert_misses,
-        static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.attention_ms, s.delta_net_ms,
+        static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.draft_tokens_proposed,
+        s.draft_tokens_accepted, s.attention_ms, s.delta_net_ms,
         s.router_ms, s.experts_ms, s.shared_expert_ms, s.dense_ffn_ms, s.lm_head_ms, peak_rss_mib(),
         json_string(text).c_str());
     std::fflush(stdout);
@@ -187,6 +189,8 @@ void usage() {
                  "  --draft-tokens K   tokens per speculative step (default 3)\n"
                  "  --lookup           speculative decoding without a draft model: drafts from the\n"
                  "                     conversation (n-gram lookup)\n"
+                 "  --suffix           speculative decoding without a draft model: drafts from the suffix\n"
+                 "                     drafter (this and earlier conversations, confidence-sized drafts)\n"
                  "  --fixed-drafts     always verify --draft-tokens drafts (default: learned per device)\n"
                  "  --profile P        performance | balanced | low_power (default balanced)\n"
                  "  --tps R            override the paced token rate\n"
@@ -261,6 +265,7 @@ int main(int argc, char** argv) {
         else if (arg == "--draft") config.draft_model_path = next();
         else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
         else if (arg == "--lookup") config.lookup_drafts = true;
+        else if (arg == "--suffix") config.suffix_drafts = 1;
         else if (arg == "--fixed-drafts") config.adaptive_drafts = false;
         else if (arg == "--tps") config.target_tps = std::atof(next());
         else if (arg == "--skin-threshold") config.skin_threshold_c = static_cast<float>(std::atof(next()));
