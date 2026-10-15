@@ -219,7 +219,17 @@ final class LiyabEngineCounters extends Struct {
   external int tokensGenerated;
 }
 
+/// liyab_grammar_stats: the cost of constrained decoding in one generation.
+final class LiyabGrammarStats extends Struct {
+  @Int32()
+  external int constrainedTokens;
+  @Double()
+  external double grammarMs;
+}
+
 typedef LiyabTokenCallbackNative = Int32 Function(Pointer<Utf8> piece, Size len, Int32 token, Pointer<Void> user);
+typedef LiyabContinuationCallbackNative = Size Function(Pointer<Utf8> generated, Size len, Pointer<Uint8> out, Size cap,
+    Pointer<Pointer<Void>> grammar, Pointer<Void> user);
 typedef LiyabForceCallbackNative = Size Function(
     Pointer<Utf8> generated, Size len, Pointer<Uint8> out, Size cap, Pointer<Void> user);
 typedef LiyabLogCallbackNative = Void Function(Int32 level, Pointer<Utf8> message, Pointer<Void> user);
@@ -299,7 +309,36 @@ final class LiyabLib {
         renderChat = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int)>('liyab_engine_render_chat'),
         chatFormat = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
-            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int)>('liyab_engine_chat_format');
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int)>('liyab_engine_chat_format'),
+        grammarFromJsonSchema = lib.lookupFunction<Int32 Function(Pointer<Utf8>, Int32, Pointer<Pointer<Void>>),
+            int Function(Pointer<Utf8>, int, Pointer<Pointer<Void>>)>('liyab_grammar_from_json_schema'),
+        grammarParse = lib.lookupFunction<Int32 Function(Pointer<Utf8>, Pointer<Pointer<Void>>),
+            int Function(Pointer<Utf8>, Pointer<Pointer<Void>>)>('liyab_grammar_parse'),
+        grammarDestroy =
+            lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('liyab_grammar_destroy'),
+        grammarMatches = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Size),
+            int Function(Pointer<Void>, Pointer<Utf8>, int)>('liyab_grammar_matches'),
+        generateStructured = lib.lookupFunction<
+            Int32 Function(
+                Pointer<Void>,
+                Pointer<Utf8>,
+                Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+                Pointer<Void>,
+                Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+                Pointer<Void>,
+                Pointer<LiyabGenerationStats>,
+                Pointer<LiyabGrammarStats>),
+            int Function(
+                Pointer<Void>,
+                Pointer<Utf8>,
+                Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+                Pointer<Void>,
+                Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+                Pointer<Void>,
+                Pointer<LiyabGenerationStats>,
+                Pointer<LiyabGrammarStats>)>('liyab_engine_generate_structured');
 
   /// libliyab.so from the APK on Android; linked into the app on iOS.
   static final LiyabLib instance =
@@ -344,6 +383,33 @@ final class LiyabLib {
   /// its layout of turns (probe JSON in, ChatFormat JSON out). -1 on failure.
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int) renderChat;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int) chatFormat;
+
+  /// Constrained decoding (liyab/grammar.h): grammars from a JSON Schema or
+  /// grammar text (an opaque liyab_grammar*, destroyed with grammarDestroy),
+  /// and generation constrained by a whole-output grammar or by spans a
+  /// continuation callback opens.
+  final int Function(Pointer<Utf8>, int, Pointer<Pointer<Void>>) grammarFromJsonSchema;
+  final int Function(Pointer<Utf8>, Pointer<Pointer<Void>>) grammarParse;
+  final void Function(Pointer<Void>) grammarDestroy;
+  final int Function(Pointer<Void>, Pointer<Utf8>, int) grammarMatches;
+  final int Function(
+      Pointer<Void>,
+      Pointer<Utf8>,
+      Pointer<LiyabSamplingParams>,
+      Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+      Pointer<Void>,
+      Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+      Pointer<Void>,
+      Pointer<LiyabGenerationStats>,
+      Pointer<LiyabGrammarStats>) generateStructured;
+
+  /// Why grammar text does not compile (null when it does).
+  String? grammarError(String text) => using((arena) {
+        final out = arena<Pointer<Void>>();
+        if (grammarParse(text.toNativeUtf8(allocator: arena), out) != LiyabStatus.ok) return errorMessage();
+        grammarDestroy(out.value);
+        return null;
+      });
   final int Function(Pointer<Utf8>, int) logBufferTake;
 
   /// Engine log lines buffered since the last call ("I message", "W message"…).

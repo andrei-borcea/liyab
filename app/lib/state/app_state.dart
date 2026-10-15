@@ -287,6 +287,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   late final DeviceMonitor monitor;
 
   /// How the loaded model calls tools (none: no tools offered).
+  @override
   ToolDialect toolDialect = ToolDialect.none;
 
   String status = 'No model loaded';
@@ -407,9 +408,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<int> countTokens(String text) => engine.countTokens(text);
 
   @override
-  Generation generate(String prompt, SamplingOptions sampling) {
+  String? grammarError(String grammar) => engine.grammarError(grammar);
+
+  @override
+  Generation generate(String prompt, SamplingOptions sampling,
+      {String? grammar, Continuation Function(String generated)? structure}) {
     _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
-    final generation = engine.generate(prompt, sampling);
+    final generation = engine.generate(prompt, sampling, grammar: grammar, structure: structure);
     ++_apiGenerations;
     _updateWork();
     var ended = false;

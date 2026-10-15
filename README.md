@@ -122,7 +122,7 @@ These rules decide what goes into the code:
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
 | Liyab app (Flutter): chat, model library with Hugging Face downloads, activity meters, settings, system assistant sheet (phone) or command bar (computer) | ✅ Android · ✅ macOS (Apple silicon) · 🟡 iOS app not built yet (the engine builds for iOS) |
 | Agent tools: calendar, notifications (chats, email previews), SMS, calls, contacts, clipboard on Android; calendar, Apple Mail, Messages, calls, contacts, clipboard on macOS; each source opt-in | ✅ |
-| Local API for other apps on the device: OpenAI, Anthropic Messages, gRPC; loopback only, token-protected, off by default | ✅ text only for now |
+| Local API for other apps on the device: OpenAI, Anthropic Messages, gRPC; loopback only, token-protected, off by default; tools and JSON answers by constrained decoding | ✅ text (no images) |
 | Voice, actions (alarms, events, replies), local memory/RAG, embedding models | 🔜 [Roadmap](#roadmap) |
 | Experimental: early exit, head pruning, EGLS, 2:4 sparsity, JIT unpacker, persistent KV prefix files, io_uring | 🧪 `LIYAB_ENABLE_EXPERIMENTAL` |
 
@@ -910,7 +910,27 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   model loads for the first request (and unloads again after the idle delay). Android allows that service although
   Liyab was never on screen: the system binds the listener as a foreground binding, which lets the process start
   foreground services. With the API off, such a process starts nothing.
-* **Not yet.** Tools, images, `n` > 1 and logprobs are refused with an error, never silently ignored.
+* **Tools and JSON answers.** OpenAI clients pass `tools`, `tool_choice` (`auto`, `none`, `required`, a named
+  function) and `parallel_tool_calls`, and get `tool_calls` back, streamed as deltas; tool results come back in
+  `tool` messages. Anthropic clients pass `tools` and `tool_choice` (`auto`, `any`, `tool`, `none`,
+  `disable_parallel_tool_use`) and get `tool_use` blocks, streamed as `input_json_delta` events; results come back
+  in `tool_result` blocks. Calls are written in the loaded model's own format (Hermes JSON for Qwen2.5 / Qwen3,
+  XML for Qwen3.5 / Qwen3.6, from its chat template), and past calls and results are replayed the way its template
+  renders them.
+  * **Every call is valid.** The model chooses to write `<tool_call>`; from there the call is one constrained span
+    (see [constrained decoding](#context-memory-and-serving)): only the names of the request's tools, and only
+    arguments valid against the chosen tool's schema. Names, keys and separators are forced, so the model samples
+    only the tool and the values. With `tool_choice` `required` or a named tool, the call is forced right away
+    (after the reasoning, when the model reasons). In XML calls, string parameters are written raw, as Qwen's
+    parser reads them, and every other type as JSON.
+  * **A tool whose schema uses a keyword the engine cannot enforce** (`pattern`, `uniqueItems`...) keeps working:
+    its arguments are then constrained to any JSON object (any parameters in XML), not to its schema.
+  * **`response_format`** `json_object` or `json_schema` constrains the whole answer to a JSON object or to the
+    schema (after the reasoning, when the model reasons); a schema the engine cannot enforce is refused with an
+    error naming the keyword. `response_format` and `tools` together are refused.
+  * Tools need a ChatML model whose template uses one of these formats; other models refuse them with an error.
+    gRPC carries text only.
+* **Not yet.** Images, `n` > 1 and logprobs are refused with an error, never silently ignored.
 
 ### Everything else
 
@@ -1244,7 +1264,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets |
+| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused |
 
 Benchmarks and tools built with the tests:
 
@@ -1372,8 +1392,8 @@ Implemented features are described above. These are next, in order:
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need, plus suffix decoding next to lookup.
 5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
-6. **Grammar-constrained decoding.** A token mask from a JSON schema, so tool *arguments* are constrained too; then
-   tools through the local API.
+6. **Constrained arguments for the app's own tools.** The local API's calls are constrained by their schemas; the
+   assistant's own tool calls still force only their syntax and names.
 7. **Pooling models** for local memory and retrieval (embeddings, reranker, intent router), next to generative ones.
 8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
@@ -1414,7 +1434,7 @@ Implemented features are described above. These are next, in order:
   picker cannot find its other parts.
 * **App:**
   * iOS is not built yet;
-  * the local API is text only;
+  * the local API takes text only (no images), and tools only through OpenAI and Anthropic requests;
   * Android may stop Liyab in the background (which stops the API too). Once Liyab's work is done, HyperOS also
     freezes it there (cgroup freezer): a frozen Liyab runs no code, so an idle model is not released until Liyab
     runs again. The local API escapes this only while its listening service runs. Android starts that service when

@@ -1,10 +1,15 @@
 // Anthropic Messages API (/v1/messages, /v1/messages/count_tokens, models)
 // over the local API's core. Thinking comes back as `thinking` blocks (with an
 // empty signature: there is nothing to verify locally); a last assistant
-// message is continued, as the API's prefill. Not supported: tools, images,
-// documents.
+// message is continued, as the API's prefill. Tools (`tools`, `tool_choice`
+// with disable_parallel_tool_use; calls as `tool_use` blocks, also streamed as
+// input_json_delta events; results as `tool_result` blocks) are constrained
+// decoding: calls always parse and their input is valid against the tool's
+// input_schema. Not supported: server tools, images, documents.
 import 'dart:async';
+import 'dart:convert';
 
+import '../agent/tool_format.dart';
 import 'api_core.dart';
 import 'local_api.dart';
 
@@ -37,25 +42,83 @@ class AnthropicApi {
         'last_id': model.isEmpty ? null : model,
       };
 
+  static List<ToolSpec> _tools(Object? raw) {
+    if (raw == null) return const [];
+    if (raw is! List) throw const ApiError(400, 'tools must be a list');
+    return [
+      for (final t in raw)
+        switch (t) {
+          {'name': String name, 'input_schema': Map schema} when t['type'] == null || t['type'] == 'custom' =>
+            ToolSpec(name, '${t['description'] ?? ''}', schema.cast<String, Object?>()),
+          {'type': String type} => throw ApiError(400, 'server tools are not supported: $type'),
+          _ => throw const ApiError(400, 'each tool needs a name and an input_schema'),
+        },
+    ];
+  }
+
+  /// A message's turns: tool_result blocks become tool results (before the
+  /// text that follows them, as the user wrote it), tool_use blocks the
+  /// assistant's calls. Earlier thinking is not replayed, as Anthropic's own
+  /// models drop it.
+  static List<ApiMessage> _messages(Map<String, Object?> m) {
+    final role = m['role'];
+    if (role != 'user' && role != 'assistant') throw const ApiError(400, 'each message must have the role user or assistant');
+    final content = m['content'];
+    if (content is! List) return [ApiMessage(role as String, textContent(content))];
+    final text = <Object?>[], calls = <ApiCall>[], results = <ApiMessage>[];
+    for (final block in content) {
+      switch (block) {
+        case {'type': 'tool_use', 'name': String name}:
+          final input = block['input'];
+          if (role != 'assistant' || input is! Map) throw const ApiError(400, 'tool_use blocks belong to assistant turns, with an input object');
+          calls.add(ApiCall(name, input.cast<String, Object?>()));
+        case {'type': 'tool_result'}:
+          if (role != 'user') throw const ApiError(400, 'tool_result blocks belong to user turns');
+          final result = textContent(block['content']);
+          results.add(ApiMessage('tool', block['is_error'] == true ? 'Error: $result' : result));
+        default:
+          text.add(block);
+      }
+    }
+    final rest = textContent(text, skip: const {'thinking', 'redacted_thinking'});
+    return [
+      ...results,
+      if (role == 'assistant') ApiMessage('assistant', rest, calls: calls) else if (rest.isNotEmpty || results.isEmpty) ApiMessage('user', rest),
+    ];
+  }
+
+  /// tool_choice: {"type": "auto" | "any" | "tool" (with "name") | "none"}.
+  static (ToolChoice, String?, bool) _toolChoice(Object? raw) {
+    if (raw == null) return (ToolChoice.auto, null, true);
+    if (raw is! Map) throw const ApiError(400, 'tool_choice must be an object');
+    final parallel = raw['disable_parallel_tool_use'] != true;
+    return switch (raw['type']) {
+      'auto' => (ToolChoice.auto, null, parallel),
+      'any' => (ToolChoice.required, null, parallel),
+      'none' => (ToolChoice.none, null, parallel),
+      'tool' when raw['name'] is String => (ToolChoice.required, raw['name'] as String, parallel),
+      _ => throw const ApiError(400, 'tool_choice.type must be auto, any, tool (with a name) or none'),
+    };
+  }
+
   static ApiRequest request(Map<String, Object?> body, {bool requireMaxTokens = true}) {
-    final tools = body['tools'];
-    if (tools is List && tools.isNotEmpty) throw const ApiError(400, 'tools are not supported');
     final maxTokens = intField(body, 'max_tokens');
     if (requireMaxTokens && maxTokens == null) throw const ApiError(400, 'max_tokens is required');
     final raw = body['messages'];
     if (raw is! List) throw const ApiError(400, 'messages is required');
     final system = textContent(body['system']);
     final thinking = body['thinking'];
+    final (choice, toolName, parallel) = _toolChoice(body['tool_choice']);
     return ApiRequest(
       messages: [
         if (system.isNotEmpty) ApiMessage('system', system),
         for (final m in raw)
-          if (m is Map<String, Object?> && (m['role'] == 'user' || m['role'] == 'assistant'))
-            // Earlier thinking is not replayed, as Anthropic's own models drop it.
-            ApiMessage(m['role'] as String, textContent(m['content'], skip: const {'thinking', 'redacted_thinking'}))
-          else
-            throw const ApiError(400, 'each message must have the role user or assistant'),
+          if (m is Map<String, Object?>) ..._messages(m) else throw const ApiError(400, 'each message must be an object'),
       ],
+      tools: _tools(body['tools']),
+      toolChoice: choice,
+      toolName: toolName,
+      parallelToolCalls: parallel,
       temperature: numberField(body, 'temperature'),
       topP: numberField(body, 'top_p'),
       topK: intField(body, 'top_k'),
@@ -65,6 +128,15 @@ class AnthropicApi {
     );
   }
 
+  /// A call's input: its arguments object (empty when they never finished: max_tokens).
+  static Object? _input(String args) {
+    try {
+      return jsonDecode(args);
+    } on FormatException {
+      return const <String, Object?>{};
+    }
+  }
+
   Future<void> countTokens(Map<String, Object?> body, ApiConnection conn) async =>
       conn.json(200, {'input_tokens': await core.countTokens(request(body, requireMaxTokens: false))});
 
@@ -72,6 +144,7 @@ class AnthropicApi {
         FinishReason.stop => 'end_turn',
         FinishReason.length => 'max_tokens',
         FinishReason.stopSequence => 'stop_sequence',
+        FinishReason.toolCalls => 'tool_use',
       };
 
   Future<void> messages(Map<String, Object?> body, ApiConnection conn) async {
@@ -80,6 +153,8 @@ class AnthropicApi {
     final model = core.backend.modelName;
     final it = await startRun(core, r, conn);
     final promptTokens = (it.current as ApiStart).promptTokens;
+    final callIds = <int, String>{};
+    String callId(int index) => callIds.putIfAbsent(index, () => responseId('toolu_'));
     Map<String, Object?> usage(int output, ApiDone? d) => {
           'input_tokens': promptTokens,
           'output_tokens': output,
@@ -88,6 +163,7 @@ class AnthropicApi {
 
     if (body['stream'] != true) {
       final text = StringBuffer(), reasoning = StringBuffer();
+      final calls = <(String, StringBuffer)>[];
       ApiDone? done;
       while (await it.moveNext()) {
         switch (it.current) {
@@ -95,6 +171,10 @@ class AnthropicApi {
             text.write(t);
           case ApiReasoning(text: final t):
             reasoning.write(t);
+          case ApiToolCallStart(:final name):
+            calls.add((name, StringBuffer()));
+          case ApiToolCallArguments(:final delta):
+            calls.last.$2.write(delta);
           case ApiDone d:
             done = d;
           case ApiStart():
@@ -108,7 +188,9 @@ class AnthropicApi {
         'model': model,
         'content': [
           if (reasoning.isNotEmpty) {'type': 'thinking', 'thinking': reasoning.toString(), 'signature': ''},
-          {'type': 'text', 'text': text.toString()},
+          if (text.isNotEmpty || calls.isEmpty) {'type': 'text', 'text': text.toString()},
+          for (final (i, (name, args)) in calls.indexed)
+            {'type': 'tool_use', 'id': callId(i), 'name': name, 'input': _input(args.toString())},
         ],
         'stop_reason': _stopReason(done),
         'stop_sequence': done.stopSequence,
@@ -120,13 +202,14 @@ class AnthropicApi {
     Future<void> send(String event, Map<String, Object?> data) => sse.send({'type': event, ...data}, event: event);
     var index = -1;
     String? open; // the type of the content block being streamed
-    Future<void> block(String type) async {
-      if (open == type) return;
+    Future<void> block(String type, {Map<String, Object?>? start}) async {
+      if (open == type && start == null) return;
       if (open != null) await send('content_block_stop', {'index': index});
       open = type;
       await send('content_block_start', {
         'index': ++index,
-        'content_block': type == 'thinking' ? {'type': 'thinking', 'thinking': '', 'signature': ''} : {'type': 'text', 'text': ''},
+        'content_block': start ??
+            (type == 'thinking' ? {'type': 'thinking', 'thinking': '', 'signature': ''} : {'type': 'text', 'text': ''}),
       });
     }
 
@@ -156,6 +239,13 @@ class AnthropicApi {
             await send('content_block_delta', {
               'index': index,
               'delta': {'type': 'text_delta', 'text': t},
+            });
+          case ApiToolCallStart(index: final call, :final name):
+            await block('tool_use', start: {'type': 'tool_use', 'id': callId(call), 'name': name, 'input': const {}});
+          case ApiToolCallArguments(:final delta):
+            await send('content_block_delta', {
+              'index': index,
+              'delta': {'type': 'input_json_delta', 'partial_json': delta},
             });
           case ApiDone d:
             if (open == null) await block('text'); // a reply has at least one (possibly empty) text block

@@ -10,6 +10,42 @@ import 'dart:convert';
 
 import 'tools.dart';
 
+/// A tool described by a client of the local API: its name, description and
+/// the JSON Schema of its arguments (an object).
+class ToolSpec {
+  const ToolSpec(this.name, this.description, this.parameters);
+  final String name;
+  final String description;
+  final Map<String, Object?> parameters;
+
+  /// The OpenAI-style function description chat templates render.
+  Map<String, Object?> get schema => {
+        'type': 'function',
+        'function': {'name': name, 'description': description, 'parameters': parameters},
+      };
+}
+
+/// JSON as Python's json.dumps writes it (", " and ": ", non-ASCII kept), the
+/// layout chat templates' `tojson` gives tool calls and the layout constrained
+/// decoding writes JSON in.
+String pyJson(Object? v) => switch (v) {
+      null => 'null',
+      bool b => '$b',
+      int i => '$i',
+      double d => d.isFinite && d == d.truncateToDouble() && d.abs() < 1e16 ? '${d.toInt()}.0' : jsonEncode(d),
+      String s => jsonEncode(s),
+      List l => '[${l.map(pyJson).join(', ')}]',
+      Map m => '{${m.entries.map((e) => '${jsonEncode('${e.key}')}: ${pyJson(e.value)}').join(', ')}}',
+      _ => jsonEncode('$v'),
+    };
+
+/// `text` as a literal of grammar text (include/liyab/grammar.h).
+String grammarLiteral(String text) =>
+    '"${text.replaceAll(r'\', r'\\').replaceAll('"', r'\"').replaceAll('\n', r'\n').replaceAll('\r', r'\r').replaceAll('\t', r'\t')}"';
+
+/// How a parameter value is written in an XML call (ToolDialect.xmlValueKind).
+enum XmlValue { text, raw, json }
+
 enum ToolDialect {
   none,
   qwenXml,
@@ -25,23 +61,133 @@ enum ToolDialect {
   /// The ChatML system block with the tool descriptions, as the template renders it.
   String system(String text, List<AgentTool> tools) {
     if (this == none || tools.isEmpty) return '<|im_start|>system\n$text<|im_end|>\n';
-    final list = tools.map((t) => jsonEncode(t.schema)).join('\n');
+    return _withTools(text, tools.map((t) => jsonEncode(t.schema)).join('\n'));
+  }
+
+  /// The system block describing a local API client's tools. With no system
+  /// text, the block holds only the tools, as the templates render it.
+  /// Each tool is written as the templates' `tojson` writes it.
+  String systemFor(String text, List<ToolSpec> tools) {
+    if (this == none || tools.isEmpty) return system(text, const []);
+    final full = _withTools(text, tools.map((t) => pyJson(t.schema)).join('\n'));
+    if (text.isNotEmpty) return full;
     return switch (this) {
-      qwenXml => '<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n$list\n</tools>'
-          '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n'
-          '<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n'
-          '<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n'
-          '</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified '
-          'format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n'
-          '- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in '
-          'natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer '
-          'the question like normal with your current knowledge and do not tell the user about function calls\n'
-          '</IMPORTANT>\n\n$text<|im_end|>\n',
-      _ => '<|im_start|>system\n$text\n\n# Tools\n\nYou may call one or more functions to assist with the user query.'
-          '\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n$list\n</tools>\n\n'
-          'For each function call, return a json object with function name and arguments within <tool_call></tool_call> '
-          'XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call><|im_end|>\n',
+      qwenXml => full.replaceFirst('</IMPORTANT>\n\n<|im_end|>', '</IMPORTANT><|im_end|>'),
+      _ => full.replaceFirst('<|im_start|>system\n\n\n# Tools', '<|im_start|>system\n# Tools'),
     };
+  }
+
+  String _withTools(String text, String list) => switch (this) {
+        qwenXml => '<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n$list\n</tools>'
+            '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n'
+            '<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n'
+            '<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n'
+            '</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified '
+            'format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n'
+            '- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in '
+            'natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer '
+            'the question like normal with your current knowledge and do not tell the user about function calls\n'
+            '</IMPORTANT>\n\n$text<|im_end|>\n',
+        _ => '<|im_start|>system\n$text\n\n# Tools\n\nYou may call one or more functions to assist with the user query.'
+            '\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n$list\n</tools>\n\n'
+            'For each function call, return a json object with function name and arguments within <tool_call></tool_call> '
+            'XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call><|im_end|>\n',
+      };
+
+  /// A call as the model's template writes it in a past assistant turn.
+  String callText(String name, Map<String, Object?> arguments) => switch (this) {
+        qwenXml => '<tool_call>\n<function=$name>\n'
+            '${arguments.entries.map((e) => '<parameter=${e.key}>\n${e.value is String ? e.value : pyJson(e.value)}\n</parameter>\n').join()}'
+            '</function>\n</tool_call>',
+        _ => '<tool_call>\n{"name": ${pyJson(name)}, "arguments": ${pyJson(arguments)}}\n</tool_call>',
+      };
+
+  /// A past assistant turn's text: what it wrote, then its calls.
+  String assistantText(String content, List<String> calls) {
+    if (calls.isEmpty) return content;
+    return switch (this) {
+      qwenXml => '${content.trim().isEmpty ? '' : '$content\n\n'}${calls.join('\n')}',
+      _ => '${content.isEmpty ? '' : '$content\n'}${calls.join('\n')}',
+    };
+  }
+
+  /// The user turn that answers a turn's calls, one result per call.
+  static String responses(List<String> results) =>
+      results.map((r) => '<tool_response>\n$r\n</tool_response>').join('\n');
+
+  /// Grammar text (include/liyab/grammar.h) of one call right after
+  /// `<tool_call>` (`newline`: the newline that follows it is still to
+  /// come): the call's syntax around the name of one of `tools` and
+  /// arguments valid against that tool's schema, then `</tool_call>`. With
+  /// constrained decoding the model chooses only the tool and the values;
+  /// names, keys and every separator are forced. Tools in `loose` (a schema
+  /// the engine cannot enforce) take arguments of any shape: a JSON object,
+  /// or parameters with any names and text values.
+  String callGrammar(List<ToolSpec> tools, {bool newline = true, Set<String> loose = const {}}) {
+    final nl = newline ? r'"\n" ' : '';
+    final rules = <String>[];
+    final alts = <String>[];
+    for (final (i, t) in tools.indexed) {
+      alts.add('t$i');
+      switch (this) {
+        case qwenXml:
+          rules.add('t$i ::= ${grammarLiteral('${t.name}>\n')} ${_xmlParameters(t, i, loose.contains(t.name), rules)}');
+        default:
+          final args = loose.contains(t.name) ? '%schema {"type": "object"}' : _jsonArguments(t.parameters);
+          rules.add('t$i ::= ${grammarLiteral('${pyJson(t.name)}, "arguments": ')} $args');
+      }
+    }
+    final root = switch (this) {
+      qwenXml => 'root ::= $nl"<function=" (${alts.join(' | ')}) "</function>\\n</tool_call>"',
+      _ => 'root ::= $nl"{\\"name\\": " (${alts.join(' | ')}) "}\\n</tool_call>"',
+    };
+    return [root, ...rules].join('\n');
+  }
+
+  /// The arguments of a JSON call: a value of the schema; `{}` for a tool without parameters.
+  static String _jsonArguments(Map<String, Object?> parameters) {
+    final props = parameters['properties'];
+    final open = parameters.containsKey('additionalProperties') || parameters.containsKey('required');
+    if ((props is! Map || props.isEmpty) && !open) return '"{}"';
+    return '%schema ${jsonEncode({'type': 'object', ...parameters})}';
+  }
+
+  /// XML parameters: declared ones in order (required ones always), each
+  /// value raw text for strings, JSON for every other type.
+  static String _xmlParameters(ToolSpec t, int i, bool loose, List<String> rules) {
+    const free = r'%until "\n</parameter>" "\n"';
+    if (loose) return '("<parameter=" [^>\\n]+ ">\\n" $free)*';
+    final props = t.parameters['properties'];
+    final required = [for (final r in (t.parameters['required'] as List?) ?? const []) '$r'];
+    final entries = <(String, Object?)>[
+      if (props is Map) for (final e in props.entries) ('${e.key}', e.value),
+      for (final r in required)
+        if (props is! Map || !props.containsKey(r)) (r, null),
+    ];
+    final parts = <String>[];
+    for (final (j, (name, schema)) in entries.indexed) {
+      final value = xmlValueKind(schema) == XmlValue.text
+          ? free
+          : '${xmlValueKind(schema) == XmlValue.raw ? '%string' : '%schema'} ${jsonEncode(schema)} "\\n</parameter>\\n"';
+      rules.add('p$i-$j ::= ${grammarLiteral('<parameter=$name>\n')} $value');
+      parts.add(required.contains(name) ? 'p$i-$j' : 'p$i-$j?');
+    }
+    return parts.isEmpty ? '""' : parts.join(' ');
+  }
+
+  /// How an XML parameter's value is written: free text (a string without
+  /// constraints), raw text bounded by its schema (a constrained string), or
+  /// JSON (every other type), as Qwen's parser reads them.
+  static XmlValue xmlValueKind(Object? schema) {
+    if (schema is! Map) return XmlValue.text;
+    final type = schema['type'];
+    final values = [if (schema['enum'] is List) ...schema['enum'] as List, if (schema.containsKey('const')) schema['const']];
+    if (values.isNotEmpty) {
+      return values.every((v) => v is String) && (type == null || type == 'string') ? XmlValue.raw : XmlValue.json;
+    }
+    if (type != 'string') return type == null && schema.isEmpty ? XmlValue.text : XmlValue.json;
+    const constraints = {'format', 'minLength', 'maxLength'};
+    return schema.keys.any(constraints.contains) ? XmlValue.raw : XmlValue.text;
   }
 
   /// What follows an assistant segment that called a tool: the end of that

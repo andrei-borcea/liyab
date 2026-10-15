@@ -112,6 +112,8 @@ class GenerationStats {
     this.prefillMs = 0,
     this.contextMs = 0,
     this.ttftStallMs = 0,
+    this.constrainedTokens = 0,
+    this.grammarMs = 0,
   });
 
   final int promptTokens;
@@ -140,6 +142,21 @@ class GenerationStats {
   final double prefillMs;
   final double contextMs;
   final double ttftStallMs;
+
+  /// Constrained decoding: tokens sampled under a grammar, and the time its masks took (part of the decode time), ms.
+  final int constrainedTokens;
+  final double grammarMs;
+}
+
+/// What a structured reply continues with at a point (the engine's
+/// Continuation): `text` is forced, then, when `grammar` is set, the reply
+/// continues with a span matching it (grammar text, include/liyab/grammar.h),
+/// until that match is complete. Sendable: it crosses to the engine's isolate.
+class Continuation {
+  const Continuation([this.text = '', this.grammar]);
+  static const none = Continuation();
+  final String text;
+  final String? grammar;
 }
 
 /// A generation queued or running on the engine.
@@ -290,6 +307,8 @@ class EngineService {
             prefillMs: s[12] as double,
             contextMs: s[13] as double,
             ttftStallMs: s[14] as double,
+            constrainedTokens: s[15] as int,
+            grammarMs: s[16] as double,
           )))
           ..close();
       case 'error':
@@ -388,7 +407,16 @@ class EngineService {
   /// engine runs that text through the model in one batched pass and streams
   /// it like generated text. It runs on the engine's isolate, so it must be a
   /// pure function of its argument and what it captures.
-  Generation generate(String prompt, SamplingOptions s, {String Function(String generated)? force}) {
+  ///
+  /// Constrained decoding (at most one of the two, and not with `force`):
+  /// `grammar` (grammar text) is matched by the whole reply, which ends once
+  /// the match is complete; `structure` is asked before the first piece and,
+  /// while no constrained span is active, after each piece, and returns forced
+  /// text and the grammar of the span that follows (Continuation). Grammar
+  /// text that does not compile fails the generation (check it first with
+  /// grammarError). `structure` runs on the engine's isolate, as `force`.
+  Generation generate(String prompt, SamplingOptions s,
+      {String Function(String generated)? force, String? grammar, Continuation Function(String generated)? structure}) {
     final id = _nextId++;
     void stop() {
       if (_running?.id == id) {
@@ -401,9 +429,14 @@ class EngineService {
 
     final controller = StreamController<GenerationEvent>(onCancel: stop);
     _streams[id] = controller;
-    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force], background: false));
+    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force, grammar, structure],
+        background: false));
     return Generation(controller.stream, stop);
   }
+
+  /// Why grammar text (include/liyab/grammar.h) does not compile; null when it does. Compiling needs no model and
+  /// takes well under a millisecond for a tool call's grammar, so it runs here, not on the engine's isolate.
+  String? grammarError(String grammar) => LiyabLib.instance.grammarError(grammar);
 
   /// Changes the power profile at once, even during a generation (thread-safe; no queueing).
   void setPowerProfile(int profile) {
@@ -622,6 +655,41 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
     exceptionalReturn: 0,
   );
   final rule = m[7] as String Function(String)?;
+  final grammarText = m[8] as String?;
+  final structure = m[9] as Continuation Function(String)?;
+  // Grammars compiled once per text for this generation; the engine keeps its
+  // own reference to each while it uses it, so they are destroyed at the end.
+  final grammars = <String, Pointer<Void>>{};
+  String? grammarFailure;
+  Pointer<Void> compiled(String text) => grammars.putIfAbsent(text, () {
+        return using((arena) {
+          final out = arena<Pointer<Void>>();
+          if (lib.grammarParse(text.toNativeUtf8(allocator: arena), out) != LiyabStatus.ok) {
+            grammarFailure ??= lib.errorMessage();
+            return nullptr;
+          }
+          return out.value;
+        });
+      });
+  final continuation = structure == null
+      ? null
+      : NativeCallable<LiyabContinuationCallbackNative>.isolateLocal(
+          (Pointer<Utf8> generated, int len, Pointer<Uint8> out, int cap, Pointer<Pointer<Void>> grammar,
+              Pointer<Void> user) {
+            final next = structure(utf8.decode(generated.cast<Uint8>().asTypedList(len), allowMalformed: true));
+            final text = utf8.encode(next.text);
+            if (text.length > cap) return 0; // never cut a continuation short
+            final g = next.grammar;
+            if (g != null) {
+              final p = compiled(g);
+              if (p == nullptr) return 0; // reported after the generation
+              grammar.value = p;
+            }
+            out.asTypedList(cap).setRange(0, text.length, text);
+            return text.length;
+          },
+          exceptionalReturn: 0,
+        );
   final force = rule == null
       ? null
       : NativeCallable<LiyabForceCallbackNative>.isolateLocal(
@@ -643,12 +711,21 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
         ..topK = m[5] as int
         ..maxTokens = m[6] as int;
       final stats = arena<LiyabGenerationStats>();
+      final grammarStats = arena<LiyabGrammarStats>();
       final prompt = (m[2] as String).toNativeUtf8(allocator: arena);
-      final status = force == null
-          ? lib.generate(engine, prompt, params, callback.nativeFunction, nullptr, stats)
-          : lib.generateForced(engine, prompt, params, callback.nativeFunction, force.nativeFunction, nullptr, stats);
-      if (status != LiyabStatus.ok) {
-        replies.send(['error', id, lib.errorMessage()]);
+      final whole = grammarText == null ? null : compiled(grammarText);
+      if (whole == nullptr) {
+        replies.send(['error', id, 'grammar: $grammarFailure']);
+        return;
+      }
+      final status = whole != null || continuation != null
+          ? lib.generateStructured(engine, prompt, params, callback.nativeFunction, whole ?? nullptr,
+              continuation?.nativeFunction ?? nullptr, nullptr, stats, grammarStats)
+          : force == null
+              ? lib.generate(engine, prompt, params, callback.nativeFunction, nullptr, stats)
+              : lib.generateForced(engine, prompt, params, callback.nativeFunction, force.nativeFunction, nullptr, stats);
+      if (status != LiyabStatus.ok || grammarFailure != null) {
+        replies.send(['error', id, grammarFailure != null ? 'grammar: $grammarFailure' : lib.errorMessage()]);
         return;
       }
       final s = stats.ref;
@@ -685,11 +762,17 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
           s.prefillMs,
           s.contextMs,
           s.ttftStallMs,
+          grammarStats.ref.constrainedTokens,
+          grammarStats.ref.grammarMs,
         ]
       ]);
     });
   } finally {
     callback.close();
     force?.close();
+    continuation?.close();
+    for (final g in grammars.values) {
+      if (g != nullptr) lib.grammarDestroy(g);
+    }
   }
 }

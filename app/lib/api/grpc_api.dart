@@ -126,8 +126,8 @@ class LiyabGrpcService extends Service {
           ..writeField(5, PbFieldType.O3, d.stats.cachedPrefixTokens)
           ..writeField(6, PbFieldType.OF, d.stats.tokensPerSecond);
         w.writeField(3, PbFieldType.OY, done.toBuffer());
-      case ApiStart():
-        break;
+      case ApiStart() || ApiToolCallStart() || ApiToolCallArguments():
+        break; // gRPC requests carry no tools
     }
     return w.toBuffer();
   }
