@@ -32,90 +32,23 @@
 #include <cstring>
 
 #include "core/quant.h"
+#include "core/quant_blocks.h"
 #include "core/quant_tables.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
 #define LIYAB_LOWBIT_NEON 1
 #endif
+// x86-64: AVX2 kernels for Q4_K / Q5_K / Q6_K / IQ4_XS against Q8_K and for
+// IQ4_NL / MXFP4 against Q8_0, chosen at run time (core/quant_x86.h).
+#if defined(LIYAB_USE_AVX2)
+#include "core/quant_x86.h"
+#define LIYAB_LOWBIT_AVX2 1
+#endif
 
 namespace liyab::quant {
 
 namespace {
-
-// --- GGML block layouts (ggml-common.h). Rows of these blocks are read
-// straight from the mapped GGUF; every block size is even, so the uint16
-// members are always 2-byte aligned. ---------------------------------------
-struct BlockQ2K {
-    uint8_t scales[16];  // low nibble: scale, high nibble: min, per 16 values
-    uint8_t qs[64];
-    uint16_t d, dmin;
-};
-struct BlockQ3K {
-    uint8_t hmask[32];
-    uint8_t qs[64];
-    uint8_t scales[12];
-    uint16_t d;
-};
-struct BlockTQ2_0 {
-    uint8_t qs[64];
-    uint16_t d;
-};
-struct BlockIq2Xxs {
-    uint16_t d;
-    uint16_t qs[32];
-};
-struct BlockIq2Xs {
-    uint16_t d;
-    uint16_t qs[32];
-    uint8_t scales[8];
-};
-struct BlockIq2S {
-    uint16_t d;
-    uint8_t qs[64];  // 32 grid indices (low 8 bits), then 32 sign bytes
-    uint8_t qh[8];
-    uint8_t scales[8];
-};
-struct BlockIq3Xxs {
-    uint16_t d;
-    uint8_t qs[96];  // 64 grid indices, then 8 x uint32 scales-and-signs
-};
-struct BlockIq3S {
-    uint16_t d;
-    uint8_t qs[64];
-    uint8_t qh[8];
-    uint8_t signs[32];
-    uint8_t scales[4];
-};
-struct BlockIq1S {
-    uint16_t d;
-    uint8_t qs[32];
-    uint16_t qh[8];
-};
-struct BlockIq1M {
-    uint8_t qs[32];
-    uint8_t qh[16];
-    uint8_t scales[8];  // 4 x uint16; the fp16 super-block scale is spread over their top nibbles
-};
-struct BlockIq4Nl {
-    uint16_t d;
-    uint8_t qs[16];
-};
-struct BlockIq4Xs {
-    uint16_t d;
-    uint16_t scales_h;
-    uint8_t scales_l[4];
-    uint8_t qs[128];
-};
-struct BlockMxfp4 {
-    uint8_t e;
-    uint8_t qs[16];
-};
-static_assert(sizeof(BlockQ2K) == 84 && sizeof(BlockQ3K) == 110 && sizeof(BlockTQ2_0) == 66);
-static_assert(sizeof(BlockIq2Xxs) == 66 && sizeof(BlockIq2Xs) == 74 && sizeof(BlockIq2S) == 82);
-static_assert(sizeof(BlockIq3Xxs) == 98 && sizeof(BlockIq3S) == 110);
-static_assert(sizeof(BlockIq1S) == 50 && sizeof(BlockIq1M) == 56);
-static_assert(sizeof(BlockIq4Nl) == 18 && sizeof(BlockIq4Xs) == 136 && sizeof(BlockMxfp4) == 17);
 
 // Generic (decode-based) Q8_K dot used where the NEON kernels are unavailable.
 float dot_lowbit_generic(DType type, const void* row, const BlockQ8_K* x, int64_t n) noexcept {
@@ -1175,6 +1108,9 @@ float dot_codebook4_q8_0(const Block* x, const BlockQ8_0* y, int64_t nb, const i
 }  // namespace
 
 void quantize_row_q8_K(const float* x, BlockQ8_K* y, int64_t n) noexcept {
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled()) return x86::quantize_row_q8_K(x, y, n);
+#endif
     for (int64_t i = 0; i < n / kSuperBlock; ++i, x += kSuperBlock) {
         // llama.cpp keeps the sign of the first element of largest magnitude:
         // d = max / -127 then maps that element to exactly -127.
@@ -1234,6 +1170,8 @@ bool uses_q8_K(DType type) noexcept {
         default:
             return false;
     }
+#elif defined(LIYAB_LOWBIT_AVX2)
+    return x86::avx2_enabled() && x86::has_q8_K_kernel(type);
 #else
     (void)type;
     return false;
@@ -1260,6 +1198,8 @@ float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n
         case DType::IQ4_XS: return dot_iq4_xs(static_cast<const BlockIq4Xs*>(row), x, nb);
         default: break;
     }
+#elif defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled() && x86::has_q8_K_kernel(type)) return x86::dot_q8_K(type, row, x, n);
 #endif
     switch (type) {
         case DType::Q4_K: case DType::Q5_K: case DType::Q6_K:
@@ -1275,8 +1215,11 @@ float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n
 
 void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x, int32_t rows, int64_t n,
                           float* out) noexcept {
-    const int64_t nb = n / kSuperBlock;
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled() && x86::has_q8_K_kernel(type)) return x86::dot_q8_K_rows(type, row, x, rows, n, out);
+#endif
 #if defined(LIYAB_LOWBIT_NEON)
+    const int64_t nb = n / kSuperBlock;
     // Up to 4 rows per weight decode; longer batches go 4 at a time.
     auto run = [&](auto kernel4, auto kernel3, auto kernel2, auto kernel1) {
         int32_t r = 0;
@@ -1321,6 +1264,9 @@ void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x
 }
 
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled()) return x86::dot_iq4_nl_q8_0(row, x, n);
+#endif
 #if defined(LIYAB_LOWBIT_NEON)
     return dot_codebook4_q8_0(static_cast<const BlockIq4Nl*>(row), x, n / kBlock, kIq4nlValues,
                               [](const BlockIq4Nl& b) { return h2f(b.d); });
@@ -1330,6 +1276,9 @@ float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
 }
 
 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled()) return x86::dot_mxfp4_q8_0(row, x, n);
+#endif
 #if defined(LIYAB_LOWBIT_NEON)
     return dot_codebook4_q8_0(static_cast<const BlockMxfp4*>(row), x, n / kBlock, kMxfp4Values,
                               [](const BlockMxfp4& b) { return e8m0_to_fp32_half(b.e); });

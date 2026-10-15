@@ -72,8 +72,9 @@ static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block must match GGML layout");
 
 // Float epilogues of one block, shared by every CPU kernel of its format: the
 // single-row and multi-row kernels on the file's layout (quant.cpp,
-// quant_lowbit.cpp) and the repacked gemv / gemm (quant_repack.cpp, which
-// apply the same operations lane by lane with vfmsq_f32 / vfmaq_f32). From
+// quant_lowbit.cpp, and the AVX2 ones in quant_x86.cpp) and the repacked gemv
+// / gemm (quant_repack.cpp, which apply the same operations lane by lane with
+// vfmsq_f32 / vfmaq_f32). From
 // the block's exact integer sums they take these fused multiply-adds in this
 // order, so a row's result does not depend on which kernel computed it: a
 // streamed expert's layout follows how it was read (I/O timing), and a
@@ -187,9 +188,10 @@ static_assert(sizeof(BlockQ8_K) == 292, "Q8_K block must match GGML layout");
 // d = 0, zero values and zero sums.
 void quantize_row_q8_K(const float* x, BlockQ8_K* y, int64_t n) noexcept;
 
-// True when `type` has a dedicated Q8_K dot kernel on this build (AArch64 NEON):
-// Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and
-// TQ2_0. Callers should then quantize activations with quantize_row_q8_K and
+// True when `type` has a dedicated Q8_K dot kernel in the kernel set in use:
+// on AArch64 NEON Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+// IQ3_S, IQ4_XS and TQ2_0; with the x86-64 AVX2 kernels Q4_K, Q5_K, Q6_K and
+// IQ4_XS. Callers should then quantize activations with quantize_row_q8_K and
 // call dot_lowbit_q8_K; other types keep the Q8_0 path (dot_quantized). The
 // 4-6 bit K-quants are cheap to decode, but per 32 values the Q8_0 path pays a
 // horizontal add and two fp16 conversions; per 256 they accumulate in int32.
@@ -197,7 +199,7 @@ bool uses_q8_K(DType type) noexcept;
 
 // Dot of one weight row of `type` (any type listed for uses_q8_K) with a Q8_K
 // activation row; `n` is a multiple of 256. Available on every target: without
-// NEON it decodes through unpack_ext_block (correct, not fast). Thread-safe
+// a dedicated kernel it decodes through unpack_ext_block (correct, not fast). Thread-safe
 // (pure function of its inputs). Returns 0 for unsupported types.
 float dot_lowbit_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n) noexcept;
 // The same weight row against `rows` activation rows (x[r] = row r's
@@ -267,12 +269,21 @@ struct BlockQ8_0x4 {
 };
 static_assert(sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0), "Q8_0_R4 keeps Q8_0's size");
 
-// The instruction set the CPU kernels were compiled for: "scalar", "neon" or
-// "neon+dotprod" (the repacked i8mm kernels give the same bits as these;
-// repack_kernels_available() tells whether they are built in). Kernels for
-// different sets may round differently, the same set never from one run to
-// the next: tests/test_golden.cpp pins the logits per set.
+// The kernel set the CPU kernels run: "scalar", "neon" or "neon+dotprod" on
+// arm64 (fixed when compiled; the repacked i8mm kernels give the same bits as
+// these, repack_kernels_available() tells whether they are built in), and on
+// x86-64 "avx2" (AVX2 + FMA + F16C) or "scalar", chosen at run time from
+// CPUID. Kernels for different sets may round differently, the same set never
+// from one run or machine to the next: tests/test_golden.cpp pins the logits
+// per set. The environment variable LIYAB_KERNELS=scalar, read on the first
+// kernel call, makes an x86-64 process use the scalar set.
 const char* kernel_isa() noexcept;
+// Turns the run-time selected SIMD kernels on or off and returns whether SIMD
+// kernels are in use afterwards: on x86-64 the AVX2 set (on only when the CPU
+// has it); arm64 builds have no scalar alternative (always true), scalar-only
+// builds none at all (always false). For tests and benchmarks comparing the
+// sets in one process: no kernel may run on another thread meanwhile.
+bool use_simd_kernels(bool on) noexcept;
 // Whether the repacked kernels are built in (they also need the CPU's i8mm).
 bool repack_kernels_available() noexcept;
 // Rearranges `rows` (a multiple of 8) Q4_K rows of `cols` values into Q4_K_R8.

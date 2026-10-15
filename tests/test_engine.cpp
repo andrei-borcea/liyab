@@ -541,6 +541,140 @@ TEST_CASE("Multi-row kernels equal one single-row dot per activation row") {
     }
 }
 
+// x86-64: the AVX2 kernels are chosen at run time, so both sets live in one
+// binary. Activation quantization and decoding must give the scalar code's
+// bits (a different rounding there would move every later result); the dots
+// may round differently but must agree with the scalar ones closely.
+TEST_CASE("Run-time SIMD kernels (x86-64 AVX2): activations and decodes are the scalar bits, dots agree") {
+    if (!quant::use_simd_kernels(true) || quant::use_simd_kernels(false)) {
+        std::printf("  skipped: the kernel set (%s) is fixed in this build or on this CPU\n", quant::kernel_isa());
+        quant::use_simd_kernels(true);
+        return;
+    }
+    struct RestoreSimd {
+        ~RestoreSimd() { quant::use_simd_kernels(true); }
+    } restore;
+    std::mt19937 rng(53);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const int64_t n = 1024;
+    std::vector<float> x(static_cast<size_t>(n));
+    for (float& v : x) v = normal(rng) * (rng() % 64 == 0 ? 8.0f : 1.0f);
+    // Block 3: d = 1 and every value a tie (k + 0.5), where std::lround
+    // (away from zero) and the vector rounding (to even) differ.
+    for (int j = 0; j < 31; ++j) x[static_cast<size_t>(96 + j)] = static_cast<float>(j - 15) - 0.5f;
+    x[127] = 127.0f;
+    std::fill(x.begin() + 256, x.begin() + 512, 0.0f);  // all-zero blocks and super-block
+    x[600] = -1e-40f;                                   // a subnormal
+    x[601] = 70000.0f;                                  // beyond fp16: infinity
+
+    struct Outputs {
+        std::vector<quant::BlockQ8_0> q8;
+        std::vector<quant::BlockQ8_K> q8k;
+        std::vector<uint16_t> f16;
+        std::vector<float> from_f16, from_bf16, from_q8, from_q4_0, from_q4_1;
+    };
+    std::vector<quant::BlockQ4_0> q4_0(static_cast<size_t>(n / 32));
+    std::vector<quant::BlockQ4_1> q4_1(static_cast<size_t>(n / 32));
+    quant::quantize_row_q4_0(x.data(), q4_0.data(), n);
+    quant::quantize_row_q4_1(x.data(), q4_1.data(), n);
+    std::vector<uint16_t> bf16(static_cast<size_t>(n));
+    for (auto& h : bf16) h = static_cast<uint16_t>(rng());
+    auto run = [&](bool simd) {
+        CHECK(quant::use_simd_kernels(simd) == simd);
+        Outputs o;
+        o.q8.resize(static_cast<size_t>(n / 32));
+        o.q8k.resize(static_cast<size_t>(n / 256));
+        o.f16.resize(static_cast<size_t>(n));
+        quant::quantize_row_q8_0(x.data(), o.q8.data(), n);
+        quant::quantize_row_q8_K(x.data(), o.q8k.data(), n);
+        quant::quantize_row(DType::F16, x.data(), o.f16.data(), n);
+        for (auto* v : {&o.from_f16, &o.from_bf16, &o.from_q8, &o.from_q4_0, &o.from_q4_1}) v->resize(x.size());
+        quant::dequantize_row(DType::F16, o.f16.data(), o.from_f16.data(), n);
+        quant::dequantize_row(DType::BF16, bf16.data(), o.from_bf16.data(), n);
+        quant::dequantize_row(DType::Q8_0, o.q8.data(), o.from_q8.data(), n);
+        quant::dequantize_row(DType::Q4_0, q4_0.data(), o.from_q4_0.data(), n);
+        quant::dequantize_row(DType::Q4_1, q4_1.data(), o.from_q4_1.data(), n);
+        return o;
+    };
+    const Outputs scalar = run(false);
+    const Outputs simd = run(true);
+    auto same = [](const auto& a, const auto& b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
+    };
+    CHECK(same(scalar.q8, simd.q8));
+    CHECK(same(scalar.q8k, simd.q8k));
+    CHECK(same(scalar.f16, simd.f16));
+    CHECK(same(scalar.from_f16, simd.from_f16));
+    CHECK(same(scalar.from_bf16, simd.from_bf16));
+    CHECK(same(scalar.from_q8, simd.from_q8));
+    CHECK(same(scalar.from_q4_0, simd.from_q4_0));
+    CHECK(same(scalar.from_q4_1, simd.from_q4_1));
+    CHECK(simd.q8[3].qs[0] == -16 && simd.q8[3].qs[30] == 15);  // -15.5 -> -16, 14.5 -> 15: ties away from zero
+
+    // Extreme Q8_0 bytes: -128 weights (GGUF rows may hold them) against
+    // +-127 activations stay exact (no int16 saturation in the pair sums).
+    {
+        quant::BlockQ8_0 w{}, a{};
+        w.d = a.d = quant::fp32_to_fp16(1.0f);
+        for (int j = 0; j < 32; ++j) {
+            w.qs[j] = -128;
+            a.qs[j] = static_cast<int8_t>(j % 2 ? 127 : -127);
+        }
+        CHECK(quant::dot_q8_0_q8_0(&w, &a, 32) == 0.0f);
+        for (int j = 0; j < 32; ++j) a.qs[j] = -127;
+        CHECK(quant::dot_q8_0_q8_0(&w, &a, 32) == 32.0f * 128 * 127);
+        const quant::BlockQ8_0* rows[2] = {&a, &a};
+        float out[2] = {};
+        quant::dot_q8_0_q8_0_rows(&w, rows, 2, 32, out);
+        CHECK(out[0] == 32.0f * 128 * 127 && out[1] == out[0]);
+    }
+
+    // Every format's dot with both sets (the reference vectors as weights).
+    std::vector<QuantVector> vectors;
+    if (!load_quant_vectors(vectors)) return;
+    int compared = 0;
+    for (const QuantVector& qv : vectors) {
+        const int64_t m = qv.n / 256 * 256 > 0 ? qv.n / 256 * 256 : qv.n / 32 * 32;
+        std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(m / 32));
+        std::vector<int32_t> xs(xq.size());
+        quant::quantize_row_q8_0(simd.from_q8.data(), xq.data(), m);  // any activations; the same for both sets
+        quant::block_sums(xq.data(), xs.data(), m);
+        double mag = 1e-3;
+        for (int64_t i = 0; i < m; ++i) mag += std::fabs(static_cast<double>(qv.expected[i]) * simd.from_q8[i]);
+        float got[2], got_k[2] = {0.0f, 0.0f};
+        for (const bool use : {false, true}) {
+            quant::use_simd_kernels(use);
+            got[use] = qv.type == DType::BF16 ? quant::dot_bf16_f32(reinterpret_cast<const uint16_t*>(qv.blocks.data()),
+                                                                     simd.from_q8.data(), m)
+                                              : quant::dot_quantized(qv.type, qv.blocks.data(), xq.data(), xs.data(), m);
+            if (m % 256 == 0) {
+                std::vector<quant::BlockQ8_K> xk(static_cast<size_t>(m / 256));
+                quant::quantize_row_q8_K(simd.from_q8.data(), xk.data(), m);
+                got_k[use] = quant::dot_lowbit_q8_K(qv.type, qv.blocks.data(), xk.data(), m);
+            }
+        }
+        const bool ok = std::fabs(got[0] - got[1]) <= 1e-5 * mag && std::fabs(got_k[0] - got_k[1]) <= 1e-5 * mag;
+        if (!ok) {
+            std::printf("  %s: scalar %g / %g, simd %g / %g\n", std::string(dtype_traits(qv.type).name).c_str(),
+                        got[0], got_k[0], got[1], got_k[1]);
+        }
+        CHECK(ok);
+        ++compared;
+    }
+    // The float dots (F32 weights, the F16 KV cache).
+    for (const int64_t len : {int64_t{7}, int64_t{64}, int64_t{500}}) {  // finite values (x[601] is infinite in F16)
+        float got[2], got_h[2];
+        for (const bool use : {false, true}) {
+            quant::use_simd_kernels(use);
+            got[use] = quant::dot_f32(x.data() + 1, simd.from_q8.data(), len);
+            got_h[use] = quant::dot_f16_f32(simd.f16.data() + 32, simd.from_q8.data(), len);
+        }
+        CHECK_NEAR(got[0], got[1], 1e-5 * (1.0 + std::fabs(got[0])) * len);
+        CHECK_NEAR(got_h[0], got_h[1], 1e-5 * (1.0 + std::fabs(got_h[0])) * len);
+    }
+    std::printf("  %d formats compared, kernels %s\n", compared, quant::kernel_isa());
+}
+
 TEST_CASE("Repacked K-quants (Q4_K_R8 / Q5_K_R8 / Q6_K_R8): gemm equals gemv exactly, and both match the row kernel") {
     if (!quant::repack_kernels_available() || !detect_cpu().i8mm) {
         std::printf("  skipped: no i8mm on this CPU or build\n");
