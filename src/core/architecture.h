@@ -12,11 +12,12 @@
 //    from parts the engine already runs needs only its row.
 //  * ModelConfig and one BlockPlan per block: the hyperparameters from the
 //    metadata, and each block's structure from the tensors present (which
-//    token mixer, a gated attention output, a windowed attention, a dense or
-//    mixture-of-experts FFN, a shared expert). Optional per-element tensors
-//    (QKV biases, Q/K norms, the norms after the mixer and the FFN, the
-//    shared expert's gate, the router's selection bias) are bound where
-//    present and need no plan entry.
+//    token mixer, fused or separate projections, a gated attention output,
+//    a windowed attention, a dense or mixture-of-experts FFN, a shared
+//    expert). Optional per-element tensors (QKV biases, Q/K norms, the norms
+//    after the mixer and the FFN, the shared expert's gate, the router's
+//    selection bias, RoPE frequency factors) are bound where present and
+//    need no plan entry.
 //
 // describe_model() is a pure function of the file: it reads metadata and
 // tensor names, never weights, so a model can be described (and refused with
@@ -49,7 +50,7 @@ enum class QkNormOrder : uint8_t {
 
 // Activation of a gated FFN's gate projection: down(act(gate) * up).
 enum class FfnActivation : uint8_t {
-    SiLU,      // SwiGLU: Llama, Qwen, Hunyuan
+    SiLU,      // SwiGLU: Llama, Qwen, Phi, Hunyuan
     GeluTanh,  // GeGLU, with the tanh approximation of GELU: Gemma
 };
 
@@ -122,7 +123,13 @@ struct BlockPlan {
     // (ArchSpec::swa_period), and rotates with ModelConfig::rope_base_swa
     // when that is set.
     bool windowed = false;
+    // Attention: one attn_qkv matrix projects [q | k | v] (Phi-3), instead of
+    // attn_q, attn_k and attn_v.
+    bool fused_qkv = false;
     FfnKind ffn = FfnKind::Dense;
+    // Dense: ffn_up projects [gate | up] (twice as tall) and there is no
+    // ffn_gate (Phi-3).
+    bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
 };
@@ -143,6 +150,13 @@ struct ModelConfig {
     float rms_eps = 1e-5f;
     float rope_base = 10000.0f;
     float rope_scale = 1.0f;  // linear position scaling
+    // LongRoPE (Phi-3): rope_factors_short.weight and rope_factors_long.weight
+    // divide the frequencies, the long ones when the context is longer than
+    // rope_ctx_orig (the Transformer picks once, from its context length).
+    int32_t rope_ctx_orig = 0;
+    // Multiplies the rotated dimensions of queries and keys
+    // (<arch>.rope.scaling.attn_factor: LongRoPE's attention factor; 1 when absent).
+    float rope_magnitude = 1.0f;
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

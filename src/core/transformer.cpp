@@ -222,11 +222,19 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!cache) return cache.status();
     model->kv_ = std::move(cache).value();
 
-    // RoPE inverse frequencies, with optional per-pair factors (Llama 3.x).
+    // RoPE inverse frequencies, with optional per-pair factors: Llama 3.x's
+    // rope_freqs, or LongRoPE's (Phi-3), whose long factors apply when the
+    // context is longer than the original one. The reference picks them by
+    // the sequence's length instead; with one table for the whole context,
+    // keys never need rotating again (a context up to the original length
+    // matches the reference exactly).
     std::vector<float> factors(static_cast<size_t>(c.rope_dim / 2), 1.0f);
-    if (const TensorView* rf = f.tensor("rope_freqs.weight")) {
+    const char* factor_tensor = c.rope_ctx_orig == 0                         ? "rope_freqs.weight"
+                                : model->context_length_ > c.rope_ctx_orig ? "rope_factors_long.weight"
+                                                                           : "rope_factors_short.weight";
+    if (const TensorView* rf = f.tensor(factor_tensor)) {
         if (rf->elements() != c.rope_dim / 2 || rf->type != DType::F32) {
-            return Status(ErrorCode::InvalidModel, "rope_freqs.weight has an unexpected shape");
+            return Status(ErrorCode::InvalidModel, std::string(factor_tensor) + " has an unexpected shape");
         }
         quant::dequantize_row(DType::F32, rf->data, factors.data(), rf->elements());
     }
@@ -241,6 +249,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         return t;
     };
     model->rope_tables_.push_back(table(c.rope_base, c.rope_scale, factors));
+    model->rope_tables_.back().magnitude = c.rope_magnitude;
     // Windowed blocks with a base of their own rotate unscaled, without the
     // global frequency factors (Gemma 3's local RoPE).
     if (c.rope_base_swa > 0.0f) {
@@ -345,13 +354,27 @@ Status Transformer::bind_weights() {
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
         if (plan.mixer == MixerKind::Attention) {
             L.kv_slot = kv_slots++;
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q.weight"), c.n_embd, plan.attn_gate ? 2 * q_dim : q_dim, L.w[kQ]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_k.weight"), c.n_embd, kv_dim, L.w[kK]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_v.weight"), c.n_embd, kv_dim, L.w[kV]));
+            if (plan.fused_qkv) {
+                LIYAB_RETURN_IF_ERROR(
+                    matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, q_dim + 2 * kv_dim, L.w[kQkv]));
+                // A fused bias, if any, splits like the rows.
+                std::vector<float> bias;
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_qkv.bias"), q_dim + 2 * kv_dim, false, bias));
+                if (!bias.empty()) {
+                    L.bq.assign(bias.begin(), bias.begin() + q_dim);
+                    L.bk.assign(bias.begin() + q_dim, bias.begin() + q_dim + kv_dim);
+                    L.bv.assign(bias.begin() + q_dim + kv_dim, bias.end());
+                }
+            } else {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q.weight"), c.n_embd,
+                                             plan.attn_gate ? 2 * q_dim : q_dim, L.w[kQ]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_k.weight"), c.n_embd, kv_dim, L.w[kK]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_v.weight"), c.n_embd, kv_dim, L.w[kV]));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q.bias"), q_dim, false, L.bq));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k.bias"), kv_dim, false, L.bk));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
+            }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q.bias"), q_dim, false, L.bq));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k.bias"), kv_dim, false, L.bk));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
         } else {
@@ -376,8 +399,13 @@ Status Transformer::bind_weights() {
                                       false, L.post_ffn_norm));
         }
         if (plan.ffn == FfnKind::Dense) {
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+            if (plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
+                LIYAB_RETURN_IF_ERROR(
+                    matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{c.n_ff}, L.w[kUp]));
+            } else {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+            }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
             continue;
         }
@@ -537,11 +565,16 @@ bool get(std::istream& in, T& v) {
 }  // namespace
 
 // What must match for a saved state to be valid here: the model (file size
-// and shape) and how the KV cache stores rows.
+// and shape) and how the KV cache stores rows. A LongRoPE model whose context
+// picked the long factors rotates its keys otherwise than with the short
+// ones, so that choice marks the first field (every other model's
+// fingerprint, and so its saved states, stay as they were).
 std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
     const KvCacheConfig& kv = kv_->config();
-    return {static_cast<int64_t>(file_->file_size()), config_.n_layers, config_.n_embd, config_.n_vocab,
-            kv.n_layers, kv.n_head_kv, kv.head_dim, static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
+    const bool long_rope = config_.rope_ctx_orig > 0 && context_length_ > config_.rope_ctx_orig;
+    const int64_t file = static_cast<int64_t>(file_->file_size()) ^ (long_rope ? int64_t{1} << 62 : 0);
+    return {file, config_.n_layers, config_.n_embd, config_.n_vocab, kv.n_layers, kv.n_head_kv, kv.head_dim,
+            static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
 }
 
 Status Transformer::write_state(std::ostream& out) const {
@@ -711,8 +744,8 @@ void Transformer::rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable
         float* x = vec + static_cast<size_t>(h) * static_cast<size_t>(config_.head_dim);
         for (int32_t i = 0; i < half; ++i) {
             const float theta = p * table.inv_freq[static_cast<size_t>(i)];
-            const float cs = std::cos(theta);
-            const float sn = std::sin(theta);
+            const float cs = std::cos(theta) * table.magnitude;  // x 1 keeps the bits
+            const float sn = std::sin(theta) * table.magnitude;
             const int32_t a = halves ? i : 2 * i;
             const int32_t b = halves ? i + half : 2 * i + 1;
             const float x0 = x[a];
@@ -995,6 +1028,22 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
     return matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows);
 }
 
+Status Transformer::project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n) {
+    const ModelConfig& c = config_;
+    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
+    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const size_t row = q_dim + 2 * kv_dim;
+    qkv_.resize(static_cast<size_t>(n) * row);
+    LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kQkv], xb_.data(), qkv_.data(), n));
+    for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
+        const float* src = qkv_.data() + t * row;
+        std::copy(src, src + q_dim, q_.data() + t * q_dim);
+        std::copy(src + q_dim, src + q_dim + kv_dim, k_.data() + t * kv_dim);
+        std::copy(src + q_dim + kv_dim, src + row, v_.data() + t * kv_dim);
+    }
+    return Status::ok();
+}
+
 Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) {
     const ModelConfig& c = config_;
     // Only reached for attention-only stacks: early exit is disabled for hybrid models.
@@ -1004,8 +1053,12 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         LIYAB_RETURN_IF_ERROR(w.status());
         Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
         rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
-        LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kK], xb_.data(), k_.data(), 1));
-        LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kV], xb_.data(), v_.data(), 1));
+        if (c.blocks[static_cast<size_t>(l)].fused_qkv) {
+            LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, backend, w, 1));
+        } else {
+            LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kK], xb_.data(), k_.data(), 1));
+            LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kV], xb_.data(), v_.data(), 1));
+        }
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
@@ -1023,13 +1076,15 @@ KeyScalingShape Transformer::key_scaling_shape() const {
     // The horizon depends on the model only, never on the configured context,
     // so every process gets the same factors (and the same replies).
     const int32_t positions = c.n_ctx_train > 0 ? std::min(c.n_ctx_train, kKeyRangePositions) : kKeyRangePositions;
-    KeyScalingShape shape{c.n_attn_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim, c.spec->rope, {}, positions};
+    KeyScalingShape shape{c.n_attn_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim,
+                          c.spec->rope, {}, {}, positions};
     // Transformer::rope: pair i of an attention block turns by
     // inv_freq[i] / scale of the block's table per position.
     for (const Layer& L : layers_) {
         if (L.kv_slot < 0) continue;  // attention blocks only, in KV slot order
         const RopeTable& t = rope_tables_[static_cast<size_t>(L.rope_table)];
         for (const float f : t.inv_freq) shape.pair_speed.push_back(f / t.scale);
+        shape.rope_magnitude.push_back(t.magnitude);
     }
     return shape;
 }
@@ -1061,12 +1116,17 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
     // ranges see x * s, unrotated, and the norm weight w as a gain applied
     // after the rotation (KeyRanges::add).
     const auto hd = static_cast<size_t>(c.head_dim);
+    // RoPE's magnitude (LongRoPE) scales the rotated channels before the norm.
+    const float magnitude = rope_tables_[static_cast<size_t>(L.rope_table)].magnitude;
+    std::vector<float> rotated(hd);
     auto scaled = [&](const float* x, int32_t heads, bool normed, std::vector<float>& out) {
         out.assign(x, x + static_cast<size_t>(heads) * hd);
         if (!normed) return;
         for (size_t h = 0; h < static_cast<size_t>(heads); ++h) {
             float* xh = out.data() + h * hd;
-            const float s = rms_scale(xh, c.head_dim, c.rms_eps);
+            std::copy(xh, xh + hd, rotated.begin());
+            for (size_t i = 0; i < static_cast<size_t>(c.rope_dim); ++i) rotated[i] *= magnitude;
+            const float s = rms_scale(rotated.data(), c.head_dim, c.rms_eps);
             for (size_t i = 0; i < hd; ++i) xh[i] *= s;
         }
     };
@@ -1170,7 +1230,10 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (gated) qg_.resize(un * 2 * q_dim);
-    {
+    if (c.blocks[static_cast<size_t>(layer)].fused_qkv) {
+        // One [q | k | v] projection per token, split into q_, k_ and v_.
+        LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, route.attention, w, n));
+    } else {
         const TensorView* qkv[] = {&w[kQ], &w[kK], &w[kV]};
         float* outs[] = {gated ? qg_.data() : q_.data(), k_.data(), v_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, qkv, xb_.data(), outs, n));
@@ -1514,6 +1577,18 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         if (hook != nullptr && hook->ffn_matmul(layer, p, x, y, n)) return Status::ok();
         return matmul(route, route.ffn, m, x, y, n);
     };
+    if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
+        // One [gate | up] projection per token (no per-projection hook: the
+        // halves are one matrix); act(gate) * up lands in hb_.
+        const auto ff = static_cast<size_t>(c.n_ff);
+        hb2_.resize(2 * rows);
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kUp], xb_.data(), hb2_.data(), n));
+        for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
+            const float* gate_up = hb2_.data() + t * 2 * ff;
+            gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff);
+        }
+        return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
+    }
     if (hook != nullptr) {
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Gate, w[kGate], xb_.data(), hb_.data()));
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb2_.data()));

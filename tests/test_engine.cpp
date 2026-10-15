@@ -1099,6 +1099,72 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
 }
 
+TEST_CASE("describe_model: windowed blocks from the architecture or the file, fused projections, LongRoPE") {
+    auto describe = [](const std::string& name, const test::TinyModelSpec& spec) -> ModelConfig {
+        auto file = MmapLoader::open(model_path(name, spec));
+        auto described = file ? describe_model(**file) : Result<ModelConfig>(file.status());
+        CHECK(described.has_value());
+        if (!described) {
+            std::printf("  %s: %s\n", name.c_str(), described.status().to_string().c_str());
+            return {};
+        }
+        return std::move(described).value();
+    };
+    using Flags = std::vector<bool>;
+    auto windowed = [](const ModelConfig& c) {
+        std::vector<bool> out;
+        for (const BlockPlan& b : c.blocks) out.push_back(b.windowed);
+        return out;
+    };
+    test::TinyModelSpec gemma;
+    gemma.arch = "gemma3";
+    gemma.n_layers = 12;
+    gemma.sliding_window = 8;
+    {
+        // The architecture's period: every sixth block attends globally.
+        const ModelConfig c = describe("describe_gemma", gemma);
+        const Flags every_sixth_global = {true, true, true, true, true, false, true, true, true, true, true, false};
+        CHECK(windowed(c) == every_sixth_global);
+        CHECK(c.sliding_window == 8);
+        CHECK(c.rope_base_swa == 10000.0f);
+        CHECK(c.embd_scale == static_cast<float>(std::sqrt(128.0)));
+        CHECK(c.spec->ffn_activation == FfnActivation::GeluTanh);
+    }
+    {
+        test::TinyModelSpec s = gemma;  // the file's period
+        s.swa_pattern = 3;
+        const Flags every_third_global = {true, true, false, true, true, false, true, true, false, true, true, false};
+        CHECK(windowed(describe("describe_gemma_period", s)) == every_third_global);
+        s.swa_layers = {false, true, false, true, false, true, false, true, false, true, false, true};  // per block
+        CHECK(windowed(describe("describe_gemma_flags", s)) == s.swa_layers);
+    }
+    {
+        test::TinyModelSpec s = gemma;  // no window in the file: every block global
+        s.sliding_window = 0;
+        const ModelConfig c = describe("describe_gemma_global", s);
+        CHECK(windowed(c) == std::vector<bool>(12, false));
+        CHECK(c.rope_base_swa == 0.0f);
+    }
+    {
+        test::TinyModelSpec s;  // an architecture without windowed blocks ignores the key
+        s.sliding_window = 8;
+        CHECK(windowed(describe("describe_llama_window", s)) == std::vector<bool>(2, false));
+    }
+    {
+        test::TinyModelSpec s;
+        s.arch = "phi3";
+        s.fused_qkv = true;
+        s.fused_gate_up = true;
+        s.longrope_ctx = 256;
+        s.sliding_window = 32;
+        const ModelConfig c = describe("describe_phi3", s);
+        for (const BlockPlan& b : c.blocks) CHECK(b.fused_qkv && b.fused_gate_up && b.windowed);
+        CHECK(c.rope_ctx_orig == 256);
+        CHECK(c.rope_magnitude == 1.19f);
+        CHECK(c.rope_base_swa == 0.0f);  // windowed blocks rotate like the others
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key scaling for quantized KV caches (core/key_scaling.h)
 // ---------------------------------------------------------------------------
@@ -1367,6 +1433,32 @@ TEST_CASE("Mixture of experts with identical experts equals its dense twin (rout
         REQUIRE(lc.has_value());
         CHECK(max_abs_diff(*lc, dense_logits) < 1e-3);
     }
+}
+
+TEST_CASE("Fused attn_qkv and [gate | up] matrices give the separate matrices' logits, bit for bit") {
+    // The same weights either way (the writer draws them in the same order),
+    // so the fused projections and their split must change no bit.
+    test::TinyModelSpec separate;
+    separate.arch = "phi3";
+    test::TinyModelSpec fused = separate;
+    fused.fused_qkv = true;
+    fused.fused_gate_up = true;
+    auto a = load_transformer(model_path("phi3_separate", separate));
+    auto b = load_transformer(model_path("phi3_fused", fused));
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(!a->config().blocks[0].fused_qkv && !a->config().blocks[0].fused_gate_up);
+    CHECK(b->config().blocks[0].fused_qkv && b->config().blocks[0].fused_gate_up);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto la = a->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(la.has_value());
+    const std::vector<float> expected(la->begin(), la->end());
+    auto lb = b->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(lb.has_value());
+    REQUIRE(lb->size() == expected.size());
+    CHECK(std::memcmp(lb->data(), expected.data(), expected.size() * sizeof(float)) == 0);
 }
 
 TEST_CASE("MoE expert_mass and max_experts run fewer experts per token") {

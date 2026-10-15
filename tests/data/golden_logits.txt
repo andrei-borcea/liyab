@@ -10,6 +10,8 @@ arm64-neon-dotprod llama-f16kv c3762e1cc6e0440f
 arm64-neon-dotprod llama-sliding c8828407db88fd5d
 arm64-neon-dotprod llama-tied-ropefreqs-linear a8b8d00b97943246
 arm64-neon-dotprod mistral 843d1f69e41d69be
+arm64-neon-dotprod phi3 9c3751723cbcaeb6
+arm64-neon-dotprod phi3-longrope-partial aced195c53a3204c
 arm64-neon-dotprod qwen2 04f8541886af11a2
 arm64-neon-dotprod qwen2-keyscaled b655ee31a3851655
 arm64-neon-dotprod qwen3 39f1cb43464bb220

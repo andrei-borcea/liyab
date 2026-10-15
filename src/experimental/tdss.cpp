@@ -178,6 +178,13 @@ void Sparse24Matrix::matmul(const float* x, float* y, int32_t n, ThreadPool& poo
 
 Result<std::unique_ptr<Tdss>> Tdss::create(std::span<const std::array<const TensorView*, 3>> ffn, ThreadPool& pool,
                                            TdssConfig config) {
+    for (const auto& layer : ffn) {
+        for (const TensorView* t : layer) {
+            if (t == nullptr) {  // a fused [gate | up] matrix (Phi-3) or an FFN of another kind
+                return Status(ErrorCode::Unsupported, "TDSS needs separate gate, up and down matrices in every block");
+            }
+        }
+    }
     std::unique_ptr<Tdss> tdss(new Tdss());
     tdss->pool_ = &pool;
     tdss->config_ = config;

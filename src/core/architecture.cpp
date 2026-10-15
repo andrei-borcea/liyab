@@ -38,6 +38,10 @@ constexpr ArchSpec kArchitectures[] = {
      .scale_embeddings = true,
      .swa_period = 6,
      .rope_base_swa = 10000.0f},
+    // Phi-3 / Phi-3.5 / Phi-4-mini: fused attn_qkv and [gate | up] ffn_up
+    // (planned from the tensors), LongRoPE factors; every block uses the
+    // sliding window when the file sets one (Phi-3-mini-4k: 2047).
+    {.name = "phi3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .swa_period = 1},
 };
 
 }  // namespace
@@ -117,12 +121,31 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
     c.rope_base = static_cast<float>(f.get_float(key("rope.freq_base")).value_or(10000.0));
-    if (const auto scaling = f.get_string(key("rope.scaling.type")); scaling && *scaling != "none") {
-        if (*scaling != "linear") {
-            return Status(ErrorCode::Unsupported, "rope scaling '" + std::string(*scaling) + "' is not supported");
+    // LongRoPE: frequency factors for short and long contexts (Phi-3), and the
+    // attention factor that comes with them.
+    const TensorView* long_factors = f.tensor("rope_factors_long.weight");
+    const TensorView* short_factors = f.tensor("rope_factors_short.weight");
+    const bool longrope = long_factors != nullptr || short_factors != nullptr;
+    if (longrope) {
+        if (long_factors == nullptr || short_factors == nullptr || f.tensor("rope_freqs.weight") != nullptr) {
+            return Status(ErrorCode::InvalidModel,
+                          "LongRoPE needs both rope_factors_short and rope_factors_long, and no rope_freqs");
         }
-        c.rope_scale = static_cast<float>(f.get_float(key("rope.scaling.factor")).value_or(1.0));
-        if (c.rope_scale <= 0.0f) return Status(ErrorCode::InvalidModel, "invalid rope scaling factor");
+        LIYAB_RETURN_IF_ERROR(require_int("rope.scaling.original_context_length", c.rope_ctx_orig));
+    }
+    c.rope_magnitude = static_cast<float>(f.get_float(key("rope.scaling.attn_factor")).value_or(1.0));
+    if (!(c.rope_magnitude > 0.0f)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.attn_factor"));
+    }
+    if (const auto scaling = f.get_string(key("rope.scaling.type")); scaling && *scaling != "none") {
+        if (*scaling == "longrope" || *scaling == "su") {
+            if (!longrope) return Status(ErrorCode::InvalidModel, "LongRoPE scaling without rope_factors_long/short");
+        } else if (*scaling != "linear") {
+            return Status(ErrorCode::Unsupported, "rope scaling '" + std::string(*scaling) + "' is not supported");
+        } else {
+            c.rope_scale = static_cast<float>(f.get_float(key("rope.scaling.factor")).value_or(1.0));
+            if (c.rope_scale <= 0.0f) return Status(ErrorCode::InvalidModel, "invalid rope scaling factor");
+        }
     }
     // As the reference scales them: sqrt(d) rounded once to float.
     if (c.spec->scale_embeddings) c.embd_scale = static_cast<float>(std::sqrt(static_cast<double>(c.n_embd)));
@@ -179,7 +202,12 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             ++c.n_attn_layers;
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = wq != nullptr && wq->rows() == 2 * q_dim;
+            b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
+        }
+        if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
+            b.fused_gate_up =
+                f.tensor(block_tensor(l, "ffn_gate.weight")) == nullptr && up->rows() == 2 * int64_t{c.n_ff};
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");

@@ -32,7 +32,8 @@ KeyRanges::KeyRanges(KeyScalingShape shape)
                      static_cast<size_t>(shape_.head_dim),
                  0.0f) {}
 
-void KeyRanges::update(const float* rows, int32_t heads, float* max, const float* speed, const float* gain) const {
+void KeyRanges::update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
+                       const float* gain) const {
     const auto hd = static_cast<size_t>(shape_.head_dim);
     const int32_t half = shape_.rope_dim / 2;
     const double last = std::max(shape_.positions - 1, 0);
@@ -46,7 +47,7 @@ void KeyRanges::update(const float* rows, int32_t heads, float* max, const float
         for (int32_t i = 0; i < half; ++i) {
             const int32_t a = shape_.rope == RopeLayout::Halves ? i : 2 * i;
             const int32_t b = shape_.rope == RopeLayout::Halves ? i + half : 2 * i + 1;
-            const double r = std::hypot(static_cast<double>(x[a]), static_cast<double>(x[b]));
+            const double r = std::hypot(static_cast<double>(x[a]), static_cast<double>(x[b])) * magnitude;
             const double phi = std::atan2(static_cast<double>(x[b]), static_cast<double>(x[a]));
             const double sweep = static_cast<double>(speed[i]) * last;
             m[a] = std::max(m[a], static_cast<float>(g(a) * r * max_abs_cos(phi, sweep)));
@@ -62,8 +63,11 @@ void KeyRanges::add(int32_t block, const float* q, const float* k, const float* 
     const auto hd = static_cast<size_t>(shape_.head_dim);
     const auto b = static_cast<size_t>(block);
     const float* speed = shape_.pair_speed.data() + b * static_cast<size_t>(shape_.rope_dim / 2);
-    update(k, shape_.n_head_kv, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, k_gain);
-    update(q, shape_.n_head, query_max_.data() + b * static_cast<size_t>(shape_.n_head) * hd, speed, q_gain);
+    const double magnitude = shape_.rope_magnitude.empty() ? 1.0 : shape_.rope_magnitude[b];
+    update(k, shape_.n_head_kv, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, magnitude,
+           k_gain);
+    update(q, shape_.n_head, query_max_.data() + b * static_cast<size_t>(shape_.n_head) * hd, speed, magnitude,
+           q_gain);
 }
 
 float KeyRanges::outlier_ratio() const {

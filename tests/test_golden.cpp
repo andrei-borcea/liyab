@@ -171,6 +171,17 @@ std::vector<GoldenCase> cases() {
     add("gemma3-sliding", s, engine_window);
     s.k_norm_outlier = 60.0f;  // key scaling with two RoPE tables
     add("gemma3-keyscaled", s, {}, true);
+
+    s = {};
+    s.arch = "phi3";  // fused attn_qkv and [gate | up], LongRoPE, every block windowed
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    s.longrope_ctx = 128;  // longer than the test's context: the short factors
+    s.sliding_window = 16;
+    add("phi3", s);
+    s.longrope_ctx = 32;  // shorter: the long factors
+    s.rope_dim = 16;      // partial rotation (Phi-4-mini)
+    add("phi3-longrope-partial", s);
     return out;
 }
 
