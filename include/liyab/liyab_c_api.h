@@ -101,6 +101,7 @@ typedef struct liyab_engine_config {
     const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
+    int32_t suffix_drafts;        /* nonzero, no draft model: draft from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most) instead of context lookup; takes precedence over lookup_drafts (see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

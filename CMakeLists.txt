@@ -86,6 +86,7 @@ add_library(liyab_core OBJECT
   src/core/direct_io.cpp
   src/core/speculative_decoder.cpp
   src/core/draft_budget.cpp
+  src/core/suffix_drafter.cpp
   src/core/engine.cpp
   src/backends/cpu/cpu_backend.cpp
   src/backends/qnn/qnn_backend.cpp
@@ -282,6 +283,9 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-kl tools/liyab_kl.cpp)
   target_link_libraries(liyab-kl PRIVATE liyab_core)
   target_include_directories(liyab-kl PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Speculative decoding without a draft model on assistant tasks: plain vs lookup vs suffix drafts.
+  add_executable(liyab-spec-bench tools/liyab_spec_bench.cpp)
+  target_link_libraries(liyab-spec-bench PRIVATE liyab_core)
   # A tokenizer on its own: ids, comparison with reference ids, encoding speed.
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)

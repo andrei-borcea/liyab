@@ -19,6 +19,7 @@
 #include "core/draft_budget.h"
 #include "core/quant.h"
 #include "core/sampling.h"
+#include "core/suffix_drafter.h"
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
 #include "core/transformer.h"
@@ -2195,9 +2196,15 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
         EngineConfig drafted = lookup;
         drafted.lookup_drafts = false;
         drafted.draft_model_path = path;  // the target itself: every draft accepted, steps of 4 tokens
-        for (const EngineConfig* config : {&plain, &lookup, &drafted}) {
+        EngineConfig suffix = lookup;
+        suffix.suffix_drafts = true;
+        for (const EngineConfig* config : {&plain, &lookup, &suffix, &drafted}) {
             const bool speculative = config != &plain;
-            std::printf("  %s, %s\n", path.c_str(), config == &plain ? "plain" : config == &lookup ? "lookup" : "draft model");
+            std::printf("  %s, %s\n", path.c_str(),
+                        config == &plain    ? "plain"
+                        : config == &lookup ? "lookup"
+                        : config == &suffix ? "suffix"
+                                            : "draft model");
             auto engine = Engine::create(*config);
             REQUIRE(engine.has_value());
             std::string text;
@@ -3047,6 +3054,229 @@ TEST_CASE("Adaptive draft counts keep greedy output identical") {
     CHECK(run(*engine.value(), prompt, greedy(48)) == expected);
 }
 
+TEST_CASE("Suffix arrays order every suffix on its first tokens") {
+    std::mt19937 rng(7);
+    for (const int32_t n : {1, 2, 17, 300, 2000}) {
+        std::vector<int32_t> tokens(static_cast<size_t>(n));
+        // A small alphabet makes long repeats; large ids check the dense ranking.
+        for (int32_t& t : tokens) t = static_cast<int32_t>(rng() % 4) * 100000;
+        for (const int32_t depth : {1, 4, SuffixDrafter::kMaxMatch}) {
+            std::vector<int32_t> sa;
+            SuffixDrafter::build_suffix_array(tokens, depth, sa);
+            REQUIRE(sa.size() == tokens.size());
+            std::vector<int32_t> sorted = sa;
+            std::sort(sorted.begin(), sorted.end());
+            bool permutation = true;
+            for (int32_t i = 0; i < n; ++i) permutation = permutation && sorted[static_cast<size_t>(i)] == i;
+            CHECK(permutation);
+            auto prefix = [&](int32_t pos) {
+                const int32_t end = std::min(n, pos + depth);
+                return std::vector<int32_t>(tokens.begin() + pos, tokens.begin() + end);
+            };
+            bool ordered = true;
+            for (int32_t i = 1; i < n; ++i) {
+                ordered = ordered && prefix(sa[static_cast<size_t>(i) - 1]) <= prefix(sa[static_cast<size_t>(i)]);
+            }
+            CHECK(ordered);
+        }
+    }
+}
+
+TEST_CASE("The suffix drafter proposes the branch most occurrences of the longest match agree on") {
+    SuffixDrafter drafter;
+    // "5 6" occurs three times before the end, followed by 7 8, 7 9 and 7 8:
+    // the branch is 7 8, then on a tie the newest occurrence's 4 5 6.
+    drafter.sync(std::vector<int32_t>{1, 5, 6, 7, 8, 2, 5, 6, 7, 9, 3, 5, 6, 7, 8, 4, 5, 6});
+    const SuffixDrafter::Draft& d = drafter.propose(10);
+    CHECK(d.match == 2);
+    CHECK((d.tokens == std::vector<int32_t>{7, 8, 4, 5, 6}));
+    REQUIRE(d.survival.size() == d.tokens.size());
+    bool decreasing = d.survival[0] > 0.0f && d.survival[0] <= 1.0f;
+    for (size_t i = 1; i < d.survival.size(); ++i) decreasing = decreasing && d.survival[i] <= d.survival[i - 1];
+    CHECK(decreasing);
+    CHECK(drafter.propose(2).tokens.size() == 2);
+    // Nothing repeats: no draft.
+    drafter.sync(std::vector<int32_t>{1, 2, 3, 4, 5});
+    CHECK(drafter.propose(4).tokens.empty());
+}
+
+TEST_CASE("The suffix drafter drafts from earlier sequences, counts none twice and stays bounded") {
+    std::vector<int32_t> a;  // an earlier conversation
+    for (int32_t i = 0; i < 64; ++i) a.push_back(1000 + i);
+    std::vector<int32_t> b = {7, 7, 7};
+    for (int32_t i = 0; i < 40; ++i) b.push_back(2000 + i);
+    SuffixDrafter drafter;
+    drafter.sync(a);
+    drafter.sync(b);  // a new conversation: `a` is stored
+    CHECK(drafter.stored_sequences() == 1);
+    CHECK(drafter.stored_tokens() == 64);
+    // The new conversation quotes `a`: the continuation comes from the store.
+    std::vector<int32_t> quoting = b;
+    quoting.insert(quoting.end(), {1010, 1011, 1012});
+    drafter.sync(quoting);
+    CHECK((drafter.propose(3).tokens == std::vector<int32_t>{1013, 1014, 1015}));
+    // `a` taken up again: the live sequence contains it, so it is not matched
+    // (the draft rests on the live occurrence and the one `quoting` holds).
+    std::vector<int32_t> resumed = a;
+    resumed.insert(resumed.end(), {1010, 1011});
+    drafter.sync(resumed);  // `quoting` is stored
+    CHECK(drafter.stored_sequences() == 2);
+    CHECK((drafter.propose(4).tokens == std::vector<int32_t>{1012, 1013, 1014, 1015}));
+    // Set aside, the resumed conversation replaces the stored one it continues.
+    drafter.sync(std::vector<int32_t>{9, 9, 9});
+    CHECK(drafter.stored_sequences() == 2);
+    CHECK(drafter.stored_tokens() == static_cast<int64_t>(resumed.size() + quoting.size()));
+    // A rollback of a few tokens stores nothing.
+    std::vector<int32_t> c(100, 3);
+    drafter.sync(c);
+    c.resize(95);
+    drafter.sync(c);
+    CHECK(drafter.stored_sequences() == 2);
+
+    // Not counted twice: with `a` stored and taken up again, "1010 1011"
+    // occurred once (in the live sequence), not twice.
+    SuffixDrafter single;
+    single.sync(a);
+    single.sync(b);
+    single.sync(resumed);
+    const SuffixDrafter::Draft& once = single.propose(1);
+    REQUIRE(once.tokens.size() == 1);
+    CHECK(once.tokens[0] == 1012);
+    CHECK((once.bins[0] / 2) % 3 == 0);  // the support class of a single occurrence
+
+    // Caps: tokens and sequences, least recently used out first.
+    SuffixDrafter::Limits limits;
+    limits.max_stored_tokens = 1000;
+    limits.max_sequences = 4;
+    SuffixDrafter small(limits);
+    for (int32_t s = 0; s < 20; ++s) {
+        std::vector<int32_t> seq;
+        for (int32_t i = 0; i < 300; ++i) seq.push_back(s * 1000 + i);
+        small.sync(seq);
+        CHECK(small.stored_tokens() <= limits.max_stored_tokens);
+        CHECK(small.stored_sequences() <= static_cast<size_t>(limits.max_sequences));
+        CHECK(small.memory_bytes() <= (1000 * 2 + 600) * sizeof(int32_t));
+    }
+    // The newest stored sequence (18) is there, the oldest (0) is gone.
+    small.sync(std::vector<int32_t>{5, 18000, 18001});
+    CHECK(!small.propose(1).tokens.empty());
+    small.sync(std::vector<int32_t>{5, 0, 1});
+    CHECK(small.propose(1).tokens.empty());
+    // A sequence longer than the store keeps its end.
+    std::vector<int32_t> huge;
+    for (int32_t i = 0; i < 5000; ++i) huge.push_back(500000 + i);
+    small.sync(huge);
+    small.sync(std::vector<int32_t>{1});
+    CHECK(small.stored_tokens() == 1000);
+    CHECK(small.stored_sequences() == 1);
+    small.sync(std::vector<int32_t>{2, 504990, 504991});
+    CHECK((small.propose(2).tokens == std::vector<int32_t>{504992, 504993}));
+}
+
+TEST_CASE("Suffix draft acceptance is calibrated by verification outcomes") {
+    SuffixDrafter drafter;
+    drafter.sync(std::vector<int32_t>{1, 2, 3, 4, 1, 2});
+    const SuffixDrafter::Draft first = drafter.propose(2);
+    REQUIRE(first.tokens.size() == 2);
+    const float before = first.survival[0];
+    for (int i = 0; i < 50; ++i) drafter.feedback(first, 2, 0);  // the first draft always rejected
+    const float rejected = drafter.propose(2).survival[0];
+    CHECK(rejected < before);
+    CHECK(rejected < 0.1f);
+    for (int i = 0; i < 400; ++i) drafter.feedback(first, 2, 2);  // then always accepted
+    CHECK(drafter.propose(2).survival[0] > 0.8f);
+}
+
+TEST_CASE("DraftBudget sizes a draft by its acceptance probabilities and the measured step cost") {
+    // Choices over `steps` steps for one draft's survival, with a step
+    // costing `ms(j)` for j drafts and producing the expected tokens.
+    auto histogram = [](DraftBudget& budget, const std::vector<float>& survival, double (*ms)(int32_t), int steps) {
+        std::vector<int> counts(survival.size() + 1, 0);
+        for (int i = 0; i < steps; ++i) {
+            const int32_t j = budget.choose(survival);
+            ++counts[static_cast<size_t>(j)];
+            budget.record(j, j > 0 ? 1 + static_cast<int32_t>(survival[static_cast<size_t>(j) - 1] * j + 0.5f) : 1,
+                          ms(j));
+        }
+        return counts;
+    };
+    const std::vector<float> sure = {0.99f, 0.98f, 0.97f, 0.96f, 0.95f, 0.94f, 0.93f, 0.92f};
+    const std::vector<float> doubtful = {0.02f, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Cheap verification (a dense model in RAM): sure drafts at full length,
+    // doubtful ones not at all.
+    DraftBudget dense(8);
+    CHECK(dense.choose(sure) == 0);  // plain decoding is measured first
+    dense.record(0, 1, 10.0);
+    auto cheap = [](int32_t j) { return 10.0 + 0.5 * j; };
+    CHECK(histogram(dense, sure, cheap, 200)[8] >= 180);
+    CHECK(histogram(dense, doubtful, cheap, 200)[0] >= 180);
+    CHECK(dense.cost(8) > dense.cost(0));
+    // A verified token costing 55% of a step (a MoE reading each token's
+    // experts): drafts that are 90% sure pay at length 3, 40% sure ones never.
+    DraftBudget moe(4);
+    auto dear = [](int32_t j) { return 10.0 + 5.5 * j; };
+    const std::vector<float> likely = {0.9f, 0.81f, 0.729f, 0.656f};
+    const std::vector<float> unlikely = {0.4f, 0.16f, 0.064f, 0.026f};
+    CHECK(histogram(moe, likely, dear, 200)[3] >= 170);
+    CHECK(histogram(moe, unlikely, dear, 200)[0] >= 180);
+}
+
+TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give plain decoding's tokens") {
+    // A prompt that repeats itself, so the drafter finds drafts.
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    const std::vector<int32_t> other = {1, 260, 261, 262, 263, 5, 290, 77};
+    test::TinyModelSpec hybrid;
+    hybrid.arch = "qwen35";
+    hybrid.n_layers = 4;
+    hybrid.delta_net_interval = 2;
+    SamplingParams sampled;
+    sampled.temperature = 0.9f;
+    sampled.seed = 1234;
+    sampled.max_tokens = 40;
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+        EngineConfig plain = engine_config(path);
+        plain.backend = BackendKind::Cpu;
+        auto base_engine = Engine::create(plain);
+        REQUIRE(base_engine.has_value());
+        const auto expected = run(*base_engine.value(), prompt, greedy(40));
+        const auto expected_other = run(*base_engine.value(), other, greedy(40));
+        const auto expected_sampled = run(*base_engine.value(), prompt, sampled);
+        REQUIRE(!expected.empty());
+        REQUIRE(!expected_sampled.empty());
+
+        for (const bool adaptive : {false, true}) {
+            for (const int32_t k : {3, 6}) {
+                EngineConfig suffix = plain;
+                suffix.suffix_drafts = true;
+                suffix.lookup_drafts = true;  // suffix drafts take precedence
+                suffix.draft_tokens = k;
+                suffix.adaptive_drafts = adaptive;
+                auto engine = Engine::create(suffix);
+                REQUIRE(engine.has_value());
+                GenerationStats stats;
+                CHECK(run(*engine.value(), prompt, greedy(40), &stats) == expected);
+                if (!adaptive) {
+                    CHECK(stats.draft_tokens_proposed > 0);
+                    // Tiny random models reject drafts too, so hybrid models
+                    // go back to their recurrent-state checkpoints.
+                    CHECK(stats.draft_tokens_accepted < stats.draft_tokens_proposed);
+                }
+                // Another conversation (the first one is stored), then the
+                // first again: drafts from the store, the same tokens.
+                CHECK(run(*engine.value(), other, greedy(40)) == expected_other);
+                CHECK(run(*engine.value(), prompt, greedy(40), &stats) == expected);
+                if (!adaptive) CHECK(stats.draft_tokens_accepted > 0);
+                // Sampling: plain decoding's tokens for the seed, whatever was
+                // drafted and however many drafts were verified, run after run.
+                CHECK(run(*engine.value(), prompt, sampled) == expected_sampled);
+                CHECK(run(*engine.value(), prompt, sampled, &stats) == expected_sampled);
+                if (!adaptive) CHECK(stats.draft_tokens_proposed > 0);
+            }
+        }
+    }
+}
+
 TEST_CASE("Speculative decoding works on hybrid (DeltaNet) target and draft models") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
     test::TinyModelSpec target_spec;
@@ -3144,6 +3374,7 @@ TEST_CASE("C API: create, generate, describe, errors") {
     liyab_engine_config_default(&config);
     CHECK(config.backend == LIYAB_BACKEND_AUTO);
     CHECK(config.kv_cache_type == LIYAB_KV_Q8_0);
+    CHECK(config.suffix_drafts == (EngineConfig{}.suffix_drafts ? 1 : 0));
 
     config.model_path = "/nonexistent/model.gguf";
     liyab_engine* engine = nullptr;

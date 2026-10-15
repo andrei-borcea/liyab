@@ -116,7 +116,7 @@ These rules decide what goes into the code:
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
 | Structured output: forced continuations (tool-call syntax and names in the app) | ✅ |
-| Speculative decoding: draft model or n-gram lookup, adaptive draft count, hybrid models included | ✅ |
+| Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
@@ -504,12 +504,29 @@ happens.
 
 ## Speculative decoding
 
-A small draft model proposes *k* tokens, or, with `lookup_drafts`, the conversation itself does: the tokens that
-followed the most recent earlier occurrence of the last 4…2 tokens. Lookup needs no extra weights and works with any
-model. The target verifies the drafts in one batched pass, reading its weights once for *k* + 1 tokens.
+A small draft model proposes *k* tokens, or the text itself does, with no extra weights and for any model:
+
+* **Lookup** (`lookup_drafts`): the tokens that followed the most recent earlier occurrence of the last 4…2 tokens of
+  the conversation.
+* **Suffix drafts** (`suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that occurred before, in
+  this conversation or in earlier ones of the same engine, and the continuation most of its occurrences agree on.
+  Earlier conversations are kept with a suffix array each, so finding a match is a binary search. They are set
+  aside when a prompt stops continuing them (a new conversation, a regenerated reply) and are bounded: 262,144
+  tokens (~2 MiB) in at most 64 of them, least recently used out first. A conversation taken up again replaces its
+  stored copy, so no text is counted twice. Each drafted token carries an acceptance probability, calibrated on
+  the device from what verification accepted, by match length, by how many occurrences agree and by whether the
+  conversation itself supports it. A step verifies as many drafts as give the most expected tokens per millisecond
+  at the measured cost of a step per draft count. A confident draft is verified at full length (`draft_tokens` at
+  most) and a doubtful one not at all.
+
+The target verifies the drafts in one batched pass, reading its weights once for *k* + 1 tokens. Verification is
+linear: the suffix drafts' best branch, not their whole tree, which would need tree attention masks.
 
 * **Exact.** Acceptance follows Leviathan et al. (2023), so the output keeps the target's distribution. With greedy
-  sampling it is token-for-token identical to plain decoding (tested).
+  sampling it is token-for-token identical to plain decoding (tested). Suffix drafts are kept while they equal the
+  token plain decoding samples from the same row. With temperature, their output is therefore plain decoding's own
+  tokens for a seed, whatever was drafted (tested on the CPU backend). The one exception is the tokens after a
+  forced continuation cut a step short.
 * **Hybrid models included.** Both models keep copies of their recurrent states for the last *k* + 1 tokens, so
   rejected tokens roll back exactly.
 * **Self-tuning.** How many drafts to verify is learned on the device: tokens per millisecond per draft count, the
@@ -605,7 +622,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
 * `cache_dir`, where what is measured once per model is kept (the KV cache's key scales);
 * KV type, sliding window and sinks;
-* speculative decoding;
+* speculative decoding (draft model, lookup or suffix drafts);
 * the MoE trade-offs;
 * the experimental flags.
 
@@ -701,6 +718,7 @@ liyab-cli -m moe.gguf -p "..." --memory-budget 5500         # stay within a per-
 liyab-cli -m moe.gguf -p "..." --expert-cache 3000          # MoE: experts through a 3000 MiB cache (-1 auto)
 liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts covering 90% of router weight
 liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the conversation itself
+liyab-cli -m model.gguf -p "..." --suffix                   # ... from suffix drafts (this and earlier conversations)
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model
 liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts in a 256 MiB LRU
 liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
@@ -1196,7 +1214,7 @@ downloaded.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; F16 KV, Q8_0 KV with key scaling, sliding window; MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
@@ -1221,6 +1239,14 @@ Benchmarks and tools built with the tests:
   ```bash
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
   build/liyab-kl -m Qwen3-0.6B-BF16.gguf -f tests/data/conform_text.txt --compare qwen3.ref --max-kl 0.01 --min-top1 97
+  ```
+* `liyab-spec-bench`: speculative decoding without a draft model on assistant tasks (a code edit, a summary, a
+  repeated tool output over two turns, free chat, and that tool conversation again as a new one). It compares
+  plain decoding with lookup and suffix drafts, greedy and unpaced, and reports tok/s, accepted drafts, tokens
+  per pass and whether each reply equals the plain one.
+
+  ```bash
+  build/liyab-spec-bench -m Qwen3-0.6B-BF16.gguf --modes plain,lookup,suffix,suffix:8
   ```
 * `liyab-tok`: a model's tokenizer on its own, from the full GGUF or a vocabulary-only one. It prints the ids of a
   text, compares them with reference ids (first difference shown with the pieces around it, exit status 1), or
@@ -1327,7 +1353,7 @@ Implemented features are described above. These are next, in order:
    and fewer fork/joins per CPU block.
 3. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
-   target will need, plus suffix decoding next to lookup.
+   target will need. Then verification of the suffix drafts' whole tree in one pass, with tree attention masks.
 5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
 6. **Grammar-constrained decoding.** A token mask from a JSON schema, so tool *arguments* are constrained too; then
    tools through the local API.
@@ -1391,11 +1417,12 @@ include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experime
 src/core/               engine, architecture registry and model description, transformer, loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
-                        sampler, power manager, device detection, thread pool
+                        sampler, speculative decoding (draft budget, suffix drafter), power manager, device
+                        detection, thread pool
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py,
+tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-spec-bench, conform_reference.py,
                         tokenizer_reference.py and chat_template_reference.py (Hugging Face references),
                         gguf_vocab.py,
                         table/vector/test-case generators, benchmark and brand image generators

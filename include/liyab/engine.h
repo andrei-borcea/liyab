@@ -128,6 +128,19 @@ struct EngineConfig {
     // see SpeculativeDecoder). false: always draft_tokens, which keeps sampled
     // output reproducible for a fixed seed.
     bool adaptive_drafts = true;
+    // Without a draft model: draft from the suffix drafter instead of context
+    // lookup (core/suffix_drafter.h): the longest earlier match (2..32
+    // tokens) in this conversation or in earlier ones of this engine, and the
+    // continuation most of its occurrences agree on, verified at a length
+    // chosen per step from calibrated acceptance probabilities and the
+    // measured cost of a step per draft count (adaptive_drafts). Takes
+    // precedence over lookup_drafts. Earlier conversations are kept in RAM
+    // for the engine's lifetime, at most 262144 tokens (~2 MiB) in at most 64
+    // sequences, least recently used out first. Sampled output is the same
+    // tokens as plain decoding draws from the seed (CPU backend), adaptive or
+    // not. draft_tokens is the most drafts per step, and hybrid models keep
+    // draft_tokens + 1 recurrent-state checkpoints.
+    bool suffix_drafts = false;
     std::optional<BackendKind> backend;  // force one backend; default: device ranking
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing
