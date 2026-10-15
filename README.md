@@ -1222,6 +1222,14 @@ Benchmarks and tools built with the tests:
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
   build/liyab-kl -m Qwen3-0.6B-BF16.gguf -f tests/data/conform_text.txt --compare qwen3.ref --max-kl 0.01 --min-top1 97
   ```
+* `liyab-experts` and `tools/expert_study.py`: measurements on a MoE's routed experts, for the
+  [cold-expert study](docs/research/cold-experts.md). `liyab-experts capture` runs a text one token at a time
+  through a backend that wraps the CPU one and records routing counts and traces, the input second moments of
+  every expert and sample inputs (the engine is not modified); `to-q8` copies a GGUF with its experts in Q8_0;
+  `dequant` / `dequant-raw` decode tensors or raw blocks with the engine's dequantizer. `expert_study.py`
+  (needs `numpy`, `torch`, `gguf`) computes spectra, builds candidate representations and their errors, writes
+  model variants with the least used experts replaced (for `liyab-kl`), and replays routing traces through an
+  LFU cache.
 * `liyab-tok`: a model's tokenizer on its own, from the full GGUF or a vocabulary-only one. It prints the ids of a
   text, compares them with reference ids (first difference shown with the pieces around it, exit status 1), or
   measures encoding speed (`--bench N`). `tools/tokenizer_reference.py` writes the reference from the model's
@@ -1395,9 +1403,9 @@ src/core/               engine, architecture registry and model description, tra
 src/backends/           cpu/ (NEON), metal/, vulkan/ (+ shaders/), qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, conform_reference.py,
+tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, conform_reference.py,
                         tokenizer_reference.py and chat_template_reference.py (Hugging Face references),
-                        gguf_vocab.py,
+                        gguf_vocab.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
@@ -1406,6 +1414,7 @@ app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), l
                         command bar), proto/ (gRPC interface), android/ and macos/ (native runners: shortcut,
                         command-bar window, device and data channels)
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
+docs/research/          measured studies (cold-experts.md: smaller representations of rarely used experts)
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
 scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py, thread_cpu.py
