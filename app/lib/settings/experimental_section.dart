@@ -99,6 +99,9 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
       toggle('Lookup speculative decoding', 'Drafts tokens from the conversation\'s own text and verifies them in one '
           'pass. Exact output. The lossy features above do not apply with it.', _x.lookupDrafts, (v) => _x.lookupDrafts = v),
       if (_x.lookupDrafts)
+        toggle('Suffix drafts', 'Drafts from earlier conversations too, sized per step by how likely they are to '
+            'be accepted. Keeps up to 2 MiB of earlier text in memory.', _x.suffixDrafts, (v) => _x.suffixDrafts = v),
+      if (_x.lookupDrafts)
         slider('Tokens per draft', _x.draftTokens.toDouble(), 1, 7, 6, (v) => '${v.round()}', (v) => _x.draftTokens = v.round()),
       choice('KV cache', 'Smaller caches hold longer contexts, with some loss. A change re-prepares the system prompt.',
           _x.kvCacheType, const [(1, 'Q8_0'), (0, 'F16'), (2, 'Q4_0'), (3, 'Q4_1')], (v) => _x.kvCacheType = v),

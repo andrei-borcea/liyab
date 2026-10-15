@@ -123,7 +123,10 @@ void SuffixDrafter::store(std::span<const int32_t> sequence) {
     if (cut) sequence = sequence.last(static_cast<size_t>(limits_.max_stored_tokens));
     entry.tokens.assign(sequence.begin(), sequence.end());
     entry.prefix_aligned = !cut;
-    build_suffix_array(entry.tokens, kMaxMatch, entry.sa);
+    // Sorted one token past the longest pattern: then the occurrence of a
+    // pattern that ends the sequence (no continuation) sorts first among the
+    // pattern's occurrences, where range() skips it.
+    build_suffix_array(entry.tokens, kMaxMatch + 1, entry.sa);
     entry.used = ++tick_;
     if (entry.prefix_aligned) {
         const size_t most = std::min(entry.tokens.size(), live_.size());

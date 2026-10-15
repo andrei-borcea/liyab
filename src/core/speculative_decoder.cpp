@@ -159,10 +159,6 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
     return out;
 }
 
-}  // namespace liyab
-
-namespace liyab {
-
 Result<std::vector<int32_t>> SpeculativeDecoder::suffix_step(int32_t last, std::span<const int32_t> context,
                                                              Sampler& sampler, int32_t room, const Route& target_route,
                                                              ThreadPool& pool,
