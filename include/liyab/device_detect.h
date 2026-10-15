@@ -22,11 +22,17 @@ struct SocInfo {
     std::string npu;    // NPU generation if known, e.g. "Hexagon v79"
 };
 
+// What the CPU offers for the kernels. On x86-64 the AVX flags are true only
+// when the OS also saves the 256-bit registers (XCR0), so they mean "usable".
+// The kernels themselves choose by these at run time (quant::kernel_isa()).
 struct CpuFeatures {
     bool neon = false;
     bool dotprod = false;  // SDOT/UDOT (ARMv8.2), used by the Q4_0/Q8_0 kernels
     bool i8mm = false;     // SMMLA (ARMv8.6 int8 matrix multiply): repacked Q4_K kernels
     bool fp16 = false;
+    bool avx2 = false;     // x86-64 AVX2: the "avx2" kernel set needs it with fma and f16c
+    bool fma = false;      // x86-64 FMA3
+    bool f16c = false;     // x86-64 F16C (fp16 <-> fp32 conversions, the F16 KV cache)
     int32_t cores = 0;
     int32_t performance_cores = 0;
 };

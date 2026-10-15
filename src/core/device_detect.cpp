@@ -9,6 +9,8 @@
 #include <thread>
 
 #include "backends/probes.h"
+#include "core/cpu_features.h"
+#include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/mmap_loader.h"
 
@@ -23,6 +25,10 @@
 #endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#endif
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#define LIYAB_X86_CPUID 1
 #endif
 
 namespace liyab {
@@ -206,6 +212,31 @@ std::vector<BackendKind> rank_backends(const SocInfo& soc, const Accelerators& a
     return order;
 }
 
+X86Simd detect_x86_simd() noexcept {
+    X86Simd f;
+#if defined(LIYAB_X86_CPUID)
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid(0, &eax, &ebx, &ecx, &edx) == 0) return f;
+    const unsigned max_leaf = eax;
+    __cpuid(1, eax, ebx, ecx, edx);
+    const bool osxsave = (ecx & (1u << 27)) != 0;
+    const bool avx = (ecx & (1u << 28)) != 0;
+    if (!osxsave || !avx) return f;  // no AVX, or the OS does not save the YMM registers
+    // XCR0 bits 1 (XMM) and 2 (YMM): the OS saves both on a context switch.
+    // xgetbv by its encoding: the _xgetbv intrinsic needs -mxsave on GCC.
+    unsigned xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0x6u) != 0x6u) return f;
+    f.fma = (ecx & (1u << 12)) != 0;
+    f.f16c = (ecx & (1u << 29)) != 0;
+    if (max_leaf >= 7) {
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        f.avx2 = (ebx & (1u << 5)) != 0;
+    }
+#endif
+    return f;
+}
+
 CpuFeatures detect_cpu() {
     CpuFeatures f;
     f.cores = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
@@ -226,6 +257,10 @@ CpuFeatures detect_cpu() {
     f.fp16 = (hwcap & HWCAP_ASIMDHP) != 0;
     f.i8mm = (hwcap2 & HWCAP2_I8MM) != 0;
 #endif
+    const X86Simd x86 = detect_x86_simd();
+    f.avx2 = x86.avx2;
+    f.fma = x86.fma;
+    f.f16c = x86.f16c;
     return f;
 }
 
@@ -268,8 +303,15 @@ std::string describe_device(const DeviceInfo& info) {
     out += "SoC:        " + info.soc.name + " [" + soc_vendor_name(info.soc.vendor) + ", " + info.soc.model + "]\n";
     out += "NPU:        " + (info.soc.npu.empty() ? std::string("unknown") : info.soc.npu) + "\n";
     out += "CPU:        " + std::to_string(info.cpu.cores) + " cores (" + std::to_string(info.cpu.performance_cores) +
-           " performance), neon=" + (info.cpu.neon ? "1" : "0") + " dotprod=" + (info.cpu.dotprod ? "1" : "0") +
-           " i8mm=" + (info.cpu.i8mm ? "1" : "0") + " fp16=" + (info.cpu.fp16 ? "1" : "0") + "\n";
+           " performance), ";
+#if defined(__x86_64__)
+    out += std::string("avx2=") + (info.cpu.avx2 ? "1" : "0") + " fma=" + (info.cpu.fma ? "1" : "0") +
+           " f16c=" + (info.cpu.f16c ? "1" : "0");
+#else
+    out += std::string("neon=") + (info.cpu.neon ? "1" : "0") + " dotprod=" + (info.cpu.dotprod ? "1" : "0") +
+           " i8mm=" + (info.cpu.i8mm ? "1" : "0") + " fp16=" + (info.cpu.fp16 ? "1" : "0");
+#endif
+    out += std::string(", kernels ") + quant::kernel_isa() + "\n";
     out += std::string("Memory:     ") + mem + "\n";
     out += "QNN HTP:    " + probe(info.accelerators.qnn_htp) + "\n";
     out += "NeuroPilot: " + probe(info.accelerators.neuropilot) + "\n";

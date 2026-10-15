@@ -19,10 +19,25 @@ endif()
 # --------------------------------------------------------------------------
 # Target architecture
 # --------------------------------------------------------------------------
+# On Apple the target comes from CMAKE_OSX_ARCHITECTURES when it is set: an
+# x86_64 build on an Apple-silicon Mac (run under Rosetta 2) still reports
+# CMAKE_SYSTEM_PROCESSOR=arm64. One architecture per build: a universal
+# (arm64;x86_64) build would need per-slice kernel flags.
 set(LIYAB_ARM64 OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR ANDROID_ABI STREQUAL "arm64-v8a"
-   OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+set(LIYAB_X86_64 OFF)
+if(CMAKE_OSX_ARCHITECTURES)
+  if(CMAKE_OSX_ARCHITECTURES MATCHES ";")
+    message(FATAL_ERROR "liyab: build one architecture at a time (CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES})")
+  endif()
+  if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    set(LIYAB_ARM64 ON)
+  elseif(CMAKE_OSX_ARCHITECTURES MATCHES "^x86_64h?$")
+    set(LIYAB_X86_64 ON)
+  endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR ANDROID_ABI STREQUAL "arm64-v8a")
   set(LIYAB_ARM64 ON)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" OR ANDROID_ABI STREQUAL "x86_64")
+  set(LIYAB_X86_64 ON)
 endif()
 
 # --------------------------------------------------------------------------
