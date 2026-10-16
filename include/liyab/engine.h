@@ -149,6 +149,15 @@ struct EngineConfig {
     PowerConfig power;                   // profile, thermal thresholds, pacing
     bool thermal_polling = true;         // background thermal sampling thread (while prefilling or generating)
     ExperimentalConfig experimental;
+    // KV cache format of a pooling model (one whose GGUF declares
+    // <arch>.pooling_type: an embedding model or a reranker, see Pooling),
+    // used instead of kv_cache_type. Such a model holds one input in its
+    // cache at a time and keeps no conversation, so the memory a quantized
+    // cache saves is small, while its rounding moves every vector and score:
+    // on Qwen3-Embedding-0.6B and Qwen3-Reranker-0.6B, Q8_0 kept a cosine of
+    // 0.9995 with transformers' embeddings and moved scores by up to 0.004,
+    // against 0.9999997 and 0.00006 with F16 (README, Embeddings and reranking).
+    KvCacheType pooling_kv_cache_type = KvCacheType::F16;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
@@ -256,6 +265,72 @@ struct ChatFormat {
     std::string assistant_end;      // what closes a reply
 };
 
+// ---- Pooling models: embeddings and reranking -----------------------------
+// A pooling model turns a text into one vector (an embedding model such as
+// Qwen3-Embedding) or a (query, document) pair into a relevance score (a
+// reranker such as Qwen3-Reranker), from the decoder's final hidden states.
+// What a model does is data from its GGUF, never per-model code:
+//  * <arch>.pooling_type (the GGUF numbering below) says how hidden states
+//    become one vector;
+//  * tokenizer.ggml.add_eos_token says whether every input ends with the EOS
+//    token, as the model's Hugging Face tokenizer appends it (Qwen3-Embedding:
+//    <|endoftext|>); a file converted without that flag needs the EOS token's
+//    text at the end of each input;
+//  * a reranker carries a ranking head (cls.output.weight, one row per label
+//    of <arch>.classifier.output_labels, optional cls.output.bias) and the
+//    prompt of one pair (tokenizer.chat_template.rerank, with "{query}" and
+//    "{document}" where they go).
+
+// How a model pools (<arch>.pooling_type), and what EmbedOptions asks for.
+enum class Pooling : int32_t {
+    Auto = -1,  // EmbedOptions only: the model's own pooling_type
+    None = 0,   // the model declares none (a generative model)
+    Mean = 1,   // the mean of every token's final hidden state
+    Cls = 2,    // the first token's: encoder models; in a causal decoder it does not depend on the rest of the text
+    Last = 3,   // the last token's: decoder embedding models (Qwen3-Embedding)
+    Rank = 4,   // a ranking head over the last token's state: rerankers (Engine::rerank)
+};
+
+struct EmbedOptions {
+    // Auto: the model's pooling_type, which must be Mean or Last (a model
+    // without one, or a reranker, is refused: Unsupported). Mean or Last apply
+    // to any model, a generative one included. Cls, None and Rank: InvalidArgument.
+    Pooling pooling = Pooling::Auto;
+    // > 0: keep only the first `dimensions` values of each vector, for models
+    // trained for it (Matryoshka representation learning: Qwen3-Embedding
+    // supports 32..1024), before normalizing. 0: all embedding_size() values;
+    // more than embedding_size(): InvalidArgument.
+    int32_t dimensions = 0;
+    // L2-normalize every vector (unit length, so a dot product is the cosine).
+    // false: the pooled hidden state as is.
+    bool normalize = true;
+    // An input longer than the context (Engine::context_length(), its BOS and
+    // EOS included) is InvalidArgument; true: cut its text's tokens to fit,
+    // keeping BOS and EOS (as a Hugging Face tokenizer truncates).
+    bool truncate = false;
+};
+
+struct RerankOptions {
+    // The prompt of one pair, with "{query}" and "{document}" where they go
+    // (each replaced once, in the template only); empty: the model's own
+    // (tokenizer.chat_template.rerank). Qwen3-Reranker's asks a fixed
+    // instruction; a template of your own carries another.
+    std::string prompt_template;
+    // Empty: score with the model's ranking head. Otherwise score with the LM
+    // head's logits of these tokens (each label's text must be exactly one
+    // token), the first being the positive one: for a reranker converted as a
+    // plain causal model, without a ranking head (Qwen3-Reranker: {"yes",
+    // "no"}, with its prompt in prompt_template).
+    std::vector<std::string> labels;
+};
+
+// What an embed() or rerank() call processed.
+struct PoolingStats {
+    int32_t tokens = 0;         // tokens of every input as encoded, special tokens included
+    int32_t reused_tokens = 0;  // of them, shared with another input and not processed again
+    double ms = 0.0;            // wall time of the call
+};
+
 class LIYAB_API Engine {
 public:
     static Result<std::unique_ptr<Engine>> create(const EngineConfig& config);
@@ -301,7 +376,8 @@ public:
     // prompt, prepared right after loading). Follows the same reuse rules as
     // generate(). Not reentrant (Busy); cancel() stops it between chunks.
     Status prefill(std::string_view text, bool add_bos = true);
-    // Forgets the context (the next call starts from scratch).
+    // Forgets the context (the next call starts from scratch, or from a
+    // context the prefix cache set aside that its prompt continues).
     void reset_context();
     // Saves the context (e.g. a prefilled system prompt) to `path`: KV pages,
     // recurrent states (with the oldest and the pinned state snapshots on
@@ -417,6 +493,57 @@ public:
     // when thinking is on). A template that is not prefix stable is not an
     // error: the result says so. Unsupported without a template. Thread-safe.
     [[nodiscard]] Result<ChatFormat> chat_format(std::string_view probe_json) const;
+
+    // ---- Pooling models (see Pooling) ---------------------------------------
+    // What the model declares (<arch>.pooling_type): None for a generative
+    // model, Last (Qwen3-Embedding) or Mean for an embedding model, Rank for a
+    // reranker. Thread-safe.
+    [[nodiscard]] Pooling pooling() const noexcept;
+    // Values per vector embed() returns without EmbedOptions::dimensions: the
+    // model's hidden size (1024 for Qwen3-Embedding-0.6B). Thread-safe.
+    [[nodiscard]] int32_t embedding_size() const noexcept;
+    // One vector per text, in order. Each text is encoded as generate()
+    // encodes a prompt (special tokens written in it map to their ids, BOS
+    // when the model uses one) followed by EOS when the GGUF asks for it
+    // (see Pooling), so an instruction is part of the text: Qwen3-Embedding
+    // queries are "Instruct: {task}\nQuery:{query}", its documents plain.
+    // Contract:
+    //  * every input holds at least one token and at most context_length()
+    //    positions (else InvalidArgument naming it, unless options.truncate);
+    //  * vectors have embedding_size() values (options.dimensions when set),
+    //    unit length unless options.normalize is false;
+    //  * the texts run one after another in the context, sorted so that those
+    //    sharing a token prefix (an instruction) are neighbours: each keeps
+    //    the KV of the prefix it shares with the one before and processes
+    //    only the rest (Last pooling, attention-only models). On the CPU
+    //    backend a vector is the same bits whatever the batch around it;
+    //  * the context is used and left empty: a conversation in progress is
+    //    set aside in the prefix cache when one is configured (prefix_cache_mb
+    //    or prefix_cache_disk_mb), as when another prompt replaces it, and is
+    //    processed again otherwise;
+    //  * an engine serves one call at a time: Busy while a generation, a
+    //    prefill or another embed() / rerank() runs; cancel() stops it between
+    //    passes and inside them (Cancelled);
+    //  * Unsupported when the pooling cannot apply (see EmbedOptions::pooling).
+    // `stats` (optional) receives the tokens processed and reused and the time.
+    Result<std::vector<std::vector<float>>> embed(std::span<const std::string_view> texts,
+                                                  const EmbedOptions& options = {}, PoolingStats* stats = nullptr);
+    // Relevance of each document to `query`, in order: the score of the pair's
+    // prompt (RerankOptions::prompt_template or the model's rerank template,
+    // "{query}" and "{document}" replaced, encoded like an embed() input) from
+    // the last token's state: with the model's ranking head, the softmax
+    // probability of its first label ("yes" for Qwen3-Reranker: P(yes) over
+    // {yes, no}, as its model card normalizes), or the sigmoid of a head's
+    // single output; with RerankOptions::labels, the softmax probability of
+    // the first label's token among the labels' LM-head logits. Scores are in
+    // (0, 1), higher is more relevant; they are not sorted. Errors: no prompt
+    // template (InvalidArgument) or no ranking head and no labels
+    // (Unsupported); a pair longer than context_length() (InvalidArgument
+    // naming it; no truncation). Otherwise the same contract as embed():
+    // pairs share the KV of their common prefix (the instruction and the
+    // query), the context is left empty, one call at a time, cancellable.
+    Result<std::vector<float>> rerank(std::string_view query, std::span<const std::string_view> documents,
+                                      const RerankOptions& options = {}, PoolingStats* stats = nullptr);
 
 private:
     struct Impl;

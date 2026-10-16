@@ -1,0 +1,90 @@
+{
+  "comment": "Inputs of the pooling-model conformance check (tools/pooling_reference.py, liyab-embed --cases). embed: texts exactly as embedded; queries carry Qwen3-Embedding's instruction as its model card writes it ('Instruct: {task}\\nQuery:{query}'), documents are plain. rerank: one query and its documents per case, formatted by the model's rerank prompt (its card's default instruction).",
+  "embed": [
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:What is the capital of China?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Explain gravity",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Qual è la montagna più alta d'Europa?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:如何在家里种植番茄？",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:東京で一番古い寺はどこですか？",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:¿Cuántos huesos tiene el cuerpo humano adulto?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:ما هي فوائد شرب الماء؟",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Кто написал роман «Война и мир»?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:भारत की राजधानी क्या है?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Wie funktioniert eine Wärmepumpe?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:김치는 어떻게 만드나요?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:Pourquoi le ciel est-il bleu ?",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:python sort a list of dicts by key",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:battery",
+    "The capital of China is Beijing.",
+    "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+    "Il Monte Bianco, con i suoi 4.805 metri, è la vetta più alta delle Alpi e dell'Europa occidentale.",
+    "番茄喜欢阳光充足的地方，每天至少需要六到八小时的日照，并且要保持土壤湿润但不积水。",
+    "浅草寺は東京都台東区にある都内最古の寺で、628年に創建されたと伝えられています。",
+    "El esqueleto humano adulto está formado por 206 huesos, mientras que un recién nacido tiene alrededor de 300.",
+    "يساعد شرب الماء بانتظام على تنظيم درجة حرارة الجسم وتحسين التركيز ودعم وظائف الكلى.",
+    "«Война и мир» — роман-эпопея Льва Николаевича Толстого, описывающий русское общество в эпоху войн против Наполеона.",
+    "नई दिल्ली भारत की राजधानी है और यह देश के उत्तरी भाग में स्थित है।",
+    "Eine Wärmepumpe entzieht der Umgebung Wärme und hebt sie mit Hilfe eines Kältemittels und eines Verdichters auf ein höheres Temperaturniveau.",
+    "김치는 배추를 소금에 절인 뒤 고춧가루, 마늘, 생강, 젓갈 등으로 만든 양념에 버무려 발효시킨 한국의 전통 음식입니다.",
+    "Le ciel paraît bleu parce que les molécules de l'air diffusent davantage la lumière bleue, de courte longueur d'onde, que la lumière rouge : c'est la diffusion de Rayleigh.",
+    "sorted(people, key=lambda p: p[\"age\"])  # returns a new list ordered by each dict's 'age' value",
+    "O Brasil é o maior país da América do Sul e o quinto maior do mundo em área territorial.",
+    "İstanbul, Avrupa ile Asya'yı birbirine bağlayan Boğaziçi'nin iki yakasına kurulmuş bir şehirdir.",
+    "Phở là một món ăn truyền thống của Việt Nam, gồm bánh phở, nước dùng và thịt bò hoặc gà.",
+    "Η Ακρόπολη της Αθήνας είναι ένας αρχαίος βράχος πάνω από την πόλη, όπου βρίσκεται ο Παρθενώνας.",
+    "ירושלים היא אחת הערים העתיקות בעולם, וקדושה ליהדות, לנצרות ולאסלאם.",
+    "Mlima Kilimanjaro ni mlima mrefu zaidi barani Afrika, ukiwa na urefu wa mita 5,895.",
+    "กรุงเทพมหานครเป็นเมืองหลวงและเมืองที่มีประชากรมากที่สุดของประเทศไทย",
+    "Battery life tips 🔋: lower the screen brightness, turn off background refresh, and use dark mode on OLED screens 📱.",
+    "  leading and trailing spaces  \n\tand a tab\r\n",
+    "",
+    "<|im_start|>user\nWhat is the weather like today?<|im_end|>\n<|im_start|>assistant\n",
+    "Photosynthesis is the process by which green plants, algae and some bacteria turn light energy into chemical energy. In the chloroplasts, chlorophyll absorbs mostly blue and red light; that energy splits water molecules, releasing oxygen, and drives the production of ATP and NADPH. In the Calvin cycle these carriers then fix carbon dioxide from the air into three-carbon sugars, which the plant builds into glucose, starch and cellulose. Almost every food chain on Earth starts here, and the oxygen in the atmosphere is its by-product. La fotosintesi avviene anche nelle alghe marine, che producono una parte importante dell'ossigeno del pianeta. 光合作用不仅为植物提供能量，也是地球上几乎所有生命的能量来源。 Фотосинтез происходит в хлоропластах и зависит от интенсивности света, концентрации углекислого газа и температуры. Without photosynthesis, the carbon dioxide that respiration and fires release would accumulate, and the planet's climate would be very different from the one we know today."
+  ],
+  "rerank": [
+    {
+      "query": "What is the capital of China?",
+      "documents": [
+        "The capital of China is Beijing.",
+        "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+        "北京是中华人民共和国的首都，也是全国的政治和文化中心。",
+        "Shanghai is the largest city in China by population and a global financial hub."
+      ]
+    },
+    {
+      "query": "Explain gravity",
+      "documents": [
+        "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+        "La gravità è la forza con cui i corpi dotati di massa si attraggono a vicenda; sulla Terra dà peso agli oggetti e fa cadere la mela dall'albero.",
+        "The capital of China is Beijing.",
+        "Battery life tips 🔋: lower the screen brightness, turn off background refresh, and use dark mode on OLED screens 📱."
+      ]
+    },
+    {
+      "query": "如何在家里种植番茄？",
+      "documents": [
+        "番茄喜欢阳光充足的地方，每天至少需要六到八小时的日照，并且要保持土壤湿润但不积水。",
+        "Tomatoes need at least six hours of direct sun a day, a deep pot with good drainage, and regular watering at the base of the plant.",
+        "浅草寺は東京都台東区にある都内最古の寺で、628年に創建されたと伝えられています。"
+      ]
+    },
+    {
+      "query": "Qual è la montagna più alta d'Europa?",
+      "documents": [
+        "Il Monte Bianco, con i suoi 4.805 metri, è la vetta più alta delle Alpi e dell'Europa occidentale.",
+        "Mount Elbrus in the Caucasus, at 5,642 m, is often considered the highest mountain in Europe.",
+        "Mlima Kilimanjaro ni mlima mrefu zaidi barani Afrika, ukiwa na urefu wa mita 5,895.",
+        "Le ciel paraît bleu parce que les molécules de l'air diffusent davantage la lumière bleue, de courte longueur d'onde, que la lumière rouge : c'est la diffusion de Rayleigh."
+      ]
+    },
+    {
+      "query": "python sort a list of dicts by key",
+      "documents": [
+        "sorted(people, key=lambda p: p[\"age\"])  # returns a new list ordered by each dict's 'age' value",
+        "Use list.sort(key=operator.itemgetter('name')) to sort the list in place; pass reverse=True for descending order.",
+        "Eine Wärmepumpe entzieht der Umgebung Wärme und hebt sie mit Hilfe eines Kältemittels und eines Verdichters auf ein höheres Temperaturniveau.",
+        "Photosynthesis is the process by which green plants, algae and some bacteria turn light energy into chemical energy. In the chloroplasts, chlorophyll absorbs mostly blue and red light; that energy splits water molecules, releasing oxygen, and drives the production of ATP and NADPH. In the Calvin cycle these carriers then fix carbon dioxide from the air into three-carbon sugars, which the plant builds into glucose, starch and cellulose."
+      ]
+    }
+  ]
+}

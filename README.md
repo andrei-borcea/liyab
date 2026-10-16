@@ -40,6 +40,7 @@ from the command line and **~12–16 tok/s in the app**.
 * [Context, memory and serving](#context-memory-and-serving)
 * [Heat and power](#heat-and-power)
 * [Speculative decoding](#speculative-decoding)
+* [Embeddings and reranking](#embeddings-and-reranking)
 * [Using the engine](#using-the-engine): C++, C ABI, Kotlin, Swift, command line
 * [The Liyab app](#the-liyab-app): assistant, agent tools, local OpenAI / Anthropic / gRPC API
 * [Look and feel](#look-and-feel): the living flame, colours, type
@@ -119,13 +120,14 @@ These rules decide what goes into the code:
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Structured output: grammar-constrained decoding (JSON Schema, grammar text) and forced continuations (tool-call syntax and names in the app) | ✅ |
+| Embeddings and reranking: decoder embedding models and rerankers as their GGUF declares them (last-token or mean pooling, ranking heads, or LM-head labels), shared prefixes computed once | ✅ cross-checked against Hugging Face transformers |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
 | Liyab app (Flutter): chat, model library with Hugging Face downloads, activity meters, settings, system assistant sheet (phone) or command bar (computer) | ✅ Android · ✅ macOS (Apple silicon) · 🟡 iOS app not built yet (the engine builds for iOS) |
 | Agent tools: calendar, notifications (chats, email previews), SMS, calls, contacts, clipboard on Android; calendar, Apple Mail, Messages, calls, contacts, clipboard on macOS; each source opt-in | ✅ |
 | Local API for other apps on the device: OpenAI, Anthropic Messages, gRPC; loopback only, token-protected, off by default; tools and JSON answers by constrained decoding | ✅ text (no images) |
-| Voice, actions (alarms, events, replies), local memory/RAG, embedding models | 🔜 [Roadmap](#roadmap) |
+| Voice, actions (alarms, events, replies), local memory/RAG | 🔜 [Roadmap](#roadmap) |
 | Experimental: early exit, head pruning, EGLS, 2:4 sparsity, JIT unpacker, persistent KV prefix files, io_uring | 🧪 `LIYAB_ENABLE_EXPERIMENTAL` |
 
 ---
@@ -317,6 +319,9 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
   first position on (the reference switches when the sequence grows past it, rotating earlier keys again). YaRN is
   rejected with a clear error.
   `liyab_supported_architectures()` lists what a build runs, so front ends can filter downloads.
+* **Embedding models and rerankers** built on these architectures (Qwen3-Embedding, Qwen3-Reranker) run as their
+  GGUF declares them: see [Embeddings and reranking](#embeddings-and-reranking). Encoder-only models (BERT, XLM-R)
+  are not supported.
 * **MoE details:**
   * softmax or sigmoid gating, optional selection bias, top-k, renormalization and scale from the metadata;
   * an optional shared expert with a sigmoid gate;
@@ -648,6 +653,73 @@ conversation. Every reply was identical to plain decoding's.
 
 ---
 
+## Embeddings and reranking
+
+Local memory and retrieval need two more kinds of model next to the generative one: an embedding model, which turns
+a text into a vector so similar texts lie close together, and a reranker, which scores how well a document answers a
+query. Decoder models fine-tuned for these jobs (Qwen3-Embedding, Qwen3-Reranker) run on the architectures above with
+the same forward pass; `Engine::embed()` and `Engine::rerank()` (C: `liyab_engine_embed` / `_rerank`) use them.
+
+* **What a model does is data from its GGUF**, never a per-model branch:
+  * `<arch>.pooling_type` says how the decoder's final hidden states become one vector: the last token's (3,
+    Qwen3-Embedding), the mean of all tokens' (1), or a ranking head over the last token's (4, a reranker).
+    `Engine::pooling()` reports it.
+  * `tokenizer.ggml.add_eos_token` ends every input with the EOS token, as the model's Hugging Face tokenizer
+    appends it (Qwen3-Embedding's `<|endoftext|>`, whose state is the one pooled). A file converted without the flag
+    needs the token's text at the end of each input.
+  * A reranker carries its ranking head (`cls.output.weight`, one row per label of
+    `<arch>.classifier.output_labels`: Qwen3-Reranker's are the rows of "yes" and "no" in its LM head, with an
+    optional `cls.output.bias`) and the prompt of one pair (`tokenizer.chat_template.rerank`, with `{query}` and
+    `{document}`). Some published Qwen3-Reranker GGUFs are plain causal models without either: `RerankOptions`
+    gives the prompt and `labels` (`{"yes", "no"}`), and the pair is scored with the LM head's logits of those
+    tokens, the way the model card does.
+* **How.** `embed()` runs each text through the transformer without the LM head and takes the final hidden state
+  after the output norm, the state the LM head would read: the last token's or the mean of every token's. Vectors are
+  L2-normalized; `dimensions` keeps the first values for models trained for it (Qwen3-Embedding: 32 to 1,024).
+  `rerank()` writes each pair into the prompt and scores the last token's state with the head: the softmax
+  probability of the first label, which for Qwen3-Reranker is P(yes) over {yes, no}, its model card's
+  normalization (a head with one output: its sigmoid). An instruction is part of the text: Qwen3-Embedding queries
+  are `Instruct: {task}\nQuery:{query}`, its documents plain text; Qwen3-Reranker's prompt carries its instruction.
+* **Shared prefixes are computed once.** The inputs of a call run one after another in the context, sorted by
+  their tokens, and each keeps the KV of the prefix it shares with the one before: the queries' instruction, the
+  reranker's system prompt and query. That is 17% of the tokens of the embedding check set below and 47% of the
+  reranking one. The last token always runs. On the CPU backend a row's result does not depend on the pass it is
+  computed in, so a vector or a score is the same bits alone, in any batch and in any order (tested; also on Metal
+  for the models below). Hybrid models start every input over (their recurrent states cannot rewind to any
+  position), and a mean needs every row, so mean pooling shares nothing.
+* **The KV cache of a pooling model is F16** (`EngineConfig::pooling_kv_cache_type`): it holds one input at a time
+  and no conversation, so a quantized cache saves little memory, while its rounding moves every result. With the
+  Q8_0 default of generative models, Qwen3-Embedding-0.6B's vectors kept a cosine of 0.99949 with transformers' and
+  Qwen3-Reranker-0.6B's scores moved by up to 0.0038; with F16, 0.9999997 and 0.00006.
+* **Contract.** An input holds at most `context_length()` tokens, its special tokens included; a longer one is an
+  error naming it, or is cut (`EmbedOptions::truncate`, keeping BOS and EOS) for embeddings. The calls use the
+  engine's context and leave it empty: a conversation in progress is set aside in the prefix cache when one is
+  configured, and restored when its next prompt comes, as when another conversation's prompt replaces it. An
+  engine serves one call at a time (`Busy` while a generation, a prefill or another call runs), and `cancel()`
+  stops a call within a block of the model. The public header has the whole contract.
+
+**Against Hugging Face transformers.** `tools/pooling_reference.py` computes the reference the way the model cards
+do, in float32 (for Qwen3-Embedding it reproduces its card's example scores to 1e-6), over
+`tests/data/pooling_cases.json`: 39 texts in 18 languages, code and emoji (Instruct-formatted queries, documents,
+an empty text, a chat-formatted text, a 232-token paragraph that changes language four times) and 5 queries with 19
+documents. `liyab-embed` checks that every input encodes to the reference's token ids, then compares. Every
+input gave the reference's ids, and every vector and score was the same bits alone as in its batch:
+
+| GGUF | Backend | Against the reference |
+| :--- | :--- | :--- |
+| Qwen3-Embedding-0.6B F16 (Qwen's), last token | CPU / Metal | cosine ≥ 0.99999965 / 0.99999967 per vector |
+| the same, mean pooling | CPU | cosine ≥ 0.99999964 |
+| the same, not normalized | CPU | relative L2 error ≤ 0.00084 |
+| Qwen3-Reranker-0.6B BF16 (ranking head) | CPU / Metal | scores within 0.000063 |
+| the same, scored with the LM head's "yes" and "no" (`labels`) | CPU | scores within 0.000063 |
+| Qwen3-Embedding-0.6B Q8_0 (Qwen's) | CPU / Metal | cosine mean 0.9972 / 0.9983; ≥ 0.9983 / 0.9994 except the empty text (its EOS alone): 0.92 / 0.95 |
+| Qwen3-Reranker-0.6B Q8_0 (ggml-org) | CPU / Metal | scores within 0.011 / 0.012 |
+
+The 8-bit files lose what their weights lose (and, on the CPU, what 8-bit activations lose), most where a single
+token's state is pooled: use F16 or BF16 files of these small models when the vectors must match the reference.
+
+---
+
 ## Using the engine
 
 ### C++
@@ -686,6 +758,17 @@ auto schema = liyab::Grammar::from_json_schema(R"({"type": "object", "properties
 liyab::GenerateOptions options;
 options.grammar = *schema;  // or options.continuation: forced text and constrained spans where you choose
 auto stats = engine.value()->generate(prompt, params, on_piece, options);
+```
+
+Embeddings and reranking, with an embedding model and a reranker (each its own engine):
+
+```cpp
+const std::string_view texts[] = {
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:What is the capital of China?",
+    "The capital of China is Beijing."};
+auto vectors = embedder->embed(texts);  // unit vectors of embedding_size() values; dot product = cosine
+const std::string_view documents[] = {"The capital of China is Beijing.", "Gravity is a force..."};
+auto scores = reranker->rerank("What is the capital of China?", documents);  // P(relevant) per document
 ```
 
 `Engine::cancel()` is thread-safe and stops at the next token. `prefill(text)` processes a prefix ahead of time,
@@ -730,6 +813,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_metadata` / `_describe` / `liyab_describe_device` | GGUF metadata (e.g. recommended sampling), engine and device descriptions |
 | `liyab_supported_architectures` | Architectures this build runs |
 | `liyab_engine_render_chat` / `_chat_format` | The model's chat template applied to a conversation (JSON); its layout of turns and whether it is prefix-stable |
+| `liyab_engine_embed` / `_rerank` | Pooling models: one vector per text; one relevance score per document of a query |
+| `liyab_engine_pooling` / `_embedding_size` | What the model pools (none, mean, last token, rank); the values per vector |
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
@@ -744,7 +829,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 * the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
 * `cache_dir`, where what is measured once per model is kept (the KV cache's key scales);
-* KV type, sliding window and sinks;
+* KV type, sliding window and sinks, and the KV type of pooling models (`pooling_kv_cache_type`, F16 by default);
 * speculative decoding (draft model, lookup or suffix drafts);
 * the MoE trade-offs;
 * the experimental flags.
@@ -1416,6 +1501,7 @@ downloaded.
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE); streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases; fused QKV and gate/up projections, LongRoPE short and long factors; F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
+| `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
@@ -1476,6 +1562,20 @@ Benchmarks and tools built with the tests:
   ```
   `liyab-tok -m model.gguf --render request.json` applies the GGUF's chat template to a request, and `--format
   PROBE` prints its layout of turns and whether it is prefix-stable.
+* `liyab-embed`: an embedding model or a reranker on its own. It embeds the texts of a cases file or reranks its
+  queries' documents, checks every input's token ids and then each vector's cosine (`--min-cosine`, default
+  0.999) or each score's distance (`--max-score-diff`, default 0.001) against `tools/pooling_reference.py`'s
+  reference, written from Hugging Face transformers the way the model cards run the models (needs `torch` and
+  `transformers`). It also runs every input on its own and checks it gives the same bits as in the batch, and
+  `--bench N` measures texts or pairs per second. `--pooling`, `--no-normalize`, `--labels` and `--template`
+  select the other paths.
+
+  ```bash
+  tools/pooling_reference.py --embedding Qwen/Qwen3-Embedding-0.6B --reranker Qwen/Qwen3-Reranker-0.6B \
+      --cases tests/data/pooling_cases.json --out pooling.ref.json
+  build/liyab-embed -m Qwen3-Embedding-0.6B-f16.gguf --cases tests/data/pooling_cases.json --ref pooling.ref.json
+  build/liyab-embed -m Qwen3-Reranker-0.6B-BF16.gguf --cases tests/data/pooling_cases.json --ref pooling.ref.json
+  ```
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
@@ -1562,7 +1662,8 @@ Implemented features are described above. These are next, in order:
    * more block parts described as data (YaRN RoPE, MLA, fused expert tensors, logit soft-capping), then
      DeepSeek and Gemma 2;
    * per-block KV caches, so blocks with a sliding window keep only their window's rows;
-   * later, multimodal, embedding, reranking and classification models.
+   * later, multimodal and classification models, and encoder-only embedding models (BERT, XLM-R: bidirectional
+     attention, learned positions, LayerNorm with bias, WordPiece and Unigram vocabularies).
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
    and fewer fork/joins per CPU block.
 3. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
@@ -1571,7 +1672,9 @@ Implemented features are described above. These are next, in order:
 5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
 6. **Constrained arguments for the app's own tools.** The local API's calls are constrained by their schemas; the
    assistant's own tool calls still force only their syntax and names.
-7. **Pooling models** for local memory and retrieval (embeddings, reranker, intent router), next to generative ones.
+7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
+   data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
+   pass (a mask per input), so short texts fill the matrix kernels.
 8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
 9. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
@@ -1625,6 +1728,9 @@ Implemented features are described above. These are next, in order:
   1/√(d/heads), which its GGUF does not record: it is not supported (it runs with 1/√head_dim).
 * **DeltaNet** runs its recurrence token by token on the CPU, also during prefill: no chunked parallel scan or GPU
   kernel yet.
+* **Embeddings and reranking:** decoder models only (no encoder-only models). The inputs of a call run one pass
+  each, so short texts give the matrix kernels few rows. F16 and BF16 weights multiply row by row on the CPU (no
+  tiled float kernel yet), which makes their files several times slower to embed with than Q8_0 ones.
 * **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as
   `anyOf` (overlapping branches are not told apart); speculative decoding pauses while a grammar is active.
 * **Split GGUF:** dense split models use the older `mmap` streaming window. A split model opened through the system
@@ -1650,7 +1756,8 @@ Implemented features are described above. These are next, in order:
 
 ```
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
-src/core/               engine, architecture registry and model description, transformer, loader, KV cache and
+src/core/               engine, architecture registry and model description, transformer, pooling models
+                        (embeddings, reranking), loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
                         sampler, speculative decoding (draft budget, suffix drafter), power manager, device
@@ -1660,8 +1767,8 @@ src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*),
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
-                        conform_reference.py, tokenizer_reference.py and chat_template_reference.py (Hugging
-                        Face references),
+                        liyab-embed, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
+                        and pooling_reference.py (Hugging Face references),
                         gguf_vocab.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
