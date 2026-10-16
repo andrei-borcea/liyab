@@ -1163,6 +1163,9 @@ MoE 0.0056 (95.7%), whose keys need no scaling. `--kv f16` removes the remaining
   one token for 2 tokens, 2.5× for 3.
 * **2:4 sparsity on phones.** There are no sparse tensor units, so index decoding costs more than the halved
   multiply-accumulates: −54% decode (see [Experimental](#experimental-modules)).
+* **Binary low-rank experts (LittleBit-style).** Qwen3.6's experts are nearly full-rank (90% of the energy needs
+  ~65% of the rank), so binary factors at 1 bit/weight lose about half of each expert: with the least used quarter
+  replaced, KL 0.069 against 0.0095 for Q3_K ([study](docs/research/cold-experts.md)).
 * **Repacking every streamed expert on read.** It added ~0.1–0.2 ms to each decode miss (−6% decode), so only
   experts read for batched passes are repacked.
 
@@ -1342,7 +1345,11 @@ Implemented features are described above. These are next, in order:
 7. **Pooling models** for local memory and retrieval (embeddings, reranker, intent router), next to generative ones.
 8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
-9. **Smaller cold experts.** A non-uniform 3-bit tier for rarely used experts, validated with `liyab-kl`.
+9. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
+   (a format the engine already decodes): with half of each block's least used experts in it, `liyab-kl` measured
+   KL 0.016 and 94.7% top-1 agreement; with all experts, 0.040 and 91.2%, 29% fewer bytes per expert. Next: Q3_K's
+   decode cost on the phone, then the tier (a mixed file written once on the device). Binary factorization
+   (LittleBit-style) and a non-uniform 3-bit codebook were measured and not chosen.
 10. **The agent.** Planned in this order:
     * voice input (on-device speech recognition);
     * actions confirmed by the user (alarms, events, replies);
