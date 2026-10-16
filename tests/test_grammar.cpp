@@ -710,6 +710,56 @@ TEST_CASE("constrained generation: deterministic, and unconstrained generation u
     CHECK(plain == with_options);
 }
 
+TEST_CASE("constrained generation: a forced token the model would extend is left to it (token healing)") {
+    auto file = MmapLoader::open(tiny_model());
+    REQUIRE(file.has_value());
+    auto tok = Tokenizer::load(*file.value());
+    REQUIRE(tok.has_value());
+    auto trie = grammar::VocabTrie::build(*tok);
+    // The tiny vocabulary holds every substring of "▁world": a forced " wor"
+    // can be the start of " world", but of no token ending in "q" or "z".
+    const Grammar heals = text_grammar(R"(root ::= " wor" ("ld" | "m"))");
+    const Grammar keeps = text_grammar(R"(root ::= " wor" ("q" | "z"))");
+    grammar::StateTable th(heals.program());
+    grammar::StateTable tk(keeps.program());
+    CHECK(th.forced_text(th.initial()) == " wor");
+    CHECK(th.extends(th.initial(), " wor", *trie));
+    CHECK(th.extends(th.initial(), " wo", *trie));
+    CHECK(!tk.extends(tk.initial(), " wor", *trie));
+    CHECK(!th.extends(th.initial(), " he", *trie));   // the state rejects it
+    CHECK(!th.extends(th.initial(), " wox", *trie));  // no token starts so
+    CHECK(!th.extends(th.advance(th.initial(), " worl"), "d", *trie));  // nothing follows " world"
+
+    auto engine = Engine::create(config_for(tiny_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    std::set<std::string> firsts;
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+        std::string healed;
+        std::string first;
+        auto sh = e.generate("hello world", sampling(1.5f, seed, 20), [&](std::string_view piece, int32_t) {
+            if (healed.empty()) first = piece;
+            healed += piece;
+            return true;
+        }, GenerateOptions{.grammar = heals});
+        REQUIRE(sh.has_value());
+        CHECK(heals.matches(healed));
+        firsts.insert(first);
+        // With no longer token to write, the forced text stays forced, whole.
+        std::string kept;
+        auto sk = e.generate("hello world", sampling(1.5f, seed, 20), [&](std::string_view piece, int32_t) {
+            if (kept.empty()) CHECK(piece == " wor");
+            kept += piece;
+            return true;
+        }, GenerateOptions{.grammar = keeps});
+        REQUIRE(sk.has_value());
+        CHECK(keeps.matches(kept));
+        CHECK(sk->forced_tokens >= 1);
+    }
+    // The model wrote the start of " world" itself (a token of its choosing), not a forced " wor" every time.
+    CHECK((firsts.size() > 1 || !firsts.contains(" wor")));
+}
+
 TEST_CASE("C API: grammars, a constrained whole output and constrained spans") {
     liyab_grammar* bad = nullptr;
     CHECK(liyab_grammar_from_json_schema(R"({"type": "string", "pattern": "x"})", 0, &bad) == LIYAB_ERR_UNSUPPORTED);

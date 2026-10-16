@@ -1021,11 +1021,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// is one constrained span (ToolDialect.callGrammar) that admits only the
   /// names of `tools` and arguments valid against the chosen tool's spec, up
   /// to `</tool_call>`. The model chooses whether to call, which tool and the
-  /// values; every name, key and separator is forced, so a call always
-  /// parses. Nothing is constrained inside reasoning (`thinking`: the step
-  /// starts inside it), and text without a call is generated as without
-  /// tools. Tools in `loose` take arguments of any shape. Captures only
-  /// sendable values: it runs on the engine's isolate.
+  /// values; every name, key and separator is fixed by the grammar, so a
+  /// call always parses. Nothing is constrained inside reasoning
+  /// (`thinking`: the step starts inside it), and text without a call is
+  /// sampled with no mask. Tools in `loose` take arguments of any shape.
+  /// Captures only sendable values: it runs on the engine's isolate.
   static Continuation Function(String generated) callStructure(ToolDialect dialect, List<AgentTool> tools,
       {required bool thinking, Set<String> loose = const {}}) {
     final specs = [for (final t in tools) t.spec];

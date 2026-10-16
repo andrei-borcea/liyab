@@ -138,9 +138,10 @@ enum ToolDialect {
   /// arguments valid against that tool's schema (and its value grammars,
   /// ToolSpec.values), then `</tool_call>`. With constrained decoding the
   /// model chooses only the tool and the values; names, keys and every
-  /// separator are forced. Tools in `loose` (a schema the engine cannot
-  /// enforce) take arguments of any shape: a JSON object, or parameters with
-  /// any names and text values.
+  /// separator are fixed (forced, or sampled under the mask where a token of
+  /// the model's covers them: the engine's token healing). Tools in `loose`
+  /// (a schema the engine cannot enforce) take arguments of any shape: a JSON
+  /// object, or parameters with any names and text values.
   String callGrammar(List<ToolSpec> tools, {bool newline = true, Set<String> loose = const {}}) {
     final nl = newline ? r'"\n" ' : '';
     final rules = <String>[];
