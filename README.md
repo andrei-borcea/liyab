@@ -1671,8 +1671,9 @@ Implemented features are described above. These are next, in order:
     recurrence has a NEON path but no x86 one.
 * **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
   expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
-  supported either (a new one is a table row): Youtu-LLM's `youtu` is not one yet, so that model runs on token ids
-  only (its text cannot be encoded).
+  supported either (a new one is a table row): Youtu-LLM's `youtu` is not one yet, so its text cannot be encoded.
+  The model runs on token ids with an F16 KV cache only: a quantized cache's key scaling must encode its
+  calibration text first, and the engine refuses to load the model when it cannot.
 * **Latent attention** attends in the absorbed form also during prefill: per position and head it scores 576
   channels and accumulates 512 on DeepSeek-V2-Lite where expanded keys and values would take 192 and 128, so a long
   prompt costs more attention work than an expanded form would (the decode step, which reads the cache, is what
