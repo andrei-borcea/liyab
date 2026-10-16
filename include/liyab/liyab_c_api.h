@@ -17,8 +17,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Windows: dllexport while building liyab.dll (LIYAB_DLL_EXPORT), dllimport
+ * for its users that define LIYAB_DLL_IMPORT (the CMake target `liyab` does);
+ * loading liyab.dll at run time (FFI, LoadLibrary) needs neither. */
 #if defined(_WIN32)
+#if defined(LIYAB_DLL_EXPORT)
 #define LIYAB_C_API __declspec(dllexport)
+#elif defined(LIYAB_DLL_IMPORT)
+#define LIYAB_C_API __declspec(dllimport)
+#else
+#define LIYAB_C_API
+#endif
 #else
 #define LIYAB_C_API __attribute__((visibility("default")))
 #endif

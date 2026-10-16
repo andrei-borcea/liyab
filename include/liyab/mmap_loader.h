@@ -11,6 +11,10 @@
 // three-layer window resident (the layer being computed, plus the next two
 // being faulted in) and releases layers behind the compute cursor. Pages are
 // faulted on the prefetch thread so the compute threads never block on flash.
+//
+// Windows: the file is mapped with CreateFileMappingW / MapViewOfFile and
+// stays deletable while mapped (FILE_SHARE_DELETE), as on POSIX. Paths are
+// UTF-8 on every platform.
 #ifndef LIYAB_MMAP_LOADER_H
 #define LIYAB_MMAP_LOADER_H
 
@@ -47,16 +51,20 @@ public:
     [[nodiscard]] const std::string& path() const noexcept { return path_; }
 
     // Paging hints over [offset, offset + length), widened to whole pages and
-    // clamped to the file. They return whether madvise() accepted the hint;
-    // callers may ignore the result since every hint is advisory.
+    // clamped to the file. They return whether the OS accepted the hint
+    // (madvise(); on Windows the call named below); callers may ignore the
+    // result since every hint is advisory.
     //
-    // Streaming: aggressive read-ahead, pages behind the cursor reclaimed first.
+    // Streaming: aggressive read-ahead, pages behind the cursor reclaimed
+    // first. Windows has no such hint for a mapped view: always false there.
     bool advise_sequential() const noexcept;
     // Start reading pages in asynchronously (prefetch upcoming layers).
+    // Windows: PrefetchVirtualMemory.
     bool advise_willneed(size_t offset, size_t length) const noexcept;
     // Drop our page-table entries now. The mapping is read-only and file
     // backed, so this frees RSS immediately and the next access re-reads the
-    // page from the page cache or flash; no data can be lost.
+    // page from the page cache or flash; no data can be lost. Windows:
+    // VirtualUnlock, which takes unlocked pages out of the working set.
     bool advise_dontneed(size_t offset, size_t length) const noexcept;
     // Faults [offset, offset + length) in by touching one byte per page.
     void touch(size_t offset, size_t length) const noexcept;
@@ -138,7 +146,8 @@ public:
     [[nodiscard]] std::pair<size_t, size_t> layer_range(int32_t slot) const;
     // Selective residency (MoE expert streaming): tensors for which
     // `resident` is true are paged in now and stay mapped; the others are
-    // marked MADV_RANDOM (no read-ahead), because their bytes are read through
+    // released and marked MADV_RANDOM (no read-ahead; Windows has no such
+    // hint, they are only released), because their bytes are read through
     // another path. Turns off the streaming window (call before
     // configure_layers). Returns the resident bytes.
     size_t keep_resident(const std::function<bool(const TensorView&)>& resident);
@@ -217,7 +226,10 @@ LIYAB_API uint64_t xxhash64(const void* data, size_t length, uint64_t seed = 0) 
 // the engine derives once per model and keeps on storage.
 LIYAB_API uint64_t model_fingerprint(const MappedFile& file) noexcept;
 
-// Physical memory the process can still use without being killed, in bytes.
+// Physical memory the process can still use without being killed, in bytes
+// (iOS: os_proc_available_memory; macOS: free, inactive and purgeable pages;
+// Linux / Android: MemAvailable; Windows: available physical memory, free and
+// standby pages). 0 when unknown.
 LIYAB_API uint64_t available_memory_bytes() noexcept;
 
 // available_memory_bytes() capped by `budget_bytes` when it is > 0. Platform

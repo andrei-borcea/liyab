@@ -17,7 +17,19 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>     // GetProcessMemoryInfo
+#include <shellapi.h>  // CommandLineToArgvW
+#else
 #include <sys/resource.h>
+#endif
 
 #include "liyab/liyab_c_api.h"
 
@@ -25,6 +37,7 @@ namespace {
 
 liyab_engine* g_engine = nullptr;
 
+// Ctrl+C. On Windows the C runtime calls it on a thread of its own.
 void on_sigint(int) {
     if (g_engine != nullptr) liyab_engine_cancel(g_engine);  // async-signal-safe: sets an atomic flag
 }
@@ -47,8 +60,15 @@ int32_t on_piece(const char* piece, size_t len, int32_t, void* user) {
 }
 
 // The process's peak resident memory in MiB. ru_maxrss counts KiB on Linux
-// and Android, bytes on Apple platforms.
+// and Android, bytes on Apple platforms; Windows reports the peak working set
+// in bytes.
 double peak_rss_mib() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof counters;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters)) return 0.0;
+    return static_cast<double>(counters.PeakWorkingSetSize) / (1024.0 * 1024.0);
+#else
     rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) != 0) return 0.0;
 #if defined(__APPLE__)
@@ -56,7 +76,45 @@ double peak_rss_mib() {
 #else
     return static_cast<double>(usage.ru_maxrss) / 1024.0;
 #endif
+#endif
 }
+
+#if defined(_WIN32)
+// The arguments as UTF-8, the encoding of every string the C API takes.
+// main()'s argv holds them in the ANSI code page instead (UTF-8 only where the
+// executable's manifest takes effect, Windows 10 1903 and later), which cannot
+// represent most of a prompt's characters; the wide command line holds them all.
+std::vector<std::string> utf8_arguments() {
+    std::vector<std::string> args;
+    int argc = 0;
+    wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (wide == nullptr) return args;
+    for (int i = 0; i < argc; ++i) {
+        // With length -1 the size counts the terminating NUL.
+        const int n = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string arg(static_cast<size_t>(std::max(n, 1)), '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, arg.data(), n, nullptr, nullptr);
+        arg.resize(static_cast<size_t>(std::max(n - 1, 0)));
+        args.push_back(std::move(arg));
+    }
+    LocalFree(wide);
+    return args;
+}
+
+// The console shows the bytes it is sent in its own code page (an OEM one by
+// default), so replies print as UTF-8 only while it is switched to UTF-8: done
+// for the life of the process and undone at exit, since the console outlives
+// it. Output to a file or a pipe is UTF-8 either way.
+struct Utf8Console {
+    UINT previous = GetConsoleOutputCP();  // 0 without a console
+    Utf8Console() {
+        if (previous != 0) SetConsoleOutputCP(CP_UTF8);
+    }
+    ~Utf8Console() {
+        if (previous != 0) SetConsoleOutputCP(previous);
+    }
+};
+#endif
 
 // `s` as a JSON string. Replies are whole UTF-8 (the C API never splits a
 // character), which JSON carries as is; only quotes, backslashes and control
@@ -232,6 +290,16 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    static const Utf8Console console;  // static: restored by std::exit() too
+    std::vector<std::string> utf8_args = utf8_arguments();
+    std::vector<char*> utf8_argv;
+    for (std::string& arg : utf8_args) utf8_argv.push_back(arg.data());
+    if (!utf8_argv.empty()) {
+        argc = static_cast<int>(utf8_argv.size());
+        argv = utf8_argv.data();
+    }
+#endif
     liyab_engine_config config;
     liyab_engine_config_default(&config);
     liyab_sampling_params params;

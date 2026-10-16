@@ -1,6 +1,8 @@
 #include "liyab/device_detect.h"
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -10,6 +12,7 @@
 
 #include "backends/probes.h"
 #include "core/cpu_features.h"
+#include "core/os.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/mmap_loader.h"
@@ -26,9 +29,20 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// CPUID: MSVC's intrinsics where _MSC_VER is defined (cl and clang-cl, whose
+// <intrin.h> would collide with <cpuid.h>'s __cpuid macro), <cpuid.h> with
+// GCC and Clang elsewhere (MinGW included).
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+#include <immintrin.h>  // _xgetbv
+#include <intrin.h>     // __cpuidex
+#define LIYAB_X86_CPUID 1
+#define LIYAB_X86_CPUID_MSVC 1
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
 #define LIYAB_X86_CPUID 1
+#endif
+#if defined(_WIN32)
+#include "core/windows_api.h"
 #endif
 
 namespace liyab {
@@ -147,17 +161,63 @@ std::string sysctl_string(const char* name) {
 #endif
 
 
+#if defined(_WIN32)
+// The processor's marketing name as Windows records it at boot (the CPUID
+// brand string on x86-64), without the padding some CPUs put around it.
+std::string windows_processor_name() {
+    wchar_t name[256] = {};
+    DWORD bytes = sizeof name;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"ProcessorNameString", RRF_RT_REG_SZ, nullptr, name, &bytes) != ERROR_SUCCESS) {
+        return {};
+    }
+    std::string text = os::narrow(name);
+    const size_t first = text.find_first_not_of(' ');
+    const size_t last = text.find_last_not_of(' ');
+    return first == std::string::npos ? std::string() : text.substr(first, last - first + 1);
+}
+#endif
+
 uint64_t total_memory_bytes() {
 #if defined(__APPLE__)
     uint64_t mem = 0;
     size_t len = sizeof mem;
     return sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 ? mem : 0;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullTotalPhys) : 0;
 #else
     const long pages = sysconf(_SC_PHYS_PAGES);
     const long page = sysconf(_SC_PAGESIZE);
     return pages > 0 && page > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(page) : 0;
 #endif
 }
+
+#if defined(LIYAB_X86_CPUID)
+// CPUID leaf `leaf`, sub-leaf `subleaf` -> eax, ebx, ecx, edx.
+void cpuid(unsigned leaf, unsigned subleaf, unsigned (&r)[4]) noexcept {
+#if defined(LIYAB_X86_CPUID_MSVC)
+    int regs[4] = {};
+    __cpuidex(regs, static_cast<int>(leaf), static_cast<int>(subleaf));
+    for (int i = 0; i < 4; ++i) r[i] = static_cast<unsigned>(regs[i]);
+#else
+    __cpuid_count(leaf, subleaf, r[0], r[1], r[2], r[3]);
+#endif
+}
+
+// XCR0: the register state the OS saves on a context switch.
+uint64_t xcr0() noexcept {
+#if defined(LIYAB_X86_CPUID_MSVC)
+    return _xgetbv(0);
+#else
+    // xgetbv by its encoding: the _xgetbv intrinsic needs -mxsave on GCC.
+    unsigned lo = 0, hi = 0;
+    __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0));
+    return uint64_t{hi} << 32 | lo;
+#endif
+}
+#endif
 
 }  // namespace
 
@@ -215,23 +275,22 @@ std::vector<BackendKind> rank_backends(const SocInfo& soc, const Accelerators& a
 X86Simd detect_x86_simd() noexcept {
     X86Simd f;
 #if defined(LIYAB_X86_CPUID)
-    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (__get_cpuid(0, &eax, &ebx, &ecx, &edx) == 0) return f;
-    const unsigned max_leaf = eax;
-    __cpuid(1, eax, ebx, ecx, edx);
+    unsigned r[4] = {};
+    cpuid(0, 0, r);
+    const unsigned max_leaf = r[0];
+    if (max_leaf == 0) return f;
+    cpuid(1, 0, r);
+    const unsigned ecx = r[2];
     const bool osxsave = (ecx & (1u << 27)) != 0;
     const bool avx = (ecx & (1u << 28)) != 0;
     if (!osxsave || !avx) return f;  // no AVX, or the OS does not save the YMM registers
     // XCR0 bits 1 (XMM) and 2 (YMM): the OS saves both on a context switch.
-    // xgetbv by its encoding: the _xgetbv intrinsic needs -mxsave on GCC.
-    unsigned xcr0_lo = 0, xcr0_hi = 0;
-    __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
-    if ((xcr0_lo & 0x6u) != 0x6u) return f;
+    if ((xcr0() & 0x6u) != 0x6u) return f;
     f.fma = (ecx & (1u << 12)) != 0;
     f.f16c = (ecx & (1u << 29)) != 0;
     if (max_leaf >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        f.avx2 = (ebx & (1u << 5)) != 0;
+        cpuid(7, 0, r);
+        f.avx2 = (r[1] & (1u << 5)) != 0;
     }
 #endif
     return f;
@@ -239,7 +298,7 @@ X86Simd detect_x86_simd() noexcept {
 
 CpuFeatures detect_cpu() {
     CpuFeatures f;
-    f.cores = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+    f.cores = logical_core_count();
     f.performance_cores = performance_core_count();
 #if defined(__APPLE__) && defined(__aarch64__)
     f.neon = true;
@@ -278,11 +337,13 @@ DeviceInfo detect_device() {
     info.soc = classify_soc("Apple", brand, machine, "");
 #elif defined(__linux__)
     info.soc = classify_soc("", "", "", cpuinfo_hardware());
+#elif defined(_WIN32)
+    info.soc = classify_soc("", windows_processor_name(), "", "");
 #endif
     info.cpu = detect_cpu();
     info.total_memory = total_memory_bytes();
     info.available_memory = available_memory_bytes();
-    info.page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    info.page_size = os::page_size();
 
     info.accelerators.qnn_htp = probes::probe_qnn_htp();
     info.accelerators.neuropilot = probes::probe_neuropilot();
@@ -304,7 +365,7 @@ std::string describe_device(const DeviceInfo& info) {
     out += "NPU:        " + (info.soc.npu.empty() ? std::string("unknown") : info.soc.npu) + "\n";
     out += "CPU:        " + std::to_string(info.cpu.cores) + " cores (" + std::to_string(info.cpu.performance_cores) +
            " performance), ";
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     out += std::string("avx2=") + (info.cpu.avx2 ? "1" : "0") + " fma=" + (info.cpu.fma ? "1" : "0") +
            " f16c=" + (info.cpu.f16c ? "1" : "0");
 #else

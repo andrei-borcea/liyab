@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
-#include <unistd.h>
 #include <vector>
 
 #include "core/quant.h"
@@ -163,7 +162,7 @@ TEST_CASE("Quantized KV rows stay accurate; asymmetric INT4 wins on shifted data
 }
 
 TEST_CASE("Engine with an INT4 sliding-window KV cache uses less KV memory") {
-    const std::string path = test::temp_dir() + "/liyab_kv_" + std::to_string(getpid()) + ".gguf";
+    const std::string path = test::temp_dir() + "/liyab_kv_" + std::to_string(test::process_id()) + ".gguf";
     test::write_tiny_model(path);
     auto run = [&](KvCacheType type) {
         EngineConfig config;

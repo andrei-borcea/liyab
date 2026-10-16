@@ -1,16 +1,17 @@
 #include "liyab/power_manager.h"
 
-#include <dirent.h>
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string_view>
+#include <system_error>
 
 #include "core/log.h"
+#include "core/os.h"
 
 #if defined(__ANDROID__)
 #include <dlfcn.h>
@@ -39,7 +40,7 @@ const char* thermal_status_name(ThermalStatus status) noexcept {
 namespace {
 
 bool read_file(const std::string& path, char* buf, size_t size) {
-    std::FILE* f = std::fopen(path.c_str(), "r");
+    std::FILE* f = os::open_file(path, "r");
     if (!f) return false;
     size_t n = std::fread(buf, 1, size - 1, f);
     std::fclose(f);
@@ -125,11 +126,16 @@ ThermalStatus os_thermal_status() {
 
 ThermalSample read_sysfs_thermal(const std::string& root) {
     ThermalSample sample;
-    DIR* dir = opendir(root.c_str());
-    if (dir == nullptr) return sample;  // commonly denied to apps by SELinux
-    while (const dirent* entry = readdir(dir)) {
-        if (std::strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
-        const std::string zone = root + "/" + entry->d_name;
+    // std::filesystem rather than opendir(): the same listing on every OS
+    // (Windows has no <dirent.h>), and the tests run it on all of them.
+    std::error_code ec;
+    std::filesystem::directory_iterator it(os::utf8_path(root), ec);
+    if (ec) return sample;  // commonly denied to apps by SELinux
+    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        const std::string name = os::path_utf8(it->path().filename());
+        if (!name.starts_with("thermal_zone")) continue;
+        const std::string zone = root + "/" + name;
         char type[128];
         char temp[64];
         if (!read_file(zone + "/type", type, sizeof type) || !read_file(zone + "/temp", temp, sizeof temp)) continue;
@@ -147,7 +153,6 @@ ThermalSample read_sysfs_thermal(const std::string& root) {
             keep_max(sample.soc_c, static_cast<float>(value));
         }
     }
-    closedir(dir);
     return sample;
 }
 

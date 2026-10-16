@@ -15,6 +15,12 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
+#if defined(_WIN32)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>  // _mm_pause
+#endif
+#include "core/windows_api.h"
+#endif
 
 namespace liyab {
 
@@ -26,6 +32,8 @@ namespace {
     __asm__ __volatile__("yield");
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
+#elif defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();  // MSVC, which defines neither of the above: the same PAUSE instruction
 #endif
 }
 
@@ -53,6 +61,123 @@ inline void wait_step(const std::atomic<T>& a, T old) noexcept {
     cpu_relax();
 #endif
 }
+
+#if defined(_WIN32)
+// The processors as Windows' scheduler presents them, read once.
+//  * Machines with more than 64 logical processors are split into processor
+//    groups. Before Windows 11 a thread runs only in the group of the thread
+//    that created it unless it is moved, so a pool sized from every group's
+//    cores would crowd them all onto one group's (see join_processor_group).
+//  * Cores of a hybrid CPU (Intel P- and E-cores) report an EfficiencyClass,
+//    higher for the faster ones; homogeneous CPUs report 0 for every core.
+struct Topology {
+    std::vector<KAFFINITY> group_masks;            // active processors, by group number
+    std::vector<int32_t> group_performance_cores;  // physical cores of the top class, by group
+    int32_t performance_cores = 0;                 // physical cores of the top class, all groups
+    int32_t logical = 0;                           // active logical processors, all groups
+};
+
+Topology read_topology() {
+    Topology t;
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationAll, nullptr, &bytes);  // fails, and reports the size it needs
+    if (bytes == 0) return t;
+    std::vector<uint8_t> buffer(bytes);
+    if (!GetLogicalProcessorInformationEx(RelationAll,
+                                          reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+                                          &bytes)) {
+        return t;
+    }
+    // Records of varying size, in no promised order: one for the groups, one
+    // per physical core, and others (caches, NUMA nodes, packages) skipped.
+    auto each = [&](LOGICAL_PROCESSOR_RELATIONSHIP kind, const auto& fn) {
+        for (DWORD at = 0; at + sizeof(LOGICAL_PROCESSOR_RELATIONSHIP) + sizeof(DWORD) <= bytes;) {
+            const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at);
+            if (info->Size == 0 || info->Size > bytes - at) break;
+            if (info->Relationship == kind) fn(*info);
+            at += info->Size;
+        }
+    };
+    each(RelationGroup, [&](const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX& info) {
+        for (WORD g = 0; g < info.Group.ActiveGroupCount; ++g) {
+            t.group_masks.push_back(info.Group.GroupInfo[g].ActiveProcessorMask);
+            t.logical += info.Group.GroupInfo[g].ActiveProcessorCount;
+        }
+    });
+    BYTE top = 0;
+    each(RelationProcessorCore, [&](const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX& info) {
+        top = std::max(top, info.Processor.EfficiencyClass);
+    });
+    t.group_performance_cores.assign(t.group_masks.size(), 0);
+    each(RelationProcessorCore, [&](const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX& info) {
+        if (info.Processor.EfficiencyClass != top) return;
+        ++t.performance_cores;
+        const WORD group = info.Processor.GroupMask[0].Group;  // a core lies in one group
+        if (group < t.group_performance_cores.size()) ++t.group_performance_cores[group];
+    });
+    return t;
+}
+
+const Topology& topology() noexcept {
+    static const Topology t = [] {
+        try {
+            return read_topology();
+        } catch (...) {  // allocation failure: report nothing, callers fall back
+            return Topology{};
+        }
+    }();
+    return t;
+}
+
+// Moves the calling worker, pool participant `participant` (the thread that
+// calls parallel_for() is participant 0), to the processor group holding the
+// participant-th performance core, counting from the group the pool was
+// created in: the pool's threads spread over the groups as its size was
+// counted over them. With a single group (nearly every PC) nothing is set and
+// the scheduler places the workers, as on other systems. Windows 11 lets
+// threads use every group by default; one group per worker still keeps each
+// on one NUMA node there.
+void join_processor_group(int32_t participant) noexcept {
+    const Topology& t = topology();
+    if (t.group_masks.size() < 2 || t.performance_cores <= 0) return;
+    GROUP_AFFINITY current{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &current)) return;
+    const auto groups = static_cast<WORD>(t.group_masks.size());
+    int32_t slot = participant % t.performance_cores;
+    for (WORD i = 0; i < groups; ++i) {
+        const auto g = static_cast<WORD>((current.Group + i) % groups);
+        if (slot >= t.group_performance_cores[g]) {
+            slot -= t.group_performance_cores[g];
+            continue;
+        }
+        if (g != current.Group) {
+            GROUP_AFFINITY target{};
+            target.Mask = t.group_masks[g];
+            target.Group = g;
+            SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr);
+        }
+        return;
+    }
+}
+
+// SetThreadDescription (Windows 10 1607 and later), looked up at run time so
+// the library still loads on systems without it. The name shows in debuggers
+// and ETW traces, as a pthread name does in /proc and Instruments.
+void set_thread_name(const std::string& name) noexcept {
+    using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const SetDescription set = [] {
+        const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        // Through void (*)(): a cast from FARPROC to another function type
+        // needs an intermediate one compilers accept without a warning.
+        return kernel == nullptr ? nullptr
+                                 : reinterpret_cast<SetDescription>(reinterpret_cast<void (*)()>(
+                                       GetProcAddress(kernel, "SetThreadDescription")));
+    }();
+    if (set == nullptr) return;
+    const std::wstring wide(name.begin(), name.end());  // ASCII
+    set(GetCurrentThread(), wide.c_str());
+}
+#endif
 
 }  // namespace
 
@@ -158,6 +283,7 @@ int32_t ThreadPool::current_thread_id() noexcept {
 
 void ThreadPool::worker_loop(int32_t index) {
     worker_tids_[static_cast<size_t>(index)].store(current_thread_id(), std::memory_order_release);
+    const int32_t participant = index + 1;  // the caller is participant 0
     // A name of its own (a thread otherwise inherits its creator's: the CLI's,
     // or a Dart isolate's in the app), so per-thread CPU readings tell the
     // decode workers apart (scripts/thread_cpu.py). At most 15 characters.
@@ -167,10 +293,12 @@ void ThreadPool::worker_loop(int32_t index) {
         pthread_setname_np(pthread_self(), name.c_str());
 #elif defined(__APPLE__)
         pthread_setname_np(name.c_str());
+#elif defined(_WIN32)
+        set_thread_name(name);
+        join_processor_group(participant);
 #endif
     }
     uint64_t seen = 0;
-    const int32_t participant = index + 1;  // the caller is participant 0
     for (;;) {
         seen = wait_for_job(seen);
         if (stop_.load(std::memory_order_relaxed)) return;
@@ -180,8 +308,17 @@ void ThreadPool::worker_loop(int32_t index) {
     }
 }
 
+int32_t logical_core_count() noexcept {
+#if defined(_WIN32)
+    // Every group's processors: depending on the C++ runtime,
+    // hardware_concurrency() may count the current group's only.
+    if (const int32_t n = topology().logical; n > 0) return n;
+#endif
+    return static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
 int32_t performance_core_count() noexcept {
-    const auto hw = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+    const int32_t hw = logical_core_count();
 #if defined(__APPLE__)
     int32_t perf = 0;
     size_t len = sizeof perf;
@@ -207,6 +344,13 @@ int32_t performance_core_count() noexcept {
     const auto big = std::count_if(freqs.begin(), freqs.end(),
                                    [&](long khz) { return khz * 10 >= fastest * 7; });
     return std::max<int32_t>(1, static_cast<int32_t>(big));
+#elif defined(_WIN32)
+    // Physical cores of the highest efficiency class, one worker each as on
+    // Apple (hw.perflevel0.physicalcpu): SMT siblings share a core's load
+    // ports and the memory bandwidth decoding is bound by, and two workers
+    // spinning on one core slow each other down.
+    const int32_t big = topology().performance_cores;
+    return big > 0 ? std::min(big, hw) : hw;
 #else
     return hw;
 #endif
@@ -214,7 +358,7 @@ int32_t performance_core_count() noexcept {
 
 int32_t default_thread_count() noexcept {
     const int32_t big = performance_core_count();
-    const auto all = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
+    const int32_t all = logical_core_count();
     return big >= all && big > 2 ? big - 1 : big;
 }
 

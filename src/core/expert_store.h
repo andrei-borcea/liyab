@@ -5,7 +5,8 @@
 // cache and serves them from a fixed RAM budget instead:
 //
 //  * Experts are read with direct I/O (O_DIRECT on Linux/Android, F_NOCACHE
-//    on Apple) by background threads, one large aligned read per matrix, so
+//    on Apple, FILE_FLAG_NO_BUFFERING on Windows: core/direct_io.h) by
+//    background threads, one large aligned read per matrix, so
 //    the kernel neither duplicates them in the page cache nor evicts the
 //    resident (non-expert) weights to make room for them. The thread that
 //    starts an expert reads its first matrix and hands the other two to idle

@@ -1,0 +1,4 @@
+// The UTF-8 code page manifest (utf8.manifest) as the executable's manifest
+// resource (ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, type 24 = RT_MANIFEST),
+// for toolchains without MSVC's manifest tool (MinGW's windres).
+1 24 "utf8.manifest"

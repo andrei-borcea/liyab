@@ -4,7 +4,6 @@
 //   LIYAB_BENCH_MODEL=tinyllama-q4_0.gguf ./test_backends
 //
 // Without LIYAB_BENCH_MODEL the shapes come from a small synthetic model.
-#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -59,7 +58,7 @@ TEST_CASE("[bench] per-matmul latency by backend on the model's shapes") {
     if (const char* env = std::getenv("LIYAB_BENCH_MODEL")) {
         path = env;
     } else {
-        path = test::temp_dir() + "/liyab_bb_" + std::to_string(getpid()) + ".gguf";
+        path = test::temp_dir() + "/liyab_bb_" + std::to_string(test::process_id()) + ".gguf";
         test::TinyModelSpec spec;
         spec.n_embd = 512;
         spec.n_ff = 1408;

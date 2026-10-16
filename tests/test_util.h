@@ -10,6 +10,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <filesystem>
+#include <system_error>
+#endif
+
+#include "core/os.h"
+
 namespace liyab::test {
 
 struct Case {
@@ -44,11 +51,21 @@ inline int run_all() {
     return failed_cases == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-// Directory for temporary files: $TMPDIR or /tmp (/data/local/tmp on Android).
+// This process's id, which the tests put in their temporary file names.
+inline int process_id() { return os::process_id(); }
+
+// Directory for temporary files: $TMPDIR, else /tmp (/data/local/tmp on
+// Android, the user's temporary directory on Windows: %TMP% / %TEMP%).
 inline std::string temp_dir() {
     if (const char* dir = std::getenv("TMPDIR")) return dir;
 #if defined(__ANDROID__)
     return "/data/local/tmp";
+#elif defined(_WIN32)
+    std::error_code ec;
+    std::string dir = os::path_utf8(std::filesystem::temp_directory_path(ec));
+    if (ec || dir.empty()) return ".";
+    while (dir.size() > 3 && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();  // callers append "/name"
+    return dir;
 #else
     return "/tmp";
 #endif

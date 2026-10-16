@@ -39,6 +39,11 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR ANDROID_ABI S
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" OR ANDROID_ABI STREQUAL "x86_64")
   set(LIYAB_X86_64 ON)
 endif()
+# Windows: x86-64 only. Windows on Arm would need its own kernel flags and has
+# not been ported.
+if(WIN32 AND NOT LIYAB_X86_64)
+  message(FATAL_ERROR "liyab: Windows builds target x86-64 (this one targets ${CMAKE_SYSTEM_PROCESSOR})")
+endif()
 
 # --------------------------------------------------------------------------
 # Feature flags
@@ -76,6 +81,32 @@ if(LIYAB_USE_AVX2 AND NOT LIYAB_X86_64)
   message(STATUS "liyab: LIYAB_USE_AVX2 ignored on ${CMAKE_SYSTEM_PROCESSOR}")
   set(LIYAB_USE_AVX2 OFF)
 endif()
+if(WIN32)
+  # Their runtimes are opened with dlopen() and their probes read Android's
+  # libraries: not available on Windows.
+  foreach(flag VULKAN QNN NEUROPILOT)
+    if(LIYAB_USE_${flag})
+      message(FATAL_ERROR "liyab: LIYAB_USE_${flag} is not available on Windows")
+    endif()
+  endforeach()
+endif()
+
+# --------------------------------------------------------------------------
+# Windows toolchain settings (MSVC and clang-cl; MinGW takes the definitions)
+# --------------------------------------------------------------------------
+if(MSVC)
+  # /utf-8: sources and narrow string literals are UTF-8 (tokenizer tests, the
+  # CLI's text), where cl.exe would read sources in the ANSI code page.
+  # /Zc:__cplusplus: __cplusplus reports C++20 instead of 199711L.
+  # /bigobj: the largest sources exceed the default 2^16 sections per object.
+  add_compile_options(/utf-8 /Zc:__cplusplus /bigobj)
+endif()
+if(WIN32)
+  # Windows 10 and later (PrefetchVirtualMemory, processor groups, UTF-8 code
+  # page manifests); no min/max macros from <windows.h>; no deprecation
+  # warnings for the C runtime's portable functions (fopen, getenv, sscanf).
+  add_compile_definitions(_WIN32_WINNT=0x0A00 NOMINMAX _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
 
 # --------------------------------------------------------------------------
 # Core library (object library shared by libliyab and the tests)
@@ -88,6 +119,7 @@ add_library(liyab_core OBJECT
   src/core/quant_lowbit.cpp
   src/core/quant_repack.cpp
   src/core/thread_pool.cpp
+  src/core/os.cpp
   src/core/mmap_loader.cpp
   src/core/device_detect.cpp
   src/core/power_manager.cpp
@@ -146,10 +178,16 @@ foreach(flag NEON AVX2 METAL VULKAN QNN NEUROPILOT)
 endforeach()
 
 # Warnings. -ffast-math is deliberately never used: the fp16 conversions and
-# softmax rely on IEEE semantics.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+# softmax rely on IEEE semantics (nor /fp:fast with MSVC).
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   target_compile_options(liyab_core PRIVATE -Wall -Wextra -Wno-unused-parameter
     $<$<CONFIG:Release>:-ffunction-sections -fdata-sections>)
+elseif(MSVC)
+  # cl.exe and clang-cl (which reads -Wall as -Weverything). C4251 / C4275:
+  # exported classes hold standard-library members and derive from unexported
+  # hook interfaces, which is sound because a user of the C++ API must share
+  # liyab.dll's C++ runtime anyway (the C API has no such constraint).
+  target_compile_options(liyab_core PRIVATE /W3 /wd4251 /wd4275)
 endif()
 
 # ARM SIMD. On AArch64 (arm64-v8a, Apple arm64) NEON/ASIMD is part of the base
@@ -188,6 +226,8 @@ if(ANDROID)
   target_link_libraries(liyab_core PUBLIC log dl)
 elseif(UNIX AND NOT APPLE)
   target_link_libraries(liyab_core PUBLIC dl)
+elseif(WIN32)
+  target_link_libraries(liyab_core PUBLIC advapi32)  # RegGetValueW: the processor's name (device_detect.cpp)
 endif()
 if(APPLE)
   # Foundation/objc: thermal state via NSProcessInfo; Metal: GPU backend.
@@ -264,6 +304,13 @@ endif()
 # plus its usage requirements (include dirs, definitions, system libraries).
 target_link_libraries(liyab PUBLIC liyab_core)
 set_target_properties(liyab PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+if(WIN32 AND LIYAB_BUILD_SHARED)
+  # A DLL exports what is marked (LIYAB_API / LIYAB_C_API): dllexport while its
+  # sources compile, dllimport for the targets that link liyab.dll. The tests
+  # and tools link the objects themselves and need neither.
+  target_compile_definitions(liyab_core PRIVATE LIYAB_DLL_EXPORT)
+  target_compile_definitions(liyab INTERFACE LIYAB_DLL_IMPORT)
+endif()
 
 if(LIYAB_BUILD_SHARED)
   # Only LIYAB_API / LIYAB_C_API symbols are exported.
@@ -291,6 +338,8 @@ if(LIYAB_BUILD_CLI)
   target_link_libraries(liyab-cli PRIVATE liyab)
   if(ANDROID)
     target_link_options(liyab-cli PRIVATE -Wl,-z,max-page-size=16384)
+  elseif(WIN32)
+    target_link_libraries(liyab-cli PRIVATE psapi shell32)  # peak working set; the UTF-16 command line
   endif()
 endif()
 
@@ -328,4 +377,24 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)
   target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+
+# --------------------------------------------------------------------------
+# Windows executables: UTF-8 as their ANSI code page
+# --------------------------------------------------------------------------
+# Liyab's strings are UTF-8. With this manifest (Windows 10 1903 and later),
+# main()'s arguments, getenv() and the C runtime's narrow file functions of the
+# tests and tools are UTF-8 too, so paths under a user profile with non-ASCII
+# characters work. The library itself converts every path it opens (it cannot
+# rely on its host's manifest), and liyab-cli reads its UTF-16 command line.
+if(WIN32)
+  foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok)
+    if(TARGET ${exe})
+      if(MSVC)
+        target_sources(${exe} PRIVATE ${PROJECT_SOURCE_DIR}/cmake/windows/utf8.manifest)  # merged by mt.exe
+      else()
+        target_sources(${exe} PRIVATE ${PROJECT_SOURCE_DIR}/cmake/windows/utf8.rc)
+      endif()
+    endif()
+  endforeach()
 endif()

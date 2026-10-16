@@ -2,6 +2,13 @@
 #ifndef LIYAB_CORE_LOG_H
 #define LIYAB_CORE_LOG_H
 
+// printf-style format checking where the compiler has it (not cl.exe).
+#if defined(__GNUC__) || defined(__clang__)
+#define LIYAB_PRINTF_FORMAT(format_index, first_arg) __attribute__((format(printf, format_index, first_arg)))
+#else
+#define LIYAB_PRINTF_FORMAT(format_index, first_arg)
+#endif
+
 namespace liyab::log {
 
 enum class Level : int { Debug = 0, Info = 1, Warn = 2, Error = 3, Off = 4 };
@@ -12,7 +19,7 @@ void set_level(Level level) noexcept;
 // Additional sink (e.g. an app's debug console). Called from any thread.
 void set_sink(Sink sink, void* user_data) noexcept;
 bool enabled(Level level) noexcept;
-void write(Level level, const char* fmt, ...) noexcept __attribute__((format(printf, 2, 3)));
+void write(Level level, const char* fmt, ...) noexcept LIYAB_PRINTF_FORMAT(2, 3);
 
 }  // namespace liyab::log
 

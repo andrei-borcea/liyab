@@ -1,12 +1,11 @@
 #include "liyab/experimental/kv_dedup.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#include "core/os.h"
 
 namespace liyab::experimental {
 
@@ -29,13 +28,12 @@ struct Header {
     uint32_t header_bytes;  // page data starts here (OS-page aligned)
 };
 
-size_t os_page() { return static_cast<size_t>(sysconf(_SC_PAGESIZE)); }
+size_t os_page() { return os::page_size(); }
 
 }  // namespace
 
 Result<std::unique_ptr<KvDedup>> KvDedup::create(std::string directory, uint64_t fingerprint) {
-    struct stat st {};
-    if (stat(directory.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || access(directory.c_str(), W_OK) != 0) {
+    if (!os::writable_directory(directory)) {
         return Status(ErrorCode::InvalidArgument, "KV dedup directory '" + directory + "' is not a writable directory");
     }
     std::unique_ptr<KvDedup> dedup(new KvDedup());
@@ -103,12 +101,12 @@ Result<int32_t> KvDedup::save(std::span<const int32_t> tokens, int32_t n, const 
     if (n <= 0) return 0;
     const auto prefix = tokens.first(static_cast<size_t>(n));
     const std::string path = path_for(prefix, cache);
-    if (access(path.c_str(), F_OK) == 0) return 0;  // already snapshotted
+    if (os::path_exists(path)) return 0;  // already snapshotted
 
     Header h{kMagic, kVersion, key(prefix, cache), static_cast<uint32_t>(n), static_cast<uint32_t>(page),
              cache.page_bytes(), static_cast<uint32_t>(n / page), static_cast<uint32_t>(std::max<size_t>(os_page(), 4096))};
-    const std::string tmp = path + ".tmp" + std::to_string(getpid());
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    const std::string tmp = path + ".tmp" + std::to_string(os::process_id());
+    std::FILE* f = os::open_file(tmp, "wb");
     if (f == nullptr) return Status(ErrorCode::IoError, "cannot create '" + tmp + "'");
     std::vector<uint8_t> header(h.header_bytes, 0);
     std::memcpy(header.data(), &h, sizeof h);
@@ -119,8 +117,8 @@ Result<int32_t> KvDedup::save(std::span<const int32_t> tokens, int32_t n, const 
     }
     ok = std::fflush(f) == 0 && ok;
     ok = std::fclose(f) == 0 && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
+    if (!ok || !os::replace_file(tmp, path)) {
+        os::remove_file(tmp);
         return Status(ErrorCode::IoError, "cannot write KV snapshot '" + path + "'");
     }
     return n;

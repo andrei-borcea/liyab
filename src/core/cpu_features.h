@@ -9,7 +9,8 @@ namespace liyab {
 // 256-bit ones also the OS saving the YMM state across context switches
 // (OSXSAVE and XCR0 bits 1-2): a CPU with AVX2 under an OS that does not save
 // those registers would corrupt them on every preemption. All false on other
-// architectures. Cheap (a few CPUID instructions) and thread-safe.
+// architectures. Cheap (a few CPUID instructions: <cpuid.h> with GCC and
+// Clang, __cpuidex / _xgetbv with MSVC and clang-cl) and thread-safe.
 struct X86Simd {
     bool avx2 = false;
     bool fma = false;

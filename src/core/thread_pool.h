@@ -27,6 +27,13 @@ namespace liyab {
 // slowest thread did: the prime cores run ~20% faster than the performance
 // cores, and a worker the OS preempts (I/O threads, the app's UI) stalled the
 // whole job until it ran again. Now the others take over its chunks.
+//
+// Windows: workers wait with PAUSE (as on other x86-64 systems) and are named
+// with SetThreadDescription. On machines with several processor groups (more
+// than 64 logical processors), each worker is moved to a group so that the
+// pool spreads over the groups' performance cores, starting from the group of
+// the thread that created the pool; with one group, placement is left to the
+// scheduler, as everywhere else.
 class ThreadPool {
 public:
     // `n_threads` includes the calling thread; values < 1 select
@@ -94,8 +101,14 @@ private:
     std::condition_variable wake_;
 };
 
-// Number of "big" cores (highest max frequency) on this device; falls back to
-// std::thread::hardware_concurrency().
+// Logical processors the process can run on: std::thread::hardware_concurrency(),
+// on Windows summed over every processor group. At least 1.
+int32_t logical_core_count() noexcept;
+
+// Number of "big" cores on this device: on Linux / Android the CPUs whose max
+// frequency is within 70% of the fastest; on Apple and Windows the physical
+// cores of the performance level / highest EfficiencyClass (one per core, SMT
+// siblings not counted). Falls back to logical_core_count().
 int32_t performance_core_count() noexcept;
 
 // Default pool size: the performance cores, minus one when every core is a

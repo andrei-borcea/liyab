@@ -1,9 +1,11 @@
 #include "liyab/mmap_loader.h"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -14,6 +16,7 @@
 
 #include "core/direct_io.h"
 #include "core/log.h"
+#include "core/os.h"
 #include "core/quant.h"
 
 #if defined(LIYAB_USE_NEON) && defined(__ARM_NEON)
@@ -29,24 +32,91 @@
 #endif
 #endif
 
+#if defined(_WIN32)
+#include "core/windows_api.h"
+#endif
+
 namespace liyab {
 
 namespace {
 
+// Cached here as well: the paging hints and touch() run per layer and token
+// while streaming, and a local static saves them a call into os.cpp.
 size_t page_size() noexcept {
-    static const size_t size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    static const size_t size = os::page_size();
     return size;
 }
+
+#if defined(_WIN32)
+// madvise() advice has no Win32 constants: MappedFile::advise() takes these
+// on Windows (see its definition for what each one does there).
+constexpr int kAdviseWillNeed = 0;
+constexpr int kAdviseDontNeed = 1;
+constexpr int kAdviseSequential = 2;
+
+// `code` is read by the caller right after the failing call, before anything
+// else can overwrite the thread's last error.
+Status io_error(const std::string& what, const std::string& path, DWORD code) {
+    return {ErrorCode::IoError, what + " '" + path + "': " + os::error_text(code)};
+}
+#else
+constexpr int kAdviseWillNeed = MADV_WILLNEED;
+constexpr int kAdviseDontNeed = MADV_DONTNEED;
+constexpr int kAdviseSequential = MADV_SEQUENTIAL;
 
 Status io_error(const std::string& what, const std::string& path) {
     return {ErrorCode::IoError, what + " '" + path + "': " + std::strerror(errno)};
 }
+#endif
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // MappedFile
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
+// The file is opened with FILE_SHARE_READ | FILE_SHARE_DELETE: other readers
+// may map it too, and it can be deleted or replaced while mapped (it goes when
+// the view is unmapped), as an unlinked file stays readable through a POSIX
+// mapping. Writers are refused while it is mapped, since a view of a file being
+// rewritten would change under the forward pass. The whole file is one view at
+// offset 0, so the 64 KiB allocation granularity that view offsets must respect
+// never applies; the paging hints below work on 4 KiB pages. The section and
+// the file handle are closed once the view exists: the view keeps the section,
+// and the section the file.
+Result<std::unique_ptr<MappedFile>> MappedFile::open(const std::string& path) {
+    const HANDLE file = CreateFileW(os::widen(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        return io_error("cannot open", path, error);
+    }
+
+    LARGE_INTEGER bytes{};
+    if (!GetFileSizeEx(file, &bytes)) {
+        const DWORD error = GetLastError();
+        CloseHandle(file);
+        return io_error("cannot stat", path, error);
+    }
+    if (GetFileType(file) != FILE_TYPE_DISK || bytes.QuadPart <= 0) {
+        CloseHandle(file);
+        return Status(ErrorCode::IoError, "not a non-empty regular file: '" + path + "'");
+    }
+    const auto size = static_cast<size_t>(bytes.QuadPart);
+    const HANDLE section = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    const void* view = section != nullptr ? MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    const DWORD map_error = view == nullptr ? GetLastError() : 0;
+    if (section != nullptr) CloseHandle(section);
+    CloseHandle(file);
+    if (view == nullptr) return io_error("mmap failed for", path, map_error);
+
+    return std::unique_ptr<MappedFile>(new MappedFile(path, static_cast<const uint8_t*>(view), size));
+}
+
+MappedFile::~MappedFile() {
+    if (data_ != nullptr) UnmapViewOfFile(data_);
+}
+#else
 Result<std::unique_ptr<MappedFile>> MappedFile::open(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return io_error("cannot open", path);
@@ -73,23 +143,46 @@ Result<std::unique_ptr<MappedFile>> MappedFile::open(const std::string& path) {
 MappedFile::~MappedFile() {
     if (data_ != nullptr) munmap(const_cast<uint8_t*>(data_), size_);
 }
+#endif
 
 bool MappedFile::advise(size_t offset, size_t length, int flag) const noexcept {
     if (offset >= size_ || length == 0) return false;
     const size_t page = page_size();
     const size_t begin = offset & ~(page - 1);
     const size_t end = offset + std::min(length, size_ - offset);
-    return madvise(const_cast<uint8_t*>(data_) + begin, end - begin, flag) == 0;
+    void* const address = const_cast<uint8_t*>(data_) + begin;
+#if defined(_WIN32)
+    switch (flag) {
+        case kAdviseWillNeed: {
+            // Starts reading the pages in asynchronously, as MADV_WILLNEED.
+            WIN32_MEMORY_RANGE_ENTRY range{address, end - begin};
+            return PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) != 0;
+        }
+        case kAdviseDontNeed:
+            // VirtualUnlock on pages that are not locked removes them from the
+            // working set (and reports ERROR_NOT_LOCKED): resident memory drops
+            // at once, the pages stay in the standby list, and the next access
+            // maps them back from there or from the file, as MADV_DONTNEED does
+            // for a read-only file mapping.
+            return VirtualUnlock(address, end - begin) != 0 || GetLastError() == ERROR_NOT_LOCKED;
+        default:
+            // MADV_SEQUENTIAL has no counterpart for a mapped view: the memory
+            // manager's read-ahead of mapped files is its own.
+            return false;
+    }
+#else
+    return madvise(address, end - begin, flag) == 0;
+#endif
 }
 
-bool MappedFile::advise_sequential() const noexcept { return advise(0, size_, MADV_SEQUENTIAL); }
+bool MappedFile::advise_sequential() const noexcept { return advise(0, size_, kAdviseSequential); }
 
 bool MappedFile::advise_willneed(size_t offset, size_t length) const noexcept {
-    return advise(offset, length, MADV_WILLNEED);
+    return advise(offset, length, kAdviseWillNeed);
 }
 
 bool MappedFile::advise_dontneed(size_t offset, size_t length) const noexcept {
-    return advise(offset, length, MADV_DONTNEED);
+    return advise(offset, length, kAdviseDontNeed);
 }
 
 void MappedFile::touch(size_t offset, size_t length) const noexcept {
@@ -354,7 +447,7 @@ MmapLoader::~MmapLoader() {
     }
     prefetch_cv_.notify_all();
     if (prefetch_thread_.joinable()) prefetch_thread_.join();
-    for (const auto& [p, bytes] : converted_) munmap(p, bytes);
+    for (const auto& [p, bytes] : converted_) os::unmap_anonymous(p, bytes);
 }
 
 Status MmapLoader::parse(uint32_t shard) {
@@ -444,9 +537,11 @@ Status MmapLoader::parse(uint32_t shard) {
 
         uint64_t elements = 1;
         for (int d = 0; d < t.n_dims; ++d) {
-            if (__builtin_mul_overflow(elements, static_cast<uint64_t>(t.ne[d]), &elements)) {
+            const auto ne = static_cast<uint64_t>(t.ne[d]);  // >= 1, checked above
+            if (elements > std::numeric_limits<uint64_t>::max() / ne) {
                 return invalid(path, "tensor '" + name + "' size overflows");
             }
+            elements *= ne;
         }
         const uint64_t nbytes = elements / static_cast<uint64_t>(traits.block_size) *
                                 static_cast<uint64_t>(traits.block_bytes);
@@ -579,8 +674,8 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
         const size_t row_out = out.row_bytes();
         const auto rows = static_cast<size_t>(t.rows());
         const size_t bytes = row_out * rows;
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) return Status(ErrorCode::OutOfMemory, "cannot allocate requantized weights");
+        void* p = os::map_anonymous(bytes);
+        if (p == nullptr) return Status(ErrorCode::OutOfMemory, "cannot allocate requantized weights");
         converted_.emplace_back(p, bytes);
         auto* dst = static_cast<uint8_t*>(p);
         // Repacking: the same bytes, rows interleaved (a rearrangement).
@@ -640,10 +735,12 @@ size_t MmapLoader::keep_resident(const std::function<bool(const TensorView&)>& r
             bytes += t.nbytes;
         } else {
             f.advise_dontneed(t.file_offset, t.nbytes);  // drop anything read so far
-            const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#if !defined(_WIN32)  // Windows has no read-ahead switch for a range of a mapped view
+            const size_t page = page_size();
             const size_t begin = static_cast<size_t>(t.file_offset) & ~(page - 1);
             madvise(const_cast<uint8_t*>(f.data()) + begin, static_cast<size_t>(t.file_offset) + t.nbytes - begin,
                     MADV_RANDOM);
+#endif
         }
     }
     return bytes;
@@ -785,6 +882,12 @@ uint64_t available_memory_bytes() noexcept {
     }
     std::fclose(f);
     return kb * 1024;
+#elif defined(_WIN32)
+    // Free plus standby pages (the file cache Windows hands back on demand),
+    // like Linux's MemAvailable.
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullAvailPhys) : 0;
 #else
     return 0;
 #endif

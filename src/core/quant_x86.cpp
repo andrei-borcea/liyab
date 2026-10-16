@@ -35,6 +35,9 @@
 #include "core/quant_blocks.h"
 #include "core/quant_tables.h"
 
+// clang-cl takes the attribute too. cl.exe has no such attribute and needs
+// none: it compiles AVX2 intrinsics in any function, while the rest of the
+// library is built without /arch:AVX2, at the x86-64 baseline.
 #if defined(__GNUC__) || defined(__clang__)
 #define LIYAB_AVX2 __attribute__((target("avx2,fma,f16c")))
 #else
@@ -85,7 +88,19 @@ void set_avx2_enabled(bool on) noexcept {
 
 namespace {
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// cl.exe declares neither _cvtsh_ss nor _cvtss_sh: the same instructions
+// (VCVTPH2PS, VCVTPS2PH) through their vector forms, on lane 0.
+inline float h2f(uint16_t h) noexcept { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
+inline uint16_t f2h(float x) noexcept {
+    return static_cast<uint16_t>(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(x), _MM_FROUND_TO_NEAREST_INT), 0));
+}
+#else
 LIYAB_AVX2 inline float h2f(uint16_t h) noexcept { return _cvtsh_ss(h); }
+LIYAB_AVX2 inline uint16_t f2h(float x) noexcept {
+    return static_cast<uint16_t>(_cvtss_sh(x, _MM_FROUND_TO_NEAREST_INT));
+}
+#endif
 
 LIYAB_AVX2 inline __m256i load256(const void* p) noexcept {
     return _mm256_loadu_si256(static_cast<const __m256i*>(p));
@@ -176,7 +191,7 @@ LIYAB_AVX2 void quantize_row_q8_0(const float* x, BlockQ8_0* y, int64_t n) noexc
         const float amax = abs_max(xb, kBlock);
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        y[i].d = static_cast<uint16_t>(_cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT));
+        y[i].d = f2h(d);
         // std::lround: to nearest, ties away from zero. VCVTPS2DQ rounds ties
         // to even, so the magnitude is truncated and bumped when the dropped
         // fraction (exact: |v| < 2^24) is at least one half.
@@ -240,7 +255,7 @@ LIYAB_AVX2 void fp32_to_fp16_row(const float* x, uint16_t* y, int64_t n) noexcep
         _mm_storeu_si128(reinterpret_cast<__m128i*>(y + i),
                          _mm256_cvtps_ph(_mm256_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT));
     }
-    for (; i < n; ++i) y[i] = static_cast<uint16_t>(_cvtss_sh(x[i], _MM_FROUND_TO_NEAREST_INT));
+    for (; i < n; ++i) y[i] = f2h(x[i]);
 }
 
 LIYAB_AVX2 void fp16_to_fp32_row(const uint16_t* x, float* y, int64_t n) noexcept {

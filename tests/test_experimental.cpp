@@ -9,10 +9,13 @@
 // Benchmarks never fail the run: their numbers depend on the device, the
 // filesystem and the (random-weight) benchmark model, so read them as
 // relative costs, not as quality claims.
+#if defined(__linux__)
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>  // _ReadWriteBarrier
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -48,10 +51,30 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 std::string temp_path(const std::string& name) {
-    return test::temp_dir() + "/liyab_x" + std::to_string(getpid()) + "_" + name;
+    return test::temp_dir() + "/liyab_x" + std::to_string(test::process_id()) + "_" + name;
 }
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// Makes the memory at `p` observable, so a benchmark loop that only writes it
+// is not elided.
+inline void keep(const void* p) {
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" ::"r"(p) : "memory");
+#else
+    // MSVC: the pointer escapes through a volatile store, and the compiler
+    // barrier keeps the writes before it.
+    static const void* volatile escaped = nullptr;
+    escaped = p;
+    _ReadWriteBarrier();
+#endif
+}
+
+// Removes a directory the tests made, and everything in it.
+void remove_dir(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
 
 bool benchmarks_enabled() {
     const char* v = std::getenv("LIYAB_BENCH");
@@ -472,7 +495,7 @@ TEST_CASE("[bench] JIT unpacker vs NEON intrinsics vs scalar") {
                 out[i] = static_cast<int8_t>((b & 0x0F) - 8);
                 out[i + 1] = static_cast<int8_t>((b >> 4) - 8);
             }
-            asm volatile("" ::"r"(out.data()) : "memory");  // keep the loop from being elided
+            keep(out.data());  // keep the loop from being elided
         });
         const double neon = measure([&] { MmapLoader::unpack_int4_to_int8_neon(packed.data(), out.data(), n); });
         const double jitted = measure([&] { jit.value()->run(packed.data(), out.data()); });
@@ -581,8 +604,9 @@ namespace {
 
 std::string fresh_dir(const std::string& name) {
     const std::string dir = temp_path(name);
-    std::system(("rm -rf '" + dir + "'").c_str());
-    mkdir(dir.c_str(), 0755);
+    remove_dir(dir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
     return dir;
 }
 
@@ -641,7 +665,7 @@ TEST_CASE("KV dedup: restored prefix gives bit-identical logits to a full prefil
     auto c = Transformer::load(std::move(file).value(), q4);
     REQUIRE(c.has_value());
     CHECK(dedup.value()->restore(prompt, 149, c.value()->mutable_kv_cache()) == 0);
-    std::system(("rm -rf '" + dir + "'").c_str());
+    remove_dir(dir);
 }
 
 TEST_CASE("Engine with KV dedup reuses the prompt prefix across sessions") {
@@ -671,7 +695,7 @@ TEST_CASE("Engine with KV dedup reuses the prompt prefix across sessions") {
     CHECK(s2->cached_prefix_tokens == 128);
     CHECK(first == second);
     CHECK(s2->ttft_ms > 0.0);
-    std::system(("rm -rf '" + dir + "'").c_str());
+    remove_dir(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -884,7 +908,7 @@ TEST_CASE("[bench] KV dedup on a real model: time to first token across sessions
     size_t snapshot_bytes = 0;
     for (const auto& e : std::filesystem::directory_iterator(dir)) snapshot_bytes += std::filesystem::file_size(e);
     std::printf("  snapshot directory: %.2f MiB\n", static_cast<double>(snapshot_bytes) / (1 << 20));
-    std::system(("rm -rf '" + dir + "'").c_str());
+    remove_dir(dir);
 }
 
 TEST_CASE("[bench] early exit and head pruning: decode throughput") {
@@ -961,6 +985,8 @@ TEST_CASE("[bench] weight streaming I/O: mmap vs pread vs direct I/O") {
     std::printf("  streaming %zu MiB in 1 MiB chunks%s:\n", mb,
 #if defined(__linux__)
                 " (page cache dropped before each run)"
+#elif defined(_WIN32)
+                " (Windows: mapped and buffered runs may hit a warm file cache)"
 #else
                 " (macOS: mmap/pread runs may hit a warm page cache)"
 #endif
@@ -968,16 +994,14 @@ TEST_CASE("[bench] weight streaming I/O: mmap vs pread vs direct I/O") {
 
     {  // mmap + touch, the default engine path
         drop_cache();
-        const int fd = ::open(path.c_str(), O_RDONLY);
-        void* map = mmap(nullptr, static_cast<size_t>(bytes), PROT_READ, MAP_SHARED, fd, 0);
-        ::close(fd);
-        REQUIRE(map != MAP_FAILED);
+        auto map = MappedFile::open(path);
+        REQUIRE(map.has_value());
+        const uint8_t* data = map.value()->data();
         const auto t0 = Clock::now();
         volatile uint8_t sink = 0;
-        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        for (size_t off = 0; off < static_cast<size_t>(bytes); off += page) sink ^= static_cast<const uint8_t*>(map)[off];
+        const size_t page = os::page_size();
+        for (size_t off = 0; off < static_cast<size_t>(bytes); off += page) sink ^= data[off];
         report("mmap + page touch", ms_since(t0), mb);
-        munmap(map, static_cast<size_t>(bytes));
     }
     for (const auto& [name, uring, bypass, qd] : std::vector<std::tuple<const char*, bool, bool, uint32_t>>{
              {"pread (page cache)", false, false, 1},

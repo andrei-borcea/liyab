@@ -11,8 +11,6 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include "core/chat_template.h"
 #include "core/grammar.h"
 #include "core/tokenizer.h"
@@ -357,7 +355,7 @@ TEST_CASE("grammar: forced text stops at a choice and at partial characters") {
 namespace {
 
 std::string temp_path(const std::string& name) {
-    return test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_grammar_" + name;
+    return test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_grammar_" + name;
 }
 
 // The tiny model (SentencePiece: byte tokens, letters, pieces of "▁hello"
