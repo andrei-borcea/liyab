@@ -1406,7 +1406,8 @@ includes them, all off by default). Enable them through `EngineConfig::experimen
 ## Testing
 
 The tests depend on nothing beyond the compiler. They generate small GGUF models on the fly, so nothing needs to be
-downloaded.
+downloaded. One check is in Python (standard library only) and is registered when CMake finds a Python 3
+interpreter: `describe_model_registry`.
 
 | Suite | Covers |
 | :--- | :--- |
@@ -1419,6 +1420,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
+| `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
 | `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused |
 
 Benchmarks and tools built with the tests:
@@ -1639,6 +1641,9 @@ Implemented features are described above. These are next, in order:
 * **Architectures not supported yet:** Gemma 2 and 3n, Phi-1/2 and Phi MoE, DeepSeek V3/V4, fused
   `ffn_gate_up_exps` tensors and YaRN RoPE scaling. BPE pre-tokenizers beyond those of
   [Supported models](#supported-models) are not supported either (a new one is a table row).
+  `tools/describe_model.py` lists what each model lacks; for Gemma 2, DeepSeek-V2-Lite, Mistral-Nemo (its `tekken`
+  pre-tokenizer only), OLMo 2, Granite, SmolLM2 (its `smollm` pre-tokenizer only) and SmolLM3, see
+  [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
 * **Gemma 3:** the windowed blocks' keys stay in the cache for the whole context (the pages are shared by every
   block), so a long context costs Gemma 3 the KV memory of full attention. Gemma 3 27B scales its queries by
   1/√(d/heads), which its GGUF does not record: it is not supported (it runs with 1/√head_dim).

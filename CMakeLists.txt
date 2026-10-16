@@ -328,4 +328,12 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)
   target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # tools/describe_model.py reads the registry and prints rows the way architecture.cpp writes them: every
+  # row must round-trip. Standard-library Python only; registered when a Python 3 interpreter is found.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME describe_model_registry
+             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/describe_model.py --self-test
+                     --source ${PROJECT_SOURCE_DIR})
+  endif()
 endif()

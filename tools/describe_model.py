@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Describes a model for Liyab from its Hugging Face implementation and a GGUF of it, and verifies the description.
 
-    tools/describe_model.py --model Qwen/Qwen2.5-1.5B-Instruct --gguf qwen2.5-1.5b-instruct-fp16.gguf --gate
-    tools/describe_model.py --model google/gemma-2-2b-it --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q4_K_M.gguf
+    tools/describe_model.py --model Qwen/Qwen2.5-1.5B-Instruct --gguf Qwen2.5-1.5B-Instruct-f16.gguf --gate
+    tools/describe_model.py --model unsloth/gemma-2-2b-it --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf
 
 Liyab describes an architecture by one row of facts its tensors cannot tell (src/core/architecture.cpp, ArchSpec)
 and plans each block from the tensors present. This tool establishes those facts for a model and either prints the
 registry row it needs or the precise list of parts Liyab does not implement yet. It never guesses: a fact it cannot
-establish is reported as unknown, and no row is proposed.
+establish is reported as unknown, and no row is proposed. Where this GGUF disagrees with the reference (other
+weights, a window or BOS rule it does not record), that is reported as a problem of the file, apart from the row.
 
 Where the facts come from:
 
@@ -18,26 +19,31 @@ Where the facts come from:
   the FFN's activation, the MoE routing, how embeddings enter and logits leave.
 * The GGUF's metadata and tensor names (and shapes): hyperparameters, the per-block plan (mixer, fused or separate
   projections, gated attention, dense or MoE FFN, shared expert), the RoPE encoding the file carries (base, scaling,
-  frequency factors), the window, the tokenizer. Every tensor must be one the engine binds.
-* A few weights of both checkpoints, read with HTTP range requests when remote (a few MB): one block's key
-  projection, which tells whether the converter permuted its rows (so how RoPE pairs dimensions in the file), and
-  one block's norm weights, which tell which GGUF tensor holds which norm and whether a norm the reference applies
-  as x * (1 + w) is stored as 1 + w.
-* The engine's own sources: the ArchSpec fields and enums (architecture.h), the registry rows (architecture.cpp),
-  the tensors the forward pass binds (transformer.cpp), the pre-tokenizer table and tokenizer kinds.
+  frequency factors, YaRN), the window, the tokenizer and its BOS and space-prefix rules. Every tensor must be one
+  the engine binds.
+* A few weights of both checkpoints, read with HTTP range requests when remote (a few MB): two heads of one block's
+  key projection, which tell whether the converter permuted its rows (so how RoPE pairs dimensions in the file),
+  and one block's norm weights, which tell which GGUF tensor holds which norm and whether a norm the reference
+  applies as x * (1 + w) is stored as 1 + w.
+* The engine's own sources: the ArchSpec fields and enums (architecture.h), the registry rows and the metadata keys
+  and RoPE scaling types describe_model() reads (architecture.cpp: what the engine takes from the file, such as an
+  attention scale, soft caps or YaRN, is supported exactly when it reads it), the tensors the forward pass binds
+  (transformer.cpp), the pre-tokenizer table and tokenizer kinds.
 
 With --gate the row is then verified: the tool copies the source tree to a scratch directory, adds or replaces the
 row there (the repository is never modified), builds liyab-kl and liyab-tok, and runs the conformance gate:
 liyab-tok's ids against the model's own tokenizer on three texts (tools/tokenizer_reference.py), then liyab-kl
---kv f16 against transformers in float32 (tools/conform_reference.py) with --max-kl and --min-top1. The patch is
-reverted afterwards, so the scratch tree stays a pristine copy and later runs rebuild only what changed. The row is
-accepted only if every check passes. The gate needs the GGUF as a local file (a BF16/F16 one: lower bit widths add
-their own error) and downloads the Hugging Face weights.
+--ref-tokens --kv f16 against transformers in float32 (tools/conform_reference.py, eager attention when the model
+soft-caps its scores and that tool takes --attn-implementation) with --max-kl and --min-top1, which must pass and
+must find the file's own encoding of the text, BOS included, equal to the reference's. The patch is reverted
+afterwards, so the scratch tree stays a pristine copy and later runs rebuild only what changed. The row is accepted
+only if every check passes. The gate needs the GGUF as a local file (a BF16/F16 one: lower bit widths add their own
+error) and downloads the Hugging Face weights.
 
 Needs torch, transformers, huggingface_hub, numpy and gguf (for quantized tensors). Run with the toolchain on PATH
 (cmake, ninja) for --gate. --self-test checks the registry parser and printer against architecture.cpp (no network).
 Exit status: 0 when a row is proposed (and accepted with --gate), 1 when the model needs parts Liyab lacks, a fact
-is unknown or the gate fails, 2 on usage errors.
+is unknown or the gate fails, 2 on usage errors or a file that cannot be read as a GGUF.
 """
 
 import argparse
@@ -68,8 +74,10 @@ class ByteSource:
             from huggingface_hub import HfFileSystem
             # Small blocks: only a header and a few tensor rows are read.
             self.file = HfFileSystem().open(spec[len("hf://"):], "rb", block_size=256 << 10)
+            self.size = int(self.file.size)
         else:
             self.file = open(spec, "rb")
+            self.size = os.fstat(self.file.fileno()).st_size
 
     def read_at(self, offset, size):
         self.file.seek(offset)
@@ -89,18 +97,27 @@ class ByteSource:
 # GGUF: metadata, tensor infos, and the values of a few tensors
 # ----------------------------------------------------------------------------------------------------------------
 
+class FormatError(ValueError):
+    """A file that is not a GGUF this tool can read."""
+
+
 GGUF_SCALARS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 GGML_F32, GGML_F16, GGML_BF16 = 0, 1, 30
 
 
 class _Cursor:
+    """Sequential reads over a ByteSource, fetched in 1 MiB chunks (a remote header is read in a few requests)."""
+
     def __init__(self, src, offset=0):
         self.src, self.pos, self.buf, self.base = src, offset, b"", offset
 
     def read(self, n):
         while self.pos + n > self.base + len(self.buf):
-            want = max(1 << 20, self.pos + n - self.base - len(self.buf))
-            self.buf += self.src.read_at(self.base + len(self.buf), want) if want else b""
+            start = self.base + len(self.buf)
+            want = min(max(1 << 20, self.pos + n - start), self.src.size - start)
+            if want <= 0:
+                raise FormatError(f"{self.src.spec}: ends inside its GGUF header")
+            self.buf += self.src.read_at(start, want)
         out = self.buf[self.pos - self.base:self.pos - self.base + n]
         self.pos += n
         return out
@@ -125,7 +142,7 @@ class _Cursor:
             return [self.value(etype) for _ in range(count)]
         if vtype in GGUF_SCALARS:
             return self.unpack(GGUF_SCALARS[vtype])[0]
-        raise ValueError(f"unknown GGUF value type {vtype}")
+        raise FormatError(f"unknown GGUF value type {vtype}")
 
 
 class Gguf:
@@ -140,17 +157,17 @@ class Gguf:
         if count > 1:
             m = re.match(r"(.*)-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(spec.split("@")[-1]))
             if not m:
-                raise ValueError(f"{spec}: split.count {count} but the name has no -0000N-of-0000M part")
+                raise FormatError(f"{spec}: split.count {count} but the name has no -0000N-of-0000M part")
             for i in range(2, count + 1):
                 self._read_part(first.sibling(f"{m.group(1)}-{i:05d}-of-{count:05d}.gguf"))
 
     def _read_part(self, src):
         cur = _Cursor(src)
         if cur.read(4) != b"GGUF":
-            raise ValueError(f"{src.spec} is not a GGUF file")
+            raise FormatError(f"{src.spec} is not a GGUF file")
         version, n_tensors, n_kv = cur.unpack("IQQ")
         if version not in (2, 3):
-            raise ValueError(f"{src.spec}: GGUF version {version} is not supported")
+            raise FormatError(f"{src.spec}: GGUF version {version} is not supported")
         for _ in range(n_kv):
             key = cur.string()
             (vtype,) = cur.unpack("I")
@@ -496,6 +513,7 @@ class Description:
         self.notes = []
         self.row = None
         self.registry = None  # comparison with the existing row
+        self.softcap = False  # the reference soft-caps attention scores (its reference run needs eager attention)
 
     def set(self, field, value, evidence):
         self.fields[field] = (value, evidence)
@@ -658,7 +676,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if not arch:
         d.unknown.append("the GGUF has no general.architecture")
         return d, None, g
-    facts = reference_trace.describe_reference(model, revision, trust_remote_code)
+    try:
+        facts = reference_trace.describe_reference(model, revision, trust_remote_code)
+    except Exception as e:  # noqa: BLE001 - whatever stops the reference stops the description: say what
+        d.unknown.append(f"the reference implementation could not be traced: {type(e).__name__}: {e}")
+        return d, None, g
     cfg = facts["config"]
     d.set("name", arch, "general.architecture of the GGUF")
     d.notes.append(f"reference: {facts['model_class']} ({facts.get('model_type')}), {facts['traced_blocks']} of "
@@ -989,6 +1011,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         elif not _close(engine_scale, head_dim ** -0.5, 1e-6):
             d.parts.append(f"attention scale {engine_scale:.6g} from the file, as the reference's")
         cap = m.get("softcap") or 0.0
+        d.softcap = d.softcap or bool(cap)
         if "attn_logit_softcapping" not in engine.file_keys:
             if cap:
                 d.missing.append(f"block {i}: attention logit soft-capping at {cap:g}")
@@ -1098,6 +1121,26 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.set(field, norm_names[r],
                   f"{b0[r]['module'].rsplit('.', 1)[-1]} normalizes the {'mixer' if 'mixer' in r else 'FFN'}'s "
                   f"output before the residual add; GGUF blk.N.{norm_names[r]}")
+    # Q/K norms: their formula, and whether the file stores what the engine multiplies by.
+    for b in att_blocks[:1]:
+        for side, gsuffix in (("key", "attn_k_norm.weight"), ("query", "attn_q_norm.weight")):
+            norm = (b["mixer"].get(side) or {}).get("norm")
+            if not norm:
+                continue
+            if norm.get("formula") not in ("rms", "rms_1p"):
+                d.unknown.append(f"block {b['index']}: the {side} norm is not an RMSNorm (x w or x (1 + w))")
+                continue
+            gname = f"blk.{b['index']}.{gsuffix}"
+            hname = ckpt.find(layer_suffix(norm["module"]) + ".weight") if ckpt else None
+            if gname not in g.tensors:
+                d.file_issues.append(f"the reference normalizes {side}s, the GGUF has no {gname}")
+            elif hname is not None:
+                w = ckpt.tensor(hname).reshape(-1)
+                want = w + 1.0 if norm["formula"] == "rms_1p" else w
+                have = g.values(gname).reshape(-1)
+                if have.shape != want.shape or _rel_err(have, want) > 1e-2:
+                    d.file_issues.append(f"{gname} does not hold the reference's {hname}"
+                                         + (" as 1 + w" if norm["formula"] == "rms_1p" else ""))
     if facts.get("final_norm") and ckpt is not None and "output_norm.weight" in g.tensors:
         fn = facts["final_norm"]
         hname = ckpt.find(fn["module"].split(".", 1)[-1] + ".weight") or ckpt.find(fn["module"] + ".weight")
@@ -1134,7 +1177,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             if plan and plan.get("ffn") != "moe":
                 d.file_issues.append(f"block {i}: MoE in the reference, dense FFN in the file")
                 continue
-            if plan.get("fused_experts"):
+            if plan.get("fused_experts") and "ffn_gate_up_exps.weight" not in engine.block_tensors:
                 d.missing.append(f"block {i}: fused ffn_gate_up_exps expert tensors")
             if not f.get("gating"):
                 continue
@@ -1321,10 +1364,26 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
     plain = tok("The sea", add_special_tokens=False)["input_ids"]
     special = tok("The sea", add_special_tokens=True)["input_ids"]
     ref_bos = len(special) > len(plain) and special[0] == bos and special[1:1 + len(plain)] == plain
+    # What the model's tokenizer_config.json declares. transformers does not always apply it (version 5 runs
+    # DeepSeek's tokenizer.json as it is, without the BOS its LlamaTokenizerFast class added).
+    declared = None
+    try:
+        path = os.path.join(model, "tokenizer_config.json") if os.path.isdir(model) else None
+        if path is None:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(model, "tokenizer_config.json", revision=revision)
+        declared = json.load(open(path, encoding="utf-8")).get("add_bos_token")
+    except Exception:  # noqa: BLE001 - no declaration: the behaviour decides
+        pass
+    gguf_rule = f"tokenizer.ggml.add_bos_token {g.metadata.get('tokenizer.ggml.add_bos_token', 'absent')}"
     if add_bos != ref_bos:
-        d.file_issues.append(f"the model's tokenizer {'adds' if ref_bos else 'adds no'} BOS, the GGUF "
-                             f"{'asks for one' if add_bos else 'asks for none'} (tokenizer.ggml.add_bos_token "
-                             f"{g.metadata.get('tokenizer.ggml.add_bos_token', 'absent')})")
+        if isinstance(declared, bool) and declared == add_bos:
+            d.notes.append(f"BOS: tokenizer_config.json declares add_bos_token {declared} and the GGUF follows it "
+                           f"({gguf_rule}), but transformers' tokenizer {'adds' if ref_bos else 'adds no'} BOS; the "
+                           f"gate, whose reference is transformers', sees the first token differ")
+        else:
+            d.file_issues.append(f"the model's tokenizer {'adds' if ref_bos else 'adds no'} BOS, the GGUF "
+                                 f"{'asks for one' if add_bos else 'asks for none'} ({gguf_rule})")
     if kind == "llama" and plain:
         piece = tok.convert_ids_to_tokens(plain[0])
         ref_prefix = isinstance(piece, str) and piece.startswith("▁")
@@ -1356,8 +1415,15 @@ def run(cmd, log, cwd=None, env=None):
 def sync_tree(src, dst):
     """Copies the source tree (tracked files and untracked ones git does not ignore) to dst, leaving files whose
     contents did not change untouched so that the scratch build stays incremental."""
-    files = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=src, stdout=subprocess.PIPE,
-                           text=True, check=True).stdout.split("\n")
+    listed = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=src, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    if listed.returncode == 0:
+        files = listed.stdout.split("\n")
+    else:  # not a git checkout: every file but build outputs
+        files = []
+        for root, dirs, names in os.walk(src):
+            dirs[:] = [x for x in dirs if not x.startswith(("build", ".")) and x != "__pycache__"]
+            files += [os.path.relpath(os.path.join(root, n), src) for n in names]
     wanted = set()
     for f in files:
         if not f or f.startswith(("app/", "docs/")) or not os.path.isfile(os.path.join(src, f)):
@@ -1460,11 +1526,15 @@ def gate(args, d, row_text, arch, engine):
         print(f"  tokenizer, {os.path.basename(text)}: {'pass' if code == 0 else 'FAIL'} ({last})", flush=True)
         ok = ok and code == 0
     ref = os.path.join(work, "reference.kl")
-    cmd = [py, os.path.join(tools, "conform_reference.py"), "--model", args.model, "--text", texts[0], "--out", ref]
+    conform = os.path.join(tools, "conform_reference.py")
+    cmd = [py, conform, "--model", args.model, "--text", texts[0], "--out", ref]
     if args.revision:
         cmd += ["--revision", args.revision]
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
+    # transformers' default attention kernel leaves a soft cap out: the reference then needs the eager one.
+    if d.softcap and "--attn-implementation" in open(conform, encoding="utf-8").read():
+        cmd += ["--attn-implementation", "eager"]
     code, out = run(cmd, log)
     if code == 0:
         # On the reference's ids, so that the forward pass (the row) is measured even when this file encodes
@@ -1582,7 +1652,11 @@ def main():
         parser.error("--gate needs the GGUF as a local file")
 
     print(f"Describing {args.model} with {args.gguf}", flush=True)
-    d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code)
+    try:
+        d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code)
+    except (OSError, FormatError) as e:  # an unreadable or malformed GGUF
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
     arch = g.arch
     print_description(d, engine, arch)
     out = {"model": args.model, "gguf": args.gguf, "architecture": arch, **d.to_json()}

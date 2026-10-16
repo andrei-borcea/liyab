@@ -36,7 +36,6 @@ SEQ = 13  # trace length: prime, so it is never mistaken for a head count when s
 VOCAB = 512  # reduced vocabulary (the trace's token ids are below it)
 FFN = 64  # reduced FFN and expert widths
 EXPERTS = 16  # reduced routed expert count (kept at least top-k + 1)
-MAX_LAYERS = 8  # blocks traced at most (fewer when they already show every kind of block)
 ATTN_IMPL = "liyab_trace"
 
 # Recomputed values must match the reference to within float32 rounding of a few operations.
@@ -177,7 +176,7 @@ def blocks_to_trace(cfg):
         sparse = [i for i in range(n) if i not in mlp_only]
         if dense and sparse:
             want = max(want, max(dense[0], sparse[0]) + 1)
-    return min(n, max(want, 2), max(MAX_LAYERS, want))
+    return min(n, max(want, 2))
 
 
 def reduced_config(config):
@@ -470,9 +469,9 @@ def _projection_views(linear_calls, heads, head_dim, total_heads):
     return views
 
 
-def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim):
+def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
     """How target [b, heads, s, d] (what the attention received) is made from a projection: returns a dict with
-    the projection, its layout, the rotation, and where a norm sits, or None."""
+    the projection, its layout, the rotation, and where a norm sits (with its formula), or None."""
     for call, how, raw in raw_views:
         if raw is None:
             continue
@@ -486,19 +485,22 @@ def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim):
                 continue
             w = getattr(n.module, "weight", None)
             span = int(w.numel()) if w is not None else None
+            form = norm_formula(n, eps)
+            norm = {"module": n.path, "span": span, "formula": form[0] if form else None,
+                    "eps": form[1] if form else None}
             # Norm before the rotation: the norm reads the projection, the rotation reads the norm.
             if close(_as_heads(nin, heads, head_dim), raw):
                 normed = _as_heads(nout, heads, head_dim)
                 for rot, r in _rotations(normed, freqs):
                     if close(r, target):
                         return {"projection": call.path, "projection_layout": how, **rot,
-                                "norm": {"module": n.path, "order": "before_rope", "span": span}}
+                                "norm": {**norm, "order": "before_rope"}}
             # Norm after the rotation: the norm reads the rotated projection and gives the target.
             if close(_as_heads(nout, heads, head_dim), target):
                 for rot, r in _rotations(raw, freqs):
                     if close(r, _as_heads(nin, heads, head_dim)):
                         return {"projection": call.path, "projection_layout": how, **rot,
-                                "norm": {"module": n.path, "order": "after_rope", "span": span}}
+                                "norm": {**norm, "order": "after_rope"}}
     return None
 
 
@@ -528,8 +530,8 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                 views.append((call, how, v))
         return views
 
-    key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd)
-    query = _match_rotated(a.query, views_for(n_q, 0), norms, freqs, n_q, hd)
+    key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
+    query = _match_rotated(a.query, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
     value = None
     for call, how, v in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
         if close(v, a.value):

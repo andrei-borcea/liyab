@@ -49,7 +49,9 @@ block's plan, made the way `describe_model()` makes it. The RoPE frequencies and
 the file are compared with the reference's table, the windowed blocks' own table included. Every tensor must be one
 the engine binds (`src/core/transformer.cpp`); one it would ignore is a missing part. The file's BOS and
 space-prefix rules (`tokenizer.ggml.add_bos_token`, `add_space_prefix`) are compared with what the model's own
-tokenizer does with a short text.
+tokenizer does with a short text. Where its `tokenizer_config.json` declares a BOS rule that transformers does not
+apply (version 5 runs DeepSeek's `tokenizer.json` without the BOS its `LlamaTokenizerFast` added) and the GGUF
+follows the declaration, that is a note, not a problem of the file.
 
 What the engine takes from the file rather than from the row (an attention scale, logit soft-caps, YaRN) counts as
 supported exactly when `describe_model()` reads the metadata key, or accepts the RoPE scaling type, that carries it;
@@ -68,7 +70,7 @@ first attention block's key projection and the first block's norm weights (a few
   can be trusted.
 * The norm weights say which GGUF tensor holds which norm, so the role found in the trace becomes a tensor name
   (`ffn_norm`, `post_mixer_norm`, `post_ffn_norm`), and whether a norm the reference applies as `x (1 + w)` is
-  stored as `1 + w`.
+  stored as `1 + w`. The Q/K norms and the final norm are checked the same way.
 
 **The engine's sources.** The `ArchSpec` fields, their defaults and the enum values come from `architecture.h`, the
 existing rows from `architecture.cpp` (printed back the way that file writes rows: `--self-test` checks the round
@@ -91,7 +93,9 @@ rows until the rule is added.
    own special-token rule, and `liyab-kl --ref-tokens --kv f16 --max-kl 0.01 --min-top1 97` must pass (both
    thresholds are options). On the reference's ids the forward pass, which is what the row decides, is measured
    even when the file encodes the text differently; `liyab-kl` still reports whether its own encoding, BOS
-   included, gives the same ids, and that must hold too.
+   included, gives the same ids, and that must hold too. When the reference soft-caps attention scores and
+   `conform_reference.py` takes `--attn-implementation`, the reference runs with transformers' eager attention:
+   its default kernel leaves soft caps out.
 
 The row is accepted only if every step passes. When only the encoding fails, the tool says so: the row is right and
 the file's tokenizer settings are not. The GGUF must be a local file for the gate, BF16 or F16 (lower bit widths add
@@ -119,10 +123,9 @@ field and as text.
 
 No published GGUF uses `general.architecture = mistral`: llama.cpp writes Mistral 7B and Nemo as `llama`, newer
 Mistral models as `mistral3` or `mistral4` (more than 2,400 GGUF repositories found by Mistral-related searches on
-Hugging Face were checked). The
-`mistral` row was regenerated from Mistral-7B-Instruct-v0.3 with a copy of its GGUF's header whose architecture name
-and metadata prefix were changed to `mistral`, holding the four tensors the tool reads. Its original GGUF gives the
-`llama` row.
+Hugging Face were checked). The `mistral` row was regenerated from Mistral-7B-Instruct-v0.3 with a copy of its GGUF's
+header whose architecture name and metadata prefix were changed to `mistral`, holding the four tensors the tool
+reads. Its original GGUF gives the `llama` row.
 
 Two official Qwen GGUFs hold other weights than their Hugging Face repositories: `qwen2.5-0.5b-instruct-fp16.gguf`
 and `qwen2.5-1.5b-instruct-fp16.gguf` (Qwen/Qwen2.5-*-Instruct-GGUF). Their key projections match the reference in no
@@ -151,6 +154,8 @@ keys set to the tokenizer's own rules in a copy of the file, the gate accepted t
 | Model | Row | Tokenizer: conform / edge / chat | liyab-kl `--kv f16` | Verdict |
 | :--- | :--- | ---: | :--- | :--- |
 | Qwen3-0.6B (BF16) | registry's `qwen3` | 524 / 804 / 179, identical | 511 positions, mean KL 0.00000, top-1 99.80% | accepted |
+| Qwen2.5-1.5B-Instruct (bartowski f16), not tested before | registry's `qwen2` | 524 / 804 / 181, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| gemma-3-1b-it (unsloth BF16), not tested before | registry's `gemma3` | 523 / 801 / 211, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 
@@ -161,7 +166,7 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
 | Gemma 2 2B (`gemma2`) | attention logit soft-capping at 50; final logit soft-capping at 30. Everything else is expressible: GeGLU, √d embeddings, both sandwich norms, every 2nd block global (`swa_period` 2, window 4096) |
-| DeepSeek-V2-Lite-Chat (`deepseek2`) | multi-head latent attention (`attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b` unused; value heads of 128 with key heads of 192); YaRN RoPE scaling; attention scale 0.1147 instead of 1/√192. Its MoE is expressible: softmax top 6 of 64, no renormalization, an ungated shared expert, a dense first block |
+| DeepSeek-V2-Lite-Chat (`deepseek2`) | multi-head latent attention (`attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b` unused; value heads of 128 with key heads of 192); YaRN RoPE scaling; attention scale 0.1147 instead of 1/√192. Its MoE is expressible: softmax top 6 of 64, no renormalization, an ungated shared expert, a dense first block. A note: `tokenizer_config.json` asks for a BOS and the GGUF follows it, while transformers 5 adds none |
 | Mistral-Nemo-Instruct-2407 (`llama`) | the `tekken` BPE pre-tokenizer. The architecture is the `llama` row (head size 128 from `key_length`) |
 | OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
 | Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
@@ -179,6 +184,12 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
   must agree, and the tool says it assumed the rest do too.
 * **Experts' weights.** The experts' activation is recomputed from transformers' fused 3-D expert weights; other
   layouts leave it to the dense blocks' activation.
+* **What the tool knows of the engine.** Row fields come from `architecture.h` and need a rule each in the tool (it
+  refuses rows while one has none). Features the engine takes from the file are recognized by the metadata keys
+  `describe_model()` reads: an attention scale (`attention.scale`), soft caps (`attn_logit_softcapping`,
+  `final_logit_softcapping`) and the RoPE scaling types it accepts, YaRN's parameters included. A new kind of file
+  feature (another multiplier, another scaling) is reported as missing until the tool learns to compare it with the
+  reference.
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
