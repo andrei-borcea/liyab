@@ -19,8 +19,11 @@ class FakeBackend implements ApiBackend {
   final prompts = <String>[];
   var stops = 0;
 
+  bool loaded = true; // false: released while idle, as after a start without a window
   @override
-  String get modelName => 'test-model.gguf';
+  String get modelName => loaded ? 'test-model.gguf' : '';
+  @override
+  String get servedModel => 'test-model.gguf';
   @override
   ChatTemplate get template => ChatTemplate.chatml;
   @override
@@ -142,6 +145,15 @@ void main() {
       expect(wrong, 401);
       expect(backend.prompts, isEmpty);
       expect((await call('GET', '/health', headers: const {})).$1, 200);
+    });
+
+    test('models lists the model requests load, also while it is released', () async {
+      backend.loaded = false;
+      final (_, openai) = await call('GET', '/v1/models');
+      expect(jsonDecode(openai)['data'][0]['id'], 'test-model.gguf');
+      final (_, anthropic) =
+          await call('GET', '/v1/models', headers: const {'x-api-key': token, 'anthropic-version': '2023-06-01'});
+      expect(jsonDecode(anthropic)['data'][0]['id'], 'test-model.gguf');
     });
 
     test('OpenAI: models, chat completion, reasoning, usage, streaming', () async {

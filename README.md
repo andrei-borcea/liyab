@@ -839,6 +839,9 @@ they would a server:
 | Anthropic Messages | `http://127.0.0.1:8642/v1` | `POST /messages`, `POST /messages/count_tokens`, `GET /models` |
 | gRPC | `127.0.0.1:8643` | `liyab.v1.Liyab`: `ListModels`, `Generate` (server streaming), `CountTokens` ([`app/proto/liyab.proto`](app/proto/liyab.proto)) |
 
+The model lists name the model requests are served with, also while it is not in memory (released while idle, or
+not loaded yet in a process Android started without a window): the first request loads it.
+
 ```bash
 curl http://127.0.0.1:8642/v1/chat/completions \
   -H "Authorization: Bearer $LIYAB_TOKEN" -H "Content-Type: application/json" \

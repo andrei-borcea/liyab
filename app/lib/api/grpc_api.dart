@@ -24,7 +24,7 @@ class LiyabGrpcService extends Service {
   @override
   String get $name => 'liyab.v1.Liyab';
 
-  List<String> _models() => [if (core.backend.modelName.isNotEmpty) core.backend.modelName];
+  List<String> _models() => [if (core.backend.servedModel.isNotEmpty) core.backend.servedModel];
 
   Stream<ApiEvent> _generate(ServiceCall call, Future<ApiRequest> request) async* {
     try {

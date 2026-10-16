@@ -151,6 +151,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Timer? _parkRetry;
   Timer? _releaseTimer;
   String? _released; // the model unloaded while idle
+
+  @override
+  String get servedModel =>
+      modelName.isNotEmpty ? modelName : (_released == null ? '' : File(_released!).uri.pathSegments.last);
   bool _parkPending = false; // hidden, and the park not done yet
 
   static const _work = MethodChannel('liyab/work');

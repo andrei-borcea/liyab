@@ -95,6 +95,12 @@ class ApiDone extends ApiEvent {
 abstract class ApiBackend {
   /// The loaded model's name ('' when none).
   String get modelName;
+
+  /// The model requests are served with: the loaded one, or the one
+  /// ensureLoaded() loads (released while idle, or not loaded yet in a
+  /// process Android started without a window); '' when none is chosen.
+  /// Listed by /v1/models, so a client that checks the list first finds it.
+  String get servedModel;
   ChatTemplate get template;
   bool get thinkingSupported;
 
