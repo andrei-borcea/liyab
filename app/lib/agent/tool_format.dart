@@ -6,17 +6,34 @@
 //  - Qwen2.5 / Qwen3 (Hermes): JSON calls,
 //      <tool_call>\n{"name": NAME, "arguments": {...}}\n</tool_call>
 // Both answer tool results in a user turn wrapped in <tool_response>.
+//
+// Calls are constrained decoding (include/liyab/grammar.h): from `<tool_call>`
+// on, a call is one span of the grammar callGrammar writes, which admits only
+// the names of the tools offered and arguments valid against the chosen
+// tool's schema. The local API's clients (api/tool_calls.dart) and the app's
+// own tools (AgentTool.spec, state/app_state.dart) take the same path.
 import 'dart:convert';
 
 import 'tools.dart';
 
-/// A tool described by a client of the local API: its name, description and
-/// the JSON Schema of its arguments (an object).
+/// A tool as a call's grammar sees it: its name, description and the JSON
+/// Schema of its arguments (an object). Clients of the local API describe
+/// theirs; the app's own tools give theirs through AgentTool.spec.
+///
+/// `values`: grammar text (include/liyab/grammar.h) for the values of some
+/// string parameters, which calls follow instead of the parameter's schema,
+/// for shapes JSON Schema cannot express in the engine's subset (a local
+/// date-time, see localDateTime in tools.dart). Each key names a declared
+/// property, every required name is a declared property, and the grammar
+/// admits only characters JSON writes without escapes: it matches the value's
+/// characters as they are, between the quotes of a JSON call or the tags of
+/// an XML one.
 class ToolSpec {
-  const ToolSpec(this.name, this.description, this.parameters);
+  const ToolSpec(this.name, this.description, this.parameters, {this.values = const {}});
   final String name;
   final String description;
   final Map<String, Object?> parameters;
+  final Map<String, String> values;
 
   /// The OpenAI-style function description chat templates render.
   Map<String, Object?> get schema => {
@@ -118,11 +135,12 @@ enum ToolDialect {
   /// Grammar text (include/liyab/grammar.h) of one call right after
   /// `<tool_call>` (`newline`: the newline that follows it is still to
   /// come): the call's syntax around the name of one of `tools` and
-  /// arguments valid against that tool's schema, then `</tool_call>`. With
-  /// constrained decoding the model chooses only the tool and the values;
-  /// names, keys and every separator are forced. Tools in `loose` (a schema
-  /// the engine cannot enforce) take arguments of any shape: a JSON object,
-  /// or parameters with any names and text values.
+  /// arguments valid against that tool's schema (and its value grammars,
+  /// ToolSpec.values), then `</tool_call>`. With constrained decoding the
+  /// model chooses only the tool and the values; names, keys and every
+  /// separator are forced. Tools in `loose` (a schema the engine cannot
+  /// enforce) take arguments of any shape: a JSON object, or parameters with
+  /// any names and text values.
   String callGrammar(List<ToolSpec> tools, {bool newline = true, Set<String> loose = const {}}) {
     final nl = newline ? r'"\n" ' : '';
     final rules = <String>[];
@@ -133,7 +151,11 @@ enum ToolDialect {
         case qwenXml:
           rules.add('t$i ::= ${grammarLiteral('${t.name}>\n')} ${_xmlParameters(t, i, loose.contains(t.name), rules)}');
         default:
-          final args = loose.contains(t.name) ? '%schema {"type": "object"}' : _jsonArguments(t.parameters);
+          final args = loose.contains(t.name)
+              ? '%schema {"type": "object"}'
+              : t.values.isEmpty
+                  ? _jsonArguments(t.parameters)
+                  : _jsonObject(t, i, rules);
           rules.add('t$i ::= ${grammarLiteral('${pyJson(t.name)}, "arguments": ')} $args');
       }
     }
@@ -152,8 +174,37 @@ enum ToolDialect {
     return '%schema ${jsonEncode({'type': 'object', ...parameters})}';
   }
 
+  /// The arguments of a JSON call whose tool has value grammars: the object
+  /// written out the way the engine writes a schema's (the declared
+  /// properties in order, required ones always and optional ones when the
+  /// model chooses, json.dumps' separators), so that a value can follow its
+  /// grammar, in quotes; the other values follow their schemas.
+  static String _jsonObject(ToolSpec t, int i, List<String> rules) {
+    final props = t.parameters['properties'] as Map<Object?, Object?>? ?? const {};
+    final required = {for (final r in (t.parameters['required'] as List?) ?? const []) '$r'};
+    assert(required.every(props.containsKey) && t.values.keys.every(props.containsKey), 'see ToolSpec.values');
+    final names = [for (final k in props.keys) '$k'];
+    for (final (j, name) in names.indexed) {
+      final grammar = t.values[name];
+      final value = grammar == null ? '%schema ${jsonEncode(props[name])}' : '"\\"" ($grammar) "\\""';
+      rules.add('p$i-$j ::= ${grammarLiteral('${jsonEncode(name)}: ')} $value');
+    }
+    String seq(Iterable<String> parts) => parts.where((p) => p.isNotEmpty).join(' ');
+    // The properties from `j` on, after one was written: each after ", ".
+    String rest(int j) =>
+        seq([for (var k = j; k < names.length; ++k) required.contains(names[k]) ? '", " p$i-$k' : '(", " p$i-$k)?']);
+    final first = names.indexWhere(required.contains);
+    if (first >= 0) {
+      // Optional properties before the first required one are each followed by ", ".
+      return seq(['"{"', for (var k = 0; k < first; ++k) '(p$i-$k ", ")?', 'p$i-$first', rest(first + 1), '"}"']);
+    }
+    // All optional: none, or the first one written and any of those after it.
+    return '"{" (${[for (var k = 0; k < names.length; ++k) seq(['p$i-$k', rest(k + 1)])].join(' | ')})? "}"';
+  }
+
   /// XML parameters: declared ones in order (required ones always), each
-  /// value raw text for strings, JSON for every other type.
+  /// value its grammar when the tool gives one (ToolSpec.values), else raw
+  /// text for strings and JSON for every other type.
   static String _xmlParameters(ToolSpec t, int i, bool loose, List<String> rules) {
     const free = r'%until "\n</parameter>" "\n"';
     if (loose) return '("<parameter=" [^>\\n]+ ">\\n" $free)*';
@@ -166,9 +217,12 @@ enum ToolDialect {
     ];
     final parts = <String>[];
     for (final (j, (name, schema)) in entries.indexed) {
-      final value = xmlValueKind(schema) == XmlValue.text
-          ? free
-          : '${xmlValueKind(schema) == XmlValue.raw ? '%string' : '%schema'} ${jsonEncode(schema)} "\\n</parameter>\\n"';
+      final grammar = t.values[name];
+      final value = grammar != null
+          ? '($grammar) "\\n</parameter>\\n"'
+          : xmlValueKind(schema) == XmlValue.text
+              ? free
+              : '${xmlValueKind(schema) == XmlValue.raw ? '%string' : '%schema'} ${jsonEncode(schema)} "\\n</parameter>\\n"';
       rules.add('p$i-$j ::= ${grammarLiteral('<parameter=$name>\n')} $value');
       parts.add(required.contains(name) ? 'p$i-$j' : 'p$i-$j?');
     }
@@ -195,64 +249,6 @@ enum ToolDialect {
   static String response(String result) =>
       '<|im_end|>\n<|im_start|>user\n<tool_response>\n$result\n</tool_response><|im_end|>\n<|im_start|>assistant\n';
 
-  /// Structured output: the text a reply must continue with at this point of a
-  /// tool call ('' for none), given the reply so far (`generated`, after the
-  /// template's opening; `thinking` when that opening is a `<think>` block).
-  /// The fixed parts of the call format are forced, and a function name as
-  /// soon as one of `names` is the only one that fits, so the model samples
-  /// only what it actually chooses (which tool, the arguments) and cannot
-  /// misspell a name or break the format around it. Tags inside reasoning are
-  /// left alone. The result already includes every continuation that follows
-  /// from it (after `<tool_call>`, with a single tool, its whole opening).
-  String continuation(String generated, List<String> names, {bool thinking = false}) {
-    var forced = '';
-    for (var step = _forced(generated, names, thinking); step.isNotEmpty; step = _forced(generated, names, thinking)) {
-      forced += step;
-      generated += step;
-    }
-    return forced;
-  }
-
-  /// continuation() as a function to hand to EngineService.generate: it
-  /// captures only sendable values, so it can run on the engine's isolate.
-  String Function(String generated) forcer(List<String> names, {bool thinking = false}) =>
-      (generated) => continuation(generated, names, thinking: thinking);
-
-  String _forced(String generated, List<String> names, bool thinking) {
-    if (this == none || names.isEmpty) return '';
-    final close = generated.lastIndexOf('</think>');
-    if (close < 0 && (thinking || generated.contains('<think>'))) return '';
-    final body = close < 0 ? generated : generated.substring(close + '</think>'.length);
-    final open = body.lastIndexOf('<tool_call>');
-    if (open < 0) return '';
-    final call = body.substring(open + '<tool_call>'.length);
-    if (call.contains('</tool_call>')) return '';
-    final newline = call.isEmpty ? '\n' : '';
-    switch (this) {
-      case qwenXml:
-        if (call.trim().isEmpty) return '$newline<function=';
-        final end = call.trimRight();
-        if (end.endsWith('</function>')) return '${end.length == call.length ? '\n' : ''}</tool_call>';
-        const fn = '<function=';
-        final at = call.indexOf(fn);
-        if (at < 0 || call.contains('>', at + fn.length)) return '';
-        return _completeName(call.substring(at + fn.length), names, '>\n');
-      case hermesJson:
-        if (call.trim().isEmpty) return '$newline{"name": "';
-        final m = _jsonName.firstMatch(call);
-        return m == null ? '' : _completeName(m.group(1)!, names, '", "arguments": ');
-      case none:
-        return '';
-    }
-  }
-
-  /// The rest of the only name in `names` that starts with `partial`, then `after`; '' when none or several fit.
-  static String _completeName(String partial, List<String> names, String after) {
-    final fits = names.where((n) => n.startsWith(partial)).toList();
-    return fits.length == 1 ? fits.single.substring(partial.length) + after : '';
-  }
-
-  static final _jsonName = RegExp(r'^\s*\{\s*"name"\s*:\s*"([^"]*)$');
   static final _xmlCall = RegExp(r'<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>', dotAll: true);
   static final _xmlParam = RegExp(r'<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>', dotAll: true);
   static final _jsonCall = RegExp(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', dotAll: true);

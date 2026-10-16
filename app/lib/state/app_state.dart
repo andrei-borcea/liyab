@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../agent/tool_format.dart';
 import '../api/api_core.dart';
 import '../api/local_api.dart';
+import '../api/tool_calls.dart' show toolStructure;
 import '../agent/tools.dart';
 import '../chat/chat_template.dart';
 import '../engine/engine_service.dart';
@@ -963,14 +964,22 @@ class AppState extends ChangeNotifier implements ApiBackend {
     final head = prompt.substring(0, prompt.length - message.prefix.length);
     final sampling = SamplingOptions(
         temperature: settings.temperature, topP: settings.topP, topK: settings.topK, maxTokens: settings.maxTokens);
-    final tools = toolDialect == ToolDialect.none ? const <String>[] : [for (final t in await toolbox.enabled()) t.name];
+    final tools = toolDialect == ToolDialect.none ? const <AgentTool>[] : await toolbox.enabled();
+    // A tool whose call grammar the engine refuses (none does: app/test checks every one) would fail the whole
+    // reply; it takes arguments of any shape instead, as the local API's tools do.
+    final loose = {
+      for (final t in tools)
+        if (grammarError(toolDialect.callGrammar([t.spec])) != null) t.name,
+    };
+    if (loose.isNotEmpty) _log('Tool calls not constrained by their schemas: ${loose.join(', ')}');
     try {
       for (var calls = 0;; ++calls) {
-        // Tool calls are structured output: their format and names are forced, not sampled.
-        final force = tools.isEmpty || calls >= _maxToolCalls
+        // Tool calls are constrained decoding: a call names an enabled tool, and its arguments follow its schema.
+        final structure = tools.isEmpty || calls >= _maxToolCalls
             ? null
-            : toolDialect.forcer(tools, thinking: message.prefix.endsWith('<think>\n'));
-        await _stream(head + message.exact, sampling, message, force, latency: calls == 0 ? (asked, wakingMs) : null);
+            : callStructure(toolDialect, tools, thinking: message.prefix.endsWith('<think>\n'), loose: loose);
+        await _stream(head + message.exact, sampling, message, structure,
+            latency: calls == 0 ? (asked, wakingMs) : null);
         final call = calls < _maxToolCalls && message.stats?.cancelled != true ? toolDialect.parse(message.raw) : null;
         final tool = call == null ? null : toolbox.byName(call.name);
         if (call == null) break;
@@ -1006,17 +1015,39 @@ class AppState extends ChangeNotifier implements ApiBackend {
     }
   }
 
+  /// The structure of a reply step that may call `tools`, in `dialect`'s
+  /// format (EngineService.generate's `structure`), the same path as the
+  /// local API's calls (api/tool_calls.dart): from `<tool_call>` on, the call
+  /// is one constrained span (ToolDialect.callGrammar) that admits only the
+  /// names of `tools` and arguments valid against the chosen tool's spec, up
+  /// to `</tool_call>`. The model chooses whether to call, which tool and the
+  /// values; every name, key and separator is forced, so a call always
+  /// parses. Nothing is constrained inside reasoning (`thinking`: the step
+  /// starts inside it), and text without a call is generated as without
+  /// tools. Tools in `loose` take arguments of any shape. Captures only
+  /// sendable values: it runs on the engine's isolate.
+  static Continuation Function(String generated) callStructure(ToolDialect dialect, List<AgentTool> tools,
+      {required bool thinking, Set<String> loose = const {}}) {
+    final specs = [for (final t in tools) t.spec];
+    return toolStructure(
+        grammar: dialect.callGrammar(specs, loose: loose),
+        grammarAfterNewline: dialect.callGrammar(specs, newline: false, loose: loose),
+        mustCall: false,
+        thinking: thinking);
+  }
+
   /// Streams one generation into the message's current segment. Redraws are
   /// batched (~15 a second): the engine runs on all but one core, and
   /// rebuilding the reply for every token would take CPU time from it.
+  /// `structure`: the step may call tools (callStructure).
   /// `latency`, for a reply's first step: the watch started when the message was sent and the time the model took
   /// to wake up, to check the first token against its budget.
   Future<void> _stream(String prompt, SamplingOptions sampling, ChatMessage message,
-      String Function(String)? force, {(Stopwatch, int)? latency}) async {
+      Continuation Function(String)? structure, {(Stopwatch, int)? latency}) async {
     var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
     int? firstMs;
     _chatContext = true;
-    await for (final event in engine.generate(prompt, sampling, force: force).events) {
+    await for (final event in engine.generate(prompt, sampling, structure: structure).events) {
       switch (event) {
         case TextPiece(:final text):
           firstMs ??= latency?.$1.elapsedMilliseconds;
@@ -1034,7 +1065,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
               '${firstMs != null && latency != null ? ' (${(firstMs / 1000).toStringAsFixed(2)} s after sending)' : ''}, '
               '${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
-              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}${_forced(stats)}');
+              '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}${stepCost(stats)}');
           if (stats.generatedTokens >= 16) {
             final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5).map((e) => '${e.key} ${e.value.toStringAsFixed(1)}');
             final total = 1000 / (stats.tokensPerSecond > 0 ? stats.tokensPerSecond : 1);
@@ -1073,14 +1104,20 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// The forced tokens of a step, what their batched passes took, and what
   /// sampling them one by one would have taken at the step's own decode
-  /// speed: the time structured output saved (or cost) in that step.
-  static String _forced(GenerationStats stats) {
-    if (stats.forcedTokens == 0) return '';
+  /// speed: the time structured output saved (or cost) in that step. Then
+  /// what constrained decoding cost: the tokens a call's grammar masked and
+  /// the grammar's time (masks, its bookkeeping and the structure callback
+  /// asked after every token; part of the decode time).
+  static String stepCost(GenerationStats stats) {
+    final grammar = stats.constrainedTokens == 0 && stats.grammarMs < 0.05
+        ? ''
+        : ', ${stats.constrainedTokens} constrained, grammar ${stats.grammarMs.toStringAsFixed(1)} ms';
+    if (stats.forcedTokens == 0) return grammar;
     final passes = ', ${stats.forcedTokens} forced in ${(stats.forcedMs / 1000).toStringAsFixed(2)} s';
-    if (stats.generatedTokens == 0 || stats.tokensPerSecond <= 0) return passes;
+    if (stats.generatedTokens == 0 || stats.tokensPerSecond <= 0) return passes + grammar;
     final decodeMs = stats.generatedTokens * 1000 / stats.tokensPerSecond; // forced passes included
     final perToken = (decodeMs - stats.forcedMs) / stats.generatedTokens;
-    return '$passes (sampled: ~${(stats.forcedTokens * perToken / 1000).toStringAsFixed(2)} s)';
+    return '$passes (sampled: ~${(stats.forcedTokens * perToken / 1000).toStringAsFixed(2)} s)$grammar';
   }
 
   Timer? _toolsSettle;

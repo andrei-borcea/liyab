@@ -1,14 +1,18 @@
 // Agent tools: what the model may read on the phone to answer about the
 // user's own data. Each tool is off until the user turns it on in Settings
 // (and Android grants its permission); only enabled tools are offered to the
-// model. Results stay on the device and go back to the model as data, as
-// short text (ToolText).
+// model. Calls are constrained decoding: a call names an enabled tool and its
+// arguments follow the tool's schema (AgentTool.spec), so every call parses.
+// Results stay on the device and go back to the model as data, as short text
+// (ToolText).
 
 import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'tool_format.dart';
 
 /// A request the model wrote: a tool name and its arguments.
 class ToolCall {
@@ -28,9 +32,24 @@ abstract class AgentTool {
   String get name;
   String get description;
 
-  /// JSON schema of the arguments (object properties).
+  /// JSON schema of the arguments (object properties). The prompt shows it
+  /// (schema) and calls follow it (spec): the system block's bytes, and with
+  /// them every saved context of a conversation, depend on it.
   Map<String, Object?> get parameters;
   List<String> get required => const [];
+
+  /// Parameters whose values are local date-times: a call writes them in
+  /// the shape localDateTime admits, which run() reads with DateTime.parse.
+  Set<String> get dateTimes => const {};
+
+  /// The tool as a call's grammar sees it (ToolDialect.callGrammar): the
+  /// schema the prompt shows (declared parameters only, required ones
+  /// always, values of their types) and the shape of its date-times.
+  ToolSpec get spec => ToolSpec(name, description, arguments, values: {for (final p in dateTimes) p: localDateTime});
+
+  /// JSON Schema of the arguments object, as the prompt shows it.
+  Map<String, Object?> get arguments =>
+      {'type': 'object', 'properties': parameters, if (required.isNotEmpty) 'required': required};
 
   /// What the step is called in the chat.
   String get label;
@@ -53,13 +72,20 @@ abstract class AgentTool {
   /// The OpenAI-style function description chat templates render.
   Map<String, Object?> get schema => {
         'type': 'function',
-        'function': {
-          'name': name,
-          'description': description,
-          'parameters': {'type': 'object', 'properties': parameters, if (required.isNotEmpty) 'required': required},
-        },
+        'function': {'name': name, 'description': description, 'parameters': arguments},
       };
 }
+
+/// Grammar text (include/liyab/grammar.h) of a local date-time as the tools
+/// take it: "2026-10-09T08:00", seconds optional, a day alone meaning its
+/// midnight; DateTime.parse reads each of these as local time. The prompt
+/// shows the shape by example, and a call's grammar keeps the value to it,
+/// so a time the model writes always parses (a free value such as "today"
+/// or "8am" would not, and the tool would quietly use its default range).
+/// The engine's JSON Schema subset cannot say this: format "date-time"
+/// requires a UTC offset and seconds, and `pattern` is refused.
+const localDateTime = r'[0-9]{4} "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [12] [0-9] | "3" [01]) '
+    r'("T" ([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] (":" [0-5] [0-9])?)?';
 
 const _data = MethodChannel('liyab/data');
 
@@ -227,6 +253,8 @@ class CalendarTool extends AgentTool with _OsPermission {
   @override
   List<String> get required => const ['start', 'end'];
 
+  @override
+  Set<String> get dateTimes => const {'start', 'end'};
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -322,6 +350,8 @@ class MessagesTool extends AgentTool with _OsPermission {
         ..._sinceParam,
         'from': {'type': 'string', 'description': 'name or number'},
       };
+  @override
+  Set<String> get dateTimes => const {'since'};
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -346,6 +376,8 @@ class CallsTool extends AgentTool with _OsPermission {
   String get description => 'Phone calls since a time: who, when, missed or not, length.';
   @override
   Map<String, Object?> get parameters => _sinceParam;
+  @override
+  Set<String> get dateTimes => const {'since'};
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
@@ -369,6 +401,8 @@ class NotificationsTool extends AgentTool {
         ..._sinceParam,
         'app': {'type': 'string', 'description': 'e.g. WhatsApp, Gmail'},
       };
+  @override
+  Set<String> get dateTimes => const {'since'};
   @override
   Future<bool> permitted() async => await _data.invokeMethod<bool>('notificationAccess') ?? false;
 
@@ -410,6 +444,8 @@ class EmailTool extends AgentTool with _OsPermission {
         ..._sinceParam,
         'query': {'type': 'string', 'description': 'a sender or a word of the subject'},
       };
+  @override
+  Set<String> get dateTimes => const {'since'};
 
   @override
   Future<(String, String)> run(Map<String, Object?> args) async {
