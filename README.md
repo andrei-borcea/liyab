@@ -1707,7 +1707,8 @@ Implemented features are described above. These are next, in order:
    assistant's own tool calls still force only their syntax and names.
 7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
-   pass (a mask per input), so short texts fill the matrix kernels.
+   pass (a mask per input), which the GPU path needs most: a pass costs it ~35 ms of fixed work, against ~3 ms on
+   the CPU.
 8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
 9. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
