@@ -543,8 +543,9 @@ happens.
 A small draft model proposes *k* tokens, or, with `lookup_drafts`, the text itself does, with no extra weights and
 for any model. Two drafters:
 
-* **Suffix drafts** (the default, `suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that occurred before, in
-  this conversation or in earlier ones of the same engine, and the continuation most of its occurrences agree on.
+* **Suffix drafts** (the default, `suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that
+  occurred before, in this conversation or in earlier ones of the same engine, and the continuation most of its
+  occurrences agree on.
   Earlier conversations are kept with a suffix array each, so finding a match is a binary search. They are set
   aside when a prompt stops continuing them (a new conversation, a regenerated reply) and are bounded: 262,144
   tokens (~2 MiB) in at most 64 of them, least recently used out first. A conversation taken up again replaces its
@@ -574,6 +575,42 @@ linear: the suffix drafts' best branch, not their whole tree, which would need t
   phone went from 11.2 to 12.6 tok/s on a code edit, with 65% of drafts accepted. It does not pay on a MoE whose
   experts stream from flash, because a pass reads the union of its tokens' experts. That is why it is off by
   default.
+
+### Host measurements: suffix drafts and context lookup
+
+Measured with `liyab-spec-bench` on an Apple M4 Pro with the CPU backend, 6 threads, greedy decoding and replies of up to
+256 tokens. The default of 3 drafts per step was used, and the draft count was learned. Each cell gives the decode
+speed-up over plain decoding (median of 2 runs) and, in parentheses, the tokens produced per verification pass. The
+tasks are a code edit (a 50-line module rewritten with one rename), a summary of a pasted text, two turns that each
+carry the same tool output (the second asks for it in full), free chat, and that tool conversation again as a new
+conversation. Every reply was identical to plain decoding's.
+
+| Model | Drafter | Code edit | Summary | Tool output | Free chat | Tool chat again |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B Q8_0 | lookup | 2.60× (3.44) | 1.42× (1.51) | 1.71× (1.92) | 1.06× (1.09) | 1.69× (1.81) |
+| | suffix | 2.96× (3.61) | 1.40× (1.56) | 1.63× (1.94) | 1.15× (1.05) | 2.59× (3.83) |
+| Qwen3-0.6B BF16 | lookup | 1.25× (2.69) | 0.98× (1.04) | 0.98× (1.06) | 1.04× (1.01) | 0.98× (1.06) |
+| | suffix | 1.28× (3.26) | 0.99× (1.16) | 1.00× (1.24) | 1.01× (1.00) | 1.33× (3.62) |
+| Qwen3.5-0.8B BF16 (hybrid) | lookup | 1.18× (2.28) | 0.93× (1.02) | 0.99× (1.02) | 0.96× (1.00) | 0.95× (1.01) |
+| | suffix | 1.18× (2.19) | 0.97× (1.13) | 0.98× (1.18) | 0.97× (1.01) | 1.30× (3.91) |
+| Llama-3.2-1B BF16 (best run) | lookup | 0.94× (2.33) | 0.89× (1.03) | 1.10× (0.99) | 0.96× (1.00) | 1.13× (1.02) |
+| | suffix | 0.98× (2.60) | 0.93× (1.04) | 0.93× (1.00) | 1.00× (1.01) | 1.36× (3.01) |
+
+* **Acceptance.** Of the drafts verified, suffix drafts had 92–98% accepted on the code edit, 42–62% on the summary,
+  26–77% on the tool output, 0–35% in free chat and 100% on the conversation seen before. Lookup had 86–97%,
+  24–55%, 0–64%, 0–29% and 29–60%.
+* **The same drafts where the text occurs once.** With every draft verified (`suffix:K:fixed`), both drafters
+  give nearly the same tokens per pass on the code edit and the summary (3.71 for 3 drafts, 7.11 for 8 on Qwen2.5).
+  On the repeated conversation, suffix drafts give 3.90–3.96 tokens per pass for 3 drafts and 8.53–8.67 for 8.
+  Lookup gives 1.15–2.01 and 1.16–2.42, because it sees only the conversation in progress.
+* **Doubtful drafts are not verified.** Suffix drafts size each draft from its acceptance probabilities, so they
+  stay within 7% of plain decoding where drafting cannot pay. With 8 drafts per step, lookup lost up to 20% on
+  the same tasks (Llama summary 0.80×, Qwen3 summary 0.84×), and suffix drafts lost at most 5%.
+  Suffix drafts reached 1.24–2.85× on the repeated conversation, with 6.1–7.8 tokens per pass.
+* **Why the BF16 models gain less.** On this CPU a pass over 4 tokens costs about 3× one token on the BF16
+  models, against ~1.5× on Q8_0 (from the tokens per pass and speed-ups above). Only near-certain drafts pay there.
+* The Llama runs shared the host with other heavy work. Their speed-ups are the least disturbed run's; tokens per
+  pass and acceptance do not depend on timing.
 
 ---
 
