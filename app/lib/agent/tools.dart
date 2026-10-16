@@ -82,12 +82,13 @@ abstract class AgentTool {
 /// prompt shows the first shape by example, and a call's grammar keeps the
 /// value to these, so a time the model writes always parses (a free value
 /// such as "today" or "8am" would not, and the tool would quietly use its
-/// default range). A time alone is there because small models write one for
-/// "this morning"; without it the grammar would bend its first digits into
-/// a year ("16:30" became 1606-10-16 with Qwen2.5-0.5B). Years are 20xx for
-/// the same reason: the first digit then tells a time from a date. The
-/// engine's JSON Schema subset cannot say any of this: format "date-time"
-/// requires a UTC offset and seconds, and `pattern` is refused.
+/// default range). A time alone is there because small models write one
+/// when the day is today; without it the grammar would bend its first
+/// digits into a year ("16:30:00" became 1606-10-16 with Qwen2.5-0.5B).
+/// Years are 20xx for the same reason: the first digit then tells a time
+/// from a date. The engine's JSON Schema subset cannot say any of this:
+/// format "date-time" requires a UTC offset and seconds, and `pattern` is
+/// refused.
 const localDateTime = '"20" [0-9] [0-9] "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [12] [0-9] | "3" [01]) '
     '("T" $_clock)? | $_clock';
 const _clock = r'([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] (":" [0-5] [0-9])?';

@@ -908,11 +908,19 @@ cancellation and live counters go straight to the C API, which makes them thread
     day alone for its midnight, or a time alone for today (a "since" still to come today means yesterday's). The
     engine's JSON Schema subset cannot say this (`date-time` requires a UTC offset, `pattern` is refused), so these
     values follow a grammar of their own, and a time the model writes always parses (a free value such as "today"
-    would leave the tool to its default range). The time alone is there because small models write one for "this
-    morning", and years are 20xx so that a first digit tells a time from a date: with dates only, Qwen2.5-0.5B's
-    `16:30` was bent into the year 1606.
+    would leave the tool to its default range). The time alone is there because small models write one when the
+    day is today, and years are 20xx so that a first digit tells a time from a date: with dates only, Qwen2.5-0.5B's
+    `16:30:00` was bent into the year 1606.
   * Text outside a call is sampled with no mask, token for token as in an unconstrained reply. Each step's log line
     gives the tokens a call's grammar constrained and the grammar's time ("9 constrained, grammar 4.3 ms").
+  * **Measured** on a shared M4 Pro's CPU through the app's own prompt and path, with Android's six tools and ten
+    questions asked five times each at the app's settings: Qwen2.5-0.5B made 45 calls, all valid. With only their
+    syntax and names forced, 15 of its 45 were not: times that do not parse (`16 October 2026, 10:30 UTC+03:00`,
+    `2026-10-10T08:00; default 24 h ago`), parameters the tool does not have, calls that do not parse. Qwen3-0.6B (25
+    calls) and Qwen3.5-0.8B (28) wrote valid calls either way, also at temperature 1.0 on harder questions with
+    relative times. A call's grammar cost 0.6–0.9 ms per constrained token against decode steps of about 80 ms
+    in the same runs (a call has 15–35 constrained tokens), and asking the structure after each token of a reply
+    without a call cost 20–60 µs a token. Greedy replies without a call came out the same, token for token.
   * Results are compact text with ISO dates. On Qwen3.6's tokenizer, 6 events take 190 tokens instead of 428 as
     JSON, which saves ~18 s of prefill on the 35B.
   * The system prompt tells the model to treat tool results as data, not instructions.
