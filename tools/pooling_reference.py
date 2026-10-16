@@ -19,8 +19,11 @@ embedded as they are (queries carry their instruction), and "rerank", cases of
 one query with its documents. Each input runs alone, without padding, so the
 reference holds no padding effects; --check-batched also runs the card's
 left-padded batches and prints how far they are from it (float32 rounding).
---sentence-transformers also encodes the texts with sentence-transformers,
-when installed, and prints the largest difference from the transformers path.
+--sentence-transformers also runs sentence-transformers, when installed, and
+prints how far it is from the transformers path: the embedding model's
+SentenceTransformer (its pooling and normalization modules) and the
+reranker's CrossEncoder (whose score is the "yes" minus "no" logit: its
+sigmoid is the card's P(yes)).
 
     tools/pooling_reference.py --embedding Qwen/Qwen3-Embedding-0.6B --reranker Qwen/Qwen3-Reranker-0.6B \\
         --cases tests/data/pooling_cases.json --out pooling.ref.json
@@ -74,14 +77,15 @@ def embeddings(model_id, texts, dtype, check_batched, sentence_transformers):
         except ImportError:
             print("sentence-transformers is not installed: skipped")
         else:
-            st = SentenceTransformer(model_id, device="cpu")
+            # In the reference's precision: sentence-transformers would load the checkpoint's (bfloat16).
+            st = SentenceTransformer(model_id, device="cpu", model_kwargs={"dtype": getattr(torch, dtype)})
             encoded = torch.tensor(st.encode(texts, batch_size=1, normalize_embeddings=True))
             cos = (encoded * torch.tensor(out["embed"])).sum(dim=1)
             print(f"sentence-transformers vs transformers: min cosine {cos.min().item():.7f}")
     return out
 
 
-def rerank_scores(model_id, cases, dtype):
+def rerank_scores(model_id, cases, dtype, sentence_transformers):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -106,6 +110,22 @@ def rerank_scores(model_id, cases, dtype):
                 ids.append(tokens)
             out["rerank"].append(scores)
             out["rerank_ids"].append(ids)
+    if sentence_transformers:
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError:
+            print("sentence-transformers is not installed: skipped")
+        else:
+            # Its CrossEncoder scores a pair by the "yes" and "no" logits (the
+            # model's LogitScore module, no activation): the card's P(yes) is
+            # the sigmoid of that score.
+            st = CrossEncoder(model_id, device="cpu", model_kwargs={"dtype": getattr(torch, dtype)})
+            worst = 0.0
+            for case, expected in zip(cases, out["rerank"]):
+                raw = st.predict([(case["query"], d) for d in case["documents"]], batch_size=1)
+                for score, card in zip(torch.sigmoid(torch.tensor(raw, dtype=torch.float64)).tolist(), expected):
+                    worst = max(worst, abs(score - card))
+            print(f"sentence-transformers vs the card's scores: largest |diff| {worst:.2e}")
     return out
 
 
@@ -120,7 +140,7 @@ def main():
     parser.add_argument("--check-batched", action="store_true",
                         help="also run the embedding card's left-padded batch and print its distance")
     parser.add_argument("--sentence-transformers", action="store_true",
-                        help="also encode with sentence-transformers (when installed) and print its distance")
+                        help="also run sentence-transformers (when installed) and print its distance")
     args = parser.parse_args()
     if not args.embedding and not args.reranker:
         parser.error("give --embedding, --reranker or both")
@@ -132,7 +152,7 @@ def main():
         out.update(embeddings(args.embedding, cases["embed"], args.dtype, args.check_batched,
                               args.sentence_transformers))
     if args.reranker:
-        out.update(rerank_scores(args.reranker, cases["rerank"], args.dtype))
+        out.update(rerank_scores(args.reranker, cases["rerank"], args.dtype, args.sentence_transformers))
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f)
 

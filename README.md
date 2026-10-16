@@ -701,7 +701,9 @@ so does the app's [local API](#local-api-one-model-for-every-app-on-the-device) 
   stops a call within a block of the model. The public header has the whole contract.
 
 **Against Hugging Face transformers.** `tools/pooling_reference.py` computes the reference the way the model cards
-do, in float32 (for Qwen3-Embedding it reproduces its card's example scores to 1e-6), over
+do, in float32 (for Qwen3-Embedding it reproduces its card's example scores to 1e-6; sentence-transformers 6.1,
+run in float32, agrees with it to a cosine of 0.9999998 and, through the sigmoid of its CrossEncoder's score, to
+2e-7 on every reranker score), over
 `tests/data/pooling_cases.json`: 39 texts in 18 languages, code and emoji (Instruct-formatted queries, documents,
 an empty text, a chat-formatted text, a 232-token paragraph that changes language four times) and 5 queries with 19
 documents. `liyab-embed` checks that every input encodes to the reference's token ids, then compares. Every
