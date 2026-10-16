@@ -43,7 +43,7 @@ private:
 struct TinyModelSpec {
     // Any registered architecture: "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3", "qwen3moe",
     // "qwen35"/"qwen35moe" (post_attention_norm before the FFN), "hunyuan-dense" (Q/K norms after RoPE),
-    // "gemma3" (scaled embeddings, GeGLU, windowed blocks; with post_norms)...
+    // "gemma2" / "gemma3" (scaled embeddings, GeGLU, windowed blocks; with post_norms)...
     std::string arch = "llama";
     int32_t n_layers = 2;
     int32_t n_embd = 128;
@@ -116,6 +116,11 @@ struct TinyModelSpec {
     float yarn_beta_fast = 0.0f;
     float yarn_beta_slow = 0.0f;
     float yarn_log_mul = 0.0f;
+    // > 0: attn_logit_softcapping / final_logit_softcapping (Gemma 2) and
+    // attention.scale, the q·k scale the file states. Metadata only.
+    float attn_softcap = 0.0f;
+    float final_softcap = 0.0f;
+    float attn_scale = 0.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

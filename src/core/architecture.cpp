@@ -23,6 +23,20 @@ constexpr ArchSpec kArchitectures[] = {
     // Hunyuan dense (Hunyuan-MT, Hunyuan 0.5B-7B): Q/K norms after RoPE. The
     // converter folds the dynamic-NTK "alpha" scaling into rope.freq_base.
     {"hunyuan-dense", RopeLayout::Halves, "ffn_norm", false, QkNormOrder::AfterRope},
+    // Gemma 2: embeddings scaled by sqrt(d), GeGLU, norms after the attention
+    // and the FFN; every other block (the even ones) attends through the
+    // sliding window, all with the one RoPE base. The soft caps of the
+    // attention scores and the logits come from the file. As for Gemma 3, the
+    // converter stores RMSNorm weights as 1 + w.
+    {.name = "gemma2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 2},
     // Gemma 3: embeddings scaled by sqrt(d), GeGLU, norms after the attention
     // and the FFN, Q/K norms; every sixth block attends globally with RoPE
     // base rope.freq_base, the others through the sliding window with base
@@ -226,6 +240,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
     }
     if (qk_mscale != 1.0) c.attn_scale = static_cast<float>(c.attn_scale * qk_mscale * qk_mscale);
+    // Soft caps, wherever the file states them (0 or absent: none).
+    c.attn_softcap = static_cast<float>(f.get_float(key("attn_logit_softcapping")).value_or(0.0));
+    c.final_softcap = static_cast<float>(f.get_float(key("final_logit_softcapping")).value_or(0.0));
+    if (!(c.attn_softcap >= 0.0f) || !(c.final_softcap >= 0.0f) || !std::isfinite(c.attn_softcap) ||
+        !std::isfinite(c.final_softcap)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("attn_logit_softcapping / final_logit_softcapping"));
+    }
     const TensorView* embd = f.tensor("token_embd.weight");
     if (embd == nullptr || embd->cols() != c.n_embd) {
         return Status(ErrorCode::InvalidModel, "missing or malformed token_embd.weight");

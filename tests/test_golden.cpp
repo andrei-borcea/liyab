@@ -172,6 +172,18 @@ std::vector<GoldenCase> cases() {
     add("hunyuan-dense-keyscaled", s, {}, true);
 
     s = {};
+    s.arch = "gemma2";  // Gemma 3's parts without Q/K norms, every other block windowed, soft caps
+    s.n_layers = 4;
+    s.sliding_window = 8;
+    s.post_norms = true;
+    s.tied_output = true;
+    s.attn_softcap = 1.0f;  // caps small enough to squash the tiny model's scores and logits
+    s.final_softcap = 2.0f;
+    add("gemma2", s);
+    s.attn_scale = 0.125f;  // the q·k scale the file states (attention.scale)
+    add("gemma2-attn-scale", s);
+
+    s = {};
     s.arch = "gemma3";  // scaled embeddings, GeGLU, norms after the attention and the FFN
     s.n_layers = 6;     // five windowed blocks (RoPE base 10000), then a global one
     s.sliding_window = 8;

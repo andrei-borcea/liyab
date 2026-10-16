@@ -823,6 +823,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const int32_t group = c.n_head / c.n_head_kv;
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(hd);
     const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
+    const float softcap = c.attn_softcap;
     const DType kv_type = kv_->dtype();
     const bool quantized_kv = quant::is_block_quantized(kv_type);
     const auto uhd = static_cast<size_t>(hd);
@@ -918,6 +919,9 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
                         scale;
                 }
             }
+        }
+        if (softcap > 0.0f) {  // Gemma 2: the scaled scores squashed into (-cap, cap) before the softmax
+            for (size_t i = 0; i < ugroup * len; ++i) scores[i] = softcap * std::tanh(scores[i] / softcap);
         }
         for (int32_t j = 0; j < group; ++j) {
             const size_t at = static_cast<size_t>(j) * stride;
@@ -1056,7 +1060,12 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
                 xb_.data() + static_cast<size_t>(r) * d, c.n_embd, c.rms_eps);
     }
     logits_.resize(static_cast<size_t>(rows) * static_cast<size_t>(c.n_vocab));
-    return matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows));
+    if (c.final_softcap > 0.0f) {  // Gemma 2: logits squashed into (-cap, cap)
+        const float cap = c.final_softcap;
+        for (float& l : logits_) l = cap * std::tanh(l / cap);
+    }
+    return Status::ok();
 }
 
 Status Transformer::project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n) {

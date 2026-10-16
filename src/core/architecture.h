@@ -187,6 +187,11 @@ struct ModelConfig {
     // file has it, else 1/sqrt(head_dim); with YaRN and a
     // rope.scaling.yarn_log_multiplier m, times (1 + m ln(factor))^2.
     float attn_scale = 0.0f;
+    // Logit soft-capping, cap * tanh(x / cap) (0: none): of the scaled
+    // attention scores before the softmax (<arch>.attn_logit_softcapping)
+    // and of the output logits (<arch>.final_logit_softcapping). Gemma 2.
+    float attn_softcap = 0.0f;
+    float final_softcap = 0.0f;
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

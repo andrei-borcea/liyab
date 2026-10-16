@@ -1,5 +1,7 @@
 # Logit hashes pinned by tests/test_golden.cpp: <platform> <case> <FNV-1a of the logits' bits>.
 # Rewritten with LIYAB_GOLDEN_UPDATE=1 when a change is meant to move outputs (say why in the commit).
+arm64-neon-dotprod gemma2 9b6a987e9aefe81a
+arm64-neon-dotprod gemma2-attn-scale 843fee0cd832c3fb
 arm64-neon-dotprod gemma3 19faef709b9415e5
 arm64-neon-dotprod gemma3-keyscaled 3052ae0686acb23e
 arm64-neon-dotprod gemma3-sliding 3d832e8030b226d2
@@ -23,6 +25,8 @@ arm64-neon-dotprod qwen35moe ff112dcc4a0eef3b
 arm64-neon-dotprod qwen3moe 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-avx2 gemma2 bbddcfdacc84a2f9
+x86_64-avx2 gemma2-attn-scale d6c431b6d159cb6a
 x86_64-avx2 gemma3 44220e7c3a456955
 x86_64-avx2 gemma3-keyscaled 977082237f3b4df3
 x86_64-avx2 gemma3-sliding 56f3d4f6e710bb6f
@@ -46,6 +50,8 @@ x86_64-avx2 qwen35moe a3f11d7bbcffbcce
 x86_64-avx2 qwen3moe 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-scalar gemma2 5d7c25fc539f2a8c
+x86_64-scalar gemma2-attn-scale 0b8ca19040011fd4
 x86_64-scalar gemma3 240a514ba039cfa9
 x86_64-scalar gemma3-keyscaled 18bfb14aa203d770
 x86_64-scalar gemma3-sliding aaab29f02bd25f92

@@ -246,6 +246,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.yarn_beta_slow > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_slow", s.yarn_beta_slow);
         if (s.yarn_log_mul != 0.0f) w.add_f32(a + ".rope.scaling.yarn_log_multiplier", s.yarn_log_mul);
     }
+    if (s.attn_softcap > 0.0f) w.add_f32(a + ".attn_logit_softcapping", s.attn_softcap);
+    if (s.final_softcap > 0.0f) w.add_f32(a + ".final_logit_softcapping", s.final_softcap);
+    if (s.attn_scale > 0.0f) w.add_f32(a + ".attention.scale", s.attn_scale);
     if (s.longrope_ctx > 0) {  // as the Phi-3 converter writes it: no scaling type, the factors as tensors
         w.add_u32(a + ".rope.scaling.original_context_length", static_cast<uint32_t>(s.longrope_ctx));
         w.add_f32(a + ".rope.scaling.attn_factor", 1.19f);

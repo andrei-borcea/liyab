@@ -1221,7 +1221,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
     {
         test::TinyModelSpec spec;
-        spec.arch = "gemma2";
+        spec.arch = "gemma3n";
         auto file = MmapLoader::open(model_path("describe_unknown", spec));
         REQUIRE(file.has_value());
         auto described = describe_model(**file);
@@ -1229,7 +1229,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
         CHECK(described.status().code() == ErrorCode::Unsupported);
         // The message names the architecture and every supported one.
         const std::string message = described.status().to_string();
-        CHECK(message.find("'gemma2'") != std::string::npos);
+        CHECK(message.find("'gemma3n'") != std::string::npos);
         for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
     }
 }
@@ -1284,6 +1284,23 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         test::TinyModelSpec s;  // an architecture without windowed blocks ignores the key
         s.sliding_window = 8;
         CHECK(windowed(describe("describe_llama_window", s)) == std::vector<bool>(2, false));
+    }
+    {
+        test::TinyModelSpec s;  // Gemma 2: the even blocks windowed, one RoPE base, the file's soft caps and scale
+        s.arch = "gemma2";
+        s.n_layers = 4;
+        s.sliding_window = 4096;
+        s.attn_softcap = 50.0f;
+        s.final_softcap = 30.0f;
+        const ModelConfig c = describe("describe_gemma2", s);
+        CHECK(windowed(c) == (Flags{true, false, true, false}));
+        CHECK(c.sliding_window == 4096);
+        CHECK(c.rope_base_swa == 0.0f);
+        CHECK(c.attn_softcap == 50.0f);
+        CHECK(c.final_softcap == 30.0f);
+        CHECK(c.attn_scale == 1.0f / std::sqrt(32.0f));  // 1/sqrt(head_dim) when the file states none
+        s.attn_scale = 1.0f / 12.0f;
+        CHECK(describe("describe_gemma2_scale", s).attn_scale == 1.0f / 12.0f);
     }
     {
         test::TinyModelSpec s;
