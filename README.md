@@ -1476,6 +1476,24 @@ Benchmarks and tools built with the tests:
   ```
   `liyab-tok -m model.gguf --render request.json` applies the GGUF's chat template to a request, and `--format
   PROBE` prints its layout of turns and whether it is prefix-stable.
+* `tools/describe_model.py`: the registry row a model needs, established from its Hugging Face implementation
+  and a GGUF of it, or the precise list of parts Liyab does not implement yet; it never guesses a fact it cannot
+  establish. `tools/reference_trace.py` runs a reduced copy of the transformers model with random weights and
+  recomputes what it observes (block order and residual adds, norm formulas, RoPE pairing and frequencies, Q/K norm
+  order, attention scale, window and soft-cap, FFN activation, MoE routing, embedding and logit scaling); the GGUF's
+  metadata, tensor names and a few weights of both checkpoints (one key projection, one block's norms, read with
+  HTTP range requests when remote) give the rest. `--gate` adds the row to a scratch copy of the sources (the
+  repository is not touched), builds `liyab-kl` and `liyab-tok` there, and accepts the row only if the tokenizer
+  gives the model's own ids on three texts and `liyab-kl --kv f16` passes against transformers. How each fact is
+  established and what the tool said about the supported architectures and others:
+  [docs/model-descriptions.md](docs/model-descriptions.md).
+
+  ```bash
+  tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
+  tools/describe_model.py --model unsloth/gemma-2-2b-it \
+      --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf     # a few MB of the file
+  tools/describe_model.py --model baidu/ERNIE-4.5-0.3B-PT --gguf ERNIE-4.5-0.3B-PT-F16.gguf --gate
+  ```
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
@@ -1558,7 +1576,8 @@ Implemented features are described above. These are next, in order:
 1. **Model support as data** (in progress). In place: an architecture is one row of facts its tensors cannot tell
    (`src/core/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
-   Hugging Face (`liyab-kl`). Next:
+   Hugging Face (`liyab-kl`). A model's row is established from its Hugging Face implementation and a GGUF and
+   verified by the conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
    * more block parts described as data (YaRN RoPE, MLA, fused expert tensors, logit soft-capping), then
      DeepSeek and Gemma 2;
    * per-block KV caches, so blocks with a sliding window keep only their window's rows;
@@ -1661,7 +1680,8 @@ src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV d
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
                         conform_reference.py, tokenizer_reference.py and chat_template_reference.py (Hugging
-                        Face references),
+                        Face references), describe_model.py and reference_trace.py (registry rows established
+                        from the Hugging Face implementation and verified),
                         gguf_vocab.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
@@ -1672,6 +1692,8 @@ app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), l
                         command-bar window, device and data channels)
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
 docs/research/          measured studies (cold-experts.md: smaller representations of rarely used experts)
+docs/model-descriptions.md  how tools/describe_model.py establishes a model's registry row, and what it said
+                        about the supported architectures, new models and unsupported ones
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
 scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py, thread_cpu.py
@@ -1696,6 +1718,11 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   exist.
   Add a `test_golden` case and check a BF16/F16 GGUF against its Hugging Face model (`tools/conform_reference.py`,
   then `liyab-kl --compare … --kv f16`). New kinds of blocks still need engine code (see the [roadmap](#roadmap)).
+  `tools/describe_model.py --model <id> --gguf <file> --gate` does the description and the conformance run for you:
+  it establishes the row from the reference implementation and the GGUF, or lists the parts Liyab lacks, then
+  builds a scratch copy with the row and accepts it only if the tokenizer and `liyab-kl` checks pass
+  ([docs/model-descriptions.md](docs/model-descriptions.md)). An `ArchSpec` field added to `architecture.h` needs
+  its rule in that tool too: until then it refuses to propose rows.
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64
   device for kernel changes, and `flutter analyze && flutter test` in `app/` for app changes.
 
