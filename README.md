@@ -1277,6 +1277,8 @@ cache the forward passes agree:
 | Hunyuan-MT-7B (`hunyuan-dense`, reference ids, text after its BOS) | 512 | 0.00000 | 100.00% |
 | gemma-3-270m-it (`gemma3`) | 512 | 0.00000 | 100.00% |
 | gemma-3-270m-it, a longer text: 4 times its 512-position window | 2,048 | 0.00000 | 99.95% |
+| gemma-2-2b-it (`gemma2`, soft caps on the attention scores and the logits) | 512 | 0.00000 | 100.00% |
+| gemma-2-2b-it, a longer text past its 4,096-position window | 4,400 | 0.00000 | 100.00% |
 | Phi-3.5-mini-instruct (`phi3`, LongRoPE short factors) | 512 | 0.00000 | 99.80% |
 | Phi-3.5-mini-instruct, a longer text past its 4,096-position original context (long factors) | 4,200 | 0.00000 | 99.95% |
 
@@ -1445,7 +1447,8 @@ Benchmarks and tools built with the tests:
     tokenizer still differs (or cannot encode the text yet), and `--kv f16` keeps the KV cache's own rounding out of the measurement. `tests/data/conform_text.txt` is the text used (prose, Italian, code, numbers, URLs,
     CJK, Greek, Cyrillic, Hebrew, Arabic, emoji, tabs and trailing spaces). The script's `--config` sets
     configuration fields before the model is built (a GGUF copy given YaRN metadata is compared with the model
-    configured the same way), and `--attn-implementation` picks transformers' attention kernel.
+    configured the same way), and `--attn-implementation` picks transformers' attention kernel (`eager` for
+    Gemma 2: the default one leaves its soft cap out). The text is read byte for byte, `\r\n` included.
 
   ```bash
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref

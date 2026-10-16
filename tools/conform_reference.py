@@ -31,7 +31,8 @@ reference of a variant the repository does not ship: a GGUF copy given YaRN
 metadata is compared with the model run with the same RoPE parameters, e.g.
 --config '{"rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000,
 "factor": 4.0, "original_max_position_embeddings": 32768}}'.
---attn-implementation picks transformers' attention kernel (e.g. "eager").
+--attn-implementation picks transformers' attention kernel: Gemma 2 needs
+"eager", the default kernel leaves its attention soft cap out.
 """
 
 import argparse
@@ -62,7 +63,8 @@ def main():
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    with open(args.text, encoding="utf-8") as f:
+    # newline="" keeps "\r\n" as written: liyab-kl encodes the file's exact bytes.
+    with open(args.text, encoding="utf-8", newline="") as f:
         text = f.read()
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision,
                                               trust_remote_code=args.trust_remote_code)
