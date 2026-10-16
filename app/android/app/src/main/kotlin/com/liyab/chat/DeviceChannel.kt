@@ -1,12 +1,16 @@
 package com.liyab.chat
 
+import android.app.AppOpsManager
 import android.app.role.RoleManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
+import android.net.Uri
+import android.os.Process
 import android.provider.Settings
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -14,7 +18,7 @@ import kotlin.math.abs
 
 /**
  * The "liyab/device" channel: what only the Android SDK exposes (power draw,
- * thermal state, the default-assistant role). The engine itself is reached
+ * thermal state, the default-assistant role, HyperOS's Autostart switch). The engine itself is reached
  * from Dart through dart:ffi. Attached once, when the shared engine is created
  * (LiyabEngine), with the application context: it needs no activity, so it
  * also serves an engine running without a window.
@@ -34,6 +38,8 @@ object DeviceChannel {
                         Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     result.success(null)
                 }
+                "autostart" -> result.success(autostart(context))
+                "openAutostartSettings" -> result.success(openAutostartSettings(context))
                 else -> result.notImplemented()
             }
         }
@@ -67,6 +73,69 @@ object DeviceChannel {
         val headroom = if (Build.VERSION.SDK_INT >= 30) pm.getThermalHeadroom(10) else Float.NaN
         return mapOf("status" to status, "headroom" to headroom.toDouble())
     }
+
+    /**
+     * MIUI / HyperOS (Xiaomi, Redmi, POCO) refuse to start an app's process
+     * by themselves unless the user allowed its "Autostart": after a reboot
+     * the notification listener is then never bound, so Liyab's process does
+     * not start and its local API stays closed until Liyab is opened (seen in
+     * the log as "AutoStartManagerService: Reject service …
+     * LiyabNotificationListener"). No API turns it on; the user can, in the
+     * system's Autostart screen (openAutostartSettings).
+     *
+     * Returns "hyperos": whether this is such a system, and "allowed": the
+     * switch read through MIUI's own app-op (10008, not in the public SDK,
+     * read by reflection), or null when it cannot be read.
+     */
+    private fun autostart(context: Context): Map<String, Any?> {
+        if (!isMiui()) return mapOf("hyperos" to false, "allowed" to null)
+        val allowed = try {
+            val ops = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val check = AppOpsManager::class.java.getMethod(
+                "checkOpNoThrow", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java)
+            check.invoke(ops, MIUI_OP_AUTO_START, Process.myUid(), context.packageName) == AppOpsManager.MODE_ALLOWED
+        } catch (e: Exception) {
+            null
+        }
+        return mapOf("hyperos" to true, "allowed" to allowed)
+    }
+
+    /**
+     * Opens the system's Autostart screen (HyperOS / MIUI Security app), or
+     * this app's settings page where it is missing. Returns false when
+     * neither could be opened.
+     */
+    private fun openAutostartSettings(context: Context): Boolean {
+        val screens = listOf(
+            Intent().setComponent(
+                ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")),
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")),
+        )
+        for (intent in screens) {
+            try {
+                context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return true
+            } catch (e: Exception) {
+                // Not on this system (or not exported to us): try the next one.
+            }
+        }
+        return false
+    }
+
+    private fun isMiui(): Boolean {
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        if (manufacturer == "xiaomi" || manufacturer == "redmi" || manufacturer == "poco") return true
+        return systemProperty("ro.mi.os.version.name").isNotEmpty() || systemProperty("ro.miui.ui.version.name").isNotEmpty()
+    }
+
+    private fun systemProperty(name: String): String = try {
+        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, name) as String
+    } catch (e: Exception) {
+        ""
+    }
+
+    /** MIUI's app-op for Autostart (android.app.AppOpsManager has no constant for it). */
+    private const val MIUI_OP_AUTO_START = 10008
 
     private fun isAssistant(context: Context): Boolean {
         val roles = context.getSystemService(RoleManager::class.java) ?: return false

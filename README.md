@@ -867,7 +867,10 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   API on, that process starts the app's Dart side and the API listens at once, under its listening service; the
   model loads for the first request (and unloads again after the idle delay). Android allows that service although
   Liyab was never on screen: the system binds the listener as a foreground binding, which lets the process start
-  foreground services. With the API off, such a process starts nothing.
+  foreground services. With the API off, such a process starts nothing. HyperOS / MIUI refuse that binding unless
+  Liyab's Autostart is allowed (after a reboot the log shows "AutoStartManagerService: Reject service …
+  LiyabNotificationListener" and no process starts). No API can allow it, so with the local API on, Settings shows
+  **Allow Autostart** while the switch reads off, and opens the system's Autostart screen.
 * **Not yet.** Tools, images, `n` > 1 and logprobs are refused with an error, never silently ignored.
 
 ### Everything else
@@ -1376,7 +1379,7 @@ Implemented features are described above. These are next, in order:
     Liyab leaves the screen, and in a process it started for the notification listener (see the local API). A
     process Android started in the background for another reason (a download job) does not listen until Liyab is
     opened, nor does any process when notification access is off or the system does not start the listener's
-    process on its own (HyperOS may require Autostart for that);
+    process on its own (HyperOS / MIUI: only with Liyab's Autostart allowed, which Settings asks for);
   * pages that need a full activity may not open from the assistant sheet's window;
   * on macOS: Apple silicon only; the app is signed ad hoc, so macOS may ask for its permissions again after a
     rebuild; other apps' notifications cannot be read;
