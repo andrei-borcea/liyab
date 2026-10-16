@@ -358,7 +358,9 @@ class Trace:
 def run_trace(model_id, revision=None, trust_remote_code=False):
     """Builds the reduced model, runs it once and returns the records."""
     from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.utils import logging as hf_logging
 
+    hf_logging.set_verbosity_error()  # configuration and kernel notices are not facts about the model
     config = AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=trust_remote_code)
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     reduced, keep, n = reduced_config(config)

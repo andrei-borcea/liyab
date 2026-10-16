@@ -14,6 +14,11 @@ encoding, windows, per-block plan, MoE routing, tokenizer), and then either the 
 parts Liyab does not implement yet. A fact it cannot establish is reported as unknown and no row is proposed: it
 never fills a field with a guess. `--json FILE` writes the same as data.
 
+A description reads a few MB of the two checkpoints and runs a reduced copy of the model: Hunyuan-0.5B with a remote
+GGUF took 16 s on an M4 Pro, 3 s of it CPU, the rest the network. The gate builds `liyab-kl` and `liyab-tok` once
+(later runs recompile `architecture.cpp` when the row changes) and runs the model in transformers, in float32, and in
+Liyab: the 4 GB of float32 weights of a 1B model, 13 GB for a 3B one.
+
 ## Contents
 
 * [Where the facts come from](#where-the-facts-come-from)
@@ -156,6 +161,7 @@ keys set to the tokenizer's own rules in a copy of the file, the gate accepted t
 | Qwen3-0.6B (BF16) | registry's `qwen3` | 524 / 804 / 179, identical | 511 positions, mean KL 0.00000, top-1 99.80% | accepted |
 | Qwen2.5-1.5B-Instruct (bartowski f16), not tested before | registry's `qwen2` | 524 / 804 / 181, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | gemma-3-1b-it (unsloth BF16), not tested before | registry's `gemma3` | 523 / 801 / 211, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| Llama-3.2-3B-Instruct (unsloth BF16), not tested before | registry's `llama` | 498 / 797 / 202, identical | 498 positions, mean KL 0.00000, top-1 99.80% | accepted |
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 
