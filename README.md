@@ -1113,6 +1113,7 @@ reference's ids (`--ref-tokens`). With an F16 KV cache the forward passes agree:
 | Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% |
 | Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% |
 | Hunyuan-0.5B-Instruct (`hunyuan-dense`, reference ids, text after its BOS) | 500 | 0.00000 | 100.00% |
+| Hunyuan-MT-7B (`hunyuan-dense`, reference ids, text after its BOS) | 512 | 0.00000 | 100.00% |
 | gemma-3-270m-it (`gemma3`) | 512 | 0.00000 | 100.00% |
 | gemma-3-270m-it, a longer text: 4 times its 512-position window | 2,048 | 0.00000 | 99.95% |
 | Phi-3.5-mini-instruct (`phi3`, LongRoPE short factors) | 512 | 0.00000 | 99.80% |
