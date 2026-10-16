@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../api/local_api.dart';
 import '../state/app_state.dart';
+import 'autostart_hint.dart';
 
 class ApiSection extends StatelessWidget {
   const ApiSection({super.key, required this.app});
@@ -70,6 +71,7 @@ class ApiSection extends StatelessWidget {
               'them while it is closed; it uses no CPU until a request comes.',
               style: muted,
             ),
+            const AutostartHint(),
           ],
         ]);
       },
