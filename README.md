@@ -316,16 +316,17 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already, for Gemma 2 too;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE;
-  * `deepseek2` (DeepSeek-V2-Lite and the models converted to its architecture, such as Youtu-LLM-2B): multi-head
-    latent attention, queries from one projection or a low-rank pair with its norm, dense FFNs in the leading blocks
-    and MoE with shared experts in the others (from the tensors), YaRN with its log multiplier. Attention runs in
-    the absorbed form: each head's query is projected onto the latent once (`attn_k_b`), so all heads attend over
-    one cached row per position and block, `[k_pe | latent]` (576 values on DeepSeek-V2-Lite instead of the 5,120
-    of per-head keys and values), whose latent channels are the values; the weighted latent is then expanded per
-    head (`attn_v_b`). Queries are scaled for the per-head width the model was trained with (1/√192 there). Key
-    scaling covers the latent too and multiplies the attention output back. Files converted before `attn_kv_b` was
-    split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again, and so is group-limited
-    expert routing (`expert_group_count`, DeepSeek-V2 236B and V3).
+  * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with one expert group, and the models converted to
+    their architecture, such as Youtu-LLM-2B): multi-head latent attention, queries from one projection or a
+    low-rank pair with its norm, dense FFNs in the leading blocks and MoE with shared experts in the others (from
+    the tensors), YaRN with its log multiplier. Attention runs in the absorbed form: each head's query is projected
+    onto the latent once (`attn_k_b`), so all heads attend over one cached row per position and block,
+    `[k_pe | latent]` (576 values on DeepSeek-V2-Lite instead of the 5,120 of per-head keys and values), whose
+    latent channels are the values; the weighted latent is then expanded per head (`attn_v_b`). Queries are scaled
+    for the per-head width the model was trained with (1/√192 there). Key scaling covers the latent too and
+    multiplies the attention output back. Files converted before `attn_kv_b` was split into `attn_k_b` and
+    `attn_v_b` are refused with a request to convert them again, and so is group-limited expert routing
+    (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -1300,6 +1301,21 @@ cache the forward passes agree:
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
 
+The fused Huihui copy (written by `tools/gguf_fuse_experts.py`: the converter's `--fuse-gate-up-exps` does not
+cover `qwen3moe`), its experts streamed through a 128 MB cache, gave the split file's distributions exactly (KL 0,
+top-1 100%). DeepSeek-V2-Lite's own weights (31 GB) were not run: small random models built by transformers' own
+DeepSeek code with its structures, converted by llama.cpp's converter to F32, were compared instead (F16 KV, 511
+positions; weights drawn wide, so attention and outputs are sharp and a wrong part shows):
+
+* DeepSeek-V2-Lite's structure (latent attention without low-rank queries, YaRN with factor 40 and its mscale, a
+  dense first block, softmax top-3 of 8 experts unnormalized and scaled by 1.5, two shared experts): mean KL
+  0.00010, top-1 99.41% with the router's scores spread out; 0.00059, 99.61% with them as drawn, where a few
+  positions sit at a near-tie between two experts and choose the other. Changing the file's expert scale or YaRN
+  log multiplier moves the KL to 1.1 and 4.2. The same structure with dense blocks only: 0.00003, 100.00%.
+* DeepSeek-V3's structure with one expert group (low-rank queries, sigmoid scores with a selection bias,
+  renormalized top-3 scaled by 2.5, one shared expert): median KL 0.00001, top-1 99.80%; the mean, 0.0037, is one
+  position whose expert choice flipped at a near-tie.
+
 **Tokenizers against Hugging Face.** `liyab-tok` compared Liyab's ids with those of each model's own
 `tokenizer.json`, run by the Hugging Face `tokenizers` library (`tools/tokenizer_reference.py`), on three texts:
 `conform_text.txt`, `tokenizer_edge.txt` (contractions in both cases, digit runs, white-space runs, `\r\n`, CJK,
@@ -1507,6 +1523,9 @@ Benchmarks and tools built with the tests:
   ```
   `liyab-tok -m model.gguf --render request.json` applies the GGUF's chat template to a request, and `--format
   PROBE` prints its layout of turns and whether it is prefix-stable.
+* `tools/gguf_fuse_experts.py` copies a GGUF with each block's `ffn_gate_exps` and `ffn_up_exps` fused into one
+  `ffn_gate_up_exps` (standard library only, rows copied byte for byte): the copy must give the original's logits
+  bit for bit, in place and streamed, which checks the fused-expert path on any real MoE file.
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
@@ -1703,7 +1722,7 @@ src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
                         conform_reference.py, tokenizer_reference.py and chat_template_reference.py (Hugging
                         Face references),
-                        gguf_vocab.py, expert_study.py (cold-expert study),
+                        gguf_vocab.py, gguf_fuse_experts.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
