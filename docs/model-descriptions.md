@@ -44,10 +44,20 @@ transformers. Each fact is then recomputed from the records, never read from a c
 | Embeddings, logits | Block 0's input against the embedding table's rows (a scale of 1 or √d); the logits against the output projection's output (a scale or a soft-cap); whether the output matrix is the embedding table. |
 
 **The GGUF.** Its metadata and tensor names and shapes give the hyperparameters, how the file encodes RoPE (base,
-linear scaling, Llama 3 `rope_freqs`, LongRoPE factors), the window, the MoE metadata, the tokenizer and each
-block's plan, made the way `describe_model()` makes it. The RoPE frequencies the engine computes from the file are
-compared with the reference's table, the windowed blocks' own table included. Every tensor must be one the engine
-binds (`src/core/transformer.cpp`); one it would ignore is a missing part.
+linear scaling, Llama 3 `rope_freqs`, LongRoPE factors, YaRN), the window, the MoE metadata, the tokenizer and each
+block's plan, made the way `describe_model()` makes it. The RoPE frequencies and magnitude the engine computes from
+the file are compared with the reference's table, the windowed blocks' own table included. Every tensor must be one
+the engine binds (`src/core/transformer.cpp`); one it would ignore is a missing part. The file's BOS and
+space-prefix rules (`tokenizer.ggml.add_bos_token`, `add_space_prefix`) are compared with what the model's own
+tokenizer does with a short text.
+
+What the engine takes from the file rather than from the row (an attention scale, logit soft-caps, YaRN) counts as
+supported exactly when `describe_model()` reads the metadata key, or accepts the RoPE scaling type, that carries it;
+the reference's value must then be the file's. Otherwise the reference's scale, soft-cap or scaling is a missing
+part.
+
+A disagreement between the GGUF and the reference (other weights, a window or BOS rule the file does not record) is
+reported as a problem of the file: it does not change the row, and the gate fails on it where it matters.
 
 **A few weights of both checkpoints.** Read with HTTP range requests when the files are remote: two heads of the
 first attention block's key projection and the first block's norm weights (a few MB at most).
@@ -77,11 +87,15 @@ rows until the rule is added.
 2. `liyab-kl` and `liyab-tok` are built (CPU only), then `architecture.cpp` is restored in the scratch copy.
 3. The tokenizer: `tools/tokenizer_reference.py` writes the model's own ids for `tests/data/conform_text.txt`,
    `tokenizer_edge.txt` and `tokenizer_chat.txt`, and `liyab-tok --ids` must give the same ids for each.
-4. The forward pass: `tools/conform_reference.py` writes the transformers reference in float32 and `liyab-kl
-   --kv f16 --max-kl 0.01 --min-top1 97` must pass (both thresholds are options).
+4. The forward pass: `tools/conform_reference.py` writes the transformers reference in float32, with the model's
+   own special-token rule, and `liyab-kl --ref-tokens --kv f16 --max-kl 0.01 --min-top1 97` must pass (both
+   thresholds are options). On the reference's ids the forward pass, which is what the row decides, is measured
+   even when the file encodes the text differently; `liyab-kl` still reports whether its own encoding, BOS
+   included, gives the same ids, and that must hold too.
 
-The row is accepted only if every step passes. The GGUF must be a local file for the gate, BF16 or F16 (lower bit
-widths add their own error), and of the weights the reference loads.
+The row is accepted only if every step passes. When only the encoding fails, the tool says so: the row is right and
+the file's tokenizer settings are not. The GGUF must be a local file for the gate, BF16 or F16 (lower bit widths add
+their own error), and of the weights the reference loads.
 
 ## Validation
 
@@ -110,11 +124,35 @@ Hugging Face were checked). The
 and metadata prefix were changed to `mistral`, holding the four tensors the tool reads. Its original GGUF gives the
 `llama` row.
 
+Two official Qwen GGUFs hold other weights than their Hugging Face repositories: `qwen2.5-0.5b-instruct-fp16.gguf`
+and `qwen2.5-1.5b-instruct-fp16.gguf` (Qwen/Qwen2.5-*-Instruct-GGUF). Their key projections match the reference in no
+row order and no block-0 tensor holds the reference's norms, so the tool establishes nothing from them; bartowski's
+conversions of the same models match to rounding.
+
+### A new architecture: ERNIE 4.5
+
+`baidu/ERNIE-4.5-0.3B-PT` with `unsloth/ERNIE-4.5-0.3B-PT-GGUF` (F16), `general.architecture = ernie4_5`, which the
+registry does not have. Its reference rotates adjacent pairs `(2i, 2i + 1)` and the converter keeps the rows as
+they are, so the file pairs adjacent dimensions too; the rest is a plain pre-norm block with SwiGLU. The tool
+proposes:
+
+```
+    {"ernie4_5", RopeLayout::Adjacent, "ffn_norm", false},
+```
+
+It also reports that this GGUF asks for a BOS and a space before the text (`tokenizer.ggml.add_bos_token` true,
+`add_space_prefix` absent) while the model's tokenizer adds neither. The gate built the scratch copy with the row
+(only `architecture.cpp` recompiled) and rejected it for the file: the forward pass on the reference's ids passed
+(mean KL 0.00000, top-1 100.00%), the encodings did not (the first token differs on every text). With those two
+keys set to the tokenizer's own rules in a copy of the file, the gate accepted the row.
+
 ### The gate
 
 | Model | Row | Tokenizer: conform / edge / chat | liyab-kl `--kv f16` | Verdict |
 | :--- | :--- | ---: | :--- | :--- |
 | Qwen3-0.6B (BF16) | registry's `qwen3` | 524 / 804 / 179, identical | 511 positions, mean KL 0.00000, top-1 99.80% | accepted |
+| ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
+| ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 

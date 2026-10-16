@@ -347,6 +347,11 @@ class Engine:
             ftype, name, default = m.groups()
             self.fields.append((name, ftype, None if default is None else self.parse_value(ftype, default)))
         cpp = read("src/core/architecture.cpp")
+        # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
+        # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
+        # caps, YaRN) are supported exactly when it reads them.
+        self.file_keys = set(re.findall(r'(?:key|require_int)\(\s*"([^"]+)"', cpp))
+        self.rope_scalings = set(re.findall(r'\*scaling\s*[!=]=\s*"([\w-]+)"', cpp))
         m = re.search(r"kArchitectures\[\]\s*=\s*\{(.*?)\n\};", cpp, re.S)
         if m is None:
             raise ValueError("architecture.cpp: kArchitectures not found")
@@ -497,10 +502,15 @@ class Description:
 
     @property
     def ok(self):
-        return not (self.missing or self.unknown or self.file_issues)
+        """Every fact established and every part implemented. Disagreements of this GGUF with the reference
+        (file_issues) concern the file, not the architecture's row: they are reported, and the gate fails on
+        them where they matter."""
+        return not (self.missing or self.unknown)
 
     def merge_blocks(self):
         """"block 0: X", "block 1: X" -> "X (blocks 0-1)": a fact of every traced block is said once."""
+        self.parts = list(dict.fromkeys(self.parts))
+        self.notes = list(dict.fromkeys(self.notes))
         for name in ("missing", "unknown", "file_issues"):
             merged, order = {}, []
             for item in getattr(self, name):
@@ -572,12 +582,19 @@ def pairing_in_file(ref_layout, permutation, rope_dims, head_dim):
     return None
 
 
-def engine_inv_freq(g, rope_dim, long_context=False):
-    """RoPE frequencies the engine computes from the file (transformer.cpp): base^(-2i/r) divided by the file's
-    frequency factors, and the position scale; returns (inv_freq / scale list, magnitude, how)."""
+def _f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
+    """RoPE frequencies and magnitude the engine computes from the file (Transformer::load and describe_model()):
+    base^(-2i/r) divided by the file's frequency factors, blended by YaRN when the file asks for it, over the
+    linear position scale. Returns (inv_freq / scale list, magnitude, q.k factor, how)."""
     base = float(g.key("rope.freq_base", 10000.0))
     scaling = g.key("rope.scaling.type")
     scale = 1.0
+    magnitude = float(g.key("rope.scaling.attn_factor", 1.0))
+    qk = 1.0  # YaRN's factor on q.k when the file has a yarn_log_multiplier (squared into the attention scale)
     how = [f"base {base:g}"]
     if scaling == "linear":
         scale = float(g.key("rope.scaling.factor", 1.0))
@@ -594,11 +611,41 @@ def engine_inv_freq(g, rope_dim, long_context=False):
         if len(vals) == rope_dim // 2:
             factors = [float(v) for v in vals]
             how.append(f"factors {name.split('.')[0]}")
+    yarn = None
+    if scaling == "yarn":
+        factor = float(g.key("rope.scaling.factor", 0.0))
+        ctx = float(g.key("rope.scaling.original_context_length", n_ctx_train))
+        fast = float(g.key("rope.scaling.yarn_beta_fast", 32.0))
+        slow = float(g.key("rope.scaling.yarn_beta_slow", 1.0))
+        ext = float(g.key("rope.scaling.yarn_ext_factor", 1.0))
+        truncate = bool(g.key("rope.scaling.yarn_truncate", True))
+        # The correction range: the (fractional) pairs that turn beta_fast and beta_slow times over the
+        # original context.
+        turning = lambda turns: rope_dim * math.log(ctx / (turns * 2.0 * math.pi)) / (2.0 * math.log(base))
+        low, high = turning(fast), turning(slow)
+        if truncate:
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0.0), min(high, rope_dim - 1.0)
+        if high == low:
+            high += 0.001
+        yarn = (factor, low, high, ext)
+        ln = math.log(factor) if factor > 1.0 else 0.0
+        log_mul = g.key("rope.scaling.yarn_log_multiplier")
+        attn = g.key("rope.scaling.yarn_attn_factor")
+        magnitude *= float(attn) if attn is not None else (1.0 if log_mul is not None else 0.1 * ln + 1.0)
+        if log_mul is not None:
+            qk = 1.0 + float(log_mul) * ln
+        how.append(f"YaRN factor {factor:g} over {ctx:g} positions")
     inv = []
     for i in range(rope_dim // 2):
-        freq = base ** (-2.0 * i / rope_dim)
-        inv.append(float(struct.unpack("f", struct.pack("f", freq / factors[i]))[0]) / scale)
-    return inv, float(g.key("rope.scaling.attn_factor", 1.0)), ", ".join(how)
+        original = base ** (-2.0 * i / rope_dim) / factors[i]
+        if yarn is not None:
+            factor, low, high, ext = yarn
+            ramp = min(max((i - low) / (high - low), 0.0), 1.0)
+            kept = (1.0 - ramp) * ext
+            original = original / factor * (1.0 - kept) + original * kept
+        inv.append(_f32(original) / scale)
+    return inv, _f32(magnitude), qk, ", ".join(how)
 
 
 def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
@@ -781,10 +828,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     window_tables = {b["mixer"]["key"]["rope"]["table"] for b in att_blocks
                      if b["mixer"].get("key") and b["mixer"]["key"].get("rope") and windows[b["index"]] is not None}
     scaling_type = g.key("rope.scaling.type")
-    if scaling_type == "yarn":
-        d.missing.append("YaRN RoPE scaling (rope.scaling.type yarn)")
-    elif scaling_type not in (None, "none", "linear", "longrope", "su"):
-        d.missing.append(f"RoPE scaling '{scaling_type}'")
+    if scaling_type not in (None, "none") and scaling_type not in engine.rope_scalings:
+        d.missing.append(f"{'YaRN' if scaling_type == 'yarn' else repr(scaling_type)} RoPE scaling "
+                         f"(rope.scaling.type {scaling_type})")
+    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
     rope_dims = {b["mixer"]["key"]["rope"]["dims"] for b in att_blocks
                  if b["mixer"].get("key") and b["mixer"]["key"].get("rope")}
     if rope_dims and rope_dims != {rope_dim}:
@@ -797,7 +844,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         t = rope_tables[tname]
         ref = t["inv_freq"]
         if rope_base is None:
-            inv, mag, how = engine_inv_freq(g, rope_dim)
+            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"
@@ -923,14 +970,33 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
 
     # --- attention arguments ---
     qk_orders, qk_spans = set(), set()
+    # The q.k scale the engine uses: the file's attention.scale when it reads that key, else 1/sqrt(head_dim);
+    # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
+    file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
+    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(head_dim))) * qk_factor ** 2
+    file_cap = g.key("attn_logit_softcapping") if "attn_logit_softcapping" in engine.file_keys else None
     for b in att_blocks:
         m = b["mixer"]
         i = b["index"]
-        if not _close(m["scale"], m["head_dim"] ** -0.5, 1e-6):
-            d.missing.append(f"block {i}: attention scale {m['scale']:.6g}, not 1/sqrt(head_dim) = "
-                             f"{m['head_dim'] ** -0.5:.6g}")
-        if m.get("softcap"):
-            d.missing.append(f"block {i}: attention logit soft-capping at {m['softcap']:g}")
+        if not _close(m["scale"], engine_scale, 1e-5):
+            if "attention.scale" in engine.file_keys:
+                d.file_issues.append(f"block {i}: attention scale {m['scale']:.6g} in the reference, "
+                                     f"{engine_scale:.6g} from the file (attention.scale "
+                                     f"{'absent' if file_scale is None else file_scale})")
+            else:
+                d.missing.append(f"block {i}: attention scale {m['scale']:.6g}, not 1/sqrt(head_dim) = "
+                                 f"{m['head_dim'] ** -0.5:.6g}")
+        elif not _close(engine_scale, head_dim ** -0.5, 1e-6):
+            d.parts.append(f"attention scale {engine_scale:.6g} from the file, as the reference's")
+        cap = m.get("softcap") or 0.0
+        if "attn_logit_softcapping" not in engine.file_keys:
+            if cap:
+                d.missing.append(f"block {i}: attention logit soft-capping at {cap:g}")
+        elif not _close(float(file_cap or 0.0), cap, 1e-6):
+            d.file_issues.append(f"block {i}: attention soft-cap {cap:g} in the reference, {file_cap or 0:g} in the "
+                                 f"file (attn_logit_softcapping)")
+        elif cap:
+            d.parts.append(f"attention scores soft-capped at {cap:g} (from the file)")
         if m.get("sinks"):
             d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
         if not m.get("causal", True):
@@ -1129,10 +1195,17 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.missing.append(f"embeddings multiplied by {es:g} (the engine scales by sqrt(n_embd) = "
                          f"{math.sqrt(n_embd):.6g} or not at all)")
     lg = facts.get("logits") or {}
+    final_cap = lg["value"] if lg.get("transform") == "softcap" else 0.0
     if lg.get("transform") == "scale":
         d.missing.append(f"logits multiplied by {lg['value']:.6g} after the output projection")
-    elif lg.get("transform") == "softcap":
-        d.missing.append(f"final logit soft-capping at {lg['value']:g}")
+    elif "final_logit_softcapping" not in engine.file_keys:
+        if final_cap:
+            d.missing.append(f"final logit soft-capping at {final_cap:g}")
+    elif not _close(float(g.key("final_logit_softcapping", 0.0) or 0.0), final_cap, 1e-6):
+        d.file_issues.append(f"final logits soft-capped at {final_cap:g} in the reference, "
+                             f"{g.key('final_logit_softcapping', 0)} in the file (final_logit_softcapping)")
+    elif final_cap:
+        d.parts.append(f"final logits soft-capped at {final_cap:g} (from the file)")
     tied = facts.get("tied_output")
     has_output = "output.weight" in g.tensors
     if not has_output and tied is False:
@@ -1208,6 +1281,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.missing.append(f"BPE pre-tokenizer '{pre}' (tokenizer.ggml.pre) is not in the pre-tokenizer table")
     else:
         d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" else ""))
+    check_tokenizer_settings(d, g, model, revision, trust_remote_code)
 
     d.merge_blocks()
     if complete and not d.unknown:
@@ -1227,6 +1301,39 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
 
 def engine_default(engine, field):
     return next(dflt for n, _, dflt in engine.fields if n == field)
+
+
+def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
+    """The GGUF's BOS and space-prefix rules against what the model's own tokenizer does (the engine follows the
+    file: tokenizer.ggml.add_bos_token, by default on for SentencePiece only; tokenizer.ggml.add_space_prefix, by
+    default on). A file that disagrees encodes every prompt differently from the model's training."""
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
+    except Exception as e:  # noqa: BLE001 - reported, the gate checks the ids anyway
+        d.notes.append(f"the reference tokenizer did not load ({type(e).__name__}); its BOS and space-prefix rules "
+                       f"are left to the gate")
+        return
+    kind = g.metadata.get("tokenizer.ggml.model")
+    bos = g.metadata.get("tokenizer.ggml.bos_token_id")
+    add_bos = g.metadata.get("tokenizer.ggml.add_bos_token", kind == "llama")
+    add_bos = bool(add_bos) and bos is not None
+    plain = tok("The sea", add_special_tokens=False)["input_ids"]
+    special = tok("The sea", add_special_tokens=True)["input_ids"]
+    ref_bos = len(special) > len(plain) and special[0] == bos and special[1:1 + len(plain)] == plain
+    if add_bos != ref_bos:
+        d.file_issues.append(f"the model's tokenizer {'adds' if ref_bos else 'adds no'} BOS, the GGUF "
+                             f"{'asks for one' if add_bos else 'asks for none'} (tokenizer.ggml.add_bos_token "
+                             f"{g.metadata.get('tokenizer.ggml.add_bos_token', 'absent')})")
+    if kind == "llama" and plain:
+        piece = tok.convert_ids_to_tokens(plain[0])
+        ref_prefix = isinstance(piece, str) and piece.startswith("▁")
+        add_prefix = bool(g.metadata.get("tokenizer.ggml.add_space_prefix", True))
+        if add_prefix != ref_prefix:
+            d.file_issues.append(f"the model's tokenizer {'puts a' if ref_prefix else 'puts no'} space before the "
+                                 f"text, the GGUF {'asks for one' if add_prefix else 'asks for none'} "
+                                 f"(tokenizer.ggml.add_space_prefix "
+                                 f"{g.metadata.get('tokenizer.ggml.add_space_prefix', 'absent')})")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1346,7 +1453,9 @@ def gate(args, d, row_text, arch, engine):
         if code == 0:
             code, out = run([os.path.join(build, "liyab-tok"), "-m", args.gguf, "-f", text, "--ids", ids, "--quiet"],
                             log)
-        last = out.strip().splitlines()[-1] if out.strip() else ""
+        # liyab-tok's verdict line: "same ids: N tokens" or "tokens: ... first difference at token K".
+        lines_ = out.strip().splitlines()
+        last = next((ln for ln in lines_ if ln.startswith(("same ids", "tokens:"))), lines_[-1] if lines_ else "")
         results["checks"].append({"check": f"tokenizer {os.path.basename(text)}", "pass": code == 0, "detail": last})
         print(f"  tokenizer, {os.path.basename(text)}: {'pass' if code == 0 else 'FAIL'} ({last})", flush=True)
         ok = ok and code == 0
@@ -1358,14 +1467,22 @@ def gate(args, d, row_text, arch, engine):
         cmd.append("--trust-remote-code")
     code, out = run(cmd, log)
     if code == 0:
+        # On the reference's ids, so that the forward pass (the row) is measured even when this file encodes
+        # the text differently; liyab-kl still reports whether its own encoding, BOS rule included, matches.
         code, out = run([os.path.join(build, "liyab-kl"), "-m", args.gguf, "-f", texts[0], "--compare", ref,
-                         "--kv", "f16", "--max-kl", str(args.max_kl), "--min-top1", str(args.min_top1)], log)
+                         "--ref-tokens", "--kv", "f16", "--max-kl", str(args.max_kl), "--min-top1",
+                         str(args.min_top1)], log)
     lines = [ln for ln in out.strip().splitlines() if "positions |" in ln or ln.startswith(("PASS", "FAIL", "tokens"))]
-    results["checks"].append({"check": "liyab-kl --kv f16", "pass": code == 0, "detail": lines})
+    same_ids = any(ln.startswith("tokens:") and "identical to the reference" in ln for ln in lines)
+    results["checks"].append({"check": "encoding with the model's special-token rule", "pass": same_ids,
+                              "detail": next((ln for ln in lines if ln.startswith("tokens:")), "")})
+    results["checks"].append({"check": "liyab-kl --kv f16 on the reference's ids", "pass": code == 0, "detail": lines})
+    print(f"  the conformance text with the model's BOS rule: {'same ids' if same_ids else 'DIFFERENT ids'}")
     print(f"  forward pass against transformers: {'pass' if code == 0 else 'FAIL'}", flush=True)
     for ln in lines:
         print("    " + ln)
-    ok = ok and code == 0
+    results["row"] = code == 0
+    ok = ok and same_ids and code == 0
     return ok, results
 
 
@@ -1403,7 +1520,7 @@ def print_description(d, engine, arch):
         for n in d.notes:
             print("  " + n)
     if d.file_issues:
-        print("\nThe GGUF disagrees with the reference:")
+        print("\nThis GGUF disagrees with the reference (a problem of the file, not of the row):")
         for n in d.file_issues:
             print("  - " + n)
     if d.missing:
@@ -1474,8 +1591,13 @@ def main():
         if d.ok and d.row:
             passed, results = gate(args, d, d.row, arch, engine)
             out["gate"] = {"pass": passed, **results}
-            print("\nACCEPTED: the row passes the conformance gate." if passed else
-                  "\nREJECTED: the row does not pass the conformance gate (see the log).")
+            if passed:
+                print("\nACCEPTED: the row passes the conformance gate.")
+            elif results.get("row"):
+                print("\nREJECTED: the forward pass with the row matches the reference on its ids, but this GGUF "
+                      "does not encode text as the model's tokenizer does (see above and the log).")
+            else:
+                print("\nREJECTED: the row does not pass the conformance gate (see the log).")
             status = 0 if passed else 1
         else:
             print("\nNo row to verify.")
