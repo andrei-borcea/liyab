@@ -24,7 +24,30 @@ Nothing in the engine changed for it. Every number below comes from a run descri
 
 ## Summary
 
-SUMMARY_PLACEHOLDER
+* **Experts are not low-rank.** Effective rank 85–86% of full, 90% of the energy at 64–66% of the rank (a matrix
+  of shuffled entries: 97% and 76%). A rank-25 SVD (1 bit/weight) leaves 89–91% of the matrix unexplained. Only
+  block 0 is partly low-rank.
+* **LittleBit-style binary factorization is not worth implementing for these experts.** With our local refinement
+  (no training through the model) its output error is 0.52 at 1 bit/weight and 0.22 at 3 bits, worse than plain
+  uniform 2-bit (0.21 at 2.63 bits). End to end, the least used 25% of experts at 1 bit cost KL 0.069 (top-1
+  91.0%), seven times Q3_K's 0.0095 and over half of removing those experts outright (0.121).
+* **A non-uniform 3-bit codebook is a small gain over a well-fitted uniform 3-bit.** At Q3_K's 3.44 bits/weight it
+  lowers the output error by 8% (0.109 against 0.118) and the KL with the least used 50% replaced by 15% (0.0133
+  against 0.0156), but it needs a new kernel. The earlier quick study's gap (0.169 against 0.237) came from a weak
+  uniform baseline.
+* **Q3_K (a format the engine already decodes), fitted with input importances, is the candidate.** Replacing the
+  least used 25 / 50 / 75 / 100% of each block's experts costs KL 0.0095 / 0.0156 / 0.0253 / 0.0401 against the
+  unmodified model (top-1 95.1 / 94.7 / 92.1 / 91.2%; the Q8_0 harness alone accounts for 0.0064 and 97.5%).
+  All experts in Q3_K cost about what `--expert-mass 0.9` costs (KL 0.039, top-1 92.0%) and are 29% smaller.
+* **IQ3_XXS** saves 11% more bytes than Q3_K but costs more quality (KL 0.0186 at 50%) and 2–2.7× the original's
+  decode time per expert on the Mac, which cancels the I/O it saves.
+* **"Cold" experts carry few bytes.** The least used 25% of experts carry 4.7% of the routings (7.6% on another
+  text), so shrinking only them cuts the bytes read per token by 5–7% (projection). The bytes sit in the middle
+  of the usage ranking: a tier pays off only at 50–100% of the experts.
+* **Projected speed (not measured on the phone):** Q3_K for 50% of the experts, +4 to +8% at `--memory-budget 5500`;
+  for all experts, +9 to +29%. The range is the unknown decode cost of Q3_K on the phone: on the Mac a Q3_K expert
+  takes 1.18× (4 threads) to 1.48× (1 thread) the time of the original one. Measuring that on the phone
+  (`liyab-bench` now has the shapes) is the first step of the plan below.
 
 ## Setup
 
@@ -180,7 +203,31 @@ the evaluation text, with experts read in place (`--expert-cache 0`, no memory b
 
 The Q8_0 copy alone measures: KL mean 0.00643 (median 0.00256), top-1 agreement 97.45%, perplexity 7.345 → 7.376.
 
-E2E_TABLE_PLACEHOLDER
+Replaced: the least used fraction of every block's experts, by calibration counts (2,560 experts per 25%).
+The Frobenius error is over all replaced matrices; KL, top-1 and perplexity over the 509 positions of the
+evaluation text. The perplexity of a 510-token text moves by a few percent between runs of equal KL, so KL and
+top-1 are the measures to read.
+
+| Variant | Replaced | Frobenius error | KL mean / median vs original | KL p99 | Top-1 vs original | Perplexity (7.345) | KL / top-1 vs Q8_0 copy |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 copy only | 0 | | 0.0064 / 0.0026 | 0.037 | 97.45% | 7.376 | — |
+| Q3_K w | 25% | 0.147 | 0.0095 / 0.0037 | 0.060 | 95.09% | 7.388 | 0.0088 / 95.09% |
+| non-uniform w (16-value scales) | 25% | 0.141 | **0.0091** / 0.0035 | 0.080 | 95.48% | 7.276 | 0.0092 / 96.07% |
+| IQ3_XXS w | 25% | 0.194 | 0.0105 / 0.0041 | 0.083 | 95.48% | 7.370 | 0.0111 / 94.50% |
+| LittleBit 1 bit w | 25% | 0.668 | 0.0694 / 0.0152 | 0.697 | 90.96% | 7.234 | 0.0673 / 90.37% |
+| removed (zero) | 25% | 1 | 0.1209 / 0.0200 | 1.559 | 87.82% | 7.757 | 0.1185 / 87.43% |
+| Q3_K w | 50% | 0.147 | 0.0156 / 0.0065 | 0.145 | 94.70% | 7.301 | 0.0132 / 94.70% |
+| non-uniform w (16-value scales) | 50% | 0.142 | **0.0133** / 0.0053 | 0.108 | 95.09% | 7.234 | 0.0131 / 96.07% |
+| IQ3_XXS w | 50% | 0.195 | 0.0186 / 0.0067 | 0.160 | 92.53% | 7.240 | 0.0169 / 92.14% |
+| removed (zero) | 50% | 1 | 0.6921 / 0.1114 | 8.145 | 71.71% | 14.040 | 0.6988 / 70.73% |
+| Q3_K w | 75% | 0.147 | 0.0253 / 0.0114 | 0.183 | 92.14% | 7.367 | 0.0233 / 92.73% |
+| Q3_K w | 100% | 0.147 | 0.0401 / 0.0177 | 0.253 | 91.16% | 7.514 | 0.0389 / 91.94% |
+| Q3_K, unweighted | 100% | 0.145 | 0.0482 / 0.0207 | 0.367 | 90.37% | 7.510 | 0.0464 / 90.57% |
+
+* The ranking of the per-matrix study holds end to end: non-uniform < Q3_K < IQ3_XXS ≪ LittleBit 1 bit < removal.
+* Importance weighting matters end to end: all experts in Q3_K cost KL 0.048 unweighted and 0.040 weighted (−17%),
+  although the weighted fit has the larger Frobenius error.
+* The cost grows faster than the replaced share: 25% of the experts carry ~5–8% of the routings, 100% carry all.
 
 For scale, the existing lossy options on the same text (README): `--requant 5` KL 0.055 / top-1 91.1%,
 `--requant 4` 0.082 / 89.6%, `--expert-mass 0.9` 0.039 / 92.0%, `--expert-mass 0.8` 0.092 / 90.1% (measured on the
@@ -202,34 +249,98 @@ change in bytes is applied to the measured 284 (or 208) MiB, and the time saved 
 
 The replay has no prediction, so it misses less than the phone (200 simulated against 284 measured MiB per token at
 the 5500 cache) and it overstates how much a larger cache saves: from the 5500 to the 7000 cache it predicts
-−38% bytes where the phone measured −27%. The speed figures below are therefore upper estimates. The model is
-also linear in bytes and ignores any change in compute (a 3-bit expert multiplies at a different cost than a
-Q4_K one).
+−38% bytes where the phone measured −27%. The I/O-only figures below are therefore upper estimates.
 
-| Cold tier | Cold share | Simulated MiB/token (5500 cache) | Projected MiB/token | Projected tok/s at 5500 (8.29 measured) | at 7000 (9.50 measured) |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| none | 0 | 200 | 284 | 8.29 | 9.50 |
-| Q3_K | 25% | 190 | 269 | 8.50 (+3%) | 9.78 (+3%) |
-| Q3_K | 50% | 170 | 241 | 8.94 (+8%) | 10.34 (+9%) |
-| Q3_K | 75% | 140 | 199 | 9.67 (+17%) | 11.20 (+18%) |
-| Q3_K | 100% | 105 | 148 | 10.73 (+29%) | 12.21 (+29%) |
-| IQ3_XXS | 25% | 187 | 266 | 8.56 (+3%) | 9.85 (+4%) |
-| IQ3_XXS | 50% | 161 | 229 | 9.13 (+10%) | 10.58 (+11%) |
-| IQ3_XXS | 75% | 125 | 177 | 10.10 (+22%) | 11.71 (+23%) |
-| IQ3_XXS | 100% | 82 | 117 | 11.52 (+39%) | 12.97 (+37%) |
-| 1 bit (LittleBit) | 25% | 172 | 244 | 8.88 (+7%) | 10.29 (+8%) |
-| 1 bit (LittleBit) | 50% | 118 | 168 | 10.29 (+24%) | 12.07 (+27%) |
+**Decode cost of the tier formats** (measured on the Mac, Apple M4 Pro, not on the phone): `liyab-bench`, which
+now includes these shapes, timed one 2048×512 expert matrix from RAM (µs, three runs):
+
+| Format | 1 thread | 4 threads | Bits/weight |
+| :--- | ---: | ---: | ---: |
+| Q4_K (original gate / up) | 22–25 | 13–15 | 4.5 |
+| Q5_K (original down) | 32–37 | 14–16 | 5.5 |
+| Q3_K | 38–39 | 16–17 | 3.44 |
+| IQ3_XXS | 66–75 | 24–34 | 3.06 |
+| Q2_K | 31–32 | 14–22 | 2.63 |
+
+Per expert (gate + up + down), Q3_K takes 1.18× (4 threads) to 1.48× (1 thread) the time of the original
+formats, IQ3_XXS 2.07× to 2.65×. On the phone the routed experts take ~55 ms per token, of which about a third is
+waiting for flash (README), so ~37 ms of compute. The "with decode cost" projection adds that compute, scaled by
+the tier's share of the routings (measured on the evaluation text: 7.6 / 24.6 / 54.9 / 100% for 25 / 50 / 75 /
+100% of the experts) and by the ratio above (4-thread ratio / 1-thread ratio). It assumes the extra compute does
+not overlap with reads, so it is a lower estimate.
+
+| Tier | Experts in the tier | Simulated MiB/token (5500 cache) | Projected MiB/token | tok/s at 5500 (8.29 measured), I/O only | with decode cost | tok/s at 7000 (9.50 measured), I/O only | with decode cost |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| none | 0 | 200 | 284 | 8.29 | | 9.50 | |
+| Q3_K | 25% | 190 | 269 | 8.50 (+3%) | +2% / +1% | 9.78 (+3%) | +2% / +2% |
+| Q3_K | 50% | 170 | 241 | 8.94 (+8%) | +6% / +4% | 10.34 (+9%) | +7% / +4% |
+| Q3_K | 75% | 140 | 199 | 9.67 (+17%) | +13% / +7% | 11.20 (+18%) | +13% / +6% |
+| Q3_K | 100% | 105 | 148 | 10.73 (+29%) | +21% / +9% | 12.21 (+29%) | +19% / +6% |
+| IQ3_XXS | 25% | 187 | 266 | 8.56 (+3%) | +1% / −1% | 9.85 (+4%) | +1% / −1% |
+| IQ3_XXS | 50% | 161 | 229 | 9.13 (+10%) | +1% / −3% | 10.58 (+11%) | +1% / −4% |
+| IQ3_XXS | 75% | 125 | 177 | 10.10 (+22%) | 0% / −9% | 11.71 (+23%) | −2% / −12% |
+| IQ3_XXS | 100% | 82 | 117 | 11.52 (+39%) | −5% / −18% | 12.97 (+37%) | −10% / −24% |
+| 1 bit (LittleBit) | 25% | 172 | 244 | 8.88 (+7%) | no kernel | 10.29 (+8%) | no kernel |
+| 1 bit (LittleBit) | 50% | 118 | 168 | 10.29 (+24%) | no kernel | 12.07 (+27%) | no kernel |
+
+The non-uniform 3.44-bit tier reads the same bytes as Q3_K; its decode cost is unknown until a kernel exists.
 
 The cold quarter of the experts carries only ~5% of the routings, so shrinking it barely changes the bytes read
 (−5 to −7%): what is rarely used is also rarely read. The bytes are in the middle of the usage ranking.
 
 ## Conclusion
 
-CONCLUSION_PLACEHOLDER
+* **LittleBit: no.** These experts are nearly full-rank, so binary factors at 0.5–1 bit/weight lose half or more
+  of each expert (output error 0.52–0.68), and end to end the least used quarter at 1 bit costs KL 0.069, seven
+  times Q3_K. Its quality catches up with 3-bit quantization only at ~3 bits/weight, where it is worse than a
+  2.6-bit uniform format. Initializing from the GGUF and refining locally helps (0.69 → 0.54 at 1 bit) but cannot
+  make up for the missing low-rank structure.
+* **Non-uniform 3-bit tier: not now.** At equal bits it beats Q3_K by 8% in output error and 3–15% in KL. That is
+  less than the cost of a new kernel family (CPU NEON, Vulkan, Metal) whose decode cost is still unknown. It is
+  worth revisiting if Q3_K's decode cost on the phone turns out to be the limit and a codebook kernel can be made
+  cheaper than Q3_K's bit unpacking.
+* **IQ3_XXS tier: no.** It reads 11% fewer bytes than Q3_K, costs more quality, and decodes at 2–2.7× the original's
+  time on the Mac (on the phone the I-quant kernels were already measured slower per byte: IQ3_S 6.7 GB/s against
+  16.8 for Q4_K), which eats the I/O it saves.
+* **Q3_K tier, importance-weighted: worth implementing as an opt-in lossy option**, from 50% of the experts
+  (KL 0.0156, top-1 94.7%, projected +4 to +8%, 2.8 GB less on flash) to all of them (KL 0.040, top-1 91.2%,
+  projected +9 to +29%, 5.7 GB less). All experts in Q3_K cost what `--expert-mass 0.9` costs in quality, and the
+  two cut different things (bytes per expert, experts per token). It needs no new kernel. Its speed gain hinges on
+  Q3_K's decode cost on the Snapdragon, which must be measured before any engine work.
+* **"Cold" is the wrong criterion for bytes.** With the cache of the 5500 MiB budget (12% of the experts), the least
+  used experts are rarely read because they are rarely used; the reads come from the middle of the ranking. A
+  tier chosen by usage pays off only once it covers half or more of the experts, and its quality cost is then set
+  by how many routings land on it.
 
 ## Implementation plan for a runtime tier
 
-PLAN_PLACEHOLDER
+Conditional on step 1.
+
+1. **Measure Q3_K's decode cost on the phone.** Run `liyab-bench` on the Snapdragon (it now includes Q3_K, IQ3_XXS
+   and Q2_K expert shapes) at 1 and 7 threads. Go on only if a Q3_K expert costs at most ~1.25× the original's,
+   so that the projection's lower bound for all experts stays at about +9%. If the NEON Q3_K × Q8_K kernel is the
+   bottleneck, speeding it up comes first.
+2. **One-time conversion on the device, into a smaller file.** A GGUF tensor has one type, so a mixed model keeps
+   each block's experts in two stacked tensors, `ffn_{gate,up,down}_exps.weight` (original types) and
+   `ffn_{gate,up,down}_exps_q3.weight` (the tier, Q3_K), plus a per-block map from expert id to (tensor, index) in
+   the metadata. The converter reads the original file, encodes the tier with this study's importance-weighted
+   Q3_K encoder (ported to C++ next to `quantize_row_q4_K`), and writes the new file, which replaces the original
+   once complete and verified. Flash use shrinks (−2.8 GB at 50%, −5.7 GB at 100%) instead of growing with a second
+   copy. The importances come from a short calibration pass on a fixed text the engine ships (like the key-scaling
+   calibration text), not from the user's data.
+3. **Which experts.** Rank experts by routing counts on that calibration pass, or by the ExpertStore's persisted hot
+   list, which follows the user's own use. The tier fraction is the user-facing setting (off, 50%, 100%), shown with
+   its measured KL as the other lossy options are.
+4. **ExpertStore.** Size classes per (block, layout) already exist: the tier adds a Q3_K class per block, and
+   `segment()` resolves an expert id through the map. Batched passes repack Q4_K/Q5_K/Q6_K to `_R8`; Q3_K has no
+   repacked layout, so prefill uses the file layout for tier experts (measure the prefill cost). Prediction, LFU and
+   determinism are unchanged: an expert always has one format, so results do not depend on I/O timing.
+5. **Kernels.** CPU: the existing Q3_K × Q8_K NEON kernel. Vulkan and Metal: check Q3_K coverage for experts and add
+   it where missing.
+6. **Validation.** `liyab-kl` against the original file at each tier fraction (gated on the KL measured here), the
+   streamed-vs-in-place bit-identity test extended to a mixed model, a golden-logits model with a mixed expert
+   layout, then decode speed on the phone in alternating A/B runs at budgets 5500 and 7000, and the phone
+   regression run.
 
 ## Reproducing
 
