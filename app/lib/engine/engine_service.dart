@@ -350,12 +350,27 @@ class EngineService {
   }
 
   /// Queues `command`; `background` work yields to the user's requests.
-  Future<T> _call<T>(List<Object?> command, {bool background = false}) {
+  /// `abandoned` (optional) completes when the caller no longer wants the result: see _abandon.
+  Future<T> _call<T>(List<Object?> command, {bool background = false, Future<void>? abandoned}) {
     final id = _nextId++;
     final completer = Completer<T>();
     _pending[id] = (value) => value is EngineException ? completer.completeError(value) : completer.complete(value as T);
     _enqueue(_Job(id, [command[0], id, ...command.skip(1)], background: background));
+    abandoned?.then((_) => _abandon(id));
     return completer.future;
+  }
+
+  /// Stops command `id` for a caller that went away: while it waits it is dropped (its future fails); while it
+  /// runs the engine's cancel() stops it (embed and rerank between two blocks of the model, which then fail as
+  /// cancelled). Nothing else is touched: the next command is sent only once this one has replied, and the engine
+  /// clears its cancel flag when a call starts.
+  void _abandon(int id) {
+    if (_running?.id == id) {
+      cancel();
+    } else if (_queue.any((j) => j.id == id)) {
+      _queue.removeWhere((j) => j.id == id);
+      _pending.remove(id)?.call(EngineException('the request was abandoned'));
+    }
   }
 
   /// Loads a model, replacing the current one.
@@ -414,16 +429,17 @@ class EngineService {
   /// One vector per text with a pooling model (liyab_engine_embed): unit length, `dimensions` values when set
   /// (models trained for it), else the model's embedding size. An instruction is part of the text. An
   /// EngineException when the model does not embed (a generative model, a reranker) or a text is too long. Queued
-  /// like a generation: the engine serves one call at a time.
-  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) async {
-    final r = await _call<List<Object?>>(['embed', texts, dimensions]);
+  /// like a generation: the engine serves one call at a time. `abandoned` completing stops the call (see _abandon).
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned}) async {
+    final r = await _call<List<Object?>>(['embed', texts, dimensions], abandoned: abandoned);
     return Embeddings(List<Float32List>.from(r[0] as List), r[1] as int);
   }
 
   /// The relevance of each document to `query` with a reranker (liyab_engine_rerank), in input order. An
-  /// EngineException when the model is not a reranker or a pair is too long. Queued like a generation.
-  Future<RerankScores> rerank(String query, List<String> documents) async {
-    final r = await _call<List<Object?>>(['rerank', query, documents]);
+  /// EngineException when the model is not a reranker or a pair is too long. Queued like a generation; `abandoned`
+  /// as for embed.
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned}) async {
+    final r = await _call<List<Object?>>(['rerank', query, documents], abandoned: abandoned);
     return RerankScores(List<double>.from(r[0] as List), r[1] as int);
   }
 

@@ -1106,7 +1106,8 @@ curl http://127.0.0.1:8642/v1/chat/completions \
     blocks for Anthropic ones.
   * A final assistant message is continued, like Anthropic's prefill.
 * **Fair and frugal.** Requests wait their turn with your own messages. A client that disconnects stops its
-  generation, even while it is still queued or its prompt is being processed.
+  generation, even while it is still queued or its prompt is being processed, and its embedding or reranking call,
+  queued or running.
 * **Your chat keeps its place.** A request's prompt replaces the chat's context in the engine, which sets the chat's
   aside on storage (the prefix cache: at most 512 MB, no RAM) and restores it on your next message: 95 ms for a
   4,907-token chat on the 35B, where processing a 4,009-token one again had taken 163 s.

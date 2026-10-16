@@ -203,7 +203,7 @@ class OpenAiApi {
 
   Future<void> embeddings(Map<String, Object?> body, ApiConnection conn) async {
     final (input, dimensions, base64) = embeddingRequest(body);
-    final result = await core.embed(input, dimensions: dimensions);
+    final result = await core.embed(input, dimensions: dimensions, gone: conn.gone);
     return conn.json(200, {
       'object': 'list',
       'data': [

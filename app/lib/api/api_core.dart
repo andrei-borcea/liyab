@@ -189,11 +189,13 @@ abstract class ApiBackend {
   int get pooling;
 
   /// One unit vector per text, from the loaded embedding model (EngineService.embed); `dimensions` > 0 keeps the
-  /// first values (models trained for it). Throws EngineException when the engine refuses.
-  Future<Embeddings> embed(List<String> texts, {int dimensions = 0});
+  /// first values (models trained for it). Throws EngineException when the engine refuses. `abandoned` completing
+  /// (the client went away) stops the call, queued or running.
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned});
 
-  /// The relevance of each document to `query`, from the loaded reranker (EngineService.rerank).
-  Future<RerankScores> rerank(String query, List<String> documents);
+  /// The relevance of each document to `query`, from the loaded reranker (EngineService.rerank); `abandoned` as
+  /// for embed.
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned});
 }
 
 class ApiCore {
@@ -324,8 +326,9 @@ class ApiCore {
   }
 
   /// Embeddings of `texts` with the loaded model, in order. ApiError when it is not an embedding model, a text is
-  /// longer than its context or `dimensions` is more than it has.
-  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) async {
+  /// longer than its context or `dimensions` is more than it has. `gone` completing (the client went away) stops
+  /// the call, also while it waits in the queue.
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? gone}) async {
     if (texts.isEmpty) throw const ApiError(400, 'input must not be empty');
     await backend.ensureLoaded();
     final pooling = backend.pooling;
@@ -335,15 +338,15 @@ class ApiCore {
           'Qwen3-Embedding');
     }
     try {
-      return await backend.embed(texts, dimensions: dimensions);
+      return await backend.embed(texts, dimensions: dimensions, abandoned: gone);
     } on EngineException catch (e) {
       throw ApiError(400, e.message);
     }
   }
 
   /// The relevance of each document to `query` with the loaded reranker. ApiError when it is not a reranker or a
-  /// pair is longer than its context.
-  Future<RerankScores> rerank(String query, List<String> documents) async {
+  /// pair is longer than its context. `gone` as for embed.
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? gone}) async {
     if (documents.isEmpty) throw const ApiError(400, 'documents must not be empty');
     await backend.ensureLoaded();
     if (backend.pooling != LiyabPooling.rank) {
@@ -351,7 +354,7 @@ class ApiCore {
           'Qwen3-Reranker (a GGUF with its ranking head)');
     }
     try {
-      return await backend.rerank(query, documents);
+      return await backend.rerank(query, documents, abandoned: gone);
     } on EngineException catch (e) {
       throw ApiError(400, e.message);
     }

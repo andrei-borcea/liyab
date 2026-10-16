@@ -42,7 +42,7 @@ class RerankApi {
 
   Future<void> rerank(Map<String, Object?> body, ApiConnection conn) async {
     final (query, documents, topN, echo) = request(body);
-    final result = await core.rerank(query, documents);
+    final result = await core.rerank(query, documents, gone: conn.gone);
     final order = List<int>.generate(documents.length, (i) => i)
       // Highest first; equal scores keep the request's order.
       ..sort((a, b) {

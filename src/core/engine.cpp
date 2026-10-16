@@ -1014,7 +1014,9 @@ struct Engine::Impl {
         forward_hooks.cancel = &cancel;
         auto run = run_pooled(*target, sequences, pool_target, route, *this->pool, prefill_chunk(), &forward_hooks);
         clear_context();
-        if (!run && run.status().code() == ErrorCode::Cancelled) return Status(ErrorCode::Cancelled, "cancelled");
+        if (!run && run.status().code() == ErrorCode::Cancelled) {
+            return Status(ErrorCode::Cancelled, "the embedding or reranking call was cancelled");
+        }
         return run;
     }
 };

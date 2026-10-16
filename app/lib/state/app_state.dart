@@ -449,11 +449,12 @@ class AppState extends ChangeNotifier implements ApiBackend {
   int pooling = LiyabPooling.none;
 
   @override
-  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) =>
-      _apiCall(() => engine.embed(texts, dimensions: dimensions));
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned}) =>
+      _apiCall(() => engine.embed(texts, dimensions: dimensions, abandoned: abandoned));
 
   @override
-  Future<RerankScores> rerank(String query, List<String> documents) => _apiCall(() => engine.rerank(query, documents));
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned}) =>
+      _apiCall(() => engine.rerank(query, documents, abandoned: abandoned));
 
   /// Another app's embedding or reranking request: API work like a generation (the model stays loaded, and
   /// hidden, the work service keeps the process running), and the engine's context is not the chat's once it ran.

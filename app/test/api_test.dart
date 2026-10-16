@@ -46,10 +46,23 @@ class FakeBackend implements ApiBackend {
   final embedCalls = <(List<String>, int)>[];
   final rerankCalls = <(String, List<String>)>[];
   String? poolingError; // set: the engine refuses the call with this message
+  Duration poolingDelay = Duration.zero; // a call's time, unless abandoned first
+  var abandons = 0;
+
+  // As EngineService: an abandoned call stops at once and fails.
+  Future<void> _work(Future<void>? abandoned) async {
+    var gone = false;
+    await Future.any([Future<void>.delayed(poolingDelay), if (abandoned != null) abandoned.then((_) => gone = true)]);
+    if (gone) {
+      ++abandons;
+      throw EngineException('cancelled');
+    }
+  }
 
   @override
-  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) async {
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned}) async {
     embedCalls.add((texts, dimensions));
+    await _work(abandoned);
     if (poolingError != null) throw EngineException(poolingError!);
     final size = dimensions > 0 ? dimensions : 4;
     return Embeddings([
@@ -61,8 +74,9 @@ class FakeBackend implements ApiBackend {
   }
 
   @override
-  Future<RerankScores> rerank(String query, List<String> documents) async {
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned}) async {
     rerankCalls.add((query, documents));
+    await _work(abandoned);
     if (poolingError != null) throw EngineException(poolingError!);
     final words = query.toLowerCase().split(' ');
     return RerankScores([
@@ -710,6 +724,32 @@ t1 ::= "now>\n" ""''');
       expect(embedding, 400);
       expect(jsonDecode(why)['error']['message'], contains('not a reranker'));
       expect(backend.rerankCalls, hasLength(3));
+    });
+
+    test('a client that goes away stops its embedding or reranking call', () async {
+      backend.poolingDelay = const Duration(seconds: 30);
+      for (final (pooling, path, body) in [
+        (LiyabPooling.last, '/v1/embeddings', <String, Object?>{'input': ['a', 'b']}),
+        (LiyabPooling.rank, '/v1/rerank', <String, Object?>{'query': 'q', 'documents': ['a', 'b']}),
+      ]) {
+        backend.pooling = pooling;
+        final before = backend.abandons;
+        final calls = backend.embedCalls.length + backend.rerankCalls.length;
+        final client = HttpClient();
+        final req = await client.open('POST', '127.0.0.1', api.boundHttpPort!, path);
+        req.headers.set('authorization', 'Bearer $token');
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode(body));
+        unawaited(req.close().then((r) => r.drain<void>()).catchError((_) {}));
+        for (var i = 0; i < 200 && backend.embedCalls.length + backend.rerankCalls.length == calls; ++i) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        client.close(force: true);
+        for (var i = 0; i < 200 && backend.abandons == before; ++i) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(backend.abandons, before + 1, reason: path);
+      }
     });
 
     test('a client that goes away mid-stream stops its generation', () async {
