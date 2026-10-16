@@ -300,6 +300,38 @@ t1 ::= "now>\n" "")");
                        "</function>\n</tool_call>"));
 }
 
+// A Qwen XML call whose string value has free characters under a bound
+// ({"type": "string", "maxLength": 80}): %string's characters can run over
+// the markup that follows them, so after a whole call the value could still
+// be going on and the call's span never ended. ToolDialect.callGrammar now
+// writes such a value without '<' (app/test/agent_calls_test.dart expects
+// this text): the call ends where it closes.
+TEST_CASE("grammar: an XML call's bounded string value cannot run over its closing tag") {
+    const Grammar runs_over = text_grammar(R"(root ::= "\n" "<function=" (t0) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=title>\n" %string {"type":"string","maxLength":80} "\n</parameter>\n"
+t0 ::= "note>\n" p0-0?)");
+    const Grammar closes = text_grammar(R"(root ::= "\n" "<function=" (t0) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=title>\n" [^<]{0,80} "\n</parameter>\n"
+t0 ::= "note>\n" p0-0?)");
+    const std::string call = "\n<function=note>\n<parameter=title>\nShopping\n</parameter>\n</function>\n</tool_call>";
+    // The same call with the closing tags taken in by the value, which goes on.
+    const std::string taken_in = "\n<function=note>\n<parameter=title>\nShopping\n</parameter>\n</function>\n</tool_call>\nx"
+                                 "\n</parameter>\n</function>\n</tool_call>";
+    for (const Grammar* g : {&runs_over, &closes}) {
+        CHECK(g->matches(call));
+        grammar::StateTable t(g->program());
+        const int32_t end = t.advance(t.initial(), call);
+        REQUIRE(end >= 0);
+        CHECK(t.accepting(end));
+        // A span ends when its match is complete and nothing can follow (Engine::generate).
+        CHECK(t.extendable(end) == (g == &runs_over));
+        CHECK(g->matches(taken_in) == (g == &runs_over));
+    }
+    // Lines and every other character are still text; the bound still holds.
+    CHECK(closes.matches("\n<function=note>\n<parameter=title>\nMilk\nEggs > 2/day\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(!closes.matches("\n<function=note>\n<parameter=title>\n" + std::string(81, 'x') + "\n</parameter>\n</function>\n</tool_call>"));
+}
+
 TEST_CASE("grammar: a table past its bound starts over and keeps following the input") {
     // Each position of a bounded string is its own state: 300 positions, a table of at most 40.
     const Grammar g = schema(R"({"type": "string", "maxLength": 300})");

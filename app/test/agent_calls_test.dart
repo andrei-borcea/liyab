@@ -335,6 +335,80 @@ t1 ::= "\\"read_sms\\", \\"arguments\\": " "{" (p1-0 (", " p1-1)? | p1-1)? "}"''
     }
   }, skip: Engine.skip);
 
+  test('an XML string value with a length bound or an unchecked format cannot hold its closing tag', () {
+    final engine = Engine.instance!;
+    // Every way a client's string parameter gets free characters with a constraint, next to the kinds whose
+    // values are literals or have no newline (enum, a format the engine checks), which keep %string.
+    const note = ToolSpec('note', 'Note', {
+      'type': 'object',
+      'properties': {
+        'title': {'type': 'string', 'maxLength': 80},
+        'body': {'type': 'string', 'minLength': 1},
+        'code': {'type': 'string', 'minLength': 2, 'maxLength': 120},
+        'to': {'type': 'string', 'format': 'email'},
+        'link': {'type': 'string', 'format': 'uri', 'maxLength': 200},
+        'key': {'type': 'string', 'minLength': 16, 'maxLength': 16},
+        'tag': {'type': 'string', 'minLength': 3, 'maxLength': 3},
+        'unit': {'enum': ['c', 'f']},
+        'day': {'type': 'string', 'format': 'date'},
+      },
+    });
+    final xml = ToolDialect.qwenXml.callGrammar([note]);
+    expect(engine.error(xml), isNull);
+    String call(String name, String value) =>
+        '\n<function=note>\n<parameter=$name>\n$value\n</parameter>\n</function>\n</tool_call>';
+    const closing = '\n</parameter>\n</function>\n</tool_call>';
+    final samples = {
+      'title': 'abc',
+      'body': 'abc',
+      'code': 'abc',
+      'to': 'a@b.it',
+      'link': 'https://a.it/x',
+      'key': '0123456789abcdef',
+      'tag': 'abc',
+      'unit': 'c',
+      'day': '2026-10-16',
+    };
+    for (final MapEntry(key: name, value: sample) in samples.entries) {
+      expect(engine.matches(xml, call(name, sample)), isTrue, reason: name);
+      // No value can take in the call's closing tags and go on (the call's span would then never end): the first
+      // "\n</parameter>" closes it, as the parsers read it.
+      expect(engine.matches(xml, call(name, '$sample${closing}x')), isFalse, reason: name);
+      expect(engine.matches(xml, call(name, '${sample.substring(1)}${closing.substring(0, 13)}')), isFalse,
+          reason: name);
+    }
+    expect(xml, contains('p0-0 ::= "<parameter=title>\\n" [^<]{0,80} "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-1 ::= "<parameter=body>\\n" [^<]{1,} "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-2 ::= "<parameter=code>\\n" [^<]{2,120} "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-3 ::= "<parameter=to>\\n" [^<]* "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-4 ::= "<parameter=link>\\n" [^<]{0,200} "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-5 ::= "<parameter=key>\\n" [^<]{16} "\\n</parameter>\\n"'));
+    // What cannot hold the 13 characters of the closing tag keeps the text the local API always wrote.
+    expect(xml, contains('p0-6 ::= "<parameter=tag>\\n" %string {"type":"string","minLength":3,"maxLength":3} '
+        '"\\n</parameter>\\n"'));
+    expect(xml, contains('p0-7 ::= "<parameter=unit>\\n" %string {"enum":["c","f"]} "\\n</parameter>\\n"'));
+    expect(xml, contains('p0-8 ::= "<parameter=day>\\n" %string {"type":"string","format":"date"} "\\n</parameter>\\n"'));
+    // Lines, '>' and '/' are text like any other; the bounds count characters.
+    expect(engine.matches(xml, call('body', 'Milk\nEggs > 2/day\n')), isTrue);
+    expect(engine.matches(xml, call('code', 'x')), isFalse);
+    expect(engine.matches(xml, call('title', 'x' * 81)), isFalse);
+    expect(engine.matches(xml, call('title', 'é' * 80)), isTrue);
+    expect(engine.matches(xml, call('key', '0123456789abcde')), isFalse);
+    expect(engine.matches(xml, call('tag', 'abcd')), isFalse);
+    // JSON calls never had it: a value is a quoted string, which holds the closing tag's text as text.
+    final json = ToolDialect.hermesJson.callGrammar([note]);
+    expect(engine.matches(json, '\n{"name": "note", "arguments": {"title": "a\\n</tool_call>"}}\n</tool_call>'), isTrue);
+    expect(engine.matches(json, '\n{"name": "note", "arguments": {"title": "a"}}\n</tool_call>x'), isFalse);
+    // Bounds the engine refuses (above 10000, a maximum below the minimum) still leave the tool loose.
+    for (final bad in [
+      {'type': 'string', 'maxLength': 20000},
+      {'type': 'string', 'minLength': 5, 'maxLength': 2},
+    ]) {
+      final t = ToolSpec('t', '', {'type': 'object', 'properties': {'v': bad}});
+      expect(engine.error(ToolDialect.qwenXml.callGrammar([t])), isNotNull, reason: '$bad');
+    }
+  }, skip: Engine.skip);
+
   test('a scripted model calls through the structure the app generates with, in both formats', () async {
     final engine = Engine.instance;
     for (final d in dialects) {

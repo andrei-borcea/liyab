@@ -221,13 +221,46 @@ enum ToolDialect {
       final grammar = t.values[name];
       final value = grammar != null
           ? '($grammar) "\\n</parameter>\\n"'
-          : xmlValueKind(schema) == XmlValue.text
-              ? free
-              : '${xmlValueKind(schema) == XmlValue.raw ? '%string' : '%schema'} ${jsonEncode(schema)} "\\n</parameter>\\n"';
+          : switch (xmlValueKind(schema)) {
+              XmlValue.text => free,
+              XmlValue.raw => '${_rawValue(schema as Map)} "\\n</parameter>\\n"',
+              XmlValue.json => '%schema ${jsonEncode(schema)} "\\n</parameter>\\n"',
+            };
       rules.add('p$i-$j ::= ${grammarLiteral('<parameter=$name>\n')} $value');
       parts.add(required.contains(name) ? 'p$i-$j' : 'p$i-$j?');
     }
     return parts.isEmpty ? '""' : parts.join(' ');
+  }
+
+  /// The formats whose text the engine checks (include/liyab/grammar.h): none
+  /// has a newline, so none can hold a parameter's closing tag.
+  static const _checkedFormats = {'date', 'time', 'date-time', 'uuid'};
+
+  /// A constrained string parameter's raw value (XmlValue.raw). %string writes
+  /// literals (enum, const) and the formats the engine checks as the schema
+  /// says. Any other raw value, under a length bound or a format the engine
+  /// does not check, is free characters, which %string would let run over the
+  /// closing `\n</parameter>`: the grammar would also read the call's closing
+  /// tags as the value going on, and the call's span would stay open to the
+  /// end of generation. Such a value takes every character but `<` instead,
+  /// with the schema's length, so the first `\n</parameter>` closes it, as
+  /// the parsers read it. A value too short to hold the closing tag
+  /// (maxLength under its 13 characters) cannot run over it, and keeps
+  /// %string. Bounds the engine refuses (above 10000, a maximum below the
+  /// minimum) are refused here too, so the tool takes arguments of any shape,
+  /// as when %string refused them.
+  static String _rawValue(Map<Object?, Object?> schema) {
+    final string = '%string ${jsonEncode(schema)}';
+    final format = schema['format'];
+    if (schema['enum'] is List || schema.containsKey('const') || _checkedFormats.contains(format)) return string;
+    int? count(Object? v) => v is num && v >= 0 && v == v.roundToDouble() && v <= 1e9 ? v.toInt() : null;
+    final min = schema.containsKey('minLength') ? count(schema['minLength']) : 0;
+    final max = schema.containsKey('maxLength') ? count(schema['maxLength']) : null;
+    if (min == null || (schema.containsKey('maxLength') && max == null)) return string; // the engine says why
+    if (max != null && max < '\n</parameter>'.length) return string;
+    return max == null
+        ? (min == 0 ? '[^<]*' : '[^<]{$min,}')
+        : (min == max ? '[^<]{$min}' : '[^<]{$min,$max}');
   }
 
   /// How an XML parameter's value is written: free text (a string without

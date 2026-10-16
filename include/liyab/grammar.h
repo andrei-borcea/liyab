@@ -67,7 +67,11 @@
 //   %schema {..}  a JSON value valid against the JSON Schema that follows
 //   %string {..}  the raw text of a value of a string schema (type "string",
 //                 or an enum / const of strings): no quotes, no escapes, any
-//                 character; for values inside markup (XML tool calls)
+//                 character; for values inside markup (XML tool calls). Free
+//                 characters (a length bound, a format not checked) can also
+//                 spell the markup that follows, so a match can go on past
+//                 it: keep such a value from holding that markup (a class
+//                 such as [^<]{0,80} does)
 //   %until "s"    any text that does not contain s, then s (e.g. reasoning
 //                 up to its closing tag)
 //
