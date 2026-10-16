@@ -144,7 +144,8 @@ private:
     bool stopped_ = false;
 };
 
-// Expert `e` of a stacked expert tensor [cols, rows, n_expert] as a 2-D view.
+// Slice `e` of a stacked tensor [cols, rows, n] as a 2-D view: an expert of
+// a MoE block, or a head of latent attention's per-head matrices.
 TensorView expert_slice(const TensorView& t, int64_t e) {
     TensorView v = t;
     v.n_dims = 2;
@@ -194,8 +195,18 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // with few attention blocks gets a long context (Qwen3.6-35B-A3B: 10.6 KiB
     // per position, ~24k), where a flat 4096 forced chats with tools to drop
     // old turns, and each drop meant processing the whole history again.
-    const size_t kv_per_token = KvCache::bytes_per_token(std::max(c.n_attn_layers, 1), c.n_head_kv, c.head_dim,
-                                                         options.kv_type);
+    KvCacheConfig kv;
+    // Only attention blocks have keys and values (at least one slot keeps the
+    // cache well-formed for purely recurrent stacks).
+    kv.n_layers = std::max(c.n_attn_layers, 1);
+    kv.n_head_kv = c.n_head_kv;
+    kv.head_dim = c.head_dim;
+    kv.type = options.kv_type;
+    // Latent attention: one row [k_pe | latent] per position and block, its
+    // latent channels serving as the values (ModelConfig::mla).
+    kv.values_in_keys = c.mla.kv_rank > 0;
+    kv.value_offset = kv.values_in_keys ? c.rope_dim : 0;
+    const size_t kv_per_token = KvCache::bytes_per_token(kv);
     const auto automatic = static_cast<int32_t>(std::clamp<size_t>(kKvBudgetBytes / std::max<size_t>(kv_per_token, 1),
                                                                    4096, 32768));
     model->context_length_ = options.context_length > 0
@@ -205,18 +216,12 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         LIYAB_LOG_WARN("context %d exceeds the model's training context %d", model->context_length_, c.n_ctx_train);
     }
     model->max_batch_ = std::max(1, options.max_batch);
-    KvCacheConfig kv;
-    // Only attention blocks have keys and values (at least one slot keeps the
-    // cache well-formed for purely recurrent stacks).
-    kv.n_layers = std::max(c.n_attn_layers, 1);
-    kv.n_head_kv = c.n_head_kv;
-    kv.head_dim = c.head_dim;
-    kv.type = options.kv_type;
     kv.max_positions = model->context_length_;
     kv.window = options.sliding_window > 0 && options.sliding_window < model->context_length_ ? options.sliding_window : 0;
     kv.sink_tokens = std::clamp(options.sink_tokens, 0, kv.page_tokens);
-    if (kv.type != KvCacheType::F16 && c.head_dim % quant::kBlock != 0) {
-        LIYAB_LOG_WARN("head_dim %d is not a multiple of %d; using an F16 KV cache", c.head_dim, quant::kBlock);
+    if (kv.type != KvCacheType::F16 && (c.head_dim % quant::kBlock != 0 || kv.value_offset % quant::kBlock != 0)) {
+        LIYAB_LOG_WARN("head_dim %d (values from channel %d) is not in whole blocks of %d; using an F16 KV cache",
+                       c.head_dim, kv.value_offset, quant::kBlock);
         kv.type = KvCacheType::F16;
     }
     auto cache = KvCache::create(kv);
@@ -304,7 +309,13 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                    c.arch.c_str(), c.n_layers, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab,
                    model->context_length_, kv.window ? " (sliding)" : "",
                    std::string(dtype_traits(model->kv_->dtype()).name).c_str(),
-                   static_cast<double>(KvCache::bytes_per_token(kv.n_layers, c.n_head_kv, c.head_dim, kv.type)) / 1024.0);
+                   static_cast<double>(KvCache::bytes_per_token(kv)) / 1024.0);
+    if (c.mla.kv_rank > 0) {
+        LIYAB_LOG_INFO("latent attention: a %d-wide latent + %d RoPE channels cached per position, %d heads of %d + %d "
+                       "-> %d%s",
+                       c.mla.kv_rank, c.rope_dim, c.n_head, c.mla.nope_dim, c.rope_dim, c.mla.v_dim,
+                       c.mla.q_rank > 0 ? ", low-rank queries" : "");
+    }
     if (c.hybrid()) {
         LIYAB_LOG_INFO("DeltaNet: %d recurrent blocks, %d/%d heads x %d, conv %d, state %.1f MiB", c.n_layers - c.n_attn_layers,
                        c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
@@ -383,7 +394,38 @@ Status Transformer::bind_weights() {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
-        if (plan.mixer == MixerKind::Attention) {
+        if (plan.mixer == MixerKind::Attention && plan.latent) {
+            L.kv_slot = kv_slots++;
+            const LatentAttention& m = c.mla;
+            const int64_t q_rows = int64_t{c.n_head} * (m.nope_dim + c.rope_dim);  // per head [q_nope | q_pe]
+            if (m.q_rank > 0) {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q_a.weight"), c.n_embd, m.q_rank, L.w[kQa]));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_a_norm.weight"), m.q_rank, true, L.q_a_norm));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q_b.weight"), m.q_rank, q_rows, L.w[kQb]));
+            } else {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q.weight"), c.n_embd, q_rows, L.w[kQ]));
+            }
+            LIYAB_RETURN_IF_ERROR(
+                matrix(block_tensor(l, "attn_kv_a_mqa.weight"), c.n_embd, m.kv_rank + c.rope_dim, L.w[kKvA]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_kv_a_norm.weight"), m.kv_rank, true, L.kv_a_norm));
+            // Per head: attn_k_b maps a head's q_nope onto the latent (the
+            // key's projection, transposed by the converter), attn_v_b the
+            // weighted latent onto the head's value.
+            auto per_head = [&](const char* suffix, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
+                const std::string name = block_tensor(l, suffix);
+                const TensorView* t = f.tensor(name);
+                if (t == nullptr) return Status(ErrorCode::InvalidModel, "missing tensor '" + name + "'");
+                if (t->ne[0] != cols || t->ne[1] != rows || t->ne[2] != c.n_head || t->ne[3] != 1) {
+                    return Status(ErrorCode::InvalidModel, "tensor '" + name + "' does not have the per-head shape");
+                }
+                out = t;
+                return Status::ok();
+            };
+            LIYAB_RETURN_IF_ERROR(per_head("attn_k_b.weight", m.nope_dim, m.kv_rank, L.w[kKb]));
+            LIYAB_RETURN_IF_ERROR(per_head("attn_v_b.weight", m.kv_rank, m.v_dim, L.w[kVb]));
+            LIYAB_RETURN_IF_ERROR(
+                matrix(block_tensor(l, "attn_output.weight"), int64_t{c.n_head} * m.v_dim, c.n_embd, L.w[kO]));
+        } else if (plan.mixer == MixerKind::Attention) {
             L.kv_slot = kv_slots++;
             if (plan.fused_qkv) {
                 LIYAB_RETURN_IF_ERROR(
@@ -826,7 +868,11 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const ModelConfig& c = config_;
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
-    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(hd);
+    // Values may be narrower than keys (latent attention: the latent part of
+    // each key row); every value-sized buffer below follows value_dim.
+    const int32_t vd = c.value_dim;
+    const auto uvd = static_cast<size_t>(vd);
+    const size_t out_dim = static_cast<size_t>(c.n_head) * uvd;  // att_ row: every head's output
     const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
     const float softcap = c.attn_softcap;
     const DType kv_type = kv_->dtype();
@@ -879,10 +925,10 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     // Span sp of token t for the query heads of KV head g. For head j of the
     // group: the span's maximum score mx[j * stride], the sum of exp(score -
     // maximum) sm[j * stride] and the V rows weighted by them at out + j *
-    // stride * hd (stride: span slots per head).
+    // stride * vd (stride: span slots per head).
     auto score_span = [&](int32_t t, int32_t g, int32_t sp, float* mx, float* sm, float* out, size_t stride) {
         thread_local std::vector<float> scores;  // [group][span length]
-        thread_local std::vector<float> vrow;    // one V row, decoded
+        thread_local std::vector<float> vrow;    // one V row, decoded (vd values)
         thread_local std::vector<float> dots;    // one K row against the group's queries
         thread_local std::vector<const quant::BlockQ8_0*> queries;  // the group's Q8_0 queries
         const int32_t pos = n_past_ + t;
@@ -930,8 +976,8 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         }
         for (int32_t j = 0; j < group; ++j) {
             const size_t at = static_cast<size_t>(j) * stride;
-            float* o = out + at * uhd;
-            std::fill(o, o + hd, 0.0f);
+            float* o = out + at * uvd;
+            std::fill(o, o + vd, 0.0f);
             mx[at] = -INFINITY;
             sm[at] = 0.0f;
             if (len == 0 || (head_mask != nullptr && head_mask[h0 + j] == 0)) continue;
@@ -945,28 +991,28 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         }
         // V: each row decoded once into floats, then added to every head of
         // the group (decoding it per head cost 8x the work).
-        vrow.resize(uhd);
+        vrow.resize(uvd);
         for (size_t i = 0; i < len; ++i) {
             const uint8_t* v = kv_->v_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
             if (kv_type == DType::F32) {
-                std::copy_n(reinterpret_cast<const float*>(v), uhd, vrow.data());
+                std::copy_n(reinterpret_cast<const float*>(v), uvd, vrow.data());
             } else {
-                quant::dequantize_row(kv_type, v, vrow.data(), hd);
+                quant::dequantize_row(kv_type, v, vrow.data(), vd);
             }
             for (int32_t j = 0; j < group; ++j) {
                 if (head_mask != nullptr && head_mask[h0 + j] == 0) continue;
                 const float w = scores[static_cast<size_t>(j) * len + i];
-                float* o = out + static_cast<size_t>(j) * stride * uhd;
-                for (size_t d = 0; d < uhd; ++d) o[d] += w * vrow[d];
+                float* o = out + static_cast<size_t>(j) * stride * uvd;
+                for (size_t d = 0; d < uvd; ++d) o[d] += w * vrow[d];
             }
         }
     };
-    // Token t's spans of head h (mx[sp], sm[sp], out + sp * hd), merged in
+    // Token t's spans of head h (mx[sp], sm[sp], out + sp * vd), merged in
     // order into att_: exp(m_s - M) rescales each span's sum and weighted V
     // to the overall maximum M.
     auto merge = [&](int32_t t, int32_t h, int32_t spans, const float* mx, const float* sm, const float* out) {
-        float* dst = att_.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * uhd;
-        std::fill(dst, dst + hd, 0.0f);
+        float* dst = att_.data() + static_cast<size_t>(t) * out_dim + static_cast<size_t>(h) * uvd;
+        std::fill(dst, dst + vd, 0.0f);
         if (head_mask != nullptr && head_mask[h] == 0) return;  // pruned head: contributes nothing
         float m = -INFINITY;
         for (int32_t sp = 0; sp < spans; ++sp) m = std::max(m, mx[sp]);
@@ -975,11 +1021,11 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             if (sm[sp] == 0.0f) continue;
             const float w = std::exp(mx[sp] - m);
             sum += w * sm[sp];
-            const float* src = out + static_cast<size_t>(sp) * uhd;
-            for (size_t d = 0; d < uhd; ++d) dst[d] += w * src[d];
+            const float* src = out + static_cast<size_t>(sp) * uvd;
+            for (size_t d = 0; d < uvd; ++d) dst[d] += w * src[d];
         }
         const float inv = 1.0f / sum;
-        for (size_t d = 0; d < uhd; ++d) dst[d] *= inv;
+        for (size_t d = 0; d < uvd; ++d) dst[d] *= inv;
     };
 
     const int32_t max_spans = spans_of(n - 1);  // the last token sees the most positions
@@ -994,14 +1040,14 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
                 const auto uspans = static_cast<size_t>(spans);
                 mx.resize(ugroup * uspans);
                 sm.resize(ugroup * uspans);
-                out.resize(ugroup * uspans * uhd);
+                out.resize(ugroup * uspans * uvd);
                 for (int32_t sp = 0; sp < spans; ++sp) {
                     const auto usp = static_cast<size_t>(sp);
-                    score_span(t, g, sp, mx.data() + usp, sm.data() + usp, out.data() + usp * uhd, uspans);
+                    score_span(t, g, sp, mx.data() + usp, sm.data() + usp, out.data() + usp * uvd, uspans);
                 }
                 for (int32_t j = 0; j < group; ++j) {
                     const size_t at = static_cast<size_t>(j) * uspans;
-                    merge(t, g * group + j, spans, mx.data() + at, sm.data() + at, out.data() + at * uhd);
+                    merge(t, g * group + j, spans, mx.data() + at, sm.data() + at, out.data() + at * uvd);
                 }
             }
         });
@@ -1011,7 +1057,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const auto slots = static_cast<size_t>(max_spans);
     part_max_.resize(static_cast<size_t>(n) * n_head * slots);
     part_sum_.resize(part_max_.size());
-    part_out_.resize(part_max_.size() * uhd);
+    part_out_.resize(part_max_.size() * uvd);
     auto base = [&](int32_t t, int32_t h) { return (static_cast<size_t>(t) * n_head + static_cast<size_t>(h)) * slots; };
     pool.parallel_for(pairs * max_spans, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
@@ -1020,7 +1066,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             const auto g = static_cast<int32_t>(task / max_spans % c.n_head_kv);
             if (sp >= spans_of(t)) continue;  // an earlier token of the batch sees fewer positions
             const size_t at = base(t, g * group) + static_cast<size_t>(sp);
-            score_span(t, g, sp, part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uhd, slots);
+            score_span(t, g, sp, part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd, slots);
         }
     });
     // Merging many spans is worth a second fork/join (at 3000 positions on
@@ -1031,7 +1077,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             const auto t = static_cast<int32_t>(th / c.n_head);
             const auto h = static_cast<int32_t>(th % c.n_head);
             const size_t at = base(t, h);
-            merge(t, h, spans_of(t), part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uhd);
+            merge(t, h, spans_of(t), part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd);
         }
     };
     if (max_spans >= kParallelMergeSpans) {
@@ -1098,7 +1144,10 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         LIYAB_RETURN_IF_ERROR(w.status());
         Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
         rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
-        if (c.blocks[static_cast<size_t>(l)].fused_qkv) {
+        if (c.blocks[static_cast<size_t>(l)].latent) {
+            // The key row only: its latent channels are the values.
+            LIYAB_RETURN_IF_ERROR(latent_project(l, w, 1, route, backend, false));
+        } else if (c.blocks[static_cast<size_t>(l)].fused_qkv) {
             LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, backend, w, 1));
         } else {
             LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kK], xb_.data(), k_.data(), 1));
@@ -1312,6 +1361,142 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     attention(L.kv_slot, L.window, n, pool, head_mask);
     if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
+    }
+    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+}
+
+Status Transformer::per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out,
+                                    int32_t n) {
+    const auto heads = static_cast<size_t>(stacked.ne[2]);
+    const auto cols = static_cast<size_t>(stacked.ne[0]);
+    const auto rows = static_cast<size_t>(stacked.ne[1]);
+    const auto un = static_cast<size_t>(n);
+    mla_head_views_.resize(heads);
+    mla_items_.clear();
+    for (size_t h = 0; h < heads; ++h) {
+        mla_head_views_[h] = expert_slice(stacked, static_cast<int64_t>(h));
+        mla_items_.push_back({&mla_head_views_[h], in + h * un * cols, out + h * un * rows, n});
+    }
+    // Transient views into a 3-D tensor, as the experts' are: the CPU reads
+    // them in place, one parallel pass for every head (a matmul per head
+    // would pay a thread fork/join each).
+    return route.cpu->matmul_batch(mla_items_);
+}
+
+Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                   Backend* backend, bool queries) {
+    const ModelConfig& c = config_;
+    const LatentAttention& m = c.mla;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto heads = static_cast<size_t>(c.n_head);
+    const auto rd = static_cast<size_t>(c.rope_dim);
+    const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto nope = static_cast<size_t>(m.nope_dim);
+    const size_t qk = nope + rd;                        // a head's query as projected: [q_nope | q_pe]
+    const auto kd = static_cast<size_t>(c.head_dim);    // rd + rank: an absorbed query, a cached key
+    mla_kv_.resize(un * (rank + rd));
+    if (!queries) {
+        LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kKvA], xb_.data(), mla_kv_.data(), n));
+    } else {
+        const bool low_rank = m.q_rank > 0;  // q = W_qb RMSNorm(W_qa x), else q = W_q x
+        mla_q_.resize(un * heads * qk);
+        if (low_rank) mla_qa_.resize(un * static_cast<size_t>(m.q_rank));
+        const TensorView* proj[] = {low_rank ? &w[kQa] : &w[kQ], &w[kKvA]};
+        float* outs[] = {low_rank ? mla_qa_.data() : mla_q_.data(), mla_kv_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, backend, proj, xb_.data(), outs, n));
+        if (low_rank) {
+            for (size_t t = 0; t < un; ++t) {
+                float* row = mla_qa_.data() + t * static_cast<size_t>(m.q_rank);
+                rmsnorm(row, L.q_a_norm.data(), row, m.q_rank, c.rms_eps);
+            }
+            LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kQb], mla_qa_.data(), mla_q_.data(), n));
+        }
+    }
+    // The key row: [k_pe | RMSNorm(latent)] (the projection gives [latent |
+    // k_pe]). RoPE's channels come first, as in every other head this
+    // engine rotates, so rope() and the key ranges treat it like any head.
+    for (size_t t = 0; t < un; ++t) {
+        const float* kv = mla_kv_.data() + t * (rank + rd);
+        float* k = k_.data() + t * kd;
+        std::copy(kv + rank, kv + rank + rd, k);
+        rmsnorm(kv, L.kv_a_norm.data(), k + rd, m.kv_rank, c.rms_eps);
+    }
+    if (!queries) return Status::ok();
+    // Each head's query absorbs its key projection: W_kb,h^T q_nope,h is what
+    // the latent is scored against. The q_nope of every token are gathered
+    // per head so each head is one matmul over the batch.
+    mla_heads_in_.resize(heads * un * nope);
+    for (size_t t = 0; t < un; ++t) {
+        for (size_t h = 0; h < heads; ++h) {
+            const float* src = mla_q_.data() + (t * heads + h) * qk;
+            std::copy(src, src + nope, mla_heads_in_.data() + (h * un + t) * nope);
+        }
+    }
+    mla_heads_out_.resize(heads * un * rank);
+    LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kKb], mla_heads_in_.data(), mla_heads_out_.data(), n));
+    for (size_t t = 0; t < un; ++t) {
+        for (size_t h = 0; h < heads; ++h) {
+            float* q = q_.data() + (t * heads + h) * kd;
+            const float* pe = mla_q_.data() + (t * heads + h) * qk + nope;
+            std::copy(pe, pe + rd, q);
+            const float* absorbed = mla_heads_out_.data() + (h * un + t) * rank;
+            std::copy(absorbed, absorbed + rank, q + rd);
+        }
+    }
+    return Status::ok();
+}
+
+Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                           ThreadPool& pool, const uint8_t* head_mask) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const LatentAttention& m = c.mla;
+    const auto un = static_cast<size_t>(n);
+    const auto heads = static_cast<size_t>(c.n_head);
+    const auto rd = static_cast<size_t>(c.rope_dim);
+    const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto vd = static_cast<size_t>(m.v_dim);
+    const auto kd = static_cast<size_t>(c.head_dim);
+    const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
+
+    LIYAB_RETURN_IF_ERROR(latent_project(layer, w, n, route, route.attention, true));
+    for (size_t t = 0; t < un; ++t) {
+        float* q = q_.data() + t * heads * kd;
+        float* k = k_.data() + t * kd;
+        const int32_t pos = n_past_ + static_cast<int32_t>(t);
+        if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
+        rope(q, c.n_head, pos, rope_table);
+        rope(k, 1, pos, rope_table);
+        scale_keys(L.kv_slot, q, k);
+        kv_->store(L.kv_slot, pos, k, nullptr);  // the values are this row's latent channels
+    }
+    // att_: per token and head, the softmax-weighted latent (value_dim = rank).
+    attention(L.kv_slot, L.window, n, pool, head_mask);
+
+    // Per head, the weighted latent becomes the head's value: W_vb,h c. Keys
+    // stored with per-channel scales carried their latent divided by them,
+    // so the latent is multiplied back first (exact for each channel).
+    const float* scales = key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd + rd;
+    mla_heads_in_.resize(heads * un * rank);
+    for (size_t t = 0; t < un; ++t) {
+        for (size_t h = 0; h < heads; ++h) {
+            const float* src = att_.data() + (t * heads + h) * rank;
+            float* dst = mla_heads_in_.data() + (h * un + t) * rank;
+            if (scales == nullptr) {
+                std::copy(src, src + rank, dst);
+            } else {
+                for (size_t i = 0; i < rank; ++i) dst[i] = src[i] * scales[i];
+            }
+        }
+    }
+    mla_heads_out_.resize(heads * un * vd);
+    LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kVb], mla_heads_in_.data(), mla_heads_out_.data(), n));
+    for (size_t t = 0; t < un; ++t) {  // [token][head][value], the order attn_output reads
+        for (size_t h = 0; h < heads; ++h) {
+            const float* src = mla_heads_out_.data() + (h * un + t) * vd;
+            std::copy(src, src + vd, att_.data() + (t * heads + h) * vd);
+        }
     }
     return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
 }
@@ -2024,6 +2209,10 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         if (plan.mixer == MixerKind::DeltaNet) {
             const PhaseTimer timer(phases_.delta_net);
             LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
+        } else if (plan.latent) {
+            const PhaseTimer timer(phases_.attention);
+            LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,
+                                                         head_mask != nullptr ? head_mask->mask(l) : nullptr));
         } else {
             const PhaseTimer timer(phases_.attention);
             LIYAB_RETURN_IF_ERROR(

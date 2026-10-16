@@ -217,6 +217,17 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.n_ff_shared > 0) w.add_u32(a + ".expert_shared_feed_forward_length", static_cast<uint32_t>(s.n_ff_shared));
         if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
     }
+    if (s.dense_lead > 0) w.add_u32(a + ".leading_dense_block_count", static_cast<uint32_t>(s.dense_lead));
+    if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b
+        w.add_u32(a + ".attention.kv_lora_rank", static_cast<uint32_t>(s.mla_kv_rank));
+        if (s.mla_q_rank > 0) w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.mla_kv_rank + s.rope_dim));
+        w.add_u32(a + ".attention.value_length", static_cast<uint32_t>(s.mla_kv_rank));
+        if (!s.mla_legacy) {
+            w.add_u32(a + ".attention.key_length_mla", static_cast<uint32_t>(s.mla_nope + s.rope_dim));
+            w.add_u32(a + ".attention.value_length_mla", static_cast<uint32_t>(s.mla_v));
+        }
+    }
     const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
     if (s.delta_net_interval > 0) {
         w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(ssm_kernel));
@@ -316,6 +327,31 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ssm_a", {ssm_hv}, DType::F32, a_neg);
             w.add_tensor(p + "ssm_dt.bias", {ssm_hv}, DType::F32, random(ssm_hv, 0.5f));
             w.add_tensor(p + "ssm_norm.weight", {ssm_hd}, DType::F32, norm_weights(ssm_hd));
+        } else if (s.mla_kv_rank > 0) {  // multi-head latent attention, per-head key and value expansions split
+            const int64_t rank = s.mla_kv_rank, rd = s.rope_dim, heads = s.n_head;
+            const int64_t q_rows = heads * (s.mla_nope + rd);  // per head [q_nope | q_pe]
+            if (s.mla_q_rank > 0) {
+                const int64_t qr = s.mla_q_rank;
+                w.add_tensor(p + "attn_q_a.weight", {d, qr}, s.attn_type, random(d * qr, s.weight_scale));
+                w.add_tensor(p + "attn_q_a_norm.weight", {qr}, DType::F32, norm_weights(qr));
+                w.add_tensor(p + "attn_q_b.weight", {qr, q_rows}, s.attn_type, random(qr * q_rows, s.weight_scale));
+            } else {
+                w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
+            }
+            w.add_tensor(p + "attn_kv_a_mqa.weight", {d, rank + rd}, s.attn_type,
+                         random(d * (rank + rd), s.weight_scale));
+            std::vector<float> kv_norm = norm_weights(rank);
+            if (s.k_norm_outlier > 0.0f) {  // large latent channels: keys and, with them, values
+                kv_norm[static_cast<size_t>(rank / 2 - 1)] = s.k_norm_outlier;
+                kv_norm[static_cast<size_t>(rank - 3)] = s.k_norm_outlier;
+            }
+            w.add_tensor(p + "attn_kv_a_norm.weight", {rank}, DType::F32, kv_norm);
+            w.add_tensor(p + "attn_k_b.weight", {s.mla_nope, rank, heads}, s.attn_type,
+                         random(s.mla_nope * rank * heads, s.weight_scale));
+            w.add_tensor(p + "attn_v_b.weight", {rank, s.mla_v, heads}, s.attn_type,
+                         random(rank * s.mla_v * heads, s.weight_scale));
+            w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
+                         random(heads * s.mla_v * d, s.weight_scale));
         } else {
             const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
             if (s.fused_qkv) {  // the same draws as separate matrices, stacked [q | k | v]
@@ -371,7 +407,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);
             continue;
         }
-        if (s.n_expert == 0) {
+        if (s.n_expert == 0 || l < s.dense_lead) {
             w.add_tensor(p + "ffn_gate.weight", {d, s.n_ff}, s.ffn_type, gate);
             w.add_tensor(p + "ffn_up.weight", {d, s.n_ff}, s.ffn_type, up);
             w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);

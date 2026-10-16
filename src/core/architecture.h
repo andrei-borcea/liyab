@@ -116,6 +116,10 @@ enum class FfnKind : uint8_t {
 // The structure of one block, from the tensors present.
 struct BlockPlan {
     MixerKind mixer = MixerKind::Attention;
+    // Attention: multi-head latent attention (attn_kv_a_mqa present, see
+    // ModelConfig::mla). Keys and values come from one compressed latent per
+    // position, which is what the KV cache stores.
+    bool latent = false;
     // Attention: attn_q projects [q | gate] per head (twice as tall) and the
     // attention output is multiplied by sigmoid(gate).
     bool attn_gate = false;
@@ -156,6 +160,24 @@ struct YarnRope {
     bool truncate = true;
 };
 
+// Multi-head latent attention (DeepSeek-V2/V3, `deepseek2`), in its absorbed
+// form. Each position's keys and values come from one latent c (kv_rank
+// wide, RMS-normalized) and one RoPE key k_pe (rope_dim, shared by every
+// head): head h's key is [W_kb,h c | k_pe] and its value W_vb,h c. Since
+// q_h . (W_kb,h c) = (W_kb,h^T q_h) . c, each head's query is projected onto
+// the latent once (attn_k_b, stored transposed per head) and attention runs
+// as one KV head of [k_pe | c] (ModelConfig::head_dim = rope_dim + kv_rank)
+// whose values are its latent channels; the weighted latent is then
+// expanded per head (attn_v_b) before attn_output. The KV cache keeps
+// rope_dim + kv_rank values per position and block instead of
+// n_head * (key + value) widths: 576 instead of 5,120 on DeepSeek-V2-Lite.
+struct LatentAttention {
+    int32_t kv_rank = 0;   // <arch>.attention.kv_lora_rank: latent width; 0: no latent attention
+    int32_t q_rank = 0;    // <arch>.attention.q_lora_rank: queries through attn_q_a, a norm and attn_q_b; 0: attn_q
+    int32_t nope_dim = 0;  // per-head query/key channels without RoPE: key_length_mla - rope_dim
+    int32_t v_dim = 0;     // per-head value width once expanded: <arch>.attention.value_length_mla
+};
+
 struct ModelConfig {
     const ArchSpec* spec = nullptr;  // registry row (static lifetime)
     std::string arch;                // spec->name
@@ -165,7 +187,8 @@ struct ModelConfig {
     int32_t n_ff = 0;
     int32_t n_head = 0;
     int32_t n_head_kv = 0;
-    int32_t head_dim = 0;
+    int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
+    int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
     int32_t rope_dim = 0;
     int32_t n_vocab = 0;
     int32_t n_ctx_train = 0;
@@ -193,6 +216,7 @@ struct ModelConfig {
     // and of the output logits (<arch>.final_logit_softcapping). Gemma 2.
     float attn_softcap = 0.0f;
     float final_softcap = 0.0f;
+    LatentAttention mla;  // kv_rank 0: plain attention
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

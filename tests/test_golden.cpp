@@ -203,6 +203,29 @@ std::vector<GoldenCase> cases() {
     add("gemma3-keyscaled", s, {}, true);
 
     s = {};
+    s.arch = "deepseek2";  // latent attention: the Q8_0 cache holds [k_pe | latent] per position, values its latent
+    s.n_layers = 3;
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    add("deepseek2-mla", s);
+    add("deepseek2-mla-f16kv", s, f16_kv);
+    s.k_norm_outlier = 60.0f;  // large latent channels: key scaling over keys and the values in them
+    add("deepseek2-mla-keyscaled", s, {}, true);
+    s.k_norm_outlier = 0.0f;
+    s.mla_q_rank = 64;  // low-rank queries, a dense leading block, MoE with a shared expert, YaRN with DeepSeek's mscale
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_ff_shared = 64;
+    s.dense_lead = 1;
+    s.expert_weights_norm = -1;
+    s.yarn_factor = 4.0f;
+    s.yarn_ctx = 32;
+    s.yarn_log_mul = 0.0707f;
+    add("deepseek2-mla-qlora-moe-yarn", s);
+
+    s = {};
     s.arch = "phi3";  // fused attn_qkv and [gate | up], LongRoPE, every block windowed
     s.fused_qkv = true;
     s.fused_gate_up = true;

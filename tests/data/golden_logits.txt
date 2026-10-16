@@ -1,5 +1,9 @@
 # Logit hashes pinned by tests/test_golden.cpp: <platform> <case> <FNV-1a of the logits' bits>.
 # Rewritten with LIYAB_GOLDEN_UPDATE=1 when a change is meant to move outputs (say why in the commit).
+arm64-neon-dotprod deepseek2-mla 191166464f5adf1d
+arm64-neon-dotprod deepseek2-mla-f16kv d7bd154c444cbaec
+arm64-neon-dotprod deepseek2-mla-keyscaled e1808726e057431c
+arm64-neon-dotprod deepseek2-mla-qlora-moe-yarn 98b521db8e47d3d4
 arm64-neon-dotprod gemma2 9b6a987e9aefe81a
 arm64-neon-dotprod gemma2-attn-scale 843fee0cd832c3fb
 arm64-neon-dotprod gemma3 19faef709b9415e5
@@ -27,6 +31,10 @@ arm64-neon-dotprod qwen3moe-fused-gate-up 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-avx2 deepseek2-mla 191166464f5adf1d
+x86_64-avx2 deepseek2-mla-f16kv d7bd154c444cbaec
+x86_64-avx2 deepseek2-mla-keyscaled e1808726e057431c
+x86_64-avx2 deepseek2-mla-qlora-moe-yarn fa1627ae04d2e05d
 x86_64-avx2 gemma2 bbddcfdacc84a2f9
 x86_64-avx2 gemma2-attn-scale d6c431b6d159cb6a
 x86_64-avx2 gemma3 44220e7c3a456955
@@ -54,6 +62,10 @@ x86_64-avx2 qwen3moe-fused-gate-up 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-scalar deepseek2-mla e5ed5527b3ed36da
+x86_64-scalar deepseek2-mla-f16kv 169d4c05b54192ae
+x86_64-scalar deepseek2-mla-keyscaled e43125c7bb4e1823
+x86_64-scalar deepseek2-mla-qlora-moe-yarn 38cb498803f9eb18
 x86_64-scalar gemma2 5d7c25fc539f2a8c
 x86_64-scalar gemma2-attn-scale 0b8ca19040011fd4
 x86_64-scalar gemma3 240a514ba039cfa9
