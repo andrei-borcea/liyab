@@ -1747,15 +1747,18 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   * Speed claims come from alternating A/B runs on a real device.
   * Documentation changes in the same commit as the code it describes: this README, the headers in
     `include/liyab/`, and `--help` texts.
-* **Adding a model.** An architecture whose blocks are made of the pieces above (attention or Gated DeltaNet, dense
-  or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`: how RoPE pairs dimensions, the names
-  of the norms before the FFN and after the attention and the FFN, the MoE renormalization default, whether Q/K norms
-  come before or after RoPE, the FFN's activation, whether embeddings are scaled, which blocks use the sliding window
-  and their RoPE base. `describe_model()` plans each block from the tensors present (mixer, separate or fused
-  projections, gated or windowed attention, dense or MoE FFN, shared expert) and binds optional tensors where they
-  exist.
+* **Adding a model.** An architecture whose blocks are made of the pieces above (attention, multi-head latent
+  attention or Gated DeltaNet, dense or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`:
+  how RoPE pairs dimensions, the names of the norms before the FFN and after the attention and the FFN, the MoE
+  renormalization default, whether Q/K norms come before or after RoPE, the FFN's activation, whether embeddings are
+  scaled, which blocks use the sliding window and their RoPE base. `describe_model()` plans each block from the
+  tensors present (mixer, separate or fused projections and experts, gated or windowed attention, dense or MoE FFN,
+  shared expert) and binds optional tensors where they exist; what the file states (RoPE scaling up to YaRN, soft
+  caps, the q·k scale, latent attention's widths) is read from it.
   Add a `test_golden` case and check a BF16/F16 GGUF against its Hugging Face model (`tools/conform_reference.py`,
-  then `liyab-kl --compare … --kv f16`). New kinds of blocks still need engine code (see the [roadmap](#roadmap)).
+  then `liyab-kl --compare … --kv f16`). When the weights are too large to fetch, a small random model built by
+  transformers' own code for the architecture and converted to GGUF checks the same paths. New kinds of blocks still
+  need engine code (see the [roadmap](#roadmap)).
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64
   device for kernel changes, and `flutter analyze && flutter test` in `app/` for app changes.
 

@@ -30,8 +30,9 @@ running them over `adb`). The app builds with `scripts/build_flutter_app.sh` (An
 
 ## Good places to start
 
-* **Model support.** An architecture made of the existing pieces (softmax attention or Gated DeltaNet; dense or MoE
-  FFN) needs only a row in `src/core/architecture.cpp`; each block's structure is planned from the tensors. Prove it
+* **Model support.** An architecture made of the existing pieces (softmax attention, multi-head latent attention or
+  Gated DeltaNet; dense or MoE FFN) needs only a row in `src/core/architecture.cpp`; each block's structure is
+  planned from the tensors, and what the file states (RoPE scaling, soft caps, the q·k scale) is read from it. Prove it
   with a `test_golden` case and a conformance run against the Hugging Face model (README, *Adding a model*). Open a
   *Model support* issue with the GGUF's `general.architecture` and tensor names first.
 * **Kernels.** Faster NEON / i8mm paths for formats that still use the generic decode (TQ1_0, NVFP4, lattice

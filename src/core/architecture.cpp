@@ -52,8 +52,8 @@ constexpr ArchSpec kArchitectures[] = {
      .scale_embeddings = true,
      .swa_period = 6,
      .rope_base_swa = 10000.0f},
-    // DeepSeek-V2 / V3 and the models converted alike (Youtu-LLM, Kimi,
-    // Moonlight...): multi-head latent attention (planned from attn_kv_a_mqa,
+    // DeepSeek-V2 / V3 and the models converted alike (Youtu-LLM):
+    // multi-head latent attention (planned from attn_kv_a_mqa,
     // geometry from attention.*_lora_rank and *_mla), RoPE on adjacent pairs
     // of the shared k_pe, a dense FFN in the leading blocks and a MoE with
     // shared experts in the others (both from the tensors); the top-k
