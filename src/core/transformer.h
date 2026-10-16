@@ -291,6 +291,7 @@ private:
         kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
         kGate, kUp, kDown,           // SwiGLU FFN
         kRouter, kGateExps, kUpExps, kDownExps,  // MoE: router [n_embd x n_expert], experts stacked on dim 2
+                                                 // (fused_gate_up: kUpExps holds [gate | up], no kGateExps)
         kGateShared, kUpShared, kDownShared,     // MoE: shared expert
         kWeightRoles
     };

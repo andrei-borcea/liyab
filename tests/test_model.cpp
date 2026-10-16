@@ -388,8 +388,20 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             }
             return all;
         };
-        w.add_tensor(p + "ffn_gate_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, stacked(gate));
-        w.add_tensor(p + "ffn_up_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, stacked(up));
+        const std::vector<float> gate_exps = stacked(gate);
+        const std::vector<float> up_exps = stacked(up);
+        if (s.fused_gate_up) {  // each expert's [gate | up] rows: the same draws as the split tensors
+            std::vector<float> gate_up;
+            const auto per_expert = static_cast<std::ptrdiff_t>(d * s.n_ff);
+            for (std::ptrdiff_t e = 0; e < s.n_expert; ++e) {
+                gate_up.insert(gate_up.end(), gate_exps.begin() + e * per_expert, gate_exps.begin() + (e + 1) * per_expert);
+                gate_up.insert(gate_up.end(), up_exps.begin() + e * per_expert, up_exps.begin() + (e + 1) * per_expert);
+            }
+            w.add_tensor(p + "ffn_gate_up_exps.weight", {d, 2 * s.n_ff, s.n_expert}, s.ffn_type, gate_up);
+        } else {
+            w.add_tensor(p + "ffn_gate_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, gate_exps);
+            w.add_tensor(p + "ffn_up_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, up_exps);
+        }
         w.add_tensor(p + "ffn_down_exps.weight", {s.n_ff, d, s.n_expert}, s.ffn_type, stacked(down));
         // The router uses its own generator so every other weight matches the dense twin.
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));

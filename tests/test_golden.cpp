@@ -140,6 +140,9 @@ std::vector<GoldenCase> cases() {
     TransformerOptions streamed;
     streamed.expert_cache_bytes = int64_t{1} << 20;  // experts read through the ExpertStore
     add("qwen3moe-streamed", s, streamed);
+    s.fused_gate_up = true;  // each expert's [gate | up] in one tensor: the split model's bits
+    add("qwen3moe-fused-gate-up", s);
+    add("qwen3moe-fused-gate-up-streamed", s, streamed);
     s = moe_spec("qwen3moe");
     s.sigmoid_gating = true;
     s.expert_bias = true;

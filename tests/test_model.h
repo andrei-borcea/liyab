@@ -98,7 +98,9 @@ struct TinyModelSpec {
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
     bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
-    bool fused_gate_up = false;  // ffn_up holds [gate | up], no ffn_gate (Phi-3)
+    // ffn_up holds [gate | up], no ffn_gate (Phi-3); with n_expert > 0, ffn_gate_up_exps holds each
+    // expert's [gate | up] (the split tensors' weights, as a converter fuses them)
+    bool fused_gate_up = false;
     // > 0: LongRoPE (Phi-3) with this original context: rope_factors_short /
     // rope_factors_long and an attention factor of 1.19.
     int32_t longrope_ctx = 0;

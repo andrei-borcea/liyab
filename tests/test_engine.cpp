@@ -1743,6 +1743,67 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
     CHECK(b->expert_store()->stats().loads > st.loads);
 }
 
+// A file may hold each expert's gate and up projections as one [gate | up]
+// matrix (ffn_gate_up_exps). Its rows are the split tensors' rows, so the
+// logits must not move by a bit, read in place or streamed; streamed, a
+// fused expert is one read per matrix: two instead of three.
+TEST_CASE("Fused [gate | up] experts give the split experts' logits bit for bit, in place and streamed") {
+    test::TinyModelSpec split;  // Q4_0 experts: block-quantized slices at unaligned offsets
+    split.arch = "qwen3moe";
+    split.n_layers = 3;
+    split.n_expert = 32;
+    split.n_expert_used = 4;
+    split.identical_experts = false;
+    split.n_ff_shared = 64;  // a shared expert next to the fused routed ones
+    test::TinyModelSpec fused = split;
+    fused.fused_gate_up = true;
+    TransformerOptions in_place;
+    in_place.expert_cache_bytes = 0;
+    TransformerOptions streamed;
+    streamed.expert_cache_bytes = 1;  // minimum: a few dozen slots for 96 experts, so experts are evicted and read again
+    auto a = load_transformer(model_path("moe_split_experts", split), in_place);
+    auto b = load_transformer(model_path("moe_fused_experts", fused), in_place);
+    auto c = load_transformer(model_path("moe_fused_experts", fused), streamed);
+    auto d = load_transformer(model_path("moe_split_experts", split), streamed);
+    REQUIRE(a != nullptr && b != nullptr && c != nullptr && d != nullptr);
+    for (const BlockPlan& plan : b->config().blocks) CHECK(plan.ffn == FfnKind::Moe && plan.fused_gate_up);
+    CHECK(!a->config().blocks[0].fused_gate_up);
+    REQUIRE(c->expert_store() != nullptr && d->expert_store() != nullptr);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 40; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto run = [&](Transformer& model, bool stepwise) {  // every row's logits, batched or token by token
+        model.reset();
+        std::vector<float> out;
+        for (size_t at = 0; at < tokens.size(); at += stepwise ? 1 : tokens.size()) {
+            const auto batch = std::span<const int32_t>(tokens).subspan(at, stepwise ? 1 : tokens.size());
+            auto r = model.forward(batch, stepwise ? Transformer::Logits::Last : Transformer::Logits::All, route, pool);
+            CHECK(r.has_value());
+            if (!r) return std::vector<float>();
+            out.insert(out.end(), r->begin(), r->end());
+        }
+        return out;
+    };
+    for (const bool stepwise : {false, true}) {
+        const std::vector<float> expected = run(*a, stepwise);
+        for (Transformer* model : {b.get(), c.get(), d.get()}) {
+            const std::vector<float> got = run(*model, stepwise);
+            REQUIRE(got.size() == expected.size());
+            CHECK(std::memcmp(got.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+        }
+    }
+    const ExpertStore::Stats fused_reads = c->expert_store()->stats();
+    const ExpertStore::Stats split_reads = d->expert_store()->stats();
+    std::printf("  fused: %llu experts read in %llu reads; split: %llu in %llu\n",
+                static_cast<unsigned long long>(fused_reads.loads), static_cast<unsigned long long>(fused_reads.reads),
+                static_cast<unsigned long long>(split_reads.loads), static_cast<unsigned long long>(split_reads.reads));
+    CHECK(fused_reads.loads > c->expert_store()->entries());  // evictions happened
+    CHECK(fused_reads.reads == 2 * fused_reads.loads);
+    CHECK(split_reads.reads == 3 * split_reads.loads);
+}
+
 TEST_CASE("Automatic requantization converts the resident Q8_0 matrices only when the expert cache is tight") {
     test::TinyModelSpec spec;  // as below: Q8_0 attention and output, 256 columns
     spec.arch = "qwen3moe";

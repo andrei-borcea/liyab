@@ -23,6 +23,8 @@ arm64-neon-dotprod qwen3-yarn fba339d34a88e1d4
 arm64-neon-dotprod qwen35 30c8738d4c549e49
 arm64-neon-dotprod qwen35moe ff112dcc4a0eef3b
 arm64-neon-dotprod qwen3moe 8b289d59d6c99ad7
+arm64-neon-dotprod qwen3moe-fused-gate-up 8b289d59d6c99ad7
+arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-avx2 gemma2 bbddcfdacc84a2f9
@@ -48,6 +50,8 @@ x86_64-avx2 qwen3-yarn fba339d34a88e1d4
 x86_64-avx2 qwen35 225414c8f10f3ac9
 x86_64-avx2 qwen35moe a3f11d7bbcffbcce
 x86_64-avx2 qwen3moe 8b289d59d6c99ad7
+x86_64-avx2 qwen3moe-fused-gate-up 8b289d59d6c99ad7
+x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-scalar gemma2 5d7c25fc539f2a8c
@@ -73,5 +77,7 @@ x86_64-scalar qwen3-yarn 1f4c6473f820755a
 x86_64-scalar qwen35 473e53e31407341a
 x86_64-scalar qwen35moe 1c7a57b54e1cf1df
 x86_64-scalar qwen3moe abc771ef46e2fa79
+x86_64-scalar qwen3moe-fused-gate-up abc771ef46e2fa79
+x86_64-scalar qwen3moe-fused-gate-up-streamed abc771ef46e2fa79
 x86_64-scalar qwen3moe-sigmoid-bias-shared 029803af7cad79e0
 x86_64-scalar qwen3moe-streamed abc771ef46e2fa79

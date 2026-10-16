@@ -451,8 +451,13 @@ Status Transformer::bind_weights() {
             out = t;
             return Status::ok();
         };
-        LIYAB_RETURN_IF_ERROR(experts("ffn_gate_exps.weight", c.n_embd, c.n_ff_expert, L.w[kGateExps]));
-        LIYAB_RETURN_IF_ERROR(experts("ffn_up_exps.weight", c.n_embd, c.n_ff_expert, L.w[kUpExps]));
+        if (plan.fused_gate_up) {  // each expert's [gate | up] in one tensor; no gate of its own
+            LIYAB_RETURN_IF_ERROR(
+                experts("ffn_gate_up_exps.weight", c.n_embd, 2 * int64_t{c.n_ff_expert}, L.w[kUpExps]));
+        } else {
+            LIYAB_RETURN_IF_ERROR(experts("ffn_gate_exps.weight", c.n_embd, c.n_ff_expert, L.w[kGateExps]));
+            LIYAB_RETURN_IF_ERROR(experts("ffn_up_exps.weight", c.n_embd, c.n_ff_expert, L.w[kUpExps]));
+        }
         LIYAB_RETURN_IF_ERROR(experts("ffn_down_exps.weight", c.n_ff_expert, c.n_embd, L.w[kDownExps]));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "exp_probs_b.bias"), c.n_expert, false, L.expert_bias));
         if (plan.shared_expert) {
@@ -1500,7 +1505,8 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     for (int32_t l = 0; l < c.n_layers; ++l) {
         if (c.blocks[static_cast<size_t>(l)].ffn != FfnKind::Moe) continue;
         const Layer& L = layers_[static_cast<size_t>(l)];
-        const size_t matrices = L.w[kGateExps]->nbytes + L.w[kUpExps]->nbytes + L.w[kDownExps]->nbytes;
+        const size_t matrices = (L.w[kGateExps] != nullptr ? L.w[kGateExps]->nbytes : 0) + L.w[kUpExps]->nbytes +
+                                L.w[kDownExps]->nbytes;
         largest_expert = std::max(largest_expert, matrices / static_cast<size_t>(c.n_expert));
     }
     const size_t cache_floor =
@@ -1655,7 +1661,8 @@ size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const
 
 // Mixture of experts, as llama.cpp's build_moe_ffn: router probabilities
 // (softmax or sigmoid), top-k selection (optionally on probability + bias),
-// optional renormalization and scale; each selected expert is a SwiGLU FFN.
+// optional renormalization and scale; each selected expert is a gated FFN
+// (its gate and up projections separate or one [gate | up] matrix).
 // Tokens are grouped by expert so a batch reads every expert once. A shared
 // expert, optionally scaled by sigmoid(shared_gate . x), is added on top.
 Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route) {
@@ -1666,6 +1673,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     const auto E = static_cast<size_t>(c.n_expert);
     const auto K = static_cast<size_t>(c.n_expert_used);
     const auto ff = static_cast<size_t>(c.n_ff_expert);
+    const bool fused = c.blocks[static_cast<size_t>(layer)].fused_gate_up;  // experts as [gate | up] and down
 
     PhaseTimer router_timer(phases_.router);
     if (expert_store_ != nullptr) expert_store_->set_batch(n > 1);  // its reads are repacked for batched kernels
@@ -1839,7 +1847,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
                 }
                 views.push_back(*loaded);
             } else {
-                views.push_back({expert_slice(w[kGateExps], ex), expert_slice(w[kUpExps], ex),
+                views.push_back({fused ? TensorView{} : expert_slice(w[kGateExps], ex), expert_slice(w[kUpExps], ex),
                                  expert_slice(w[kDownExps], ex)});
             }
             wave.push_back(ex);
@@ -1853,7 +1861,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         // case in decode), so all of them share one quantized copy.
         ein_.resize(rows_total * d);
         eh_.resize(rows_total * ff);
-        eh2_.resize(rows_total * ff);
+        eh2_.resize(rows_total * (fused ? 2 * ff : ff));  // fused: each row's [gate | up]
         eout_.resize(rows_total * d);
         items.clear();
         for (size_t i = 0; i < wave.size(); ++i) {
@@ -1867,6 +1875,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
                 }
                 in = gathered;
             }
+            if (fused) {
+                items.push_back({&views[i][1], in, eh2_.data() + first_row[i] * 2 * ff, rows});
+                continue;
+            }
             items.push_back({&views[i][0], in, eh_.data() + first_row[i] * ff, rows});
             items.push_back({&views[i][1], in, eh2_.data() + first_row[i] * ff, rows});
         }
@@ -1874,7 +1886,14 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             release_wave();
             return st;
         }
-        gated_activation(c.spec->ffn_activation, eh_.data(), eh2_.data(), eh_.data(), rows_total * ff);
+        if (fused) {  // the same rows as the split matrices give, so the same bits
+            for (size_t r = 0; r < rows_total; ++r) {
+                const float* gate_up = eh2_.data() + r * 2 * ff;
+                gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, eh_.data() + r * ff, ff);
+            }
+        } else {
+            gated_activation(c.spec->ffn_activation, eh_.data(), eh2_.data(), eh_.data(), rows_total * ff);
+        }
         items.clear();
         for (size_t i = 0; i < wave.size(); ++i) {
             const auto rows = static_cast<int32_t>(assigned[static_cast<size_t>(wave[i])].size());

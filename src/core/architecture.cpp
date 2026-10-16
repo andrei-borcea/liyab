@@ -275,10 +275,11 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
-            if (f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr) {
-                return Status(ErrorCode::Unsupported, "fused ffn_gate_up_exps tensors are not supported yet");
-            }
             b.ffn = FfnKind::Moe;
+            // Each expert's gate and up projections as one [gate | up]
+            // matrix (a converter option, Granite MoE), instead of two tensors.
+            b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
+                              f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
         }
     }

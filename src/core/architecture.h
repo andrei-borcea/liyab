@@ -128,7 +128,8 @@ struct BlockPlan {
     bool fused_qkv = false;
     FfnKind ffn = FfnKind::Dense;
     // Dense: ffn_up projects [gate | up] (twice as tall) and there is no
-    // ffn_gate (Phi-3).
+    // ffn_gate (Phi-3). Moe: ffn_gate_up_exps holds each expert's [gate | up]
+    // instead of ffn_gate_exps and ffn_up_exps.
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
