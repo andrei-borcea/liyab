@@ -51,7 +51,7 @@ WORK = PHONE_DIR + "/reg"  # this script's binaries and scratch files
 APP = "com.liyab.chat"
 API_PORT = 8642
 TESTS = ["test_mmap", "test_device_detect", "test_kv_cache", "test_backends", "test_engine", "test_text",
-         "test_golden", "test_grammar", "test_experimental"]
+         "test_golden", "test_grammar", "test_experimental", "test_pooling"]
 MAX_TOKENS = 64  # per turn
 # The app's defaults (Settings): CPU, Balanced, 50 °C skin limit, 5500 MiB budget, automatic requantization. Like
 # the app, the CLI keeps what it measures once per model (the KV cache's key scales) in a cache directory (run_cli),

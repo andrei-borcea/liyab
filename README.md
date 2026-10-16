@@ -685,9 +685,10 @@ so does the app's [local API](#local-api-one-model-for-every-app-on-the-device) 
   their tokens, and each keeps the KV of the prefix it shares with the one before: the queries' instruction, the
   reranker's system prompt and query. That is 17% of the tokens of the embedding check set below and 47% of the
   reranking one. The last token always runs. On the CPU backend a row's result does not depend on the pass it is
-  computed in, so a vector or a score is the same bits alone, in any batch and in any order (tested; also on Metal
-  for the models below). Hybrid models start every input over (their recurrent states cannot rewind to any
-  position), and a mean needs every row, so mean pooling shares nothing.
+  computed in, so a vector or a score is the same bits alone, in any batch and in any order (tested; on Metal, each
+  input of the check sets below gave the same bits alone as in its batch too). Hybrid models start every input over
+  (their recurrent states cannot rewind to any position), and a mean needs every row, so mean pooling shares
+  nothing.
 * **The KV cache of a pooling model is F16** (`EngineConfig::pooling_kv_cache_type`): it holds one input at a time
   and no conversation, so a quantized cache saves little memory, while its rounding moves every result. With the
   Q8_0 default of generative models, Qwen3-Embedding-0.6B's vectors kept a cosine of 0.99949 with transformers' and
