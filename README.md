@@ -303,8 +303,9 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     multi-token-prediction head is skipped;
   * mixture-of-experts: `qwen3moe` (Qwen3-30B-A3B…) and `qwen35moe` (Qwen3.5/3.6-35B-A3B…);
   * `hunyuan-dense` (Hunyuan-MT-7B, Hunyuan 0.5B–7B): Q/K norms after RoPE. Its dynamic-NTK "alpha" RoPE scaling
-    is already folded into `rope.freq_base` by the GGUF converter. Its BPE pre-tokenizer is not supported yet, so
-    prompts go in as token ids; the model expects its BOS token first (the GGUF does not ask for one);
+    is already folded into `rope.freq_base` by the GGUF converter. Its `hunyuan` / `hunyuan-dense` pre-tokenizers
+    are table rows (below). A prompt must start with its BOS token, which the GGUF does not ask the tokenizer to
+    add;
   * `gemma3` (Gemma 3 text models): embeddings scaled by √d, GeGLU, norms after the attention and the FFN, Q/K
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already;
@@ -1254,8 +1255,9 @@ the phone, nine runs of the same chat on the 35B gave the same greedy replies, a
 
 **Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
 float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every supported tokenizer
-gave the reference's ids for the whole text; a model whose pre-tokenizer is not supported yet was measured on the
-reference's ids (`--ref-tokens`). With an F16 KV cache the forward passes agree:
+gave the reference's ids for the whole text. The Hunyuan models were measured on the reference's ids
+(`--ref-tokens`), before their pre-tokenizers were added; those now give the same ids on their own. With an F16 KV
+cache the forward passes agree:
 
 | Model (architecture) | Tokens | Mean KL | Top-1 agreement |
 | :--- | ---: | ---: | ---: |
