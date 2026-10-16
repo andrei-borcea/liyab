@@ -103,7 +103,7 @@ class LocalApi {
       if (!open) return await conn.json(401, error(401, 'missing or wrong token'));
       final route = '${request.method} $path';
       if (route == 'GET /v1/models') {
-        final model = core.backend.modelName;
+        final model = core.backend.servedModel;
         return await conn.json(200, anthropic ? AnthropicApi.models(model) : OpenAiApi.models(model));
       }
       switch (route) {
