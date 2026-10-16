@@ -117,6 +117,21 @@ std::vector<GoldenCase> cases() {
     add("qwen3", s);
     s.rope_dim = 16;  // half of the 32-wide heads
     add("qwen3-partial-rope", s);
+    s = {};
+    s.arch = "qwen3";
+    s.qk_norm = true;
+    s.yarn_factor = 4.0f;  // YaRN: default betas, attention factor 1 + 0.1 ln 4
+    s.yarn_ctx = 32;       // a ramp over the first pairs, the slower ones interpolated
+    add("qwen3-yarn", s);
+    s = {};
+    s.arch = "qwen2";
+    s.key_outlier = 60.0f;  // key scaling over YaRN's per-pair speeds
+    s.yarn_factor = 8.0f;
+    s.yarn_ctx = 48;
+    s.yarn_beta_fast = 16.0f;
+    s.yarn_beta_slow = 2.0f;
+    s.yarn_log_mul = 0.0707f;  // DeepSeek's convention: q·k scaled, rotation magnitude 1
+    add("qwen2-yarn-keyscaled", s, {}, true);
 
     s = moe_spec("qwen3moe");
     s.qk_norm = true;

@@ -5,7 +5,7 @@
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
 // mixer — softmax attention (GQA, separate or fused QKV projections, RoPE in
-// either pairing with a per-block table and LongRoPE factors, optional QKV
+// either pairing with a per-block table, LongRoPE factors or YaRN, optional QKV
 // bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
 // optional sliding window) or a Gated DeltaNet linear-attention recurrence —
 // followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and

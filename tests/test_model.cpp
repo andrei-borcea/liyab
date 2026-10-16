@@ -238,6 +238,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_string(a + ".rope.scaling.type", "linear");
         w.add_f32(a + ".rope.scaling.factor", s.rope_scale);
     }
+    if (s.yarn_factor > 0.0f) {  // the keys the GGUF converter writes for a YaRN config
+        w.add_string(a + ".rope.scaling.type", "yarn");
+        w.add_f32(a + ".rope.scaling.factor", s.yarn_factor);
+        if (s.yarn_ctx > 0) w.add_u32(a + ".rope.scaling.original_context_length", static_cast<uint32_t>(s.yarn_ctx));
+        if (s.yarn_beta_fast > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_fast", s.yarn_beta_fast);
+        if (s.yarn_beta_slow > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_slow", s.yarn_beta_slow);
+        if (s.yarn_log_mul != 0.0f) w.add_f32(a + ".rope.scaling.yarn_log_multiplier", s.yarn_log_mul);
+    }
     if (s.longrope_ctx > 0) {  // as the Phi-3 converter writes it: no scaling type, the factors as tensors
         w.add_u32(a + ".rope.scaling.original_context_length", static_cast<uint32_t>(s.longrope_ctx));
         w.add_f32(a + ".rope.scaling.attn_factor", 1.19f);

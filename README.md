@@ -311,11 +311,15 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
     stores its RMSNorm weights as 1 + w already;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE.
 
-  Linear RoPE scaling, Llama 3.x `rope_freqs` and LongRoPE are supported, and windowed blocks can rotate with a RoPE
-  base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the model's
-  original context (4,096 on Phi-3.5), where the result is the reference's, and the long ones beyond it from the
-  first position on (the reference switches when the sequence grows past it, rotating earlier keys again). YaRN is
-  rejected with a clear error.
+  Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
+  a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
+  model's original context (4,096 on Phi-3.5), where the result is the reference's, and the long ones beyond it from
+  the first position on (the reference switches when the sequence grows past it, rotating earlier keys again).
+  YaRN is read from the file's `rope.scaling.*` keys (factor, original context, `yarn_beta_fast` / `yarn_beta_slow`,
+  `yarn_ext_factor`, `yarn_truncate`, `yarn_attn_factor`, `yarn_log_multiplier`): each rotary pair's frequency is
+  blended between its own and the one divided by the factor along the reference's ramp, and queries and keys get
+  its attention factor (0.1 ln factor + 1 unless the file states one). It does not depend on the context length,
+  so one table serves every position. The q·k scale is the file's `attention.scale` when it has one, else 1/√head_dim.
   `liyab_supported_architectures()` lists what a build runs, so front ends can filter downloads.
 * **MoE details:**
   * softmax or sigmoid gating, optional selection bias, top-k, renormalization and scale from the metadata;
@@ -1264,6 +1268,7 @@ cache the forward passes agree:
 | Llama-3.2-1B-Instruct (`llama`) | 499 | 0.00000 | 99.80% |
 | Qwen2.5-0.5B-Instruct (`qwen2`) | 512 | 0.00001 | 99.80% |
 | Qwen3-0.6B (`qwen3`) | 512 | 0.00000 | 99.80% |
+| Qwen3-0.6B with YaRN (factor 4 over 32,768 positions, set on a copy of the GGUF and in transformers' config) | 512 | 0.00000 | 100.00% |
 | Qwen3.5-0.8B (`qwen35`, hybrid) | 510 | 0.00000 | 100.00% |
 | Hunyuan-0.5B-Instruct (`hunyuan-dense`, reference ids, text after its BOS) | 500 | 0.00000 | 100.00% |
 | Hunyuan-MT-7B (`hunyuan-dense`, reference ids, text after its BOS) | 512 | 0.00000 | 100.00% |
@@ -1413,8 +1418,8 @@ downloaded.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE); streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
-| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases; fused QKV and gate/up projections, LongRoPE short and long factors; F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts; DeltaNet hybrids) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
@@ -1435,7 +1440,9 @@ Benchmarks and tools built with the tests:
     into the same token ids, printing the first difference, then measures the forward pass; `--max-kl` and
     `--min-top1` make it a pass/fail gate, `--ref-tokens` measures the model on the reference's ids while a
     tokenizer still differs (or cannot encode the text yet), and `--kv f16` keeps the KV cache's own rounding out of the measurement. `tests/data/conform_text.txt` is the text used (prose, Italian, code, numbers, URLs,
-    CJK, Greek, Cyrillic, Hebrew, Arabic, emoji, tabs and trailing spaces).
+    CJK, Greek, Cyrillic, Hebrew, Arabic, emoji, tabs and trailing spaces). The script's `--config` sets
+    configuration fields before the model is built (a GGUF copy given YaRN metadata is compared with the model
+    configured the same way), and `--attn-implementation` picks transformers' attention kernel.
 
   ```bash
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
@@ -1558,9 +1565,9 @@ Implemented features are described above. These are next, in order:
 1. **Model support as data** (in progress). In place: an architecture is one row of facts its tensors cannot tell
    (`src/core/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
-   Hugging Face (`liyab-kl`). Next:
-   * more block parts described as data (YaRN RoPE, MLA, fused expert tensors, logit soft-capping), then
-     DeepSeek and Gemma 2;
+   Hugging Face (`liyab-kl`); YaRN RoPE is read from the file. Next:
+   * more block parts described as data (MLA, fused expert tensors, logit soft-capping), then DeepSeek and
+     Gemma 2;
    * per-block KV caches, so blocks with a sliding window keep only their window's rows;
    * later, multimodal, embedding, reranking and classification models.
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
@@ -1617,9 +1624,11 @@ Implemented features are described above. These are next, in order:
     decode path; there are no AVX-VNNI, AVX-512 or repacked layouts, and CPUs without AVX2 run scalar kernels;
   * the transformer's element-wise loops (norms, softmax, RoPE) are plain C++ left to the compiler, and the DeltaNet
     recurrence has a NEON path but no x86 one.
-* **Architectures not supported yet:** Gemma 2 and 3n, Phi-1/2 and Phi MoE, DeepSeek V3/V4, fused
-  `ffn_gate_up_exps` tensors and YaRN RoPE scaling. BPE pre-tokenizers beyond those of
-  [Supported models](#supported-models) are not supported either (a new one is a table row).
+* **Architectures not supported yet:** Gemma 2 and 3n, Phi-1/2 and Phi MoE, DeepSeek V3/V4 and fused
+  `ffn_gate_up_exps` tensors. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
+  supported either (a new one is a table row).
+* **YaRN:** a file can state only one of the reference's two mscales (`yarn_log_multiplier`); when it does, they are
+  taken as equal, as on every DeepSeek model so far.
 * **Gemma 3:** the windowed blocks' keys stay in the cache for the whole context (the pages are shared by every
   block), so a long context costs Gemma 3 the KV memory of full attention. Gemma 3 27B scales its queries by
   1/√(d/heads), which its GGUF does not record: it is not supported (it runs with 1/√head_dim).

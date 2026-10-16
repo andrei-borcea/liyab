@@ -137,9 +137,41 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (!(c.rope_magnitude > 0.0f)) {
         return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.attn_factor"));
     }
+    double qk_mscale = 1.0;  // YaRN's factor on q·k (yarn_log_multiplier), squared into attn_scale below
     if (const auto scaling = f.get_string(key("rope.scaling.type")); scaling && *scaling != "none") {
         if (*scaling == "longrope" || *scaling == "su") {
             if (!longrope) return Status(ErrorCode::InvalidModel, "LongRoPE scaling without rope_factors_long/short");
+        } else if (*scaling == "yarn") {
+            YarnRope& y = c.yarn;
+            y.factor = static_cast<float>(f.get_float(key("rope.scaling.factor")).value_or(0.0));
+            y.ctx_orig = static_cast<int32_t>(
+                f.get_int(key("rope.scaling.original_context_length")).value_or(c.n_ctx_train));
+            y.beta_fast = static_cast<float>(f.get_float(key("rope.scaling.yarn_beta_fast")).value_or(32.0));
+            y.beta_slow = static_cast<float>(f.get_float(key("rope.scaling.yarn_beta_slow")).value_or(1.0));
+            y.ext_factor = static_cast<float>(f.get_float(key("rope.scaling.yarn_ext_factor")).value_or(1.0));
+            const GgufValue* truncate = f.metadata(key("rope.scaling.yarn_truncate"));
+            if (truncate != nullptr && !truncate->as_bool()) {
+                return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.yarn_truncate"));
+            }
+            y.truncate = truncate == nullptr || *truncate->as_bool();
+            if (!(y.factor > 0.0f) || !std::isfinite(y.factor) || y.ctx_orig <= 0 || !(y.beta_fast > 0.0f) ||
+                !(y.beta_slow > 0.0f) || !(y.ext_factor >= 0.0f) || !std::isfinite(y.ext_factor)) {
+                return Status(ErrorCode::InvalidModel, "invalid YaRN parameters (" + key("rope.scaling.*") + ")");
+            }
+            // The attention factor that comes with the frequencies: the
+            // file's own, or 0.1 ln(factor) + 1. A yarn_log_multiplier m
+            // (DeepSeek, which stores 0.1 x its mscale_all_dim) scales q·k by
+            // (1 + m ln(factor))^2 instead and leaves the rotation's
+            // magnitude at 1: the reference's two mscales are equal there.
+            const double ln_factor = y.factor > 1.0f ? std::log(static_cast<double>(y.factor)) : 0.0;
+            const auto log_mul = f.get_float(key("rope.scaling.yarn_log_multiplier"));
+            const auto attn_factor = f.get_float(key("rope.scaling.yarn_attn_factor"));
+            const double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            if (log_mul) qk_mscale = 1.0 + *log_mul * ln_factor;
+            if (!(magnitude > 0.0) || !(qk_mscale > 0.0)) {
+                return Status(ErrorCode::InvalidModel, "invalid YaRN attention factor (" + key("rope.scaling.*") + ")");
+            }
+            c.rope_magnitude = static_cast<float>(c.rope_magnitude * magnitude);
         } else if (*scaling != "linear") {
             return Status(ErrorCode::Unsupported, "rope scaling '" + std::string(*scaling) + "' is not supported");
         } else {
@@ -183,6 +215,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (c.head_dim <= 0 || c.rope_dim <= 0 || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
     }
+    // The q·k scale: the file's, else 1/sqrt(head_dim) (computed as the
+    // attention always computed it, so existing models keep their bits).
+    if (const auto scale = f.get_float(key("attention.scale"))) {
+        c.attn_scale = static_cast<float>(*scale);
+        if (!(c.attn_scale > 0.0f) || !std::isfinite(c.attn_scale)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.scale"));
+        }
+    } else {
+        c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+    }
+    if (qk_mscale != 1.0) c.attn_scale = static_cast<float>(c.attn_scale * qk_mscale * qk_mscale);
     const TensorView* embd = f.tensor("token_embd.weight");
     if (embd == nullptr || embd->cols() != c.n_embd) {
         return Status(ErrorCode::InvalidModel, "missing or malformed token_embd.weight");

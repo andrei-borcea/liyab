@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <istream>
+#include <numbers>
 #include <ostream>
 
 #include "core/log.h"
@@ -238,22 +239,52 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         }
         quant::dequantize_row(DType::F32, rf->data, factors.data(), rf->elements());
     }
-    auto table = [&](float base, float scale, const std::vector<float>& divisors) {
+    auto table = [&](float base, float scale, const std::vector<float>& divisors, const YarnRope* yarn) {
         RopeTable t;
         t.scale = scale;
         t.inv_freq.resize(divisors.size());
+        // YaRN: pair i keeps the share e(i) of its own frequency and takes
+        // 1 - e(i) of it divided by the factor; e falls linearly from 1 to 0
+        // between the pairs that turn beta_fast and beta_slow times over the
+        // original context (the reference's correction range), times
+        // ext_factor. One table for every position: keys never need
+        // rotating again, and the result does not depend on the context.
+        double low = 0.0, high = 0.0;
+        if (yarn != nullptr) {
+            const double dims = c.rope_dim;
+            auto pair_turning = [&](double turns) {  // the (fractional) pair that turns `turns` times
+                return dims * std::log(yarn->ctx_orig / (turns * 2.0 * std::numbers::pi)) /
+                       (2.0 * std::log(static_cast<double>(base)));
+            };
+            low = pair_turning(yarn->beta_fast);
+            high = pair_turning(yarn->beta_slow);
+            if (yarn->truncate) {
+                low = std::floor(low);
+                high = std::ceil(high);
+            }
+            low = std::max(low, 0.0);
+            high = std::min(high, dims - 1.0);
+            if (high == low) high += 0.001;  // as the reference: no division by zero
+        }
         for (size_t i = 0; i < divisors.size(); ++i) {
             const double freq = std::pow(static_cast<double>(base), -2.0 * static_cast<double>(i) / c.rope_dim);
-            t.inv_freq[i] = static_cast<float>(freq / divisors[i]);
+            if (yarn == nullptr) {
+                t.inv_freq[i] = static_cast<float>(freq / divisors[i]);
+                continue;
+            }
+            const double ramp = std::clamp((static_cast<double>(i) - low) / (high - low), 0.0, 1.0);
+            const double extrapolated = (1.0 - ramp) * yarn->ext_factor;
+            const double original = freq / divisors[i];
+            t.inv_freq[i] = static_cast<float>(original / yarn->factor * (1.0 - extrapolated) + original * extrapolated);
         }
         return t;
     };
-    model->rope_tables_.push_back(table(c.rope_base, c.rope_scale, factors));
+    model->rope_tables_.push_back(table(c.rope_base, c.rope_scale, factors, c.yarn.factor > 0.0f ? &c.yarn : nullptr));
     model->rope_tables_.back().magnitude = c.rope_magnitude;
     // Windowed blocks with a base of their own rotate unscaled, without the
     // global frequency factors (Gemma 3's local RoPE).
     if (c.rope_base_swa > 0.0f) {
-        model->rope_tables_.push_back(table(c.rope_base_swa, 1.0f, std::vector<float>(factors.size(), 1.0f)));
+        model->rope_tables_.push_back(table(c.rope_base_swa, 1.0f, std::vector<float>(factors.size(), 1.0f), nullptr));
     }
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = model->layers_[static_cast<size_t>(l)];
@@ -791,7 +822,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(hd);
-    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
     const DType kv_type = kv_->dtype();
     const bool quantized_kv = quant::is_block_quantized(kv_type);
     const auto uhd = static_cast<size_t>(hd);

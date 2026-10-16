@@ -134,6 +134,27 @@ struct BlockPlan {
     bool shared_expert = false;
 };
 
+// YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
+// states it. Each rotary pair's frequency is blended between its original
+// value and that value divided by `factor`: pairs that turn more than
+// beta_fast times over the original context keep their frequency
+// (extrapolation), pairs that turn fewer than beta_slow times are divided
+// by the factor (interpolation), and the pairs between follow a linear
+// ramp. Transformer::load builds the table; the attention factor that comes
+// with it is folded into ModelConfig::rope_magnitude and attn_scale.
+struct YarnRope {
+    float factor = 0.0f;       // rope.scaling.factor; > 0: YaRN is on
+    int32_t ctx_orig = 0;      // rope.scaling.original_context_length (default: context_length)
+    float beta_fast = 32.0f;   // rope.scaling.yarn_beta_fast
+    float beta_slow = 1.0f;    // rope.scaling.yarn_beta_slow
+    // rope.scaling.yarn_ext_factor: the share of the ramp that
+    // extrapolates (0: every pair interpolated).
+    float ext_factor = 1.0f;
+    // rope.scaling.yarn_truncate: the ramp's ends are rounded outwards to
+    // whole pairs (the reference's default).
+    bool truncate = true;
+};
+
 struct ModelConfig {
     const ArchSpec* spec = nullptr;  // registry row (static lifetime)
     std::string arch;                // spec->name
@@ -155,8 +176,17 @@ struct ModelConfig {
     // rope_ctx_orig (the Transformer picks once, from its context length).
     int32_t rope_ctx_orig = 0;
     // Multiplies the rotated dimensions of queries and keys
-    // (<arch>.rope.scaling.attn_factor: LongRoPE's attention factor; 1 when absent).
+    // (<arch>.rope.scaling.attn_factor: LongRoPE's attention factor; 1 when
+    // absent), times YaRN's attention factor with YaRN:
+    // rope.scaling.yarn_attn_factor when the file has it, else
+    // 1 + 0.1 ln(factor); 1 when the file has a yarn_log_multiplier, whose
+    // factor goes into attn_scale instead (DeepSeek's convention).
     float rope_magnitude = 1.0f;
+    YarnRope yarn;  // factor 0: no YaRN
+    // Multiplies q·k before the softmax: <arch>.attention.scale when the
+    // file has it, else 1/sqrt(head_dim); with YaRN and a
+    // rope.scaling.yarn_log_multiplier m, times (1 + m ln(factor))^2.
+    float attn_scale = 0.0f;
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

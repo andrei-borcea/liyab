@@ -1298,6 +1298,28 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         CHECK(c.rope_magnitude == 1.19f);
         CHECK(c.rope_base_swa == 0.0f);  // windowed blocks rotate like the others
     }
+    {
+        test::TinyModelSpec s;  // YaRN with the reference's defaults
+        s.arch = "qwen3";
+        s.yarn_factor = 4.0f;
+        s.yarn_ctx = 32;
+        const ModelConfig c = describe("describe_yarn", s);
+        CHECK(c.yarn.factor == 4.0f);
+        CHECK(c.yarn.ctx_orig == 32);
+        CHECK(c.yarn.beta_fast == 32.0f);
+        CHECK(c.yarn.beta_slow == 1.0f);
+        CHECK(c.yarn.ext_factor == 1.0f);
+        CHECK(c.yarn.truncate);
+        CHECK(c.rope_magnitude == static_cast<float>(0.1 * std::log(4.0) + 1.0));  // the attention factor
+        CHECK(c.attn_scale == 1.0f / std::sqrt(32.0f));
+        s.yarn_ctx = 0;  // the original context defaults to the training context
+        s.yarn_log_mul = 0.0707f;
+        const ModelConfig d = describe("describe_yarn_logmul", s);
+        CHECK(d.yarn.ctx_orig == s.context_length);
+        CHECK(d.rope_magnitude == 1.0f);  // DeepSeek's convention: the factor scales q·k
+        const double m = 1.0 + static_cast<double>(0.0707f) * std::log(4.0);
+        CHECK(d.attn_scale == static_cast<float>(1.0f / std::sqrt(32.0f) * m * m));
+    }
 }
 
 // ---------------------------------------------------------------------------

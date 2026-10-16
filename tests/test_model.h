@@ -106,6 +106,16 @@ struct TinyModelSpec {
     // non-empty swa_layers writes one flag per block (true: windowed) instead.
     int32_t swa_pattern = 0;
     std::vector<bool> swa_layers;
+    // > 0: YaRN RoPE scaling (rope.scaling.type "yarn") with this factor;
+    // yarn_ctx > 0 writes rope.scaling.original_context_length, the betas
+    // are written when > 0 and yarn_log_mul (DeepSeek's
+    // rope.scaling.yarn_log_multiplier) when != 0. Metadata only: the
+    // weights are those of the same spec without YaRN.
+    float yarn_factor = 0.0f;
+    int32_t yarn_ctx = 0;
+    float yarn_beta_fast = 0.0f;
+    float yarn_beta_slow = 0.0f;
+    float yarn_log_mul = 0.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
