@@ -2,7 +2,9 @@
 // what a reply streams (ApiEvent), and the one place that turns a request into
 // a prompt in the loaded model's own chat format, runs it, separates the
 // reasoning from the answer and the tool calls from the text, and applies stop
-// sequences. Tool calls and response formats are constrained decoding: the
+// sequences. With a pooling model loaded (an embedding model or a reranker)
+// it embeds texts and scores documents instead (embed, rerank), and refuses
+// to generate. Tool calls and response formats are constrained decoding: the
 // engine only lets the model write a call that parses, with arguments valid
 // against the tool's schema (tool_calls.dart), or an answer valid against the
 // requested schema. The OpenAI, Anthropic and gRPC front ends (openai_api.dart,
@@ -14,6 +16,7 @@ import 'dart:convert';
 import '../agent/tool_format.dart';
 import '../chat/chat_template.dart';
 import '../engine/engine_service.dart';
+import '../engine/liyab_ffi.dart' show LiyabPooling;
 import 'tool_calls.dart';
 
 /// A tool call an assistant turn made (in a conversation's history).
@@ -180,6 +183,17 @@ abstract class ApiBackend {
   /// See EngineService.generate for `grammar` and `structure` (constrained decoding).
   Generation generate(String prompt, SamplingOptions sampling,
       {String? grammar, Continuation Function(String generated)? structure});
+
+  /// What the loaded model pools (LiyabPooling): none for a generative model, last or mean for an embedding
+  /// model, rank for a reranker. Valid once ensureLoaded() returned.
+  int get pooling;
+
+  /// One unit vector per text, from the loaded embedding model (EngineService.embed); `dimensions` > 0 keeps the
+  /// first values (models trained for it). Throws EngineException when the engine refuses.
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0});
+
+  /// The relevance of each document to `query`, from the loaded reranker (EngineService.rerank).
+  Future<RerankScores> rerank(String query, List<String> documents);
 }
 
 class ApiCore {
@@ -301,10 +315,53 @@ class ApiCore {
     return backend.countTokens(prompt(r).$1);
   }
 
+  /// A pooling model (embedding model, reranker) writes no text: generation requests are refused, not answered
+  /// with what its LM head happens to give.
+  void _refusePooling() {
+    if (backend.pooling == LiyabPooling.none) return;
+    throw ApiError(400, 'the loaded model (${backend.modelName}) is '
+        '${backend.pooling == LiyabPooling.rank ? 'a reranker: use /v1/rerank' : 'an embedding model: use /v1/embeddings'}');
+  }
+
+  /// Embeddings of `texts` with the loaded model, in order. ApiError when it is not an embedding model, a text is
+  /// longer than its context or `dimensions` is more than it has.
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) async {
+    if (texts.isEmpty) throw const ApiError(400, 'input must not be empty');
+    await backend.ensureLoaded();
+    final pooling = backend.pooling;
+    if (pooling == LiyabPooling.rank) throw const ApiError(400, 'the loaded model is a reranker: use /v1/rerank');
+    if (pooling != LiyabPooling.last && pooling != LiyabPooling.mean) {
+      throw ApiError(400, 'the loaded model (${backend.modelName}) is not an embedding model: load one such as '
+          'Qwen3-Embedding');
+    }
+    try {
+      return await backend.embed(texts, dimensions: dimensions);
+    } on EngineException catch (e) {
+      throw ApiError(400, e.message);
+    }
+  }
+
+  /// The relevance of each document to `query` with the loaded reranker. ApiError when it is not a reranker or a
+  /// pair is longer than its context.
+  Future<RerankScores> rerank(String query, List<String> documents) async {
+    if (documents.isEmpty) throw const ApiError(400, 'documents must not be empty');
+    await backend.ensureLoaded();
+    if (backend.pooling != LiyabPooling.rank) {
+      throw ApiError(400, 'the loaded model (${backend.modelName}) is not a reranker: load one such as '
+          'Qwen3-Reranker (a GGUF with its ranking head)');
+    }
+    try {
+      return await backend.rerank(query, documents);
+    } on EngineException catch (e) {
+      throw ApiError(400, e.message);
+    }
+  }
+
   /// Runs `r`: ApiStart, then reasoning and answer pieces, then ApiDone.
   /// Cancelling the subscription stops the generation.
   Stream<ApiEvent> run(ApiRequest r) async* {
     await backend.ensureLoaded();
+    _refusePooling();
     final (text, reasoning) = prompt(r);
     final (grammar, structure) = constraints(r, reasoning: reasoning);
     yield ApiStart(await backend.countTokens(text));

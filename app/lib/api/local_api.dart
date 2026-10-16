@@ -1,7 +1,10 @@
 // The local API: other apps on this device use the loaded model through the
-// OpenAI API (/v1/chat/completions, /v1/completions, /v1/models), the
-// Anthropic Messages API (/v1/messages, /v1/messages/count_tokens) or gRPC
-// (liyab.v1.Liyab, see app/proto/liyab.proto), as they would a server.
+// OpenAI API (/v1/chat/completions, /v1/completions, /v1/embeddings,
+// /v1/models), the Anthropic Messages API (/v1/messages,
+// /v1/messages/count_tokens), the rerank API common clients use (/v1/rerank,
+// also /rerank and /v2/rerank) or gRPC (liyab.v1.Liyab, see
+// app/proto/liyab.proto), as they would a server. Embeddings need an embedding
+// model loaded, reranking a reranker.
 //
 // Off by default. The servers listen on the loopback interface only, so
 // nothing outside the device can connect, and every call must carry the
@@ -20,6 +23,7 @@ import 'anthropic_api.dart';
 import 'api_core.dart';
 import 'grpc_api.dart';
 import 'openai_api.dart';
+import 'rerank_api.dart';
 
 class LocalApi {
   LocalApi(ApiBackend backend, this.token) : core = ApiCore(backend);
@@ -111,6 +115,10 @@ class LocalApi {
           await OpenAiApi(core).chat(body, conn);
         case 'POST /v1/completions':
           await OpenAiApi(core).completion(body, conn);
+        case 'POST /v1/embeddings':
+          await OpenAiApi(core).embeddings(body, conn);
+        case 'POST /v1/rerank' || 'POST /v2/rerank' || 'POST /rerank':
+          await RerankApi(core).rerank(body, conn);
         case 'POST /v1/messages':
           await AnthropicApi(core).messages(body, conn);
         case 'POST /v1/messages/count_tokens':

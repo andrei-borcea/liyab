@@ -9,6 +9,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
@@ -81,7 +82,9 @@ class LoadedModel {
       required this.loadSeconds,
       required this.metadata,
       required this.memory,
-      required this.contextLength});
+      required this.contextLength,
+      this.pooling = LiyabPooling.none,
+      this.embeddingSize = 0});
 
   final String description;
   final double loadSeconds;
@@ -92,6 +95,26 @@ class LoadedModel {
 
   /// The GGUF keys the app reads (missing ones absent).
   final Map<String, String> metadata;
+
+  /// What the model pools (LiyabPooling): none for a generative model, last or mean for an embedding model, rank
+  /// for a reranker; and the values per embedding vector (its hidden size).
+  final int pooling;
+  final int embeddingSize;
+}
+
+/// The vectors of an embed call, in input order (unit length), and the tokens it processed.
+class Embeddings {
+  const Embeddings(this.vectors, this.tokens);
+  final List<Float32List> vectors;
+  final int tokens;
+}
+
+/// The scores of a rerank call, one per document in input order (in (0, 1), higher is more relevant), and the
+/// tokens it processed.
+class RerankScores {
+  const RerankScores(this.scores, this.tokens);
+  final List<double> scores;
+  final int tokens;
 }
 
 /// One finished generation, from liyab_generation_stats.
@@ -348,7 +371,9 @@ class EngineService {
         loadSeconds: r[2] as double,
         metadata: Map<String, String>.from(r[3] as Map),
         memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int),
-        contextLength: r[5] as int);
+        contextLength: r[5] as int,
+        pooling: r[6] as int,
+        embeddingSize: r[7] as int);
   }
 
   Future<void> unload() async {
@@ -385,6 +410,22 @@ class EngineService {
 
   /// Restores a context saveState() wrote for this model; the tokens restored.
   Future<int> loadState(String path) => _call<int>(['loadState', path]);
+
+  /// One vector per text with a pooling model (liyab_engine_embed): unit length, `dimensions` values when set
+  /// (models trained for it), else the model's embedding size. An instruction is part of the text. An
+  /// EngineException when the model does not embed (a generative model, a reranker) or a text is too long. Queued
+  /// like a generation: the engine serves one call at a time.
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0}) async {
+    final r = await _call<List<Object?>>(['embed', texts, dimensions]);
+    return Embeddings(List<Float32List>.from(r[0] as List), r[1] as int);
+  }
+
+  /// The relevance of each document to `query` with a reranker (liyab_engine_rerank), in input order. An
+  /// EngineException when the model is not a reranker or a pair is too long. Queued like a generation.
+  Future<RerankScores> rerank(String query, List<String> documents) async {
+    final r = await _call<List<Object?>>(['rerank', query, documents]);
+    return RerankScores(List<double>.from(r[0] as List), r[1] as int);
+  }
 
   /// Empties the engine's expert cache (the model stays loaded); the bytes released.
   Future<int> trimMemory() => _call<int>(['trim'], background: true);
@@ -527,6 +568,8 @@ void _worker(SendPort replies) {
                 metadata,
                 [plan.ref.residentBytes, plan.ref.expertBytes, plan.ref.expertCacheBytes, plan.ref.recommendedBytes, plan.ref.requantBits],
                 lib.contextLength(engine),
+                lib.pooling(engine),
+                lib.embeddingSize(engine),
               ]
             ]);
           });
@@ -612,11 +655,74 @@ void _worker(SendPort replies) {
         case 'generate':
           if (engine.address == 0) return fail('no model loaded');
           _generate(lib, engine, m, replies);
+        case 'embed':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final texts = List<String>.from(m[2] as List);
+            final params = arena<LiyabEmbedParams>();
+            lib.embedParamsDefault(params);
+            params.ref.dimensions = m[3] as int;
+            final size = lib.embeddingSize(engine);
+            final dims = params.ref.dimensions > 0 && params.ref.dimensions <= size ? params.ref.dimensions : size;
+            final out = arena<Float>(texts.isEmpty ? 1 : texts.length * dims);
+            final stats = arena<LiyabPoolingStats>();
+            final (pointers, lengths) = _nativeTexts(texts, arena);
+            if (lib.embed(engine, pointers, lengths, texts.length, params, out, texts.length * dims, stats) !=
+                LiyabStatus.ok) {
+              return fail();
+            }
+            final all = out.asTypedList(texts.length * dims);
+            replies.send([
+              'ok',
+              id,
+              [
+                [for (var i = 0; i < texts.length; ++i) Float32List.fromList(all.sublist(i * dims, (i + 1) * dims))],
+                stats.ref.tokens,
+              ]
+            ]);
+          });
+        case 'rerank':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final documents = List<String>.from(m[3] as List);
+            final params = arena<LiyabRerankParams>();
+            lib.rerankParamsDefault(params);
+            final scores = arena<Float>(documents.isEmpty ? 1 : documents.length);
+            final stats = arena<LiyabPoolingStats>();
+            final (pointers, lengths) = _nativeTexts(documents, arena);
+            final query = (m[2] as String).toNativeUtf8(allocator: arena);
+            if (lib.rerank(engine, query, pointers, lengths, documents.length, params, scores, stats) != LiyabStatus.ok) {
+              return fail();
+            }
+            replies.send([
+              'ok',
+              id,
+              [
+                [for (final s in scores.asTypedList(documents.length)) s.toDouble()],
+                stats.ref.tokens,
+              ]
+            ]);
+          });
       }
     } catch (e) {
       fail('$e');
     }
   });
+}
+
+/// UTF-8 copies of `texts` in `arena`, as liyab_engine_embed / _rerank take them: a pointer and a byte length each
+/// (lengths, not terminators: a text may hold NUL).
+(Pointer<Pointer<Utf8>>, Pointer<Size>) _nativeTexts(List<String> texts, Arena arena) {
+  final pointers = arena<Pointer<Utf8>>(texts.isEmpty ? 1 : texts.length);
+  final lengths = arena<Size>(texts.isEmpty ? 1 : texts.length);
+  for (final (i, text) in texts.indexed) {
+    final bytes = utf8.encode(text);
+    final copy = arena<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+    copy.asTypedList(bytes.length).setAll(0, bytes);
+    pointers[i] = copy.cast();
+    lengths[i] = bytes.length;
+  }
+  return (pointers, lengths);
 }
 
 /// Sets the experimental and advanced options present in `x` (see LoadOptions.experimental).

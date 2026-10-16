@@ -658,7 +658,8 @@ conversation. Every reply was identical to plain decoding's.
 Local memory and retrieval need two more kinds of model next to the generative one: an embedding model, which turns
 a text into a vector so similar texts lie close together, and a reranker, which scores how well a document answers a
 query. Decoder models fine-tuned for these jobs (Qwen3-Embedding, Qwen3-Reranker) run on the architectures above with
-the same forward pass; `Engine::embed()` and `Engine::rerank()` (C: `liyab_engine_embed` / `_rerank`) use them.
+the same forward pass; `Engine::embed()` and `Engine::rerank()` (C: `liyab_engine_embed` / `_rerank`) use them, and
+so does the app's [local API](#local-api-one-model-for-every-app-on-the-device) (`/v1/embeddings`, `/v1/rerank`).
 
 * **What a model does is data from its GGUF**, never a per-model branch:
   * `<arch>.pooling_type` says how the decoder's final hidden states become one vector: the last token's (3,
@@ -717,6 +718,22 @@ input gave the reference's ids, and every vector and score was the same bits alo
 
 The 8-bit files lose what their weights lose (and, on the CPU, what 8-bit activations lose), most where a single
 token's state is pooled: use F16 or BF16 files of these small models when the vectors must match the reference.
+
+**Throughput** on an Apple M4 Pro (CPU backend with 10 threads, or Metal), over the same sets: 39 texts of 37
+tokens on average in one `embed()` call, and the 5 queries' 19 pairs of 110 tokens on average, one `rerank()` call
+per query. Medians of 7 runs (`liyab-embed --bench 7`), on a Mac other jobs shared (load average 10–14):
+
+| GGUF | CPU | Metal |
+| :--- | ---: | ---: |
+| Qwen3-Embedding-0.6B Q8_0 | 30.2 texts/s (1,128 tokens/s) | 9.4 texts/s |
+| Qwen3-Embedding-0.6B F16 | 6.6 texts/s | 8.6 texts/s |
+| Qwen3-Reranker-0.6B Q8_0 | 18.4 pairs/s | 6.7 pairs/s |
+| Qwen3-Reranker-0.6B BF16 | 3.5 pairs/s | 3.6 pairs/s |
+
+The CPU's 8-bit kernels lead: Metal submits one command buffer per matrix product, which these small passes
+cannot hide, and F16 / BF16 weights multiply row by row on the CPU (see [Known limitations](#known-limitations)).
+Sharing prefixes skipped 17% of the embedding tokens and 47% of the reranking ones. A single 525-token text ran at
+~380 tokens/s on the Q8_0 file: per token, short inputs are cheaper, since attention grows with the input.
 
 ---
 
@@ -1061,7 +1078,8 @@ they would a server:
 
 | Protocol | Endpoint | Calls |
 | :--- | :--- | :--- |
-| OpenAI | `http://127.0.0.1:8642/v1` | `POST /chat/completions`, `POST /completions`, `GET /models` |
+| OpenAI | `http://127.0.0.1:8642/v1` | `POST /chat/completions`, `POST /completions`, `POST /embeddings`, `GET /models` |
+| Rerank (Jina / Cohere shape) | `http://127.0.0.1:8642/v1` | `POST /rerank` (also at `/rerank` and `/v2/rerank`) |
 | Anthropic Messages | `http://127.0.0.1:8642/v1` | `POST /messages`, `POST /messages/count_tokens`, `GET /models` |
 | gRPC | `127.0.0.1:8643` | `liyab.v1.Liyab`: `ListModels`, `Generate` (server streaming), `CountTokens` ([`app/proto/liyab.proto`](app/proto/liyab.proto)) |
 
@@ -1120,7 +1138,18 @@ curl http://127.0.0.1:8642/v1/chat/completions \
     error naming the keyword. `response_format` and `tools` together are refused.
   * Tools need a ChatML model whose template uses one of these formats; other models refuse them with an error.
     gRPC carries text only.
-* **Not yet.** Images, `n` > 1 and logprobs are refused with an error, never silently ignored.
+* **Embeddings and reranking.** With an [embedding model](#embeddings-and-reranking) loaded (Qwen3-Embedding),
+  `/v1/embeddings` returns its vectors: `input` is a string or a list (one engine call for the whole list, shared
+  prefixes computed once), `encoding_format` `float` or `base64` (the official OpenAI clients' default), and
+  `dimensions` keeps the first values for models trained for it. A query carries its instruction in its text
+  (`Instruct: {task}\nQuery:{query}` for Qwen3-Embedding). With a reranker loaded (a GGUF with its ranking head,
+  such as Qwen3-Reranker's from ggml-org), `/v1/rerank` takes `query`, `documents` (strings or `{"text": …}`
+  objects), `top_n` and `return_documents` (default true), and returns `results` sorted by `relevance_score`
+  (P(relevant), highest first) with each document's `index`. Usage counts the tokens processed. A pooling model
+  writes no text, so generation requests are refused while one is loaded, and so are embeddings or reranking with
+  a model that does not do them.
+* **Not yet.** Images, `n` > 1, logprobs and token arrays as embedding input are refused with an error, never
+  silently ignored.
 
 ### Everything else
 
@@ -1505,7 +1534,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused |
+| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses |
 
 Benchmarks and tools built with the tests:
 
@@ -1738,6 +1767,8 @@ Implemented features are described above. These are next, in order:
 * **App:**
   * iOS is not built yet;
   * the local API takes text only (no images), and tools only through OpenAI and Anthropic requests;
+  * the app keeps one model loaded: to serve embeddings or reranking, the embedding model or the reranker is loaded
+    in place of the chat model (the chat then asks for a chat model), and gRPC carries generation only;
   * Android may stop Liyab in the background (which stops the API too). Once Liyab's work is done, HyperOS also
     freezes it there (cgroup freezer): a frozen Liyab runs no code, so an idle model is not released until Liyab
     runs again. The local API escapes this only while its listening service runs. Android starts that service when
