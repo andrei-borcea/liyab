@@ -904,10 +904,13 @@ cancellation and live counters go straight to the C API, which makes them thread
     separators are fixed by the grammar (forced, or sampled under its mask where the model's own token covers
     them, see token healing), so the model chooses only whether to call, which tool and the values. Every call
     parses, names only declared parameters and has the required ones.
-  * Times are local date-times in the shape the prompt shows by example: `2026-10-09T08:00`, seconds optional, a day
-    alone for its midnight. The engine's JSON Schema subset cannot say this (`date-time` requires a UTC offset,
-    `pattern` is refused), so these values follow a grammar of their own, and a time the model writes always parses
-    (a free value such as "today" would leave the tool to its default range).
+  * Times are local: a date-time in the shape the prompt shows by example (`2026-10-09T08:00`, seconds optional), a
+    day alone for its midnight, or a time alone for today (a "since" still to come today means yesterday's). The
+    engine's JSON Schema subset cannot say this (`date-time` requires a UTC offset, `pattern` is refused), so these
+    values follow a grammar of their own, and a time the model writes always parses (a free value such as "today"
+    would leave the tool to its default range). The time alone is there because small models write one for "this
+    morning", and years are 20xx so that a first digit tells a time from a date: with dates only, Qwen2.5-0.5B's
+    `16:30` was bent into the year 1606.
   * Text outside a call is sampled with no mask, token for token as in an unconstrained reply. Each step's log line
     gives the tokens a call's grammar constrained and the grammar's time ("9 constrained, grammar 4.3 ms").
   * Results are compact text with ISO dates. On Qwen3.6's tokenizer, 6 events take 190 tokens instead of 428 as
@@ -1439,7 +1442,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused |
+| `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), each shape of a time read as local time, a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; with `LIYAB_TOOL_MODEL=a.gguf,b.gguf` on a Mac, real models answer questions for each tool through the app's prompt and structure, every call valid, and the grammar's cost per token is printed; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused |
 
 Benchmarks and tools built with the tests:
 

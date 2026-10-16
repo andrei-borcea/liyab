@@ -3,7 +3,8 @@
 // the tools (byte for byte as before, so saved contexts stay valid), a
 // scripted model calling through the structure the app generates with, and,
 // with the engine built on this host, every call grammar compiled and matched
-// by the engine itself.
+// by the engine itself; with LIYAB_TOOL_MODEL, real models calling the tools
+// the way the app has them call.
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
@@ -14,8 +15,10 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liyab/agent/tool_format.dart';
 import 'package:liyab/agent/tools.dart';
+import 'package:liyab/chat/chat_template.dart';
 import 'package:liyab/engine/engine_service.dart';
 import 'package:liyab/state/app_state.dart';
+import 'package:liyab/state/settings.dart';
 
 /// The engine's grammar compiler and matcher (include/liyab/grammar.h), from
 /// the library built on this host (`cmake --build build`; LIYAB_LIBRARY
@@ -89,12 +92,13 @@ AgentTool tool(String name) => allTools.firstWhere((t) => t.name == name);
 
 const dialects = [ToolDialect.qwenXml, ToolDialect.hermesJson];
 
-final _localDateTime = RegExp(r'^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?)?$');
+final _localDateTime = RegExp(r'^(20\d\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(T<clock>)?|<clock>)$'
+    .replaceAll('<clock>', r'([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?'));
 
 /// Why `args` are not what `t` takes (null when they are): declared
 /// parameters only, the required ones present, text values, date-times in
-/// the shape run() reads as local time. Checked here on its own, not with
-/// the grammar it checks.
+/// a shape the tool reads as local time (localTime). The shape is checked
+/// here on its own, not with the grammar under test.
 String? invalid(AgentTool t, Map<String, Object?> args) {
   for (final k in args.keys) {
     if (!t.parameters.containsKey(k)) return 'undeclared parameter $k';
@@ -106,7 +110,7 @@ String? invalid(AgentTool t, Map<String, Object?> args) {
     if (value is! String) return '$key is not text: $value';
     if (!t.dateTimes.contains(key)) continue;
     if (!_localDateTime.hasMatch(value)) return '$key is not a local date-time: $value';
-    final time = DateTime.tryParse(value);
+    final time = localTime(value, DateTime(2026, 10, 16, 10, 30));
     if (time == null || time.isUtc) return '$key is not read as local time: $value';
   }
   return null;
@@ -128,10 +132,12 @@ final examples = <String, List<Map<String, Object?>>>{
     {'since': '2026-10-09T08:00:30'},
     {'from': '+39 333 123 4567'},
     {'since': '2026-01-31T07:05', 'from': 'Zoë "Zo" Müller'},
+    {'since': '07:30'},
   ],
   'recent_calls': [
     {},
     {'since': '2026-10-08'},
+    {'since': '23:59:59'},
   ],
   'find_contact': [
     {'name': 'Anna'},
@@ -201,8 +207,9 @@ void main() {
   });
 
   test('each tool\'s call grammar: names and keys forced, values of their types, date-times in their shape', () {
-    const date = r'([0-9]{4} "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [12] [0-9] | "3" [01]) '
-        r'("T" ([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] (":" [0-5] [0-9])?)?)';
+    const clock = r'([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] (":" [0-5] [0-9])?';
+    const date = '("20" [0-9] [0-9] "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [12] [0-9] | "3" [01]) '
+        '("T" $clock)? | $clock)';
     expect(localDateTime, date.substring(1, date.length - 1));
     expect(ToolDialect.qwenXml.callGrammar([tool('calendar_events').spec, tool('read_sms').spec]), '''
 root ::= "\\n" "<function=" (t0 | t1) "</function>\\n</tool_call>"
@@ -295,7 +302,10 @@ t1 ::= "\\"read_sms\\", \\"arguments\\": " "{" (p1-0 (", " p1-1)? | p1-1)? "}"''
       j('calendar_events', '{"start": "2026-10-09T24:00", $end}'),
       j('calendar_events', '{"start": "2026-13-01", $end}'),
       j('calendar_events', '{"start": "09/10/2026", $end}'),
+      j('calendar_events', '{"start": "1606-10-16T10:30", $end}'), // 20xx: a first "1" starts a time, not a year
       j('read_sms', '{"since": "yesterday"}'),
+      j('read_sms', '{"since": "8:00"}'), // two-digit hours, as the prompt's example
+      j('read_sms', '{"since": "T08:00"}'),
       j('read_sms', '{"from": 3}'), // text
       j('read_sms', '{"from": "Marco", "since": "2026-10-09"}'),
       j('read_clipboard', '{"text": ""}'),
@@ -304,11 +314,13 @@ t1 ::= "\\"read_sms\\", \\"arguments\\": " "{" (p1-0 (", " p1-1)? | p1-1)? "}"''
     ]) {
       expect(engine.matches(json, bad), isFalse, reason: bad);
     }
+    expect(engine.matches(json, j('read_sms', '{"since": "16:30"}')), isTrue); // a time alone: today
     final xml = ToolDialect.qwenXml.callGrammar([for (final t in android) t.spec]);
     String x(String name, Map<String, String> params) =>
         '\n<function=$name>\n${params.entries.map((e) => '<parameter=${e.key}>\n${e.value}\n</parameter>\n').join()}'
         '</function>\n</tool_call>';
     expect(engine.matches(xml, x('read_sms', {'since': '2026-10-09T08:00', 'from': 'Marco\nRossi'})), isTrue);
+    expect(engine.matches(xml, x('calendar_events', {'start': '14:00', 'end': '18:30:00'})), isTrue);
     for (final bad in [
       x('read_email', {}),
       x('calendar_events', {'start': '2026-10-09T00:00'}),
@@ -369,6 +381,103 @@ t1 ::= "\\"read_sms\\", \\"arguments\\": " "{" (p1-0 (", " p1-1)? | p1-1)? "}"''
       // The structure runs on the engine's isolate: it must reach another isolate intact.
       expect(await Isolate.run(() => structure('Sure.<tool_call>').grammar), grammar);
     }
+  });
+
+  // Real models (LIYAB_TOOL_MODEL=a.gguf[,b.gguf], on a Mac with the engine built): the app's own prompt and macOS
+  // tools, questions for each tool sampled at the model's settings, every call through the structure the app
+  // generates with. Every call the model writes parses, names an offered tool and has valid arguments; the counts
+  // and the grammar's cost per token are printed.
+  final models = (Platform.environment['LIYAB_TOOL_MODEL'] ?? '').split(',').where((p) => p.isNotEmpty).toList();
+  test('real models: every call to the app\'s tools is valid; the grammar\'s cost per token', () async {
+    // LiyabLib looks its functions up in the process (DynamicLibrary.process() on macOS): the host library, opened
+    // here, provides them.
+    DynamicLibrary.open(Engine.path);
+    final engine = await EngineService.start();
+    const questions = [
+      'What do I have in my calendar tomorrow?',
+      'Am I free on Friday afternoon?',
+      'Any emails from my bank since Monday?',
+      'Did Marco text me since this morning?',
+      'Who called me today?',
+      "What's Anna's phone number?",
+      'What did I just copy?',
+      'Cosa ho in agenda oggi?',
+    ];
+    final samples = int.tryParse(Platform.environment['LIYAB_TOOL_SAMPLES'] ?? '') ?? 3;
+    for (final path in models) {
+      final model = await engine.load(LoadOptions(modelPath: path, contextLength: 4096));
+      final source = model.metadata['tokenizer.chat_template'] ?? '';
+      var (template, thinks, _) = await ChatTemplate.fromModel(engine, source);
+      if (template == null) (template, thinks) = await ChatTemplate.detect(engine);
+      final dialect = template.isChatML ? ToolDialect.of(source) : ToolDialect.none;
+      expect(dialect, isNot(ToolDialect.none), reason: '$path has no tool-call format the app knows');
+      final settings = ModelSettings()..maxTokens = 160;
+      double? number(String key) => double.tryParse(model.metadata[key] ?? '');
+      final sampling = SamplingOptions(
+          temperature: number('general.sampling.temp') ?? settings.temperature,
+          topP: number('general.sampling.top_p') ?? settings.topP,
+          topK: number('general.sampling.top_k')?.round() ?? settings.topK,
+          maxTokens: settings.maxTokens);
+      final thinking = thinks ? Thinking.off : Thinking.none;
+      final system = dialect.system(settings.systemPrompt, macos);
+      var replies = 0, calls = 0, cut = 0, constrained = 0, generated = 0;
+      var grammarMs = 0.0, decodeMs = 0.0;
+      for (final q in questions) {
+        for (var s = 0; s < samples; ++s) {
+          final prompt = template.build(system, const [], '$q\n\n${AppState.nowLine(DateTime.now())}', thinking);
+          final structure = AppState.callStructure(dialect, macos, thinking: false);
+          var raw = '';
+          late GenerationStats stats;
+          await for (final e in engine.generate(prompt, sampling, structure: structure).events) {
+            if (e is TextPiece) raw += e.text;
+            if (e is GenerationDone) stats = e.stats;
+          }
+          ++replies;
+          constrained += stats.constrainedTokens;
+          generated += stats.generatedTokens;
+          grammarMs += stats.grammarMs;
+          decodeMs += stats.tokensPerSecond > 0 ? stats.generatedTokens * 1000 / stats.tokensPerSecond : 0;
+          if (!raw.contains('<tool_call>')) continue;
+          final call = dialect.parse(raw);
+          if (call == null && stats.generatedTokens >= sampling.maxTokens) {
+            ++cut; // max_tokens came first: a prefix of a call
+            continue;
+          }
+          expect(call, isNotNull, reason: 'a call that does not parse: $raw');
+          final t = macos.where((t) => t.name == call!.name).firstOrNull;
+          expect(t, isNotNull, reason: 'not an offered tool: $raw');
+          expect(invalid(t!, call!.arguments), isNull, reason: raw);
+          ++calls;
+        }
+      }
+      // ignore: avoid_print
+      print('${File(path).uri.pathSegments.last} (${dialect.name}): $replies replies, $calls valid calls, $cut cut by '
+          'max_tokens; grammar ${(grammarMs / (constrained == 0 ? 1 : constrained)).toStringAsFixed(2)} ms per '
+          'constrained token ($constrained), decode ${(decodeMs / (generated == 0 ? 1 : generated)).toStringAsFixed(1)} '
+          'ms per token');
+    }
+    await engine.unload();
+  },
+      skip: models.isEmpty
+          ? 'set LIYAB_TOOL_MODEL to GGUF paths (comma-separated)'
+          : !Platform.isMacOS
+              ? 'the app looks its engine up in the process on macOS only'
+              : Engine.skip,
+      timeout: const Timeout(Duration(hours: 2)));
+
+  test('the tools read each shape a call can give a time in, as local time', () {
+    final now = DateTime(2026, 10, 16, 10, 30);
+    expect(localTime('2026-10-09T08:00', now), DateTime(2026, 10, 9, 8));
+    expect(localTime('2026-10-09T08:00:30', now), DateTime(2026, 10, 9, 8, 0, 30));
+    expect(localTime('2026-10-09', now), DateTime(2026, 10, 9));
+    expect(localTime('07:45', now), DateTime(2026, 10, 16, 7, 45)); // a time alone: today
+    expect(localTime(null, now), isNull);
+    expect(localTime('today', now), isNull); // an unconstrained value: the tool's default
+    expect(sinceTime('07:45', now), DateTime(2026, 10, 16, 7, 45));
+    expect(sinceTime('22:00', now), DateTime(2026, 10, 15, 22)); // still to come today: last night's
+    expect(sinceTime('2026-10-16T22:00', now), DateTime(2026, 10, 16, 22)); // a day written: as written
+    expect(sinceTime('23:00', DateTime(2026, 11, 1, 9)), DateTime(2026, 10, 31, 23));
+    expect(sinceTime(null, now), now.subtract(const Duration(hours: 24)));
   });
 
   test('the step log line gives what constrained decoding cost', () {
