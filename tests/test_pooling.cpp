@@ -504,6 +504,12 @@ TEST_CASE("embed: a pooling model's KV cache is F16 by default (pooling_kv_cache
     REQUIRE(pooled != nullptr && generative != nullptr);
     CHECK(pooled->describe().find("KV cache:   f16") != std::string::npos);
     CHECK(generative->describe().find("KV cache:   q8_0") != std::string::npos);
+    CHECK(pooled->describe().find("Pooling:    embeddings, last token, 128 values per vector, inputs end with EOS\n") !=
+          std::string::npos);
+    CHECK(generative->describe().find("Pooling:") == std::string::npos);
+    auto ranker = make_engine(cpu_config(model_path("reranker", reranker_spec())));
+    REQUIRE(ranker != nullptr);
+    CHECK(ranker->describe().find("Pooling:    reranking, ranking head of 2 labels\n") != std::string::npos);
     EngineConfig quantized = cpu_config(model_path("embedding", embedding_spec()));
     quantized.pooling_kv_cache_type = KvCacheType::Q8_0;
     auto q8 = make_engine(quantized);

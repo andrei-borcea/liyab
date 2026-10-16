@@ -1335,6 +1335,16 @@ std::string Engine::describe() const {
         out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
                " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
     }
+    if (const PoolingModel& p = impl_->pooling; p.declared != Pooling::None) {  // an embedding model or a reranker
+        static constexpr const char* kKinds[] = {"", "embeddings, mean of the tokens", "first token (CLS)",
+                                                 "embeddings, last token", "reranking"};
+        out += "Pooling:    " + std::string(kKinds[static_cast<int>(p.declared)]);
+        out += p.declared == Pooling::Rank
+                   ? (p.head != nullptr ? ", ranking head of " + std::to_string(p.head->rows()) + " labels"
+                                        : ", no usable ranking head")
+                   : ", " + std::to_string(c.n_embd) + " values per vector";
+        out += p.add_eos ? ", inputs end with EOS\n" : "\n";
+    }
     return out;
 }
 

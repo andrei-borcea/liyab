@@ -1758,8 +1758,10 @@ Implemented features are described above. These are next, in order:
 * **DeltaNet** runs its recurrence token by token on the CPU, also during prefill: no chunked parallel scan or GPU
   kernel yet.
 * **Embeddings and reranking:** decoder models only (no encoder-only models). The inputs of a call run one pass
-  each, so short texts give the matrix kernels few rows. F16 and BF16 weights multiply row by row on the CPU (no
-  tiled float kernel yet), which makes their files several times slower to embed with than Q8_0 ones.
+  each: on the M4 Pro a pass's fixed cost is ~3 ms on the CPU (one-word texts: 304 per second on Qwen3-Embedding
+  Q8_0, against ~33 ms of work for a 37-token text) and ~35 ms on Metal (29 per second). F16 and BF16 weights
+  multiply row by row on the CPU (no tiled float kernel yet), which makes their files several times slower to embed
+  with than Q8_0 ones.
 * **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as
   `anyOf` (overlapping branches are not told apart); speculative decoding pauses while a grammar is active.
 * **Split GGUF:** dense split models use the older `mmap` streaming window. A split model opened through the system
