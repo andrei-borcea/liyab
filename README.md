@@ -17,9 +17,10 @@ is written in C++20 and has no cloud dependency. Our aim is to be the reference 
 whatever device is at hand. That means models larger than the device's RAM, on any phone, without heating it up, and
 without a single byte of the user's data leaving the device.
 
-Today a 22 GB mixture-of-experts model (**Qwen3.6-35B-A3B**) answers at **~9–10 tokens per second** from the command
-line on a Snapdragon 8 Elite phone, and at **~7.4 tok/s in the app**. Its experts are streamed from flash storage into
-the 6 GiB that Android lets one app use.
+Today a 22 GB mixture-of-experts model (**Qwen3.6-35B-A3B**) answers at **~9–10.5 tokens per second** from the
+command line on a Snapdragon 8 Elite phone, and at **~7.5–9.4 tok/s in the app**. Its experts are streamed from flash
+storage into the 6 GiB that Android lets one app use. A model that fits in RAM, **Qwen3.5-4B**, answers at **~12 tok/s**
+from the command line and **~12–16 tok/s in the app**.
 
 > **This README describes the code as it is.** Every feature listed here is implemented and tested; everything that
 > is not lives in the [Roadmap](#roadmap). Numbers are measured on real hardware. Where a number comes from a single
@@ -87,7 +88,7 @@ These rules decide what goes into the code:
    lengths, expert prefetch depth, context length, memory plans and thermal bands are measured or derived on the
    device the engine runs on.
 2. **Kernels per instruction set, policy per platform.** Compute kernels target ISAs: ARM64 NEON with dot product
-   and i8mm, Metal, Vulkan. Differences between operating systems (thermal APIs, performance hints, memory limits)
+   and i8mm, x86-64 AVX2, Metal, Vulkan. Differences between operating systems (thermal APIs, performance hints, memory limits)
    live behind a thin adaptive layer, never in the kernels.
 3. **Lossless by default.** Every speed-up that changes the output (fewer experts, requantization, skipping) is
    opt-in, labelled lossy, and measured with `liyab-kl` against the lossless path.
@@ -116,10 +117,8 @@ These rules decide what goes into the code:
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
-| Structured output: forced continuations (tool-call syntax and names in the app) | ✅ |
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Structured output: grammar-constrained decoding (JSON Schema, grammar text) and forced continuations (tool-call syntax and names in the app) | ✅ |
-| Speculative decoding: draft model or n-gram lookup, adaptive draft count, hybrid models included | ✅ |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
@@ -1149,7 +1148,8 @@ CPU backend, greedy decoding, starting from a cold expert cache.
 
 Later work raised it further: WFE waits, parallel DeltaNet passes, prediction by rank, the shared expert overlapped
 with reads, and the attention rewrite. The command line now reaches **~9–10.5 tok/s on a cool phone**, and the app
-**~7.4 tok/s at a 1.9k-token context**.
+**~7.5–9.4 tok/s** (7.4 tok/s at a 1.9k-token context when first measured; the phone regression run tracks both,
+see [Regression run on the phone](#regression-run-on-the-phone)).
 
 Per token, about 105 ms on a cool phone:
 
@@ -1324,6 +1324,44 @@ MoE 0.0056 (95.7%), whose keys need no scaling. `--kv f16` removes the remaining
 ![Matrix-vector throughput by weight format](docs/benchmarks/matvec_formats.svg)
 
 ![Decode speed of models that fit in RAM, CPU vs GPU](docs/benchmarks/in_ram_decode.svg)
+
+### What we found along the way
+
+Facts measured while building Liyab that shaped the code, kept here because they are easy to get wrong.
+
+* **Some model families need help to fit their keys in 8 bits.** Qwen2.5 and Qwen3 carry a few key channels 50–107
+  times their head's median, nearly constant across tokens; a Q8_0 cache then rounded everything near them with a
+  step a hundred times too coarse (KL 0.05–0.07 against F16). Scaling keys per channel, with the inverse on the
+  queries, removes it (KL ~0.002) at no cost in memory or speed. Qwen3.5/3.6, the 27B and Llama 3.2 have no such
+  channels (6–11×): scaling gained nothing there, so they keep their keys bit for bit
+  ([key scaling](#architecture)). What a Q8_0 cache still costs the 35B (KL 0.0056, 95.7% top-1) is 8-bit rounding
+  itself; values alone cost as much as keys alone. Only an F16 cache removes it.
+* **A published GGUF may not hold the weights of the model it names.** The official Qwen2.5-0.5B-Instruct GGUF
+  matched its Hugging Face model only in the biases; a GGUF converted from the Hugging Face weights matched at KL
+  0.00001. When conformance fails from the first token, compare tensors before suspecting the engine.
+* **The Mac and the phone compute the same bits.** The same kernel set (NEON with dot product) gives identical
+  logits on an Apple M4 Pro and a Snapdragon 8 Elite, through different compilers and operating systems
+  (`test_golden`). Reproducibility across batch splits, thread counts and layouts holds on both.
+* **A model may write one character in two tokens.** Byte-level vocabularies split rare characters and emoji, so a
+  conversation's text can end inside a character; matching the next prompt must step back to a whole character,
+  or a hybrid model processes the whole conversation again.
+* **Tokenizing a prompt can be slow enough to matter.** Before tokenizers became data, an 81 KB Llama chat took
+  1.35 s to encode and a 75 KB ChatML one 158 ms, on every prompt typed ahead; now 2.5–3.5 ms.
+* **Not every chat template can be reused across turns.** Qwen3 and Qwen3.5 drop earlier reasoning from the
+  rendered history, so turn n is not a prefix of turn n + 1; Liyab detects that at load and keeps its own format
+  there. Llama 3's template writes today's date, so its system prompt changes once a day.
+* **A stop inside a speculative step must cut the step.** Tokens verified past an end-of-generation token stayed
+  in the cache, and the next turn diverged from plain decoding.
+* **Experts are not low-rank.** Qwen3.6's routed experts need ~65% of their rank for 90% of their energy; the
+  least used quarter of them carries only 5–8% of routings. A smaller tier for all experts in Q3_K costs about
+  what `--expert-mass 0.9` costs ([study](docs/research/cold-experts.md)).
+* **HyperOS starts nothing in the background without Autostart.** Android binds the notification listener after a
+  reboot, but HyperOS rejects it unless Liyab's Autostart is allowed; with it, the local API answers a request
+  after a reboot without Liyab ever being opened (first token 6.4 s, the 35B loaded from cold).
+* **Swap distorts speed measurements.** With 7.5 GB of zram in use by other apps, the same build ran prefill
+  ~30% slower; alternating A/B runs, not single runs, tell a change from the phone's state.
+* **Rosetta 2 is not an x86 benchmark.** It translates `VPSIGNB` and `VPSHUFB` into long sequences, so AVX2
+  kernels that are faster natively can run slower there than scalar code.
 
 ### What did not pay off (so you don't have to try)
 
@@ -1546,10 +1584,10 @@ Implemented features are described above. These are next, in order:
     * local memory over your own data;
     * the screen content through a voice-interaction service.
 11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
-    it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and command bar as on macOS),
-    which first needs a Windows port of the engine (the x86-64 AVX2 kernels are in place) and validation of those
-    kernels on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP, NeuroPilot); app
-    localization.
+    it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and
+    command bar as on macOS), which first needs a Windows port of the engine (the x86-64 AVX2 kernels are in place)
+    and validation of those kernels on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP,
+    NeuroPilot); app localization.
 12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
 ## Known limitations
