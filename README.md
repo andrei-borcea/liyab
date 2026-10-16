@@ -1662,7 +1662,7 @@ Implemented features are described above. These are next, in order:
 * **Windows:**
   * the [port](#windows-x64) has not been compiled or run on Windows yet: it was written against the Win32 API for
     MSVC and clang-cl and checked only through the macOS builds (arm64, x86-64, and a `-pedantic` x86-64 build that
-    finds no GNU extension cl.exe would reject), so its first Windows build may still need fixes;
+    finds no GNU language extension in the code Windows compiles), so its first Windows build may still need fixes;
   * `test_golden` compares Windows' results with the `x86_64-*` hashes recorded on macOS. The forward pass calls
     the C runtime's `exp`, `tanh`, `log1p`, `pow`, `sin` and `cos`, which Windows implements with its own code: if a
     result rounds differently there, those hashes need entries of their own;
