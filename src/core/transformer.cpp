@@ -1,6 +1,7 @@
 #include "core/transformer.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <istream>
@@ -206,6 +207,137 @@ void expand_strip(const float* a, int64_t m, int64_t k, const float* wp, float* 
             float* dst = out + static_cast<size_t>(j0 + i) * out_stride;
             for (int32_t c = 0; c < columns; ++c) dst[offset[c]] = acc[i][c];
         }
+    }
+}
+
+// The expanded form's attention kernels. Each score is one dot product over
+// kScoreLanes interleaved partial sums reduced in a fixed tree, and each
+// weighted value one multiply-add chain over the positions in ascending
+// order, whatever the queries and rows computed alongside: blocks of
+// kScoreQueries tokens and kScoreKeys rows share every load, and a token's
+// bits do not depend on which tokens share its block.
+constexpr int32_t kScoreQueries = 4;
+constexpr int32_t kScoreKeys = 2;
+constexpr int32_t kScoreLanes = 8;
+constexpr int32_t kValueColumns = 16;
+// A task attends kAttendTokens tokens of one head (fewer when the pass has
+// too few tasks for the threads), kAttendRows rows of keys and values at a time.
+constexpr size_t kAttendTokens = 32;
+constexpr size_t kAttendRows = 64;
+
+// out[t][r] = q[t] . k[r] over n channels, for kScoreQueries queries and kScoreKeys rows.
+void score_block(const float* const* q, const float* const* k, size_t n, float (*out)[kScoreKeys]) {
+#if defined(__ARM_NEON)
+    // The same sums as the portable loop below, lanes 0-3 and 4-7 in two
+    // vectors (compilers leave the portable loop scalar: 64 accumulators).
+    if (n % kScoreLanes == 0) {
+        float32x4_t lo[kScoreQueries][kScoreKeys], hi[kScoreQueries][kScoreKeys];
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) lo[t][r] = hi[t][r] = vdupq_n_f32(0.0f);
+        }
+        for (size_t i = 0; i < n; i += kScoreLanes) {
+            float32x4_t k_lo[kScoreKeys], k_hi[kScoreKeys];
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                k_lo[r] = vld1q_f32(k[r] + i);
+                k_hi[r] = vld1q_f32(k[r] + i + 4);
+            }
+            for (int32_t t = 0; t < kScoreQueries; ++t) {
+                const float32x4_t q_lo = vld1q_f32(q[t] + i);
+                const float32x4_t q_hi = vld1q_f32(q[t] + i + 4);
+                for (int32_t r = 0; r < kScoreKeys; ++r) {
+                    lo[t][r] = vfmaq_f32(lo[t][r], q_lo, k_lo[r]);
+                    hi[t][r] = vfmaq_f32(hi[t][r], q_hi, k_hi[r]);
+                }
+            }
+        }
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                const float32x4_t s = vaddq_f32(lo[t][r], hi[t][r]);  // a[l] + a[l + 4]
+                out[t][r] = (vgetq_lane_f32(s, 0) + vgetq_lane_f32(s, 1)) + (vgetq_lane_f32(s, 2) + vgetq_lane_f32(s, 3));
+            }
+        }
+        return;
+    }
+#endif
+    float acc[kScoreQueries][kScoreKeys][kScoreLanes] = {};
+    size_t i = 0;
+    for (; i + kScoreLanes <= n; i += kScoreLanes) {
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                for (int32_t l = 0; l < kScoreLanes; ++l) acc[t][r][l] += q[t][i + l] * k[r][i + l];
+            }
+        }
+    }
+    for (int32_t l = 0; i < n; ++i, ++l) {
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) acc[t][r][l] += q[t][i] * k[r][i];
+        }
+    }
+    for (int32_t t = 0; t < kScoreQueries; ++t) {
+        for (int32_t r = 0; r < kScoreKeys; ++r) {
+            const float* a = acc[t][r];
+            out[t][r] = ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]));
+        }
+    }
+}
+
+// o[t][d] += sum over rows i in [a, b) of p[t][i] * v[i * stride + d], d in
+// [0, width), for T tokens: kValueColumns columns of every token held in
+// registers while the rows go by.
+template <int32_t T>
+void weigh_values(float* const* o, const float* const* p, const float* v, size_t stride, size_t a, size_t b,
+                  size_t width) {
+    if (a >= b) return;
+#if defined(__ARM_NEON)
+    // The same multiply-adds as the portable loop below, in vectors (which
+    // compilers do not reliably make of it).
+    if (width % kValueColumns == 0) {
+        for (size_t d0 = 0; d0 < width; d0 += kValueColumns) {
+            float32x4_t acc[T][4];
+            for (int32_t t = 0; t < T; ++t) {
+                for (int32_t c = 0; c < 4; ++c) acc[t][c] = vld1q_f32(o[t] + d0 + 4 * c);
+            }
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                const float32x4_t r0 = vld1q_f32(row), r1 = vld1q_f32(row + 4);
+                const float32x4_t r2 = vld1q_f32(row + 8), r3 = vld1q_f32(row + 12);
+                for (int32_t t = 0; t < T; ++t) {
+                    const float32x4_t pi = vdupq_n_f32(p[t][i]);
+                    acc[t][0] = vfmaq_f32(acc[t][0], pi, r0);
+                    acc[t][1] = vfmaq_f32(acc[t][1], pi, r1);
+                    acc[t][2] = vfmaq_f32(acc[t][2], pi, r2);
+                    acc[t][3] = vfmaq_f32(acc[t][3], pi, r3);
+                }
+            }
+            for (int32_t t = 0; t < T; ++t) {
+                for (int32_t c = 0; c < 4; ++c) vst1q_f32(o[t] + d0 + 4 * c, acc[t][c]);
+            }
+        }
+        return;
+    }
+#endif
+    for (size_t d0 = 0; d0 < width; d0 += kValueColumns) {
+        const size_t w = std::min<size_t>(kValueColumns, width - d0);
+        float acc[T][kValueColumns] = {};
+        for (int32_t t = 0; t < T; ++t) std::copy(o[t] + d0, o[t] + d0 + w, acc[t]);
+        if (w == static_cast<size_t>(kValueColumns)) {
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                for (int32_t t = 0; t < T; ++t) {
+                    const float pi = p[t][i];
+                    for (int32_t c = 0; c < kValueColumns; ++c) acc[t][c] += pi * row[c];
+                }
+            }
+        } else {
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                for (int32_t t = 0; t < T; ++t) {
+                    const float pi = p[t][i];
+                    for (size_t c = 0; c < w; ++c) acc[t][c] += pi * row[c];
+                }
+            }
+        }
+        for (int32_t t = 0; t < T; ++t) std::copy(acc[t], acc[t] + w, o[t] + d0);
     }
 }
 
@@ -1718,51 +1850,139 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                              mla_ex_.data(), row, mla_col_offset_.data() + us * strip, columns);
             }
         });
-        // Every (token, head) folds in the tile's positions it sees.
-        pool.parallel_for(static_cast<int64_t>(un * heads), [&](int64_t a, int64_t b) {
-            thread_local std::vector<float> scores;
-            scores.resize(urows);
+        // Every (token, head) folds in the tile's positions it sees. A task
+        // takes one head and a group of tokens and goes through the tile's
+        // rows kAttendRows at a time, so a chunk of that head's keys and
+        // values (80 KiB on DeepSeek-V2-Lite) is read from L2 once for the
+        // whole group and reused from L1 by each block of kScoreQueries
+        // tokens. Each token still sees its rows in ascending order, and its
+        // block-mates (a last short block repeats its last token, computed,
+        // not used) change no bit of it.
+        const auto block = static_cast<size_t>(kScoreQueries);
+        size_t group = kAttendTokens;  // fewer tokens per task when there are too few tasks for the threads
+        while (group > block && heads * ((un + group - 1) / group) <
+                                    static_cast<size_t>(pool.max_threads()) * ThreadPool::kChunksPerThread) {
+            group /= 2;
+        }
+        const size_t groups = (un + group - 1) / group;
+        pool.parallel_for(static_cast<int64_t>(groups * heads), [&](int64_t a, int64_t b) {
+            thread_local std::vector<float> scores;                    // [token of the group][row]
+            thread_local std::vector<std::array<std::pair<size_t, size_t>, 2>> ranges;  // per token: sinks, [first, pos]
+            scores.resize(group * urows);
+            ranges.resize(group);
             for (int64_t task = a; task < b; ++task) {
-                const auto ut = static_cast<size_t>(task);
-                const size_t t = ut / heads;
-                const size_t h = ut % heads;
+                const size_t h = static_cast<size_t>(task) % heads;
+                const size_t g0 = static_cast<size_t>(task) / heads * group;
                 if (head_mask != nullptr && head_mask[h] == 0) continue;  // pruned head: contributes nothing
-                const int32_t pos = n_past_ + static_cast<int32_t>(t);
-                const Seen s = seen_by(*kv_, pos, L.window);
-                // Rows are ascending: the sinks, then [first, pos], as index ranges.
-                auto index = [&](int32_t p) {
-                    return static_cast<size_t>(std::lower_bound(mla_rows_.begin(), mla_rows_.end(), p) -
+                const size_t count = std::min(group, un - g0);
+                auto index = [&](int32_t pos) {
+                    return static_cast<size_t>(std::lower_bound(mla_rows_.begin(), mla_rows_.end(), pos) -
                                                mla_rows_.begin());
                 };
-                const std::pair<size_t, size_t> ranges[2] = {{index(s.sink_begin), index(s.sink_end)},
-                                                             {index(std::max(s.first, s.sink_end)), index(pos + 1)}};
-                const float* q = mla_q_.data() + ut * qk;
-                float tile_max = -INFINITY;
-                for (const auto& [i0, i1] : ranges) {
-                    for (size_t i = i0; i < i1; ++i) {
-                        float sc = quant::dot_f32(q, mla_ex_.data() + i * row + h * qk, static_cast<int64_t>(qk)) * scale;
-                        if (softcap > 0.0f) sc = softcap * std::tanh(sc / softcap);
-                        scores[i] = sc;
-                        tile_max = std::max(tile_max, sc);
+                // Each token's visible rows, as index ranges into the ascending mla_rows_.
+                size_t lo = urows, hi = 0;
+                for (size_t j = 0; j < count; ++j) {
+                    const int32_t pos = n_past_ + static_cast<int32_t>(g0 + j);
+                    const Seen s = seen_by(*kv_, pos, L.window);
+                    ranges[j][0] = {index(s.sink_begin), index(s.sink_end)};
+                    ranges[j][1] = {index(std::max(s.first, s.sink_end)), index(pos + 1)};
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        if (i0 >= i1) continue;
+                        lo = std::min(lo, i0);
+                        hi = std::max(hi, i1);
                     }
                 }
-                if (tile_max == -INFINITY) continue;  // nothing visible in this tile
-                float& mx = mla_max_[ut];
-                float& sum = mla_sum_[ut];
-                float* o = att_.data() + ut * vd;
-                const float next = std::max(mx, tile_max);
-                if (next != mx) {  // rescale what earlier tiles added (nothing yet: 0 x 0)
-                    const float f = std::exp(mx - next);
-                    sum *= f;
-                    for (size_t d = 0; d < vd; ++d) o[d] *= f;
-                    mx = next;
+                if (lo >= hi) continue;  // the group sees nothing in this tile
+                auto token = [&](size_t j0, size_t j) { return std::min(j0 + j, count - 1); };  // a short block's padding
+                // Scores of every token of the group over [lo, hi), by chunks of rows.
+                for (size_t c0 = lo; c0 < hi; c0 += kAttendRows) {
+                    const size_t c1 = std::min(hi, c0 + kAttendRows);
+                    for (size_t j0 = 0; j0 < count; j0 += block) {
+                        const float* q[kScoreQueries];
+                        for (size_t j = 0; j < block; ++j) q[j] = mla_q_.data() + ((g0 + token(j0, j)) * heads + h) * qk;
+                        for (size_t i = c0; i < c1; i += kScoreKeys) {
+                            const float* k[kScoreKeys];
+                            for (size_t r = 0; r < static_cast<size_t>(kScoreKeys); ++r) {
+                                k[r] = mla_ex_.data() + std::min(i + r, c1 - 1) * row + h * qk;
+                            }
+                            float dots[kScoreQueries][kScoreKeys];
+                            score_block(q, k, qk, dots);
+                            for (size_t j = 0; j < block && j0 + j < count; ++j) {
+                                for (size_t r = 0; r < static_cast<size_t>(kScoreKeys) && i + r < c1; ++r) {
+                                    float sc = dots[j][r] * scale;
+                                    if (softcap > 0.0f) sc = softcap * std::tanh(sc / softcap);
+                                    scores[(j0 + j) * urows + i + r] = sc;
+                                }
+                            }
+                        }
+                    }
                 }
-                for (const auto& [i0, i1] : ranges) {
-                    for (size_t i = i0; i < i1; ++i) {
-                        const float p = std::exp(scores[i] - next);
-                        sum += p;
-                        const float* v = mla_ex_.data() + i * row + heads * qk + h * vd;
-                        for (size_t d = 0; d < vd; ++d) o[d] += p * v[d];
+                // Per token: the tile's maximum, earlier tiles rescaled to it,
+                // weights exp(score - maximum) in place of the scores, their sum.
+                for (size_t j = 0; j < count; ++j) {
+                    const size_t ut = (g0 + j) * heads + h;
+                    float* o = att_.data() + ut * vd;
+                    float* sc = scores.data() + j * urows;
+                    float tile_max = -INFINITY;
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        for (size_t i = i0; i < i1; ++i) tile_max = std::max(tile_max, sc[i]);
+                    }
+                    if (tile_max == -INFINITY) continue;  // nothing visible in this tile
+                    float& mx = mla_max_[ut];
+                    float& sum = mla_sum_[ut];
+                    const float next = std::max(mx, tile_max);
+                    if (next != mx) {  // rescale what earlier tiles added (nothing yet: 0 x 0)
+                        const float f = std::exp(mx - next);
+                        sum *= f;
+                        for (size_t d = 0; d < vd; ++d) o[d] *= f;
+                        mx = next;
+                    }
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        for (size_t i = i0; i < i1; ++i) sum += sc[i] = std::exp(sc[i] - next);
+                    }
+                }
+                // Weighted values, by the same chunks of rows: per block, the
+                // rows all of its tokens see go through together, the others per
+                // token before and after them (rows ascending for every token).
+                const float* values = mla_ex_.data() + heads * qk + h * vd;
+                for (size_t c0 = lo; c0 < hi; c0 += kAttendRows) {
+                    const size_t c1 = std::min(hi, c0 + kAttendRows);
+                    auto clip = [&](size_t i0, size_t i1) {
+                        return std::pair<size_t, size_t>{std::clamp(i0, c0, c1), std::clamp(i1, c0, c1)};
+                    };
+                    for (size_t j0 = 0; j0 < count; j0 += block) {
+                        float* o[kScoreQueries];
+                        const float* w[kScoreQueries];
+                        const size_t in_block = std::min(block, count - j0);
+                        size_t common0 = 0, common1 = 0;  // rows every token of the block sees, if no sinks
+                        bool together = in_block == block;
+                        for (size_t j = 0; j < in_block; ++j) {
+                            o[j] = att_.data() + ((g0 + j0 + j) * heads + h) * vd;
+                            w[j] = scores.data() + (j0 + j) * urows;
+                            const auto& rg = ranges[j0 + j];
+                            together = together && rg[0].first >= rg[0].second;
+                            common0 = j == 0 ? rg[1].first : std::max(common0, rg[1].first);
+                            common1 = j == 0 ? rg[1].second : std::min(common1, rg[1].second);
+                        }
+                        const auto [m0, m1] = clip(common0, common1);
+                        if (together && m0 < m1) {
+                            for (size_t j = 0; j < block; ++j) {
+                                const auto [b0, b1] = clip(ranges[j0 + j][1].first, common0);
+                                weigh_values<1>(&o[j], &w[j], values, row, b0, b1, vd);
+                            }
+                            weigh_values<kScoreQueries>(o, w, values, row, m0, m1, vd);
+                            for (size_t j = 0; j < block; ++j) {
+                                const auto [e0, e1] = clip(common1, ranges[j0 + j][1].second);
+                                weigh_values<1>(&o[j], &w[j], values, row, e0, e1, vd);
+                            }
+                        } else {
+                            for (size_t j = 0; j < in_block; ++j) {
+                                for (const auto& [i0, i1] : ranges[j0 + j]) {
+                                    const auto [r0, r1] = clip(i0, i1);
+                                    weigh_values<1>(&o[j], &w[j], values, row, r0, r1, vd);
+                                }
+                            }
+                        }
                     }
                 }
             }
