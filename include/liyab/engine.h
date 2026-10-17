@@ -35,6 +35,14 @@ struct ExperimentalConfig {
     std::string kv_dedup_dir;             // non-empty: persistent prefix KV cache in this directory
 };
 
+// How a model with multi-head latent attention (DeepSeek-V2/V3 and models
+// converted to their architecture) attends; see EngineConfig::latent_form.
+enum class LatentAttentionForm : int32_t {
+    Auto = 0,      // per pass, by its batch and context against a threshold measured once per device; decoding absorbed
+    Absorbed = 1,  // always over the cached latents with absorbed queries
+    Expanded = 2,  // every pass of two tokens or more over per-head keys and values expanded from the latents
+};
+
 struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
     std::string draft_model_path;     // optional: enables speculative decoding
@@ -162,6 +170,18 @@ struct EngineConfig {
     // 0.9995 with transformers' embeddings and moved scores by up to 0.004,
     // against 0.9999997 and 0.00006 with F16 (README, Embeddings and reranking).
     KvCacheType pooling_kv_cache_type = KvCacheType::F16;
+    // Latent attention only (ignored by other models): the form prefill
+    // passes attend in. Both forms compute the same function over the same
+    // cache of latents and round differently. Auto times the two forms once
+    // per model and device at load (0.18 s on a 2B model), keeps the
+    // result in cache_dir (in memory for the process without one; measured
+    // again when the file is missing or damaged) and then picks each pass's
+    // form from its batch size and context alone: the same prompt gives the
+    // same bits on that device in every run, whatever the load; another
+    // device may pick otherwise and round differently. Absorbed or Expanded
+    // give the same bits on every device of a kernel set. Decoding steps are
+    // always absorbed.
+    LatentAttentionForm latent_form = LatentAttentionForm::Auto;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated

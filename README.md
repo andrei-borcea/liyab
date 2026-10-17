@@ -115,7 +115,7 @@ These rules decide what goes into the code:
 | CPU backend on x86-64: AVX2 + FMA + F16C kernels chosen at run time by CPUID, scalar fallback in the same binary | 🟡 tested under Rosetta 2 only |
 | Windows x64 port of the engine, `liyab-cli`, the tests and tools: file mapping, unbuffered direct reads, processor groups and hybrid cores, UTF-8 paths and console; MSVC or clang-cl | 🟡 written, not yet compiled or run on Windows ([Windows](#windows-x64)) |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
-| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention | ✅ |
+| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
@@ -380,13 +380,39 @@ What the port does differently from the POSIX platforms:
   * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with one expert group, and the models converted to
     their architecture, such as Youtu-LLM-2B): multi-head latent attention, queries from one projection or a
     low-rank pair with its norm, dense FFNs in the leading blocks and MoE with shared experts in the others (from
-    the tensors), YaRN with its log multiplier. Attention runs in the absorbed form: each head's query is projected
-    onto the latent once (`attn_k_b`), so all heads attend over one cached row per position and block,
-    `[k_pe | latent]` (576 values on DeepSeek-V2-Lite instead of the 5,120 of per-head keys and values), whose
-    latent channels are the values; the weighted latent is then expanded per head (`attn_v_b`). Queries are scaled
-    for the per-head width the model was trained with (1/√192 there). Key scaling covers the latent too and
-    multiplies the attention output back. Files converted before `attn_kv_b` was split into `attn_k_b` and
-    `attn_v_b` are refused with a request to convert them again, and so is group-limited expert routing
+    the tensors), YaRN with its log multiplier. The cache holds one row per position and block, `[k_pe | latent]`
+    (576 values on DeepSeek-V2-Lite instead of the 5,120 of per-head keys and values), whose latent channels are the
+    values. Attention reads it in one of two forms, chosen per forward pass:
+    * absorbed (always for decoding): each head's query is projected onto the latent once (`attn_k_b`), so all
+      heads attend over the cached rows themselves; the weighted latent is then expanded per head (`attn_v_b`). Per
+      position and head that scores 576 channels and accumulates 512;
+    * expanded (prefill batches): per-head keys `[W_kb c | k_pe]` and values `W_vb c` are expanded from the cached
+      latents of the positions the batch sees, a tile of at most 256 positions at a time (5 MiB on
+      DeepSeek-V2-Lite, plus 8 MiB of the decoded `attn_k_b` and `attn_v_b` of the block being run; never the
+      whole context: the cache keeps latents only), and the batch attends over them: 192 channels scored and 128
+      accumulated per position and head, for the cost of expanding each position once per pass instead of
+      projecting each token's query. Tiles have absolute bounds and are merged in order, so a token's result is the
+      same however its prompt was split into passes and however many threads run.
+
+    The form is chosen from measured cost, measured once: each form's work is counted per pass from its batch size
+    and context, and the ratio of what a multiply-add costs in each form on this device sets the threshold, so it is
+    the device's own instead of a constant. The engine times both forms of one block on a synthetic pass at load
+    (256 tokens after 768 cached positions, best of 3 each; 0.18 s on Youtu-LLM-2B on the Mac, ratio 0.595), rounds
+    the ratio to 1/8 octave and keeps it in `EngineConfig::cache_dir` next to the key scales (measured again when
+    the file is missing or damaged; without a `cache_dir`, kept in memory for the process only, and two processes
+    may measure a step apart: 0.595 and 0.648 in three runs there). It is never re-measured on
+    the fly: from then on a pass's form follows from its shape alone, so the same prompt gives the same bits on that
+    device in every run, whatever else loads it. Another device (or another kernel set) may set another threshold
+    and round a long prompt differently. The engine prefills these models in passes of 512 tokens (64 for other models, 1,024 with streamed
+    experts): a pass of 64 tokens deep in a context does not repay expanding every position it sees, and stays
+    absorbed. Both forms compute the same function and round differently: outputs are not bit-identical across
+    forms (each form on its own is, and `test_golden` pins both); against transformers both give a mean KL of
+    0.00000 with an F16 cache, and the expanded form is the closer with a Q8_0 one ([Correctness](#correctness)).
+    `TransformerOptions::latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled for the
+    per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the absorbed form
+    multiplies the attention output back, the expanded one the latents before it expands them. Files converted
+    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
+    and so is group-limited expert routing
     (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
@@ -942,7 +968,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 * the backend, threads and power profile;
 * the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
-* `cache_dir`, where what is measured once per model is kept (the KV cache's key scales);
+* `cache_dir`, where what is measured once per model is kept (the KV cache's key scales, and latent attention's
+  form ratio);
 * KV type, sliding window and sinks, and the KV type of pooling models (`pooling_kv_cache_type`, F16 by default);
 * speculative decoding (draft model, lookup or suffix drafts);
 * the MoE trade-offs;
@@ -1445,6 +1472,23 @@ decoding are the practical routes to interactive speeds.
 Models that fit use the GPU's repacked-copy path, where some formats fall back to the CPU. Streamed models use the
 native kernels instead.
 
+### Latent attention prefill (Mac)
+
+Youtu-LLM-2B (`deepseek2`, Q8_0 weights and KV cache) prefilling synthetic token ids on the Mac's CPU (10 threads,
+`liyab-bench --prefill`), each setting run twice, alternated, while another job kept 8 cores busy, in tokens per
+second:
+
+| Prompt | Absorbed, passes of 64 (before) | Absorbed, passes of 512 | Expanded, passes of 512 | Automatic, passes of 512 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 tokens | 111 / 114 | 129 / 129 | 149 / 153 | 149 / 148 |
+| 2,048 tokens | 80 / 80 | 90 / 92 | 120 / 120 | 119 / 123 |
+| 8,192 tokens | 40 / 37 | 58 | 74 / 63 | 101 |
+
+The automatic form chose the expanded one for every pass of 512 tokens. At 8,192 tokens the load moved the runs the
+most; on a quieter machine the same prompt ran at 57.6 tok/s in passes of 64 (absorbed) and 121.3 in passes of 512
+(expanded), 2.1 times faster. In passes of 64 the expanded form is no faster (2,048 tokens: 70 / 68 tok/s), which is
+why the engine prefills latent-attention models in passes of 512. Decoding is absorbed in every case and unchanged.
+
 ### Storage and kernels
 
 | Direct reads from UFS 4 | Throughput |
@@ -1514,6 +1558,7 @@ cache the forward passes agree:
 | Youtu-LLM-2B (`deepseek2`: latent attention, low-rank queries; BF16 converted from the Hugging Face weights) | 512 | 0.00000 | 100.00% |
 | SmolLM2-360M-Instruct (`llama`, `smollm` pre-tokenizer; bartowski f16) | 512 | 0.00000 | 100.00% |
 | ERNIE-4.5-0.3B-PT (`ernie4_5`; unsloth F16, its tokenizer keys fixed) | 512 | 0.00000 | 100.00% |
+| Youtu-LLM-2B, latent attention in the expanded form (passes of 512 tokens) | 512 | 0.00000 | 99.80% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
 
@@ -1537,6 +1582,26 @@ positions; weights drawn wide, so attention and outputs are sharp and a wrong pa
 * DeepSeek-V3's structure with one expert group (low-rank queries, sigmoid scores with a selection bias,
   renormalized top-3 scaled by 2.5, one shared expert): median KL 0.00001, top-1 99.80%; the mean, 0.0037, is one
   position whose expert choice flipped at a near-tie.
+
+**Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
+the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
+for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B
+on the reference's ids, and a new random model with DeepSeek-V2-Lite's structure built by transformers' DeepSeek-V2
+code at V2-Lite's attention widths, 16 heads, a 512-wide latent, keys of 128 + 64 and values of 128, converted to
+F32), 511 positions:
+
+| Model, KV cache | Absorbed: mean KL / top-1 | Expanded: mean KL / top-1 |
+| :--- | ---: | ---: |
+| Youtu-LLM-2B (BF16), F16 | 0.00000 / 100.00% | 0.00000 / 99.80% |
+| Youtu-LLM-2B (BF16), Q8_0 without key scaling (its calibration text cannot be encoded yet) | 0.00115 / 97.26% | 0.00098 / 98.43% |
+| random V2-Lite structure (F32), F16 | 0.00000 / 99.02% | 0.00000 / 99.02% |
+| random V2-Lite structure (F32), Q8_0 with key scaling | 0.00308 / 67.51% | 0.00186 / 74.76% |
+
+With an F16 cache the forms are indistinguishable at this precision (on the random model, the expanded form against
+the absorbed one: KL 0.00000, top-1 99.61%, the rest near-ties of a random model's flat distributions). With a Q8_0
+cache the expanded form is the closer of the two: the absorbed form rounds each 576-wide absorbed query to Q8_0 to
+score it against the cache, the expanded one scores in float against the decoded latents. Passes of 64 or 512 tokens
+give the same expanded figures, as they must.
 
 **Tokenizers against Hugging Face.** `liyab-tok` compared Liyab's ids with those of each model's own
 `tokenizer.json`, run by the Hugging Face `tokenizers` library (`tools/tokenizer_reference.py`), on three texts:
@@ -1683,8 +1748,8 @@ interpreter: `describe_model_registry`.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
-| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier) |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts and in every `latent_form`; its expanded form vs the absorbed form and the reference, the same bits for every split into passes and thread count over several tiles of expanded rows (F16, Q8_0 with key scaling, a sliding window with sinks), no further from an F16 cache than the absorbed form, absorbed decoding after an expanded prefill; the automatic form's work counts and threshold, calibrated once and then the same forms and bits while other threads load every core, the ratio kept in `cache_dir` (engines give the same sampled reply, models given the kept ratio the same logits bit for bit; damaged files measured again; in memory without a `cache_dir`); hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
+| `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier, each in the absorbed and the expanded form, the expanded one also with a sliding window and sinks) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory |
@@ -1696,12 +1761,18 @@ interpreter: `describe_model_registry`.
 Benchmarks and tools built with the tests:
 
 * `liyab-bench`: CPU matvec throughput on a MoE's decode shapes, against the RAM read ceiling. It prints the kernel
-  set first; on x86-64, `LIYAB_KERNELS=scalar` runs the same cases on the scalar kernels.
+  set first; on x86-64, `LIYAB_KERNELS=scalar` runs the same cases on the scalar kernels. `--prefill model.gguf`
+  times a model's prefill instead: prompts of each `--tokens` length (synthetic token ids) in passes of `--batch`
+  tokens on the CPU, best of `--repeat` runs; `--latent-form auto|absorbed|expanded` sets how a latent-attention
+  model attends (auto measures its ratio first, as the engine does at load, and prints it), and the line reports
+  the passes each form took.
 * `liyab-kl`: teacher-forced next-token distributions compared against a reference, for two uses.
   * **The price of a lossy option.** It saves the distributions from the lossless path, then reports KL divergence,
     top-1 agreement and perplexity for a lossy run. The two runs are separate processes, so a model that fills the
     RAM fits once. A quantized KV cache stores keys scaled, as the engine does; `--no-key-scaling` stores them
-    as computed, to measure what the scaling saves.
+    as computed, to measure what the scaling saves. `--batch N` sets the tokens per pass (64), and
+    `--latent-form absorbed|expanded` pins how a latent-attention model attends, to measure one form against the
+    other.
   * **Conformance with another implementation.** `tools/conform_reference.py` writes the same reference from
     Hugging Face transformers (needs `torch` and `transformers`). The comparison first checks that the text encodes
     into the same token ids, printing the first difference, then measures the forward pass; `--max-kl` and
@@ -1873,8 +1944,7 @@ Implemented features are described above. These are next, in order:
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
    Youtu-LLM). A model's row is established from its Hugging Face implementation and a GGUF and verified by the
    conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
-   * group-limited expert routing (DeepSeek-V3), and attention in the expanded form for long prefills of latent
-     attention;
+   * group-limited expert routing (DeepSeek-V3);
    * per-block KV caches, so blocks with a sliding window keep only their window's rows;
    * later, multimodal and classification models, and encoder-only embedding models (BERT, XLM-R: bidirectional
      attention, learned positions, LayerNorm with bias, WordPiece and Unigram vocabularies).
@@ -1950,10 +2020,10 @@ Implemented features are described above. These are next, in order:
   its keys unscaled (the key scales are measured on a text it cannot encode).
   `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see
   [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
-* **Latent attention** attends in the absorbed form also during prefill: per position and head it scores 576
-  channels and accumulates 512 on DeepSeek-V2-Lite where expanded keys and values would take 192 and 128, so a long
-  prompt costs more attention work than an expanded form would (the decode step, which reads the cache, is what
-  the absorbed form saves).
+* **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long
+  prompt's attention differently (each repeats its own bits run after run); `latent_form` pins one form when the
+  bits must match across devices (not exposed through the C ABI and `liyab-cli` yet). A new measurement takes
+  removing its file from `cache_dir`. The expanded form runs on the CPU.
 * **YaRN:** a file can state only one of the reference's two mscales (`yarn_log_multiplier`); when it does, they are
   taken as equal, as on every DeepSeek model so far.
 * **Gemma 2 and 3:** the windowed blocks' keys stay in the cache for the whole context (the pages are shared by every

@@ -1,11 +1,13 @@
 #include "core/transformer.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <istream>
 #include <numbers>
 #include <ostream>
+#include <random>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -156,8 +158,218 @@ TensorView expert_slice(const TensorView& t, int64_t e) {
     return v;
 }
 
+// Positions a query at `pos` of a block with `window` (0: none) sees through
+// the cache: [sink_begin, sink_end) ∪ [first, pos].
+struct Seen {
+    int32_t sink_begin, sink_end, first;
+};
+Seen seen_by(const KvCache& kv, int32_t pos, int32_t window) {
+    const KvCache::Visible vis = kv.visible(pos);
+    Seen s{0, vis.sink_end, vis.first};
+    if (window > 0) {
+        const int32_t lo = pos - window + 1;
+        s.first = std::max(s.first, lo);
+        s.sink_begin = std::clamp(lo, 0, s.sink_end);
+    }
+    return s;
+}
+
+// Latent attention's expanded form, the GEMM that expands cached latents
+// into per-head keys and values: columns are taken kExpandColumns at a time
+// from weights packed per column tile ([tile][kv_rank][kExpandColumns]), so
+// one tile's strip (kv_rank x 16 floats, 32 KiB on DeepSeek-V2-Lite) stays in
+// L1 while every latent row passes through it, and kExpandRows rows share
+// each strip load. Each output is one float sum over the latent channels in
+// ascending order, from zero, whatever the rows around it: the vector lanes
+// run separate columns, never parts of one sum, so the bits of a position's
+// keys and values do not depend on how many positions a pass expands.
+constexpr int32_t kExpandColumns = 16;
+constexpr int32_t kExpandRows = 4;
+
+// Rows [0, m) of `a` (m x k, row-major) times the strip `wp` (k x
+// kExpandColumns): row j's column c lands at out[j * out_stride + offset[c]]
+// for the `columns` (<= kExpandColumns) columns that exist.
+void expand_strip(const float* a, int64_t m, int64_t k, const float* wp, float* out, size_t out_stride,
+                  const size_t* offset, int32_t columns) {
+    for (int64_t j0 = 0; j0 < m; j0 += kExpandRows) {
+        // A last block of fewer rows repeats the last one (computed, not stored).
+        const float* rows[kExpandRows];
+        for (int64_t i = 0; i < kExpandRows; ++i) rows[i] = a + std::min(j0 + i, m - 1) * k;
+        float acc[kExpandRows][kExpandColumns] = {};
+        for (int64_t r = 0; r < k; ++r) {
+            const float* w = wp + r * kExpandColumns;
+            for (int32_t i = 0; i < kExpandRows; ++i) {
+                const float x = rows[i][r];
+                for (int32_t c = 0; c < kExpandColumns; ++c) acc[i][c] += x * w[c];
+            }
+        }
+        const int64_t stored = std::min<int64_t>(kExpandRows, m - j0);
+        for (int64_t i = 0; i < stored; ++i) {
+            float* dst = out + static_cast<size_t>(j0 + i) * out_stride;
+            for (int32_t c = 0; c < columns; ++c) dst[offset[c]] = acc[i][c];
+        }
+    }
+}
+
+// The expanded form's attention kernels. Each score is one dot product over
+// kScoreLanes interleaved partial sums reduced in a fixed tree, and each
+// weighted value one multiply-add chain over the positions in ascending
+// order, whatever the queries and rows computed alongside: blocks of
+// kScoreQueries tokens and kScoreKeys rows share every load, and a token's
+// bits do not depend on which tokens share its block.
+constexpr int32_t kScoreQueries = 4;
+constexpr int32_t kScoreKeys = 2;
+constexpr int32_t kScoreLanes = 8;
+constexpr int32_t kValueColumns = 16;
+// A task attends kAttendTokens tokens of one head (fewer when the pass has
+// too few tasks for the threads), kAttendRows rows of keys and values at a time.
+constexpr size_t kAttendTokens = 32;
+constexpr size_t kAttendRows = 64;
+
+// out[t][r] = q[t] . k[r] over n channels, for kScoreQueries queries and kScoreKeys rows.
+void score_block(const float* const* q, const float* const* k, size_t n, float (*out)[kScoreKeys]) {
+#if defined(__ARM_NEON)
+    // The same sums as the portable loop below, lanes 0-3 and 4-7 in two
+    // vectors (compilers leave the portable loop scalar: 64 accumulators).
+    if (n % kScoreLanes == 0) {
+        float32x4_t lo[kScoreQueries][kScoreKeys], hi[kScoreQueries][kScoreKeys];
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) lo[t][r] = hi[t][r] = vdupq_n_f32(0.0f);
+        }
+        for (size_t i = 0; i < n; i += kScoreLanes) {
+            float32x4_t k_lo[kScoreKeys], k_hi[kScoreKeys];
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                k_lo[r] = vld1q_f32(k[r] + i);
+                k_hi[r] = vld1q_f32(k[r] + i + 4);
+            }
+            for (int32_t t = 0; t < kScoreQueries; ++t) {
+                const float32x4_t q_lo = vld1q_f32(q[t] + i);
+                const float32x4_t q_hi = vld1q_f32(q[t] + i + 4);
+                for (int32_t r = 0; r < kScoreKeys; ++r) {
+                    lo[t][r] = vfmaq_f32(lo[t][r], q_lo, k_lo[r]);
+                    hi[t][r] = vfmaq_f32(hi[t][r], q_hi, k_hi[r]);
+                }
+            }
+        }
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                const float32x4_t s = vaddq_f32(lo[t][r], hi[t][r]);  // a[l] + a[l + 4]
+                out[t][r] = (vgetq_lane_f32(s, 0) + vgetq_lane_f32(s, 1)) + (vgetq_lane_f32(s, 2) + vgetq_lane_f32(s, 3));
+            }
+        }
+        return;
+    }
+#endif
+    float acc[kScoreQueries][kScoreKeys][kScoreLanes] = {};
+    size_t i = 0;
+    for (; i + kScoreLanes <= n; i += kScoreLanes) {
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) {
+                for (int32_t l = 0; l < kScoreLanes; ++l) acc[t][r][l] += q[t][i + l] * k[r][i + l];
+            }
+        }
+    }
+    for (int32_t l = 0; i < n; ++i, ++l) {
+        for (int32_t t = 0; t < kScoreQueries; ++t) {
+            for (int32_t r = 0; r < kScoreKeys; ++r) acc[t][r][l] += q[t][i] * k[r][i];
+        }
+    }
+    for (int32_t t = 0; t < kScoreQueries; ++t) {
+        for (int32_t r = 0; r < kScoreKeys; ++r) {
+            const float* a = acc[t][r];
+            out[t][r] = ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]));
+        }
+    }
+}
+
+// o[t][d] += sum over rows i in [a, b) of p[t][i] * v[i * stride + d], d in
+// [0, width), for T tokens: kValueColumns columns of every token held in
+// registers while the rows go by.
+template <int32_t T>
+void weigh_values(float* const* o, const float* const* p, const float* v, size_t stride, size_t a, size_t b,
+                  size_t width) {
+    if (a >= b) return;
+#if defined(__ARM_NEON)
+    // The same multiply-adds as the portable loop below, in vectors (which
+    // compilers do not reliably make of it).
+    if (width % kValueColumns == 0) {
+        for (size_t d0 = 0; d0 < width; d0 += kValueColumns) {
+            float32x4_t acc[T][4];
+            for (int32_t t = 0; t < T; ++t) {
+                for (int32_t c = 0; c < 4; ++c) acc[t][c] = vld1q_f32(o[t] + d0 + 4 * c);
+            }
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                const float32x4_t r0 = vld1q_f32(row), r1 = vld1q_f32(row + 4);
+                const float32x4_t r2 = vld1q_f32(row + 8), r3 = vld1q_f32(row + 12);
+                for (int32_t t = 0; t < T; ++t) {
+                    const float32x4_t pi = vdupq_n_f32(p[t][i]);
+                    acc[t][0] = vfmaq_f32(acc[t][0], pi, r0);
+                    acc[t][1] = vfmaq_f32(acc[t][1], pi, r1);
+                    acc[t][2] = vfmaq_f32(acc[t][2], pi, r2);
+                    acc[t][3] = vfmaq_f32(acc[t][3], pi, r3);
+                }
+            }
+            for (int32_t t = 0; t < T; ++t) {
+                for (int32_t c = 0; c < 4; ++c) vst1q_f32(o[t] + d0 + 4 * c, acc[t][c]);
+            }
+        }
+        return;
+    }
+#endif
+    for (size_t d0 = 0; d0 < width; d0 += kValueColumns) {
+        const size_t w = std::min<size_t>(kValueColumns, width - d0);
+        float acc[T][kValueColumns] = {};
+        for (int32_t t = 0; t < T; ++t) std::copy(o[t] + d0, o[t] + d0 + w, acc[t]);
+        if (w == static_cast<size_t>(kValueColumns)) {
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                for (int32_t t = 0; t < T; ++t) {
+                    const float pi = p[t][i];
+                    for (int32_t c = 0; c < kValueColumns; ++c) acc[t][c] += pi * row[c];
+                }
+            }
+        } else {
+            for (size_t i = a; i < b; ++i) {
+                const float* row = v + i * stride + d0;
+                for (int32_t t = 0; t < T; ++t) {
+                    const float pi = p[t][i];
+                    for (size_t c = 0; c < w; ++c) acc[t][c] += pi * row[c];
+                }
+            }
+        }
+        for (int32_t t = 0; t < T; ++t) std::copy(acc[t], acc[t] + w, o[t] + d0);
+    }
+}
+
 
 }  // namespace
+
+LatentFormChooser::Work LatentFormChooser::work(const ModelConfig& c, int64_t n, int64_t visible, int64_t positions) {
+    const LatentAttention& m = c.mla;
+    const auto heads = static_cast<double>(c.n_head);
+    const double project = static_cast<double>(m.kv_rank) * (m.nope_dim + m.v_dim);  // per head: k_b and v_b
+    Work w;
+    w.absorbed = heads * (static_cast<double>(n) * project +
+                          static_cast<double>(visible) * (c.rope_dim + 2.0 * m.kv_rank));
+    w.expanded = heads * (static_cast<double>(positions + 1) * project +
+                          static_cast<double>(visible) * (m.nope_dim + c.rope_dim + m.v_dim));
+    return w;
+}
+
+Status LatentFormChooser::set_ratio(float ratio) noexcept {
+    if (!(ratio >= kMinRatio && ratio <= kMaxRatio)) {
+        return Status(ErrorCode::InvalidArgument, "latent form ratio out of range");
+    }
+    ratio_ = ratio;
+    return Status::ok();
+}
+
+float LatentFormChooser::round_ratio(double measured) noexcept {
+    if (!(measured > 0.0) || !std::isfinite(measured)) return 1.0f;
+    const double steps = std::round(std::log2(measured) * 8.0);
+    return std::clamp(static_cast<float>(std::exp2(steps / 8.0)), kMinRatio, kMaxRatio);
+}
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -176,6 +388,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     model->expert_mass_ = options.expert_mass;
     model->max_experts_ = options.max_experts;
     model->skip_slow_ = options.skip_slow;
+    model->latent_form_ = options.latent_form;
 
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
     const Layer& first = model->layers_[0];
@@ -815,11 +1028,15 @@ void Transformer::set_rollback_window(int32_t positions) {
     }
 }
 void Transformer::rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const {
+    rope(vec, n_heads, static_cast<size_t>(config_.head_dim), pos, table);
+}
+
+void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const {
     const int32_t half = config_.rope_dim / 2;
     const bool halves = config_.spec->rope == RopeLayout::Halves;
     const float p = static_cast<float>(pos) / table.scale;
     for (int32_t h = 0; h < n_heads; ++h) {
-        float* x = vec + static_cast<size_t>(h) * static_cast<size_t>(config_.head_dim);
+        float* x = vec + static_cast<size_t>(h) * stride;
         for (int32_t i = 0; i < half; ++i) {
             const float theta = p * table.inv_freq[static_cast<size_t>(i)];
             const float cs = std::cos(theta) * table.magnitude;  // x 1 keeps the bits
@@ -904,19 +1121,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         return std::clamp(n_visible / kAttentionMinSpan, 1, kAttentionMaxSpans);
     };
     // Positions a query at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
-    struct Seen {
-        int32_t sink_begin, sink_end, first;
-    };
-    auto seen = [&](int32_t pos) {
-        const KvCache::Visible vis = kv_->visible(pos);
-        Seen s{0, vis.sink_end, vis.first};
-        if (window > 0) {
-            const int32_t lo = pos - window + 1;
-            s.first = std::max(s.first, lo);
-            s.sink_begin = std::clamp(lo, 0, s.sink_end);
-        }
-        return s;
-    };
+    auto seen = [&](int32_t pos) { return seen_by(*kv_, pos, window); };
     auto spans_of = [&](int32_t t) {
         const Seen s = seen(n_past_ + t);
         return spans_for(s.sink_end - s.sink_begin + (n_past_ + t - s.first + 1));
@@ -1342,6 +1547,76 @@ Status Transformer::set_key_scales(std::span<const float> scales) {
     return Status::ok();
 }
 
+// One synthetic pass through the first latent block in each form, on its
+// real weights: cached rows of random latents (a fixed seed), random
+// normalized inputs, timed over the parts that differ between the forms
+// (latent_ms_, as in forward()). The ratio of the two forms' time per
+// counted multiply-add is what LatentFormChooser needs; one block suffices
+// because every latent block has the same shape. The best of kRepeats runs
+// per form, alternated, keeps a passing burst of load out of it.
+Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    if (c.mla.kv_rank == 0) return 1.0f;
+    int32_t layer = 0;
+    while (!c.blocks[static_cast<size_t>(layer)].latent) ++layer;
+    constexpr int32_t kContext = 1024, kBatch = 256, kRepeats = 3;
+    const int32_t context = std::min(kContext, context_length_);
+    const int32_t n = std::max(2, std::min(kBatch, context / 2));
+    reset();
+    LIYAB_RETURN_IF_ERROR(kv_->reserve(context));
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto kd = static_cast<size_t>(c.head_dim);
+    std::mt19937 rng(20251017);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> row(kd);
+    for (int32_t pos = 0; pos < context - n; ++pos) {
+        for (float& v : row) v = normal(rng);
+        kv_->store(L.kv_slot, pos, row.data(), nullptr);
+    }
+    n_past_ = context - n;
+    const auto un = static_cast<size_t>(n);
+    const size_t d = static_cast<size_t>(c.n_embd);
+    const size_t q_dim = static_cast<size_t>(c.n_head) * kd;
+    xb_.resize(un * std::max(d, q_dim));
+    q_.resize(un * q_dim);
+    k_.resize(un * kd);
+    att_.resize(un * q_dim);
+    std::vector<float> input(un * d);
+    for (float& v : input) v = normal(rng);
+    for (size_t t = 0; t < un; ++t) rmsnorm(input.data() + t * d, L.attn_norm.data(), input.data() + t * d, c.n_embd, c.rms_eps);
+    const int64_t pairs = latent_visible(n, L.window);
+    int64_t positions = 0;
+    for (const auto& [a, b] : mla_union_) positions += b - a;
+    const LatentFormChooser::Work work = LatentFormChooser::work(c, n, pairs, positions);
+
+    Status status;
+    double best[2] = {INFINITY, INFINITY};  // [absorbed, expanded], ms
+    {
+        const BlockWeights w(*this, layer);
+        status = w.status();
+        for (int32_t r = 0; r < kRepeats && status.is_ok(); ++r) {
+            for (const bool expanded : {false, true}) {
+                std::copy(input.begin(), input.end(), xb_.begin());
+                latent_expanded_ = expanded;
+                latent_ms_ = 0.0;
+                status = latent_attention_mixer(layer, w, n, route, pool, nullptr);
+                if (!status.is_ok()) break;
+                best[expanded ? 1 : 0] = std::min(best[expanded ? 1 : 0], latent_ms_);
+            }
+        }
+    }
+    latent_expanded_ = false;
+    reset();
+    if (!status.is_ok()) return status;
+    const double measured = (best[1] / work.expanded) / (best[0] / work.absorbed);
+    const float ratio = LatentFormChooser::round_ratio(measured);
+    LIYAB_RETURN_IF_ERROR(latent_chooser_.set_ratio(ratio));
+    LIYAB_LOG_INFO("latent attention: an expanded multiply-add costs %.2fx an absorbed one (%.1f / %.1f ms on a "
+                   "%d-token pass after %d positions); ratio %.3f",
+                   measured, best[1], best[0], n, context - n, static_cast<double>(ratio));
+    return ratio;
+}
+
 Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                     ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
@@ -1424,9 +1699,8 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
     const auto heads = static_cast<size_t>(c.n_head);
     const auto rd = static_cast<size_t>(c.rope_dim);
     const auto rank = static_cast<size_t>(m.kv_rank);
-    const auto nope = static_cast<size_t>(m.nope_dim);
-    const size_t qk = nope + rd;                        // a head's query as projected: [q_nope | q_pe]
-    const auto kd = static_cast<size_t>(c.head_dim);    // rd + rank: an absorbed query, a cached key
+    const size_t qk = static_cast<size_t>(m.nope_dim) + rd;  // a head's query as projected: [q_nope | q_pe]
+    const auto kd = static_cast<size_t>(c.head_dim);          // rd + rank: a cached key row
     mla_kv_.resize(un * (rank + rd));
     if (!queries) {
         LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kKvA], xb_.data(), mla_kv_.data(), n));
@@ -1454,7 +1728,19 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
         std::copy(kv + rank, kv + rank + rd, k);
         rmsnorm(kv, L.kv_a_norm.data(), k + rd, m.kv_rank, c.rms_eps);
     }
-    if (!queries) return Status::ok();
+    return Status::ok();
+}
+
+Status Transformer::latent_absorb(const BlockWeights& w, int32_t n, const Route& route) {
+    const ModelConfig& c = config_;
+    const LatentAttention& m = c.mla;
+    const auto un = static_cast<size_t>(n);
+    const auto heads = static_cast<size_t>(c.n_head);
+    const auto rd = static_cast<size_t>(c.rope_dim);
+    const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto nope = static_cast<size_t>(m.nope_dim);
+    const size_t qk = nope + rd;                      // a head's query as projected: [q_nope | q_pe]
+    const auto kd = static_cast<size_t>(c.head_dim);  // rd + rank: an absorbed query, a cached key
     // Each head's query absorbs its key projection: W_kb,h^T q_nope,h is what
     // the latent is scored against. The q_nope of every token are gathered
     // per head so each head is one matmul over the batch.
@@ -1479,8 +1765,320 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
     return Status::ok();
 }
 
+int64_t Transformer::latent_visible(int32_t n, int32_t window) {
+    mla_union_.clear();
+    int64_t pairs = 0;
+    for (int32_t t = 0; t < n; ++t) {
+        const int32_t pos = n_past_ + t;
+        const Seen s = seen_by(*kv_, pos, window);
+        pairs += (s.sink_end - s.sink_begin) + (pos - s.first + 1);
+        if (s.sink_end > s.sink_begin) mla_union_.emplace_back(s.sink_begin, s.sink_end);
+        mla_union_.emplace_back(s.first, pos + 1);
+    }
+    std::sort(mla_union_.begin(), mla_union_.end());
+    size_t kept = 0;
+    for (size_t i = 0; i < mla_union_.size(); ++i) {
+        if (kept > 0 && mla_union_[i].first <= mla_union_[kept - 1].second) {
+            mla_union_[kept - 1].second = std::max(mla_union_[kept - 1].second, mla_union_[i].second);
+        } else {
+            mla_union_[kept++] = mla_union_[i];
+        }
+    }
+    mla_union_.resize(kept);
+    return pairs;
+}
+
+int32_t Transformer::latent_tile() const noexcept {
+    const ModelConfig& c = config_;
+    const auto row = static_cast<int64_t>(c.n_head) * (c.mla.nope_dim + c.rope_dim + c.mla.v_dim) *
+                     static_cast<int64_t>(sizeof(float));
+    int32_t tile = kLatentTileMax;
+    while (tile > kLatentTileMin && tile * row > static_cast<int64_t>(kLatentTileBytes)) tile /= 2;
+    return tile;
+}
+
+// Latent attention in the expanded form, the form the model was trained in:
+// per head h, key [W_kb,h c_j | k_pe,j] and value W_vb,h c_j of every
+// position j the pass sees, scored against [q_nope,h | q_pe,h] with the same
+// scale. Per (token, position, head) that is nope + rope_dim channels scored
+// and v_dim accumulated (192 and 128 on DeepSeek-V2-Lite) where the absorbed
+// form takes rope_dim + kv_rank and kv_rank (576 and 512), for the cost of
+// expanding every position the pass sees once per pass instead of absorbing
+// each of its tokens: long prefills gain, decoding steps lose
+// (LatentFormChooser weighs the two). The cache keeps latents only; expanded
+// rows exist one tile at a time (latent_tile(), about kLatentTileBytes).
+//
+// Positions go by tiles at absolute bounds (multiples of latent_tile()). Per
+// tile, the rows the pass sees are read from the cache (key scales multiplied
+// back: stored rows were divided by them), expanded by one GEMM
+// (expand_strip) into [k_nope | k_pe] and v per head, and every (token, head)
+// folds the tile into its running softmax (maximum, sum, weighted values),
+// tiles in ascending order. A token's result therefore depends only on its
+// position, its query and the cached rows: the same bits however a prompt is
+// split into passes and however many threads run (within this form; the
+// absorbed form rounds differently).
+Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_t n, ThreadPool& pool,
+                                    const uint8_t* head_mask) {
+    const ModelConfig& c = config_;
+    const LatentAttention& m = c.mla;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto heads = static_cast<size_t>(c.n_head);
+    const auto rd = static_cast<size_t>(c.rope_dim);
+    const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto nope = static_cast<size_t>(m.nope_dim);
+    const auto vd = static_cast<size_t>(m.v_dim);
+    const auto kd = static_cast<size_t>(c.head_dim);
+    const size_t qk = nope + rd;            // a head's expanded key (and query): [nope | rope]
+    const size_t row = heads * (qk + vd);   // an expanded row: every head's key, then every head's value
+    const size_t key_cols = heads * nope;   // GEMM columns: W_kb,h's for every head, then W_vb,h's
+    const size_t cols = key_cols + heads * vd;
+    const auto strip = static_cast<size_t>(kExpandColumns);
+    const size_t strips = (cols + strip - 1) / strip;
+
+    // The expansion weights, decoded once per pass and packed per strip:
+    // mla_wp_[s][r][i] is column s * kExpandColumns + i's weight on latent
+    // channel r (zero past the last column). attn_k_b holds per head the
+    // kv_rank rows of nope weights (k_nope = sum over r of c_r row_r),
+    // attn_v_b the v_dim rows of kv_rank weights (v_d = row_d . c).
+    mla_wp_.assign(strips * rank * strip, 0.0f);
+    mla_col_offset_.assign(strips * strip, 0);
+    for (size_t col = 0; col < cols; ++col) {
+        mla_col_offset_[col] = col < key_cols ? col / nope * qk + col % nope : heads * qk + (col - key_cols);
+    }
+    const TensorView& kb = w[kKb];
+    const TensorView& vb = w[kVb];
+    pool.parallel_for(static_cast<int64_t>(heads), [&](int64_t h0, int64_t h1) {
+        thread_local std::vector<float> buf;
+        buf.resize(std::max(nope, rank));
+        for (int64_t h = h0; h < h1; ++h) {
+            const auto uh = static_cast<size_t>(h);
+            const TensorView kh = expert_slice(kb, h);
+            for (size_t r = 0; r < rank; ++r) {
+                quant::dequantize_row(kh.type, kh.row(static_cast<int64_t>(r)), buf.data(), kh.cols());
+                for (size_t i = 0; i < nope; ++i) {
+                    const size_t col = uh * nope + i;
+                    mla_wp_[(col / strip * rank + r) * strip + col % strip] = buf[i];
+                }
+            }
+            const TensorView vh = expert_slice(vb, h);
+            for (size_t d = 0; d < vd; ++d) {
+                quant::dequantize_row(vh.type, vh.row(static_cast<int64_t>(d)), buf.data(), vh.cols());
+                const size_t col = key_cols + uh * vd + d;
+                float* dst = mla_wp_.data() + col / strip * rank * strip + col % strip;
+                for (size_t r = 0; r < rank; ++r) dst[r * strip] = buf[r];
+            }
+        }
+    });
+
+    // Running softmax per (token, head); the weighted values accumulate in
+    // att_ in the [token][head][v] order attn_output reads.
+    mla_max_.assign(un * heads, -INFINITY);
+    mla_sum_.assign(un * heads, 0.0f);
+    std::fill(att_.begin(), att_.begin() + static_cast<std::ptrdiff_t>(un * heads * vd), 0.0f);
+    const float scale = c.attn_scale;
+    const float softcap = c.attn_softcap;
+    const DType kv_type = kv_->dtype();
+    const float* key_scales = key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd;
+    const int32_t tile = latent_tile();
+    latent_visible(n, L.window);
+    const int32_t lo = mla_union_.front().first;
+    const int32_t hi = mla_union_.back().second;
+    for (int32_t t0 = lo / tile * tile; t0 < hi; t0 += tile) {
+        const int32_t t1 = t0 + tile;
+        mla_rows_.clear();  // the tile's positions the pass sees, ascending
+        for (const auto& [a, b] : mla_union_) {
+            for (int32_t p = std::max(a, t0); p < std::min(b, t1); ++p) mla_rows_.push_back(p);
+        }
+        if (mla_rows_.empty()) continue;
+        const auto rows = static_cast<int64_t>(mla_rows_.size());
+        const auto urows = static_cast<size_t>(rows);
+        mla_c_.resize(urows * rank);
+        mla_ex_.resize(urows * row);
+
+        // The cached rows, decoded: the latent into mla_c_, the RoPE key into
+        // every head's key in mla_ex_ (it is shared by the heads).
+        auto decode = [&](int64_t j0, int64_t j1) {
+            thread_local std::vector<float> key;
+            key.resize(kd);
+            for (int64_t j = j0; j < j1; ++j) {
+                const auto uj = static_cast<size_t>(j);
+                const uint8_t* src = kv_->k_row(L.kv_slot, mla_rows_[uj], 0);
+                quant::dequantize_row(kv_type, src, key.data(), static_cast<int64_t>(kd));
+                if (key_scales != nullptr) {
+                    for (size_t i = 0; i < kd; ++i) key[i] *= key_scales[i];
+                }
+                std::copy(key.begin() + static_cast<std::ptrdiff_t>(rd), key.end(), mla_c_.data() + uj * rank);
+                float* ex = mla_ex_.data() + uj * row;
+                for (size_t h = 0; h < heads; ++h) {
+                    std::copy(key.begin(), key.begin() + static_cast<std::ptrdiff_t>(rd), ex + h * qk + nope);
+                }
+            }
+        };
+        if (rows >= 64) {
+            pool.parallel_for(rows, decode);
+        } else {
+            decode(0, rows);
+        }
+        // Keys and values of every head: one strip of columns per task.
+        pool.parallel_for(static_cast<int64_t>(strips), [&](int64_t s0, int64_t s1) {
+            for (int64_t s = s0; s < s1; ++s) {
+                const auto us = static_cast<size_t>(s);
+                const auto columns = static_cast<int32_t>(std::min(strip, cols - us * strip));
+                expand_strip(mla_c_.data(), rows, static_cast<int64_t>(rank), mla_wp_.data() + us * rank * strip,
+                             mla_ex_.data(), row, mla_col_offset_.data() + us * strip, columns);
+            }
+        });
+        // Every (token, head) folds in the tile's positions it sees. A task
+        // takes one head and a group of tokens and goes through the tile's
+        // rows kAttendRows at a time, so a chunk of that head's keys and
+        // values (80 KiB on DeepSeek-V2-Lite) is read from L2 once for the
+        // whole group and reused from L1 by each block of kScoreQueries
+        // tokens. Each token still sees its rows in ascending order, and its
+        // block-mates (a last short block repeats its last token, computed,
+        // not used) change no bit of it.
+        const auto block = static_cast<size_t>(kScoreQueries);
+        size_t group = kAttendTokens;  // fewer tokens per task when there are too few tasks for the threads
+        while (group > block && heads * ((un + group - 1) / group) <
+                                    static_cast<size_t>(pool.max_threads()) * ThreadPool::kChunksPerThread) {
+            group /= 2;
+        }
+        const size_t groups = (un + group - 1) / group;
+        pool.parallel_for(static_cast<int64_t>(groups * heads), [&](int64_t a, int64_t b) {
+            thread_local std::vector<float> scores;                    // [token of the group][row]
+            thread_local std::vector<std::array<std::pair<size_t, size_t>, 2>> ranges;  // per token: sinks, [first, pos]
+            scores.resize(group * urows);
+            ranges.resize(group);
+            for (int64_t task = a; task < b; ++task) {
+                const size_t h = static_cast<size_t>(task) % heads;
+                const size_t g0 = static_cast<size_t>(task) / heads * group;
+                if (head_mask != nullptr && head_mask[h] == 0) continue;  // pruned head: contributes nothing
+                const size_t count = std::min(group, un - g0);
+                auto index = [&](int32_t pos) {
+                    return static_cast<size_t>(std::lower_bound(mla_rows_.begin(), mla_rows_.end(), pos) -
+                                               mla_rows_.begin());
+                };
+                // Each token's visible rows, as index ranges into the ascending mla_rows_.
+                size_t lo = urows, hi = 0;
+                for (size_t j = 0; j < count; ++j) {
+                    const int32_t pos = n_past_ + static_cast<int32_t>(g0 + j);
+                    const Seen s = seen_by(*kv_, pos, L.window);
+                    ranges[j][0] = {index(s.sink_begin), index(s.sink_end)};
+                    ranges[j][1] = {index(std::max(s.first, s.sink_end)), index(pos + 1)};
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        if (i0 >= i1) continue;
+                        lo = std::min(lo, i0);
+                        hi = std::max(hi, i1);
+                    }
+                }
+                if (lo >= hi) continue;  // the group sees nothing in this tile
+                auto token = [&](size_t j0, size_t j) { return std::min(j0 + j, count - 1); };  // a short block's padding
+                // Scores of every token of the group over [lo, hi), by chunks of rows.
+                for (size_t c0 = lo; c0 < hi; c0 += kAttendRows) {
+                    const size_t c1 = std::min(hi, c0 + kAttendRows);
+                    for (size_t j0 = 0; j0 < count; j0 += block) {
+                        const float* q[kScoreQueries];
+                        for (size_t j = 0; j < block; ++j) q[j] = mla_q_.data() + ((g0 + token(j0, j)) * heads + h) * qk;
+                        for (size_t i = c0; i < c1; i += kScoreKeys) {
+                            const float* k[kScoreKeys];
+                            for (size_t r = 0; r < static_cast<size_t>(kScoreKeys); ++r) {
+                                k[r] = mla_ex_.data() + std::min(i + r, c1 - 1) * row + h * qk;
+                            }
+                            float dots[kScoreQueries][kScoreKeys];
+                            score_block(q, k, qk, dots);
+                            for (size_t j = 0; j < block && j0 + j < count; ++j) {
+                                for (size_t r = 0; r < static_cast<size_t>(kScoreKeys) && i + r < c1; ++r) {
+                                    float sc = dots[j][r] * scale;
+                                    if (softcap > 0.0f) sc = softcap * std::tanh(sc / softcap);
+                                    scores[(j0 + j) * urows + i + r] = sc;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Per token: the tile's maximum, earlier tiles rescaled to it,
+                // weights exp(score - maximum) in place of the scores, their sum.
+                for (size_t j = 0; j < count; ++j) {
+                    const size_t ut = (g0 + j) * heads + h;
+                    float* o = att_.data() + ut * vd;
+                    float* sc = scores.data() + j * urows;
+                    float tile_max = -INFINITY;
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        for (size_t i = i0; i < i1; ++i) tile_max = std::max(tile_max, sc[i]);
+                    }
+                    if (tile_max == -INFINITY) continue;  // nothing visible in this tile
+                    float& mx = mla_max_[ut];
+                    float& sum = mla_sum_[ut];
+                    const float next = std::max(mx, tile_max);
+                    if (next != mx) {  // rescale what earlier tiles added (nothing yet: 0 x 0)
+                        const float f = std::exp(mx - next);
+                        sum *= f;
+                        for (size_t d = 0; d < vd; ++d) o[d] *= f;
+                        mx = next;
+                    }
+                    for (const auto& [i0, i1] : ranges[j]) {
+                        for (size_t i = i0; i < i1; ++i) sum += sc[i] = std::exp(sc[i] - next);
+                    }
+                }
+                // Weighted values, by the same chunks of rows: per block, the
+                // rows all of its tokens see go through together, the others per
+                // token before and after them (rows ascending for every token).
+                const float* values = mla_ex_.data() + heads * qk + h * vd;
+                for (size_t c0 = lo; c0 < hi; c0 += kAttendRows) {
+                    const size_t c1 = std::min(hi, c0 + kAttendRows);
+                    auto clip = [&](size_t i0, size_t i1) {
+                        return std::pair<size_t, size_t>{std::clamp(i0, c0, c1), std::clamp(i1, c0, c1)};
+                    };
+                    for (size_t j0 = 0; j0 < count; j0 += block) {
+                        float* o[kScoreQueries];
+                        const float* w[kScoreQueries];
+                        const size_t in_block = std::min(block, count - j0);
+                        size_t common0 = 0, common1 = 0;  // rows every token of the block sees, if no sinks
+                        bool together = in_block == block;
+                        for (size_t j = 0; j < in_block; ++j) {
+                            o[j] = att_.data() + ((g0 + j0 + j) * heads + h) * vd;
+                            w[j] = scores.data() + (j0 + j) * urows;
+                            const auto& rg = ranges[j0 + j];
+                            together = together && rg[0].first >= rg[0].second;
+                            common0 = j == 0 ? rg[1].first : std::max(common0, rg[1].first);
+                            common1 = j == 0 ? rg[1].second : std::min(common1, rg[1].second);
+                        }
+                        const auto [m0, m1] = clip(common0, common1);
+                        if (together && m0 < m1) {
+                            for (size_t j = 0; j < block; ++j) {
+                                const auto [b0, b1] = clip(ranges[j0 + j][1].first, common0);
+                                weigh_values<1>(&o[j], &w[j], values, row, b0, b1, vd);
+                            }
+                            weigh_values<kScoreQueries>(o, w, values, row, m0, m1, vd);
+                            for (size_t j = 0; j < block; ++j) {
+                                const auto [e0, e1] = clip(common1, ranges[j0 + j][1].second);
+                                weigh_values<1>(&o[j], &w[j], values, row, e0, e1, vd);
+                            }
+                        } else {
+                            for (size_t j = 0; j < in_block; ++j) {
+                                for (const auto& [i0, i1] : ranges[j0 + j]) {
+                                    const auto [r0, r1] = clip(i0, i1);
+                                    weigh_values<1>(&o[j], &w[j], values, row, r0, r1, vd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    for (size_t i = 0; i < un * heads; ++i) {
+        if (mla_sum_[i] == 0.0f) continue;  // a pruned head stays zero
+        const float inv = 1.0f / mla_sum_[i];
+        float* o = att_.data() + i * vd;
+        for (size_t d = 0; d < vd; ++d) o[d] *= inv;
+    }
+    return Status::ok();
+}
+
 Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                            ThreadPool& pool, const uint8_t* head_mask) {
+    using Clock = std::chrono::steady_clock;
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const LatentAttention& m = c.mla;
@@ -1488,48 +2086,70 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     const auto heads = static_cast<size_t>(c.n_head);
     const auto rd = static_cast<size_t>(c.rope_dim);
     const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto nope = static_cast<size_t>(m.nope_dim);
     const auto vd = static_cast<size_t>(m.v_dim);
     const auto kd = static_cast<size_t>(c.head_dim);
+    const size_t qk = nope + rd;
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
+    const bool expanded = latent_expanded_;
 
     LIYAB_RETURN_IF_ERROR(latent_project(layer, w, n, route, route.attention, true));
+    auto start = Clock::now();
+    if (!expanded) LIYAB_RETURN_IF_ERROR(latent_absorb(w, n, route));
+    double form_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     for (size_t t = 0; t < un; ++t) {
-        float* q = q_.data() + t * heads * kd;
         float* k = k_.data() + t * kd;
         const int32_t pos = n_past_ + static_cast<int32_t>(t);
-        if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-        rope(q, c.n_head, pos, rope_table);
-        rope(k, 1, pos, rope_table);
-        scale_keys(L.kv_slot, q, k);
+        if (expanded) {
+            // Queries stay [q_nope | q_pe] per head; only q_pe turns. Keys are
+            // stored scaled as in the absorbed form (the cache is shared).
+            rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
+            rope(k, 1, pos, rope_table);
+            scale_keys(L.kv_slot, nullptr, k);
+        } else {
+            float* q = q_.data() + t * heads * kd;
+            if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
+            rope(q, c.n_head, pos, rope_table);
+            rope(k, 1, pos, rope_table);
+            scale_keys(L.kv_slot, q, k);
+        }
         kv_->store(L.kv_slot, pos, k, nullptr);  // the values are this row's latent channels
     }
-    // att_: per token and head, the softmax-weighted latent (value_dim = rank).
-    attention(L.kv_slot, L.window, n, pool, head_mask);
+    start = Clock::now();
+    if (expanded) {
+        LIYAB_RETURN_IF_ERROR(latent_expanded(layer, w, n, pool, head_mask));
+    } else {
+        // att_: per token and head, the softmax-weighted latent (value_dim = rank).
+        attention(L.kv_slot, L.window, n, pool, head_mask);
 
-    // Per head, the weighted latent becomes the head's value: W_vb,h c. Keys
-    // stored with per-channel scales carried their latent divided by them,
-    // so the latent is multiplied back first (exact for each channel).
-    const float* scales = key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd + rd;
-    mla_heads_in_.resize(heads * un * rank);
-    for (size_t t = 0; t < un; ++t) {
-        for (size_t h = 0; h < heads; ++h) {
-            const float* src = att_.data() + (t * heads + h) * rank;
-            float* dst = mla_heads_in_.data() + (h * un + t) * rank;
-            if (scales == nullptr) {
-                std::copy(src, src + rank, dst);
-            } else {
-                for (size_t i = 0; i < rank; ++i) dst[i] = src[i] * scales[i];
+        // Per head, the weighted latent becomes the head's value: W_vb,h c. Keys
+        // stored with per-channel scales carried their latent divided by them,
+        // so the latent is multiplied back first (exact for each channel).
+        const float* scales =
+            key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd + rd;
+        mla_heads_in_.resize(heads * un * rank);
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t h = 0; h < heads; ++h) {
+                const float* src = att_.data() + (t * heads + h) * rank;
+                float* dst = mla_heads_in_.data() + (h * un + t) * rank;
+                if (scales == nullptr) {
+                    std::copy(src, src + rank, dst);
+                } else {
+                    for (size_t i = 0; i < rank; ++i) dst[i] = src[i] * scales[i];
+                }
+            }
+        }
+        mla_heads_out_.resize(heads * un * vd);
+        LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kVb], mla_heads_in_.data(), mla_heads_out_.data(), n));
+        for (size_t t = 0; t < un; ++t) {  // [token][head][value], the order attn_output reads
+            for (size_t h = 0; h < heads; ++h) {
+                const float* src = mla_heads_out_.data() + (h * un + t) * vd;
+                std::copy(src, src + vd, att_.data() + (t * heads + h) * vd);
             }
         }
     }
-    mla_heads_out_.resize(heads * un * vd);
-    LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kVb], mla_heads_in_.data(), mla_heads_out_.data(), n));
-    for (size_t t = 0; t < un; ++t) {  // [token][head][value], the order attn_output reads
-        for (size_t h = 0; h < heads; ++h) {
-            const float* src = mla_heads_out_.data() + (h * un + t) * vd;
-            std::copy(src, src + vd, att_.data() + (t * heads + h) * vd);
-        }
-    }
+    form_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    latent_ms_ += form_ms;
     return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
 }
 
@@ -2192,6 +2812,32 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
     last_ffn_skips_ = 0;
 
+    // Latent attention: one form for the whole pass (LatentForm). A single
+    // token (decoding) is always absorbed, and so is key calibration (its
+    // ranges are measured on absorbed queries); otherwise the pinned form, or
+    // the one the measured costs predict faster for this batch and context.
+    latent_expanded_ = false;
+    latent_ms_ = 0.0;
+    LatentFormChooser::Work latent_work;
+    const bool latent = c.mla.kv_rank > 0 && n >= 2;
+    if (latent) {
+        int32_t window = 0;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            if (c.blocks[static_cast<size_t>(l)].latent) {
+                window = layers_[static_cast<size_t>(l)].window;
+                break;
+            }
+        }
+        const int64_t pairs = latent_visible(n, window);
+        int64_t positions = 0;
+        for (const auto& [a, b] : mla_union_) positions += b - a;
+        latent_work = LatentFormChooser::work(c, n, pairs, positions);
+        if (key_ranges_ == nullptr) {
+            latent_expanded_ = latent_form_ == LatentForm::Expanded ||
+                               (latent_form_ == LatentForm::Auto && latent_chooser_.expand(latent_work));
+        }
+    }
+
     const size_t d = static_cast<size_t>(c.n_embd);
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
     const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
@@ -2290,6 +2936,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const int32_t pos = n_past_ + n - 1 - i;
         checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
     }
+    if (c.mla.kv_rank > 0) ++(latent_expanded_ ? latent_stats_.expanded_passes : latent_stats_.absorbed_passes);
     n_past_ += n;
     kv_->release_unreachable(n_past_, max_batch_);  // recycle pages that left the window
     if (expert_store_ != nullptr && ++decode_steps_ % 16 == 0) expert_store_->age();
