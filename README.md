@@ -605,11 +605,10 @@ each of those as a scheduling problem.
   * **Kept in the prefix cache's store.** A segment is kept once a prompt marking it has been processed, as a
     context of its own whose tokens sit between two ids no vocabulary has, the first naming the position it was
     computed at. So it gets the store's tiers, caps, LRU order and files, and no prompt's chain ever reaches it
-    (its rows are exact only after what preceded it there). The same tokens computed at another position are
-    another copy; a prompt takes the copy computed at its own position if there is one, else the most recently
-    used. Text a segment holds is encoded on its own, so its tokens are the same wherever it appears (with a
-    SentencePiece vocabulary, wherever it follows the same kind of token), and segments shorter than 16 tokens
-    are processed as usual.
+    (its rows are exact only after what preceded it there). It is kept once, as first computed, and reused from
+    there wherever it appears. Text a segment holds is encoded on its own, so its tokens are the same wherever
+    it appears (with a SentencePiece vocabulary, wherever it follows the same kind of token), and segments
+    shorter than 16 tokens are processed as usual.
   * **Turned to its new positions.** RoPE turns each key by an angle proportional to its position, so a stored key
     is turned back by its old angle and on by its new one, with each block's own table: both pairings, partial
     rotation, `rope_freqs`, linear scaling, LongRoPE, YaRN, the windowed blocks' own base, latent attention's RoPE
@@ -653,7 +652,9 @@ each of those as a scheduling problem.
     blocks (2 of Llama's 16) for every reused token, the share processed again all of them. The mean KL is a
     few answer tokens' doing: the median is 6 (Llama) to 48 (Qwen3) times lower, the largest single token's KL
     0.3–1.9. A reused document costs the store its rows, ~60 KiB per token on Qwen3-0.6B and ~17 KiB on Llama
-    3.2 1B.
+    3.2 1B. Documents kept from prompts that had themselves reused others, as the engine keeps them
+    (`--warm-up-reuse`, at 10% on Qwen3-0.6B and 5% on Llama), give the same KL within 0.0006: copies made after
+    reused rows add no measurable error of their own.
   * **Which tokens are processed again matters**, at equal work too. Mean KL on Qwen3-0.6B at 10, 20 and 30%:
     the deviation criterion 0.041, 0.030, 0.026; random tokens 0.045, 0.043, 0.039; each document's first ones
     0.052, 0.041, 0.056; ranked by the attention the prompt's last tokens pay them (the question taken into the
@@ -1904,17 +1905,18 @@ Benchmarks and tools built with the tests:
 
 * `liyab-reuse`: what segment reuse costs in quality and saves in time to the first token, on RAG-shaped prompts
   (a system prompt, 3 to 5 documents of its own corpus in varying order and a question, through the model's chat
-  template). Documents are first stored by warm-up prompts; each measured prompt is then answered from a full
-  prefill (the reference, and its greedy answer), with the part before the first document taken as restored
-  (lossless), and with the documents reused at each recompute share of `--fractions`. It reports KL(full ||
-  reuse) over the whole vocabulary and the top-1 agreement at the first answer token and each next one up to
-  the reference answer's end of generation (at most `--answer`, teacher-forced on the reference), how many
-  greedy answers come out the same, and the times to the first token. `--criterion`, `--select-block`,
-  `--refine`, `--first-tokens` and `--absolute` select how the recomputed tokens are chosen, `--no-numbers`
-  leaves the documents unnumbered and `--dump` prints the positions that moved most. `--shift D` measures
-  turning keys alone (a text's rows moved D positions away and back), `--calibrate KL` runs the engine's
-  calibration; a hybrid model is refused with the share of a prompt token's work reusing its attention blocks'
-  keys and values would skip.
+  template). Documents are first stored by warm-up prompts (processed whole, or with `--warm-up-reuse F` as the
+  engine processes them: the documents stored already reused at share F, the new ones kept with rows computed
+  after those); each measured prompt is then answered from a full prefill (the reference, and its greedy
+  answer), with the part before the first document taken as restored (lossless), and with the documents reused
+  at each recompute share of `--fractions`. It reports KL(full || reuse) over the whole vocabulary and the top-1
+  agreement at the first answer token and each next one up to the reference answer's end of generation (at
+  most `--answer`, teacher-forced on the reference), how many greedy answers come out the same, and the times
+  to the first token. `--criterion`, `--select-block`, `--refine`, `--first-tokens` and `--absolute` select how
+  the recomputed tokens are chosen, `--no-numbers` leaves the documents unnumbered and `--dump` prints the
+  positions that moved most. `--shift D` measures turning keys alone (a text's rows moved D positions away and
+  back), `--calibrate KL` runs the engine's calibration; a hybrid model is refused with the share of a prompt
+  token's work reusing its attention blocks' keys and values would skip.
 
   ```bash
   build/liyab-reuse -m Qwen3-0.6B-BF16.gguf --prompts 8 --fractions 0,0.1,0.2,0.3

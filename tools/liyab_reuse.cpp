@@ -8,8 +8,11 @@
 //   liyab-reuse -m model.gguf --shift 300                      # the cost of turning keys alone
 //
 // The documents are first seen in warm-up prompts (random subsets, random
-// orders), which store their KV as segments. Each measured prompt is then
-// answered three ways, from an empty context:
+// orders), which store their KV as segments: processed whole, or with
+// --warm-up-reuse F as the engine processes them, the documents stored
+// already reused at share F and the new ones kept with rows computed after
+// those (so copies made from reused rows are measured too). Each measured
+// prompt is then answered three ways, from an empty context:
 //  * full: the whole prompt processed (the reference);
 //  * prefix: the part before the first document taken as restored by the
 //    prefix cache (not timed), the rest processed: lossless;
@@ -268,7 +271,8 @@ int usage() {
                  "usage: liyab-reuse -m model.gguf [--kv f16|q8_0|q4_0|q4_1] [--threads N] [--prompts N]\n"
                  "                   [--fractions F,F,...] [--criterion deviation|first|random|attention|impact] [--select-block B]\n"
                  "                   [--first-tokens K] [--absolute] [--answer N] [--seed S] [--plain]\n"
-                 "                   [--shift D] [--no-key-scaling] [--calibrate MAX_KL] [--dump] [--no-numbers]\n");
+                 "                   [--shift D] [--no-key-scaling] [--calibrate MAX_KL] [--dump] [--no-numbers]\n"
+                 "                   [--warm-up-reuse F]\n");
     return 2;
 }
 
@@ -279,6 +283,7 @@ int main(int argc, char** argv) {
     KvCacheType kv_type = KvCacheType::Q8_0;
     int32_t threads = 0, prompts = 8, answer = 32, shift = 0;
     double calibrate = -1.0;  // >= 0: run the engine's calibration against this target
+    float warm_up_reuse = -1.0f;  // >= 0: warm-up prompts reuse what is stored, at this share
     uint64_t seed = 7;
     bool plain = false, key_scaling = true, dump = false, numbered = true;
     std::vector<float> fractions = {0.0f, 0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.5f, 1.0f};
@@ -303,6 +308,7 @@ int main(int argc, char** argv) {
         else if (arg == "--no-numbers") numbered = false;
         else if (arg == "--shift") shift = std::atoi(next());
         else if (arg == "--calibrate") calibrate = std::atof(next());
+        else if (arg == "--warm-up-reuse") warm_up_reuse = std::strtof(next(), nullptr);
         else if (arg == "--no-key-scaling") key_scaling = false;
         else if (arg == "--select-block") settings.select_block = std::atoi(next());
         else if (arg == "--first-tokens") settings.first_tokens = std::atoi(next());
@@ -490,6 +496,7 @@ int main(int argc, char** argv) {
     // Warm-up: every document seen (and stored) in prompts of 3 to 5 others.
     std::set<size_t> seen;
     int warmups = 0;
+    int64_t warm_reused = 0;
     while (seen.size() < kDocCount) {
         const std::vector<size_t> docs = pick(3 + rng() % 3);
         auto prompt = builder.build(docs, rng() % kDocCount);
@@ -501,13 +508,35 @@ int main(int argc, char** argv) {
         std::vector<TokenSegment> segments;
         if (!encode(*prompt, tokens, segments).is_ok()) return 1;
         model->reset();
-        if (!run.prefill(tokens).is_ok()) return 1;
+        if (warm_up_reuse >= 0.0f && !segments.empty()) {
+            // As the engine does: the stored documents reused, the new ones
+            // computed after them and kept.
+            const auto n = static_cast<int32_t>(tokens.size());
+            const int32_t exact = segments.front().begin;
+            ReuseSettings w = settings;
+            w.fraction = warm_up_reuse;
+            if (!run.prefill(std::span(tokens).first(static_cast<size_t>(exact))).is_ok()) return 1;
+            auto r = reuse_segments(*model, *store, tokens, segments, exact, n, w, run.route, pool, run.chunk);
+            if (!r) {
+                std::fprintf(stderr, "warm-up reuse: %s\n", r.status().to_string().c_str());
+                return 1;
+            }
+            warm_reused += r->reused;
+            if (!run.prefill(std::span(tokens).subspan(static_cast<size_t>(r->end))).is_ok()) return 1;
+        } else if (!run.prefill(tokens).is_ok()) {
+            return 1;
+        }
         keep_segments(*model, *store, tokens, segments, settings.min_tokens);
         seen.insert(docs.begin(), docs.end());
         ++warmups;
     }
-    std::printf("warm-up: %d prompts stored %d documents (%d segment copies)\n\n", warmups, static_cast<int>(kDocCount),
+    std::printf("warm-up: %d prompts stored %d documents (%d segment copies)", warmups, static_cast<int>(kDocCount),
                 store->stats().segments);
+    if (warm_up_reuse >= 0.0f) {
+        std::printf(", %lld positions reused at %.0f%% before the new ones were computed", static_cast<long long>(warm_reused),
+                    100.0 * warm_up_reuse);
+    }
+    std::printf("\n\n");
 
     std::vector<Tally> tallies(fractions.size());
     double full_ttft = 0.0, prefix_ttft = 0.0;
