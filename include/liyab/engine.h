@@ -94,7 +94,11 @@ struct EngineConfig {
     // Prefix cache, MiB of RAM at most (0: off): contexts another
     // conversation's prompt replaced (or an embed() / rerank() call) are kept
     // and restored when a prompt continues one, instead of processing it
-    // again, cut back to where the two diverge. They are kept in a
+    // again, cut back to where the two diverge. A prompt replaces the context
+    // when it shares less than half of it, or leaves it before the end of its
+    // last prompt with at least 128 tokens to drop (another chat after a long
+    // shared system prompt, an edited message); a draft typed ahead and then
+    // edited after the last reply does not. Contexts are kept in a
     // content-addressed store of KV chunks: one KV page of tokens each, keyed
     // by every token before it plus the model, cache layout, key scales and
     // kernels, so a prefix conversations share (system prompt, tools) is
@@ -106,7 +110,8 @@ struct EngineConfig {
     // expert cache can spare: it never takes the cache under 10% of the
     // experts, so it never causes a requantization (requant_bits -1). On
     // Qwen3.6-35B-A3B a 2000-token conversation costs ~21 MiB of chunks plus
-    // 62.8 MiB per state image.
+    // 62.8 MiB per state image. Off with a sliding window (released positions
+    // are gone) or a draft model (it keeps no reusable context).
     int64_t prefix_cache_mb = 0;
     // Prefix cache on storage: what RAM does not hold (prefix_cache_mb,
     // possibly 0) goes to files in this directory (created if missing), at

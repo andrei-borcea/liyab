@@ -3166,6 +3166,61 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
     }
 }
 
+TEST_CASE("A chat after a long shared system prompt is set aside and comes back; an edited draft is not") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        spec.context_length = 1024;  // the chat and a long draft
+        EngineConfig config = engine_config(model_path(std::string("prefix_1k_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        auto reference = Engine::create(config);  // never interrupted
+        config.prefix_cache_mb = 64;
+        auto cached = Engine::create(config);
+        REQUIRE(cached.has_value() && reference.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        // The system prompt is most of each chat: the next chat shares more
+        // than half of the context, and drops more than 128 tokens of it.
+        std::string system = "system:", a = " a:", b = " b:", draft1, draft2;
+        for (int i = 0; i < 300; ++i) system += i % 3 ? " hello" : " world";
+        for (int i = 0; i < 150; ++i) {
+            a += i % 2 ? " hello" : " world";
+            b += i % 4 ? " world" : " hello";
+        }
+        for (int i = 0; i < 200; ++i) {
+            draft1 += i % 5 ? " hello" : " world";
+            draft2 += i % 7 ? " world" : " hello";
+        }
+        Engine& e = *cached.value();
+        const std::string a1 = system + a;
+        const std::string reply_a = run(e, a1);
+        CHECK(reply_a == run(*reference.value(), a1));
+        run(e, system + b);  // another chat: A is set aside
+        CHECK(e.prefix_cache_stats().set_asides == 1);
+        const std::string a2 = a1 + reply_a + " hello";
+        GenerationStats st{};
+        const std::string out = run(e, a2, &st);
+        CHECK(out == run(*reference.value(), a2));
+        // A's prompt and its reply, but the reply's last token (sampled, never processed).
+        CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(a1, true)->size()) + 5);
+        CHECK(e.prefix_cache_stats().restores == 1);
+        // A draft typed ahead after the reply, then edited: left in place, not set aside.
+        const uint64_t before = e.prefix_cache_stats().set_asides;
+        REQUIRE(e.prefill(a2 + out + draft1, true).is_ok());
+        REQUIRE(e.prefill(a2 + out + draft2, true).is_ok());
+        CHECK(e.prefix_cache_stats().set_asides == before);
+    }
+}
+
 TEST_CASE("A later engine restores the prefix an earlier one left on storage") {
     for (const char* arch : {"llama", "qwen35"}) {
         test::TinyModelSpec spec;

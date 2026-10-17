@@ -533,8 +533,11 @@ each of those as a scheduling problem.
 * **State snapshots for hybrid models.** Four are kept: the oldest one, the end of the last prompt (pinned, so
   background drafts cannot evict it), and the two newest others (a draft's words and the whole draft after them).
   They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
-* **Prefix cache across conversations** (`prefix_cache_mb`, `prefix_cache_dir`). A context that an unrelated
-  prompt replaces (or an embedding call) is set aside in a content-addressed store of KV chunks. A chunk is one page
+* **Prefix cache across conversations** (`prefix_cache_mb`, `prefix_cache_dir`). A context that another prompt
+  replaces (or an embedding call) is set aside in a content-addressed store of KV chunks. A prompt replaces it when
+  it shares less than half of it, or leaves it before the end of its last prompt with at least 128 tokens to drop:
+  another chat after a long shared system prompt, an edited message. A draft typed ahead and edited after the last
+  reply keeps using the context's own snapshots instead. A chunk is one page
   of the paged KV cache (64 tokens), keyed by a hash chained over every token before it and rooted in what its bytes
   depend on (the model file, cache layout and type, key scales, kernels and backends). A prefix that several
   conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,

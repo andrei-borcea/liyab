@@ -603,6 +603,7 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
                 continue;
             }
             set_clock(kind, it->second, clock_of(i));
+            ++result.chunks_reused;
         } else {
             auto it = states_.find(marks[index].key);
             if (it == states_.end() || !ours(it->second) || it->second.pos != marks[index].mark.pos) continue;

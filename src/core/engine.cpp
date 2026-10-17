@@ -210,6 +210,12 @@ struct Engine::Impl {
     // diverge at the first such reply and, on a hybrid model, start over.
     std::string context_text;
     size_t context_text_tokens = 0;
+    // Where the last prompt generate() processed ends in `context` (or the
+    // end of what a restore or load_state() brought back): a prompt that
+    // leaves the context before it belongs to another conversation, or
+    // branches this one (an edited message), and the prefix cache sets the
+    // context aside; one that leaves it after edits a draft typed ahead.
+    size_t last_prompt_end = 0;
 
     void clear_context() {
         target->reset();
@@ -217,6 +223,7 @@ struct Engine::Impl {
         context.clear();
         context_text.clear();
         context_text_tokens = 0;
+        last_prompt_end = 0;
     }
 
     // Moves `end` back over the text that tokens[i] stands for at the end of
@@ -353,8 +360,9 @@ struct Engine::Impl {
     // of KV chunks (core/kv_store.h). A prompt that continues one restores it
     // instead of processing it again, up to where they diverge; a prefix
     // several conversations share (system prompt, tools) is stored once and
-    // restored for any of them. Only contexts the new prompt shares less than
-    // half of are set aside: edits within a conversation keep using the
+    // restored for any of them. A context is set aside when a prompt replaces
+    // it (see reuse_prefix: another conversation, or a branch of this one),
+    // not for a draft edited after the last reply, which keeps using the
     // context's own snapshots. RAM holds what prefix_cache_mb allows, the
     // rest goes to files in prefix_cache_dir, where later engines and
     // processes find it: a phone's RAM is better spent on weights, and its
@@ -514,7 +522,7 @@ struct Engine::Impl {
             std::lock_guard<std::mutex> lock(prefix_stats_mutex);
             ++prefix_stats.set_asides;
             prefix_stats.chunks_written += static_cast<uint64_t>(put.chunks_written);
-            prefix_stats.chunks_reused += static_cast<uint64_t>(std::max(0, put.chunks - put.chunks_written));
+            prefix_stats.chunks_reused += static_cast<uint64_t>(put.chunks_reused);
             prefix_stats.set_aside_ms += ms;
         }
         note_store();
@@ -592,6 +600,7 @@ struct Engine::Impl {
             context_text.clear();
             context_text_tokens = 0;
         }
+        last_prompt_end = positions;
         store->used(plan);
         const double ms = ms_since(watch);
         LIYAB_LOG_INFO("prefix cache: restored %zu tokens (%zu kept in place) from %zu chunk(s) in %.0f ms", positions,
@@ -619,7 +628,14 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
-        if (prefix_cache_on() && common < context.size() / 2) {
+        // Set aside when the prompt replaces the context: it shares less
+        // than half of it, or leaves it before its last prompt's end with at
+        // least kMinPrefixEntry tokens to drop (another chat after a long
+        // shared system prompt). A draft edited after the last reply is not:
+        // it would write state images at every keystroke.
+        const bool replaced = common < context.size() / 2 ||
+                              (common < last_prompt_end && context.size() - common >= kMinPrefixEntry);
+        if (prefix_cache_on() && replaced) {
             stash_context();
             if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
             if (context.empty()) return 0;  // a cached context failed to restore
@@ -634,6 +650,7 @@ struct Engine::Impl {
         if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
             cut_text(keep);
             context.resize(keep);
+            last_prompt_end = std::min(last_prompt_end, keep);
             return keep;
         }
         clear_context();
@@ -1586,6 +1603,7 @@ Result<int32_t> Engine::load_state(const std::string& path) {
         }
         s.context_text_tokens = static_cast<size_t>(covered);
     }
+    s.last_prompt_end = static_cast<size_t>(n);
     return static_cast<int32_t>(n);
 }
 
@@ -1695,7 +1713,10 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     }
     stats.prefill_ms = ms_since(t_prefill);
     // The next chat turn re-sends this prompt: keep its recurrent state.
-    if (!s.draft) s.target->snapshot_state(/*pin=*/true);
+    if (!s.draft) {
+        s.target->snapshot_state(/*pin=*/true);
+        s.last_prompt_end = s.context.size();
+    }
 
     const auto t_decode = Clock::now();
     const Transformer::PhaseTimes phases_before = s.target->phase_times();

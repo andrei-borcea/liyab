@@ -77,9 +77,12 @@
 // Extension points (later branches build on these, nothing else changes):
 //  * Compressed chunks on storage (feat/kv-compress): FileHeader::encoding
 //    names how a chunk's payload is stored (KvEncoding); `raw_bytes` is its
-//    decoded size and every cap counts the stored size. An encoding is added
-//    in write_chunk_file() / read_chunk() only; a file of an unknown
-//    encoding is treated as foreign (removed when opened).
+//    decoded size and every cap counts the stored size (Item::file_bytes).
+//    Callers only ever see raw images (put()'s rows, read_chunk()), so an
+//    encoding is added in write_item_file() (encoding), read_chunk()
+//    (decoding into the caller's image) and scan() (accepting it); a file of
+//    an encoding a build does not know is removed when the directory is
+//    opened, never misread.
 //  * Chunks reused away from their prefix (feat/kv-reuse): every chunk also
 //    carries a position-independent content key (kv_content_key: the seed
 //    and its own tokens, not what precedes them) and its start position,
@@ -198,7 +201,8 @@ public:
     struct PutResult {
         bool whole = false;          // every chunk and state is stored, with the record
         int32_t chunks = 0;          // chunks of the context
-        int32_t chunks_written = 0;  // new ones (the others were already stored)
+        int32_t chunks_written = 0;  // new ones
+        int32_t chunks_reused = 0;   // stored already (a shared prefix, an earlier copy)
         int32_t states_written = 0;
         size_t bytes_ram = 0;        // added to RAM
         size_t bytes_disk = 0;       // written to storage (moves from RAM included)
