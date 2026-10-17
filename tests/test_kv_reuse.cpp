@@ -412,13 +412,14 @@ TEST_CASE("Blocks run at scattered positions give the rows and logits a whole pa
 
 namespace {
 
-// A store for a model's chunks: in RAM, or only on storage in `dir`.
-std::unique_ptr<KvStore> store_for(const Transformer& m, const std::string& dir = {}) {
+// A store for a model's chunks of `pages` KV pages each: in RAM, or only on
+// storage in `dir`.
+std::unique_ptr<KvStore> store_for(const Transformer& m, const std::string& dir = {}, int32_t pages = 1) {
     KvStore::Config sc;
     const uint64_t parts[] = {m.context_fingerprint()};
     sc.seed = kv_seed_key(parts);
-    sc.chunk_tokens = m.kv_cache().config().page_tokens;
-    sc.chunk_bytes = m.kv_cache().page_bytes();
+    sc.chunk_tokens = m.kv_cache().config().page_tokens * pages;
+    sc.chunk_bytes = m.kv_cache().page_bytes() * static_cast<size_t>(pages);
     sc.ram_bytes = dir.empty() ? size_t{64} << 20 : 0;
     sc.dir = dir;
     sc.disk_bytes = dir.empty() ? 0 : size_t{64} << 20;
@@ -477,16 +478,19 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
     s.mla_kv_rank = 64;
     archs.push_back({"deepseek2", s});
     for (const Arch& a : archs) {
+      // Chunks of one page and of two: a segment's pages are packed and
+      // read back page by page (its documents span two and three pages).
+      for (const int32_t pages : {1, 2}) {
         auto l = load(a.name, a.spec, {}, a.scale_keys);
         REQUIRE(l != nullptr);
         Transformer& m = *l->model;
-        auto store = store_for(m);
+        auto store = store_for(m, {}, pages);
         REQUIRE(store != nullptr);
-        const std::vector<int32_t> x = tokens_of(m, 20, 11), doc_a = tokens_of(m, 40, 12), doc_b = tokens_of(m, 50, 13);
+        const std::vector<int32_t> x = tokens_of(m, 20, 11), doc_a = tokens_of(m, 90, 12), doc_b = tokens_of(m, 150, 13);
         const std::vector<int32_t> mid = tokens_of(m, 10, 14), mid2 = tokens_of(m, 10, 15), q = tokens_of(m, 12, 16);
         // P = X A M B Q stores A and B...
         const std::vector<int32_t> p = join({x, doc_a, mid, doc_b, q});
-        const std::vector<TokenSegment> p_segments = {{20, 60}, {70, 120}};
+        const std::vector<TokenSegment> p_segments = {{20, 110}, {120, 270}};
         m.reset();
         REQUIRE(prefill(*l, std::span(p).first(p.size() - 1)));
         const std::vector<float> p_logits = last_logits(*l, p.back());
@@ -494,7 +498,7 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
         CHECK(keep_segments(m, *store, p, p_segments, 16) == 0);  // stored already
         // ...reused in P2 = X B M' A Q, in another order after another middle.
         const std::vector<int32_t> p2 = join({x, doc_b, mid2, doc_a, q});
-        const std::vector<TokenSegment> p2_segments = {{20, 70}, {80, 120}};
+        const std::vector<TokenSegment> p2_segments = {{20, 170}, {180, 270}};
         const auto n2 = static_cast<int32_t>(p2.size());
         m.reset();
         REQUIRE(prefill(*l, std::span(p2).first(p2.size() - 1)));
@@ -512,9 +516,9 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
             REQUIRE(r.has_value());
             // The question-guided criteria run the tail (Q) with the span.
             const bool guided = criterion == ReuseCriterion::Attention || criterion == ReuseCriterion::Impact;
-            CHECK(r->end == (guided ? n2 - 1 : 120));
-            CHECK(r->reused == 90);
-            CHECK(r->recomputed == 90);
+            CHECK(r->end == (guided ? n2 - 1 : 270));
+            CHECK(r->reused == 240);
+            CHECK(r->recomputed == 240);
             CHECK(r->computed == (guided ? 21 : 10));
             CHECK(r->segments == 2);
             CHECK(r->first_reused == 20);
@@ -536,8 +540,8 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
                                     *l->pool, 64);
             REQUIRE(r.has_value());
             CHECK(r->recomputed == 0);
-            CHECK(r->reused == 90);
-            REQUIRE(prefill(*l, std::span(p).subspan(120, p.size() - 121)));
+            CHECK(r->reused == 240);
+            REQUIRE(prefill(*l, std::span(p).subspan(270, p.size() - 271)));
             CHECK(last_logits(*l, p.back()) == p_logits);
         }
         // A share of them elsewhere: lossy, but the context is whole and sane.
@@ -547,18 +551,19 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
         REQUIRE(prefill(*l, x));
         auto r = reuse_segments(m, *store, p2, p2_segments, 20, n2 - 1, some, l->route, *l->pool, 64);
         REQUIRE(r.has_value());
-        CHECK(r->recomputed == 18);
-        CHECK(m.n_past() == 120);
-        REQUIRE(prefill(*l, std::span(p2).subspan(120, p2.size() - 121)));
+        CHECK(r->recomputed == 48);
+        CHECK(m.n_past() == 270);
+        REQUIRE(prefill(*l, std::span(p2).subspan(270, p2.size() - 271)));
         const std::vector<float> lossy = last_logits(*l, p2.back());
         CHECK(!lossy.empty() && std::all_of(lossy.begin(), lossy.end(), [](float v) { return std::isfinite(v); }));
         // A prefix that already covers them: nothing done.
         m.reset();
-        REQUIRE(prefill(*l, std::span(p2).first(120)));
-        r = reuse_segments(m, *store, p2, p2_segments, 120, n2 - 1, some, l->route, *l->pool, 64);
+        REQUIRE(prefill(*l, std::span(p2).first(270)));
+        r = reuse_segments(m, *store, p2, p2_segments, 270, n2 - 1, some, l->route, *l->pool, 64);
         REQUIRE(r.has_value());
-        CHECK(r->end == 120);
+        CHECK(r->end == 270);
         CHECK(r->reused == 0);
+      }
     }
 }
 
