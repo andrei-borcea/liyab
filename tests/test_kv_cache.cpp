@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/kv_store.h"
+#include "liyab/mmap_loader.h"
 #include "core/quant.h"
 #include "liyab/engine.h"
 #include "liyab/kv_cache.h"
@@ -360,20 +361,37 @@ KvStore::PutResult put(KvStore& store, const std::vector<int32_t>& tokens, std::
     KvStore::ContextSource src;
     src.tokens = tokens;
     src.text = "";
-    src.rows = [&tokens](int32_t chunk, int32_t n, uint8_t* out) {
+    // The rows as parts, as a cache's pages are: a whole chunk in two (two
+    // pages), a partial one in one. The store writes storage straight from
+    // them and copies them once for RAM.
+    std::vector<std::vector<uint8_t>> images;
+    src.rows = [&](int32_t chunk, int32_t n) {
+        images.emplace_back(static_cast<size_t>(n) * kPosBytes);
+        uint8_t* out = images.back().data();
         for (int32_t s = 0; s < n; ++s) {
             const int32_t pos = chunk * kChunk + s;
             for (size_t b = 0; b < kPosBytes; ++b) out[static_cast<size_t>(s) * kPosBytes + b] = row_byte(tokens[static_cast<size_t>(pos)], pos, b);
         }
-        return Status::ok();
+        const std::span<const uint8_t> all(images.back());
+        if (n < kChunk) return std::vector<std::span<const uint8_t>>{all};
+        return std::vector<std::span<const uint8_t>>{all.first(all.size() / 2), all.subspan(all.size() / 2)};
     };
     src.states = std::move(marks);
-    src.state = [&tokens](int32_t pos, float* out) {
-        const std::vector<float> s = state_image(tokens, pos);
-        std::copy(s.begin(), s.end(), out);
-        return Status::ok();
+    // An image in two parts, as a model's per-block states are.
+    std::vector<std::vector<float>> states;
+    src.state_parts = [&](int32_t pos) {
+        states.push_back(state_image(tokens, pos));
+        const std::span<const float> all(states.back());
+        return std::vector<std::span<const float>>{all.first(3), all.subspan(3)};
     };
     return store.put(src, storage_only);
+}
+
+// A state image read in two parts, as into a model's per-block states.
+Status read_state(KvStore& store, const KvKey& key, std::vector<float>& out) {
+    const std::span<float> all(out);
+    const std::span<float> parts[] = {all.first(5), all.subspan(5)};
+    return store.read_state(key, parts);
 }
 
 // Whether the store gives back the right bytes for the first `n` positions of `tokens` along `plan`.
@@ -381,7 +399,8 @@ bool rows_match(KvStore& store, const KvStore::Plan& plan, const std::vector<int
     for (size_t i = 0; i < plan.chunks.size(); ++i) {
         const int32_t n = plan.chunk_sizes[i];
         std::vector<uint8_t> image(static_cast<size_t>(n) * kPosBytes);
-        if (!store.read_chunk(plan.chunks[i], image).is_ok()) return false;
+        const std::span<uint8_t> into(image);
+        if (!store.read_chunk(plan.chunks[i], {&into, 1}).is_ok()) return false;
         for (int32_t s = 0; s < n; ++s) {
             const int32_t pos = static_cast<int32_t>(i) * kChunk + s;
             if (pos >= plan.positions) break;
@@ -411,6 +430,25 @@ std::string store_dir(const std::string& name) {
 }
 
 }  // namespace
+
+TEST_CASE("The KV store's payload hash, taken in pieces, is xxhash64 of the whole") {
+    std::mt19937 rng(9);
+    std::vector<uint8_t> data(3000);
+    for (uint8_t& b : data) b = static_cast<uint8_t>(rng());
+    bool same = true;
+    for (size_t length : {size_t{0}, size_t{1}, size_t{7}, size_t{31}, size_t{32}, size_t{33}, size_t{100}, size_t{3000}}) {
+        for (int trial = 0; trial < 20; ++trial) {
+            KvStreamHash hash;
+            for (size_t at = 0; at < length;) {
+                const size_t n = std::min(length - at, static_cast<size_t>(rng() % 70));
+                hash.update(data.data() + at, n);
+                at += n;
+            }
+            same = same && hash.digest() == xxhash64(data.data(), length);
+        }
+    }
+    CHECK(same);
+}
 
 TEST_CASE("The KV store keeps a shared prefix once and restores a prompt up to where it diverges") {
     std::mt19937 rng(7);
@@ -476,9 +514,9 @@ TEST_CASE("The KV store restores a hybrid model up to the deepest state its prom
     CHECK(p.snapshots[0].pos == 20);
     CHECK(rows_match(*store, p, prompt));
     std::vector<float> state(kStateFloats);
-    REQUIRE(store->read_state(p.state, state).is_ok());
+    REQUIRE(read_state(*store, p.state, state).is_ok());
     CHECK(state == state_image(x, 70));
-    REQUIRE(store->read_state(p.snapshots[0].key, state).is_ok());
+    REQUIRE(read_state(*store, p.snapshots[0].key, state).is_ok());
     CHECK(state == state_image(x, 20));
     prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 50), {7, 7, 7});
     p = store->plan(prompt, prompt.size());
@@ -575,7 +613,7 @@ TEST_CASE("The KV store's files outlive it, in LRU order, and what it cannot tru
         CHECK(p.snapshots.size() == 2);
         CHECK(rows_match(*store, p, a));
         std::vector<float> state(kStateFloats);
-        REQUIRE(store->read_state(p.state, state).is_ok());
+        REQUIRE(read_state(*store, p.state, state).is_ok());
         CHECK(state == state_image(a, 100));
     }
     // A lower cap: B goes first (A was used after it), then C; A stays.
