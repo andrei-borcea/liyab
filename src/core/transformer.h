@@ -44,6 +44,16 @@ namespace liyab {
 
 class ThreadPool;
 
+// Final logit soft-cap (Gemma 2): replaces every x of `logits` by
+// cap * tanh(x / cap), in place. Large spans are split into chunks on `pool`;
+// each element is computed by the same expression whatever thread runs it, so
+// the result is bit-identical for every thread count. Small spans run on the
+// calling thread (a fork/join costs more than they do). Precondition: cap > 0.
+// Not reentrant on the same pool (ThreadPool::parallel_for's rule).
+void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool);
+
+class ThreadPool;
+
 // Which backend runs which matmuls for one forward pass. `cpu` is the
 // fallback when a backend reports Unsupported for a tensor.
 struct Route {
@@ -415,8 +425,9 @@ private:
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
                         std::span<float* const> ys, int32_t n);
-    // Final norm + LM head over `rows` hidden rows starting at `first_row` of x_.
-    Status compute_logits(const Route& route, size_t first_row, int32_t rows);
+    // Final norm + LM head over `rows` hidden rows starting at `first_row` of
+    // x_, then the final soft-cap (if any) on `pool`.
+    Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
     // Early exit: writes K/V for blocks [from, n_layers) of the single token
     // at `pos` from the current hidden state, so later tokens stay coherent.
     Status propagate_kv(const Route& route, int32_t from, int32_t pos);

@@ -1101,7 +1101,23 @@ Status Transformer::matmul_group(const Route& route, Backend* backend, std::span
     return s;
 }
 
-Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t rows) {
+void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool) {
+    // Elementwise, so chunking cannot change a bit. tanh costs ~5 ns per
+    // element: one thread over Gemma 2's 256k vocabulary took 1-2 ms per token.
+    // Below this size the fork/join (a few us) is not worth it.
+    constexpr size_t kParallelMin = 16384;
+    float* p = logits.data();
+    auto run = [p, cap](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) p[i] = cap * std::tanh(p[i] / cap);
+    };
+    if (logits.size() < kParallelMin || pool.max_threads() == 1) {
+        run(0, static_cast<int64_t>(logits.size()));
+    } else {
+        pool.parallel_for(static_cast<int64_t>(logits.size()), run);
+    }
+}
+
+Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool) {
     const ModelConfig& c = config_;
     const size_t d = static_cast<size_t>(c.n_embd);
     const PhaseTimer timer(phases_.lm_head);
@@ -1113,8 +1129,7 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
     logits_.resize(static_cast<size_t>(rows) * static_cast<size_t>(c.n_vocab));
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows));
     if (c.final_softcap > 0.0f) {  // Gemma 2: logits squashed into (-cap, cap)
-        const float cap = c.final_softcap;
-        for (float& l : logits_) l = cap * std::tanh(l / cap);
+        apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
     }
     return Status::ok();
 }
@@ -2260,7 +2275,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
 
         // --- early-exit probe (experimental) ---
         if (early_exit != nullptr && early_exit->probe_after(l, c.n_layers)) {
-            LIYAB_RETURN_IF_ERROR(compute_logits(route, 0, 1));
+            LIYAB_RETURN_IF_ERROR(compute_logits(route, 0, 1, pool));
             if (early_exit->should_exit(std::span<const float>(logits_.data(), logits_.size()))) {
                 LIYAB_RETURN_IF_ERROR(propagate_kv(route, l + 1, n_past_));
                 last_exit_layer_ = l;
@@ -2282,7 +2297,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
 
     // --- output head ---
     const int32_t out_rows = logits == Logits::All ? n : 1;
-    if (Status s = compute_logits(route, logits == Logits::All ? 0 : un - 1, out_rows); !s.is_ok()) {
+    if (Status s = compute_logits(route, logits == Logits::All ? 0 : un - 1, out_rows, pool); !s.is_ok()) {
         n_past_ -= n;
         return s;
     }
