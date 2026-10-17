@@ -7,13 +7,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "core/quant.h"
 #include "core/thread_pool.h"
+#include "core/transformer.h"
 #include "liyab/backend.h"
 #include "liyab/mmap_loader.h"
 #include "test_model.h"
@@ -204,6 +208,49 @@ TEST_CASE("ThreadPool::parallel_for runs every index exactly once") {
         for (int64_t i = 0; i < n; ++i) wrong += hits[static_cast<size_t>(i)].load(std::memory_order_relaxed) != 1;
         REQUIRE(wrong == 0);
     }
+}
+
+TEST_CASE("Final logit soft-cap: same bits for 1 and N threads, and its cost per token") {
+    // Gemma 2's vocabulary (256000) plus odd sizes around the inline/parallel
+    // cut-over, so uneven chunks are covered too.
+    ThreadPool one(1);
+    ThreadPool many(8);
+    const float cap = 30.0f;
+    for (const size_t n : {size_t{7}, size_t{16383}, size_t{16384}, size_t{100003}, size_t{256000}}) {
+        std::vector<float> src(n);
+        uint32_t seed = 12345;
+        for (float& v : src) {
+            seed = seed * 1664525u + 1013904223u;
+            v = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 200.0f;  // well past the cap both ways
+        }
+        std::vector<float> want = src;
+        for (float& v : want) v = cap * std::tanh(v / cap);  // the former single-thread loop
+        for (ThreadPool* pool : {&one, &many}) {
+            for (const int32_t active : {1, 3, 8}) {
+                pool->set_active_threads(active);
+                std::vector<float> got = src;
+                apply_final_softcap(got, cap, *pool);
+                REQUIRE(std::memcmp(got.data(), want.data(), n * sizeof(float)) == 0);
+            }
+        }
+    }
+    // Cost per token on a 256k vocabulary (best of 50), before (one thread)
+    // and after (the pool).
+    std::vector<float> buf(256000, 3.0f);
+    auto best = [&](ThreadPool& pool) {
+        double b = 1e9;
+        for (int i = 0; i < 50; ++i) {
+            const auto t = Clock::now();
+            apply_final_softcap(buf, cap, pool);
+            b = std::min(b, ms_since(t));
+        }
+        return b;
+    };
+    many.set_active_threads(8);
+    const double t1 = best(one);
+    const double tn = best(many);
+    std::printf("  final soft-cap, 256000 logits: %.3f ms on 1 thread, %.3f ms on %d threads\n", t1, tn,
+                many.max_threads());
 }
 
 TEST_MAIN()
