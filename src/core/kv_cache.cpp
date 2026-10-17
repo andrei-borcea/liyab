@@ -1,6 +1,7 @@
 #include "liyab/kv_cache.h"
 
 #include <algorithm>
+#include <cstring>
 #include <new>
 #include <vector>
 
@@ -90,13 +91,7 @@ Status KvCache::reserve(int32_t end) {
     return Status::ok();
 }
 
-uint8_t* KvCache::page_ptr(size_t logical) const noexcept {
-    const int32_t entry = table_[logical];
-    // External pages are read-only file mappings; only positions beyond the
-    // attached prefix are ever written, and those live in owned pages.
-    return entry >= 0 ? pool_[static_cast<size_t>(entry)].get()
-                      : const_cast<uint8_t*>(external_[static_cast<size_t>(kExternalBase - entry)]);
-}
+uint8_t* KvCache::page_ptr(size_t logical) const noexcept { return pool_[static_cast<size_t>(table_[logical])].get(); }
 
 const uint8_t* KvCache::page_data(int32_t logical) const noexcept {
     if (logical < 0 || static_cast<size_t>(logical) >= table_.size() || table_[static_cast<size_t>(logical)] == kUnmapped) {
@@ -106,24 +101,110 @@ const uint8_t* KvCache::page_data(int32_t logical) const noexcept {
 }
 
 uint8_t* KvCache::mutable_page_data(int32_t logical) noexcept {
-    if (logical < 0 || static_cast<size_t>(logical) >= table_.size() || table_[static_cast<size_t>(logical)] < 0) {
-        return nullptr;
-    }
-    return page_ptr(static_cast<size_t>(logical));
+    return const_cast<uint8_t*>(static_cast<const KvCache*>(this)->page_data(logical));
 }
 
-Status KvCache::attach_external_pages(std::span<const uint8_t* const> pages) {
-    for (const int32_t entry : table_) {
-        if (entry != kUnmapped) return Status(ErrorCode::InvalidArgument, "external pages need an empty cache");
+size_t KvCache::rows_bytes(int32_t n) const noexcept {
+    return page_bytes_ / static_cast<size_t>(config_.page_tokens) * static_cast<size_t>(std::max(n, 0));
+}
+
+void KvCache::copy_slots(const uint8_t* src, int32_t src_slots, int32_t src_first, uint8_t* dst, int32_t dst_slots,
+                         int32_t dst_first, int32_t count) const noexcept {
+    // A slot is n_head_kv rows; each plane (K, then V) holds n_layers runs of
+    // slots, so one copy per plane and layer moves `count` contiguous slots.
+    const size_t slot = static_cast<size_t>(config_.n_head_kv) * row_bytes_;
+    const int32_t planes = config_.values_in_keys ? 1 : 2;
+    for (int32_t run = 0; run < planes * config_.n_layers; ++run) {
+        std::memcpy(dst + (static_cast<size_t>(run) * static_cast<size_t>(dst_slots) + static_cast<size_t>(dst_first)) * slot,
+                    src + (static_cast<size_t>(run) * static_cast<size_t>(src_slots) + static_cast<size_t>(src_first)) * slot,
+                    static_cast<size_t>(count) * slot);
     }
-    if (config_.window > 0) return Status(ErrorCode::Unsupported, "external pages need full attention (no window)");
-    if (static_cast<int64_t>(pages.size()) * config_.page_tokens > config_.max_positions) {
-        return Status(ErrorCode::ContextFull, "attached prefix exceeds the context");
+}
+
+Status KvCache::read_rows(int32_t logical, int32_t n, uint8_t* out) const {
+    const uint8_t* page = page_data(logical);
+    if (page == nullptr || n < 1 || n > config_.page_tokens) {
+        return Status(ErrorCode::InvalidArgument, "read_rows: the page is not mapped or the count is out of range");
     }
-    external_.assign(pages.begin(), pages.end());
-    if (table_.size() < pages.size()) table_.resize(pages.size(), kUnmapped);
-    for (size_t p = 0; p < pages.size(); ++p) table_[p] = kExternalBase - static_cast<int32_t>(p);
+    if (n == config_.page_tokens) {
+        std::memcpy(out, page, page_bytes_);
+    } else {
+        copy_slots(page, config_.page_tokens, 0, out, n, 0, n);
+    }
     return Status::ok();
+}
+
+Status KvCache::write_rows(int32_t logical, const uint8_t* image, int32_t n, int32_t from, int32_t to) {
+    uint8_t* page = mutable_page_data(logical);
+    if (page == nullptr || n < 1 || n > config_.page_tokens || from < 0 || to > n || from > to) {
+        return Status(ErrorCode::InvalidArgument, "write_rows: the page is not mapped or the range is out of bounds");
+    }
+    if (from == 0 && to == config_.page_tokens) {
+        std::memcpy(page, image, page_bytes_);
+    } else if (from < to) {
+        copy_slots(image, n, from, page, config_.page_tokens, from, to - from);
+    }
+    return Status::ok();
+}
+
+void KvCache::image_to_page(const uint8_t* image, int32_t n, uint8_t* page) const noexcept {
+    if (n >= config_.page_tokens) {
+        std::memcpy(page, image, page_bytes_);
+        return;
+    }
+    std::memset(page, 0, page_bytes_);
+    copy_slots(image, n, 0, page, config_.page_tokens, 0, n);
+}
+
+Status KvCache::read_rows_at(int32_t pos, int32_t count, uint8_t* image, int32_t slots, int32_t first) const {
+    if (pos < 0 || count < 0 || first < 0 || slots < 1 || first + count > slots) {
+        return Status(ErrorCode::InvalidArgument, "read_rows_at: the slots are not inside the image");
+    }
+    // One copy per run of positions inside a page (copy_slots moves every
+    // plane and layer of the run).
+    for (int32_t done = 0; done < count;) {
+        const int32_t p = pos + done;
+        const int32_t slot = p % config_.page_tokens;
+        const int32_t run = std::min(count - done, config_.page_tokens - slot);
+        const uint8_t* page = page_data(p / config_.page_tokens);
+        if (page == nullptr) return Status(ErrorCode::InvalidArgument, "read_rows_at: a page is not mapped");
+        copy_slots(page, config_.page_tokens, slot, image, slots, first + done, run);
+        done += run;
+    }
+    return Status::ok();
+}
+
+Status KvCache::write_rows_at(int32_t pos, const uint8_t* image, int32_t slots, int32_t first, int32_t count) {
+    if (pos < 0 || count < 0 || first < 0 || slots < 1 || first + count > slots) {
+        return Status(ErrorCode::InvalidArgument, "write_rows_at: the slots are not inside the image");
+    }
+    for (int32_t done = 0; done < count;) {
+        const int32_t p = pos + done;
+        const int32_t slot = p % config_.page_tokens;
+        const int32_t run = std::min(count - done, config_.page_tokens - slot);
+        uint8_t* page = mutable_page_data(p / config_.page_tokens);
+        if (page == nullptr) return Status(ErrorCode::InvalidArgument, "write_rows_at: a page is not mapped");
+        copy_slots(image, slots, first + done, page, config_.page_tokens, slot, run);
+        done += run;
+    }
+    return Status::ok();
+}
+
+size_t KvCache::image_key_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept {
+    // The K plane: [layer][slot][kv_head][row], as a page with `slots` slots.
+    return ((static_cast<size_t>(layer) * static_cast<size_t>(slots) + static_cast<size_t>(slot)) *
+                static_cast<size_t>(config_.n_head_kv) +
+            static_cast<size_t>(kv_head)) *
+           row_bytes_;
+}
+
+size_t KvCache::image_value_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept {
+    const size_t key = image_key_offset(slots, layer, slot, kv_head);
+    if (config_.values_in_keys) return key + value_skip_;
+    // The V plane follows the K plane of the whole image.
+    return static_cast<size_t>(config_.n_layers) * static_cast<size_t>(slots) * static_cast<size_t>(config_.n_head_kv) *
+               row_bytes_ +
+           key;
 }
 
 uint8_t* KvCache::row(int32_t layer, int32_t pos, int32_t kv_head, bool value) const noexcept {
@@ -153,7 +234,7 @@ Status KvCache::scale_keys(int32_t end, std::span<const float> factors) {
         return Status(ErrorCode::InvalidArgument, "one key factor per layer, KV head and channel");
     }
     for (int32_t p = 0; p * config_.page_tokens < end; ++p) {
-        if (mutable_page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "keys on a page that is not owned");
+        if (mutable_page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "keys on a page that is not mapped");
     }
     std::vector<float> row_values(hd);
     for (int32_t layer = 0; layer < config_.n_layers; ++layer) {
@@ -181,7 +262,7 @@ const uint8_t* KvCache::v_row(int32_t layer, int32_t pos, int32_t kv_head) const
 
 void KvCache::free_page(size_t logical) noexcept {
     if (logical >= table_.size() || table_[logical] == kUnmapped) return;
-    if (table_[logical] >= 0) free_.push_back(table_[logical]);  // external pages are just unmapped
+    free_.push_back(table_[logical]);
     table_[logical] = kUnmapped;
 }
 
@@ -219,7 +300,6 @@ int32_t KvCache::sink_page_count() const noexcept {
 
 void KvCache::clear() noexcept {
     for (size_t p = 0; p < table_.size(); ++p) free_page(p);
-    external_.clear();
     released_below_ = 0;
 }
 

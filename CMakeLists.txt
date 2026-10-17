@@ -124,6 +124,8 @@ add_library(liyab_core OBJECT
   src/core/device_detect.cpp
   src/core/power_manager.cpp
   src/core/kv_cache.cpp
+  src/core/kv_store.cpp
+  src/core/kv_reuse.cpp
   src/core/triple_buffer_loader.cpp
   src/core/unicode.cpp
   src/core/regex.cpp
@@ -156,7 +158,6 @@ if(LIYAB_ENABLE_EXPERIMENTAL)
     src/experimental/egls.cpp
     src/experimental/jit_unpacker.cpp
     src/experimental/tdss.cpp
-    src/experimental/kv_dedup.cpp
     src/experimental/head_pruner.cpp
     src/experimental/io_uring_loader.cpp)
   target_compile_definitions(liyab_core PUBLIC LIYAB_ENABLE_EXPERIMENTAL=1)
@@ -348,6 +349,7 @@ if(LIYAB_BUILD_TESTS)
   enable_testing()
   set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden test_grammar)
   list(APPEND _liyab_tests test_pooling)
+  list(APPEND _liyab_tests test_kv_reuse)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()
@@ -379,6 +381,11 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)
   target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Segment reuse (KV reused away from its prefix): KL / top-1 against a full prefill and time to the first
+  # token on RAG-shaped prompts; the cost of turning keys alone.
+  add_executable(liyab-reuse tools/liyab_reuse.cpp)
+  target_link_libraries(liyab-reuse PRIVATE liyab_core)
+  target_include_directories(liyab-reuse PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Pooling models: embeddings and reranker scores against a Hugging Face reference, and their throughput.
   add_executable(liyab-embed tools/liyab_embed.cpp)
   target_link_libraries(liyab-embed PRIVATE liyab_core)
@@ -402,7 +409,8 @@ endif()
 # characters work. The library itself converts every path it opens (it cannot
 # rely on its host's manifest), and liyab-cli reads its UTF-16 command line.
 if(WIN32)
-  foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok liyab-embed)
+  foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok liyab-embed
+              liyab-reuse)
     if(TARGET ${exe})
       if(MSVC)
         target_sources(${exe} PRIVATE ${PROJECT_SOURCE_DIR}/cmake/windows/utf8.manifest)  # merged by mt.exe

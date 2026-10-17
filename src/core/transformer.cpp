@@ -800,6 +800,7 @@ void Transformer::reset() noexcept {
     }
     std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
     snapshots_.clear();
+    spare_buffers_.clear();
     n_past_ = 0;
 }
 
@@ -824,6 +825,9 @@ void Transformer::snapshot_state(bool pin) {
         while (victim + 1 < snapshots_.size() && snapshots_[victim].pinned) ++victim;
         snap = std::move(snapshots_[victim]);
         snapshots_.erase(snapshots_.begin() + static_cast<std::ptrdiff_t>(victim));
+    } else if (!spare_buffers_.empty()) {
+        snap.data = std::move(spare_buffers_.back());
+        spare_buffers_.pop_back();
     }
     snap.pinned = pin;
     snap.pos = n_past_;
@@ -868,47 +872,140 @@ std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
             static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
 }
 
+uint64_t Transformer::context_fingerprint() const noexcept {
+    const std::array<int64_t, 9> fp = state_fingerprint();
+    const uint64_t page = kv_->page_bytes();
+    const uint64_t seed = xxhash64(fp.data(), sizeof fp, xxhash64(&page, sizeof page));
+    return xxhash64(key_scale_.data(), key_scale_.size() * sizeof(float), seed);
+}
+
+std::vector<Transformer::KeptState> Transformer::kept_states() const {
+    std::vector<KeptState> kept;
+    if (states_.empty() || n_past_ == 0) return kept;
+    bool pinned_below = false;
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) {
+            kept.push_back({snap.pos, snap.pinned});
+            pinned_below = pinned_below || snap.pinned;
+        }
+    }
+    kept.push_back({n_past_, !pinned_below});  // as read_state() pins the end
+    return kept;
+}
+
+std::vector<std::span<const float>> Transformer::kept_state_parts(int32_t pos) const {
+    std::vector<std::span<const float>> parts;
+    if (states_.empty()) return parts;
+    if (pos == n_past_) {
+        for (const RecurrentState& st : states_) {
+            parts.emplace_back(st.conv);
+            parts.emplace_back(st.ssm);
+        }
+        return parts;
+    }
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos == pos) parts.emplace_back(snap.data);
+    }
+    return parts;
+}
+
+void Transformer::begin_restore() {
+    for (StateSnapshot& snap : snapshots_) spare_buffers_.push_back(std::move(snap.data));
+    snapshots_.clear();
+}
+
+std::vector<std::span<float>> Transformer::recurrent_parts() {
+    std::vector<std::span<float>> parts;
+    for (RecurrentState& st : states_) {
+        parts.emplace_back(st.conv);
+        parts.emplace_back(st.ssm);
+    }
+    return parts;
+}
+
+Transformer::StateBuffer Transformer::take_snapshot_buffer() {
+    StateBuffer buffer;
+    if (!spare_buffers_.empty()) {
+        buffer = std::move(spare_buffers_.back());
+        spare_buffers_.pop_back();
+    }
+    buffer.resize(recurrent_state_bytes() / sizeof(float));  // not zero-filled (StateBuffer)
+    return buffer;
+}
+
 Status Transformer::write_state(std::ostream& out) const {
     if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
-    put(out, kStateMagic);
-    put(out, kStateVersion);
-    for (const int64_t v : state_fingerprint()) put(out, v);
-    put(out, static_cast<uint64_t>(key_scale_.size()));
-    out.write(reinterpret_cast<const char*>(key_scale_.data()),
-              static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
-    put(out, n_past_);
-    const int32_t pages = (n_past_ + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
-    put(out, static_cast<uint64_t>(kv_->page_bytes()));
-    put(out, pages);
-    for (int32_t p = 0; p < pages; ++p) {
-        const uint8_t* data = kv_->page_data(p);
-        if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
-        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
-    }
-    put(out, static_cast<int32_t>(states_.size()));
-    for (const RecurrentState& st : states_) {
-        put(out, static_cast<uint64_t>(st.conv.size()));
-        put(out, static_cast<uint64_t>(st.ssm.size()));
-        out.write(reinterpret_cast<const char*>(st.conv.data()), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
-        out.write(reinterpret_cast<const char*>(st.ssm.data()), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
-    }
     // The snapshots below the end (one at the end is the states above), so a
     // restored context rewinds where the live one would: the next prompt
     // re-sends the last reply as text, which may encode differently, and
     // without the last prompt's snapshot a hybrid model would keep nothing.
     // The oldest (the system prompt's end) and the pinned one are enough; a
     // draft's is not worth its size (62.8 MiB each on a 35B).
-    std::vector<const StateSnapshot*> kept;
+    std::vector<SnapshotImage> kept;
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) kept.push_back(&snap);
+        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) {
+            kept.push_back({snap.pos, snap.pinned, snap.data});
+        }
     }
-    put(out, static_cast<int32_t>(kept.size()));
-    for (const StateSnapshot* snap : kept) {
-        put(out, snap->pos);
-        put(out, static_cast<uint8_t>(snap->pinned));
-        put(out, static_cast<uint64_t>(snap->data.size()));
-        out.write(reinterpret_cast<const char*>(snap->data.data()),
-                  static_cast<std::streamsize>(snap->data.size() * sizeof(float)));
+    return write_image(out, n_past_, [this](int32_t p) { return kv_->page_data(p); }, {}, kept, true);
+}
+
+Status Transformer::write_state(std::ostream& out, const ContextImage& image) const {
+    if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
+    const size_t floats = recurrent_state_bytes() / sizeof(float);
+    if (image.n < 0 || image.n > context_length_ || !image.page || image.state.size() != (states_.empty() ? 0 : floats) ||
+        static_cast<int32_t>(image.snapshots.size()) >= kStateSnapshots ||
+        (states_.empty() && !image.snapshots.empty())) {
+        return Status(ErrorCode::InvalidArgument, "the context image does not fit this model");
+    }
+    int32_t below = 0;
+    for (const SnapshotImage& snap : image.snapshots) {
+        if (snap.pos <= below || snap.pos >= image.n || snap.data.size() != floats) {
+            return Status(ErrorCode::InvalidArgument, "the context image's snapshots do not fit this model");
+        }
+        below = snap.pos;
+    }
+    return write_image(out, image.n, image.page, image.state, image.snapshots, false);
+}
+
+// The body of both write_state()s: `state` holds the recurrent states at n
+// as one image, or `live` takes them from states_ (no copy of the live ones).
+Status Transformer::write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
+                                std::span<const float> state, std::span<const SnapshotImage> snapshots,
+                                bool live) const {
+    put(out, kStateMagic);
+    put(out, kStateVersion);
+    for (const int64_t v : state_fingerprint()) put(out, v);
+    put(out, static_cast<uint64_t>(key_scale_.size()));
+    out.write(reinterpret_cast<const char*>(key_scale_.data()),
+              static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
+    put(out, n);
+    const int32_t pages = (n + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
+    put(out, static_cast<uint64_t>(kv_->page_bytes()));
+    put(out, pages);
+    for (int32_t p = 0; p < pages; ++p) {
+        const uint8_t* data = page(p);
+        if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
+    }
+    put(out, static_cast<int32_t>(states_.size()));
+    const float* from = state.data();
+    for (const RecurrentState& st : states_) {
+        put(out, static_cast<uint64_t>(st.conv.size()));
+        put(out, static_cast<uint64_t>(st.ssm.size()));
+        const float* conv = live ? st.conv.data() : from;
+        const float* ssm = live ? st.ssm.data() : from + st.conv.size();
+        out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
+        out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
+        if (!live) from += st.conv.size() + st.ssm.size();
+    }
+    put(out, static_cast<int32_t>(snapshots.size()));
+    for (const SnapshotImage& snap : snapshots) {
+        put(out, snap.pos);
+        put(out, static_cast<uint8_t>(snap.pinned));
+        put(out, static_cast<uint64_t>(snap.data.size()));
+        out.write(reinterpret_cast<const char*>(snap.data.data()),
+                  static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
     }
     return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
 }
@@ -1123,8 +1220,9 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     // Positions a query at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
     auto seen = [&](int32_t pos) { return seen_by(*kv_, pos, window); };
     auto spans_of = [&](int32_t t) {
-        const Seen s = seen(n_past_ + t);
-        return spans_for(s.sink_end - s.sink_begin + (n_past_ + t - s.first + 1));
+        const int32_t pos = pos_of(t);
+        const Seen s = seen(pos);
+        return spans_for(s.sink_end - s.sink_begin + (pos - s.first + 1));
     };
 
     // Span sp of token t for the query heads of KV head g. For head j of the
@@ -1136,7 +1234,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         thread_local std::vector<float> vrow;    // one V row, decoded (vd values)
         thread_local std::vector<float> dots;    // one K row against the group's queries
         thread_local std::vector<const quant::BlockQ8_0*> queries;  // the group's Q8_0 queries
-        const int32_t pos = n_past_ + t;
+        const int32_t pos = pos_of(t);
         // Visible positions: attention sinks [sink_begin, sink_end) + [first, pos].
         const Seen vis = seen(pos);
         const int32_t n_sinks = vis.sink_end - vis.sink_begin;
@@ -1657,7 +1755,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
         if (!norm_after_rope) qk_norm(L, q, k);
-        const int32_t pos = n_past_ + static_cast<int32_t>(t);
+        const int32_t pos = pos_of(static_cast<int32_t>(t));
         if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
         rope(q, c.n_head, pos, rope_table);
         rope(k, c.n_head_kv, pos, rope_table);
@@ -2099,7 +2197,7 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     double form_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     for (size_t t = 0; t < un; ++t) {
         float* k = k_.data() + t * kd;
-        const int32_t pos = n_past_ + static_cast<int32_t>(t);
+        const int32_t pos = pos_of(static_cast<int32_t>(t));
         if (expanded) {
             // Queries stay [q_nope | q_pe] per head; only q_pe turns. Keys are
             // stored scaled as in the absorbed form (the cache is shared).
@@ -2783,6 +2881,298 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     return Status::ok();
 }
 
+void Transformer::size_batch(int32_t n) {
+    const ModelConfig& c = config_;
+    const size_t d = static_cast<size_t>(c.n_embd);
+    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
+    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const auto un = static_cast<size_t>(n);
+    x_.resize(un * d);
+    xb_.resize(un * std::max(d, q_dim));
+    q_.resize(un * q_dim);
+    k_.resize(un * kv_dim);
+    v_.resize(un * kv_dim);
+    att_.resize(un * q_dim);
+}
+
+Status Transformer::embed(std::span<const int32_t> tokens, std::span<float> x) const {
+    const ModelConfig& c = config_;
+    const auto d = static_cast<size_t>(c.n_embd);
+    if (x.size() < tokens.size() * d) return Status(ErrorCode::InvalidArgument, "embed: output buffer too small");
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        if (tokens[t] < 0 || tokens[t] >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "token id out of range");
+        quant::dequantize_row(token_embd_->type, token_embd_->row(tokens[t]), x.data() + t * d, c.n_embd);
+    }
+    if (c.embd_scale != 1.0f) {
+        for (size_t i = 0; i < tokens.size() * d; ++i) x[i] *= c.embd_scale;
+    }
+    return Status::ok();
+}
+
+Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                              const HeadMaskHook* head_mask, FfnSkipHook* ffn_skip, FfnMatmulHook* ffn_hook) {
+    const ModelConfig& c = config_;
+    const size_t d = static_cast<size_t>(c.n_embd);
+    const auto un = static_cast<size_t>(n);
+    const Layer& L = layers_[static_cast<size_t>(l)];
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
+    const bool moe = plan.ffn == FfnKind::Moe;
+    const Route cpu_route{route.cpu, route.cpu, route.cpu};
+    const Route& block_route = w.streamed() ? cpu_route : route;
+    // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
+    auto post_norm = [&](const std::vector<float>& weight) {
+        if (weight.empty()) return;
+        for (size_t t = 0; t < un; ++t) {
+            float* row = xb_.data() + t * d;
+            rmsnorm(row, weight.data(), row, c.n_embd, c.rms_eps);
+        }
+    };
+
+    // --- expert prefetch for the first block (the others are predicted
+    // one block ahead, see predict_experts) ---
+    if (expert_store_ != nullptr && l == 0) predict_experts(0, n, route);
+
+    // --- token mixer (attention or DeltaNet) ---
+    if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
+    for (size_t t = 0; t < un; ++t) {
+        rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+    }
+    if (plan.mixer == MixerKind::DeltaNet) {
+        const PhaseTimer timer(phases_.delta_net);
+        LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
+    } else if (plan.latent) {
+        const PhaseTimer timer(phases_.attention);
+        LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,
+                                                     head_mask != nullptr ? head_mask->mask(l) : nullptr));
+    } else {
+        const PhaseTimer timer(phases_.attention);
+        LIYAB_RETURN_IF_ERROR(
+            attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
+    }
+    post_norm(L.post_mixer_norm);
+    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    // A MoE block predicts the next one once its own experts are queued (moe_ffn).
+    if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
+
+    // --- FFN block: dense SwiGLU or mixture of experts (skippable by an experimental hook) ---
+    if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
+        ++last_ffn_skips_;
+        if (expert_store_ != nullptr && moe) predict_experts(l + 1, n, route);
+        return Status::ok();
+    }
+    for (size_t t = 0; t < un; ++t) {
+        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+    }
+    if (moe) {
+        LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
+    } else {
+        const PhaseTimer timer(phases_.dense_ffn);
+        LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
+    }
+    post_norm(L.post_ffn_norm);
+    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    return Status::ok();
+}
+
+Status Transformer::run_block_at(int32_t layer, std::span<const int32_t> positions, std::span<float> x,
+                                 int32_t chunk, const Route& route, ThreadPool& pool) {
+    LIYAB_RETURN_IF_ERROR(reuse_support());
+    const ModelConfig& c = config_;
+    const size_t d = static_cast<size_t>(c.n_embd);
+    if (layer < 0 || layer >= c.n_layers || chunk < 1 || x.size() != positions.size() * d) {
+        return Status(ErrorCode::InvalidArgument, "run_block_at: the block, the pass size or the rows do not fit");
+    }
+    for (size_t i = 0; i < positions.size(); ++i) {
+        if (positions[i] < 0 || positions[i] >= n_past_ || (i > 0 && positions[i] <= positions[i - 1])) {
+            return Status(ErrorCode::InvalidArgument, "run_block_at: positions must ascend inside the context");
+        }
+    }
+    if (route.attention == nullptr || route.ffn == nullptr || route.cpu == nullptr) {
+        return Status(ErrorCode::InvalidArgument, "incomplete backend route");
+    }
+    if (positions.empty()) return Status::ok();
+    // Acquired once for every pass: a layer source streams blocks in order.
+    const BlockWeights w(*this, layer);
+    LIYAB_RETURN_IF_ERROR(w.status());
+    predicted_layer_ = -1;  // a guess made for another batch is no use to these tokens
+    // Scattered positions attend in the absorbed form: the expanded form's tiles
+    // assume a contiguous pass (latent_visible), and forward() may have left it on.
+    latent_expanded_ = false;
+    Status status;
+    for (size_t i = 0; i < positions.size() && status.is_ok(); i += static_cast<size_t>(chunk)) {
+        const size_t m = std::min(static_cast<size_t>(chunk), positions.size() - i);
+        size_batch(static_cast<int32_t>(m));
+        std::copy_n(x.data() + i * d, m * d, x_.data());
+        positions_ = positions.subspan(i, m);
+        status = run_block(layer, w, static_cast<int32_t>(m), route, pool, nullptr, nullptr, nullptr);
+        positions_ = {};
+        if (status.is_ok()) std::copy_n(x_.data(), m * d, x.data() + i * d);
+    }
+    return status;
+}
+
+Status Transformer::reuse_support() const {
+    const ModelConfig& c = config_;
+    if (c.hybrid()) {
+        return Status(ErrorCode::Unsupported,
+                      "hybrid model: its recurrent (DeltaNet) blocks must run over the whole prompt in order, so "
+                      "every token would still go through every block; reusing the attention blocks' keys and "
+                      "values would only save their key and value projections");
+    }
+    if (kv_->window() > 0) {
+        return Status(ErrorCode::Unsupported, "a sliding-window cache releases the positions it no longer shows");
+    }
+    if (c.spec->qk_norm == QkNormOrder::AfterRope) {
+        for (const Layer& L : layers_) {
+            for (size_t i = 0; i < L.k_norm.size() && i < static_cast<size_t>(c.rope_dim); ++i) {
+                if (L.k_norm[i] == 0.0f) {
+                    return Status(ErrorCode::Unsupported,
+                                  "a key norm after RoPE zeroes a rotated channel, so stored keys cannot be turned");
+                }
+            }
+        }
+    }
+    return Status::ok();
+}
+
+Status Transformer::swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past) {
+    if (config_.hybrid() || !states_.empty()) {
+        return Status(ErrorCode::Unsupported, "swap_context: recurrent states are part of the context");
+    }
+    if (!kv) return Status(ErrorCode::InvalidArgument, "swap_context: no cache");
+    const KvCacheConfig& a = kv_->config();
+    const KvCacheConfig& b = kv->config();
+    if (a.n_layers != b.n_layers || a.n_head_kv != b.n_head_kv || a.head_dim != b.head_dim || a.type != b.type ||
+        a.page_tokens != b.page_tokens || a.values_in_keys != b.values_in_keys || a.value_offset != b.value_offset ||
+        a.window != b.window || n_past < 0 || n_past > b.max_positions) {
+        return Status(ErrorCode::InvalidArgument, "swap_context: a cache of another layout");
+    }
+    std::swap(kv_, kv);
+    std::swap(n_past_, n_past);
+    return Status::ok();
+}
+
+Result<std::unique_ptr<KvCache>> Transformer::make_kv_cache(int32_t positions) const {
+    KvCacheConfig c = kv_->config();
+    c.max_positions = std::max(positions, 1);
+    return KvCache::create(c);
+}
+
+Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int32_t count, int32_t from, int32_t to,
+                              ThreadPool* pool) const {
+    if (slots < 1 || first < 0 || count < 0 || first + count > slots || from < 0 || to < 0) {
+        return Status(ErrorCode::InvalidArgument, "move_keys: the slots or positions do not fit");
+    }
+    LIYAB_RETURN_IF_ERROR(reuse_support());
+    const ModelConfig& c = config_;
+    // Nothing turns: every row keeps its bits.
+    if (count == 0 || from == to || c.rope_dim == 0) return Status::ok();
+    const DType type = kv_->dtype();
+    const int32_t half = c.rope_dim / 2;
+    const bool halves = c.spec->rope == RopeLayout::Halves;
+    const auto hd = static_cast<size_t>(c.head_dim);
+    // The leading channels a move touches: the rotated ones, in whole blocks
+    // of a quantized row (the blocks after them keep their bits).
+    const int32_t block = quant::is_block_quantized(type) ? quant::kBlock : 1;
+    const int32_t touched = std::min(c.head_dim, (c.rope_dim + block - 1) / block * block);
+    const bool norm_after = c.spec->qk_norm == QkNormOrder::AfterRope;
+
+    // Each table's turns, back from the stored positions and on to the new
+    // ones, computed as rope() computes them (the same float operations).
+    struct Turns {
+        std::vector<float> cos_from, sin_from, cos_to, sin_to;  // [position][pair]
+    };
+    std::vector<Turns> turns(rope_tables_.size());
+    auto turns_of = [&](size_t table) -> const Turns& {
+        Turns& t = turns[table];
+        if (!t.cos_from.empty() || half == 0) return t;
+        const RopeTable& rt = rope_tables_[table];
+        const auto n = static_cast<size_t>(count) * static_cast<size_t>(half);
+        t.cos_from.resize(n);
+        t.sin_from.resize(n);
+        t.cos_to.resize(n);
+        t.sin_to.resize(n);
+        for (int32_t i = 0; i < count; ++i) {
+            const float pf = static_cast<float>(from + i) / rt.scale;
+            const float pt = static_cast<float>(to + i) / rt.scale;
+            for (int32_t j = 0; j < half; ++j) {
+                const size_t at = static_cast<size_t>(i) * static_cast<size_t>(half) + static_cast<size_t>(j);
+                const float tf = pf * rt.inv_freq[static_cast<size_t>(j)];
+                const float tt = pt * rt.inv_freq[static_cast<size_t>(j)];
+                t.cos_from[at] = std::cos(tf);
+                t.sin_from[at] = std::sin(tf);
+                t.cos_to[at] = std::cos(tt);
+                t.sin_to[at] = std::sin(tt);
+            }
+        }
+        return t;
+    };
+    // Per attention block: its table and, per KV head and touched channel,
+    // what the stored value is multiplied by to get the rotated one (the key
+    // scale over a norm-after-RoPE weight) and back.
+    struct Slot {
+        const Turns* turns = nullptr;
+        std::vector<float> unscale, rescale;  // [kv_head][touched channel]
+    };
+    std::vector<Slot> blocks;
+    for (const Layer& L : layers_) {
+        if (L.kv_slot < 0) continue;
+        if (static_cast<size_t>(L.kv_slot) >= blocks.size()) blocks.resize(static_cast<size_t>(L.kv_slot) + 1);
+        Slot& s = blocks[static_cast<size_t>(L.kv_slot)];
+        s.turns = &turns_of(static_cast<size_t>(L.rope_table));
+        s.unscale.assign(static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(touched), 1.0f);
+        s.rescale.assign(s.unscale.size(), 1.0f);
+        for (size_t g = 0; g < static_cast<size_t>(c.n_head_kv); ++g) {
+            for (size_t i = 0; i < static_cast<size_t>(touched); ++i) {
+                float f = key_scale_.empty() ? 1.0f : key_scale_[(static_cast<size_t>(L.kv_slot) * static_cast<size_t>(c.n_head_kv) + g) * hd + i];
+                if (norm_after && !L.k_norm.empty()) f /= L.k_norm[i];
+                s.unscale[g * static_cast<size_t>(touched) + i] = f;
+                s.rescale[g * static_cast<size_t>(touched) + i] = 1.0f / f;
+            }
+        }
+    }
+    const auto n_blocks = static_cast<int64_t>(blocks.size());
+    auto move = [&](int64_t begin, int64_t end) {
+        thread_local std::vector<float> row;
+        row.resize(static_cast<size_t>(touched));
+        for (int64_t task = begin; task < end; ++task) {
+            const auto slot = static_cast<int32_t>(task % n_blocks);
+            const auto i = static_cast<int32_t>(task / n_blocks);
+            const Slot& s = blocks[static_cast<size_t>(slot)];
+            if (s.turns == nullptr) continue;
+            const size_t at = static_cast<size_t>(i) * static_cast<size_t>(half);
+            for (int32_t g = 0; g < c.n_head_kv; ++g) {
+                uint8_t* r = image + kv_->image_key_offset(slots, slot, first + i, g);
+                quant::dequantize_row(type, r, row.data(), touched);
+                const float* un = s.unscale.data() + static_cast<size_t>(g) * static_cast<size_t>(touched);
+                const float* re = s.rescale.data() + static_cast<size_t>(g) * static_cast<size_t>(touched);
+                for (int32_t ch = 0; ch < c.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= un[ch];
+                for (int32_t j = 0; j < half; ++j) {
+                    const int32_t a = halves ? j : 2 * j;
+                    const int32_t b = halves ? j + half : 2 * j + 1;
+                    const size_t k = at + static_cast<size_t>(j);
+                    const float r0 = row[static_cast<size_t>(a)];
+                    const float r1 = row[static_cast<size_t>(b)];
+                    // Back by the stored position's angle, then on by the new one's.
+                    const float x0 = r0 * s.turns->cos_from[k] + r1 * s.turns->sin_from[k];
+                    const float x1 = r1 * s.turns->cos_from[k] - r0 * s.turns->sin_from[k];
+                    row[static_cast<size_t>(a)] = x0 * s.turns->cos_to[k] - x1 * s.turns->sin_to[k];
+                    row[static_cast<size_t>(b)] = x0 * s.turns->sin_to[k] + x1 * s.turns->cos_to[k];
+                }
+                for (int32_t ch = 0; ch < c.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= re[ch];
+                quant::quantize_row(type, row.data(), r, touched);
+            }
+        }
+    };
+    const int64_t tasks = int64_t{count} * n_blocks;
+    if (pool != nullptr && tasks >= 64) {
+        pool->parallel_for(tasks, move);
+    } else {
+        move(0, tasks);
+    }
+    return Status::ok();
+}
+
 Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tokens, Logits logits,
                                                     const Route& route, ThreadPool& pool, const ForwardHooks* hooks) {
     const ModelConfig& c = config_;
@@ -2837,87 +3227,17 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
                                (latent_form_ == LatentForm::Auto && latent_chooser_.expand(latent_work));
         }
     }
-
-    const size_t d = static_cast<size_t>(c.n_embd);
-    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
-    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
     const auto un = static_cast<size_t>(n);
-    x_.resize(un * d);
-    xb_.resize(un * std::max(d, q_dim));
-    q_.resize(un * q_dim);
-    k_.resize(un * kv_dim);
-    v_.resize(un * kv_dim);
-    att_.resize(un * q_dim);
-    for (size_t t = 0; t < un; ++t) {
-        quant::dequantize_row(token_embd_->type, token_embd_->row(tokens[t]), x_.data() + t * d, c.n_embd);
-    }
-    if (c.embd_scale != 1.0f) {
-        for (float& v : x_) v *= c.embd_scale;
-    }
-    // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
-    auto post_norm = [&](const std::vector<float>& weight) {
-        if (weight.empty()) return;
-        for (size_t t = 0; t < un; ++t) {
-            float* row = xb_.data() + t * d;
-            rmsnorm(row, weight.data(), row, c.n_embd, c.rms_eps);
-        }
-    };
+    size_batch(n);
+    LIYAB_RETURN_IF_ERROR(embed(tokens, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
 
     for (int32_t l = 0; l < c.n_layers; ++l) {
         if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
             return Status(ErrorCode::Cancelled, "forward pass cancelled");
         }
-        const Layer& L = layers_[static_cast<size_t>(l)];
-        const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
-        const bool moe = plan.ffn == FfnKind::Moe;
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
-        const Route cpu_route{route.cpu, route.cpu, route.cpu};
-        const Route& block_route = w.streamed() ? cpu_route : route;
-
-        // --- expert prefetch for the first block (the others are predicted
-        // one block ahead, see predict_experts) ---
-        if (expert_store_ != nullptr && l == 0) predict_experts(0, n, route);
-
-        // --- token mixer (attention or DeltaNet) ---
-        if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
-        for (size_t t = 0; t < un; ++t) {
-            rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
-        }
-        if (plan.mixer == MixerKind::DeltaNet) {
-            const PhaseTimer timer(phases_.delta_net);
-            LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
-        } else if (plan.latent) {
-            const PhaseTimer timer(phases_.attention);
-            LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,
-                                                         head_mask != nullptr ? head_mask->mask(l) : nullptr));
-        } else {
-            const PhaseTimer timer(phases_.attention);
-            LIYAB_RETURN_IF_ERROR(
-                attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
-        }
-        post_norm(L.post_mixer_norm);
-        for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
-        // A MoE block predicts the next one once its own experts are queued (moe_ffn).
-        if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
-
-        // --- FFN block: dense SwiGLU or mixture of experts (skippable by an experimental hook) ---
-        if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
-            ++last_ffn_skips_;
-            if (expert_store_ != nullptr && moe) predict_experts(l + 1, n, route);
-        } else {
-            for (size_t t = 0; t < un; ++t) {
-                rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
-            }
-            if (moe) {
-                LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
-            } else {
-                const PhaseTimer timer(phases_.dense_ffn);
-                LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
-            }
-            post_norm(L.post_ffn_norm);
-            for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
-        }
+        LIYAB_RETURN_IF_ERROR(run_block(l, w, n, route, pool, head_mask, ffn_skip, ffn_hook));
 
         // --- early-exit probe (experimental) ---
         if (early_exit != nullptr && early_exit->probe_after(l, c.n_layers)) {
@@ -2951,17 +3271,42 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     return std::span<const float>(logits_.data(), logits_.size());
 }
 
-Status Transformer::adopt_cached_prefix(int32_t n) {
-    if (config_.hybrid()) {
-        return Status(ErrorCode::Unsupported, "cached KV prefixes do not include recurrent (DeltaNet) states");
+Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end) {
+    auto fail = [this](const char* why) {
+        reset();
+        return Status(ErrorCode::InvalidArgument, why);
+    };
+    const size_t floats = recurrent_state_bytes() / sizeof(float);
+    if (n < 0 || n > context_length_ || kv_->window() > 0) return fail("the context does not fit this cache");
+    if (static_cast<int32_t>(snapshots.size()) >= kStateSnapshots || (states_.empty() && !snapshots.empty())) {
+        return fail("the context's recurrent states do not fit this model");
     }
-    if (n_past_ != 0 || n < 0 || n > context_length_) {
-        return Status(ErrorCode::InvalidArgument, "a cached prefix can only be adopted by an empty context");
+    int32_t below = 0;
+    for (const OwnedSnapshot& snap : snapshots) {
+        if (snap.pos <= below || snap.pos >= n || snap.data.size() != floats) {
+            return fail("the context's state snapshots do not fit this model");
+        }
+        below = snap.pos;
     }
     for (int32_t p = 0; p * kv_->config().page_tokens < n; ++p) {
-        if (kv_->page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "cached prefix pages are not mapped");
+        if (kv_->page_data(p) == nullptr) return fail("the context's cache pages are not mapped");
+    }
+    if (n == 0) {
+        reset();
+        return Status::ok();
+    }
+    if (Status s = kv_->truncate(n); !s.is_ok()) return fail("cannot truncate the cache");
+    std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
+    // A restore normally starts from begin_restore(), which moved the
+    // snapshots' buffers to spare_buffers_; any left here are kept the same way.
+    for (StateSnapshot& snap : snapshots_) spare_buffers_.push_back(std::move(snap.data));
+    snapshots_.clear();
+    for (OwnedSnapshot& snap : snapshots) {
+        snapshots_.push_back(StateSnapshot{snap.pos, std::move(snap.data), snap.pinned});
     }
     n_past_ = n;
+    snapshot_state(pin_end);  // in a kept buffer when one is left
+    spare_buffers_.clear();   // the others: never more memory than before the restore
     return Status::ok();
 }
 

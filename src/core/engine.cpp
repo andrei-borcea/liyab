@@ -4,8 +4,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -14,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <thread>
 
 #include "core/chat_template.h"
 #include "core/grammar.h"
@@ -24,6 +27,8 @@
 #include "core/tokenizer.h"
 #include "core/direct_io.h"
 #include "core/key_scaling.h"
+#include "core/kv_reuse.h"
+#include "core/kv_store.h"
 #include "core/os.h"
 #include "core/pooling.h"
 #include "core/transformer.h"
@@ -37,7 +42,6 @@
 #include "liyab/experimental/early_exit.h"
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/tdss.h"
-#include "liyab/experimental/kv_dedup.h"
 #include "liyab/experimental/head_pruner.h"
 #endif
 
@@ -301,6 +305,65 @@ struct Engine::Impl {
     // diverge at the first such reply and, on a hybrid model, start over.
     std::string context_text;
     size_t context_text_tokens = 0;
+    // Where the last prompt generate() processed ends in `context` (or the
+    // end of what a restore or load_state() brought back): a prompt that
+    // leaves the context before it belongs to another conversation, or
+    // branches this one (an edited message), and the prefix cache sets the
+    // context aside; one that leaves it after edits a draft typed ahead.
+    size_t last_prompt_end = 0;
+    // Segment reuse (EngineConfig::segment_reuse, core/kv_reuse.h). `reuse`
+    // holds the calibrated settings and `reuse_info` whether it is on (set at
+    // creation, or when the background calibration ends: under `busy`, and
+    // under reuse_info_mutex for segment_reuse()). `exact_end` is the first position of
+    // `context` whose rows were reused away from their prefix (kExact:
+    // none): a request that did not opt in never continues them, and the
+    // prefix cache never keeps them, so its restores stay exact. The request
+    // being served: its segments as given (`request_marks`, byte offsets, or
+    // token indices with `request_marks_tokens`), as token ranges
+    // (`request_segments`), and whether it opted in (`request_reuse`).
+    static constexpr size_t kExact = SIZE_MAX;
+    ReuseSettings reuse;
+    SegmentReuseInfo reuse_info;
+    mutable std::mutex reuse_info_mutex;
+    // The calibration, run in the background (calibrate_in_background): the
+    // job, the prompts' style (the chat template's), the context it runs on
+    // (swapped with the conversation's for each stage), its thread, and how
+    // calls stop it: each one counts itself in `calls_in_flight` and sets
+    // `calibration_stop`, which the calibration checks between blocks.
+    std::unique_ptr<ReuseCalibrator> calibrator;
+    ReusePromptStyle reuse_style;
+    std::unique_ptr<KvCache> calibration_kv;
+    int32_t calibration_n_past = 0;
+    std::thread calibration_thread;
+    std::mutex calibration_mutex;  // calibration_closing, last_call
+    std::condition_variable calibration_wake;
+    bool calibration_closing = false;
+    Clock::time_point last_call = Clock::now();  // when the last call ended (or the engine was made)
+    std::atomic<int32_t> calls_in_flight{0};
+    std::atomic<bool> calibration_holds{false};  // the calibration has `busy`
+    std::atomic<bool> calibration_stop{false};
+    size_t exact_end = kExact;
+    std::span<const PromptSegment> request_marks;
+    bool request_marks_tokens = false;
+    std::vector<TokenSegment> request_segments;
+    bool request_reuse = false;
+    // Sets the request's segments for the scope of one call.
+    struct Request {
+        Impl& s;
+        Request(Impl& impl, std::span<const PromptSegment> marks, bool tokens) : s(impl) {
+            s.request_marks = marks;
+            s.request_marks_tokens = tokens;
+            s.request_segments.clear();
+            s.request_reuse = !marks.empty() && s.reuse_info.status.is_ok() && s.store != nullptr;
+        }
+        ~Request() {
+            s.request_marks = {};
+            s.request_segments.clear();
+            s.request_reuse = false;
+        }
+        Request(const Request&) = delete;
+        Request& operator=(const Request&) = delete;
+    };
 
     void clear_context() {
         target->reset();
@@ -308,6 +371,8 @@ struct Engine::Impl {
         context.clear();
         context_text.clear();
         context_text_tokens = 0;
+        last_prompt_end = 0;
+        exact_end = kExact;
     }
 
     // Moves `end` back over the text that tokens[i] stands for at the end of
@@ -344,6 +409,37 @@ struct Engine::Impl {
         }
     }
 
+    // The text of `context`'s first n tokens and how many of them it covers,
+    // as cut_text(n) would leave them (empty and 0: not known).
+    std::pair<std::string_view, size_t> text_of(size_t n) const {
+        if (n >= context_text_tokens) return {context_text, context_text_tokens};
+        size_t end = context_text.size();
+        for (size_t i = context_text_tokens; i-- > n;) {
+            if (!step_back(context, context_text, end, i)) return {{}, 0};
+        }
+        return n > 0 ? std::pair<std::string_view, size_t>(std::string_view(context_text).substr(0, end), n)
+                     : std::pair<std::string_view, size_t>({}, 0);
+    }
+
+    // Segment reuse: a request that did not opt in never continues rows
+    // reused away from their prefix: the context goes back to the first of
+    // them, and what follows is processed again (any position restores on
+    // the attention-only models segment reuse runs on).
+    void drop_approximate() {
+        const size_t keep = exact_end;
+        LIYAB_LOG_INFO("segment reuse: the context's reused rows (from token %zu of %zu) are processed again for a "
+                       "request that does not reuse segments",
+                       keep, context.size());
+        if (keep == 0 || !target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+            clear_context();
+            return;
+        }
+        cut_text(keep);
+        context.resize(keep);
+        last_prompt_end = std::min(last_prompt_end, keep);
+        exact_end = kExact;
+    }
+
     // Tokens for `text`. When it continues a text the engine knows (this
     // context's, or a context set aside in the prefix cache, which running
     // the prompt then restores), that text's own tokens followed by the
@@ -352,6 +448,43 @@ struct Engine::Impl {
     // would recompute from a state snapshot before it.
     Result<std::vector<int32_t>> encode_continuation(std::string_view text, bool add_bos) const {
         const bool bos = add_bos && tokenizer->add_bos_default();
+        const KnownText k = known_text(text);
+        if (k.tokens != nullptr) {
+            auto rest = tokenizer->encode_continuation(text.substr(k.bytes), (*k.tokens)[k.count - 1]);
+            if (!rest) return rest.status();
+            std::vector<int32_t> tokens(k.tokens->begin(), k.tokens->begin() + static_cast<std::ptrdiff_t>(k.count));
+            tokens.insert(tokens.end(), rest->begin(), rest->end());
+            return tokens;
+        }
+        return tokenizer->encode(text, bos);
+    }
+
+    // Segment reuse: tokens for a request's text with marked segments, as
+    // encode_continuation() finds the text it continues; the rest is split
+    // at the segments' boundaries (encode_segmented), whose token ranges go
+    // to request_segments. A segment inside the known text needs no reuse
+    // (the context or the prefix cache restores it exactly).
+    Result<std::vector<int32_t>> encode_segments(std::string_view text, bool add_bos) {
+        const KnownText k = known_text(text);
+        std::vector<int32_t> tokens;
+        if (k.tokens != nullptr) {
+            tokens.assign(k.tokens->begin(), k.tokens->begin() + static_cast<std::ptrdiff_t>(k.count));
+        }
+        request_segments.clear();
+        LIYAB_RETURN_IF_ERROR(encode_segmented(*tokenizer, text, k.tokens != nullptr ? k.bytes : 0, request_marks,
+                                               add_bos && tokenizer->add_bos_default(), tokens, request_segments));
+        return tokens;
+    }
+
+    // The tokens a text a request sends starts with, when it continues a
+    // text the engine knows (see encode_continuation): those tokens (count
+    // of them, spelling its first `bytes` bytes), or none.
+    struct KnownText {
+        const std::vector<int32_t>* tokens = nullptr;
+        size_t count = 0;
+        size_t bytes = 0;
+    };
+    KnownText known_text(std::string_view text) const {
         const std::vector<int32_t>* known = nullptr;
         size_t known_tokens = 0, known_bytes = 0;
         // The rest of the prompt is encoded from a character's first byte:
@@ -381,7 +514,9 @@ struct Engine::Impl {
             }
         };
         if (!draft) {
-            for (const PrefixEntry& e : prefix_cache) consider(e.tokens, e.text, e.text_tokens);
+            if (store) {
+                for (const KvStore::Record* r : store->records()) consider(r->tokens, r->text, r->text_tokens);
+            }
             consider(context, context_text, context_text_tokens);  // preferred on a tie: nothing to restore
             // A prompt that leaves this context's text partway (a draft edited,
             // a message prepared ahead then typed over): the context's tokens
@@ -410,14 +545,7 @@ struct Engine::Impl {
                 }
             }
         }
-        if (known != nullptr) {
-            auto rest = tokenizer->encode_continuation(text.substr(known_bytes), (*known)[known_tokens - 1]);
-            if (!rest) return rest.status();
-            std::vector<int32_t> tokens(known->begin(), known->begin() + static_cast<std::ptrdiff_t>(known_tokens));
-            tokens.insert(tokens.end(), rest->begin(), rest->end());
-            return tokens;
-        }
-        return tokenizer->encode(text, bos);
+        return {known, known_tokens, known_bytes};
     }
 
     // After a run over `prompt` (the encoding of `text`): records the text the
@@ -433,204 +561,347 @@ struct Engine::Impl {
         context_text_tokens = context.size();
     }
 
-    // Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir):
-    // contexts set aside when a prompt from another conversation replaced
-    // them (the chat, the assistant sheet, a background agent, other apps
-    // through an API), kept as serialized states (KV pages and recurrent
-    // states) with the text they encode, in an LRU of bounded size. A prompt
-    // that continues one of them restores it instead of processing it again.
-    // Only contexts the new prompt shares less than half of are set aside:
-    // edits within a conversation keep using the context's own snapshots.
-    // RAM holds what prefix_cache_mb allows; the rest, or everything when it
-    // is 0, goes to files in prefix_cache_dir: a phone's RAM is better spent
-    // on weights, and its storage writes and reads back a ~100 MB context in
-    // a fraction of a second, where processing it again takes minutes.
-    struct PrefixEntry {
-        std::vector<int32_t> tokens;
-        std::string state;  // Transformer::write_state, while in RAM
-        std::string file;   // where the state is, once on storage (`state` empty)
-        size_t bytes = 0;   // the state's size
-        std::string text;   // what its first text_tokens tokens encode (see context_text)
-        size_t text_tokens = 0;
-        uint64_t last_use = 0;
-    };
-    std::vector<PrefixEntry> prefix_cache;
-    size_t prefix_cache_budget = 0;       // RAM, bytes
-    size_t prefix_cache_disk_budget = 0;  // storage, bytes (0: no storage tier)
-    std::string prefix_cache_dir;
-    uint64_t prefix_clock = 0;
+    // Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir,
+    // prefix_cache_disk_mb): contexts set aside when a prompt from another
+    // conversation replaced them (the chat, the assistant sheet, a background
+    // agent, other apps through an API) or an embedding call took the
+    // context, and the context left when the engine is destroyed (storage
+    // tier only), kept with the text they encode in a content-addressed store
+    // of KV chunks (core/kv_store.h). A prompt that continues one restores it
+    // instead of processing it again, up to where they diverge; a prefix
+    // several conversations share (system prompt, tools) is stored once and
+    // restored for any of them. A context is set aside when a prompt replaces
+    // it (see reuse_prefix: another conversation, or a branch of this one),
+    // not for a draft edited after the last reply, which keeps using the
+    // context's own snapshots. RAM holds what prefix_cache_mb allows, the
+    // rest goes to files in prefix_cache_dir, where later engines and
+    // processes find it: a phone's RAM is better spent on weights, and its
+    // storage writes and reads back a ~100 MB context in a fraction of a
+    // second, where processing it again takes minutes.
+    std::unique_ptr<KvStore> store;
     static constexpr size_t kMinPrefixEntry = 128;  // shorter contexts are cheaper to process again
+    // Engine::prefix_cache_stats(): updated after each use of the store,
+    // behind a lock of its own, so a monitor may read them while a
+    // generation runs.
+    mutable std::mutex prefix_stats_mutex;
+    PrefixCacheStats prefix_stats;
 
-    [[nodiscard]] bool prefix_cache_on() const { return prefix_cache_budget > 0 || prefix_cache_disk_budget > 0; }
+    [[nodiscard]] bool prefix_cache_on() const { return store != nullptr; }
 
     ~Impl() {
-        for (const PrefixEntry& e : prefix_cache) {
-            if (!e.file.empty()) os::remove_file(e.file);
+        stop_calibration();
+        // The context left goes to storage, so a later engine or process
+        // continues it instead of processing it again. Best effort: a
+        // destructor cannot report a failure.
+        if (!store || !store->has_storage() || !target || draft) return;
+        try {
+            stash_context(/*storage_only=*/true);
+        } catch (...) {
+            LIYAB_LOG_WARN("prefix cache: the context could not be set aside");
         }
     }
 
-    size_t prefix_cache_bytes(bool on_storage) const {
-        size_t bytes = 0;
-        for (const PrefixEntry& e : prefix_cache) {
-            if (e.file.empty() != on_storage) bytes += e.bytes;
-        }
-        return bytes;
-    }
-
-    // The file of entry `id` (its last_use, unique in this engine): the
-    // process id keeps other processes (or an earlier one) from colliding,
-    // the engine's address the other engines of this one.
-    std::string prefix_file(uint64_t id) const {
-        return prefix_cache_dir + "/ctx-" + std::to_string(os::process_id()) + "-" +
-               std::to_string(reinterpret_cast<uintptr_t>(this)) + "-" + std::to_string(id) + ".state";
-    }
-
-    // Writes entry `id`'s state to storage; the file, or empty when it could not be written.
-    std::string write_prefix_file(uint64_t id, const std::function<Status(std::ostream&)>& write) const {
-        const std::string path = prefix_file(id);
-        std::ofstream out(os::utf8_path(path), std::ios::binary | std::ios::trunc);
-        if (out && write(out).is_ok() && out.flush()) return path;
-        out.close();
-        os::remove_file(path);
-        LIYAB_LOG_WARN("prefix cache: cannot write %s", path.c_str());
-        return {};
-    }
-
-    void drop_prefix_entry(std::vector<PrefixEntry>::iterator it) {
-        if (!it->file.empty()) os::remove_file(it->file);
-        prefix_cache.erase(it);
-    }
-
-    // Least recently used entries over the RAM budget move to storage (or
-    // go, without it); over the storage budget, they go.
-    void trim_prefix_cache() {
-        auto oldest = [&](bool on_storage) {
-            auto best = prefix_cache.end();
-            for (auto it = prefix_cache.begin(); it != prefix_cache.end(); ++it) {
-                if (it->file.empty() != on_storage && (best == prefix_cache.end() || it->last_use < best->last_use)) {
-                    best = it;
-                }
-            }
-            return best;
+    // What the store's bytes depend on beyond the model file and the cache
+    // (Transformer::context_fingerprint): the kernels and backends that
+    // computed them and every option that changes hidden states, so chunks
+    // are only restored where recomputing them would give the same bits.
+    [[nodiscard]] KvKey store_seed(bool repacked, int32_t chunk_pages) const {
+        auto hash = [](std::string_view text) { return xxhash64(text.data(), text.size()); };
+        auto kind = [&](const Backend* b) {  // "cpu", "metal", "vulkan": not the thread count it describes
+            const std::string d = b->description();
+            return hash(std::string_view(d).substr(0, d.find(' ')));
         };
-        while (prefix_cache_bytes(false) > prefix_cache_budget) {
-            const auto it = oldest(false);
-            if (prefix_cache_disk_budget >= it->bytes) {
-                it->file = write_prefix_file(it->last_use, [&](std::ostream& out) {
-                    out.write(it->state.data(), static_cast<std::streamsize>(it->state.size()));
-                    return out ? Status::ok() : Status(ErrorCode::IoError, "write failed");
-                });
-            }
-            if (it->file.empty()) {
-                prefix_cache.erase(it);
-            } else {
-                std::string().swap(it->state);
-            }
-        }
-        while (prefix_cache_bytes(true) > prefix_cache_disk_budget) drop_prefix_entry(oldest(true));
+        auto bits = [](float f) {
+            uint32_t u = 0;
+            std::memcpy(&u, &f, sizeof u);
+            return static_cast<uint64_t>(u);
+        };
+        constexpr uint64_t kStoreSeedVersion = 1;  // chunk_pages below: chunks of another size are other keys
+        const Route route = normal_route();
+        const ExperimentalConfig& x = config.experimental;
+        const uint64_t parts[] = {kStoreSeedVersion,
+                                  model_fingerprint(target->file().file()),
+                                  target->context_fingerprint(),
+                                  hash(quant::kernel_isa()),
+                                  kind(route.attention),
+                                  kind(route.ffn),
+                                  repacked ? 1u : 0u,
+                                  static_cast<uint64_t>(target->memory_plan().requant_bits),
+                                  bits(config.moe_expert_mass),
+                                  static_cast<uint64_t>(config.moe_max_experts),
+                                  bits(config.moe_skip_slow),
+                                  (x.early_exit ? 1u : 0u) | (x.egls ? 2u : 0u) | (x.head_pruning ? 4u : 0u) |
+                                      (x.tdss ? 8u : 0u) | (x.tdss_force ? 16u : 0u),
+                                  bits(x.early_exit_threshold),
+                                  bits(x.egls_threshold),
+                                  bits(x.head_keep_ratio),
+                                  static_cast<uint64_t>(chunk_pages)};
+        return kv_seed_key(parts);
     }
 
-    void stash_context() {
-        if (!prefix_cache_on() || context.size() < kMinPrefixEntry) return;
+    void open_store(const EngineConfig& cfg, bool repacked) {
+        // With a budget, a MoE whose experts stream gives the prefix cache only
+        // what its expert cache can spare (see load_model).
+        size_t ram = cfg.prefix_cache_mb > 0 ? static_cast<size_t>(cfg.prefix_cache_mb) << 20 : 0;
+        if (ram > 0 && cfg.memory_budget_mb > 0 && target->expert_store() != nullptr) {
+            const size_t granted = target->memory_plan().reserved_bytes;
+            if (granted < ram) {
+                LIYAB_LOG_INFO("prefix cache: %zu of %lld MiB (more would leave the expert cache under %.0f%% of the experts)",
+                               granted >> 20, static_cast<long long>(cfg.prefix_cache_mb),
+                               100.0 * Transformer::kTightCache);
+            }
+            ram = granted;
+        }
+        const bool disk = cfg.prefix_cache_disk_mb > 0 && !cfg.prefix_cache_dir.empty();
+        if (ram == 0 && !disk) return;
+        const KvCache& kv = target->kv_cache();
+        if (kv.window() > 0) {
+            LIYAB_LOG_INFO("prefix cache: off with a sliding window (the positions it releases are gone)");
+            return;
+        }
+        if (draft) {
+            LIYAB_LOG_INFO("prefix cache: off with a draft model");
+            return;
+        }
+        // Chunks of about kChunkBytes, in whole pages: each is a file on
+        // storage, and creating and renaming a file costs ~120 us on a Mac
+        // (APFS), about writing 1 MB, so pages of a few hundred KB (Qwen3.5,
+        // the 35B: 0.4-0.7 MB) would make a long context hundreds of small
+        // files. At most kMaxChunkPages, so a prefix several conversations
+        // share is still kept to within 256 tokens (the rest of its last
+        // chunk is each conversation's own).
+        constexpr size_t kChunkBytes = size_t{2} << 20;
+        constexpr int32_t kMaxChunkPages = 4;
+        const auto chunk_pages =
+            static_cast<int32_t>(std::clamp<size_t>(kChunkBytes / kv.page_bytes(), 1, kMaxChunkPages));
+        KvStore::Config sc;
+        sc.seed = store_seed(repacked, chunk_pages);
+        sc.chunk_tokens = kv.config().page_tokens * chunk_pages;
+        sc.chunk_bytes = kv.page_bytes() * static_cast<size_t>(chunk_pages);
+        sc.state_floats = target->recurrent_state_bytes() / sizeof(float);
+        sc.ram_bytes = ram;
+        if (disk) {
+            sc.dir = cfg.prefix_cache_dir;
+            sc.disk_bytes = static_cast<size_t>(cfg.prefix_cache_disk_mb) << 20;
+        }
+        store = KvStore::open(sc);
+        if (!store) return;
+        const KvStore::Stats st = store->stats();
+        LIYAB_LOG_INFO("prefix cache: %zu MiB of RAM, %zu MiB of storage%s%s; %d chunks and %d contexts of this model "
+                       "kept from earlier runs",
+                       st.ram_cap >> 20, st.disk_cap >> 20, store->has_storage() ? " in " : "",
+                       store->has_storage() ? cfg.prefix_cache_dir.c_str() : "", st.chunks_disk, st.records);
+        note_store();
+    }
+
+    // Copies the store's state into prefix_stats.
+    void note_store() {
+        if (!store) return;
+        const KvStore::Stats st = store->stats();
+        std::lock_guard<std::mutex> lock(prefix_stats_mutex);
+        prefix_stats.ram_bytes = st.ram_bytes;
+        prefix_stats.ram_cap_bytes = st.ram_cap;
+        prefix_stats.storage_bytes = st.disk_bytes;
+        prefix_stats.storage_cap_bytes = st.disk_cap;
+        prefix_stats.chunks = st.chunks_ram + st.chunks_disk;
+        prefix_stats.state_images = st.states;
+        prefix_stats.contexts = st.records;
+        prefix_stats.chunk_tokens = store->chunk_tokens();
+        prefix_stats.segments = st.segments;
+    }
+
+    // Sets the context aside in the store (see above); `storage_only` when
+    // the engine is being destroyed.
+    void stash_context(bool storage_only = false) {
+        // Rows reused away from their prefix (segment reuse) are never kept:
+        // a context holding them is set aside up to the first one, so what
+        // the store restores is always exact.
+        const size_t exact = std::min(context.size(), exact_end);
+        if (!store || exact < kMinPrefixEntry || context.size() != static_cast<size_t>(target->n_past())) return;
         // The whole context, the last reply included: that conversation's next
         // prompt re-sends it, and on a hybrid model a reply that encodes
-        // differently goes back to the pinned snapshot the state keeps (the
-        // last prompt's end). Setting it aside at that snapshot instead made
-        // every return process the last reply again (123 tokens, 8 s on a 35B).
-        for (auto it = prefix_cache.begin(); it != prefix_cache.end();) {  // an older copy of the same conversation
-            if (it->tokens.size() <= context.size() && std::equal(it->tokens.begin(), it->tokens.end(), context.begin())) {
-                if (!it->file.empty()) os::remove_file(it->file);
-                it = prefix_cache.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        PrefixEntry entry{context, {}, {}, 0, context_text, context_text_tokens, ++prefix_clock};
+        // differently goes back to the pinned snapshot kept with it (the last
+        // prompt's end). Setting it aside at that snapshot instead made every
+        // return process the last reply again (123 tokens, 8 s on a 35B).
         const auto watch = Clock::now();
-        if (prefix_cache_budget > 0) {
-            std::ostringstream out;
-            if (!target->write_state(out).is_ok()) return;
-            entry.state = std::move(out).str();
-            entry.bytes = entry.state.size();
-        } else {  // storage only: no copy in RAM on the way
-            size_t written = 0;
-            entry.file = write_prefix_file(entry.last_use, [&](std::ostream& out) {
-                LIYAB_RETURN_IF_ERROR(target->write_state(out));
-                written = static_cast<size_t>(out.tellp());
-                return Status::ok();
-            });
-            if (entry.file.empty()) return;
-            entry.bytes = written;
-        }
-        const uint64_t id = entry.last_use;
-        const double mib = static_cast<double>(entry.bytes) / (1024.0 * 1024.0);
-        prefix_cache.push_back(std::move(entry));
-        trim_prefix_cache();
-        if (std::any_of(prefix_cache.begin(), prefix_cache.end(), [&](const PrefixEntry& e) { return e.last_use == id; })) {
-            LIYAB_LOG_INFO("prefix cache: set aside %zu tokens (%.0f MiB) in %.0f ms", context.size(), mib, ms_since(watch));
+        const KvCache& kv = target->kv_cache();
+        KvStore::ContextSource source;
+        source.tokens = std::span<const int32_t>(context).first(exact);
+        std::tie(source.text, source.text_tokens) = text_of(exact);
+        // Storage is written straight from the cache's pages and the model's
+        // states: a chunk's image is its pages' images one after the other,
+        // a whole page's being the page itself; only a partial last page is
+        // packed (into `packed`, alive while put() runs).
+        const int32_t page_tokens = kv.config().page_tokens;
+        const int32_t chunk_pages = store->chunk_tokens() / page_tokens;
+        std::deque<std::vector<uint8_t>> packed;
+        source.rows = [&](int32_t chunk, int32_t n) {
+            std::vector<std::span<const uint8_t>> parts;
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                const int32_t page = chunk * chunk_pages + k;
+                const int32_t rows = std::min(page_tokens, n - k * page_tokens);
+                const uint8_t* data = kv.page_data(page);
+                if (data != nullptr && rows == page_tokens) {
+                    parts.emplace_back(data, kv.page_bytes());
+                } else {
+                    packed.emplace_back(kv.rows_bytes(rows));
+                    if (!kv.read_rows(page, rows, packed.back().data()).is_ok()) return std::vector<std::span<const uint8_t>>();
+                    parts.emplace_back(packed.back());
+                }
+            }
+            return parts;
+        };
+        // (Segment reuse runs on attention-only models only: a hybrid
+        // model's context is always exact, so its states are its end's.)
+        for (const Transformer::KeptState& k : target->kept_states()) source.states.push_back({k.pos, k.pinned});
+        source.state_parts = [this](int32_t pos) { return target->kept_state_parts(pos); };
+        const KvStore::PutResult put = store->put(source, storage_only);
+        const double ms = ms_since(watch);
+        const double mib = 1.0 / (1024.0 * 1024.0);
+        if (put.whole) {
+            LIYAB_LOG_INFO("prefix cache: set aside %zu tokens in %.0f ms: %d of %d chunks new, %d state image(s) new, "
+                           "%.1f MiB to RAM, %.1f MiB to storage",
+                           exact, ms, put.chunks_written, put.chunks, put.states_written,
+                           static_cast<double>(put.bytes_ram) * mib, static_cast<double>(put.bytes_disk) * mib);
         } else {
-            LIYAB_LOG_INFO("prefix cache: a context of %zu tokens (%.0f MiB) is larger than the cache", context.size(), mib);
+            LIYAB_LOG_INFO("prefix cache: a context of %zu tokens does not fit the cache whole (%d of %d chunks new)",
+                           exact, put.chunks_written, put.chunks);
         }
+        {
+            std::lock_guard<std::mutex> lock(prefix_stats_mutex);
+            ++prefix_stats.set_asides;
+            prefix_stats.chunks_written += static_cast<uint64_t>(put.chunks_written);
+            prefix_stats.chunks_reused += static_cast<uint64_t>(put.chunks_reused);
+            prefix_stats.set_aside_ms += ms;
+        }
+        note_store();
     }
 
-    // Restores the cached context sharing the longest prefix with `tokens`
-    // (at most `limit` tokens of it) when that prefix is longer than `have`,
-    // cut back to where they diverge (a reply sent back as text may encode
-    // differently from the tokens generated); the tokens kept, or 0.
-    size_t restore_cached(std::span<const int32_t> tokens, size_t limit, size_t have) {
-        const PrefixEntry* best = nullptr;
-        size_t best_common = 0;
-        for (const PrefixEntry& e : prefix_cache) {
-            const size_t n = std::min({e.tokens.size(), tokens.size(), limit});
-            size_t common = 0;
-            while (common < n && e.tokens[common] == tokens[common]) ++common;
-            if (common > best_common) {
-                best = &e;
-                best_common = common;
+    // Writes the KV rows of `plan` from `rows_from` on (the live context
+    // holds the rows below for the same tokens) and its recurrent states,
+    // then makes it the context.
+    Status restore_plan(const KvStore::Plan& plan, size_t rows_from) {
+        KvCache& kv = target->mutable_kv_cache();
+        const int32_t positions = plan.positions;
+        LIYAB_RETURN_IF_ERROR(kv.reserve(positions));
+        const int32_t c = store->chunk_tokens();
+        const int32_t page_tokens = kv.config().page_tokens;
+        const int32_t chunk_pages = c / page_tokens;
+        // A chunk's pages that it restores whole are read straight into the
+        // cache; the others (partial, or partly kept in place) into scratch,
+        // then copied to the rows wanted. The whole chunk is read either way:
+        // its hash covers all of it.
+        std::vector<std::vector<uint8_t>> scratch;
+        struct Pending {
+            int32_t page, rows, from, to;
+            size_t slot;
+        };
+        std::vector<Pending> pending;
+        std::vector<std::span<uint8_t>> parts;
+        for (size_t i = 0; i < plan.chunks.size(); ++i) {
+            const auto start = static_cast<int32_t>(i) * c;
+            const int32_t n = plan.chunk_sizes[i];
+            const int32_t from = std::max(static_cast<int32_t>(rows_from) - start, 0);
+            const int32_t to = std::min(positions - start, n);
+            if (from >= to) continue;
+            parts.clear();
+            pending.clear();
+            size_t used = 0;
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                const int32_t page = static_cast<int32_t>(i) * chunk_pages + k;
+                const int32_t first = k * page_tokens;
+                const int32_t rows = std::min(page_tokens, n - first);
+                uint8_t* data = kv.mutable_page_data(page);
+                if (data != nullptr && rows == page_tokens && from <= first && first + rows <= to) {
+                    parts.emplace_back(data, kv.page_bytes());
+                    continue;
+                }
+                if (scratch.size() <= used) scratch.emplace_back();
+                scratch[used].resize(kv.rows_bytes(rows));
+                parts.emplace_back(scratch[used]);
+                const int32_t lo = std::clamp(from - first, 0, rows), hi = std::clamp(to - first, 0, rows);
+                pending.push_back({page, rows, lo, hi, used});
+                ++used;
+            }
+            LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], parts));
+            for (const Pending& p : pending) {
+                if (p.from < p.to) LIYAB_RETURN_IF_ERROR(kv.write_rows(p.page, scratch[p.slot].data(), p.rows, p.from, p.to));
             }
         }
-        if (best == nullptr || best_common <= have || best_common < kMinPrefixEntry) return 0;
-        const auto watch = Clock::now();
-        const auto it = prefix_cache.begin() + (best - prefix_cache.data());
-        Status read = Status::ok();
-        if (it->file.empty()) {
-            std::istringstream in(it->state);
-            read = target->read_state(in);
-        } else {
-            std::ifstream in(os::utf8_path(it->file), std::ios::binary);
-            read = in ? target->read_state(in) : Status(ErrorCode::IoError, "cannot read " + it->file);
+        // Recurrent states straight into the model and into the buffers of
+        // the snapshots being replaced: no intermediate copy, no allocation
+        // or zero-fill of 62.8 MiB images on a 35B.
+        std::vector<Transformer::OwnedSnapshot> snapshots;
+        if (target->recurrent_state_bytes() > 0) {
+            target->begin_restore();
+            const std::vector<std::span<float>> live = target->recurrent_parts();
+            LIYAB_RETURN_IF_ERROR(store->read_state(plan.state, live));
+            for (const KvStore::RecordState& rs : plan.snapshots) {
+                Transformer::OwnedSnapshot snap{rs.pos, rs.pinned, target->take_snapshot_buffer()};
+                const std::span<float> into(snap.data);
+                LIYAB_RETURN_IF_ERROR(store->read_state(rs.key, {&into, 1}));
+                snapshots.push_back(std::move(snap));
+            }
         }
-        if (!read.is_ok()) {
-            LIYAB_LOG_WARN("prefix cache: %s", read.to_string().c_str());
-            drop_prefix_entry(it);
+        return target->adopt_context(positions, std::move(snapshots), plan.state_pinned);
+    }
+
+    // Restores the longest prefix of `tokens` (at most `limit` of them) the
+    // store holds when it is longer than what the live context keeps of its
+    // `have` tokens in common with them, cut back to where they diverge (a
+    // reply sent back as text may encode differently from the tokens
+    // generated; on hybrid models, to a stored state image); the tokens kept,
+    // or 0.
+    size_t restore_cached(std::span<const int32_t> tokens, size_t limit, size_t have) {
+        const KvStore::Plan plan = store->plan(tokens, limit);
+        const auto positions = static_cast<size_t>(plan.positions);
+        const size_t live = context.empty() ? 0 : static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(have)));
+        if (positions <= live || positions < kMinPrefixEntry) return 0;
+        const auto watch = Clock::now();
+        const size_t rows_from = context.empty() ? 0 : std::min(have, positions);
+        if (Status st = restore_plan(plan, rows_from); !st.is_ok()) {
+            LIYAB_LOG_WARN("prefix cache: %s", st.to_string().c_str());
             clear_context();
+            note_store();
             return 0;
         }
-        context = std::move(it->tokens);
-        context_text = std::move(it->text);
-        context_text_tokens = it->text_tokens;
-        const bool from_storage = !it->file.empty();
-        drop_prefix_entry(it);  // it is the live context now
-        size_t keep = context.size();
-        if (best_common < keep) {
-            keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(best_common)));
-            if (keep == 0 || !target->truncate(static_cast<int32_t>(keep)).is_ok()) {
-                clear_context();
-                return 0;
-            }
-            cut_text(keep);
-            context.resize(keep);
+        if (plan.record != nullptr) {
+            context = plan.record->tokens;
+            context_text = plan.record->text;
+            context_text_tokens = plan.record->text_tokens;
+            cut_text(positions);
+            context.resize(positions);
+        } else {
+            context.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(positions));
+            context_text.clear();
+            context_text_tokens = 0;
         }
-        LIYAB_LOG_INFO("prefix cache: restored %zu tokens from %s in %.0f ms", keep, from_storage ? "storage" : "RAM",
-                       ms_since(watch));
-        return keep;
+        last_prompt_end = positions;
+        // The rows kept in place may be reused ones (a request that opted in
+        // to segment reuse); the restored ones are exact.
+        if (exact_end >= rows_from) exact_end = kExact;
+        store->used(plan);
+        const double ms = ms_since(watch);
+        LIYAB_LOG_INFO("prefix cache: restored %zu tokens (%zu kept in place) from %zu chunk(s) in %.0f ms", positions,
+                       rows_from, plan.chunks.size(), ms);
+        {
+            std::lock_guard<std::mutex> lock(prefix_stats_mutex);
+            ++prefix_stats.restores;
+            prefix_stats.restored_tokens += positions;
+            prefix_stats.restore_ms += ms;
+        }
+        note_store();
+        return positions;
     }
 
-    size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit) {
+    // `approximate_ok`: the request opted in to segment reuse, so it may
+    // continue rows reused away from their prefix (else they go first).
+    size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit, bool approximate_ok = false) {
         if (draft || context.size() != static_cast<size_t>(target->n_past())) {
             clear_context();
             return 0;
         }
+        if (!approximate_ok && exact_end < context.size()) drop_approximate();
         // An empty context (reset_context(), or embed() / rerank(), which use
         // the context and leave it empty): a prompt that continues a context
         // the prefix cache set aside gets it back.
@@ -639,14 +910,25 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
-        if (prefix_cache_on() && common < context.size() / 2) {
-            stash_context();
-            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
-            if (context.empty()) return 0;  // a cached context failed to restore
-        }
         // Attention-only models rewind to any position; hybrid ones to the
         // nearest recurrent-state checkpoint or snapshot below it.
         const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
+        if (prefix_cache_on()) {
+            // Set aside when the prompt replaces the context: it shares less
+            // than half of it, or leaves it before its last prompt's end and
+            // rewinding would process at least kMinPrefixEntry tokens again
+            // (another chat after a long shared system prompt; on a hybrid
+            // model, back to its nearest snapshot, possibly the start). A
+            // draft edited after the last reply is not: it would write state
+            // images at every keystroke.
+            const bool replaced = common < context.size() / 2 ||
+                                  (common < last_prompt_end && context.size() - keep >= kMinPrefixEntry);
+            if (replaced) stash_context();
+            // The store may hold more of this prompt than the context keeps
+            // (the conversation it continues, set aside earlier).
+            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
+            if (context.empty()) return 0;  // a cached context failed to restore
+        }
         // Diverging from the context costs a recomputation from `keep`: say
         // where, so a slow turn can be traced to its cause.
         LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, context.size(),
@@ -654,11 +936,391 @@ struct Engine::Impl {
         if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
             cut_text(keep);
             context.resize(keep);
+            last_prompt_end = std::min(last_prompt_end, keep);
+            if (keep <= exact_end) exact_end = kExact;  // cut before any reused row: exact again
             return keep;
         }
         clear_context();
         return 0;
     }
+    // Segment reuse for the request being served: the stored segments of
+    // `tokens` after its first `exact` positions (the context holds them)
+    // and before `limit`, reused (core/kv_reuse.h). Returns where processing
+    // resumes: past the last reused segment, or `exact` when nothing was
+    // reused or reuse failed (the context then still holds the exact prefix).
+    size_t reuse_request_segments(std::span<const int32_t> tokens, size_t exact, size_t limit, const Route& route,
+                                  int32_t chunk, const std::atomic<bool>* stop, GenerationStats* stats) {
+        if (!request_reuse || request_segments.empty() || exact >= limit) return exact;
+        const auto t0 = Clock::now();
+        auto r = reuse_segments(*target, *store, tokens, request_segments, static_cast<int32_t>(exact),
+                                static_cast<int32_t>(limit), reuse, route, *pool, chunk, stop);
+        if (!r) {
+            if (r.status().code() != ErrorCode::Cancelled) {
+                LIYAB_LOG_WARN("segment reuse: %s; the prompt is processed", r.status().to_string().c_str());
+            }
+            if (static_cast<size_t>(target->n_past()) != exact) clear_context();
+            note_store();
+            return context.size();
+        }
+        if (r->end <= static_cast<int32_t>(exact)) return exact;
+        context.assign(tokens.begin(), tokens.begin() + r->end);
+        if (r->first_reused >= 0) exact_end = std::min(exact_end, static_cast<size_t>(r->first_reused));
+        const double ms = ms_since(t0);
+        LIYAB_LOG_INFO("segment reuse: %d tokens of %d segment(s) reused (%d of them processed again), %d processed "
+                       "between them, in %.0f ms (rows %.0f ms)",
+                       r->reused, r->segments, r->recomputed, r->computed, ms, r->rows_ms);
+        if (stats != nullptr) {
+            stats->segment_reused_tokens += r->reused;
+            stats->segment_recomputed_tokens += r->recomputed;
+            stats->segment_ms += ms;
+        }
+        {
+            std::lock_guard<std::mutex> lock(prefix_stats_mutex);
+            prefix_stats.segment_reuses += static_cast<uint64_t>(r->segments);
+            prefix_stats.segment_reused_tokens += static_cast<uint64_t>(r->reused);
+            prefix_stats.segment_recomputed_tokens += static_cast<uint64_t>(r->recomputed);
+        }
+        note_store();
+        return static_cast<size_t>(r->end);
+    }
+
+    // Keeps the request's segments the context now holds and the store has
+    // no copy of (core/kv_reuse.h, keep_segments).
+    void keep_request_segments() {
+        if (!request_reuse || request_segments.empty() || !store) return;
+        // The context starts with the prompt the segments index (else
+        // nothing of them is kept: the context was replaced or cut).
+        const int32_t kept = keep_segments(*target, *store, context, request_segments, reuse.min_tokens);
+        if (kept > 0) {
+            std::lock_guard<std::mutex> lock(prefix_stats_mutex);
+            prefix_stats.segments_kept += static_cast<uint64_t>(kept);
+        }
+        note_store();
+    }
+
+    // Whether segment reuse can run (EngineConfig::segment_reuse), and the
+    // share of reused tokens processed again: measured once per model and
+    // settings (ReuseCalibrator, on the CPU like the key scales, so it
+    // depends on the model and the kernels only) and kept in cache_dir. The
+    // measurement does not hold up loading: it runs in the background while
+    // the engine is idle (calibrate_in_background), and until it ends
+    // segment reuse is not on, so marked prompts are processed as usual.
+    void prepare_segment_reuse() {
+        auto off = [&](Status why) { set_reuse_off(std::move(why)); };
+        if (!config.segment_reuse) return off(Status(ErrorCode::Unsupported, "off in EngineConfig::segment_reuse"));
+        if (draft) return off(Status(ErrorCode::Unsupported, "not with a draft model (no prefix cache)"));
+        if (Status s = target->reuse_support(); !s.is_ok()) return off(s);
+        if (!store) {
+            return off(Status(ErrorCode::Unsupported,
+                              "segments are kept in the prefix cache's store: set prefix_cache_mb or "
+                              "prefix_cache_disk_mb (none with a sliding window)"));
+        }
+        if (!(config.segment_reuse_max_kl > 0.0f)) {
+            return off(Status(ErrorCode::InvalidArgument, "segment_reuse_max_kl must be positive"));
+        }
+        const uint64_t id = reuse_calibration_id();
+        const std::string path = config.cache_dir.empty() ? std::string() : reuse_calibration_path(config.cache_dir, id);
+        bool met = false;
+        if (!path.empty() && read_reuse_calibration(path, id, met)) {
+            reuse_info.from_cache = true;
+            std::error_code ignored;
+            std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(), ignored);
+            return publish_reuse(met);
+        }
+        // Prompts shaped like real ones: through the model's chat template
+        // (plain text without one), thinking off where it has the switch.
+        reuse_style.chat = chat_template ? &*chat_template : nullptr;
+        if (chat_template) reuse_style.special = chat_special;
+        const auto source = target->file().get_string("tokenizer.chat_template");
+        reuse_style.thinking_off = source && source->find("enable_thinking") != std::string::npos;
+        auto job = ReuseCalibrator::create(*target, *tokenizer, reuse_style, reuse, config.segment_reuse_max_kl);
+        if (!job) return off(job.status());
+        calibrator = std::move(job).value();
+        std::lock_guard<std::mutex> lock(reuse_info_mutex);
+        reuse_info.calibrating = true;
+        reuse_info.progress = 0.0f;
+        reuse_info.status = Status(ErrorCode::Busy,
+                                   "calibrating in the background while the engine is idle; until then marked "
+                                   "prompts are processed as usual");
+        LIYAB_LOG_INFO("segment reuse: calibrating in the background (%s prompts)",
+                       reuse_style.chat != nullptr ? "chat-template" : "plain-text");
+    }
+
+    void set_reuse_off(Status why) {
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.calibrating = false;
+            reuse_info.status = std::move(why);
+        }
+        if (config.segment_reuse) LIYAB_LOG_INFO("segment reuse: off: %s", reuse_info.status.message().c_str());
+    }
+
+    // On with the calibrated share, or off when no share met the target.
+    void publish_reuse(bool met) {
+        if (!met) {
+            char why[240];
+            std::snprintf(why, sizeof why,
+                          "processing %.0f%% of reused tokens again still left KL %.4f (bound %.4f), above the "
+                          "target %.4f",
+                          100.0 * reuse_info.fraction, reuse_info.kl, reuse_info.bound, config.segment_reuse_max_kl);
+            return set_reuse_off(Status(ErrorCode::Unsupported, why));
+        }
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse.fraction = reuse_info.fraction;
+            reuse_info.calibrating = false;
+            reuse_info.progress = 1.0f;
+            reuse_info.status = Status::ok();
+        }
+        LIYAB_LOG_INFO("segment reuse: on, %.0f%% of reused tokens processed again (KL %.4f, bound %.4f, top-1 "
+                       "%.1f%%)%s",
+                       100.0 * reuse.fraction, reuse_info.kl, reuse_info.bound, 100.0 * reuse_info.top1,
+                       reuse_info.from_cache ? ", as measured before" : "");
+    }
+
+    // ---- The calibration in the background -----------------------------------
+    // A thread runs it one stage at a time (a few passes over one prompt's
+    // documents) once no call has used the engine for kCalibrationIdle, on a
+    // context of its own swapped in for the stage, so the conversation's is
+    // left as it was. A call arriving meanwhile stops the stage between two
+    // blocks and waits for that (Call); the stage runs again at the next
+    // idle time. Started at the end of Engine::create(), stopped by ~Impl.
+    static constexpr auto kCalibrationIdle = std::chrono::seconds(2);
+    void start_calibration() {
+        if (!calibrator) return;
+        {
+            std::lock_guard<std::mutex> lock(calibration_mutex);
+            last_call = Clock::now();
+        }
+        calibration_thread = std::thread([this] { calibrate_in_background(); });
+    }
+    void stop_calibration() {
+        {
+            std::lock_guard<std::mutex> lock(calibration_mutex);
+            calibration_closing = true;
+        }
+        calibration_stop.store(true);
+        calibration_wake.notify_all();
+        if (calibration_thread.joinable()) calibration_thread.join();
+    }
+    void calibrate_in_background() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> wait(calibration_mutex);
+                for (;;) {
+                    if (calibration_closing) return;
+                    const auto now = Clock::now();
+                    const auto ready = last_call + kCalibrationIdle;
+                    if (now >= ready && calls_in_flight.load() == 0) break;
+                    // A call ending notifies; the timeout covers the idle time.
+                    calibration_wake.wait_until(wait, std::max(ready, now + std::chrono::milliseconds(100)));
+                }
+            }
+            // Before the lock, so a call that finds `busy` taken knows to wait.
+            calibration_holds.store(true);
+            std::unique_lock<std::mutex> lock(busy, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                calibration_holds.store(false);
+                std::unique_lock<std::mutex> wait(calibration_mutex);
+                calibration_wake.wait_for(wait, std::chrono::milliseconds(100));
+                continue;
+            }
+            // A call that arrived before this store set the flag earlier and
+            // counts in calls_in_flight; one arriving after sets it again.
+            calibration_stop.store(false);
+            bool over = false;
+            if (calls_in_flight.load() == 0) over = calibration_stage();
+            lock.unlock();
+            calibration_holds.store(false);
+            if (over) return;
+        }
+    }
+    // One stage, `busy` held: true when the calibration is over (segment
+    // reuse then on or off).
+    bool calibration_stage() {
+        if (!calibration_kv) {
+            auto kv = target->make_kv_cache(calibrator->positions());
+            if (!kv) return end_calibration(kv.status());
+            calibration_kv = std::move(kv).value();
+            calibration_n_past = 0;
+        }
+        if (Status s = target->swap_context(calibration_kv, calibration_n_past); !s.is_ok()) return end_calibration(s);
+        Result<bool> r = false;
+        {
+            const PowerManager::Work thermal(*power);  // thermal sampling while this runs
+            r = calibrator->step(*target, draft_route(), *pool, target->max_batch(), &calibration_stop);
+        }
+        // The conversation's context back (the same caches: cannot fail).
+        (void)target->swap_context(calibration_kv, calibration_n_past);
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.progress = calibrator->progress();
+        }
+        if (!r) return r.status().code() == ErrorCode::Cancelled ? false : end_calibration(r.status());
+        if (!*r) return false;
+        const ReuseCalibration& c = calibrator->result();
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.fraction = c.fraction;
+            reuse_info.kl = c.kl;
+            reuse_info.bound = c.bound;
+            reuse_info.top1 = c.top1;
+        }
+        std::string tried;
+        for (size_t i = 0; i < c.kls.size(); ++i) {
+            char one[64];
+            std::snprintf(one, sizeof one, "%s%.0f%%: %.4f (%.4f)", i > 0 ? ", " : "", 100.0 * kReuseFractions[i],
+                          c.kls[i], c.bounds[i]);
+            tried += one;
+        }
+        LIYAB_LOG_INFO("segment reuse: calibrated in %.0f ms of background work: %.0f%% of reused tokens processed "
+                       "again, KL %.4f (bound %.4f), top-1 %.1f%% (target KL %.4f; KL (bound) by share: %s)",
+                       c.ms, 100.0 * c.fraction, c.kl, c.bound, 100.0 * c.top1, config.segment_reuse_max_kl,
+                       tried.c_str());
+        if (!config.cache_dir.empty()) {
+            const uint64_t id = reuse_calibration_id();
+            keep_reuse_calibration(config.cache_dir, reuse_calibration_path(config.cache_dir, id), id, c.met);
+        }
+        publish_reuse(c.met);
+        calibrator.reset();
+        calibration_kv.reset();
+        return true;
+    }
+    bool end_calibration(Status why) {
+        set_reuse_off(std::move(why));
+        calibrator.reset();
+        calibration_kv.reset();
+        return true;
+    }
+
+    // One call's hold on the engine: false (Busy) while another call runs.
+    // The background calibration is not a call: one arriving while it runs
+    // stops it between two blocks and waits for that, a fraction of a
+    // second. `wait`: wait for another call too (reset_context()).
+    class Call {
+    public:
+        explicit Call(Impl& s, bool wait = false) : s_(s), lock_(s.busy, std::defer_lock) {
+            s.calls_in_flight.fetch_add(1);
+            s.calibration_stop.store(true);
+            if (wait || (!lock_.try_lock() && s.calibration_holds.load())) lock_.lock();
+            if (!lock_.owns_lock()) s.calls_in_flight.fetch_sub(1);
+        }
+        ~Call() {
+            if (!lock_.owns_lock()) return;
+            lock_.unlock();
+            {
+                std::lock_guard<std::mutex> lock(s_.calibration_mutex);
+                s_.last_call = Clock::now();
+            }
+            s_.calls_in_flight.fetch_sub(1);
+            s_.calibration_wake.notify_all();
+        }
+        Call(const Call&) = delete;
+        Call& operator=(const Call&) = delete;
+        explicit operator bool() const noexcept { return lock_.owns_lock(); }
+
+    private:
+        Impl& s_;
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    // What a calibration depends on: the model, the cache and its key
+    // scales (context_fingerprint), the kernels, the procedure's version,
+    // the target and the selection settings.
+    [[nodiscard]] uint64_t reuse_calibration_id() const {
+        uint32_t target_bits = 0;
+        std::memcpy(&target_bits, &config.segment_reuse_max_kl, sizeof target_bits);
+        const uint64_t parts[] = {model_fingerprint(target->file().file()),
+                                  target->context_fingerprint(),
+                                  kReuseCalibrationVersion,
+                                  target_bits,
+                                  static_cast<uint64_t>(reuse.criterion),
+                                  static_cast<uint64_t>(reuse.select_block),
+                                  static_cast<uint64_t>(reuse.first_tokens),
+                                  static_cast<uint64_t>(reuse.min_tokens),
+                                  reuse.relative ? 1u : 0u};
+        const std::string_view isa = quant::kernel_isa();
+        return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+    }
+    static std::string reuse_calibration_path(const std::string& dir, uint64_t id) {
+        char name[32];
+        std::snprintf(name, sizeof name, "reuse-%016llx.bin", static_cast<unsigned long long>(id));
+        return os::path_utf8(os::utf8_path(dir) / name);
+    }
+    // A kept calibration: magic, version, id, met, fraction, KL, top-1, bound.
+    static constexpr char kReuseMagic[4] = {'L', 'Y', 'R', 'C'};
+    bool read_reuse_calibration(const std::string& path, uint64_t id, bool& met) {
+        std::ifstream in(os::utf8_path(path), std::ios::binary);
+        char magic[4] = {};
+        uint32_t version = 0;
+        uint64_t stored = 0;
+        uint8_t ok = 0;
+        float fraction = 0.0f;
+        double kl = 0.0, top1 = 0.0, bound = 0.0;
+        in.read(magic, sizeof magic);
+        in.read(reinterpret_cast<char*>(&version), sizeof version);
+        in.read(reinterpret_cast<char*>(&stored), sizeof stored);
+        in.read(reinterpret_cast<char*>(&ok), sizeof ok);
+        in.read(reinterpret_cast<char*>(&fraction), sizeof fraction);
+        in.read(reinterpret_cast<char*>(&kl), sizeof kl);
+        in.read(reinterpret_cast<char*>(&top1), sizeof top1);
+        in.read(reinterpret_cast<char*>(&bound), sizeof bound);
+        if (!in || std::memcmp(magic, kReuseMagic, sizeof magic) != 0 || version != kReuseCalibrationVersion ||
+            stored != id || !(fraction >= 0.0f && fraction <= 1.0f)) {
+            return false;
+        }
+        met = ok != 0;
+        reuse_info.fraction = fraction;
+        reuse_info.kl = kl;
+        reuse_info.top1 = top1;
+        reuse_info.bound = bound;
+        return true;
+    }
+    // Written through a temporary file; the directory keeps the
+    // kKeptReuseCalibrations most recently used (a failure only costs a
+    // calibration at the next load: logged, not returned).
+    static constexpr size_t kKeptReuseCalibrations = 16;
+    void keep_reuse_calibration(const std::string& dir, const std::string& path, uint64_t id, bool met) const {
+        std::error_code ec;
+        std::filesystem::create_directories(os::utf8_path(dir), ec);
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
+            const uint32_t version = kReuseCalibrationVersion;
+            const uint8_t ok = met ? 1 : 0;
+            out.write(kReuseMagic, sizeof kReuseMagic);
+            out.write(reinterpret_cast<const char*>(&version), sizeof version);
+            out.write(reinterpret_cast<const char*>(&id), sizeof id);
+            out.write(reinterpret_cast<const char*>(&ok), sizeof ok);
+            out.write(reinterpret_cast<const char*>(&reuse_info.fraction), sizeof reuse_info.fraction);
+            out.write(reinterpret_cast<const char*>(&reuse_info.kl), sizeof reuse_info.kl);
+            out.write(reinterpret_cast<const char*>(&reuse_info.top1), sizeof reuse_info.top1);
+            out.write(reinterpret_cast<const char*>(&reuse_info.bound), sizeof reuse_info.bound);
+            if (!out) {
+                LIYAB_LOG_WARN("segment reuse: cannot write %s", tmp.c_str());
+                std::filesystem::remove(os::utf8_path(tmp), ec);
+                return;
+            }
+        }
+        if (!os::replace_file(tmp, path)) {
+            LIYAB_LOG_WARN("segment reuse: cannot keep the calibration in %s", dir.c_str());
+            os::remove_file(tmp);
+            return;
+        }
+        std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
+        std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            const std::string name = os::path_utf8(it->path().filename());
+            if (name.starts_with("reuse-") && name.ends_with(".bin")) {
+                std::error_code ignored;
+                kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
+            }
+        }
+        if (kept.size() <= kKeptReuseCalibrations) return;
+        std::sort(kept.begin(), kept.end());  // oldest first
+        for (size_t i = 0; i + kKeptReuseCalibrations < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
+    }
+
     std::unique_ptr<TripleBufferLoader> weight_loader;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
@@ -748,7 +1410,6 @@ struct Engine::Impl {
     std::optional<experimental::HeadPruner> head_pruner;
     std::unique_ptr<experimental::Egls> egls;
     std::unique_ptr<experimental::Tdss> tdss;
-    std::unique_ptr<experimental::KvDedup> kv_dedup;
 #endif
 
     // Experimental hooks for one forward pass given the current power policy.
@@ -1183,7 +1844,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     }
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
-        config.experimental.tdss || !config.experimental.kv_dedup_dir.empty()) {
+        config.experimental.tdss) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
 #endif
@@ -1274,14 +1935,6 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
                        static_cast<double>(impl->tdss->sparse_bytes()) / (1024.0 * 1024.0),
                        static_cast<double>(impl->tdss->dense_bytes()) / (1024.0 * 1024.0));
     }
-    if (!x.kv_dedup_dir.empty()) {
-        // Snapshots hold keys as stored, so they are keyed by the key scales too.
-        const std::span<const float> scales = impl->target->key_scales();
-        auto dedup = experimental::KvDedup::create(
-            x.kv_dedup_dir, xxhash64(scales.data(), scales.size_bytes(), model_fingerprint(impl->target->file().file())));
-        if (!dedup) return dedup.status();
-        impl->kv_dedup = std::move(dedup).value();
-    }
     if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
     if (x.head_pruning) {
         if (impl->target->config().hybrid()) {
@@ -1297,45 +1950,15 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 #endif
 
     impl->power = std::make_unique<PowerManager>(config.power);
-    // With a budget, a MoE whose experts stream gives the prefix cache only
-    // what its expert cache can spare (see load_model).
-    impl->prefix_cache_budget = config.prefix_cache_mb > 0 ? static_cast<size_t>(config.prefix_cache_mb) << 20 : 0;
-    if (impl->prefix_cache_budget > 0 && config.memory_budget_mb > 0 && impl->target->expert_store() != nullptr) {
-        const size_t granted = impl->target->memory_plan().reserved_bytes;
-        if (granted < impl->prefix_cache_budget) {
-            LIYAB_LOG_INFO("prefix cache: %zu of %lld MiB (more would leave the expert cache under %.0f%% of the experts)",
-                           granted >> 20, static_cast<long long>(config.prefix_cache_mb),
-                           100.0 * Transformer::kTightCache);
-        }
-        impl->prefix_cache_budget = granted;
-    }
-    // Storage tier: the engine removes its files when destroyed, and when it
-    // starts, files left by processes that ended (other process ids).
-    if (config.prefix_cache_disk_mb > 0 && !config.prefix_cache_dir.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(os::utf8_path(config.prefix_cache_dir), ec);
-        if (ec) {
-            LIYAB_LOG_WARN("prefix cache: cannot use %s: %s", config.prefix_cache_dir.c_str(), ec.message().c_str());
-        } else {
-            const std::string own = "ctx-" + std::to_string(os::process_id()) + "-";
-            std::filesystem::directory_iterator it(os::utf8_path(config.prefix_cache_dir), ec), end;
-            for (; !ec && it != end; it.increment(ec)) {
-                const std::string name = os::path_utf8(it->path().filename());
-                std::error_code ignored;
-                if (name.starts_with("ctx-") && name.ends_with(".state") && !name.starts_with(own)) {
-                    std::filesystem::remove(it->path(), ignored);
-                }
-            }
-            impl->prefix_cache_dir = config.prefix_cache_dir;
-            impl->prefix_cache_disk_budget = static_cast<size_t>(config.prefix_cache_disk_mb) << 20;
-        }
-    }
+    impl->open_store(config, repack_cpu);
+    impl->prepare_segment_reuse();
     impl->power->poll_once();
     if (config.thermal_polling) impl->power->start();
     const Route route = impl->normal_route();
     LIYAB_LOG_INFO("engine ready in %.0f ms: attention on %s, FFN on %s, %d threads%s", ms_since(t_create),
                    route.attention->description().c_str(), route.ffn->description().c_str(),
                    impl->pool->max_threads(), impl->speculative ? ", speculative decoding" : "");
+    impl->start_calibration();
 
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
 }
@@ -1505,17 +2128,31 @@ std::string Engine::describe() const {
     return out;
 }
 
-Status Engine::prefill(std::string_view text, bool add_bos) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+Engine::PrefixCacheStats Engine::prefix_cache_stats() const {
+    std::lock_guard<std::mutex> lock(impl_->prefix_stats_mutex);
+    return impl_->prefix_stats;
+}
+
+Engine::SegmentReuseInfo Engine::segment_reuse() const {
+    std::lock_guard<std::mutex> lock(impl_->reuse_info_mutex);
+    return impl_->reuse_info;
+}
+
+Status Engine::prefill(std::string_view text, bool add_bos) { return prefill(text, {}, add_bos); }
+
+Status Engine::prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos) {
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
-    auto tokens = s.encode_continuation(text, add_bos);
+    LIYAB_RETURN_IF_ERROR(check_segments(segments, text.size(), text));
+    const Impl::Request request(s, segments, /*tokens=*/false);
+    auto tokens = s.request_reuse ? s.encode_segments(text, add_bos) : s.encode_continuation(text, add_bos);
     if (!tokens) return tokens.status();
     s.cancel_prefill.store(false, std::memory_order_relaxed);
     const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
     const std::vector<int32_t>& t = tokens.value();
-    const size_t reused = s.reuse_prefix(t, t.size());
+    size_t reused = s.reuse_prefix(t, t.size(), s.request_reuse);
     const PowerPolicy policy = s.power->policy();
     s.apply_policy(policy);
     const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
@@ -1527,6 +2164,11 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
     // the next prompt continuing this text resumes there.
     hooks.cancel = &s.cancel_prefill;
     const auto chunk = static_cast<size_t>(s.prefill_chunk());
+    // Segment reuse (marked segments): stored ones after the exact prefix;
+    // cancel_prefill() stops it between blocks, keeping that prefix.
+    reused = s.reuse_request_segments(t, reused, t.size(), route, static_cast<int32_t>(chunk), &s.cancel_prefill,
+                                      nullptr);
+    if (s.cancel_prefill.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
     for (size_t i = reused; i < t.size(); i += chunk) {
         if (s.target->config().hybrid()) s.target->snapshot_state();
         const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
@@ -1540,6 +2182,7 @@ Status Engine::prefill(std::string_view text, bool add_bos) {
         s.context.insert(s.context.end(), part.begin(), part.end());
     }
     s.target->snapshot_state();  // the next prompt starts with this text
+    s.keep_request_segments();
     s.remember_text(t, text);
     return Status::ok();
 }
@@ -1553,9 +2196,13 @@ namespace {
 // After the model's state: magic, token count, tokens, then the text they
 // encode (its length, UINT64_MAX when not known) and how many of the tokens it
 // covers. Files written before that count was saved end after the text, which
-// then covers every token.
+// then covers every token. A context holding rows reused away from their
+// prefix (segment reuse) then has kReusedMagic and the first such position
+// (`exact`), so a later request that does not reuse segments never continues
+// them; other contexts end as before, so their files are unchanged.
+constexpr uint32_t kReusedMagic = 0x5355524C;  // "LRUS"
 void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, const std::string& text,
-                        size_t text_tokens) {
+                        size_t text_tokens, size_t exact = SIZE_MAX) {
     const auto n = static_cast<uint64_t>(tokens.size());
     const bool known = text_tokens > 0;
     const uint64_t length = known ? text.size() : UINT64_MAX;
@@ -1567,6 +2214,11 @@ void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, c
     if (known) {
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
         out.write(reinterpret_cast<const char*>(&covered), sizeof covered);
+    }
+    if (exact < tokens.size()) {
+        const auto first = static_cast<uint64_t>(exact);
+        out.write(reinterpret_cast<const char*>(&kReusedMagic), sizeof kReusedMagic);
+        out.write(reinterpret_cast<const char*>(&first), sizeof first);
     }
 }
 
@@ -1594,43 +2246,87 @@ Status write_replacing(const std::string& path, const std::function<Status(std::
 }  // namespace
 
 Status Engine::save_state(const std::string& path) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
     return write_replacing(path, [&s](std::ostream& out) {
         LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
-        write_context_tail(out, s.context, s.context_text, s.context_text_tokens);
+        write_context_tail(out, s.context, s.context_text, s.context_text_tokens, s.exact_end);
         return Status::ok();
     });
 }
 
 Status Engine::save_state(const std::string& path, std::string_view text) {
     {
-        std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-        if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+        const Impl::Call call(*impl_);
+        if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
         Impl& s = *impl_;
         if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
         const bool live = s.context_text_tokens > 0 && text.starts_with(s.context_text);
         if (!live) {
             // The longest context set aside for this text, written as it is
             // kept: nothing is restored or processed.
-            const Impl::PrefixEntry* best = nullptr;
-            for (const Impl::PrefixEntry& e : s.prefix_cache) {
-                if (e.text_tokens > 0 && text.starts_with(e.text) && (best == nullptr || e.text_tokens > best->text_tokens)) {
-                    best = &e;
-                }
-            }
+            const KvStore::Record* best = s.store ? s.store->record_for_text(text) : nullptr;
             if (best == nullptr) return Status(ErrorCode::InvalidArgument, "no context continues this text");
-            return write_replacing(path, [best](std::ostream& out) {
-                if (best->file.empty()) {
-                    out.write(best->state.data(), static_cast<std::streamsize>(best->state.size()));
-                } else {
-                    std::ifstream in(os::utf8_path(best->file), std::ios::binary);
-                    if (!in) return Status(ErrorCode::IoError, "cannot read " + best->file);
-                    out << in.rdbuf();
+            // A copy: reading a damaged chunk removes it, and its record with it.
+            const KvStore::Record record = *best;
+            return write_replacing(path, [&s, &record](std::ostream& out) {
+                // Its KV pages from the store's chunks, its recurrent states
+                // and snapshots from the store's images, then its tokens and text.
+                const std::vector<KvKey> keys = s.store->chunk_path(record.tokens);
+                if (keys.empty()) return Status(ErrorCode::IoError, "the context set aside is no longer complete");
+                const KvCache& kv = s.target->kv_cache();
+                const int32_t c = s.store->chunk_tokens();
+                const int32_t page_tokens = kv.config().page_tokens;
+                const auto n = static_cast<int32_t>(record.tokens.size());
+                // Pages in order: each chunk's image read once, then cut into
+                // its pages' images (all whole but a context's last).
+                std::vector<uint8_t> image, page(kv.page_bytes());
+                int32_t image_chunk = -1;
+                Status read = Status::ok();
+                Transformer::ContextImage context;
+                context.n = n;
+                context.page = [&](int32_t p) -> const uint8_t* {
+                    const int32_t chunk = p * page_tokens / c;
+                    if (chunk != image_chunk) {
+                        image.resize(kv.rows_bytes(std::min(c, n - chunk * c)));
+                        const std::span<uint8_t> into(image);
+                        read = s.store->read_chunk(keys[static_cast<size_t>(chunk)], {&into, 1});
+                        if (!read.is_ok()) return nullptr;
+                        image_chunk = chunk;
+                    }
+                    const int32_t first = p * page_tokens - chunk * c;  // positions of the chunk before this page
+                    const int32_t rows = std::min(page_tokens, n - p * page_tokens);
+                    kv.image_to_page(image.data() + kv.rows_bytes(first), rows, page.data());
+                    return page.data();
+                };
+                const size_t floats = s.target->recurrent_state_bytes() / sizeof(float);
+                Transformer::StateBuffer state;  // images are not zero-filled before they are read
+                std::vector<Transformer::StateBuffer> snapshots;
+                if (floats > 0) {
+                    const auto end = std::find_if(record.states.begin(), record.states.end(),
+                                                  [n](const KvStore::RecordState& rs) { return rs.pos == n; });
+                    if (end == record.states.end()) {
+                        return Status(ErrorCode::Unsupported, "the recurrent states of the context set aside were not kept");
+                    }
+                    state.resize(floats);
+                    const std::span<float> into(state);
+                    LIYAB_RETURN_IF_ERROR(s.store->read_state(end->key, {&into, 1}));
+                    snapshots.reserve(record.states.size());
+                    for (const KvStore::RecordState& rs : record.states) {
+                        if (rs.pos >= n) continue;
+                        snapshots.emplace_back(floats);
+                        const std::span<float> snap(snapshots.back());
+                        LIYAB_RETURN_IF_ERROR(s.store->read_state(rs.key, {&snap, 1}));
+                        context.snapshots.push_back({rs.pos, rs.pinned, snapshots.back()});
+                    }
+                    context.state = state;
                 }
-                write_context_tail(out, best->tokens, best->text, best->text_tokens);
+                const Status written = s.target->write_state(out, context);
+                LIYAB_RETURN_IF_ERROR(read);
+                LIYAB_RETURN_IF_ERROR(written);
+                write_context_tail(out, record.tokens, record.text, record.text_tokens);
                 return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
             });
         }
@@ -1639,8 +2335,8 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
 }
 
 Result<int32_t> Engine::load_state(const std::string& path) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
     s.clear_context();
@@ -1674,18 +2370,27 @@ Result<int32_t> Engine::load_state(const std::string& path) {
         }
         s.context_text_tokens = static_cast<size_t>(covered);
     }
+    // Where rows reused away from their prefix start (segment reuse), when
+    // the context held some.
+    uint32_t reused = 0;
+    uint64_t exact = 0;
+    if (in.read(reinterpret_cast<char*>(&reused), sizeof reused) && reused == kReusedMagic) {
+        if (!in.read(reinterpret_cast<char*>(&exact), sizeof exact) || exact >= n) return damaged();
+        s.exact_end = static_cast<size_t>(exact);
+    }
+    s.last_prompt_end = static_cast<size_t>(n);
     return static_cast<int32_t>(n);
 }
 
 void Engine::reset_context() {
-    std::lock_guard<std::mutex> lock(impl_->busy);
+    const Impl::Call call(*impl_, /*wait=*/true);
     impl_->clear_context();
 }
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     auto tokens = impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     return generate_locked(*tokens, params, on_token, &prompt);
@@ -1693,8 +2398,8 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token, const ForceCallback& force) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     auto tokens = impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
@@ -1705,9 +2410,12 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
     if (options.grammar && options.continuation) {
         return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
     }
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size(), prompt));
+    const Impl::Request request(*impl_, options.segments, /*tokens=*/false);
+    auto tokens = impl_->request_reuse ? impl_->encode_segments(prompt, params.add_bos)
+                                       : impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     const bool structured = options.grammar.has_value() || static_cast<bool>(options.continuation);
     return generate_locked(*tokens, params, on_token, &prompt, nullptr, structured ? &options : nullptr);
@@ -1715,9 +2423,27 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
 
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     return generate_locked(prompt, params, on_token, nullptr);
+}
+
+Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                                const TokenCallback& on_token, const GenerateOptions& options) {
+    if (options.grammar && options.continuation) {
+        return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
+    }
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size()));
+    const Impl::Request request(*impl_, options.segments, /*tokens=*/true);
+    if (impl_->request_reuse) {
+        for (const PromptSegment& m : options.segments) {
+            impl_->request_segments.push_back({static_cast<int32_t>(m.begin), static_cast<int32_t>(m.end)});
+        }
+    }
+    const bool structured = options.grammar.has_value() || static_cast<bool>(options.continuation);
+    return generate_locked(prompt, params, on_token, nullptr, nullptr, structured ? &options : nullptr);
 }
 
 Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
@@ -1731,7 +2457,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     s.cancel.store(false, std::memory_order_relaxed);
     const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
     // The last prompt token seeds the decode loop, so it is never reused.
-    const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
+    const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1, s.request_reuse);
     if (s.speculative) s.speculative->reset_stats();
     s.power->reset_pacing();
     {
@@ -1756,29 +2482,15 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     stats.context_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
     size_t first_uncached = reused;
     stats.cached_prefix_tokens = static_cast<int32_t>(reused);
-#if defined(LIYAB_ENABLE_EXPERIMENTAL)
-    // Persistent prefix cache: attach snapshotted KV pages for the longest
-    // known prefix (full attention, no draft model).
-    // (Not for hybrid models: the snapshots hold KV pages, not recurrent states.)
-    const bool use_dedup = reused == 0 && s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0 &&
-                           !s.target->config().hybrid();
-    if (use_dedup) {
-        const int32_t restored = s.kv_dedup->restore(prompt, static_cast<int32_t>(prompt.size()) - 1,
-                                                     s.target->mutable_kv_cache());
-        if (restored > 0 && s.target->adopt_cached_prefix(restored).is_ok()) {
-            first_uncached = static_cast<size_t>(restored);
-            stats.cached_prefix_tokens = restored;
-            s.context.assign(prompt.begin(), prompt.begin() + restored);
-        } else {
-            s.clear_context();
-        }
-    }
-#endif
     const PowerPolicy prefill_policy = s.power->policy();
     s.apply_policy(prefill_policy);
     const Route prefill_route = prefill_policy.throttled ? s.throttled_route() : s.normal_route();
     const ForwardHooks prefill_hooks = s.hooks(prefill_policy, false);
     const auto chunk = static_cast<size_t>(s.prefill_chunk());
+    // Segment reuse (a request that marked segments): stored segments after
+    // the exact prefix, processing resumes after the last one reused.
+    first_uncached = s.reuse_request_segments(prompt, first_uncached, prompt.size() - 1, prefill_route,
+                                              static_cast<int32_t>(chunk), &s.cancel, &stats);
     const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1).subspan(first_uncached);
     for (size_t i = 0; i < prefix.size(); i += chunk) {
         if (s.cancel.load(std::memory_order_relaxed)) {
@@ -1801,13 +2513,10 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     }
     stats.prefill_ms = ms_since(t_prefill);
     // The next chat turn re-sends this prompt: keep its recurrent state.
-    if (!s.draft) s.target->snapshot_state(/*pin=*/true);
-#if defined(LIYAB_ENABLE_EXPERIMENTAL)
-    if (use_dedup) {
-        auto saved = s.kv_dedup->save(prompt, static_cast<int32_t>(prompt.size()) - 1, s.target->kv_cache());
-        if (!saved) LIYAB_LOG_WARN("KV snapshot not saved: %s", saved.status().to_string().c_str());
+    if (!s.draft) {
+        s.target->snapshot_state(/*pin=*/true);
+        s.last_prompt_end = s.context.size();
     }
-#endif
 
     const auto t_decode = Clock::now();
     const Transformer::PhaseTimes phases_before = s.target->phase_times();
@@ -2228,6 +2937,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         stats.draft_tokens_proposed = s.speculative->proposed();
         stats.draft_tokens_accepted = s.speculative->accepted();
     }
+    s.keep_request_segments();
     if (text != nullptr && !s.draft) s.remember_text(prompt, *text);
     return stats;
 }
@@ -2247,8 +2957,8 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
                                                       const EmbedOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     Pooling pooling = options.pooling;
@@ -2301,8 +3011,8 @@ Result<std::vector<float>> Engine::rerank(std::string_view query, std::span<cons
                                           const RerankOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     const std::string& tmpl = options.prompt_template.empty() ? s.pooling.rerank_template : options.prompt_template;

@@ -24,10 +24,13 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <iosfwd>
 #include <memory>
+#include <new>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/architecture.h"
@@ -361,6 +364,26 @@ public:
     // Unsupported with a sliding window (released positions are gone).
     // IoError when the stream fails.
     Status write_state(std::ostream& out) const;
+    // A context held outside the model, as the engine's KV store keeps it
+    // (core/kv_store.h): positions [0, n), the KV page `page(p)` returns for
+    // each p < ceil(n / page_tokens) (page_bytes() bytes, valid until the
+    // next call), the recurrent states at n and the snapshots below n.
+    struct SnapshotImage {
+        int32_t pos = 0;
+        bool pinned = false;
+        std::span<const float> data;  // recurrent_state_bytes() / sizeof(float) values
+    };
+    struct ContextImage {
+        int32_t n = 0;
+        std::function<const uint8_t*(int32_t page)> page;
+        std::span<const float> state;  // empty without recurrent blocks
+        std::vector<SnapshotImage> snapshots;
+    };
+    // Writes `image` in write_state()'s format, as if it were the context
+    // (the key scales in use, which the store's chunks were stored with).
+    // Unsupported with a sliding window; InvalidArgument for an image that
+    // does not fit this model; IoError when the stream fails.
+    Status write_state(std::ostream& out, const ContextImage& image) const;
     // Replaces the context with one write_state() saved, its snapshots
     // included (truncate() returns to them as in the context that was saved),
     // and takes a state snapshot at its end (pinned unless a saved one is).
@@ -369,6 +392,75 @@ public:
     // to them. InvalidArgument when the fingerprint differs; the context is
     // empty after any failure.
     Status read_state(std::istream& in);
+    // What the context's bytes depend on (the fingerprint read_state()
+    // checks, the page size and the key scales in use): the root of the KV
+    // store's keys, together with what the engine adds (kernels, route).
+    [[nodiscard]] uint64_t context_fingerprint() const noexcept;
+    // The recurrent-state images write_state() keeps, ascending: the oldest
+    // and the pinned snapshot below n_past(), then n_past() itself, with the
+    // pinned flags read_state() gives them back (the end pinned unless a
+    // snapshot below is). Empty without recurrent blocks or at position 0.
+    struct KeptState {
+        int32_t pos = 0;
+        bool pinned = false;
+    };
+    [[nodiscard]] std::vector<KeptState> kept_states() const;
+    // The recurrent states at `pos`, one of kept_states(), as the parts of a
+    // state image in order ([conv | ssm] of each recurrent block; one part
+    // for a snapshot), read in place: written to storage without a copy.
+    // Valid until the context changes; empty for another position.
+    [[nodiscard]] std::vector<std::span<const float>> kept_state_parts(int32_t pos) const;
+
+    // Float storage for recurrent-state images that is not zero-filled when
+    // sized: every value is written before it is read, and a 35B's image is
+    // 62.8 MiB, whose zero-fill and first touch cost as much as reading it
+    // back from storage.
+    template <typename T>
+    struct UninitializedAllocator : std::allocator<T> {
+        template <typename U>
+        struct rebind {
+            using other = UninitializedAllocator<U>;
+        };
+        UninitializedAllocator() = default;
+        template <typename U>
+        UninitializedAllocator(const UninitializedAllocator<U>&) noexcept {}
+        template <typename U>
+        void construct(U* p) noexcept {
+            ::new (static_cast<void*>(p)) U;  // default-initialized: left as it is
+        }
+        template <typename U, typename... Args>
+        void construct(U* p, Args&&... args) {
+            ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+        }
+    };
+    using StateBuffer = std::vector<float, UninitializedAllocator<float>>;
+
+    // Restoring a context image in place (the engine's KV store), with no
+    // intermediate copy of the recurrent states. begin_restore() keeps the
+    // buffers of the current snapshots for reuse (the context is being
+    // replaced: they are already the right size and in memory);
+    // recurrent_parts() are the live recurrent states, in image order, for a
+    // state image to be read into; take_snapshot_buffer() gives the buffer
+    // for one snapshot image (a kept one, else a new one, not zero-filled).
+    // adopt_context() then makes positions [0, n) the context.
+    void begin_restore();
+    [[nodiscard]] std::vector<std::span<float>> recurrent_parts();
+    [[nodiscard]] StateBuffer take_snapshot_buffer();
+    struct OwnedSnapshot {
+        int32_t pos = 0;
+        bool pinned = false;
+        StateBuffer data;  // recurrent_state_bytes() / sizeof(float) values
+    };
+    // Takes positions [0, n) as the context once the caller has written their
+    // KV rows (KvCache::reserve() and write_rows(); rows below n_past() may be
+    // left as they are where they hold the same tokens) and its recurrent
+    // states (recurrent_parts()): frees the pages past n, moves `snapshots`
+    // in as the snapshots below n (ascending, fewer than kStateSnapshots),
+    // discards the rollback checkpoints, then takes a snapshot at n, pinned
+    // when `pin_end`, in a buffer begin_restore() kept when one is left (the
+    // others are freed). InvalidArgument for an image that does not fit
+    // (sizes, positions, unmapped pages); the context is then empty.
+    Status adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -381,12 +473,73 @@ public:
     // a pass will never be rolled back (a plain decoding step) turn it off to
     // skip the state copies; positions processed meanwhile cannot be returned to.
     void set_checkpointing(bool on) noexcept { checkpointing_ = on; }
-    // Declares positions [0, n) cached after their KV pages were attached
-    // externally (KvCache::attach_external_pages). Requires an empty context.
-    // Unsupported for hybrid models (KV pages do not carry recurrent states).
-    Status adopt_cached_prefix(int32_t n);
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
+
+    // ---- KV reused away from its prefix (segment reuse, core/kv_reuse.h) ----
+    // Whether this model's KV rows can be moved to other positions and
+    // partly recomputed there, and why not: Unsupported for hybrid models
+    // (their recurrent blocks must run over the whole prompt, in order),
+    // with a sliding-window cache (released positions are gone), and when a
+    // Q/K norm after RoPE zeroes a rotated key channel (its rotation could
+    // not be undone).
+    [[nodiscard]] Status reuse_support() const;
+    // A context of its own for background work (segment reuse's calibration
+    // while the engine is idle): swaps the KV cache and the position count
+    // with `kv` and `n_past`, so the work runs on another cache and the
+    // conversation's comes back untouched by swapping again. `kv` comes from
+    // make_kv_cache(). Unsupported with recurrent blocks (their states are
+    // part of a context too); InvalidArgument for a cache of another layout.
+    Status swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past);
+    // An empty KV cache laid out like the context's (format, pages, rows)
+    // for `positions` positions; its pages are mapped as they are used.
+    [[nodiscard]] Result<std::unique_ptr<KvCache>> make_kv_cache(int32_t positions) const;
+    // Rewrites the keys of slots [first, first + count) of `image` (an image
+    // of `slots` positions in KvCache::read_rows()' layout), stored for
+    // positions from + i, as this model stores the keys of positions to + i.
+    // Exact up to rounding for every RoPE this engine runs, since RoPE turns
+    // each rotated pair by an angle proportional to the position: each pair
+    // is turned back by its stored position's angle and on by the new one's,
+    // with each block's own table (pairing, partial rotation, frequency
+    // factors, LongRoPE, YaRN, the windowed blocks' base, latent attention's
+    // RoPE part); RoPE's magnitude cancels. Key scales and a Q/K norm after
+    // RoPE are taken out before the rotation and put back after it. Only the
+    // blocks of a quantized row that hold rotated channels are dequantized
+    // and quantized again: values, unrotated channels (latent attention's
+    // latent) and every row of a move by 0 keep their bits. `pool`
+    // (optional) spreads the rows over its threads. InvalidArgument for
+    // slots outside the image or negative positions; reuse_support()'s
+    // errors otherwise.
+    Status move_keys(uint8_t* image, int32_t slots, int32_t first, int32_t count, int32_t from, int32_t to,
+                     ThreadPool* pool = nullptr) const;
+    // The token embeddings of `tokens` (n_embd floats each, scaled as
+    // forward() scales them) into `x`: the residual stream entering block 0.
+    // InvalidArgument for a token outside the vocabulary or a short `x`.
+    Status embed(std::span<const int32_t> tokens, std::span<float> x) const;
+    // Runs block `layer` for tokens at `positions` (ascending, each below
+    // n_past(): their pages mapped, every row a query reads written) whose
+    // residual streams entering the block are the rows of `x` (n_embd floats
+    // each), as forward() would for a batch at those positions: their KV rows
+    // at the block are written, each token attends to every cached position
+    // up to its own (the rows of the others as the cache holds them), and
+    // `x` is left with the streams after the block. Lets a caller recompute
+    // some positions of a context block by block, keeping the rest. Passes
+    // of at most `chunk` tokens in order, the block's weights acquired once;
+    // no hooks. Attention-only models (Unsupported otherwise, see
+    // reuse_support()); InvalidArgument for positions or sizes that do not
+    // fit.
+    Status run_block_at(int32_t layer, std::span<const int32_t> positions, std::span<float> x, int32_t chunk,
+                        const Route& route, ThreadPool& pool);
+    // The KV cache slot of block `layer`, or -1 when its mixer keeps none.
+    [[nodiscard]] int32_t kv_slot_of(int32_t layer) const noexcept {
+        return layers_[static_cast<size_t>(layer)].kv_slot;
+    }
+    // The queries the last pass's attention scored with, at the last block it
+    // ran (run_block_at: of its last pass of at most `chunk` tokens): n_head x
+    // head_dim floats per token, rotated and key-scaled as the cached keys
+    // they meet (a latent-attention head's absorbed query). Valid until the
+    // next pass.
+    [[nodiscard]] std::span<const float> last_queries() const noexcept { return q_; }
 
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as
@@ -462,6 +615,18 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
+    // Position of token t of the current batch: n_past_ + t, or positions_[t]
+    // while run_block_at() runs a batch at scattered positions.
+    [[nodiscard]] int32_t pos_of(int32_t t) const noexcept {
+        return positions_.empty() ? n_past_ + t : positions_[static_cast<size_t>(t)];
+    }
+    // Sizes the per-token scratch for a batch of n tokens.
+    void size_batch(int32_t n);
+    // One block over the batch in x_ (n rows, token t at pos_of(t)): the
+    // token mixer and the FFN with their norms and residual adds, as
+    // forward() runs it (it is forward()'s loop body).
+    Status run_block(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                     const HeadMaskHook* head_mask, FfnSkipHook* ffn_skip, FfnMatmulHook* ffn_hook);
     // Mixers: read the normalized input from xb_, leave the block output (before
     // the residual add) in xb_.
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
@@ -556,6 +721,7 @@ private:
     int32_t context_length_ = 0;
     int32_t max_batch_ = 0;
     int32_t n_past_ = 0;
+    std::span<const int32_t> positions_;  // run_block_at(): the batch's positions (see pos_of)
     int32_t last_exit_layer_ = -1;
     int32_t last_ffn_skips_ = 0;
     std::unique_ptr<KvCache> kv_;
@@ -576,12 +742,18 @@ private:
     bool checkpointing_ = true;
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
     [[nodiscard]] std::array<int64_t, 9> state_fingerprint() const noexcept;
+    Status write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
+                       std::span<const float> state, std::span<const SnapshotImage> snapshots, bool live) const;
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
-        std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order
+        StateBuffer data;          // [conv | ssm] of every recurrent block, in states_ order
         bool pinned = false;       // the end of the last prompt (see snapshot_state)
     };
     std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_
+    // Snapshot buffers begin_restore() kept for the context being restored
+    // (at most kStateSnapshots with snapshots_): no allocation, first touch
+    // or zero-fill per restore.
+    std::vector<StateBuffer> spare_buffers_;
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;

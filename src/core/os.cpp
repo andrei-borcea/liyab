@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <utility>
 
 #if defined(_WIN32)
 #include <malloc.h>   // _aligned_malloc, _aligned_free
@@ -9,6 +10,8 @@
 
 #include "core/windows_api.h"
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -157,6 +160,54 @@ bool writable_directory(const std::string& path) {
     struct stat st {};
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(path.c_str(), W_OK) == 0;
 #endif
+}
+
+FileLock::~FileLock() {
+    if (handle_ == kNone) return;
+#if defined(_WIN32)
+    // Closing the handle releases its lock.
+    CloseHandle(reinterpret_cast<HANDLE>(handle_));
+#else
+    close(static_cast<int>(handle_));  // releases the flock of this open file
+#endif
+}
+
+FileLock::FileLock(FileLock&& other) noexcept : handle_(other.handle_) { other.handle_ = kNone; }
+
+FileLock& FileLock::operator=(FileLock&& other) noexcept {
+    if (this != &other) {
+        FileLock released(std::move(*this));
+        handle_ = other.handle_;
+        other.handle_ = kNone;
+    }
+    return *this;
+}
+
+FileLock FileLock::acquire(const std::string& path) {
+    FileLock lock;
+#if defined(_WIN32)
+    // Sharing every access lets other processes open the file; LockFileEx
+    // then refuses them the byte range, as flock refuses a second lock.
+    HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return lock;
+    OVERLAPPED at{};
+    if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &at) == 0) {
+        CloseHandle(h);
+        return lock;
+    }
+    lock.handle_ = reinterpret_cast<intptr_t>(h);
+#else
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return lock;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return lock;
+    }
+    lock.handle_ = fd;
+#endif
+    return lock;
 }
 
 #if defined(_WIN32)

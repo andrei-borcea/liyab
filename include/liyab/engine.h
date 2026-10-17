@@ -32,7 +32,9 @@ struct ExperimentalConfig {
     float egls_threshold = 0.002f;        // skip a block's FFN when its entropy delta is below this
     bool tdss = false;                    // 2:4 sparse FFN weights while thermally throttled (lossy)
     bool tdss_force = false;              // use the sparse FFN even when cool (benchmarks)
-    std::string kv_dedup_dir;             // non-empty: persistent prefix KV cache in this directory
+    // (KV dedup, the experimental persistent prefix KV cache, is retired: the
+    // prefix cache's store keeps a shared prefix once, on storage across
+    // processes, for every model, within its caps; see prefix_cache_dir.)
 };
 
 // How a model with multi-head latent attention (DeepSeek-V2/V3 and models
@@ -102,23 +104,44 @@ struct EngineConfig {
     // output then depends on I/O timing. 0: off.
     float moe_skip_slow = 0.0f;
     // Prefix cache, MiB of RAM at most (0: off): contexts another
-    // conversation's prompt replaced are kept (KV pages, recurrent states and
-    // the text they encode, LRU) and restored when a prompt continues one,
-    // instead of processing it again. Taken out of memory_budget_mb; on a MoE
-    // whose experts stream, only as far as the expert cache can spare: it
-    // never takes the cache under 10% of the experts, so it never causes a
-    // requantization (requant_bits -1). On Qwen3.6-35B-A3B a 2000-token
-    // conversation costs ~85 MiB.
+    // conversation's prompt replaced (or an embed() / rerank() call) are kept
+    // and restored when a prompt continues one, instead of processing it
+    // again, cut back to where the two diverge (whenever that gives back more
+    // than the live context keeps). A prompt replaces the context when it
+    // shares less than half of it, or leaves it before the end of its last
+    // prompt and rewinding would process at least 128 tokens again (another
+    // chat after a long shared system prompt, an edited message; on a hybrid
+    // model, back to its nearest state snapshot); a draft typed ahead and
+    // then edited after the last reply does not. Contexts are kept in a
+    // content-addressed store of KV chunks (whole KV pages, about 2 MiB, at
+    // most 256 tokens), each keyed by every token before it plus the model,
+    // cache layout, key scales and kernels, so a prefix conversations share
+    // (system prompt, tools) is stored once and any prompt starting with it
+    // restores it; recurrent (DeltaNet) states are kept as images at the
+    // positions the context's state snapshots hold, and a hybrid model
+    // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
+    // of memory_budget_mb; on a MoE whose experts stream, only as far as the
+    // expert cache can spare: it never takes the cache under 10% of the
+    // experts, so it never causes a requantization (requant_bits -1). On
+    // Qwen3.6-35B-A3B a 2000-token conversation costs ~21 MiB of chunks plus
+    // 62.8 MiB per state image. Off with a sliding window (released positions
+    // are gone) or a draft model (it keeps no reusable context).
     int64_t prefix_cache_mb = 0;
-    // Prefix cache on storage: contexts set aside that RAM does not hold
-    // (prefix_cache_mb, possibly 0) are written to files in this directory
-    // (created if missing), up to prefix_cache_disk_mb (0: off), least
-    // recently used out first, and read back when a prompt continues one.
-    // No RAM spent: worth it wherever RAM is tight and storage is fast (UFS 4
-    // writes or reads a ~100 MB context in a fraction of a second; processing
-    // it again takes minutes on a large MoE). The engine owns the ctx-*.state
-    // files there: it removes its own when destroyed and, when created, those
-    // that processes which ended left behind.
+    // Prefix cache on storage: what RAM does not hold (prefix_cache_mb,
+    // possibly 0) goes to files in this directory (created if missing), at
+    // most prefix_cache_disk_mb (0: off), least recently used out first, and
+    // is read back when a prompt continues it. No RAM spent: worth it
+    // wherever RAM is tight and storage is fast (UFS 4 writes or reads a
+    // ~100 MB context in a fraction of a second; processing it again takes
+    // minutes on a large MoE). The files outlive the engine: when destroyed,
+    // it sets its context aside there too, and a later engine (or process)
+    // with the same model and settings restores from them; other models'
+    // files are kept and count against the cap. Writes go through a
+    // temporary file and a rename; when it opens the directory the engine
+    // removes what it cannot trust (interrupted writes, damaged files, other
+    // format versions, the ctx-*.state files of builds before the store).
+    // One engine at a time uses a directory (an OS lock on kv.lock there):
+    // another one, in this process or another, runs without the storage tier.
     std::string prefix_cache_dir;
     int64_t prefix_cache_disk_mb = 0;
     // What the engine measures once per model and keeps, in this directory
@@ -182,6 +205,31 @@ struct EngineConfig {
     // give the same bits on every device of a kernel set. Decoding steps are
     // always absorbed.
     LatentAttentionForm latent_form = LatentAttentionForm::Auto;
+    // Segment reuse: KV reused away from its prefix. Lossy and off by
+    // default: see PromptSegment for what it does and what it changes. On,
+    // the engine measures once per model and cache settings the share of a
+    // reused segment's tokens it processes again to keep the output within
+    // segment_reuse_max_kl of processing the whole prompt, and keeps the
+    // result in cache_dir (measured again at every load without one). The
+    // measurement does not hold up loading: it runs in the background once
+    // no call has used the engine for 2 s, a stage at a time on a context of
+    // its own (the conversation's is left as it was), and a call arriving
+    // meanwhile stops it between two blocks, so a request waits a fraction
+    // of a second at most; the stage runs again at the next idle time. In
+    // all about as much work as processing 15,000 tokens (minutes for a 1B
+    // model on a Mac's CPU). Until it ends, segment reuse is off: marked
+    // prompts are processed as usual (Engine::segment_reuse() says how far it
+    // got). Needs the prefix cache's store (prefix_cache_mb or
+    // prefix_cache_disk_mb), whose caps the stored segments share; refused,
+    // with the reason in Engine::segment_reuse(), for hybrid models, with a
+    // sliding window or a draft model, or when no share on the calibration's
+    // grid meets the target.
+    bool segment_reuse = false;
+    // The target: the mean KL divergence of the next-token distributions,
+    // KL(whole prompt processed || segments reused), over the answers to
+    // RAG-shaped prompts in the model's chat template (core/kv_reuse.h), with
+    // a margin for what those prompts cannot tell apart.
+    float segment_reuse_max_kl = 0.02f;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
@@ -254,6 +302,51 @@ struct Continuation {
 // past that point are dropped). Called on the generating thread.
 using ContinuationCallback = std::function<Continuation(std::string_view generated)>;
 
+// ---- Segment reuse: KV reused away from its prefix (lossy, opt-in) ---------
+// An agent's prompts put documents, memory snippets and tool results in the
+// middle, so a change before them makes everything after them be processed
+// again. A caller marks such parts of a prompt (PromptSegment: a system
+// block, tools, a document, a tool result, a conversation turn), and with
+// EngineConfig::segment_reuse on, the engine keeps the KV of each marked
+// part and reuses it wherever the same part appears again:
+//  * Exact reuse first. The part of the prompt the live context or the
+//    prefix cache holds is kept or restored as before, losslessly; segments
+//    are reused only after it.
+//  * A segment's KV is kept in the prefix cache's store (within its caps,
+//    least recently used out first, on storage across runs when it has a
+//    storage tier) once a prompt marking it has been processed, keyed by its
+//    tokens and the position it was computed at.
+//  * Reused elsewhere, its keys are turned from the positions they were
+//    computed at to the new ones (RoPE: exact up to rounding, every variant
+//    the engine runs), then part of its tokens is processed again with
+//    attention to everything now before them, the ones whose keys and
+//    values moved the most when the first blocks were run again; the rest
+//    keep their reused rows. The share is calibrated per model
+//    (segment_reuse_max_kl).
+//  * It changes the output: the reused rows lack attention to what now
+//    precedes them, which recomputing only part of them does not fully
+//    restore. A request opts in by marking segments; one that does not never
+//    sees reused rows: a context holding them is processed again from the
+//    first one (it is set aside in the prefix cache only up to there, and
+//    save_state() records where they start).
+//  * Text a segment holds is encoded on its own (at its boundaries the
+//    prompt is split even where encoding it whole would merge two tokens),
+//    so its tokens are the same wherever it appears. Segments shorter than
+//    16 tokens are processed as usual.
+//  * Not on hybrid models (their recurrent blocks must run over the whole
+//    prompt in order), with a sliding window or a draft model (no store):
+//    there, marked prompts are processed as usual, losslessly, and
+//    Engine::segment_reuse() says why.
+// GenerationStats and Engine::PrefixCacheStats count what was reused.
+//
+// A marked part of a prompt, [begin, end): byte offsets into a prompt's
+// text, on whole UTF-8 characters (token indices into a prompt given as
+// tokens). The segments of one prompt ascend and do not overlap.
+struct PromptSegment {
+    size_t begin = 0;
+    size_t end = 0;
+};
+
 // Options of Engine::generate. At most one of the two is set (both:
 // InvalidArgument).
 struct GenerateOptions {
@@ -264,6 +357,10 @@ struct GenerateOptions {
     // Forced text and constrained spans at chosen points of the output (a
     // tool call's syntax forced, its arguments constrained by their schema).
     ContinuationCallback continuation;
+    // Segment reuse (see PromptSegment): the prompt's marked parts, which
+    // makes this request opt in to it. Independent of the two above. Ignored
+    // (the prompt processed as usual) while segment reuse is unavailable.
+    std::vector<PromptSegment> segments;
 };
 
 // How a model's chat template lays out a conversation, found by rendering
@@ -405,8 +502,8 @@ public:
     // prompt, prepared right after loading). Follows the same reuse rules as
     // generate(). Not reentrant (Busy); cancel() stops it between chunks.
     Status prefill(std::string_view text, bool add_bos = true);
-    // Forgets the context (the next call starts from scratch, or from a
-    // context the prefix cache set aside that its prompt continues).
+    // Forgets the context (the next call starts from scratch, or from what
+    // the prefix cache keeps of its prompt).
     void reset_context();
     // Saves the context (e.g. a prefilled system prompt) to `path`: KV pages,
     // recurrent states (with the oldest and the pinned state snapshots on
@@ -417,9 +514,11 @@ public:
     Status save_state(const std::string& path);
     // Saves the context that `text` continues (a conversation's text so far):
     // the live one when it does, else the longest one the prefix cache set
-    // aside for it, written as kept (nothing is restored or processed), so a
-    // conversation another prompt replaced (a request through an app's API)
-    // can still be saved. InvalidArgument when no context continues `text`.
+    // aside for it, written from its store as kept (nothing is restored or
+    // processed), so a conversation another prompt replaced (a request
+    // through an app's API) can still be saved. InvalidArgument when no
+    // context continues `text`; Unsupported when a hybrid model's set-aside
+    // context lost its recurrent states (they did not fit the cache).
     Status save_state(const std::string& path, std::string_view text);
     // Replaces the context with one save_state() wrote for this model file
     // loaded with the same cache settings, so the next prompt that continues
@@ -575,6 +674,62 @@ public:
     // query), the context is left empty, one call at a time, cancellable.
     Result<std::vector<float>> rerank(std::string_view query, std::span<const std::string_view> documents,
                                       const RerankOptions& options = {}, PoolingStats* stats = nullptr);
+
+    // ---- Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir) ------
+    // What its store holds and how it was used since the engine was created.
+    // All zero without a prefix cache. Thread-safe: may be read while a
+    // generation runs (the figures are those after the last use).
+    struct PrefixCacheStats {
+        uint64_t ram_bytes = 0;          // KV chunks and state images in RAM
+        uint64_t ram_cap_bytes = 0;      // prefix_cache_mb as granted (0: no RAM tier)
+        uint64_t storage_bytes = 0;      // the store's files in prefix_cache_dir, every model's
+        uint64_t storage_cap_bytes = 0;  // prefix_cache_disk_mb (0: no storage tier)
+        int32_t chunks = 0;              // this model's, in RAM and on storage
+        int32_t state_images = 0;        // recurrent-state images (hybrid models)
+        int32_t contexts = 0;            // stored contexts (texts a prompt is matched against)
+        int32_t chunk_tokens = 0;        // positions per chunk: whole KV pages, about 2 MiB
+        uint64_t set_asides = 0;         // contexts set aside
+        uint64_t chunks_written = 0;     // chunks they added
+        uint64_t chunks_reused = 0;      // chunks they found stored already (shared prefixes)
+        double set_aside_ms = 0.0;       // total time setting aside
+        uint64_t restores = 0;           // prompts that restored a prefix
+        uint64_t restored_tokens = 0;    // positions restored
+        double restore_ms = 0.0;         // total time restoring
+        // Segment reuse (see PromptSegment):
+        int32_t segments = 0;                  // stored segment copies (their chunks are in `chunks`)
+        uint64_t segments_kept = 0;            // segments stored
+        uint64_t segment_reuses = 0;           // segments reused
+        uint64_t segment_reused_tokens = 0;    // positions reused away from their prefix
+        uint64_t segment_recomputed_tokens = 0;  // of them, processed again
+    };
+    [[nodiscard]] PrefixCacheStats prefix_cache_stats() const;
+
+    // ---- Segment reuse (see PromptSegment) ----------------------------------
+    // generate_tokens() with options (a grammar, a continuation, marked
+    // segments as token indices into `prompt`); see generate() with
+    // GenerateOptions.
+    Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                            const TokenCallback& on_token, const GenerateOptions& options);
+    // prefill() of a text with marked segments (byte offsets): stored
+    // segments are reused as generate() reuses them, and the segments are
+    // kept once processed. InvalidArgument for segments that are not
+    // ascending, overlap, leave the text or cut a character.
+    Status prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos = true);
+    // Whether segment reuse is on, and what it was calibrated to: OK, or why
+    // not (off in EngineConfig, the model or settings refuse it, no stored
+    // segments without a prefix cache, the target not met), or Busy while
+    // the calibration runs in the background (`calibrating`). Thread-safe.
+    struct SegmentReuseInfo {
+        Status status;
+        float fraction = 0.0f;  // share of a reused segment's tokens processed again
+        double kl = 0.0;        // the calibration's mean KL at that share
+        double top1 = 0.0;      // and its top-1 agreement with processing the whole prompt, in [0, 1]
+        bool from_cache = false;  // the calibration was read from cache_dir
+        bool calibrating = false;  // the calibration runs in the background: segment reuse is off until it ends
+        float progress = 0.0f;     // share of the calibration's work done, in [0, 1]
+        double bound = 0.0;        // the calibration's upper bound on the KL at that share (what met the target)
+    };
+    [[nodiscard]] SegmentReuseInfo segment_reuse() const;
 
 private:
     struct Impl;

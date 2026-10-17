@@ -4,7 +4,8 @@
 // the power manager and the experimental modules need beyond standard C++,
 // behind one interface. On macOS, Linux and Android each function makes the
 // POSIX call those modules made before (sysconf, posix_memalign, mmap, mlock,
-// getpid, rename, fopen, stat, access), so their behaviour there is unchanged;
+// getpid, rename, fopen, stat, access; flock for the KV store's lock), so
+// their behaviour there is unchanged;
 // on Windows each maps to its Win32 or C-runtime counterpart, and where the
 // semantics differ the function says how. The loader (mmap_loader.cpp), the
 // direct reader (direct_io.cpp) and the thread pool keep their own Windows
@@ -19,6 +20,7 @@
 #define LIYAB_CORE_OS_H
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -86,6 +88,30 @@ bool path_exists(const std::string& path);
 // reports every directory as writable): there, an existing directory, and
 // creating a file in it reports what its ACL allows.
 bool writable_directory(const std::string& path);
+
+// An exclusive advisory lock on the file at `path` (created when missing),
+// held until the object is destroyed or the process ends, a crash included
+// (flock; LockFileEx on Windows). Any other holder fails to take it
+// meanwhile: another process, and another FileLock of this one (both locks
+// belong to an open file, not to a process). Owners of a directory of shared
+// files (the engine's KV store) take it so one of them alone changes it.
+class FileLock {
+public:
+    FileLock() = default;
+    ~FileLock();
+    FileLock(FileLock&& other) noexcept;
+    FileLock& operator=(FileLock&& other) noexcept;
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+    // Takes the lock without waiting; an empty FileLock when another holder
+    // has it or the file cannot be opened.
+    static FileLock acquire(const std::string& path);
+    [[nodiscard]] bool held() const noexcept { return handle_ != kNone; }
+
+private:
+    static constexpr intptr_t kNone = -1;
+    intptr_t handle_ = kNone;  // a POSIX descriptor or a Windows HANDLE
+};
 
 #if defined(_WIN32)
 // UTF-8 <-> UTF-16 for Win32 calls. Invalid UTF-8 becomes U+FFFD.

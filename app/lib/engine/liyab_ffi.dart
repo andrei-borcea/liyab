@@ -86,7 +86,7 @@ final class LiyabEngineConfig extends Struct {
   external double eglsThreshold;
   @Int32()
   external int tdss;
-  external Pointer<Utf8> kvDedupDir;
+  external Pointer<Utf8> kvDedupDir; // retired (KV dedup, replaced by the prefix cache's store): kept for the layout
   @Float()
   external double moeSkipSlow;
   @Int64()
@@ -99,6 +99,10 @@ final class LiyabEngineConfig extends Struct {
   external int suffixDrafts;
   @Int32()
   external int poolingKvCacheType;
+  @Int32()
+  external int segmentReuse; // segment reuse (lossy, opt-in per request); 0: off
+  @Float()
+  external double segmentReuseMaxKl;
 }
 
 /// liyab_pooling: what a model does with its final hidden states (liyab_engine_pooling).
@@ -236,6 +240,12 @@ final class LiyabGenerationStats extends Struct {
   external double contextMs;
   @Double()
   external double ttftStallMs;
+  @Int32()
+  external int segmentReusedTokens;
+  @Int32()
+  external int segmentRecomputedTokens;
+  @Double()
+  external double segmentMs;
 }
 
 final class LiyabMemoryPlan extends Struct {

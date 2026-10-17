@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/kv_store.h"
 #include "core/log.h"
 #include "liyab/liyab.h"
 
@@ -99,7 +100,10 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.forced_tokens,
                                         s.forced_ms,
                                         s.context_ms,
-                                        s.ttft_stall_ms};
+                                        s.ttft_stall_ms,
+                                        s.segment_reused_tokens,
+                                        s.segment_recomputed_tokens,
+                                        s.segment_ms};
     }
     return LIYAB_OK;
 }
@@ -228,6 +232,8 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->egls_threshold = d.experimental.egls_threshold;
     config->tdss = d.experimental.tdss ? (d.experimental.tdss_force ? 2 : 1) : 0;
     config->pooling_kv_cache_type = static_cast<liyab_kv_cache_type>(d.pooling_kv_cache_type);
+    config->segment_reuse = d.segment_reuse ? 1 : 0;
+    config->segment_reuse_max_kl = d.segment_reuse_max_kl;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -279,13 +285,17 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.experimental.egls_threshold = config->egls_threshold;
         c.experimental.tdss = config->tdss != 0;
         c.experimental.tdss_force = config->tdss == 2;
-        if (config->kv_dedup_dir != nullptr) c.experimental.kv_dedup_dir = config->kv_dedup_dir;
+        // KV dedup is retired (the prefix cache's store replaces it): the
+        // field stays for the struct's layout, and what it left there goes.
+        if (config->kv_dedup_dir != nullptr) liyab::remove_kv_dedup_files(config->kv_dedup_dir);
         c.moe_skip_slow = config->moe_skip_slow;
         c.prefix_cache_mb = config->prefix_cache_mb;
         if (config->prefix_cache_dir != nullptr) c.prefix_cache_dir = config->prefix_cache_dir;
         c.prefix_cache_disk_mb = config->prefix_cache_disk_mb;
         if (config->cache_dir != nullptr) c.cache_dir = config->cache_dir;
         c.pooling_kv_cache_type = static_cast<liyab::KvCacheType>(config->pooling_kv_cache_type);
+        c.segment_reuse = config->segment_reuse != 0;
+        c.segment_reuse_max_kl = config->segment_reuse_max_kl;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());
@@ -715,6 +725,67 @@ liyab_status liyab_engine_rerank(liyab_engine* engine, const char* query, const 
         std::copy(scores->begin(), scores->end(), out_scores);
         return LIYAB_OK;
     });
+}
+
+liyab_status liyab_engine_prefix_cache_stats(const liyab_engine* engine, liyab_prefix_cache_stats* out_stats) {
+    if (engine == nullptr || out_stats == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    const liyab::Engine::PrefixCacheStats s = engine->engine->prefix_cache_stats();
+    *out_stats = liyab_prefix_cache_stats{s.ram_bytes,     s.ram_cap_bytes,  s.storage_bytes,   s.storage_cap_bytes,
+                                          s.chunks,        s.state_images,   s.contexts,        s.set_asides,
+                                          s.chunks_written, s.chunks_reused, s.set_aside_ms,    s.restores,
+                                          s.restored_tokens, s.restore_ms,    s.chunk_tokens,    s.segments,
+                                          s.segments_kept, s.segment_reuses, s.segment_reused_tokens,
+                                          s.segment_recomputed_tokens};
+    return LIYAB_OK;
+}
+
+namespace {
+
+// Marked parts of a C caller (NULL with none).
+std::vector<liyab::PromptSegment> to_cpp(const liyab_prompt_segment* segments, size_t n) {
+    std::vector<liyab::PromptSegment> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) out.push_back({segments[i].begin, segments[i].end});
+    return out;
+}
+
+}  // namespace
+
+liyab_status liyab_engine_generate_segmented(liyab_engine* engine, const char* prompt,
+                                             const liyab_prompt_segment* segments, size_t n_segments,
+                                             const liyab_sampling_params* params, liyab_token_callback callback,
+                                             void* user_data, liyab_generation_stats* stats) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || prompt == nullptr || (segments == nullptr && n_segments > 0)) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and prompt are required, and segments when n_segments > 0");
+        }
+        liyab::GenerateOptions options;
+        options.segments = to_cpp(segments, n_segments);
+        return finish_generation(engine->engine->generate(prompt, to_cpp(params), wrap(callback, user_data), options),
+                                 stats);
+    });
+}
+
+liyab_status liyab_engine_prefill_segmented(liyab_engine* engine, const char* text,
+                                            const liyab_prompt_segment* segments, size_t n_segments, int32_t add_bos) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || text == nullptr || (segments == nullptr && n_segments > 0)) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and text are required, and segments when n_segments > 0");
+        }
+        const std::vector<liyab::PromptSegment> parts = to_cpp(segments, n_segments);
+        const liyab::Status s = engine->engine->prefill(text, parts, add_bos != 0);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segment_reuse_info* out) {
+    if (engine == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine is required");
+    const liyab::Engine::SegmentReuseInfo info = engine->engine->segment_reuse();
+    if (out != nullptr) {
+        *out = liyab_segment_reuse_info{info.fraction, info.kl, info.top1, info.from_cache ? 1 : 0,
+                                        info.calibrating ? 1 : 0, info.progress, info.bound};
+    }
+    return info.status.is_ok() ? LIYAB_OK : fail(info.status);
 }
 
 }  // extern "C"

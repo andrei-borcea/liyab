@@ -48,8 +48,8 @@ class LoadOptions {
   /// later loads skip the measurement; null: measured at every load.
   final String? cacheDir;
 
-  /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson (plus 'kvDedupDir');
-  /// absent keys keep the engine's defaults.
+  /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson; absent keys keep the
+  /// engine's defaults.
   final Map<String, Object?> experimental;
 }
 
@@ -762,8 +762,6 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   c.kvCacheType = i('kvCacheType') ?? c.kvCacheType;
   c.requantBits = i('requantBits') ?? c.requantBits;
   c.nThreads = i('threads') ?? c.nThreads;
-  final dedup = x['kvDedupDir'] as String?;
-  if (dedup != null) c.kvDedupDir = dedup.toNativeUtf8(allocator: arena);
 }
 
 void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort replies) {

@@ -76,7 +76,8 @@ Liyab is built around those constraints:
   tokens and asks the governor for lower clocks, so the same tokens cost fewer watts. It does not run flat out and
   then collapse.
 * **Serving a single user well.** Context is reused across turns, including the recurrent state of hybrid models.
-  A prefix cache brings back earlier conversations. Prefill can be cancelled and resumed. Structured output covers
+  A prefix cache of KV chunks brings back earlier conversations, keeps a shared system prompt once and outlives a
+  restart. Prefill can be cancelled and resumed. Structured output covers
   tool calls. A local OpenAI, Anthropic Messages and gRPC API lets other apps on the device use the same model.
 * **A private agent on top.** The Liyab app replaces the system assistant. It answers questions about your day from
   your own calendar, notifications, messages and calls, and nothing leaves the phone.
@@ -118,7 +119,8 @@ These rules decide what goes into the code:
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
-| Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
+| Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
+| Segment reuse: marked parts of a prompt (documents, tool results) reused wherever they appear, keys turned to their new positions, a share calibrated per model processed again; attention-only models | ✅ opt-in, lossy |
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Structured output: grammar-constrained decoding (JSON Schema, grammar text; tool calls in the app and the local API) and forced continuations | ✅ |
 | Embeddings and reranking: decoder embedding models and rerankers as their GGUF declares them (last-token or mean pooling, ranking heads, or LM-head labels), shared prefixes computed once | ✅ cross-checked against Hugging Face transformers |
@@ -578,17 +580,178 @@ each of those as a scheduling problem.
 * **State snapshots for hybrid models.** Four are kept: the oldest one, the end of the last prompt (pinned, so
   background drafts cannot evict it), and the two newest others (a draft's words and the whole draft after them).
   They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
-* **Prefix cache across conversations** (`prefix_cache_mb`). A context that an unrelated prompt replaces is kept in
-  RAM as a serialized state (KV pages plus recurrent states) with the text it encodes, in an LRU of at most that
-  size. The whole context is kept, the last reply included, with a hybrid model's state snapshots (the last
-  prompt's end among them). A later prompt that continues that text is restored, cut back to where the two diverge,
-  instead of being processed again, even when its earlier replies would encode to other tokens. The output equals
-  that of a context never interrupted (tested on attention-only and hybrid models). A 2,000-token conversation on
-  the 35B costs ~85 MiB, plus 62.8 MiB per state snapshot kept. In RAM (`prefix_cache_mb`) the cache comes out of
-  the memory budget; on a MoE whose experts stream, only as far as the expert cache can spare above 10% of the
-  experts, so it never causes a requantization. On storage (`prefix_cache_dir`, `prefix_cache_disk_mb`) it costs no
-  RAM at all: contexts that RAM does not hold go to files, least recently used out first. On the phone a 4,907-token chat on the 35B (114 MiB) was set aside in 81 ms and
-  restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
+* **Prefix cache across conversations** (`prefix_cache_mb`, `prefix_cache_dir`). A context that another prompt
+  replaces (or an embedding call) is set aside in a content-addressed store of KV chunks. A prompt replaces it when
+  it shares less than half of it, or leaves it before the end of its last prompt and rewinding would process at
+  least 128 tokens again: another chat after a long shared system prompt, an edited message (on a hybrid model,
+  rewinding goes back to the nearest state snapshot). A draft typed ahead and edited after the last reply keeps
+  using the context's own snapshots instead. Whenever a prompt leaves the context, the store is asked for more of
+  it than the context keeps. A chunk is a whole number of pages of the paged KV cache, about 2 MiB and at most
+  256 tokens (each is a file on storage, and creating one costs about as much as writing a megabyte), keyed by a
+  hash chained over every token before it and rooted in what its bytes depend on (the model file, cache layout and
+  type, key scales, kernels and backends). A prefix that several
+  conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
+  and setting a conversation aside again writes only its new chunks. A later prompt is restored up to the longest
+  prefix the store holds, chunk by chunk, then cut to where the two diverge, even when its earlier replies would
+  encode to other tokens: the store keeps the text each context encodes. The rows the live context already holds
+  for the same tokens stay where they are. Recurrent states cannot be cut into chunks, so a hybrid model keeps them
+  as images at the positions the prefix cache always kept (the end of the context, the end of its last prompt and
+  the oldest snapshot). Each image is attached to a chunk holding its prefix and moves to another such chunk when
+  that one goes; a prompt restores up to the deepest one it reaches. The output equals that of a context never
+  interrupted (tested on attention-only and hybrid models, in RAM, on storage and in a later engine).
+  * **Tiers and caps.** RAM (`prefix_cache_mb`) holds the most recently used chunks. It comes out of the memory
+    budget; on a MoE whose experts stream, only as far as the expert cache can spare above 10% of the experts, so
+    it never causes a requantization. What RAM cannot hold goes to storage (`prefix_cache_dir`,
+    `prefix_cache_disk_mb`), which costs no RAM at all. What storage cannot hold goes, least recently used first:
+    a chunk with every chunk after it, a state image on its own. Room is made before anything is written, so
+    neither tier is ever above its cap. A 2,000-token conversation on the 35B costs ~21 MiB of chunks plus
+    62.8 MiB per state image.
+  * **Across runs.** The storage tier outlives the engine. When destroyed, the engine sets its context aside
+    there too, and a later engine or process with the same model and settings restores from it: a system prompt
+    or a conversation comes back after a restart without being processed again. Other models' chunks stay and
+    count against the cap. Files are written to a temporary name and renamed. When it opens the directory, the
+    engine removes interrupted writes, damaged files, other format versions, broken chains and the files of
+    builds before the store; a chunk whose payload hash does not match when read is removed and the prompt
+    processed. One engine at a time uses a directory (an OS lock); another one runs without the storage tier.
+  * **Measured on the Mac** (8 threads; the app's configuration: storage only, 512 MiB) with a scripted workload: a
+    1,392-token system and tool block, seven chats with 160-token replies, four of them resumed (two twice), three
+    abandoned, then a restart that resumes the first. Every reply equals that of a context never interrupted, with
+    this cache and with the earlier per-context one.
+    * Qwen3-0.6B: 91.1% of prompt tokens reused, against 84.4%. The earlier cache set nothing aside (each chat was
+      shorter than the system block), so a resumed chat processed its turns again: 1.8–3.8 s to the first token,
+      against 0.19–0.25 s. A set-aside took 3–24 ms and wrote only the chat's own chunks, 10–13 MiB (91 MiB for the
+      first context), where the earlier cache wrote the whole context each time; a restore took 1–4 ms, the system
+      block's rows staying in place. Storage peaked at 208 MiB. After the restart the first chat came back from
+      storage: 0.17 s to the first token instead of 14.5 s.
+    * Qwen3.5-0.8B (hybrid): 44.5% reused, against nothing (rewinding went back to the start, the nearest state
+      snapshot). Every resumed turn was restored: 0.19–0.30 s to the first token against 12–18 s. New chats still
+      process the system block, whose end has no state snapshot when it is not prepared on its own. A set-aside
+      wrote 1–2 chunks of 4 pages and 2 state images, ~40 MiB, in 9–11 ms; storage peaked at 312 MiB (352 MiB once
+      the engine set its context aside when destroyed). After the restart: 0.17 s to the first token instead of
+      18.4 s.
+    * Throughput, Qwen3.5-0.8B with a 25.8k-token context and three state images (218.6 MiB), alternating runs:
+      set aside in 43–49 ms (4.7–5.3 GB/s) and restored in 28–31 ms (7.5–8.3 GB/s), where the earlier cache wrote
+      its one file in 23–25 ms and read it back in 41–47 ms. State images are read into the model's states and the
+      snapshots' own buffers, and written from them, with no copy in between; each 1 MiB block is hashed while it
+      is in cache (xxHash64 runs at ~25 GB/s, reading from the page cache at ~17).
+    * Decoding is as fast as before (alternating runs, best of 3: 68.6, 67.9, 62.9 tok/s before; 68.9, 68.6,
+      63.3 after).
+  * On the phone, with the earlier per-context cache, a 4,907-token chat on the 35B (114 MiB) was set aside in
+    81 ms and restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
+* **Segment reuse: KV reused away from its prefix** (`segment_reuse`; opt-in and lossy). An agent's prompts carry
+  documents, memory snippets and tool results in the middle, and a change before them forced everything after them
+  to be processed again. A request can mark parts of its prompt (`GenerateOptions::segments`,
+  `liyab_engine_generate_segmented`, `prefill()` with segments: byte ranges of a system block, tools, documents,
+  tool results, turns). With segment reuse on, the KV of each marked part is kept, and a later prompt that holds the
+  same part anywhere takes it from there instead of processing it again.
+  * **Exact reuse first.** What the live context or the prefix cache holds of a prompt is kept or restored as
+    before, losslessly; segments are reused only after it. A request that marks nothing never sees a reused row: a
+    context holding some is processed again from the first one, the prefix cache keeps only the rows before it,
+    and `save_state()` records where they start.
+  * **Kept in the prefix cache's store.** A segment is kept once a prompt marking it has been processed, as a
+    context of its own whose tokens sit between two ids no vocabulary has, the first naming the position it was
+    computed at. So it gets the store's tiers, caps, LRU order and files, and no prompt's chain ever reaches it
+    (its rows are exact only after what preceded it there). It is kept once, as first computed, and reused from
+    there wherever it appears. Text a segment holds is encoded on its own, so its tokens are the same wherever
+    it appears (with a SentencePiece vocabulary, wherever it follows the same kind of token), and segments
+    shorter than 16 tokens are processed as usual.
+  * **Turned to its new positions.** RoPE turns each key by an angle proportional to its position, so a stored key
+    is turned back by its old angle and on by its new one, with each block's own table: both pairings, partial
+    rotation, `rope_freqs`, linear scaling, LongRoPE, YaRN, the windowed blocks' own base, latent attention's RoPE
+    key. Key scales and Q/K norms after RoPE are taken out first and put back after; only the quantized blocks
+    that hold rotated channels are rounded again, and values, latents and keys moved by 0 keep their bits.
+    Measured with `liyab-reuse --shift` (a context's rows moved 300 or 3,000 positions away and back, so rounded
+    twice), against the unmoved context: KL 0.0003–0.0004 on Qwen3-0.6B and 0.0006–0.0007 on Llama 3.2 1B with
+    a Q8_0 cache, under 0.000001 with F16, 0.02–0.03 with Q4_0. Segments are therefore kept in the cache's own
+    format: an F16 copy would take nearly twice the memory of a Q8_0 one to remove a difference two orders of
+    magnitude below what reuse itself changes, and an INT4 cache's extra rounding is part of what the
+    calibration measures. A move takes ~4 µs per position across all the blocks of a 1B model on the Mac.
+  * **Partly processed again.** Reused rows lack attention to what now precedes them. Every reused token runs the
+    first two blocks again with the tokens around it; the share whose keys and values moved most there runs
+    through the rest of the model, the others keep their reused rows. The whole span from the end of the exact
+    prefix to the last reused token goes block by block, in passes in order, so each token sees every position
+    before it. The share is not a constant: the engine measures it per model on prompts shaped like real ones,
+    the documents of the corpus below in the model's own chat template: three prompts store them, four others
+    arrange 3 to 5 of them in other orders, each followed in turn by three questions about them. For each share
+    of 5, 10, 15, 20, 30 and 45% it takes the mean KL of the answers against processing the whole prompt, and a
+    bound above it (1.645 standard errors of the 12 questions' own means); it keeps the smallest share whose
+    bound, and every larger share's, is within `segment_reuse_max_kl` (default 0.02). With none, the model is
+    refused. `Engine::segment_reuse()` gives the share and the calibration's KL, bound and top-1,
+    `GenerationStats` and `PrefixCacheStats` what was reused.
+  * **Calibrated in the background.** Loading does not wait for the measurement: it runs once the engine has
+    been idle for 2 s, a stage (a few passes over one prompt's documents) at a time, on a context of its own
+    swapped in for the stage, so the conversation's context stays as it was. A call arriving meanwhile stops
+    the stage between two blocks, waiting a fraction of a second instead of getting `Busy`, and the stage runs
+    again at the next idle time. Until the measurement ends segment reuse is off: marked prompts are processed as
+    usual, and `Engine::segment_reuse()` reports `Busy` with its progress. The result is kept in `cache_dir`, so
+    the next engine has it at once (without one, every load measures again).
+  * **Measured on the Mac** (`liyab-reuse`; CPU, Q8_0 cache with key scaling; on a Mac other jobs loaded heavily,
+    so times are compared within each run). 8 prompts per model: the system prompt of a small company's
+    assistant, 3–5 of its 12 documents in random order (77–80% of ~555 tokens) and a question, through the
+    model's chat template, after warm-up prompts had stored the documents in other orders. (The calibration
+    draws on the same corpus, in other arrangements.) Quality against
+    processing the whole prompt, at the first answer token and each next one up to the end of the greedy answer
+    (at most 33); the first token's time against the lossless path, the part before the first document restored
+    from the prefix cache and the rest processed:
+
+    | Model | Processed again | Mean KL | Median KL | Top-1 | Same greedy answer | First token sooner |
+    | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Qwen3-0.6B | 0% | 0.049 | 0.0013 | 95.7% | 2 of 8 | 5.5× |
+    | | 10% | 0.041 | 0.0012 | 96.2% | 3 of 8 | 3.7× |
+    | | 20% | 0.030 | 0.0008 | 95.7% | 1 of 8 | 2.8× |
+    | | 30% | 0.026 | 0.0006 | 98.3% | 4 of 8 | 2.5× |
+    | Llama 3.2 1B | 0% | 0.027 | 0.0034 | 96.5% | 3 of 8 | 4.2× |
+    | | 10% | 0.020 | 0.0025 | 97.2% | 4 of 8 | 3.2× |
+    | | 20% | 0.013 | 0.0021 | 98.0% | 4 of 8 | 2.7× |
+    | | 30% | 0.011 | 0.0015 | 98.4% | 4 of 8 | 2.2× |
+
+    The first token comes as much sooner as the work left predicts: the selection runs 2 of Qwen3-0.6B's 28
+    blocks (2 of Llama's 16) for every reused token, the share processed again all of them. The mean KL is a
+    few answer tokens' doing: the median is 6 (Llama) to 48 (Qwen3) times lower, the largest single token's KL
+    0.3–1.9. A reused document costs the store its rows, ~60 KiB per token on Qwen3-0.6B and ~17 KiB on Llama
+    3.2 1B. Documents kept from prompts that had themselves reused others, as the engine keeps them
+    (`--warm-up-reuse`, at 10% on Qwen3-0.6B and 5% on Llama), give the same KL within 0.0006: copies made after
+    reused rows add no measurable error of their own.
+  * **Which tokens are processed again matters**, at equal work too. Mean KL on Qwen3-0.6B at 10, 20 and 30%:
+    the deviation criterion 0.041, 0.030, 0.026; random tokens 0.045, 0.043, 0.039; each document's first ones
+    0.052, 0.041, 0.056; ranked by the attention the prompt's last tokens pay them (the question taken into the
+    pass) 0.037, 0.038, 0.034, and by that attention times their deviation 0.042, 0.037, 0.026; the deviation
+    with each document's first 8 tokens added 0.046 and 0.036 (10 and 20%), compared at block 3 instead of
+    block 1 0.039 and 0.037. On Llama 3.2 1B random tokens give 0.025, 0.022, 0.018. Random needs no selection
+    pass, yet with it counted the deviation still leads: at 20% it costs 26% of the documents' work on
+    Qwen3-0.6B and 30% on Llama, and gives 0.030 and 0.013 where random tokens at 30% give 0.039 and 0.018.
+    So the deviation at block 1 is the default (`liyab-reuse --criterion`, `--select-block` and `--first-tokens`
+    measure the others).
+  * **The calibration against the measurement.** The share the calibration keeps holds on the prompts measured
+    above (`liyab-reuse --calibrate 0.02` runs both), or the model is refused:
+
+    | Model | Kept at the default target | Calibration: mean KL (bound) | Measured above at that share |
+    | :--- | ---: | ---: | ---: |
+    | Llama 3.2 1B | 45% | 0.0120 (0.0160) | 0.0086 |
+    | Qwen3-0.6B | refused (45%, the largest) | 0.0364 (0.0543) | 0.0180 |
+    | Qwen3.5-0.8B | refused: hybrid | | |
+
+    Its prompts ask more than the measured ones. From 5 to 45% Llama's calibration gives 0.035, 0.027, 0.022,
+    0.019, 0.019 and 0.012 (bounds 0.045 to 0.016), where the measured prompts give 0.020 at 10% and 0.013 at
+    20%. Qwen3-0.6B's stays at 0.036–0.042 whatever the share, carried by a few of its 12 questions (at 45%,
+    0.14 and 0.07 for two of them, under 0.022 for seven), while the measured prompts fall to 0.018 at 45%. So
+    the share kept errs on the safe side: Llama 3.2 1B gets its first token 1.8× sooner at the default target,
+    where 20% (2.7×) would have stayed within it on the measured prompts. Earlier, with plain-text prompts, four
+    documents and one or three questions, the calibration was the gentler one (Llama 3.2 1B: 0.0097 at 5%
+    against 0.027 at 0% and 0.020 at 10% measured), which is why it now uses the model's chat template, the
+    corpus's numbered documents and a bound. It took 205 s of background work on Llama 3.2 1B and 90 s on
+    Qwen3-0.6B (BF16 weights on the Mac's CPU), about as much as processing 15,000 tokens, once per model and
+    cache format.
+  * **Hybrid models are refused**, with the reason in `Engine::segment_reuse()`: their recurrent blocks must run
+    over the whole prompt in order, so every token still goes through every block, and reusing the attention
+    blocks' keys and values would skip only their key and value projections (1.3% of a prompt token's matrix work
+    on Qwen3.5-0.8B). Marked prompts are then processed as usual. Windowed blocks (Gemma) take part like global
+    ones, each turned with its own RoPE table, a recomputed token seeing its window; with the engine's own
+    sliding window there is no prefix cache, so no segment reuse.
+  * **Off, nothing changes.** The forward pass, split into the steps this reuse runs block by block at scattered
+    positions, gives the same bits (golden logits, arm64 and x86) at the same speed: alternating runs on the Mac
+    before and after, a 520-token prompt and 96 tokens, prefill median 5.59 and 5.61 s, decoding 72.2 and 72.1
+    tok/s on Qwen3-0.6B, 9.49 and 9.53 s, 42.0 and 43.7 tok/s on Llama 3.2 1B, the same replies.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user
   request therefore never waits behind background work.
@@ -911,6 +1074,21 @@ const std::string_view documents[] = {"The capital of China is Beijing.", "Gravi
 auto scores = reranker->rerank("What is the capital of China?", documents);  // P(relevant) per document
 ```
 
+Segment reuse (opt-in, lossy; needs the prefix cache): mark the documents of a prompt, and a later prompt that holds
+any of them anywhere reuses their KV instead of processing them again.
+
+```cpp
+config.prefix_cache_mb = 256;
+config.segment_reuse = true;       // calibrated once per model in the background (off until then), kept in config.cache_dir
+liyab::GenerateOptions options;
+for (const std::string& doc : documents) {  // byte ranges of the documents in the rendered prompt
+    const size_t at = prompt.find(doc);
+    options.segments.push_back({at, at + doc.size()});
+}
+auto stats = engine.value()->generate(prompt, params, on_piece, options);
+// stats->segment_reused_tokens, segment_recomputed_tokens; engine.value()->segment_reuse() says why it is off
+```
+
 `Engine::cancel()` is thread-safe and stops at the next token. `prefill(text)` processes a prefix ahead of time,
 such as a system prompt right after loading. `reset_context()` forgets everything. The public headers in
 `include/liyab/` document each function's contract: preconditions, ownership, thread safety and error cases.
@@ -945,6 +1123,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_prefill` / `_reset_context` | Process a prefix ahead of time / forget the context |
 | `liyab_engine_save_state` / `_load_state` | Persist and restore the context across processes |
 | `liyab_engine_save_state_of` | Persist the context a text continues, also one the prefix cache set aside |
+| `liyab_engine_prefix_cache_stats` | What the prefix cache holds (RAM, storage, chunks, contexts, segments) and how it was used (thread-safe) |
+| `liyab_engine_generate_segmented` / `_prefill_segmented` / `_segment_reuse` | Segment reuse (opt-in, lossy): generation and prefill with marked parts of the prompt; whether it is on and its calibrated share, or how far its background calibration got (`LIYAB_ERR_BUSY` until it ends) |
 | `liyab_engine_trim_memory` / `_warm_memory` | Give the expert cache back while idle / refill it from its hot list |
 | `liyab_engine_save_expert_profile` / `_load_expert_profile` | Carry the expert hot list to a later process |
 | `liyab_engine_memory_plan` / `_context_length` | How the model uses memory; the resolved context length |
@@ -962,14 +1142,17 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
   time before it spent matching or restoring the context, and the part of it spent waiting for expert reads;
 * decode time per phase: attention, DeltaNet, routers, experts, shared expert, dense FFN, LM head;
 * the expert cache's behaviour: hits, late prefetches, misses, bytes read, read-but-unused, prediction precision,
-  dropped guesses, skipped experts, time waiting.
+  dropped guesses, skipped experts, time waiting;
+* segment reuse: prompt positions taken from stored segments, how many of them were processed again, the time it
+  took.
 
 `liyab_engine_config` exposes:
 * the backend, threads and power profile;
 * the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
-* `cache_dir`, where what is measured once per model is kept (the KV cache's key scales, and latent attention's
-  form ratio);
+* `cache_dir`, where what is measured once per model is kept (the KV cache's key scales, latent attention's
+  form ratio, segment reuse's calibration);
+* segment reuse (`segment_reuse`, its target `segment_reuse_max_kl`);
 * KV type, sliding window and sinks, and the KV type of pooling models (`pooling_kv_cache_type`, F16 by default);
 * speculative decoding (draft model, lookup or suffix drafts);
 * the MoE trade-offs;
@@ -1069,8 +1252,10 @@ liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts
 liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the text itself (suffix drafts)
 liyab-cli -m model.gguf -p "..." --context-lookup           # ... by context lookup instead
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model
-liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts in a 256 MiB LRU
-liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
+liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts as KV chunks, 256 MiB of RAM
+liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 ~/.cache/liyab/ctx  # ... or in files, kept across runs
+liyab-cli -m model.gguf -p "$SYSTEM$Q2" --prefix-cache-disk 1024 ~/.cache/liyab/ctx --prefix-stats
+                                                            # a later run gets the shared $SYSTEM back from them
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
@@ -1723,7 +1908,7 @@ Facts measured while building Liyab that shaped the code, kept here because they
 
 These are built with `-DLIYAB_ENABLE_EXPERIMENTAL=ON` (`scripts/build_android.sh --experimental`; the app's build
 includes them, all off by default). Enable them through `EngineConfig::experimental`, the C config or `liyab-cli
---early-exit P --prune-heads R --egls T --tdss hot|always --kv-dedup DIR`.
+--early-exit P --prune-heads R --egls T --tdss hot|always`.
 
 | Module | What it does | Measured | Verdict |
 | :--- | :--- | :--- | :--- |
@@ -1732,8 +1917,12 @@ includes them, all off by default). Enable them through `EngineConfig::experimen
 | **EGLS** | Skips a block's FFN when the residual's entropy barely changes | TinyLlama: +5–48% | Output diverges early: not viable without a model trained for it |
 | **JIT unpacker** | Emits unrolled AArch64 NEON unpack routines at runtime (W^X) | +37% for a 4,096-element row | Row-sized routines only; not on the hot path; unavailable on iOS |
 | **TDSS (2:4 sparsity)** | While throttled, FFN switches to a 2:4 magnitude-pruned copy (`TBL` gather + `SDOT`) | −54% decode on the phone | Counterproductive without sparse units |
-| **KV dedup** | Persists a prompt's KV pages to files keyed by hash; a later session mmaps them read-only | 447-token system prompt: TTFT 6.4 s → 1.06 s | Attention-only models; no eviction yet |
 | **io_uring loader** | `O_DIRECT` reads via raw io_uring syscalls | — | Android denies `io_uring_setup` to apps; kept for platforms that allow it |
+
+KV dedup, which persisted a prompt's KV pages to files keyed by hash for later sessions, is now part of the prefix
+cache: its store keeps a shared prefix once, on storage across runs, for hybrid models too, within its caps (KV
+dedup's files had no bound). The C config's `kv_dedup_dir` is kept for the struct's layout; the engine ignores it
+and removes the snapshot files it left there.
 
 ---
 
@@ -1748,11 +1937,12 @@ interpreter: `describe_model_registry`.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts and in every `latent_form`; its expanded form vs the absorbed form and the reference, the same bits for every split into passes and thread count over several tiles of expanded rows (F16, Q8_0 with key scaling, a sliding window with sinks), no further from an F16 cache than the absorbed form, absorbed decoding after an expanded prefill; the automatic form's work counts and threshold, calibrated once and then the same forms and bits while other threads load every core, the ratio kept in `cache_dir` (engines give the same sampled reply, models given the kept ratio the same logits bit for bit; damaged files measured again; in memory without a `cache_dir`); hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts and in every `latent_form`; its expanded form vs the absorbed form and the reference, the same bits for every split into passes and thread count over several tiles of expanded rows (F16, Q8_0 with key scaling, a sliding window with sinks), no further from an F16 cache than the absorbed form, absorbed decoding after an expanded prefill; the automatic form's work counts and threshold, calibrated once and then the same forms and bits while other threads load every core, the ratio kept in `cache_dir` (engines give the same sampled reply, models given the kept ratio the same logits bit for bit; damaged files measured again; in memory without a `cache_dir`); hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage (persisting for a later engine within its cap, a shared system prompt kept once and restored for a new conversation, a chat after a long system prompt set aside and restored while an edited draft is not, damaged files removed with the output unchanged, one engine per directory); key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier, each in the absorbed and the expanded form, the expanded one also with a sliding window and sinks) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
-| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory |
+| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; segments kept as contexts no prompt's chain reaches, found by their tokens whatever position they were computed at, the most recently used copy first, a segment that starts another kept apart, on storage for a later store |
+| `test_kv_reuse` | KV reused away from its prefix: rows copied out of and into any positions bit for bit (values in keys too); keys moved to other positions equal to the keys computed there, within two rounding steps, for every RoPE variant (adjacent and half pairs, partial rotation, `rope_freqs` with linear scaling, YaRN, LongRoPE, Q/K norms after RoPE, windowed and global RoPE tables, latent attention's RoPE key) and every cache format, key scales included, with values, unrotated latents and moves by 0 keeping their bits; blocks run at scattered positions giving the rows and logits of a whole pass bit for bit (dense, windowed, latent attention, MoE); hybrid models and sliding-window caches refused; segments reused with every token recomputed giving a full prefill's rows and logits bit for bit for every criterion (dense, key-scaled, windowed, latent attention), stored in chunks of one, two and four pages and starting inside a page, a copy reused where it was computed needing none, a damaged copy processed instead; a segment's tokens the same wherever it appears, BOS outside it, malformed ranges refused; through the engine: segments kept and reused elsewhere, one longer than two of the store's chunks reused whole, a request that marks none getting a fresh context's reply (the reused rows processed again, set aside and saved only up to the first one, restored state included), refusals with their reasons (off, no prefix cache, a hybrid model, a target never met, read back from `cache_dir`) leaving marked prompts exact; the calibration in stages, stopped and resumed, keeping the smallest share whose bound, and every larger share's, is within its target (a question-guided criterion with a pass per question); in the background: the engine created at once, marked prompts processed as usual until the calibration ends, a call stopping it without `Busy` and finding its context as it left it, the result read back from `cache_dir`, an engine closed while it runs; the C API (`Busy` while calibrating) |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item, the final logit soft-cap giving the same bits on 1 and N threads (and its cost on a 256k vocabulary) |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
@@ -1840,6 +2030,26 @@ Benchmarks and tools built with the tests:
   build/liyab-embed -m Qwen3-Reranker-0.6B-BF16.gguf --cases tests/data/pooling_cases.json --ref pooling.ref.json
   ```
 
+* `liyab-reuse`: what segment reuse costs in quality and saves in time to the first token, on RAG-shaped prompts
+  (a system prompt, 3 to 5 documents of its own corpus in varying order and a question, through the model's chat
+  template). Documents are first stored by warm-up prompts (processed whole, or with `--warm-up-reuse F` as the
+  engine processes them: the documents stored already reused at share F, the new ones kept with rows computed
+  after those); each measured prompt is then answered from a full prefill (the reference, and its greedy
+  answer), with the part before the first document taken as restored (lossless), and with the documents reused
+  at each recompute share of `--fractions`. It reports KL(full || reuse) over the whole vocabulary and the top-1
+  agreement at the first answer token and each next one up to the reference answer's end of generation (at
+  most `--answer`, teacher-forced on the reference), how many greedy answers come out the same, and the times
+  to the first token. `--criterion`, `--select-block`, `--refine`, `--first-tokens` and `--absolute` select how
+  the recomputed tokens are chosen, `--no-numbers` leaves the documents unnumbered and `--dump` prints the
+  positions that moved most. `--shift D` measures turning keys alone (a text's rows moved D positions away and
+  back). `--calibrate KL` runs the engine's calibration against that target (with its questions' own KL), then
+  measures the share it kept (the largest when it refuses) on the tool's own prompts and prints both; a hybrid
+  model is refused with the share of a prompt token's work reusing its attention blocks' keys and values would
+  skip.
+
+  ```bash
+  build/liyab-reuse -m Qwen3-0.6B-BF16.gguf --prompts 8 --fractions 0,0.1,0.2,0.3
+  ```
 * `tools/describe_model.py`: the registry row a model needs, established from its Hugging Face implementation
   and a GGUF of it, or the precise list of parts Liyab does not implement yet; it never guesses a fact it cannot
   establish. `tools/reference_trace.py` runs a reduced copy of the transformers model with random weights and
@@ -1984,6 +2194,11 @@ Implemented features are described above. These are next, in order:
   emergency moves the work to the CPU, whose kernels round differently from the GPU's, so a reply can change from
   that token on.
 * **NPUs** are detected and ranked, but have no compute kernels yet; their work runs on the GPU or CPU.
+* **Prefix cache on dense hybrid models.** A prompt processed in 64-token passes leaves the model's oldest state
+  snapshot at its first pass, not at the system prompt's end, and contexts set aside keep that one (as saved
+  contexts do). So a new conversation gets the system prompt back from the store only where it was processed in
+  one pass (a MoE whose experts stream: 1,024-token passes); the app restores it from its own saved state instead.
+  Attention-only models restore any prefix.
 * **Vulkan:**
   * batched prefill runs the matvec kernel once per token (no tiled GEMM yet);
   * models that fit in RAM are copied into GPU memory;
@@ -2068,15 +2283,15 @@ src/core/               engine, architecture registry and model description, tra
                         (embeddings, reranking), loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
-                        sampler, speculative decoding (draft budget, suffix drafter), power manager, device
-                        detection, thread pool, OS services (os.h: memory, UTF-8 paths, file replacement;
-                        POSIX and Windows)
+                        sampler, speculative decoding (draft budget, suffix drafter), the prefix cache's KV
+                        store (kv_store.h), segment reuse (kv_reuse.h), power manager, device detection, thread pool, OS services (os.h:
+                        memory, UTF-8 paths, file replacement, file locks; POSIX and Windows)
 src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*), metal/, vulkan/ (+ shaders/),
                         qnn/ and neuropilot/ (runtime probes)
-src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
+src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, io_uring loader
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
-                        liyab-embed, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
+                        liyab-embed, liyab-reuse, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
                         and pooling_reference.py (Hugging Face references), describe_model.py and
                         reference_trace.py (registry rows established from the Hugging Face implementation and
                         verified),

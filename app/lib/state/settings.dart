@@ -131,7 +131,6 @@ class ExperimentalSettings {
   bool egls = false; // skip a block's FFN when it barely changes the prediction
   double eglsThreshold = 0.002;
   int tdss = 0; // 2:4 sparse FFN weights: 0 off, 1 while hot, 2 always
-  bool kvDedup = false; // persistent prefix KV cache on storage
   bool lookupDrafts = false; // speculative decoding from the conversation's own text
   bool suffixDrafts = true; // ... by suffix drafts (this and earlier conversations); false: context lookup
   int draftTokens = 3;
@@ -151,7 +150,6 @@ class ExperimentalSettings {
         'egls': egls,
         'eglsThreshold': eglsThreshold,
         'tdss': tdss,
-        'kvDedup': kvDedup,
         'lookupDrafts': lookupDrafts,
         'suffixDrafts': suffixDrafts,
         'draftTokens': draftTokens,
@@ -176,7 +174,6 @@ class ExperimentalSettings {
       ..egls = b('egls', d.egls)
       ..eglsThreshold = n('eglsThreshold', d.eglsThreshold)
       ..tdss = i('tdss', d.tdss)
-      ..kvDedup = b('kvDedup', d.kvDedup)
       ..lookupDrafts = b('lookupDrafts', d.lookupDrafts)
       ..suffixDrafts = b('suffixDrafts', d.suffixDrafts)
       ..draftTokens = i('draftTokens', d.draftTokens)
@@ -197,7 +194,6 @@ class ExperimentalSettings {
       if (headPruning) 'head pruning ${(headKeepRatio * 100).round()}%',
       if (egls) 'EGLS ${eglsThreshold.toStringAsFixed(4)}',
       if (tdss != 0) 'TDSS ${tdss == 1 ? 'while hot' : 'always'}',
-      if (kvDedup) 'KV dedup',
       if (lookupDrafts) '${suffixDrafts ? 'suffix' : 'lookup'} drafts ($draftTokens)',
       if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
       if (maxExperts > 0) 'max $maxExperts experts',
