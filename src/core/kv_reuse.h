@@ -166,24 +166,26 @@ int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const 
 
 // ---- Calibration -------------------------------------------------------------
 // The recompute fraction for one model and cache, measured instead of set:
-// on a fixed RAG-shaped text (reuse_calibration_text: a system line, four
-// documents, a question), the documents are stored from one order, then two
-// other orders are answered both ways, with a full prefill and with the
-// documents reused at each fraction of kReuseFractions in turn. The score is
-// the mean KL divergence of the next-token distributions, KL(full ||
-// reuse), at the first answer token and the next kCalibrationAnswer tokens
-// of the full prefill's greedy answer (teacher-forced). The fraction kept is
-// the smallest whose score is within `max_kl`; none: reuse would need about
-// as much work as processing the documents, and is not worth it. The score
-// covers at most 2 x (kCalibrationAnswer + 1) positions, so one token whose
-// distribution turns moves it by a 34th of that token's KL: a coarse
-// choice, kept short because it runs at load (~40 s for a 1B model on a
-// loaded Mac).
+// on a fixed RAG-shaped text (core/kv_reuse.cpp: a system line, four
+// documents about a railway, three questions that read different ones), the
+// documents are stored from one order; then, in two other orders, each
+// question is answered both ways, with a full prefill and with the
+// documents reused at each fraction of kReuseFractions in turn (the
+// documents processed or reused once per order, every question asked after
+// them). The score is the mean KL divergence of the next-token
+// distributions, KL(full || reuse), at the first answer token and the next
+// kCalibrationAnswer tokens of the full prefill's greedy answer
+// (teacher-forced). The fraction kept is the smallest whose score is within
+// `max_kl`; none: reuse would need about as much work as processing the
+// documents, and is not worth it. The score covers at most 6 x
+// (kCalibrationAnswer + 1) = 102 positions, so one token whose distribution
+// turns moves it by a hundredth of that token's KL: a choice still coarse,
+// kept so because it runs at load (EngineConfig::segment_reuse).
 inline constexpr float kReuseFractions[] = {0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.45f};
 inline constexpr int32_t kCalibrationAnswer = 16;
 // Changing the texts, the grid or the procedure changes every model's
 // result: bump it so results kept in a cache directory are measured again.
-inline constexpr uint32_t kReuseCalibrationVersion = 1;
+inline constexpr uint32_t kReuseCalibrationVersion = 2;
 
 struct ReuseCalibration {
     bool met = false;        // a fraction on the grid met the target

@@ -187,9 +187,9 @@ struct EngineConfig {
     // reused segment's tokens it processes again to keep the output within
     // segment_reuse_max_kl of processing the whole prompt, and keeps the
     // result in cache_dir (measured again at every load without one). The
-    // measurement runs inside Engine::create(), which waits for it: ~40 s
-    // for a 1B model on a loaded Mac, in proportion to the model's prefill
-    // speed elsewhere. Needs
+    // measurement runs inside Engine::create(), which waits for it: about
+    // as long as processing 2,000 to 5,000 tokens (~1 minute for a 1B model
+    // on a Mac's CPU). Needs
     // the prefix cache's store (prefix_cache_mb or prefix_cache_disk_mb),
     // whose caps the stored segments share; refused, with the reason in
     // Engine::segment_reuse(), for hybrid models, with a sliding window or a

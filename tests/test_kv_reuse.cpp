@@ -1022,6 +1022,14 @@ TEST_CASE("Calibration finds the smallest share on its grid within the target, a
     auto middle = calibrate_reuse(*l->model, *tokenizer, settings, loose->kl * 0.5, l->route, *l->pool, 32);
     REQUIRE(middle.has_value());
     CHECK(!middle->met || middle->fraction > loose->fraction);
+    // A question-guided criterion: each question gets a pass of its own.
+    ReuseSettings guided;
+    guided.criterion = ReuseCriterion::Impact;
+    auto g = calibrate_reuse(*l->model, *tokenizer, guided, 1000.0, l->route, *l->pool, 32);
+    REQUIRE(g.has_value());
+    CHECK(g->met);
+    CHECK(g->kl > 0.0);
+    CHECK(l->model->n_past() == 0);
 }
 
 TEST_MAIN()

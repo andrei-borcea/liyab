@@ -433,12 +433,19 @@ constexpr std::string_view kCalibrationDocs[] = {
     "delays in a month. Claims are made online within 28 days, with the ticket number and the train's departure "
     "time. Delays caused by severe weather warnings are refunded at the same rates.",
 };
-constexpr std::string_view kCalibrationQuestion =
+// Three questions, each reading other documents, asked after the same
+// documents: they share one pass over them, and triple what is scored.
+constexpr std::string_view kCalibrationQuestions[] = {
     "I bought a day return after ten and my train back reached Northgate 70 minutes late. What do I get back, and "
-    "how do I claim it?";
+    "how do I claim it?",
+    "Can I take my bicycle on the 08:10 from Northgate on a weekday, and what will it cost?",
+    "My daughter is 12. What does she pay for a single from Northgate to Ashford if we buy it on the train, and how "
+    "long is the journey?",
+};
 
-// One calibration prompt: the documents in `order`, and their byte ranges.
-std::string calibration_prompt(std::span<const int> order, std::vector<PromptSegment>& documents) {
+// One calibration prompt: the documents in `order`, and their byte ranges;
+// then question `q`.
+std::string calibration_prompt(std::span<const int> order, size_t q, std::vector<PromptSegment>& documents) {
     std::string text(kCalibrationSystem);
     documents.clear();
     for (const int d : order) {
@@ -447,7 +454,7 @@ std::string calibration_prompt(std::span<const int> order, std::vector<PromptSeg
         text += kCalibrationDocs[d];
     }
     text += "\n\nQuestion: ";
-    text += kCalibrationQuestion;
+    text += kCalibrationQuestions[q];
     text += "\nAnswer:";
     return text;
 }
@@ -491,18 +498,23 @@ Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& to
         if (!r) return r.status();
         return log_probs(*r);
     };
-    auto encode = [&](std::span<const int> order, std::vector<int32_t>& tokens, std::vector<TokenSegment>& segments) {
+    auto encode = [&](std::span<const int> order, size_t q, std::vector<int32_t>& tokens,
+                      std::vector<TokenSegment>& segments) {
         std::vector<PromptSegment> documents;
-        const std::string text = calibration_prompt(order, documents);
+        const std::string text = calibration_prompt(order, q, documents);
         tokens.clear();
         segments.clear();
         return encode_segmented(tokenizer, text, 0, documents, bos, tokens, segments);
     };
-    struct Case {
-        std::vector<int32_t> tokens;
-        std::vector<TokenSegment> segments;
+    struct Question {
+        std::vector<int32_t> tokens;                 // the whole prompt: the documents, then this question
         std::vector<std::vector<double>> reference;  // the full prefill's distributions
         std::vector<int32_t> answer;                 // its greedy answer, fed back
+    };
+    struct Case {
+        std::vector<TokenSegment> segments;  // the documents (the same tokens before every question)
+        int32_t documents_end = 0;
+        std::vector<Question> questions;
     };
     auto finish = [&](Status s) -> Result<ReuseCalibration> {
         model.reset();
@@ -510,76 +522,136 @@ Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& to
         out.ms = ms_since(t0);
         return out;
     };
+    // The context holds a question's prompt up to some point past its
+    // documents: the rest processed, then the first answer token's
+    // distribution and the reference answer's next ones (teacher-forced).
+    auto answer_from_here = [&](const Question& q) -> Result<std::vector<std::vector<double>>> {
+        const auto n = static_cast<int32_t>(q.tokens.size());
+        LIYAB_RETURN_IF_ERROR(prefill(std::span(q.tokens).subspan(static_cast<size_t>(model.n_past()),
+                                                                 static_cast<size_t>(n - 1 - model.n_past()))));
+        auto first = step(q.tokens.back());
+        if (!first) return first.status();
+        std::vector<std::vector<double>> mine = {std::move(first).value()};
+        if (!q.answer.empty()) {
+            auto rows = model.forward(q.answer, Transformer::Logits::All, route, pool);
+            if (!rows) return rows.status();
+            const auto vocab = static_cast<size_t>(model.config().n_vocab);
+            for (size_t a = 0; a < q.answer.size(); ++a) {
+                mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
+            }
+        }
+        return mine;
+    };
     // The documents stored from one order...
     {
         const int order[] = {0, 1, 2, 3};
         std::vector<int32_t> tokens;
         std::vector<TokenSegment> segments;
-        if (Status s = encode(order, tokens, segments); !s.is_ok()) return finish(s);
+        if (Status s = encode(order, 0, tokens, segments); !s.is_ok()) return finish(s);
         model.reset();
         if (Status s = prefill(tokens); !s.is_ok()) return finish(s);
         keep_segments(model, *store, tokens, segments, settings.min_tokens);
     }
-    // ...answered in two others, first from a full prefill.
+    // ...answered in two others, first from a full prefill: the documents
+    // once, then each question after them.
     std::vector<Case> cases;
     for (const auto& order : {std::array<int, 4>{2, 0, 3, 1}, std::array<int, 4>{1, 3, 0, 2}}) {
         Case c;
-        if (Status s = encode(order, c.tokens, c.segments); !s.is_ok() || c.segments.empty()) {
-            return finish(s.is_ok() ? Status(ErrorCode::Internal, "calibration: no documents") : s);
+        for (size_t q = 0; q < std::size(kCalibrationQuestions); ++q) {
+            Question question;
+            std::vector<TokenSegment> segments;
+            if (Status s = encode(order, q, question.tokens, segments); !s.is_ok() || segments.empty()) {
+                return finish(s.is_ok() ? Status(ErrorCode::Internal, "calibration: no documents") : s);
+            }
+            if (q == 0) {
+                c.segments = segments;
+                c.documents_end = segments.back().end;
+            }
+            // Encoded piece by piece, the documents' tokens do not depend on
+            // the question after them.
+            const auto end = static_cast<size_t>(c.documents_end);
+            const std::vector<int32_t>& first = q == 0 ? question.tokens : c.questions.front().tokens;
+            if (segments.size() != c.segments.size() || segments.back().end != c.documents_end ||
+                question.tokens.size() <= end + 1 ||
+                !std::equal(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(end), question.tokens.begin())) {
+                return finish(Status(ErrorCode::Internal, "calibration: the documents encode differently"));
+            }
+            c.questions.push_back(std::move(question));
         }
         model.reset();
-        if (Status s = prefill(std::span(c.tokens).first(c.tokens.size() - 1)); !s.is_ok()) return finish(s);
-        auto dist = step(c.tokens.back());
-        if (!dist) return finish(dist.status());
-        // Up to the answer's end of generation, included: where it ends is part
-        // of what reuse may change; what a model says past it is not an answer.
-        for (int32_t a = 0; a <= kCalibrationAnswer; ++a) {
-            const auto best = static_cast<int32_t>(std::max_element(dist->begin(), dist->end()) - dist->begin());
-            c.reference.push_back(std::move(dist).value());
-            if (a == kCalibrationAnswer || tokenizer.is_end_of_generation(best)) break;
-            c.answer.push_back(best);
-            dist = step(best);
+        if (Status s = prefill(std::span(c.questions.front().tokens).first(static_cast<size_t>(c.documents_end)));
+            !s.is_ok()) {
+            return finish(s);
+        }
+        for (Question& q : c.questions) {
+            if (Status s = model.truncate(c.documents_end); !s.is_ok()) return finish(s);
+            const auto n = static_cast<int32_t>(q.tokens.size());
+            if (Status s = prefill(std::span(q.tokens).subspan(static_cast<size_t>(c.documents_end),
+                                                              static_cast<size_t>(n - 1 - c.documents_end)));
+                !s.is_ok()) {
+                return finish(s);
+            }
+            auto dist = step(q.tokens.back());
             if (!dist) return finish(dist.status());
+            // Up to the answer's end of generation, included: where it ends is
+            // part of what reuse may change; what a model says past it is not
+            // an answer.
+            for (int32_t a = 0; a <= kCalibrationAnswer; ++a) {
+                const auto best = static_cast<int32_t>(std::max_element(dist->begin(), dist->end()) - dist->begin());
+                q.reference.push_back(std::move(dist).value());
+                if (a == kCalibrationAnswer || tokenizer.is_end_of_generation(best)) break;
+                q.answer.push_back(best);
+                dist = step(best);
+                if (!dist) return finish(dist.status());
+            }
         }
         cases.push_back(std::move(c));
     }
-    // The smallest fraction whose answers stay within max_kl.
-    const auto vocab = static_cast<size_t>(model.config().n_vocab);
+    // The smallest fraction whose answers stay within max_kl. The documents
+    // are reused once per order and every question asked after them; the
+    // question-guided criteria rank tokens by what the question reads, so
+    // for them each question has a pass of its own.
+    const bool guided = settings.criterion == ReuseCriterion::Attention || settings.criterion == ReuseCriterion::Impact;
     for (const float fraction : kReuseFractions) {
         ReuseSettings s = settings;
         s.fraction = fraction;
         double kl_sum = 0.0;
         int64_t agree = 0, positions = 0;
-        for (const Case& c : cases) {
-            const int32_t exact = c.segments.front().begin;
-            const auto n = static_cast<int32_t>(c.tokens.size());
-            model.reset();
-            if (Status st = prefill(std::span(c.tokens).first(static_cast<size_t>(exact))); !st.is_ok()) return finish(st);
-            auto reused = reuse_segments(model, *store, c.tokens, c.segments, exact, n - 1, s, route, pool, chunk);
-            if (!reused) return finish(reused.status());
-            if (Status st = prefill(std::span(c.tokens).subspan(static_cast<size_t>(reused->end),
-                                                                 static_cast<size_t>(n - 1 - reused->end)));
-                !st.is_ok()) {
-                return finish(st);
-            }
-            auto first = step(c.tokens.back());
-            if (!first) return finish(first.status());
-            std::vector<std::vector<double>> mine = {std::move(first).value()};
-            if (!c.answer.empty()) {
-                auto rows = model.forward(c.answer, Transformer::Logits::All, route, pool);
-                if (!rows) return finish(rows.status());
-                for (size_t a = 0; a < c.answer.size(); ++a) {
-                    mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
-                }
-            }
+        auto tally = [&](const Question& q, const std::vector<std::vector<double>>& mine) {
             for (size_t p = 0; p < mine.size(); ++p) {
-                const std::vector<double>& ref = c.reference[p];
+                const std::vector<double>& ref = q.reference[p];
                 double k = 0.0;
-                for (size_t i = 0; i < vocab; ++i) k += std::exp(ref[i]) * (ref[i] - mine[p][i]);
+                for (size_t i = 0; i < ref.size(); ++i) k += std::exp(ref[i]) * (ref[i] - mine[p][i]);
                 kl_sum += std::max(k, 0.0);
                 agree += std::max_element(ref.begin(), ref.end()) - ref.begin() ==
                          std::max_element(mine[p].begin(), mine[p].end()) - mine[p].begin();
                 ++positions;
+            }
+        };
+        // From an empty context: the exact prefix processed, the documents of
+        // `tokens` reused up to `limit`, those not reused processed.
+        auto reuse_documents = [&](const Case& c, const std::vector<int32_t>& tokens, int32_t limit) -> Status {
+            const int32_t exact = c.segments.front().begin;
+            model.reset();
+            LIYAB_RETURN_IF_ERROR(prefill(std::span(tokens).first(static_cast<size_t>(exact))));
+            auto reused = reuse_segments(model, *store, tokens, c.segments, exact, limit, s, route, pool, chunk);
+            if (!reused) return reused.status();
+            return prefill(std::span(tokens).subspan(static_cast<size_t>(reused->end),
+                                                      static_cast<size_t>(std::max(c.documents_end - reused->end, 0))));
+        };
+        for (const Case& c : cases) {
+            if (!guided) {
+                if (Status st = reuse_documents(c, c.questions.front().tokens, c.documents_end); !st.is_ok()) {
+                    return finish(st);
+                }
+            }
+            for (const Question& q : c.questions) {
+                Status st = guided ? reuse_documents(c, q.tokens, static_cast<int32_t>(q.tokens.size()) - 1)
+                                   : model.truncate(c.documents_end);
+                if (!st.is_ok()) return finish(st);
+                auto mine = answer_from_here(q);
+                if (!mine) return finish(mine.status());
+                tally(q, *mine);
             }
         }
         out.fraction = fraction;
