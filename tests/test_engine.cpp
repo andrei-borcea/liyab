@@ -1841,6 +1841,53 @@ TEST_CASE("Key scales are measured once and kept in cache_dir: the same replies,
     std::filesystem::remove_all(dir);
 }
 
+// Key scales are measured on a fixed text. A model whose tokenizer cannot
+// encode text (an unknown pre-tokenizer) still loads with a quantized KV
+// cache: keys stored as computed, the reason in describe(), nothing kept in
+// cache_dir, and generation from token ids runs the unscaled model. The same
+// weights with a tokenizer that encodes the text keep their scales.
+TEST_CASE("A model whose text cannot be encoded loads with a quantized KV cache, keys unscaled, and says so") {
+    const std::string dir = temp_path("engine_cache_unscaled");
+    std::filesystem::remove_all(dir);
+    test::TinyModelSpec spec = outlier_spec();
+    spec.bpe_pre = "no-such-pre-tokenizer";
+    EngineConfig config = engine_config(model_path("key_outlier_unknown_pre", spec));
+    config.backend = BackendKind::Cpu;
+    config.cache_dir = dir;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    const std::string described = engine.value()->describe();
+    CHECK(described.find("Keys:       unscaled") != std::string::npos);
+    CHECK(described.find("no-such-pre-tokenizer") != std::string::npos);
+    CHECK(engine.value()->tokenize("hello", false).status().code() == ErrorCode::Unsupported);
+    const std::vector<int32_t> prompt = {1, 270, 300, 5, 290, 77, 310, 280};
+    const std::vector<int32_t> out = run(*engine.value(), prompt, greedy(4));
+    REQUIRE(!out.empty());
+    // The first token is the unscaled model's choice.
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    TransformerOptions q8;
+    q8.kv_type = KvCacheType::Q8_0;
+    auto plain = load_transformer(model_path("key_outlier_unknown_pre", spec), q8);
+    REQUIRE(plain != nullptr);
+    CHECK(plain->key_scales().empty());
+    auto logits = plain->forward(prompt, Transformer::Logits::Last, Route{cpu.get(), cpu.get(), cpu.get()}, pool);
+    REQUIRE(logits.has_value());
+    CHECK(out[0] == Sampler::argmax(*logits));
+    CHECK((!std::filesystem::exists(dir) || std::filesystem::is_empty(dir)));  // nothing measured, nothing kept
+    engine.value().reset();
+
+    // The same weights with their text tokenizer: measured and kept, no warning.
+    EngineConfig scaled = engine_config(model_path("key_outlier", outlier_spec()));
+    scaled.backend = BackendKind::Cpu;
+    scaled.cache_dir = dir;
+    auto with_scales = Engine::create(scaled);
+    REQUIRE(with_scales.has_value());
+    CHECK(with_scales.value()->describe().find("Keys:") == std::string::npos);
+    CHECK(!std::filesystem::is_empty(dir));
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
     test::TinyModelSpec dense = f32_spec();
     dense.arch = "qwen3";

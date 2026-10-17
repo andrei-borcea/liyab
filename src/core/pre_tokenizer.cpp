@@ -47,6 +47,17 @@ constexpr const char* kDeepSeekPunct = R"(\s?[!-/:-~\x{FF01}-\x{FF0F}\x{FF1A}-\x
 constexpr const char* kTrailingSpace = R"(\s+$)";
 constexpr const char* kDeepSeekCjk = R"([\x{4E00}-\x{9FA5}\x{800}-\x{4E00}\x{AC00}-\x{D7FF}]+)";
 constexpr const char* kEachDigit = R"(\p{N})";
+// Mistral-Nemo and later Mistral models (Tekken): the GPT-4o words without the contractions, single digits.
+constexpr const char* kTekken =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Youtu-LLM: Hangul, CJK punctuation, Bopomofo and Han/kana runs first, then the GPT-4o words with single
+// digits. The file writes the first class as \p{Hangul}; script properties are not part of core/regex.h, so it
+// is spelled out as the Hangul script's ranges (Unicode 16 Scripts.txt: the set Oniguruma matches, checked code
+// point by code point).
+constexpr const char* kYoutuCjk =
+    R"([\x{1100}-\x{11FF}\x{302E}\x{302F}\x{3131}-\x{318E}\x{3200}-\x{321E}\x{3260}-\x{327E}\x{A960}-\x{A97C}\x{AC00}-\x{D7A3}\x{D7B0}-\x{D7C6}\x{D7CB}-\x{D7FB}\x{FFA0}-\x{FFBE}\x{FFC2}-\x{FFC7}\x{FFCA}-\x{FFCF}\x{FFD2}-\x{FFD7}\x{FFDA}-\x{FFDC}]+|[\x{FF01}\x{2026}\x{201C}\x{201D}\x{2018}\x{2019}\x{2014}\x{FF1A}\x{FF1B}\x{FF0C}\x{3001}-\x{303F}\x{FE30}-\x{FE4F}]+|[\x{3105}-\x{312F}]+|[\x{4E00}-\x{9FA5}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+)";
+constexpr const char* kYoutuWords =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
 struct StepSpec {
     const char* pattern;
@@ -60,8 +71,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 8>& table() {
-    static const std::array<Row, 8> rows = {{
+const std::array<Row, 11>& table() {
+    static const std::array<Row, 11> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -73,6 +84,10 @@ const std::array<Row, 8>& table() {
           {kDeepSeekCjk, true}, {kEachDigit, true}},
          false, false},
         {{"gpt-4o"}, {{kGpt4o, false}}, false, false},
+        // SmolLM / SmolLM2: the Digits pre-tokenizer (each digit alone), then GPT-2's ByteLevel split.
+        {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
+        {{"tekken"}, {{kTekken, true}}, false, true},
+        {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
     }};
     return rows;
 }

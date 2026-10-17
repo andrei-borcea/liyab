@@ -125,6 +125,7 @@ field and as text.
 | `hunyuan-dense` | tencent/Hunyuan-0.5B-Instruct | bartowski bf16 (remote) | Q/K norms after RoPE; the file's base (1.11588e7) is the reference's alpha-scaled one |
 | `gemma3` | unsloth/gemma-3-270m-it | unsloth F16 (remote) | √640 embedding scale, GeGLU, both sandwich norms, every 6th block global, windowed blocks on their own base 10,000 |
 | `phi3` | microsoft/Phi-3.5-mini-instruct | bartowski Q8_0 (remote) | fused QKV and gate/up; LongRoPE short factors and attention factor match; every block windowed (262,144) |
+| `ernie4_5` | baidu/ERNIE-4.5-0.3B-PT | unsloth F16, tokenizer keys fixed (local) | adjacent pairs, key rows as the reference stores them; gate passed (below) |
 
 No published GGUF uses `general.architecture = mistral`: llama.cpp writes Mistral 7B and Nemo as `llama`, newer
 Mistral models as `mistral3` or `mistral4` (more than 2,400 GGUF repositories found by Mistral-related searches on
@@ -154,6 +155,17 @@ It also reports that this GGUF asks for a BOS and a space before the text (`toke
 (mean KL 0.00000, top-1 100.00%), the encodings did not (the first token differs on every text). With those two
 keys set to the tokenizer's own rules in a copy of the file, the gate accepted the row.
 
+The row is now in the registry, pinned by a synthetic `ernie4_5` case in `test_golden` (the same tensors as the
+`llama` case, so the same hashes). bartowski's and mradermacher's ERNIE GGUFs have the same problem (no
+`add_bos_token`, which a SentencePiece vocabulary reads as true, and no `add_space_prefix`). The engine does not
+special-case the model: a file is fixed once with `tools/gguf_set_keys.py`, which copies it with the keys set and
+the tensors byte for byte:
+
+```bash
+tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gguf \
+    --bool tokenizer.ggml.add_bos_token=false --bool tokenizer.ggml.add_space_prefix=false
+```
+
 ### The gate
 
 | Model | Row | Tokenizer: conform / edge / chat | liyab-kl `--kv f16` | Verdict |
@@ -164,6 +176,7 @@ keys set to the tokenizer's own rules in a copy of the file, the gate accepted t
 | Llama-3.2-3B-Instruct (unsloth BF16), not tested before | registry's `llama` | 498 / 797 / 202, identical | 498 positions, mean KL 0.00000, top-1 99.80% | accepted |
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 
@@ -171,15 +184,17 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
-| Mistral-Nemo-Instruct-2407 (`llama`) | the `tekken` BPE pre-tokenizer. The architecture is the `llama` row (head size 128 from `key_length`) |
 | OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
 | Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
 | SmolLM3 3B (`smollm3`) | blocks without RoPE (block 3 of the 4 traced; the configuration's `no_rope_layers` lists every 4th); the `smaug-bpe` pre-tokenizer |
-| SmolLM2 360M (`llama`) | the `smollm` pre-tokenizer. The architecture is the `llama` row |
 
 Gemma 2 and DeepSeek-V2 were in this table until the engine gained what the tool listed for them: logit
 soft-capping (Gemma 2), and multi-head latent attention, YaRN and the file's attention scale (DeepSeek-V2). The
-tool now reproduces the registry's `gemma2` row exactly. For latent attention it reports an unknown rather than a
+tool now reproduces the registry's `gemma2` row exactly. Mistral-Nemo-Instruct-2407 and SmolLM2-360M-Instruct were
+in it for their pre-tokenizers alone (`tekken`, `smollm`), which are table rows now: described again (Nemo from
+bartowski's Q8_0 header, SmolLM2 from bartowski's f16), both give the registry's `llama` row with nothing missing
+(Nemo's head size 128 from `key_length`). SmolLM2's f16 file then gave transformers' ids on the whole text and mean KL
+0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention it reports an unknown rather than a
 row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
 such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
 

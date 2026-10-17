@@ -23,6 +23,11 @@ constexpr ArchSpec kArchitectures[] = {
     // Hunyuan dense (Hunyuan-MT, Hunyuan 0.5B-7B): Q/K norms after RoPE. The
     // converter folds the dynamic-NTK "alpha" scaling into rope.freq_base.
     {"hunyuan-dense", RopeLayout::Halves, "ffn_norm", false, QkNormOrder::AfterRope},
+    // ERNIE 4.5 dense (0.3B): a pre-norm block with SwiGLU; the reference
+    // rotates adjacent pairs and the converter keeps the rows as they are.
+    // Row proposed and gated by tools/describe_model.py
+    // (docs/model-descriptions.md).
+    {"ernie4_5", RopeLayout::Adjacent, "ffn_norm", false},
     // Gemma 2: embeddings scaled by sqrt(d), GeGLU, norms after the attention
     // and the FFN; every other block (the even ones) attends through the
     // sliding window, all with the one RoPE base. The soft caps of the

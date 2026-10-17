@@ -106,6 +106,9 @@ std::vector<GoldenCase> cases() {
     s.arch = "mistral";
     add("mistral", s);
     s = {};
+    s.arch = "ernie4_5";
+    add("ernie4_5", s);
+    s = {};
     s.arch = "qwen2";
     add("qwen2", s);
     s.key_outlier = 60.0f;  // large constant key channels, scaled before the Q8_0 cache

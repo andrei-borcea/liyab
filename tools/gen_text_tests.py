@@ -62,6 +62,18 @@ DS_LETTERS = (
     r"\x{118A0}-\x{118DF}\x{1E900}-\x{1E943}]+")
 DS_PUNCT = r"\s?[!-/:-~\x{FF01}-\x{FF0F}\x{FF1A}-\x{FF5E}\x{2018}-\x{201F}\x{3000}-\x{3002}]+"
 DS_CJK = r"[\x{4E00}-\x{9FA5}\x{800}-\x{4E00}\x{AC00}-\x{D7FF}]+"
+TEKKEN = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
+          r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+          r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# Youtu-LLM's \p{Hangul}, spelled out as the script's ranges like the engine's table.
+YOUTU_CJK = (r"[\x{1100}-\x{11FF}\x{302E}\x{302F}\x{3131}-\x{318E}\x{3200}-\x{321E}\x{3260}-\x{327E}"
+             r"\x{A960}-\x{A97C}\x{AC00}-\x{D7A3}\x{D7B0}-\x{D7C6}\x{D7CB}-\x{D7FB}\x{FFA0}-\x{FFBE}\x{FFC2}-\x{FFC7}"
+             r"\x{FFCA}-\x{FFCF}\x{FFD2}-\x{FFD7}\x{FFDA}-\x{FFDC}]+|"
+             r"[\x{FF01}\x{2026}\x{201C}\x{201D}\x{2018}\x{2019}\x{2014}\x{FF1A}\x{FF1B}\x{FF0C}\x{3001}-\x{303F}"
+             r"\x{FE30}-\x{FE4F}]+|[\x{3105}-\x{312F}]+|[\x{4E00}-\x{9FA5}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+")
+YOUTU_WORDS = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+               r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+               r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 PRE_TOKENIZERS = {
     "default": ([(GPT2, True)], False),
     "llama3": ([(LLAMA3, True)], False),
@@ -72,6 +84,9 @@ PRE_TOKENIZERS = {
     "deepseek-llm": ([(r"[\r\n]", True), (DS_LETTERS, True), (DS_PUNCT, True), (r"\s+$", True), (DS_CJK, True),
                       (r"\p{N}", True)], False),
     "gpt-4o": ([(GPT4O, False)], False),
+    "smollm": ([(r"\p{N}", True), (GPT2, True)], False),
+    "tekken": ([(TEKKEN, True)], False),
+    "youtu": ([(YOUTU_CJK, True), (YOUTU_WORDS, True)], False),
 }
 
 # Engine features beyond the table's patterns: (pattern, keep_gaps, text).

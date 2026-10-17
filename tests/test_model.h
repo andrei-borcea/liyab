@@ -156,6 +156,11 @@ struct TinyModelSpec {
     bool cls_bias = false;          // cls.output.bias
     bool cls_dense = false;         // cls.weight: a two-layer head (refused by the engine)
     std::string rerank_template;    // non-empty: tokenizer.chat_template.rerank
+
+    // Non-empty: the vocabulary is declared byte-level BPE (tokenizer.ggml.model
+    // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
+    // does not know. Metadata only: the weights are those of the same spec.
+    std::string bpe_pre;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
