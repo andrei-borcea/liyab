@@ -112,6 +112,8 @@ typedef struct liyab_engine_config {
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
     liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
+    int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model (kept in cache_dir); 0 (default) off */
+    float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.02) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -170,6 +172,10 @@ typedef struct liyab_generation_stats {
     /* Before ttft_ms: matching the context, a prefix-cache restore, a rewind */
     double context_ms;
     double ttft_stall_ms;         /* of ttft_ms: waiting for expert reads */
+    /* Segment reuse (liyab_engine_generate_segmented) */
+    int32_t segment_reused_tokens;     /* prompt positions whose KV came from stored segments */
+    int32_t segment_recomputed_tokens; /* of them, processed again */
+    double segment_ms;                 /* time it took (part of prefill_ms) */
 } liyab_generation_stats;
 
 /*
@@ -504,9 +510,59 @@ typedef struct liyab_prefix_cache_stats {
     uint64_t restores;           /* prompts that restored a prefix */
     uint64_t restored_tokens;    /* positions restored */
     double restore_ms;           /* total time restoring */
+    /* Segment reuse */
+    int32_t segments;                    /* stored segment copies */
+    uint64_t segments_kept;              /* segments stored */
+    uint64_t segment_reuses;             /* segments reused */
+    uint64_t segment_reused_tokens;      /* positions reused away from their prefix */
+    uint64_t segment_recomputed_tokens;  /* of them, processed again */
 } liyab_prefix_cache_stats;
 
 LIYAB_C_API liyab_status liyab_engine_prefix_cache_stats(const liyab_engine* engine, liyab_prefix_cache_stats* out_stats);
+
+/*
+ * Segment reuse: KV reused away from its prefix (lossy, opt-in; Engine's
+ * PromptSegment in liyab/engine.h has the whole contract). With
+ * segment_reuse set in liyab_engine_config, a request that marks parts of
+ * its prompt (byte ranges: a system block, tools, documents, tool results,
+ * conversation turns) has each marked part's KV kept, and reuses the kept
+ * KV of any part seen before wherever it now appears: its keys turned to
+ * the new positions, part of its tokens processed again (a share
+ * calibrated per model). The output then differs from processing the whole
+ * prompt; requests that mark nothing stay exact (a context holding reused
+ * rows is processed again from the first one for them). Off, or on a model
+ * that refuses it (hybrid models), marked prompts are processed as usual.
+ */
+typedef struct liyab_prompt_segment {
+    size_t begin; /* byte offset of the part in the prompt, on a UTF-8 character boundary */
+    size_t end;   /* one past its last byte; parts ascend and do not overlap */
+} liyab_prompt_segment;
+
+/* liyab_engine_generate with marked parts (`segments` may be NULL with
+ * n_segments 0: an exact request). LIYAB_ERR_INVALID_ARGUMENT for parts that
+ * are empty, overlap, are not ascending, leave the prompt or cut a character. */
+LIYAB_C_API liyab_status liyab_engine_generate_segmented(liyab_engine* engine, const char* prompt,
+                                                         const liyab_prompt_segment* segments, size_t n_segments,
+                                                         const liyab_sampling_params* params,
+                                                         liyab_token_callback callback, void* user_data,
+                                                         liyab_generation_stats* stats);
+/* liyab_engine_prefill with marked parts (same rules). */
+LIYAB_C_API liyab_status liyab_engine_prefill_segmented(liyab_engine* engine, const char* text,
+                                                        const liyab_prompt_segment* segments, size_t n_segments,
+                                                        int32_t add_bos);
+
+typedef struct liyab_segment_reuse_info {
+    float fraction;     /* share of a reused part's tokens processed again */
+    double kl;          /* the calibration's mean KL at that share */
+    double top1;        /* its top-1 agreement with processing the whole prompt, 0..1 */
+    int32_t from_cache; /* the calibration was read from cache_dir */
+} liyab_segment_reuse_info;
+
+/* LIYAB_OK when segment reuse is on; otherwise why not (LIYAB_ERR_UNSUPPORTED:
+ * off in the config, a hybrid model, no prefix cache, the target not met;
+ * liyab_last_error() says which). `out` (may be NULL) receives the
+ * calibration either way. Thread-safe. */
+LIYAB_C_API liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segment_reuse_info* out);
 
 #ifdef __cplusplus
 }

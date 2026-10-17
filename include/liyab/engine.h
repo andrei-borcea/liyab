@@ -181,6 +181,21 @@ struct EngineConfig {
     // 0.9995 with transformers' embeddings and moved scores by up to 0.004,
     // against 0.9999997 and 0.00006 with F16 (README, Embeddings and reranking).
     KvCacheType pooling_kv_cache_type = KvCacheType::F16;
+    // Segment reuse: KV reused away from its prefix. Lossy and off by
+    // default: see PromptSegment for what it does and what it changes. On,
+    // the engine measures once per model and cache settings the share of a
+    // reused segment's tokens it processes again to keep the output within
+    // segment_reuse_max_kl of processing the whole prompt, and keeps the
+    // result in cache_dir (measured again at every load without one). Needs
+    // the prefix cache's store (prefix_cache_mb or prefix_cache_disk_mb),
+    // whose caps the stored segments share; refused, with the reason in
+    // Engine::segment_reuse(), for hybrid models, with a sliding window or a
+    // draft model, or when no share on the calibration's grid meets the target.
+    bool segment_reuse = false;
+    // The target: the mean KL divergence of the next-token distributions,
+    // KL(whole prompt processed || segments reused), over the first answer
+    // tokens of a fixed RAG-shaped prompt (its documents reordered).
+    float segment_reuse_max_kl = 0.02f;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
@@ -253,6 +268,51 @@ struct Continuation {
 // past that point are dropped). Called on the generating thread.
 using ContinuationCallback = std::function<Continuation(std::string_view generated)>;
 
+// ---- Segment reuse: KV reused away from its prefix (lossy, opt-in) ---------
+// An agent's prompts put documents, memory snippets and tool results in the
+// middle, so a change before them makes everything after them be processed
+// again. A caller marks such parts of a prompt (PromptSegment: a system
+// block, tools, a document, a tool result, a conversation turn), and with
+// EngineConfig::segment_reuse on, the engine keeps the KV of each marked
+// part and reuses it wherever the same part appears again:
+//  * Exact reuse first. The part of the prompt the live context or the
+//    prefix cache holds is kept or restored as before, losslessly; segments
+//    are reused only after it.
+//  * A segment's KV is kept in the prefix cache's store (within its caps,
+//    least recently used out first, on storage across runs when it has a
+//    storage tier) once a prompt marking it has been processed, keyed by its
+//    tokens and the position it was computed at.
+//  * Reused elsewhere, its keys are turned from the positions they were
+//    computed at to the new ones (RoPE: exact up to rounding, every variant
+//    the engine runs), then part of its tokens is processed again with
+//    attention to everything now before them, the ones whose keys and
+//    values moved the most when the first blocks were run again; the rest
+//    keep their reused rows. The share is calibrated per model
+//    (segment_reuse_max_kl).
+//  * It changes the output: the reused rows lack attention to what now
+//    precedes them, which recomputing only part of them does not fully
+//    restore. A request opts in by marking segments; one that does not never
+//    sees reused rows: a context holding them is processed again from the
+//    first one (it is set aside in the prefix cache only up to there, and
+//    save_state() records where they start).
+//  * Text a segment holds is encoded on its own (at its boundaries the
+//    prompt is split even where encoding it whole would merge two tokens),
+//    so its tokens are the same wherever it appears. Segments shorter than
+//    16 tokens are processed as usual.
+//  * Not on hybrid models (their recurrent blocks must run over the whole
+//    prompt in order), with a sliding window or a draft model (no store):
+//    there, marked prompts are processed as usual, losslessly, and
+//    Engine::segment_reuse() says why.
+// GenerationStats and Engine::PrefixCacheStats count what was reused.
+//
+// A marked part of a prompt, [begin, end): byte offsets into a prompt's
+// text, on whole UTF-8 characters (token indices into a prompt given as
+// tokens). The segments of one prompt ascend and do not overlap.
+struct PromptSegment {
+    size_t begin = 0;
+    size_t end = 0;
+};
+
 // Options of Engine::generate. At most one of the two is set (both:
 // InvalidArgument).
 struct GenerateOptions {
@@ -263,6 +323,10 @@ struct GenerateOptions {
     // Forced text and constrained spans at chosen points of the output (a
     // tool call's syntax forced, its arguments constrained by their schema).
     ContinuationCallback continuation;
+    // Segment reuse (see PromptSegment): the prompt's marked parts, which
+    // makes this request opt in to it. Independent of the two above. Ignored
+    // (the prompt processed as usual) while segment reuse is unavailable.
+    std::vector<PromptSegment> segments;
 };
 
 // How a model's chat template lays out a conversation, found by rendering
@@ -594,8 +658,37 @@ public:
         uint64_t restores = 0;           // prompts that restored a prefix
         uint64_t restored_tokens = 0;    // positions restored
         double restore_ms = 0.0;         // total time restoring
+        // Segment reuse (see PromptSegment):
+        int32_t segments = 0;                  // stored segment copies (their chunks are in `chunks`)
+        uint64_t segments_kept = 0;            // segments stored
+        uint64_t segment_reuses = 0;           // segments reused
+        uint64_t segment_reused_tokens = 0;    // positions reused away from their prefix
+        uint64_t segment_recomputed_tokens = 0;  // of them, processed again
     };
     [[nodiscard]] PrefixCacheStats prefix_cache_stats() const;
+
+    // ---- Segment reuse (see PromptSegment) ----------------------------------
+    // generate_tokens() with options (a grammar, a continuation, marked
+    // segments as token indices into `prompt`); see generate() with
+    // GenerateOptions.
+    Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                            const TokenCallback& on_token, const GenerateOptions& options);
+    // prefill() of a text with marked segments (byte offsets): stored
+    // segments are reused as generate() reuses them, and the segments are
+    // kept once processed. InvalidArgument for segments that are not
+    // ascending, overlap, leave the text or cut a character.
+    Status prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos = true);
+    // Whether segment reuse is on, and what it was calibrated to: OK, or why
+    // not (off in EngineConfig, the model or settings refuse it, no stored
+    // segments without a prefix cache, the target not met). Thread-safe.
+    struct SegmentReuseInfo {
+        Status status;
+        float fraction = 0.0f;  // share of a reused segment's tokens processed again
+        double kl = 0.0;        // the calibration's mean KL at that share
+        double top1 = 0.0;      // and its top-1 agreement with processing the whole prompt, in [0, 1]
+        bool from_cache = false;  // the calibration was read from cache_dir
+    };
+    [[nodiscard]] SegmentReuseInfo segment_reuse() const;
 
 private:
     struct Impl;

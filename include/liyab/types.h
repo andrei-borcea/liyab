@@ -276,6 +276,13 @@ struct GenerationStats {
     int32_t constrained_tokens = 0;
     double grammar_ms = 0.0;
     bool cancelled = false;
+    // Segment reuse (Engine's PromptSegment): prompt positions whose KV came
+    // from stored segments (not counted in cached_prefix_tokens), how many
+    // of them were processed again, and the time it took (part of
+    // prefill_ms).
+    int32_t segment_reused_tokens = 0;
+    int32_t segment_recomputed_tokens = 0;
+    double segment_ms = 0.0;
 };
 
 }  // namespace liyab
