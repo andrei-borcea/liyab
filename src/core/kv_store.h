@@ -74,15 +74,22 @@
 // (os::FileLock) while open; another engine, in this process or another,
 // that finds it held runs without the storage tier.
 //
+// Compressed chunks on storage. A chunk is written encoded (core/kv_codec.h):
+// losslessly by default (KvEncoding::Lossless), re-quantized to 4 bits when
+// Config::lossy asks for it (KvEncoding::Lossy4), raw when its encoding does
+// not apply or would not make it smaller. FileHeader::encoding names it,
+// `raw_bytes` is the decoded size; every cap counts the stored size
+// (Item::file_bytes), and the payload hash covers the stored bytes. RAM holds
+// raw rows: chunks are encoded when they go to storage (put(), or moving out
+// of RAM), and decoded by read_chunk() into the caller's image, on
+// Config::pool when given. A lossy store's seed is derived from Config::seed
+// (so its chunks are never returned to a store that did not opt in, in this
+// process or a later one), and a Lossy4 file under a lossless store's own
+// seed is removed as untrusted. Raw files of earlier builds stay readable; a
+// file of an encoding a build does not know is removed when the directory is
+// opened, never misread. State images are stored raw.
+//
 // Extension points (later branches build on these, nothing else changes):
-//  * Compressed chunks on storage (feat/kv-compress): FileHeader::encoding
-//    names how a chunk's payload is stored (KvEncoding); `raw_bytes` is its
-//    decoded size and every cap counts the stored size (Item::file_bytes).
-//    Callers only ever see raw images (put()'s rows, read_chunk()), so an
-//    encoding is added in write_item_file() (encoding), read_chunk()
-//    (decoding into the caller's image) and scan() (accepting it); a file of
-//    an encoding a build does not know is removed when the directory is
-//    opened, never misread.
 //  * Chunks reused away from their prefix (feat/kv-reuse): every chunk also
 //    carries a position-independent content key (kv_content_key: the seed
 //    and its own tokens, not what precedes them) and its start position,
@@ -105,6 +112,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/kv_codec.h"
 #include "core/os.h"
 #include "liyab/types.h"
 
@@ -135,11 +143,6 @@ KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcep
 // Returns how many were removed.
 int32_t remove_kv_dedup_files(const std::string& dir);
 
-// How a chunk's payload is stored on storage (see the header comment).
-enum class KvEncoding : uint32_t {
-    Raw = 0,  // the rows as KvCache::read_rows() writes them
-};
-
 class KvStore {
 public:
     struct Config {
@@ -150,6 +153,15 @@ public:
         size_t ram_bytes = 0;       // RAM cap; 0: no RAM tier
         std::string dir;            // storage tier directory (created when missing); empty: none
         size_t disk_bytes = 0;      // storage cap; 0: no storage tier
+        // The geometry of chunk images (kv_row_layout() of the cache);
+        // invalid: chunks are stored raw.
+        KvRowLayout layout;
+        // Chunks re-quantized to 4 bits on storage (KvEncoding::Lossy4):
+        // changes the output, opt-in. Changes the seed.
+        bool lossy = false;
+        // Encodes and decodes chunks in parallel when given; the store calls
+        // it from the thread calling the store, one job at a time.
+        ThreadPool* pool = nullptr;
     };
 
     // Opens the tiers `config` asks for. Never fails: a directory that cannot
@@ -261,6 +273,8 @@ public:
         size_t disk_cap = 0;
         int32_t chunks_ram = 0;    // this seed's
         int32_t chunks_disk = 0;
+        size_t chunk_file_bytes = 0;  // this seed's chunk files on storage
+        size_t chunk_raw_bytes = 0;   //   and the rows they hold, decoded
         int32_t states = 0;
         int32_t records = 0;
         int32_t foreign_files = 0;  // other seeds' files kept on storage
@@ -284,6 +298,7 @@ private:
         size_t payload_offset = 0;         //   where the payload starts in it
         uint64_t payload_hash = 0;         //   and its hash (FileHeader::payload_hash)
         int64_t mtime = 0;                 // when opened from storage: for the LRU order
+        KvEncoding encoding = KvEncoding::Raw;  // on storage: how the payload is stored
     };
     struct Chunk : Item {
         KvKey parent;
@@ -337,8 +352,12 @@ private:
     void drop_state(const KvKey& key);
     void drop_record(const KvKey& leaf, bool collect);
     void release(Kind kind, Item& it);  // frees its payload or file, out of its tier
-    [[nodiscard]] size_t file_size(Kind kind, const Item& it) const noexcept;
-    bool write_item_file(Kind kind, Item& it);  // the file of an item with its payload in `data`
+    // Encodes an item's payload (in `data`) for storage into encoded_ and
+    // returns the size its file will have. write_item_file() then writes
+    // encoded_: nothing may encode in between (making room on storage only
+    // evicts, it never writes).
+    size_t encode_for_disk(Kind kind, Item& it);
+    bool write_item_file(Kind kind, Item& it);  // the file of the item encode_for_disk() was last called for
     bool write_record_file(RecordEntry& entry);
 
     void scan();  // indexes the directory (see the header comment)
@@ -357,6 +376,8 @@ private:
     std::unordered_multimap<KvKey, KvKey, KvKeyHash> by_content_;
     std::map<uint64_t, std::pair<Kind, KvKey>> lru_[2];  // [0] RAM, [1] storage; oldest first
     std::vector<uint8_t> scratch_;
+    std::vector<uint8_t> encoded_;  // see encode_for_disk()
+    KvEncoding encoded_as_ = KvEncoding::Raw;
 };
 
 }  // namespace liyab

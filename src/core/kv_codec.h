@@ -22,12 +22,21 @@
 //  * those symbols, and the quant bytes of block formats, are entropy-coded
 //    by static rANS (range asymmetric numeral systems: one 12-bit frequency
 //    table per kind of symbol and plane, kept in the chunk; 4 interleaved
-//    32-bit states, 16-bit renormalization), our own implementation;
+//    32-bit states, 16-bit renormalization, branchless refills), our own
+//    implementation;
+//  * with one value per quant byte (Q8_0), a channel that changes less from
+//    one position to the next than it is large (the slowly turning RoPE
+//    pairs of keys: 7.4 -> 7.0 bits per byte on Qwen3-0.6B, 7.5 -> 6.7 on
+//    Llama 3.2 1B) is coded as those differences, with a table of its own;
+//  * a stream that would save less than 1/8 of its bytes is kept raw
+//    (decoding a coded byte costs ~1 ns on an M4 Pro core, about what reading
+//    it from UFS 4 costs): in practice the value quants of Q8_0;
 //  * runs are independent, so a thread pool encodes and decodes them in
 //    parallel.
 // Order-0 coding with the per-channel exponent reference reached the measured
-// entropy within a percent; richer contexts (conditioning quants on their
-// channel's magnitude) gained about 1% more and were left out.
+// entropy within a percent; conditioning quants on their channel's magnitude
+// gained about 1% more and was left out. F16 rows come out ~1.17x smaller,
+// Q8_0 rows 1.04-1.09x.
 //
 // Lossy (KvEncoding::Lossy4, opt-in: KvStore::Config::lossy). Rows are
 // re-quantized to 4 bits on their way to storage:

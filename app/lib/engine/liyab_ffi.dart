@@ -99,6 +99,8 @@ final class LiyabEngineConfig extends Struct {
   external int suffixDrafts;
   @Int32()
   external int poolingKvCacheType;
+  @Int32()
+  external int prefixCacheLossy;
 }
 
 /// liyab_pooling: what a model does with its final hidden states (liyab_engine_pooling).

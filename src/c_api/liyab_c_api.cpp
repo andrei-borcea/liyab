@@ -229,6 +229,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->egls_threshold = d.experimental.egls_threshold;
     config->tdss = d.experimental.tdss ? (d.experimental.tdss_force ? 2 : 1) : 0;
     config->pooling_kv_cache_type = static_cast<liyab_kv_cache_type>(d.pooling_kv_cache_type);
+    config->prefix_cache_lossy = d.prefix_cache_lossy ? 1 : 0;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -289,6 +290,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.prefix_cache_disk_mb = config->prefix_cache_disk_mb;
         if (config->cache_dir != nullptr) c.cache_dir = config->cache_dir;
         c.pooling_kv_cache_type = static_cast<liyab::KvCacheType>(config->pooling_kv_cache_type);
+        c.prefix_cache_lossy = config->prefix_cache_lossy != 0;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

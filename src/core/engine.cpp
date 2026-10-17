@@ -461,6 +461,12 @@ struct Engine::Impl {
             sc.dir = cfg.prefix_cache_dir;
             sc.disk_bytes = static_cast<size_t>(cfg.prefix_cache_disk_mb) << 20;
         }
+        // Chunks go to storage compressed (core/kv_codec.h), encoded and
+        // decoded on the engine's pool: the store is used under the engine's
+        // lock, never while a forward pass runs.
+        sc.layout = kv_row_layout(kv.config());
+        sc.lossy = cfg.prefix_cache_lossy;
+        sc.pool = pool.get();
         store = KvStore::open(sc);
         if (!store) return;
         const KvStore::Stats st = store->stats();
