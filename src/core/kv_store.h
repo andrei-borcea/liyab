@@ -75,9 +75,11 @@
 // that finds it held runs without the storage tier.
 //
 // Compressed chunks on storage. A chunk is written encoded (core/kv_codec.h):
-// losslessly by default (KvEncoding::Lossless), re-quantized to 4 bits when
-// Config::lossy asks for it (KvEncoding::Lossy4), raw when its encoding does
-// not apply or would not make it smaller. FileHeader::encoding names it,
+// losslessly by default (KvEncoding::Lossless) where that pays on this
+// device (the read time saved exceeds the decode time, with speeds measured
+// once: calibrate()), re-quantized to 4 bits when Config::lossy asks for it
+// (KvEncoding::Lossy4), raw when its encoding does not apply or does not
+// pay. read_chunks() reads ahead while it decodes. FileHeader::encoding names it,
 // `raw_bytes` is the decoded size; every cap counts the stored size
 // (Item::file_bytes), and the payload hash covers the stored bytes. RAM holds
 // raw rows: chunks are encoded when they go to storage (put(), or moving out
@@ -87,7 +89,9 @@
 // process or a later one), and a Lossy4 file under a lossless store's own
 // seed is removed as untrusted. Raw files of earlier builds stay readable; a
 // file of an encoding a build does not know is removed when the directory is
-// opened, never misread. State images are stored raw.
+// opened, never misread. State images are stored raw: a lossless coding of
+// their 32-bit floats would save ~13% (measured on Qwen3.5-0.8B), not worth
+// a second codec yet.
 //
 // Extension points (later branches build on these, nothing else changes):
 //  * Chunks reused away from their prefix (feat/kv-reuse): every chunk also
@@ -106,6 +110,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -162,6 +167,13 @@ public:
         // Encodes and decodes chunks in parallel when given; the store calls
         // it from the thread calling the store, one job at a time.
         ThreadPool* pool = nullptr;
+        // Where the measured costs of reading and decoding (KvCodecCosts)
+        // are kept, per device, directory, layout and thread count (16 sets
+        // at most, least recently used out first); empty: measured each time
+        // the store opens. See calibrate().
+        std::string calibration_dir;
+        // Costs to use instead of measuring them (tests, tools).
+        std::optional<KvCodecCosts> costs;
     };
 
     // Opens the tiers `config` asks for. Never fails: a directory that cannot
@@ -246,6 +258,17 @@ public:
     // unreadable file, which is removed (with what depends on it);
     // InvalidArgument for an unknown key or a wrong size.
     Status read_chunk(const KvKey& key, std::span<uint8_t> out);
+    // Reads the chunks `keys` in order, chunk i into dest(i) (its whole image,
+    // as read_chunk() takes it), calling done(i) once it is there. The next
+    // chunk's file is read on a thread of its own while the current one is
+    // decoded, so a restore costs about the longer of the two, not their sum.
+    // dest(i + 1) is asked for before done(i) is called. Stops at the first
+    // failure: read_chunk()'s errors (a damaged file is removed), or done()'s.
+    Status read_chunks(std::span<const KvKey> keys, const std::function<std::span<uint8_t>(size_t)>& dest,
+                       const std::function<Status(size_t)>& done);
+    // What reading and decoding cost here (see calibrate()); zeros without a
+    // storage tier or a layout.
+    [[nodiscard]] const KvCodecCosts& codec_costs() const noexcept { return costs_; }
     Status read_state(const KvKey& key, std::span<float> out);
     // The keys of the chunks holding `tokens` (all stored: else empty).
     [[nodiscard]] std::vector<KvKey> chunk_path(std::span<const int32_t> tokens) const;
@@ -361,6 +384,14 @@ private:
     bool write_record_file(RecordEntry& entry);
 
     void scan();  // indexes the directory (see the header comment)
+    // The costs the lossless encoding weighs (KvCodecCosts): kept in
+    // Config::calibration_dir, else measured: reading a file written to the
+    // storage directory, uncached (core/direct_io.h), and decoding a
+    // synthetic chunk of the layout on the pool. Measured once, then fixed,
+    // so what is coded is deterministic. When reads cannot be measured, or
+    // only through the page cache, nothing is coded (a restore never pays for
+    // it).
+    void calibrate();
 
     Config config_;
     bool disk_on_ = false;
@@ -377,6 +408,7 @@ private:
     std::map<uint64_t, std::pair<Kind, KvKey>> lru_[2];  // [0] RAM, [1] storage; oldest first
     std::vector<uint8_t> scratch_;
     std::vector<uint8_t> encoded_;  // see encode_for_disk()
+    KvCodecCosts costs_;
     KvEncoding encoded_as_ = KvEncoding::Raw;
 };
 

@@ -805,6 +805,7 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
         if (layout) c.layout = l;
         c.lossy = lossy;
         c.pool = pool;
+        c.costs = KvCodecCosts{1.0, 0.0};  // decoding free: every stream that shrinks is coded
         return c;
     };
     auto put_rows = [&](KvStore& store, const std::vector<int32_t>& tokens) {
@@ -909,4 +910,134 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
         CHECK(store->plan(b, b.size()).positions == 0);
     }
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("The KV store codes chunks only where it pays, measures that once, and reads ahead in batches") {
+    const KvRowLayout l = codec_layout(KvCacheType::Q8_0, 2);
+    ThreadPool pool(4);
+    auto config = [&](const std::string& dir, std::optional<KvCodecCosts> costs, const std::string& calibration = {}) {
+        KvStore::Config c;
+        const uint64_t parts[] = {78};
+        c.seed = kv_seed_key(parts);
+        c.chunk_tokens = kChunk;
+        c.chunk_bytes = l.image_bytes(kChunk);
+        c.dir = dir;
+        c.disk_bytes = size_t{64} << 20;
+        c.layout = l;
+        c.pool = &pool;
+        c.costs = costs;
+        c.calibration_dir = calibration;
+        return c;
+    };
+    auto put_rows = [&](KvStore& store, const std::vector<int32_t>& tokens) {
+        KvStore::ContextSource src;
+        src.tokens = tokens;
+        src.rows = [&](int32_t chunk, int32_t n, uint8_t* out) {
+            const std::vector<uint8_t> image = kv_image(l, tokens, chunk * kChunk, n);
+            std::copy(image.begin(), image.end(), out);
+            return Status::ok();
+        };
+        return store.put(src, /*storage_only=*/true);
+    };
+    // read_chunks() over the whole plan, each image checked as it arrives.
+    auto batch_restored = [&](KvStore& store, const std::vector<int32_t>& tokens) {
+        const KvStore::Plan plan = store.plan(tokens, tokens.size());
+        if (plan.positions != static_cast<int32_t>(tokens.size())) return false;
+        std::vector<std::vector<uint8_t>> images(plan.chunks.size());
+        bool same = true;
+        const Status s = store.read_chunks(
+            plan.chunks,
+            [&](size_t i) {
+                images[i].assign(l.image_bytes(plan.chunk_sizes[i]), 0);
+                return std::span<uint8_t>(images[i]);
+            },
+            [&](size_t i) {
+                same = same && images[i] == kv_image(l, tokens, static_cast<int32_t>(i) * kChunk, plan.chunk_sizes[i]);
+                return Status::ok();
+            });
+        return s.is_ok() && same;
+    };
+    std::mt19937 rng(9);
+    const std::vector<int32_t> a = random_tokens(rng, 150);
+    {
+        // Decoding slower than the reads it saves: nothing is coded, the files are raw.
+        const std::string dir = store_dir("pays_not");
+        auto store = KvStore::open(config(dir, KvCodecCosts{0.1, 50.0}));
+        REQUIRE(store != nullptr);
+        CHECK(put_rows(*store, a).whole);
+        const KvStore::Stats st = store->stats();
+        CHECK(st.chunk_file_bytes > st.chunk_raw_bytes);
+        CHECK(batch_restored(*store, a));
+        store.reset();
+        std::filesystem::remove_all(dir);
+    }
+    {
+        // Reads slow, decoding cheap: coded, smaller, and the batch read gives the same rows.
+        const std::string dir = store_dir("pays");
+        auto store = KvStore::open(config(dir, KvCodecCosts{10.0, 0.1}));
+        REQUIRE(store != nullptr);
+        CHECK(put_rows(*store, a).whole);
+        const KvStore::Stats st = store->stats();
+        CHECK(st.chunk_file_bytes < st.chunk_raw_bytes);
+        CHECK(batch_restored(*store, a));
+        // A failure of the caller's stops the batch and is returned.
+        const KvStore::Plan plan = store->plan(a, a.size());
+        std::vector<uint8_t> image(l.image_bytes(kChunk));
+        size_t calls = 0;
+        const Status s = store->read_chunks(
+            plan.chunks, [&](size_t) { return std::span<uint8_t>(image); },
+            [&](size_t) {
+                ++calls;
+                return Status(ErrorCode::Cancelled, "stop");
+            });
+        CHECK(s.code() == ErrorCode::Cancelled);
+        CHECK(calls == 1);
+        // A damaged file in the middle: removed, with what follows it; the batch fails.
+        std::filesystem::path victim;
+        for (const auto& e : std::filesystem::directory_iterator(dir)) {
+            if (e.path().extension() == ".chunk") victim = e.path();
+        }
+        {
+            std::fstream f(victim, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekg(-2, std::ios::end);
+            const int ch = f.get();
+            f.seekp(-2, std::ios::end);
+            f.put(static_cast<char>(ch ^ 0x33));
+        }
+        CHECK(!batch_restored(*store, a));
+        CHECK(store->plan(a, a.size()).positions < static_cast<int32_t>(a.size()));
+        store.reset();
+        std::filesystem::remove_all(dir);
+    }
+    {
+        // Measured costs are kept: a later store finds the same and makes the same choice.
+        const std::string dir = store_dir("measured");
+        const std::string calibration = store_dir("measured_costs");
+        KvCodecCosts first;
+        {
+            auto store = KvStore::open(config(dir, std::nullopt, calibration));
+            REQUIRE(store != nullptr);
+            first = store->codec_costs();
+            CHECK(first.decode_ns_per_symbol > 0);
+            CHECK(put_rows(*store, a).whole);
+            CHECK(batch_restored(*store, a));
+        }
+        size_t kept = 0;
+        for (const auto& e : std::filesystem::directory_iterator(calibration)) {
+            kept += e.path().filename().string().starts_with("kv-costs-") ? 1 : 0;
+        }
+        CHECK(kept == 1);
+        for (const auto& e : std::filesystem::directory_iterator(dir)) {
+            CHECK(e.path().filename().string() != "kv-calibration.tmp");  // the probe is gone
+        }
+        {
+            auto store = KvStore::open(config(dir, std::nullopt, calibration));
+            REQUIRE(store != nullptr);
+            CHECK(store->codec_costs().read_ns_per_byte == first.read_ns_per_byte);
+            CHECK(store->codec_costs().decode_ns_per_symbol == first.decode_ns_per_symbol);
+            CHECK(batch_restored(*store, a));
+        }
+        std::filesystem::remove_all(dir);
+        std::filesystem::remove_all(calibration);
+    }
 }

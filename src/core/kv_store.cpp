@@ -4,10 +4,19 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 #include <tuple>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+
+#include "core/direct_io.h"
 #include "core/log.h"
+#include "core/thread_pool.h"
 #include "liyab/mmap_loader.h"  // xxhash64
 
 namespace liyab {
@@ -234,6 +243,7 @@ std::unique_ptr<KvStore> KvStore::open(const Config& config) {
         } else {
             store->disk_on_ = true;
             store->scan();
+            store->calibrate();
         }
     }
     if (config.ram_bytes == 0 && !store->disk_on_) return nullptr;
@@ -289,7 +299,7 @@ size_t KvStore::encode_for_disk(Kind kind, Item& it) {
             // Lossy when asked for, else (or where it does not apply) lossless,
             // else raw.
             for (const KvEncoding e : {config_.lossy ? KvEncoding::Lossy4 : KvEncoding::Lossless, KvEncoding::Lossless}) {
-                if (kv_encode(e, config_.layout, slots, rows, encoded_, config_.pool)) {
+                if (kv_encode(e, config_.layout, slots, rows, encoded_, config_.pool, &costs_)) {
                     encoded_as_ = e;
                     payload = encoded_.size();
                     break;
@@ -995,6 +1005,99 @@ Status KvStore::read_chunk(const KvKey& key, std::span<uint8_t> out) {
     return Status(ErrorCode::IoError, "prefix cache: a chunk file is damaged or unreadable");
 }
 
+Status KvStore::read_chunks(std::span<const KvKey> keys, const std::function<std::span<uint8_t>(size_t)>& dest,
+                            const std::function<Status(size_t)>& done) {
+    // What reading chunk i takes, set on this thread; the read itself (file
+    // I/O into `out` or `stored` only, no store state) may run on the reader.
+    struct Job {
+        KvKey key;
+        std::span<uint8_t> out;
+        bool on_disk = false;
+        KvEncoding encoding = KvEncoding::Raw;
+        int32_t slots = 0;
+        std::string path;
+        size_t offset = 0;
+        uint64_t hash = 0;
+        std::vector<uint8_t> stored;  // an encoded payload, read before it is decoded
+        bool ok = false;
+    };
+    auto prepare = [&](size_t i, Job& j) -> Status {
+        j.key = keys[i];
+        auto it = chunks_.find(j.key);
+        if (it == chunks_.end() || !ours(it->second) || !it->second.placed) {
+            return Status(ErrorCode::InvalidArgument, "prefix cache: no such chunk");
+        }
+        const Chunk& ch = it->second;
+        j.out = dest(i);
+        if (j.out.size() != ch.payload_bytes) return Status(ErrorCode::InvalidArgument, "prefix cache: wrong chunk size");
+        j.on_disk = ch.on_disk;
+        j.ok = false;
+        if (!ch.on_disk) {
+            std::memcpy(j.out.data(), ch.data.get(), j.out.size());
+            j.ok = true;
+            return Status::ok();
+        }
+        j.encoding = ch.encoding;
+        j.slots = static_cast<int32_t>(ch.tokens.size());
+        j.path = path_of(j.key, ".chunk");
+        j.offset = ch.payload_offset;
+        j.hash = ch.payload_hash;
+        if (j.encoding != KvEncoding::Raw) j.stored.resize(ch.file_bytes - ch.payload_offset);
+        return Status::ok();
+    };
+    auto read = [](Job* j) {
+        j->ok = read_payload(j->path, j->offset, j->hash,
+                             j->encoding == KvEncoding::Raw ? j->out : std::span<uint8_t>(j->stored));
+    };
+    auto read_ahead = [read](Job* j) {
+#if defined(__APPLE__)
+        // The default QoS may land the reader on an efficiency core, slower
+        // than the decoding it is meant to keep up with.
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+        read(j);
+    };
+    Job jobs[2];
+    std::thread reader;
+    auto join = [&] {
+        if (reader.joinable()) reader.join();
+    };
+    auto damaged = [&](const KvKey& key) {
+        join();  // the reader may be reading a file the eviction removes
+        LIYAB_LOG_WARN("prefix cache: a chunk file is damaged or unreadable; removed");
+        evict(Kind::Chunk, key);
+        return Status(ErrorCode::IoError, "prefix cache: a chunk file is damaged or unreadable");
+    };
+    if (keys.empty()) return Status::ok();
+    LIYAB_RETURN_IF_ERROR(prepare(0, jobs[0]));
+    // Only an encoded chunk is read ahead, while the one before it decodes: a
+    // raw chunk is read on this thread when its turn comes, exactly as
+    // read_chunk() does (a new thread may run on a slower core; with nothing
+    // to decode there is nothing to overlap).
+    auto ahead = [](const Job& j) { return j.on_disk && j.encoding != KvEncoding::Raw; };
+    for (size_t i = 0; i < keys.size(); ++i) {
+        join();
+        Job& cur = jobs[i % 2];
+        if (cur.on_disk && (i == 0 || !ahead(cur))) read(&cur);
+        if (i + 1 < keys.size()) {
+            Job& next = jobs[(i + 1) % 2];
+            if (Status s = prepare(i + 1, next); !s.is_ok()) return s;
+            if (ahead(next)) reader = std::thread(read_ahead, &next);
+        }
+        if (!cur.ok) return damaged(cur.key);
+        if (cur.on_disk && cur.encoding != KvEncoding::Raw &&
+            !kv_decode(cur.encoding, config_.layout, cur.slots, cur.stored, cur.out, config_.pool)) {
+            return damaged(cur.key);
+        }
+        if (Status s = done(i); !s.is_ok()) {
+            join();
+            return s;
+        }
+    }
+    join();
+    return Status::ok();
+}
+
 Status KvStore::read_state(const KvKey& key, std::span<float> out) {
     auto it = states_.find(key);
     if (it == states_.end() || !ours(it->second) || !it->second.placed) {
@@ -1096,6 +1199,141 @@ KvStore::Stats KvStore::stats() const {
 }
 
 // --- Opening a directory ----------------------------------------------------------------
+
+void KvStore::calibrate() {
+    costs_ = {};
+    if (!disk_on_ || !config_.layout.valid()) return;
+    if (config_.costs) {
+        costs_ = *config_.costs;
+        return;
+    }
+    // What is measured, and how: bump when the decoder or the measurement changes.
+    constexpr uint64_t kCostsVersion = 2;
+    constexpr char kCostsMagic[4] = {'L', 'Y', 'K', 'C'};
+    constexpr size_t kKeptSets = 16;
+    const KvRowLayout& l = config_.layout;
+    const uint64_t parts[] = {kCostsVersion,
+                              static_cast<uint64_t>(l.type),
+                              static_cast<uint64_t>(l.planes),
+                              static_cast<uint64_t>(l.layers),
+                              static_cast<uint64_t>(l.heads),
+                              static_cast<uint64_t>(l.head_dim),
+                              static_cast<uint64_t>(config_.chunk_tokens),
+                              static_cast<uint64_t>(config_.pool != nullptr ? config_.pool->max_threads() : 1),
+                              xxhash64(config_.dir.data(), config_.dir.size())};
+    const uint64_t id = xxhash64(parts, sizeof parts);
+    std::string kept;
+    if (!config_.calibration_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(os::utf8_path(config_.calibration_dir), ec);
+        char name[40];
+        std::snprintf(name, sizeof name, "/kv-costs-%016llx.bin", static_cast<unsigned long long>(id));
+        kept = config_.calibration_dir + name;
+        if (std::FILE* f = os::open_file(kept, "rb")) {
+            char magic[4] = {};
+            uint64_t stored_id = 0;
+            KvCodecCosts c;
+            const bool ok = std::fread(magic, sizeof magic, 1, f) == 1 && std::memcmp(magic, kCostsMagic, 4) == 0 &&
+                            std::fread(&stored_id, sizeof stored_id, 1, f) == 1 && stored_id == id &&
+                            std::fread(&c.read_ns_per_byte, sizeof(double), 1, f) == 1 &&
+                            std::fread(&c.decode_ns_per_symbol, sizeof(double), 1, f) == 1 &&
+                            c.read_ns_per_byte >= 0 && c.decode_ns_per_symbol >= 0;
+            std::fclose(f);
+            if (ok) {
+                costs_ = c;
+                touch_file(kept);
+                return;
+            }
+        }
+    }
+    // Reads: a file as large as a few chunks, written to the storage
+    // directory and read back uncached in one request, as a chunk file is.
+    constexpr size_t kProbeBytes = size_t{8} << 20;
+    const std::string probe = config_.dir + "/kv-calibration.tmp";
+    double read_ns = 0;
+    {
+        std::vector<uint8_t> bytes(kProbeBytes + DirectFile::kAlign);
+        const auto misalign = reinterpret_cast<uintptr_t>(bytes.data()) % DirectFile::kAlign;
+        uint8_t* buf = bytes.data() + (misalign == 0 ? 0 : DirectFile::kAlign - misalign);
+        uint64_t x = 0x9E3779B97F4A7C15ULL;  // incompressible, should the file system compress
+        for (size_t i = 0; i < kProbeBytes; i += 8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            std::memcpy(buf + i, &x, 8);
+        }
+        bool written = false;
+        if (std::FILE* f = os::open_file(probe, "wb")) {
+            written = std::fwrite(buf, 1, kProbeBytes, f) == kProbeBytes;
+            written = std::fclose(f) == 0 && written;
+        }
+        if (written) {
+            auto file = DirectFile::open(probe);
+            // Only an uncached read measures the storage: through the page
+            // cache the probe would come back at RAM speed and make coding
+            // look free.
+            if (file && (*file)->direct()) {
+                for (int rep = 0; rep < 2; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (!(*file)->read(0, kProbeBytes, buf).is_ok()) {
+                        read_ns = 0;
+                        break;
+                    }
+                    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+                    read_ns = rep == 0 ? ns : std::min(read_ns, ns);
+                }
+            }
+            // The store's own read (buffered, then hashed) costs CPU time a
+            // device read does not show, more than the device time where
+            // storage is fast: a read costs the larger of the two.
+            if (read_ns > 0) {
+                double cpu_ns = 0;
+                for (int rep = 0; rep < 2; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (!read_payload(probe, 0, xxhash64(buf, kProbeBytes), std::span<uint8_t>(buf, kProbeBytes))) {
+                        cpu_ns = 0;
+                        read_ns = 0;
+                        break;
+                    }
+                    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+                    cpu_ns = rep == 0 ? ns : std::min(cpu_ns, ns);
+                }
+                read_ns = read_ns > 0 ? std::max(read_ns, cpu_ns) : 0;
+            }
+        }
+    }
+    os::remove_file(probe);
+    const double decode = kv_calibrate_decode(l, config_.chunk_tokens, config_.pool);
+    if (read_ns <= 0 || decode <= 0) {
+        // Nothing measured: nothing is coded, so restores never pay for it.
+        costs_ = {0, 1};
+        LIYAB_LOG_INFO("prefix cache: storage reads could not be measured uncached; chunks stored raw");
+    } else {
+        costs_ = {read_ns / static_cast<double>(kProbeBytes), decode};
+        LIYAB_LOG_INFO("prefix cache: storage reads %.2f GB/s, decoding %.2f ns per coded symbol: chunks coded where "
+                       "that pays",
+                       1.0 / costs_.read_ns_per_byte, costs_.decode_ns_per_symbol);
+    }
+    if (kept.empty()) return;
+    if (std::FILE* f = os::open_file(kept + ".tmp", "wb")) {
+        bool ok = std::fwrite(kCostsMagic, 4, 1, f) == 1 && std::fwrite(&id, sizeof id, 1, f) == 1 &&
+                  std::fwrite(&costs_.read_ns_per_byte, sizeof(double), 1, f) == 1 &&
+                  std::fwrite(&costs_.decode_ns_per_symbol, sizeof(double), 1, f) == 1;
+        ok = std::fclose(f) == 0 && ok;
+        if (!ok || !os::replace_file(kept + ".tmp", kept)) os::remove_file(kept + ".tmp");
+    }
+    // At most kKeptSets sets, least recently used out first.
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> sets;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(os::utf8_path(config_.calibration_dir), ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string name = os::path_utf8(it->path().filename());
+        std::error_code time_ec;
+        if (name.starts_with("kv-costs-") && name.ends_with(".bin")) sets.emplace_back(it->last_write_time(time_ec), it->path());
+    }
+    std::sort(sets.begin(), sets.end());
+    for (size_t i = 0; i + kKeptSets < sets.size(); ++i) std::filesystem::remove(sets[i].second, ec);
+}
 
 void KvStore::scan() {
     namespace fs = std::filesystem;

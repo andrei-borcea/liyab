@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -336,14 +337,11 @@ inline uint8_t high_byte(uint8_t symbol, uint8_t top) noexcept {
     return static_cast<uint8_t>((symbol >> 2 & 1) << 7 | e << 2 | (symbol & 3));
 }
 
-// A stream as stored: rANS-coded when that saves at least 1/kMinSaving of
-// its bytes, else its symbols as they are. Decoding a coded symbol costs
-// ~1.2 ns on one M4 Pro core, about what reading the raw byte from a phone's
-// UFS 4 storage costs (1 MiB in ~0.8 ms): a stream that barely shrinks (the
-// value quants of a Q8_0 cache, ~5%) would make restores slower for little
-// room, so it stays raw and is copied back. `field`: the 16-bit word count
-// of a coded stream, kRawStream for a raw one.
-constexpr uint32_t kMinSaving = 8;
+// A stream as stored: rANS-coded, or its symbols as they are. With `costs`
+// (the device's, KvCodecCosts), coded only when the read time its smaller
+// size saves exceeds the time decoding it takes, so compression never makes
+// a restore slower; without, whenever it is smaller. `field`: the 16-bit
+// word count of a coded stream, kRawStream for a raw one.
 constexpr uint32_t kRawStream = 0xFFFFFFFFu;
 
 struct Stream {
@@ -351,9 +349,15 @@ struct Stream {
     std::vector<uint8_t> bytes;
 };
 
-Stream make_stream(const std::vector<uint16_t>& words, const uint8_t* syms, size_t n) {
+bool pays(size_t coded_bytes, size_t n, const KvCodecCosts* costs) {
+    if (coded_bytes >= n) return false;
+    if (costs == nullptr) return true;
+    return static_cast<double>(n - coded_bytes) * costs->read_ns_per_byte > static_cast<double>(n) * costs->decode_ns_per_symbol;
+}
+
+Stream make_stream(const std::vector<uint16_t>& words, const uint8_t* syms, size_t n, const KvCodecCosts* costs) {
     Stream s;
-    if (2 * words.size() * kMinSaving <= n * (kMinSaving - 1)) {
+    if (!words.empty() && pays(2 * words.size(), n, costs)) {
         s.field = static_cast<uint32_t>(words.size());
         s.bytes.resize(2 * words.size());
         if (!words.empty()) std::memcpy(s.bytes.data(), words.data(), s.bytes.size());
@@ -397,7 +401,7 @@ RunParts parts_of(const Runs& r) {
 }
 
 bool encode_lossless(const KvRowLayout& layout, const Runs& r, std::span<const uint8_t> image,
-                     std::vector<uint8_t>& out, ThreadPool* pool) {
+                     std::vector<uint8_t>& out, ThreadPool* pool, const KvCodecCosts* costs) {
     const Blocks& b = r.b;
     const auto runs = static_cast<size_t>(r.count);
     const RunParts rp = parts_of(r);
@@ -485,11 +489,11 @@ bool encode_lossless(const KvRowLayout& layout, const Runs& r, std::span<const u
             const Run& w = work[run];
             const Freqs* t = &tables[run / layers * 3];
             rans_encode(&t, 1, w.fsym.data(), rp.floats, words);
-            streams[run * 2] = make_stream(words, w.fsym.data(), rp.floats);
+            streams[run * 2] = make_stream(words, w.fsym.data(), rp.floats, costs);
             if (qbytes == 0) continue;
             for (size_t c = 0; c < rp.qchannels; ++c) pattern[c] = t + 1 + w.mode[c];
             rans_encode(pattern.data(), rp.qchannels, w.qsym.data(), rp.quants, words);
-            streams[run * 2 + 1] = make_stream(words, w.qsym.data(), rp.quants);
+            streams[run * 2 + 1] = make_stream(words, w.qsym.data(), rp.quants, costs);
         }
     });
     out.clear();
@@ -771,12 +775,12 @@ size_t KvRowLayout::image_bytes(int32_t slots) const noexcept {
 }
 
 bool kv_encode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, std::span<const uint8_t> image,
-               std::vector<uint8_t>& out, ThreadPool* pool) {
+               std::vector<uint8_t>& out, ThreadPool* pool, const KvCodecCosts* costs) {
     Runs r;
     if (!runs_of(layout, slots, r) || image.size() != layout.image_bytes(slots)) return false;
     switch (encoding) {
         case KvEncoding::Raw: return false;
-        case KvEncoding::Lossless: return encode_lossless(layout, r, image, out, pool);
+        case KvEncoding::Lossless: return encode_lossless(layout, r, image, out, pool, costs);
         case KvEncoding::Lossy4: return encode_lossy4(layout, r, image, out, pool);
     }
     return false;
@@ -792,6 +796,39 @@ bool kv_decode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, st
         case KvEncoding::Lossy4: return decode_lossy4(layout, r, in, out, pool);
     }
     return false;
+}
+
+double kv_calibrate_decode(const KvRowLayout& layout, int32_t slots, ThreadPool* pool) {
+    Runs r;
+    if (!runs_of(layout, slots, r)) return 0;
+    // Rows shaped like keys and values: channels of their own magnitude, so
+    // every stream codes smaller and is decoded as a real chunk's would be.
+    std::vector<uint8_t> image(layout.image_bytes(slots));
+    const DType dtype = dtype_of(layout.type);
+    std::vector<float> row(static_cast<size_t>(layout.head_dim));
+    const size_t row_bytes = layout.row_bytes();
+    uint32_t seed = 12345;
+    for (size_t at = 0, k = 0; at < image.size(); at += row_bytes, ++k) {
+        for (size_t c = 0; c < row.size(); ++c) {
+            seed = seed * 1664525u + 1013904223u;
+            const float noise = static_cast<float>(seed >> 8) / 16777216.0f - 0.5f;
+            row[c] = (0.2f + static_cast<float>(c % 9) * 0.4f) * (noise + 0.3f * std::sin(0.05f * static_cast<float>(k)));
+        }
+        quant::quantize_row(dtype, row.data(), image.data() + at, layout.head_dim);
+    }
+    std::vector<uint8_t> enc;
+    if (!encode_lossless(layout, r, image, enc, pool, nullptr)) return 0;
+    const double symbols = static_cast<double>(r.count) * static_cast<double>(r.blocks) *
+                           static_cast<double>(r.b.halves + r.b.qbytes);
+    std::vector<uint8_t> back(image.size());
+    double best = 0;
+    for (int rep = 0; rep < 3; ++rep) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!decode_lossless(layout, r, enc, back, pool)) return 0;
+        const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+        best = rep == 0 ? ns : std::min(best, ns);
+    }
+    return best / symbols;
 }
 
 }  // namespace liyab

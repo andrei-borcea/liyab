@@ -28,9 +28,10 @@
 //    one position to the next than it is large (the slowly turning RoPE
 //    pairs of keys: 7.4 -> 7.0 bits per byte on Qwen3-0.6B, 7.5 -> 6.7 on
 //    Llama 3.2 1B) is coded as those differences, with a table of its own;
-//  * a stream that would save less than 1/8 of its bytes is kept raw
-//    (decoding a coded byte costs ~1 ns on an M4 Pro core, about what reading
-//    it from UFS 4 costs): in practice the value quants of Q8_0;
+//  * a stream is coded only where it pays on the device: when the read time
+//    its smaller size saves exceeds the time decoding it takes, with read and
+//    decode speeds the store measures once (KvCodecCosts); elsewhere it is
+//    kept raw, and a chunk where nothing pays is stored raw;
 //  * runs are independent, so a thread pool encodes and decodes them in
 //    parallel.
 // Order-0 coding with the per-channel exponent reference reached the measured
@@ -105,12 +106,28 @@ struct KvRowLayout {
 // The layout of a cache's chunk images (KvCache::read_rows).
 KvRowLayout kv_row_layout(const KvCacheConfig& config) noexcept;
 
+// What reading and decoding cost on this device, for the lossless
+// encoding's choice of what to code (see kv_encode()): measured once per
+// device and layout by the KV store (core/kv_store.h).
+struct KvCodecCosts {
+    double read_ns_per_byte = 0;      // reading a chunk file from storage
+    double decode_ns_per_symbol = 0;  // decoding a coded symbol, wall clock on the pool used
+};
+
 // Encodes `image` (an image of `slots` positions laid out as `layout` says)
 // with `encoding` into `out` (replaced). False when the encoding does not
 // apply to the layout (Raw, an invalid layout, Lossy4 on a 4-bit cache) or
-// would not make the chunk smaller; `out` is then unspecified.
+// would not make the chunk smaller; `out` is then unspecified. Lossless:
+// with `costs`, a stream is coded only when the read time its smaller size
+// saves exceeds its decode time (else kept raw, so a chunk where nothing
+// pays is not encoded at all); without, whenever coding makes it smaller.
 bool kv_encode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, std::span<const uint8_t> image,
-               std::vector<uint8_t>& out, ThreadPool* pool = nullptr);
+               std::vector<uint8_t>& out, ThreadPool* pool = nullptr, const KvCodecCosts* costs = nullptr);
+
+// Wall-clock nanoseconds the lossless decoder takes per coded symbol for
+// chunks of `layout` and `slots` positions on `pool` (best of 3 on a
+// synthetic chunk); 0 when the layout is invalid.
+double kv_calibrate_decode(const KvRowLayout& layout, int32_t slots, ThreadPool* pool);
 
 // Decodes `in`, written by kv_encode() with the same encoding, layout and
 // slots, into `out` (image_bytes(slots) bytes). False when it is malformed;

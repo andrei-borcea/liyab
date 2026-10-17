@@ -467,6 +467,7 @@ struct Engine::Impl {
         sc.layout = kv_row_layout(kv.config());
         sc.lossy = cfg.prefix_cache_lossy;
         sc.pool = pool.get();
+        sc.calibration_dir = cfg.cache_dir;  // what reads and decoding cost here, measured once
         store = KvStore::open(sc);
         if (!store) return;
         const KvStore::Stats st = store->stats();
@@ -542,23 +543,41 @@ struct Engine::Impl {
         const int32_t positions = plan.positions;
         LIYAB_RETURN_IF_ERROR(kv.reserve(positions));
         const int32_t c = store->chunk_tokens();
-        std::vector<uint8_t> image;
-        for (size_t i = 0; i < plan.chunks.size(); ++i) {
+        // The chunks with rows to write, read in one batch (the store reads
+        // the next file while it decodes the current one); a whole page is
+        // read straight into it, the others through an image of their own.
+        std::vector<size_t> wanted;
+        std::vector<KvKey> keys;
+        std::vector<std::vector<uint8_t>> chunk_images(plan.chunks.size());
+        auto range = [&](size_t i) {
             const auto start = static_cast<int32_t>(i) * c;
-            const int32_t n = plan.chunk_sizes[i];
-            const int32_t from = std::max(static_cast<int32_t>(rows_from) - start, 0);
-            const int32_t to = std::min(positions - start, n);
-            if (from >= to) continue;
-            if (from == 0 && to == c && n == c) {  // a whole page: read straight into it
-                uint8_t* page = kv.mutable_page_data(static_cast<int32_t>(i));
-                if (page == nullptr) return Status(ErrorCode::Internal, "a restored page is not mapped");
-                LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], std::span<uint8_t>(page, kv.page_bytes())));
-            } else {
-                image.resize(kv.rows_bytes(n));
-                LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], image));
-                LIYAB_RETURN_IF_ERROR(kv.write_rows(static_cast<int32_t>(i), image.data(), n, from, to));
+            return std::pair{std::max(static_cast<int32_t>(rows_from) - start, 0), std::min(positions - start, plan.chunk_sizes[i])};
+        };
+        auto whole = [&](size_t i) { return range(i) == std::pair{0, c} && plan.chunk_sizes[i] == c; };
+        for (size_t i = 0; i < plan.chunks.size(); ++i) {
+            if (range(i).first >= range(i).second) continue;
+            if (whole(i) && kv.mutable_page_data(static_cast<int32_t>(i)) == nullptr) {
+                return Status(ErrorCode::Internal, "a restored page is not mapped");
             }
+            wanted.push_back(i);
+            keys.push_back(plan.chunks[i]);
         }
+        LIYAB_RETURN_IF_ERROR(store->read_chunks(
+            keys,
+            [&](size_t k) {
+                const size_t i = wanted[k];
+                if (whole(i)) return std::span<uint8_t>(kv.mutable_page_data(static_cast<int32_t>(i)), kv.page_bytes());
+                chunk_images[i].resize(kv.rows_bytes(plan.chunk_sizes[i]));
+                return std::span<uint8_t>(chunk_images[i]);
+            },
+            [&](size_t k) {
+                const size_t i = wanted[k];
+                if (whole(i)) return Status::ok();
+                const auto [from, to] = range(i);
+                Status s = kv.write_rows(static_cast<int32_t>(i), chunk_images[i].data(), plan.chunk_sizes[i], from, to);
+                chunk_images[i] = {};
+                return s;
+            }));
         const size_t floats = target->recurrent_state_bytes() / sizeof(float);
         std::vector<float> state;
         std::vector<std::vector<float>> snapshots;
