@@ -12,7 +12,7 @@
 //     "Removed" with invert, which keeps only the matches);
 //   * NFC normalization of the text first (the Qwen tokenizers);
 //   * `ignore_merges`: a piece that is a vocabulary entry as a whole is that
-//     token, without merging (Llama 3, Hunyuan).
+//     token, without merging (Llama 3, Hunyuan, Tekken).
 //
 // Adding a tokenizer family is adding a row, checked against the Hugging Face
 // tokenizer with tools/tokenizer_reference.py and liyab-tok. An unknown name

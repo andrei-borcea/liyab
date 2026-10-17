@@ -48,7 +48,11 @@ struct EngineConfig {
     // (see cache_dir), which takes their mean KL against F16 from 0.05-0.07 to
     // ~0.002; other models keep their keys as computed (README, KV cache). F16
     // needs no scales. Q4_0 / Q4_1 (INT4, -72% / -69% vs F16) are scaled the
-    // same way and still trade accuracy for memory on long contexts.
+    // same way and still trade accuracy for memory on long contexts. The
+    // scales are measured on a fixed text: a model whose tokenizer cannot
+    // encode text (an unknown pre-tokenizer; it runs on token ids) loads with
+    // its keys as computed instead, with a warning in the log and a "Keys:"
+    // line in describe().
     KvCacheType kv_cache_type = KvCacheType::Q8_0;
     // Stream transformer blocks through the triple-buffered loader (3 block
     // buffers: fetch | prepare | execute) instead of reading the mmap in place.
@@ -457,7 +461,9 @@ public:
 
     [[nodiscard]] const DeviceInfo& device() const noexcept;
     [[nodiscard]] PowerManager& power() noexcept;
-    // Model, backends and memory summary for logs / UIs.
+    // Model, backends and memory summary for logs / UIs. A "Keys:" line
+    // appears only when a quantized KV cache stores keys without the scales
+    // the model may need (see kv_cache_type), and says why.
     [[nodiscard]] std::string describe() const;
 
     // Live counters for monitoring UIs; cumulative since creation, so callers

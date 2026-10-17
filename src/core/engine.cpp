@@ -723,7 +723,21 @@ struct Engine::Impl {
             }
         }
         auto tokens = tokenizer->encode(key_calibration_text(), tokenizer->add_bos_default());
-        if (!tokens) return tokens.status();
+        if (!tokens) {
+            // The tokenizer cannot encode text (an unknown pre-tokenizer): the
+            // model still runs on token ids, and the fixed text is only what
+            // the scales are measured on. Load it with its keys stored as
+            // computed, as every model without large key channels is, rather
+            // than refuse it; models with such channels lose accuracy in a
+            // quantized cache, which the warning says. Nothing is kept in
+            // cache_dir, so a later build that encodes the text measures them.
+            key_scaling_warning = "unscaled: the key calibration text cannot be encoded (" +
+                                  tokens.status().message() +
+                                  "); a quantized KV cache may lose accuracy on models with large key channels, "
+                                  "an F16 KV cache does not";
+            LIYAB_LOG_WARN("keys: %s", key_scaling_warning.c_str());
+            return Status::ok();
+        }
         const auto start = Clock::now();
         LIYAB_RETURN_IF_ERROR(model.calibrate_keys(*tokens, draft_route(), *pool));
         LIYAB_LOG_INFO("keys: calibrated in %.0f ms", ms_since(start));
@@ -970,6 +984,9 @@ struct Engine::Impl {
     // declares, or why it could not be read (reported by the calls).
     PoolingModel pooling;
     Status pooling_error;
+    // Why a quantized KV cache stores keys without the scales the model may
+    // need (prepare_key_scales); empty when they were measured or kept.
+    std::string key_scaling_warning;
 
     // One pooling input: BOS when the model uses one, the text, EOS when the
     // GGUF asks for it. Longer than the context: cut to fit (`truncate`,
@@ -1326,6 +1343,7 @@ std::string Engine::describe() const {
     std::string out = describe_device(impl_->device) + buf;
     out += "Attention:  " + route.attention->description() + "\n";
     out += "FFN:        " + route.ffn->description() + "\n";
+    if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
     if (c.hybrid()) {
         char mix[160];
         std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
