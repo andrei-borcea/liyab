@@ -56,22 +56,25 @@ struct Route {
 // pass. Both forms read the same cache of latents and compute the same
 // function; they round differently (see Transformer::latent_attention_mixer).
 enum class LatentForm : uint8_t {
-    // Per pass, the form LatentFormChooser predicts faster from the costs it
-    // measured on this machine; a single-token pass (decoding) is absorbed.
+    // Per pass, the form LatentFormChooser predicts faster from the pass's
+    // shape and a ratio measured once (calibrate_latent_form(); 1 until
+    // then): fixed per device, never re-measured on the fly. A single-token
+    // pass (decoding) is absorbed.
     Auto,
     Absorbed,  // every pass: absorbed queries over the cached [k_pe | latent] rows
     Expanded,  // every pass of two tokens or more: per-head keys and values expanded from the latents
 };
 
-// Picks latent attention's form for a pass from measured costs. Each form's
-// work is counted in multiply-adds of the parts that differ between them
-// (work()); each timed pass (record()) updates that form's measured time per
-// multiply-add, a running ratio of decayed sums, so the larger passes weigh
-// more and the estimate follows the machine (threads, clocks) as it changes.
-// A form not measured yet borrows the other's rate, and with neither measured
-// both cost the same per multiply-add: the counts decide alone. The resulting
-// threshold on batch size and context is the machine's own, not a constant.
-// Not thread-safe (one per Transformer, used from forward()).
+// Picks latent attention's form for a pass: a pure function of the pass's
+// shape and one calibrated number. Each form's work is counted in
+// multiply-adds of the parts that differ between them (work()); `ratio` is
+// what an expanded multiply-add costs on this device relative to an absorbed
+// one, measured once (Transformer::calibrate_latent_form()) and then fixed, so
+// the threshold on batch size and context is the device's own, not a
+// constant, while the same pass always takes the same form: the same prompt
+// gives the same bits on that device in every run, whatever the load. Before
+// any calibration the ratio is 1 (the counts decide alone). Not thread-safe
+// (one per Transformer, used from forward()).
 class LatentFormChooser {
 public:
     // Multiply-adds of the form-dependent parts of a pass of `n` tokens over
@@ -88,19 +91,22 @@ public:
         double expanded = 0.0;
     };
     [[nodiscard]] static Work work(const ModelConfig& c, int64_t n, int64_t visible, int64_t positions);
-    // True when the expanded form is predicted faster for `w`.
-    [[nodiscard]] bool expand(const Work& w) const noexcept;
-    // A pass that ran in the expanded (or absorbed) form: `macs` of its work
-    // took `ms` (its form-dependent parts, every latent block summed).
-    void record(bool expanded, double macs, double ms) noexcept;
-    // Measured nanoseconds per multiply-add; 0 while the form has no measurement.
-    [[nodiscard]] double ns_per_mac(bool expanded) const noexcept;
-    // Weight of the past in the running sums, per recorded pass.
-    static constexpr double kDecay = 0.75;
+    // True when the expanded form is predicted faster for `w`: ratio x
+    // expanded work < absorbed work (a tie stays absorbed).
+    [[nodiscard]] bool expand(const Work& w) const noexcept { return ratio_ * w.expanded < w.absorbed; }
+    [[nodiscard]] float ratio() const noexcept { return ratio_; }
+    // InvalidArgument outside [kMinRatio, kMaxRatio] or not finite; takes the
+    // ratio as given (callers round measurements with round_ratio()).
+    Status set_ratio(float ratio) noexcept;
+    // A measured ratio rounded to steps of 1/8 octave and clamped to
+    // [kMinRatio, kMaxRatio], so measurements a little apart (a second
+    // calibration, a similar device) usually land on the same value.
+    [[nodiscard]] static float round_ratio(double measured) noexcept;
+    static constexpr float kMinRatio = 1.0f / 16.0f;
+    static constexpr float kMaxRatio = 16.0f;
 
 private:
-    double ms_[2] = {0.0, 0.0};    // [absorbed, expanded]: decayed sums of measured times
-    double macs_[2] = {0.0, 0.0};  // and of the work they covered
+    float ratio_ = 1.0f;
 };
 
 struct TransformerOptions {
@@ -269,13 +275,26 @@ public:
     [[nodiscard]] LatentForm latent_form() const noexcept { return latent_form_; }
     void set_latent_form(LatentForm form) noexcept { latent_form_ = form; }
     // Passes run in each form so far (cumulative; passes of models without
-    // latent attention are not counted), and what the automatic choice measured.
+    // latent attention are not counted), and the automatic choice's ratio.
     struct LatentStats {
         int64_t absorbed_passes = 0;
         int64_t expanded_passes = 0;
     };
     [[nodiscard]] const LatentStats& latent_stats() const noexcept { return latent_stats_; }
     [[nodiscard]] const LatentFormChooser& latent_chooser() const noexcept { return latent_chooser_; }
+    // LatentForm::Auto's calibration: times both forms of the first latent
+    // block on a synthetic pass (256 tokens after 768 cached positions of
+    // random latents, at most half the context; best of 3 each, the
+    // form-dependent parts only, on `route`), sets the chooser's ratio from
+    // it (LatentFormChooser::round_ratio) and returns it. 0.18 s on
+    // Youtu-LLM-2B (Mac CPU). Forgets the context. Measured only when called:
+    // forward() never re-measures, so the ratio (and every pass's form) stays
+    // fixed until the next call or set_latent_ratio(). Returns 1 without
+    // measuring for models without latent attention.
+    Result<float> calibrate_latent_form(const Route& route, ThreadPool& pool);
+    // Uses a ratio measured earlier on this device (e.g. kept by the engine
+    // in its cache_dir). InvalidArgument as LatentFormChooser::set_ratio.
+    Status set_latent_ratio(float ratio) noexcept { return latent_chooser_.set_ratio(ratio); }
 
     // Discards cached positions >= n (speculative-decoding rollback, a chat
     // turn that rewrites the end of the context). KV caches simply drop

@@ -31,7 +31,8 @@
 // The two runs are separate processes: a 35B MoE does not fit twice in RAM.
 // The text goes through in passes of --batch tokens (64 by default);
 // --latent-form pins how a latent-attention model attends (auto, absorbed or
-// expanded), to measure what one form's rounding moves against the other.
+// expanded), to measure what one form's rounding moves against the other;
+// auto is calibrated first, as the engine does at load.
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS), on the CPU
 // backend, with the engine's expert streaming (--memory-budget and
@@ -274,6 +275,13 @@ int main(int argc, char** argv) {
         const liyab::Status s = calibration ? model->calibrate_keys(*calibration, route, pool) : calibration.status();
         if (!s.is_ok()) {
             std::fprintf(stderr, "key calibration: %s\n", s.to_string().c_str());
+            return 1;
+        }
+    }
+    if (model->config().mla.kv_rank > 0 && latent_form == liyab::LatentForm::Auto) {
+        auto ratio = model->calibrate_latent_form(route, pool);  // as the engine does at load
+        if (!ratio) {
+            std::fprintf(stderr, "latent form calibration: %s\n", ratio.status().to_string().c_str());
             return 1;
         }
     }

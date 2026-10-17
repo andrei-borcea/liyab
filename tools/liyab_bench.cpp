@@ -22,8 +22,9 @@
 // (synthetic token ids: attention and dense blocks cost what real text
 // costs; a MoE routes them like any text) in passes of --batch tokens on the
 // CPU, the best of --repeat runs, in tokens per second. --latent-form sets
-// how a latent-attention model attends (auto, absorbed or expanded) and the
-// line reports how many passes took each form.
+// how a latent-attention model attends (auto, absorbed or expanded; auto is
+// calibrated first, as the engine does at load) and the line reports how
+// many passes took each form.
 //
 //   liyab-bench --prefill model.gguf [--tokens 512,2048,8192] [--batch 512]
 //               [--latent-form auto|absorbed|expanded] [--kv q8_0|f16] [--threads N] [--repeat 3]
@@ -116,6 +117,16 @@ int prefill_bench(const PrefillOptions& o) {
     liyab::ThreadPool pool(o.threads > 0 ? o.threads : liyab::performance_core_count());
     auto cpu = liyab::make_cpu_backend(pool);
     const liyab::Route route{cpu.get(), cpu.get(), cpu.get()};
+    if (model->config().mla.kv_rank > 0 && o.form == liyab::LatentForm::Auto) {
+        const auto t0 = Clock::now();
+        auto ratio = model->calibrate_latent_form(route, pool);  // as the engine does at load
+        if (!ratio) {
+            std::fprintf(stderr, "%s\n", ratio.status().to_string().c_str());
+            return 1;
+        }
+        std::printf("latent form ratio (expanded / absorbed cost per multiply-add): %.3f, measured in %.0f ms\n",
+                    static_cast<double>(*ratio), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
     const int32_t vocab = model->config().n_vocab;
     std::vector<int32_t> tokens(static_cast<size_t>(longest));
     std::mt19937 rng(7);

@@ -3,6 +3,7 @@
 // speculative decoding invariants, and the Engine through C++ and C APIs.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -10,9 +11,11 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/draft_budget.h"
@@ -1819,9 +1822,9 @@ TEST_CASE("Expanded latent attention over many tiles: every split the same bits,
     }
 }
 
-// The automatic choice: work counted per form, and a threshold that follows
-// the measured cost of each form's multiply-adds.
-TEST_CASE("Latent attention's form follows the work of each form and their measured costs") {
+// The automatic choice: work counted per form, and a threshold set by one
+// calibrated ratio, nothing else.
+TEST_CASE("Latent attention's form is a pure function of a pass's shape and the calibrated ratio") {
     ModelConfig c;  // DeepSeek-V2-Lite's attention: 16 heads, a 512-wide latent, keys 128 + 64, values 128
     c.n_head = 16;
     c.rope_dim = 64;
@@ -1835,32 +1838,37 @@ TEST_CASE("Latent attention's form follows the work of each form and their measu
     CHECK(first.absorbed == 16.0 * (512.0 * 512 * 256 + 131328.0 * (64 + 1024)));
     CHECK(first.expanded == 16.0 * (513.0 * 512 * 256 + 131328.0 * (128 + 64 + 128)));
     LatentFormChooser chooser;
-    CHECK(chooser.ns_per_mac(false) == 0.0);
-    // Unmeasured: the counts decide. A long prompt's batches expand, a few
+    CHECK(chooser.ratio() == 1.0f);
+    // Uncalibrated: the counts decide. A long prompt's batches expand, a few
     // tokens deep into a context (speculative verification) stay absorbed.
     CHECK(chooser.expand(first));
     CHECK(chooser.expand(prefill(512, 8000)));
     CHECK(!chooser.expand(prefill(8, 8000)));
     CHECK(!chooser.expand(prefill(2, 0)));
-    // One measured form lends its rate to the other: still the counts.
-    chooser.record(false, 1e9, 100.0);
-    CHECK(std::abs(chooser.ns_per_mac(false) - 0.1) < 1e-9);
-    CHECK(chooser.expand(prefill(512, 8000)));
-    // Expanded multiply-adds measured twice as costly: a 512-token batch
-    // deep in a context stays absorbed, a long prompt's first batch still
-    // expands.
-    chooser.record(true, 1e9, 200.0);
+    // Expanded multiply-adds twice as costly: a 512-token batch deep in a
+    // context stays absorbed, a long prompt's first batch still expands.
+    REQUIRE(chooser.set_ratio(2.0f).is_ok());
     CHECK(!chooser.expand(prefill(512, 8000)));
     CHECK(chooser.expand(prefill(2048, 0)));
-    // The estimate follows newer passes: expanded measured cheap again.
-    for (int i = 0; i < 20; ++i) chooser.record(true, 1e9, 50.0);
+    REQUIRE(chooser.set_ratio(0.5f).is_ok());
     CHECK(chooser.expand(prefill(512, 8000)));
     CHECK(!chooser.expand(prefill(8, 8000)));
+    // Out of range or not a number: refused, the ratio kept.
+    for (const float bad : {0.0f, -1.0f, 100.0f, std::nanf("")}) CHECK(!chooser.set_ratio(bad).is_ok());
+    CHECK(chooser.ratio() == 0.5f);
+    // Measurements are rounded to 1/8 octave and clamped.
+    CHECK(LatentFormChooser::round_ratio(1.0) == 1.0f);
+    CHECK(LatentFormChooser::round_ratio(1.04) == 1.0f);
+    CHECK(LatentFormChooser::round_ratio(2.0) == 2.0f);
+    CHECK(LatentFormChooser::round_ratio(1.09) == static_cast<float>(std::exp2(0.125)));
+    CHECK(LatentFormChooser::round_ratio(1e9) == LatentFormChooser::kMaxRatio);
+    CHECK(LatentFormChooser::round_ratio(-1.0) == 1.0f);
 }
 
 // Automatic: decoding steps absorbed, a prompt's batch expanded when its
-// counts say so; the cache and its size are those of the absorbed form.
-TEST_CASE("Automatic latent form: single tokens absorbed, a long first batch expanded") {
+// counts say so; calibrated once, after which load on the machine changes
+// no pass's form and no bit.
+TEST_CASE("Automatic latent form: calibrated once, then the same forms and bits under timing noise") {
     test::TinyModelSpec spec = latent_spec(64);
     spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
     auto model = load_transformer(model_path("latent_f32_q64", spec));
@@ -1870,16 +1878,137 @@ TEST_CASE("Automatic latent form: single tokens absorbed, a long first batch exp
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
     std::vector<int32_t> tokens = {1};
-    for (int32_t i = 1; i < 64; ++i) tokens.push_back(3 + (i * 37) % (model->config().n_vocab - 3));
-    REQUIRE(model->forward(tokens, Transformer::Logits::None, route, pool).has_value());
-    CHECK(model->latent_stats().expanded_passes == 1);  // nothing measured yet: the counts, which favour it
-    CHECK(model->latent_chooser().ns_per_mac(true) > 0.0);
+    for (int32_t i = 1; i < 300; ++i) tokens.push_back(3 + (i * 37) % (model->config().n_vocab - 3));
+    // Uncalibrated (ratio 1): the counts, which favour expanding a first batch.
+    REQUIRE(model->forward(std::span<const int32_t>(tokens).first(64), Transformer::Logits::None, route, pool).has_value());
+    CHECK(model->latent_stats().expanded_passes == 1);
     const int32_t next = 5;
     REQUIRE(model->forward(std::span<const int32_t>(&next, 1), Transformer::Logits::Last, route, pool).has_value());
-    CHECK(model->latent_stats().absorbed_passes == 1);
-    model->set_latent_form(LatentForm::Absorbed);
-    REQUIRE(model->forward(std::span<const int32_t>(tokens).first(8), Transformer::Logits::None, route, pool).has_value());
-    CHECK(model->latent_stats().absorbed_passes == 2);
+    CHECK(model->latent_stats().absorbed_passes == 1);  // decoding
+    // The calibration measures once, leaves an empty context and sets the ratio.
+    auto ratio = model->calibrate_latent_form(route, pool);
+    REQUIRE(ratio.has_value());
+    std::printf("  calibrated latent form ratio: %.3f\n", static_cast<double>(*ratio));
+    CHECK(*ratio >= LatentFormChooser::kMinRatio);
+    CHECK(*ratio <= LatentFormChooser::kMaxRatio);
+    CHECK(model->latent_chooser().ratio() == *ratio);
+    CHECK(model->n_past() == 0);
+    // Passes of every size, then decoding steps: the reference run.
+    auto pass_logits = [&]() {
+        std::vector<float> out;
+        model->reset();
+        for (const size_t n : {200, 64, 2, 30}) {
+            const size_t at = out.size() / static_cast<size_t>(model->config().n_vocab);
+            auto r = model->forward(std::span<const int32_t>(tokens).subspan(at, n), Transformer::Logits::All, route, pool);
+            if (!r) return std::vector<float>();
+            out.insert(out.end(), r->begin(), r->end());
+        }
+        return out;
+    };
+    const auto before = model->latent_stats();
+    const std::vector<float> want = pass_logits();
+    REQUIRE(!want.empty());
+    const int64_t expanded = model->latent_stats().expanded_passes - before.expanded_passes;
+    // Timing noise: threads burning every core, random pauses between passes.
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> noise;
+    for (int i = 0; i < 4; ++i) {
+        noise.emplace_back([&stop, i] {
+            volatile double x = i;
+            while (!stop.load(std::memory_order_relaxed)) x = x * 1.0000001 + 1.0;
+        });
+    }
+    std::mt19937 rng(3);
+    for (int round = 0; round < 3; ++round) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(rng() % 20));
+        const auto at = model->latent_stats();
+        CHECK(pass_logits() == want);
+        CHECK(model->latent_stats().expanded_passes - at.expanded_passes == expanded);
+    }
+    stop = true;
+    for (std::thread& t : noise) t.join();
+    CHECK(model->latent_chooser().ratio() == *ratio);
+    // The ratio alone moves the threshold: the cheapest expansion takes every
+    // pass of two tokens or more, the dearest none of the short ones.
+    REQUIRE(model->set_latent_ratio(LatentFormChooser::kMinRatio).is_ok());
+    auto at = model->latent_stats();
+    REQUIRE(!pass_logits().empty());
+    CHECK(model->latent_stats().expanded_passes - at.expanded_passes == 4);
+    REQUIRE(model->set_latent_ratio(LatentFormChooser::kMaxRatio).is_ok());
+    at = model->latent_stats();
+    REQUIRE(!pass_logits().empty());
+    CHECK(model->latent_stats().expanded_passes - at.expanded_passes <= 1);  // at most the first, deepest-free pass
+    CHECK(!model->set_latent_ratio(0.0f).is_ok());
+}
+
+// Through the engine: the ratio is measured once per model and device and
+// kept in cache_dir, so two engines (two runs of an app) attend in the same
+// forms and give the same bits; a damaged file is measured again.
+TEST_CASE("Latent form ratio is kept in cache_dir: two engines give the same bits, damaged files measured again") {
+    const std::string dir = temp_path("latent_cache");
+    std::filesystem::remove_all(dir);
+    EngineConfig config = engine_config(model_path("latent", latent_spec(64)));
+    config.backend = BackendKind::Cpu;
+    config.cache_dir = dir;
+    std::vector<int32_t> prompt = {1};
+    for (int32_t i = 1; i < 300; ++i) prompt.push_back(3 + (i * 37) % 250);
+    // A seeded, sampled reply: every logit of every step counts.
+    auto reply = [&](const EngineConfig& c) {
+        auto e = Engine::create(c);
+        if (!e) return std::vector<int32_t>();
+        SamplingParams p;
+        p.temperature = 1.0f;
+        p.seed = 7;
+        p.max_tokens = 24;
+        return run(*e.value(), prompt, p);
+    };
+    const std::vector<int32_t> measured = reply(config);  // measures the ratio and keeps it
+    REQUIRE(!measured.empty());
+    std::vector<std::filesystem::path> kept;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().starts_with("latent-")) kept.push_back(entry.path());
+    }
+    REQUIRE(kept.size() == 1);
+    REQUIRE(std::filesystem::file_size(kept[0]) == 20);  // magic, version, id, ratio
+    auto kept_ratio = [&] {
+        std::ifstream in(kept[0], std::ios::binary);
+        char header[16];
+        float ratio = 0.0f;
+        in.read(header, sizeof header);
+        in.read(reinterpret_cast<char*>(&ratio), sizeof ratio);
+        return ratio;
+    };
+    const float ratio = kept_ratio();
+    // Read back, not measured: the same reply in every engine.
+    CHECK(reply(config) == measured);
+    CHECK(reply(config) == measured);
+    CHECK(kept_ratio() == ratio);
+    // What the engines do with it: two models given that ratio produce the
+    // same logits for the prompt, bit for bit, in passes of the engine's size.
+    ThreadPool pool(4);
+    std::vector<std::vector<float>> logits;
+    for (int i = 0; i < 2; ++i) {
+        auto model = load_transformer(config.model_path);
+        REQUIRE(model != nullptr);
+        REQUIRE(model->set_latent_ratio(ratio).is_ok());
+        logits.push_back(latent_pass_logits(*model, prompt, {512}, pool));
+        CHECK(model->latent_stats().expanded_passes + model->latent_stats().absorbed_passes == 1);
+    }
+    REQUIRE(!logits[0].empty());
+    CHECK(logits[0] == logits[1]);
+    {
+        std::ofstream damaged(kept[0], std::ios::binary | std::ios::trunc);
+        damaged << "damaged";
+    }
+    CHECK(!reply(config).empty());  // measured again, and kept again
+    CHECK(std::filesystem::file_size(kept[0]) == 20);
+    // Without a cache_dir the ratio measured first in the process is kept in
+    // memory: the engines of one process agree too.
+    config.cache_dir.clear();
+    const std::vector<int32_t> memory = reply(config);
+    CHECK(!memory.empty());
+    CHECK(reply(config) == memory);
+    std::filesystem::remove_all(dir);
 }
 
 // Through the engine: describe() reports the latent cache's own size (one

@@ -7,6 +7,7 @@
 #include <istream>
 #include <numbers>
 #include <ostream>
+#include <random>
 
 #include "core/log.h"
 #include "core/quant.h"
@@ -356,25 +357,18 @@ LatentFormChooser::Work LatentFormChooser::work(const ModelConfig& c, int64_t n,
     return w;
 }
 
-bool LatentFormChooser::expand(const Work& w) const noexcept {
-    double absorbed = ns_per_mac(false);
-    double expanded = ns_per_mac(true);
-    if (absorbed == 0.0 && expanded == 0.0) absorbed = expanded = 1.0;
-    if (absorbed == 0.0) absorbed = expanded;
-    if (expanded == 0.0) expanded = absorbed;
-    return expanded * w.expanded < absorbed * w.absorbed;  // a tie stays absorbed
+Status LatentFormChooser::set_ratio(float ratio) noexcept {
+    if (!(ratio >= kMinRatio && ratio <= kMaxRatio)) {
+        return Status(ErrorCode::InvalidArgument, "latent form ratio out of range");
+    }
+    ratio_ = ratio;
+    return Status::ok();
 }
 
-void LatentFormChooser::record(bool expanded, double macs, double ms) noexcept {
-    if (!(macs > 0.0) || !(ms >= 0.0)) return;
-    const int i = expanded ? 1 : 0;
-    ms_[i] = ms_[i] * kDecay + ms;
-    macs_[i] = macs_[i] * kDecay + macs;
-}
-
-double LatentFormChooser::ns_per_mac(bool expanded) const noexcept {
-    const int i = expanded ? 1 : 0;
-    return macs_[i] > 0.0 ? ms_[i] * 1e6 / macs_[i] : 0.0;
+float LatentFormChooser::round_ratio(double measured) noexcept {
+    if (!(measured > 0.0) || !std::isfinite(measured)) return 1.0f;
+    const double steps = std::round(std::log2(measured) * 8.0);
+    return std::clamp(static_cast<float>(std::exp2(steps / 8.0)), kMinRatio, kMaxRatio);
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,6 +1530,76 @@ Status Transformer::set_key_scales(std::span<const float> scales) {
     }
     key_scale_.assign(scales.begin(), scales.end());
     return Status::ok();
+}
+
+// One synthetic pass through the first latent block in each form, on its
+// real weights: cached rows of random latents (a fixed seed), random
+// normalized inputs, timed over the parts that differ between the forms
+// (latent_ms_, as in forward()). The ratio of the two forms' time per
+// counted multiply-add is what LatentFormChooser needs; one block suffices
+// because every latent block has the same shape. The best of kRepeats runs
+// per form, alternated, keeps a passing burst of load out of it.
+Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    if (c.mla.kv_rank == 0) return 1.0f;
+    int32_t layer = 0;
+    while (!c.blocks[static_cast<size_t>(layer)].latent) ++layer;
+    constexpr int32_t kContext = 1024, kBatch = 256, kRepeats = 3;
+    const int32_t context = std::min(kContext, context_length_);
+    const int32_t n = std::max(2, std::min(kBatch, context / 2));
+    reset();
+    LIYAB_RETURN_IF_ERROR(kv_->reserve(context));
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto kd = static_cast<size_t>(c.head_dim);
+    std::mt19937 rng(20251017);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> row(kd);
+    for (int32_t pos = 0; pos < context - n; ++pos) {
+        for (float& v : row) v = normal(rng);
+        kv_->store(L.kv_slot, pos, row.data(), nullptr);
+    }
+    n_past_ = context - n;
+    const auto un = static_cast<size_t>(n);
+    const size_t d = static_cast<size_t>(c.n_embd);
+    const size_t q_dim = static_cast<size_t>(c.n_head) * kd;
+    xb_.resize(un * std::max(d, q_dim));
+    q_.resize(un * q_dim);
+    k_.resize(un * kd);
+    att_.resize(un * q_dim);
+    std::vector<float> input(un * d);
+    for (float& v : input) v = normal(rng);
+    for (size_t t = 0; t < un; ++t) rmsnorm(input.data() + t * d, L.attn_norm.data(), input.data() + t * d, c.n_embd, c.rms_eps);
+    const int64_t pairs = latent_visible(n, L.window);
+    int64_t positions = 0;
+    for (const auto& [a, b] : mla_union_) positions += b - a;
+    const LatentFormChooser::Work work = LatentFormChooser::work(c, n, pairs, positions);
+
+    Status status;
+    double best[2] = {INFINITY, INFINITY};  // [absorbed, expanded], ms
+    {
+        const BlockWeights w(*this, layer);
+        status = w.status();
+        for (int32_t r = 0; r < kRepeats && status.is_ok(); ++r) {
+            for (const bool expanded : {false, true}) {
+                std::copy(input.begin(), input.end(), xb_.begin());
+                latent_expanded_ = expanded;
+                latent_ms_ = 0.0;
+                status = latent_attention_mixer(layer, w, n, route, pool, nullptr);
+                if (!status.is_ok()) break;
+                best[expanded ? 1 : 0] = std::min(best[expanded ? 1 : 0], latent_ms_);
+            }
+        }
+    }
+    latent_expanded_ = false;
+    reset();
+    if (!status.is_ok()) return status;
+    const double measured = (best[1] / work.expanded) / (best[0] / work.absorbed);
+    const float ratio = LatentFormChooser::round_ratio(measured);
+    LIYAB_RETURN_IF_ERROR(latent_chooser_.set_ratio(ratio));
+    LIYAB_LOG_INFO("latent attention: an expanded multiply-add costs %.2fx an absorbed one (%.1f / %.1f ms on a "
+                   "%d-token pass after %d positions); ratio %.3f",
+                   measured, best[1], best[0], n, context - n, static_cast<double>(ratio));
+    return ratio;
 }
 
 Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
@@ -2857,13 +2921,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         const int32_t pos = n_past_ + n - 1 - i;
         checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
     }
-    if (c.mla.kv_rank > 0) {
-        ++(latent_expanded_ ? latent_stats_.expanded_passes : latent_stats_.absorbed_passes);
-        if (latent && key_ranges_ == nullptr) {
-            latent_chooser_.record(latent_expanded_, latent_expanded_ ? latent_work.expanded : latent_work.absorbed,
-                                   latent_ms_);
-        }
-    }
+    if (c.mla.kv_rank > 0) ++(latent_expanded_ ? latent_stats_.expanded_passes : latent_stats_.absorbed_passes);
     n_past_ += n;
     kv_->release_unreachable(n_past_, max_batch_);  // recycle pages that left the window
     if (expert_store_ != nullptr && ++decode_steps_ % 16 == 0) expert_store_->age();

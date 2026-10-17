@@ -10,6 +10,7 @@
 #include <fstream>
 #include <functional>
 #include <list>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -131,6 +132,93 @@ void keep_key_scales(const std::string& dir, uint64_t id, std::span<const float>
     if (kept.size() <= kKeptKeyScales) return;
     std::sort(kept.begin(), kept.end());  // oldest first
     for (size_t i = 0; i + kKeptKeyScales < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
+}
+
+// Latent attention's form ratio (LatentFormChooser) kept in
+// EngineConfig::cache_dir, one file per model: "latent-<id>.bin" = magic,
+// kLatentRatioVersion, id, ratio. The id covers what the measurement depends
+// on: the model file, the KV cache format and the kernel set (the device is
+// the one the directory is on). Measured again when missing or damaged.
+// Without a cache_dir a ratio measured in this process is kept in memory, so
+// every engine of the process takes the same forms.
+constexpr char kLatentRatioMagic[4] = {'L', 'Y', 'L', 'F'};
+constexpr uint32_t kLatentRatioVersion = 1;
+constexpr size_t kKeptLatentRatios = 16;  // files in cache_dir at most, least recently used out first
+
+uint64_t latent_ratio_id(const Transformer& model) {
+    const uint64_t parts[] = {model_fingerprint(model.file().file()), kLatentRatioVersion,
+                              static_cast<uint64_t>(model.kv_cache().dtype())};
+    const std::string_view isa = quant::kernel_isa();
+    return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+}
+
+std::string latent_ratio_path(const std::string& dir, uint64_t id) {
+    char name[40];
+    std::snprintf(name, sizeof name, "latent-%016llx.bin", static_cast<unsigned long long>(id));
+    return os::path_utf8(os::utf8_path(dir) / name);
+}
+
+std::optional<float> read_latent_ratio(const std::string& path, uint64_t id) {
+    std::ifstream in(os::utf8_path(path), std::ios::binary);
+    char magic[4] = {};
+    uint32_t version = 0;
+    uint64_t stored_id = 0;
+    float ratio = 0.0f;
+    in.read(magic, sizeof magic);
+    in.read(reinterpret_cast<char*>(&version), sizeof version);
+    in.read(reinterpret_cast<char*>(&stored_id), sizeof stored_id);
+    in.read(reinterpret_cast<char*>(&ratio), sizeof ratio);
+    if (!in || std::memcmp(magic, kLatentRatioMagic, sizeof magic) != 0 || version != kLatentRatioVersion ||
+        stored_id != id || !(ratio >= LatentFormChooser::kMinRatio && ratio <= LatentFormChooser::kMaxRatio)) {
+        return std::nullopt;
+    }
+    return ratio;
+}
+
+// Writes the ratio (temporary file, then renamed) and keeps the directory to
+// its kKeptLatentRatios most recently used ratio files. Failures only cost a
+// new measurement at the next load: logged, not returned.
+void keep_latent_ratio(const std::string& dir, uint64_t id, float ratio) {
+    std::error_code ec;
+    std::filesystem::create_directories(os::utf8_path(dir), ec);
+    const std::string path = latent_ratio_path(dir, id);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
+        out.write(kLatentRatioMagic, sizeof kLatentRatioMagic);
+        out.write(reinterpret_cast<const char*>(&kLatentRatioVersion), sizeof kLatentRatioVersion);
+        out.write(reinterpret_cast<const char*>(&id), sizeof id);
+        out.write(reinterpret_cast<const char*>(&ratio), sizeof ratio);
+        if (!out) {
+            LIYAB_LOG_WARN("latent attention: cannot write %s", tmp.c_str());
+            std::filesystem::remove(os::utf8_path(tmp), ec);
+            return;
+        }
+    }
+    std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
+    if (ec) {
+        LIYAB_LOG_WARN("latent attention: cannot keep the form ratio in %s: %s", dir.c_str(), ec.message().c_str());
+        return;
+    }
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
+    std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const std::string name = os::path_utf8(it->path().filename());
+        if (name.starts_with("latent-") && name.ends_with(".bin")) {
+            std::error_code ignored;
+            kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
+        }
+    }
+    if (kept.size() <= kKeptLatentRatios) return;
+    std::sort(kept.begin(), kept.end());  // oldest first
+    for (size_t i = 0; i + kKeptLatentRatios < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
+}
+
+// Ratios measured in this process for models without a cache_dir, by id.
+std::mutex latent_ratios_mutex;
+std::map<uint64_t, float>& latent_ratios() {
+    static std::map<uint64_t, float> ratios;
+    return ratios;
 }
 
 // Length of the longest prefix of `s` that ends on a UTF-8 character
@@ -734,6 +822,41 @@ struct Engine::Impl {
         return Status::ok();
     }
 
+    // Latent attention with LatentForm::Auto: the form ratio kept in
+    // config.cache_dir for this model (or measured earlier in this process
+    // without one), else measured once on the CPU now and kept. From then on
+    // each pass's form follows from its shape alone (LatentFormChooser).
+    Status prepare_latent_form(Transformer& model) {
+        if (model.config().mla.kv_rank == 0 || model.latent_form() != LatentForm::Auto) return Status::ok();
+        const uint64_t id = latent_ratio_id(model);
+        if (!config.cache_dir.empty()) {
+            const std::string path = latent_ratio_path(config.cache_dir, id);
+            if (const auto kept = read_latent_ratio(path, id); kept && model.set_latent_ratio(*kept).is_ok()) {
+                std::error_code ignored;
+                std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(),
+                                                 ignored);
+                LIYAB_LOG_INFO("latent attention: form ratio %.3f (%s)", static_cast<double>(*kept), path.c_str());
+                return Status::ok();
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(latent_ratios_mutex);
+            if (const auto it = latent_ratios().find(id); it != latent_ratios().end()) {
+                return model.set_latent_ratio(it->second);
+            }
+        }
+        const auto start = Clock::now();
+        auto ratio = model.calibrate_latent_form(draft_route(), *pool);
+        if (!ratio) return ratio.status();
+        LIYAB_LOG_INFO("latent attention: form ratio measured in %.0f ms", ms_since(start));
+        if (!config.cache_dir.empty()) {
+            keep_latent_ratio(config.cache_dir, id, *ratio);
+        } else {
+            std::lock_guard<std::mutex> lock(latent_ratios_mutex);
+            latent_ratios().emplace(id, *ratio);
+        }
+        return Status::ok();
+    }
+
     Status select_backends() {
         std::vector<BackendKind> order = device.backend_order;
         if (config.backend) order = {*config.backend, BackendKind::Cpu};
@@ -1091,6 +1214,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         LIYAB_LOG_WARN("pooling: %s", pooling.status().message().c_str());
     }
     LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->target));
+    LIYAB_RETURN_IF_ERROR(impl->prepare_latent_form(*impl->target));
 
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
         auto draft = load_model(config.draft_model_path, config, max_batch, repack_cpu);
@@ -1104,6 +1228,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         draft.value()->set_rollback_window(config.draft_tokens + 1);
         impl->draft = std::move(draft).value();
         LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->draft));  // same vocabulary: the target's tokenizer
+        LIYAB_RETURN_IF_ERROR(impl->prepare_latent_form(*impl->draft));
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
     } else if (config.lookup_drafts && config.draft_tokens > 0) {
         impl->target->set_rollback_window(config.draft_tokens + 1);
