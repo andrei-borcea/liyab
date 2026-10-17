@@ -57,6 +57,10 @@ std::unique_ptr<Loaded> load(const char* name, const test::TinyModelSpec& spec, 
     if (!file) return nullptr;
     if (options.context_length == 0) options.context_length = 512;
     options.max_batch = 32;
+    // Latent attention pinned to the absorbed form, the one run_block_at()
+    // uses: LatentForm::Auto picks a form per pass shape, so a reference
+    // prefill's bits would depend on how its passes were split.
+    if (options.latent_form == LatentForm::Auto) options.latent_form = LatentForm::Absorbed;
     auto model = Transformer::load(std::move(file).value(), options);
     if (!model) {
         std::printf("  %s: %s\n", name, model.status().to_string().c_str());

@@ -114,7 +114,7 @@ typedef struct liyab_engine_config {
     liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
     int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model in the background while the engine is idle, off until then (kept in cache_dir; see EngineConfig); 0 (default) off */
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.02) */
-    int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of compressed losslessly (lossy; 0 default, see EngineConfig) */
+    int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of stored losslessly (lossy; 0 default, see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

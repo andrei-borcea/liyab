@@ -605,6 +605,18 @@ struct Engine::Impl {
     // (Transformer::context_fingerprint): the kernels and backends that
     // computed them and every option that changes hidden states, so chunks
     // are only restored where recomputing them would give the same bits.
+    // Latent attention's prefill form changes how the latents of later blocks
+    // round, so stored chunks belong to the form and the device's measured
+    // ratio they were computed with (0 for every other model, whose keys this
+    // leaves as they were).
+    [[nodiscard]] uint64_t latent_seed() const {
+        if (target->config().mla.kv_rank == 0) return 0;
+        const float ratio = target->latent_chooser().ratio();
+        uint32_t bits = 0;
+        std::memcpy(&bits, &ratio, sizeof bits);
+        return (static_cast<uint64_t>(static_cast<uint32_t>(target->latent_form()) + 1) << 32) | bits;
+    }
+
     [[nodiscard]] KvKey store_seed(bool repacked, int32_t chunk_pages) const {
         auto hash = [](std::string_view text) { return xxhash64(text.data(), text.size()); };
         auto kind = [&](const Backend* b) {  // "cpu", "metal", "vulkan": not the thread count it describes
@@ -635,7 +647,8 @@ struct Engine::Impl {
                                   bits(x.early_exit_threshold),
                                   bits(x.egls_threshold),
                                   bits(x.head_keep_ratio),
-                                  static_cast<uint64_t>(chunk_pages)};
+                                  static_cast<uint64_t>(chunk_pages),
+                                  latent_seed()};
         return kv_seed_key(parts);
     }
 

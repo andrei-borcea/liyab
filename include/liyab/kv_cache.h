@@ -100,7 +100,8 @@ public:
 
     // --- Pages as bytes (saved contexts, the engine's KV store) ------------
     // Bytes of logical page `logical` (all layers, K then V; K only with
-    // values_in_keys), or nullptr when it is not mapped.
+    // values_in_keys), or nullptr when it is not mapped. reserve() zeroes a
+    // page when it maps it, so rows no position has written hold zeros.
     [[nodiscard]] const uint8_t* page_data(int32_t logical) const noexcept;
     // The same page, writable, for restoring a saved state: a page that
     // reserve() mapped; nullptr when it is not mapped.

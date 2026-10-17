@@ -79,7 +79,6 @@ Status KvCache::reserve(int32_t end) {
         // Released pages stay unmapped: no query can see them any more.
         if (table_[p] != kUnmapped || (p >= sink_pages && p < static_cast<size_t>(released_below_))) continue;
         if (free_.empty()) {
-            // Uninitialized on purpose: every row is written before it is read.
             uint8_t* page = new (std::nothrow) uint8_t[page_bytes_];
             if (page == nullptr) return Status(ErrorCode::OutOfMemory, "cannot allocate a KV cache page");
             pool_.emplace_back(page);
@@ -87,6 +86,14 @@ Status KvCache::reserve(int32_t end) {
         }
         table_[p] = free_.back();
         free_.pop_back();
+        // Zeroed when mapped, new or recycled. Attention never reads a row
+        // before it is written, but whole pages leave the process (save_state,
+        // the prefix cache's chunks): rows past the context's end must hold
+        // zeros, not another context's rows or the heap's leftovers, so the
+        // same context always gives the same bytes and nothing else is written
+        // to storage. One page per page_tokens positions: noise next to
+        // computing them.
+        std::memset(page_ptr(p), 0, page_bytes_);
     }
     return Status::ok();
 }

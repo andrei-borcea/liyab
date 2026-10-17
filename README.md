@@ -589,7 +589,7 @@ each of those as a scheduling problem.
   it than the context keeps. A chunk is a whole number of pages of the paged KV cache, about 2 MiB and at most
   256 tokens (each is a file on storage, and creating one costs about as much as writing a megabyte), keyed by a
   hash chained over every token before it and rooted in what its bytes depend on (the model file, cache layout and
-  type, key scales, kernels and backends). A prefix that several
+  type, key scales, kernels and backends, and a latent-attention model's prefill form). A prefix that several
   conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
   and setting a conversation aside again writes only its new chunks. A later prompt is restored up to the longest
   prefix the store holds, chunk by chunk, then cut to where the two diverge, even when its earlier replies would
@@ -1839,7 +1839,7 @@ F32), 511 positions:
 | Model, KV cache | Absorbed: mean KL / top-1 | Expanded: mean KL / top-1 |
 | :--- | ---: | ---: |
 | Youtu-LLM-2B (BF16), F16 | 0.00000 / 100.00% | 0.00000 / 99.80% |
-| Youtu-LLM-2B (BF16), Q8_0 without key scaling (its calibration text cannot be encoded yet) | 0.00115 / 97.26% | 0.00098 / 98.43% |
+| Youtu-LLM-2B (BF16), Q8_0 with keys unscaled (measured before its `youtu` pre-tokenizer was a row; with key scaling the absorbed form gives 0.00065 / 97.65%) | 0.00115 / 97.26% | 0.00098 / 98.43% |
 | random V2-Lite structure (F32), F16 | 0.00000 / 99.02% | 0.00000 / 99.02% |
 | random V2-Lite structure (F32), Q8_0 with key scaling | 0.00308 / 67.51% | 0.00186 / 74.76% |
 
@@ -2300,8 +2300,11 @@ Implemented features are described above. These are next, in order:
   `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see
   [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
 * **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long
-  prompt's attention differently (each repeats its own bits run after run); `latent_form` pins one form when the
-  bits must match across devices (not exposed through the C ABI and `liyab-cli` yet). A new measurement takes
+  prompt's attention differently (each repeats its own bits run after run). A pass's form also follows its
+  shape, so the same token can round differently when a prompt reaches the engine split into other passes
+  (typed ahead, after a restored prefix, recomputed by segment reuse, which always attends absorbed);
+  `latent_form` pins one form when the bits must not depend on the device or the split (not exposed through
+  the C ABI and `liyab-cli` yet). A new measurement takes
   removing its file from `cache_dir`. The expanded form runs on the CPU.
 * **YaRN:** a file can state only one of the reference's two mscales (`yarn_log_multiplier`); when it does, they are
   taken as equal, as on every DeepSeek model so far.

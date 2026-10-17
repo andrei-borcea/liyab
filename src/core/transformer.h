@@ -525,9 +525,12 @@ public:
     // `x` is left with the streams after the block. Lets a caller recompute
     // some positions of a context block by block, keeping the rest. Passes
     // of at most `chunk` tokens in order, the block's weights acquired once;
-    // no hooks. Attention-only models (Unsupported otherwise, see
-    // reuse_support()); InvalidArgument for positions or sizes that do not
-    // fit.
+    // no hooks. Latent attention runs in the absorbed form here whatever
+    // latent_form() says: the expanded form's tiles assume a contiguous pass,
+    // so rows recomputed here equal an absorbed prefill's and differ from an
+    // expanded one's by the two forms' rounding. Attention-only models
+    // (Unsupported otherwise, see reuse_support()); InvalidArgument for
+    // positions or sizes that do not fit.
     Status run_block_at(int32_t layer, std::span<const int32_t> positions, std::span<float> x, int32_t chunk,
                         const Route& route, ThreadPool& pool);
     // The KV cache slot of block `layer`, or -1 when its mixer keeps none.

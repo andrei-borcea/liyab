@@ -103,6 +103,7 @@ final class LiyabEngineConfig extends Struct {
   external int segmentReuse; // segment reuse (lossy, opt-in per request); 0: off
   @Float()
   external double segmentReuseMaxKl;
+  @Int32()
   external int prefixCacheLossy;
 }
 

@@ -102,6 +102,32 @@ TEST_CASE("Pages are allocated on demand, not for the whole context") {
     CHECK(kv.pages_in_use() == 0);
 }
 
+TEST_CASE("Pages hold zeros when mapped, new or recycled: rows past the end never carry old bytes") {
+    auto cache = KvCache::create(small_config(KvCacheType::F16));
+    REQUIRE(cache.has_value());
+    KvCache& kv = *cache.value();
+    auto all_zero = [&](int32_t page) {
+        const uint8_t* p = kv.page_data(page);
+        if (p == nullptr) return false;
+        for (size_t i = 0; i < kv.page_bytes(); ++i) {
+            if (p[i] != 0) return false;
+        }
+        return true;
+    };
+    REQUIRE(kv.reserve(40).is_ok());  // pages 0-2, new
+    for (int32_t page = 0; page < 3; ++page) CHECK(all_zero(page));
+    for (int32_t page = 0; page < 3; ++page) std::memset(kv.mutable_page_data(page), 0xA5, kv.page_bytes());
+    REQUIRE(kv.truncate(10).is_ok());  // pages 1-2 go back to the free list with their bytes
+    REQUIRE(kv.reserve(40).is_ok());   // and come back recycled
+    CHECK(kv.pages_allocated() == 3);
+    CHECK(!all_zero(0));               // a page kept in use keeps its rows
+    CHECK(all_zero(1));
+    CHECK(all_zero(2));
+    kv.clear();
+    REQUIRE(kv.reserve(1).is_ok());
+    CHECK(all_zero(0));
+}
+
 TEST_CASE("Sliding window keeps sink tokens and recycles pages for unbounded streams") {
     auto cache = KvCache::create(small_config(KvCacheType::Q8_0, /*window=*/32, /*sinks=*/8));
     REQUIRE(cache.has_value());
