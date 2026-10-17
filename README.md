@@ -115,7 +115,7 @@ These rules decide what goes into the code:
 | CPU backend on x86-64: AVX2 + FMA + F16C kernels chosen at run time by CPUID, scalar fallback in the same binary | 🟡 tested under Rosetta 2 only |
 | Windows x64 port of the engine, `liyab-cli`, the tests and tools: file mapping, unbuffered direct reads, processor groups and hybrid cores, UTF-8 paths and console; MSVC or clang-cl | 🟡 written, not yet compiled or run on Windows ([Windows](#windows-x64)) |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
-| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention | ✅ |
+| Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by measured cost) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
@@ -1443,6 +1443,23 @@ decoding are the practical routes to interactive speeds.
 
 Models that fit use the GPU's repacked-copy path, where some formats fall back to the CPU. Streamed models use the
 native kernels instead.
+
+### Latent attention prefill (Mac)
+
+Youtu-LLM-2B (`deepseek2`, Q8_0 weights and KV cache) prefilling synthetic token ids on the Mac's CPU (10 threads,
+`liyab-bench --prefill`), each setting run twice, alternated, while another job kept 8 cores busy, in tokens per
+second:
+
+| Prompt | Absorbed, passes of 64 (before) | Absorbed, passes of 512 | Expanded, passes of 512 | Automatic, passes of 512 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 tokens | 111 / 114 | 129 / 129 | 149 / 153 | 149 / 148 |
+| 2,048 tokens | 80 / 80 | 90 / 92 | 120 / 120 | 119 / 123 |
+| 8,192 tokens | 40 / 37 | 58 | 74 / 63 | 101 |
+
+The automatic form chose the expanded one for every pass of 512 tokens. At 8,192 tokens the load moved the runs the
+most; on a quieter machine the same prompt ran at 57.6 tok/s in passes of 64 (absorbed) and 121.3 in passes of 512
+(expanded), 2.1 times faster. In passes of 64 the expanded form is no faster (2,048 tokens: 70 / 68 tok/s), which is
+why the engine prefills latent-attention models in passes of 512. Decoding is absorbed in every case and unchanged.
 
 ### Storage and kernels
 
