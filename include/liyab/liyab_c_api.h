@@ -112,7 +112,7 @@ typedef struct liyab_engine_config {
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
     liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
-    int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model inside liyab_engine_create, which waits for it (kept in cache_dir; see EngineConfig); 0 (default) off */
+    int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model in the background while the engine is idle, off until then (kept in cache_dir; see EngineConfig); 0 (default) off */
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.02) */
 } liyab_engine_config;
 
@@ -553,16 +553,21 @@ LIYAB_C_API liyab_status liyab_engine_prefill_segmented(liyab_engine* engine, co
                                                         int32_t add_bos);
 
 typedef struct liyab_segment_reuse_info {
-    float fraction;     /* share of a reused part's tokens processed again */
-    double kl;          /* the calibration's mean KL at that share */
-    double top1;        /* its top-1 agreement with processing the whole prompt, 0..1 */
-    int32_t from_cache; /* the calibration was read from cache_dir */
+    float fraction;      /* share of a reused part's tokens processed again */
+    double kl;           /* the calibration's mean KL at that share */
+    double top1;         /* its top-1 agreement with processing the whole prompt, 0..1 */
+    int32_t from_cache;  /* the calibration was read from cache_dir */
+    int32_t calibrating; /* the calibration runs in the background: segment reuse is off until it ends */
+    float progress;      /* share of the calibration's work done, 0..1 */
+    double bound;        /* the calibration's upper bound on the KL at that share */
 } liyab_segment_reuse_info;
 
-/* LIYAB_OK when segment reuse is on; otherwise why not (LIYAB_ERR_UNSUPPORTED:
- * off in the config, a hybrid model, no prefix cache, the target not met;
- * liyab_last_error() says which). `out` (may be NULL) receives the
- * calibration either way. Thread-safe. */
+/* LIYAB_OK when segment reuse is on; LIYAB_ERR_BUSY while it is calibrated in
+ * the background (marked prompts are processed as usual meanwhile);
+ * otherwise why not (LIYAB_ERR_UNSUPPORTED: off in the config, a hybrid
+ * model, no prefix cache, the target not met; liyab_last_error() says
+ * which). `out` (may be NULL) receives the calibration either way.
+ * Thread-safe. */
 LIYAB_C_API liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segment_reuse_info* out);
 
 #ifdef __cplusplus

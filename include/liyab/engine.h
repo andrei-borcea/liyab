@@ -187,17 +187,24 @@ struct EngineConfig {
     // reused segment's tokens it processes again to keep the output within
     // segment_reuse_max_kl of processing the whole prompt, and keeps the
     // result in cache_dir (measured again at every load without one). The
-    // measurement runs inside Engine::create(), which waits for it: about
-    // as long as processing 2,000 to 5,000 tokens (~1 minute for a 1B model
-    // on a Mac's CPU). Needs
-    // the prefix cache's store (prefix_cache_mb or prefix_cache_disk_mb),
-    // whose caps the stored segments share; refused, with the reason in
-    // Engine::segment_reuse(), for hybrid models, with a sliding window or a
-    // draft model, or when no share on the calibration's grid meets the target.
+    // measurement does not hold up loading: it runs in the background once
+    // no call has used the engine for 2 s, a stage at a time on a context of
+    // its own (the conversation's is left as it was), and a call arriving
+    // meanwhile stops it between two blocks, so a request waits a fraction
+    // of a second at most; the stage runs again at the next idle time. In
+    // all about as much work as processing 15,000 tokens (minutes for a 1B
+    // model on a Mac's CPU). Until it ends, segment reuse is off: marked
+    // prompts are processed as usual (Engine::segment_reuse() says how far it
+    // got). Needs the prefix cache's store (prefix_cache_mb or
+    // prefix_cache_disk_mb), whose caps the stored segments share; refused,
+    // with the reason in Engine::segment_reuse(), for hybrid models, with a
+    // sliding window or a draft model, or when no share on the calibration's
+    // grid meets the target.
     bool segment_reuse = false;
     // The target: the mean KL divergence of the next-token distributions,
-    // KL(whole prompt processed || segments reused), over the first answer
-    // tokens of a fixed RAG-shaped prompt (its documents reordered).
+    // KL(whole prompt processed || segments reused), over the answers to
+    // RAG-shaped prompts in the model's chat template (core/kv_reuse.h), with
+    // a margin for what those prompts cannot tell apart.
     float segment_reuse_max_kl = 0.02f;
 };
 
@@ -684,13 +691,17 @@ public:
     Status prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos = true);
     // Whether segment reuse is on, and what it was calibrated to: OK, or why
     // not (off in EngineConfig, the model or settings refuse it, no stored
-    // segments without a prefix cache, the target not met). Thread-safe.
+    // segments without a prefix cache, the target not met), or Busy while
+    // the calibration runs in the background (`calibrating`). Thread-safe.
     struct SegmentReuseInfo {
         Status status;
         float fraction = 0.0f;  // share of a reused segment's tokens processed again
         double kl = 0.0;        // the calibration's mean KL at that share
         double top1 = 0.0;      // and its top-1 agreement with processing the whole prompt, in [0, 1]
         bool from_cache = false;  // the calibration was read from cache_dir
+        bool calibrating = false;  // the calibration runs in the background: segment reuse is off until it ends
+        float progress = 0.0f;     // share of the calibration's work done, in [0, 1]
+        double bound = 0.0;        // the calibration's upper bound on the KL at that share (what met the target)
     };
     [[nodiscard]] SegmentReuseInfo segment_reuse() const;
 

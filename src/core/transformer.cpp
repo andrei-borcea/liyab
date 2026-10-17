@@ -2397,6 +2397,29 @@ Status Transformer::reuse_support() const {
     return Status::ok();
 }
 
+Status Transformer::swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past) {
+    if (config_.hybrid() || !states_.empty()) {
+        return Status(ErrorCode::Unsupported, "swap_context: recurrent states are part of the context");
+    }
+    if (!kv) return Status(ErrorCode::InvalidArgument, "swap_context: no cache");
+    const KvCacheConfig& a = kv_->config();
+    const KvCacheConfig& b = kv->config();
+    if (a.n_layers != b.n_layers || a.n_head_kv != b.n_head_kv || a.head_dim != b.head_dim || a.type != b.type ||
+        a.page_tokens != b.page_tokens || a.values_in_keys != b.values_in_keys || a.value_offset != b.value_offset ||
+        a.window != b.window || n_past < 0 || n_past > b.max_positions) {
+        return Status(ErrorCode::InvalidArgument, "swap_context: a cache of another layout");
+    }
+    std::swap(kv_, kv);
+    std::swap(n_past_, n_past);
+    return Status::ok();
+}
+
+Result<std::unique_ptr<KvCache>> Transformer::make_kv_cache(int32_t positions) const {
+    KvCacheConfig c = kv_->config();
+    c.max_positions = std::max(positions, 1);
+    return KvCache::create(c);
+}
+
 Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int32_t count, int32_t from, int32_t to,
                               ThreadPool* pool) const {
     if (slots < 1 || first < 0 || count < 0 || first + count > slots || from < 0 || to < 0) {

@@ -32,7 +32,9 @@
 // moved D positions away and back (two moves, each rounding a quantized key
 // again), and the rest of the text is processed on them; the KL against the
 // unmoved context bounds what moving costs. --calibrate KL runs the engine's
-// calibration (kv_reuse.h) against that target. Hybrid models are refused
+// calibration (kv_reuse.h) against that target, on its own prompts of the
+// same corpus, then measures the share it chose (or, when it refuses, the
+// largest) on these prompts, to compare the two. Hybrid models are refused
 // (see Transformer::reuse_support), with the share of a prompt's work
 // reusing their attention blocks' keys and values would skip.
 //
@@ -43,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -66,149 +69,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
-
-// The measurement corpus: an assistant's knowledge snippets. (The engine
-// calibrates on texts of its own, core/kv_reuse.cpp, so this measures other
-// prompts than the ones the fraction was fit to.)
-const char* kSystem =
-    "You are the assistant of Harbor & Pine, a small company that builds and services electric cargo bikes. Answer "
-    "the question using only the documents below. Quote numbers exactly and say which document they come from. If "
-    "the documents do not answer the question, say so in one sentence.";
-
-const char* kDocs[] = {
-    "Warranty policy (revised March). Frames are covered for seven years against defects in materials and "
-    "workmanship. Motors and controllers are covered for two years or 10,000 km, whichever comes first. Batteries "
-    "are covered for two years and must keep at least 70% of their rated capacity during that time; a battery below "
-    "that level is replaced, not repaired. Wear parts such as brake pads, chains, tyres and cassettes are not "
-    "covered. Damage from crashes, from cleaning with a pressure washer or from motors tuned past 25 km/h voids the "
-    "warranty of the affected parts. Claims need the frame number and the original invoice.",
-    "Battery care sheet. Store the battery between 10 and 25 degrees Celsius and at 40 to 60 percent charge when the "
-    "bike is not used for more than two weeks. Never charge below 0 degrees: let a cold battery warm up indoors for "
-    "an hour first. A full charge of the 720 Wh pack takes about 5 hours with the standard 4 A charger and 2.5 hours "
-    "with the fast charger. Expect about 800 full cycles before the capacity falls to 80 percent. If the battery "
-    "case is cracked, swollen or smells of solvent, stop using it and bring it to a service point in its box.",
-    "Service intervals. The first inspection is due after 300 km or three months. After that, a standard service "
-    "every 2,000 km or once a year covers brakes, drivetrain, wheel truing, bolt torques and a firmware update. "
-    "Heavy cargo users (over 100 kg of load most days) should halve the interval. Hydraulic brake fluid is replaced "
-    "every two years. A standard service costs 129 euros; parts are extra. The service book must be stamped at "
-    "every visit to keep the frame warranty valid beyond the third year.",
-    "Model line-up for the coming season. The Courier has a 120 cm front box, carries 100 kg in the box and 180 kg "
-    "in total, and weighs 38 kg. The Courier Long adds 30 cm of box and a second battery slot. The Nimbus is a "
-    "longtail for two children with a 65 kg rear rack and a total load of 200 kg. All three use a 90 Nm mid-drive "
-    "motor and a hub gear with a belt. Prices start at 5,490 euros for the Courier, 6,290 for the Courier Long and "
-    "4,990 for the Nimbus.",
-    "Delivery and returns. Bikes ordered online ship within 10 working days, fully assembled, on a pallet. Delivery "
-    "inside the country costs 89 euros; collection from the workshop in Leeuwarden is free. Customers have 14 days "
-    "after delivery to return a bike that has been ridden less than 50 km, in its original packaging; the return "
-    "transport is paid by the customer. Accessories can be returned within 30 days unless they were fitted to a "
-    "bike. Refunds are paid within 14 days of receiving the return.",
-    "Workshop notes, belt drives. A belt stretched by more than 2% or with cracked teeth must be replaced. Belt "
-    "tension is set with the phone app: the target frequency is 45 to 50 Hz for the Courier and 50 to 55 Hz for the "
-    "Nimbus. A squeaking belt is usually misaligned, not dry: check the rear wheel alignment before adding any "
-    "silicone spray, and never use chain oil. A belt lasts about 15,000 km, roughly three times as long as a chain "
-    "on the same bike.",
-    "Error codes of the display. E01: the motor sensor lost contact, check the plug under the bottom bracket. E07: "
-    "battery temperature outside the allowed range, let it cool down or warm up. E12: the speed sensor sees no "
-    "magnet, check the gap of 2 to 5 mm at the rear wheel. E21: controller overload after a long climb with full "
-    "load; the motor resumes after five minutes. E30: firmware mismatch between display and motor, run an update "
-    "from the app. Any other code means the bike must go to a service point.",
-    "Accessory compatibility. The rain cover fits every Courier box but not the Nimbus. The child seat adapter is "
-    "for the Nimbus only and holds seats up to 22 kg. The second battery slot exists only on the Courier Long, and "
-    "both batteries must be the same 720 Wh type. Front lights draw power from the main battery; the rear light "
-    "runs on it too since frame number HP-2300. Trailers are allowed behind the Nimbus only, up to 40 kg, with the "
-    "reinforced axle nut kit.",
-    "Leasing for companies. Businesses can lease any model for 36 or 48 months. The monthly rate includes the yearly "
-    "standard service, theft insurance with a 10% deductible and a replacement bike within 48 hours when a repair "
-    "takes longer than three days. At the end of the term the bike can be bought for 15% of its list price or "
-    "returned. Leasing contracts need a company registration number and at least two bikes per contract.",
-    "Theft and insurance. Every bike leaves the workshop with a frame number engraved under the bottom bracket and a "
-    "GPS tracker inside the down tube. The tracker's subscription is free for the first year and costs 4 euros per "
-    "month afterwards. Insurance through our partner covers theft and accidental damage for 9% of the bike's price "
-    "per year. A theft must be reported to the police within 24 hours, and the report number is needed for the "
-    "claim.",
-    "Riding with children. Children under four years ride in the box with the five-point harness of the bench "
-    "fastened. The bench holds two children of up to 25 kg each on the Courier. The Nimbus carries two children on "
-    "the rear rack with the side bars and foot plates mounted. A helmet is mandatory for every child on board. Do "
-    "not leave children in a parked cargo bike without the parking stand fully down and the brake lock engaged.",
-    "Firmware release notes, version 4.2. Adds a walk assist mode for pushing the loaded bike uphill at up to 6 km/h. "
-    "The range estimate now learns from the last 50 km instead of the last 10 km. Fixes a bug that showed E12 after "
-    "the wheel had been removed and refitted. Lowers the motor's peak power by 5% when the battery is below 15% so "
-    "that the last kilometres are not lost. Updating takes about 12 minutes; keep the bike switched on and the "
-    "phone within 2 metres.",
-};
-
-const char* kQuestions[] = {
-    "How long is the motor covered, and what voids the warranty?",
-    "My bike stood in the garage all winter at full charge. Was that right, and how should I charge it now?",
-    "I carry about 150 kg most days. How often should my bike be serviced and what does it cost?",
-    "Which model can carry two children, and how much does it cost?",
-    "Can I return a bike I rode for 30 km, and who pays the transport?",
-    "The belt squeaks. What should I check first and what must I avoid?",
-    "The display shows E12 after I refitted the rear wheel. What does it mean and how do I fix it?",
-    "Can I mount a second battery on my Courier, and which battery types can be combined?",
-    "What happens at the end of a company lease?",
-    "My bike was stolen yesterday. What do I need for the insurance claim?",
-    "How many children can ride on the Courier, and what is required for them?",
-    "What changes in firmware 4.2, and how long does the update take?",
-};
-
-constexpr size_t kDocCount = sizeof kDocs / sizeof kDocs[0];
-
-std::string json_string(std::string_view s) {
-    std::string out = "\"";
-    for (const char ch : s) {
-        switch (ch) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\t': out += "\\t"; break;
-            default: out += ch;
-        }
-    }
-    return out + "\"";
-}
-
-struct Prompt {
-    std::string text;
-    std::vector<PromptSegment> documents;  // byte ranges of the documents in `text`
-};
-
-// A RAG prompt: the documents (by index, in order) and the question.
-struct Builder {
-    const ChatTemplate* chat = nullptr;
-    jinja::Value special;
-    bool thinking_off = false;
-    bool numbered = true;  // "Document N:" before each document
-
-    Result<Prompt> build(const std::vector<size_t>& docs, size_t question) const {
-        std::string system = kSystem;
-        for (size_t i = 0; i < docs.size(); ++i) {
-            system += "\n\n";
-            if (numbered) system += "Document " + std::to_string(i + 1) + ":\n";
-            system += kDocs[docs[i]];
-        }
-        Prompt p;
-        if (chat != nullptr) {
-            std::string request = "{\"messages\": [{\"role\": \"system\", \"content\": " + json_string(system) +
-                                  "}, {\"role\": \"user\", \"content\": " + json_string(kQuestions[question]) +
-                                  "}], \"add_generation_prompt\": true" +
-                                  (thinking_off ? ", \"enable_thinking\": false" : "") + "}";
-            auto rendered = chat->render_chat(request, special);
-            if (!rendered) return rendered.status();
-            p.text = std::move(rendered).value();
-        } else {
-            p.text = system + "\n\nQuestion: " + kQuestions[question] + "\nAnswer:";
-        }
-        size_t from = 0;
-        for (const size_t d : docs) {
-            const size_t at = p.text.find(kDocs[d], from);
-            if (at == std::string::npos) return Status(ErrorCode::Internal, "a document is not in the rendered prompt");
-            p.documents.push_back({at, at + std::strlen(kDocs[d])});
-            from = at + std::strlen(kDocs[d]);
-        }
-        return p;
-    }
-};
 
 // Log-softmax of a row of logits, in double.
 std::vector<double> log_probs(std::span<const float> logits) {
@@ -389,8 +249,15 @@ int main(int argc, char** argv) {
 
     // --- The turning alone ---------------------------------------------------
     if (shift != 0) {
-        std::string text;
-        for (const char* d : kDocs) text += std::string(d) + "\n\n";
+        std::vector<size_t> all(kReuseDocuments);
+        std::iota(all.begin(), all.end(), size_t{0});
+        ReusePromptStyle unnumbered;
+        unnumbered.numbered = false;
+        auto corpus = reuse_corpus_prompt(unnumbered, all, 0);
+        if (!corpus) return 1;
+        const std::string text =
+            corpus->text.substr(corpus->documents.front().begin,
+                                corpus->documents.back().end - corpus->documents.front().begin) + "\n\n";
         auto encoded = tokenizer->encode(text, bos);
         if (!encoded) return 1;
         std::vector<int32_t> t = std::move(encoded).value();
@@ -432,43 +299,61 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // --- The engine's calibration ------------------------------------------------
-    if (calibrate >= 0.0) {
-        auto r = calibrate_reuse(*model, *tokenizer, settings, calibrate, run.route, pool, run.chunk);
-        if (!r) {
-            std::fprintf(stderr, "calibration: %s\n", r.status().to_string().c_str());
-            return 1;
-        }
-        std::printf("calibration against KL %.4f: %s at %.0f%% recomputed, KL %.5f, top-1 %.1f%%, %.0f ms; tried", calibrate,
-                    r->met ? "met" : "not met", 100.0 * r->fraction, r->kl, 100.0 * r->top1, r->ms);
-        for (size_t i = 0; i < r->kls.size(); ++i) std::printf(" %.0f%%: %.5f", 100.0 * kReuseFractions[i], r->kls[i]);
-        std::printf("\n");
-        return 0;
-    }
-
-    // --- RAG prompts -----------------------------------------------------------
+    // --- RAG prompts: the corpus in the model's chat template --------------------
     std::optional<ChatTemplate> chat;
-    Builder builder;
+    ReusePromptStyle style;
     if (!plain) {
         if (const auto source = model->file().get_string("tokenizer.chat_template")) {
             if (auto parsed = ChatTemplate::parse(*source)) {
                 chat.emplace(std::move(parsed).value());
-                builder.chat = &*chat;
-                builder.special = jinja::Value::object();
+                style.chat = &*chat;
                 auto special = [&](const char* name, const char* key) {
                     if (const auto id = model->file().get_int(key); id && *id >= 0 && *id < tokenizer->vocab_size()) {
-                        builder.special.fields().set(name, jinja::Value(std::string(tokenizer->token_text(static_cast<int32_t>(*id)))));
+                        style.special.fields().set(name, jinja::Value(std::string(tokenizer->token_text(static_cast<int32_t>(*id)))));
                     }
                 };
                 special("bos_token", "tokenizer.ggml.bos_token_id");
                 special("eos_token", "tokenizer.ggml.eos_token_id");
-                builder.thinking_off = source->find("enable_thinking") != std::string::npos;
+                style.thinking_off = source->find("enable_thinking") != std::string::npos;
             }
         }
     }
-    builder.numbered = numbered;
+
+    // --- The engine's calibration ------------------------------------------------
+    // Its result, then the share it chose measured on this tool's prompts.
+    float calibrated = -1.0f;
+    double calibrated_kl = 0.0, calibrated_bound = 0.0;
+    bool calibrated_met = false;
+    if (calibrate >= 0.0) {
+        auto r = calibrate_reuse(*model, *tokenizer, style, settings, calibrate, run.route, pool, run.chunk);
+        if (!r) {
+            std::fprintf(stderr, "calibration: %s\n", r.status().to_string().c_str());
+            return 1;
+        }
+        std::printf("calibration against KL %.4f: %s at %.0f%% recomputed, KL %.5f (bound %.5f), top-1 %.1f%%, %.0f ms; "
+                    "KL (bound) by share:",
+                    calibrate, r->met ? "met" : "not met", 100.0 * r->fraction, r->kl, r->bound, 100.0 * r->top1, r->ms);
+        for (size_t i = 0; i < r->kls.size(); ++i) {
+            std::printf(" %.0f%%: %.5f (%.5f)", 100.0 * kReuseFractions[i], r->kls[i], r->bounds[i]);
+        }
+        // Which of its questions carry the KL, at the share kept (or the largest).
+        const auto at = static_cast<size_t>(
+            std::find(std::begin(kReuseFractions), std::end(kReuseFractions), r->fraction) - std::begin(kReuseFractions));
+        std::printf("\nits questions' KL at %.0f%%:", 100.0 * r->fraction);
+        if (at < r->question_kls.size()) {
+            for (const double q : r->question_kls[at]) std::printf(" %.4f", q);
+        }
+        std::printf("\n");
+        calibrated = r->fraction;
+        calibrated_kl = r->kl;
+        calibrated_bound = r->bound;
+        calibrated_met = r->met;
+        if (std::find(fractions.begin(), fractions.end(), calibrated) == fractions.end()) fractions.push_back(calibrated);
+    }
+
+    style.numbered = numbered;
     std::printf("prompts: %s, %d measured, %d answer tokens scored after the first\n",
-                builder.chat != nullptr ? "the model's chat template" : "plain text", prompts, answer);
+                style.chat != nullptr ? "the model's chat template" : "plain text", prompts, answer);
 
     KvStore::Config store_config;
     const uint64_t seed_parts[] = {model->context_fingerprint()};
@@ -481,13 +366,13 @@ int main(int argc, char** argv) {
 
     std::mt19937_64 rng(seed);
     auto pick = [&](size_t count) {
-        std::vector<size_t> all(kDocCount);
+        std::vector<size_t> all(kReuseDocuments);
         for (size_t i = 0; i < all.size(); ++i) all[i] = i;
         std::shuffle(all.begin(), all.end(), rng);
         all.resize(count);
         return all;
     };
-    auto encode = [&](const Prompt& p, std::vector<int32_t>& tokens, std::vector<TokenSegment>& segments) {
+    auto encode = [&](const ReusePrompt& p, std::vector<int32_t>& tokens, std::vector<TokenSegment>& segments) {
         tokens.clear();
         segments.clear();
         return encode_segmented(*tokenizer, p.text, 0, p.documents, bos, tokens, segments);
@@ -497,9 +382,9 @@ int main(int argc, char** argv) {
     std::set<size_t> seen;
     int warmups = 0;
     int64_t warm_reused = 0;
-    while (seen.size() < kDocCount) {
+    while (seen.size() < kReuseDocuments) {
         const std::vector<size_t> docs = pick(3 + rng() % 3);
-        auto prompt = builder.build(docs, rng() % kDocCount);
+        auto prompt = reuse_corpus_prompt(style, docs, rng() % kReuseDocuments);
         if (!prompt) {
             std::fprintf(stderr, "%s\n", prompt.status().to_string().c_str());
             return 1;
@@ -530,7 +415,7 @@ int main(int argc, char** argv) {
         seen.insert(docs.begin(), docs.end());
         ++warmups;
     }
-    std::printf("warm-up: %d prompts stored %d documents (%d segment copies)", warmups, static_cast<int>(kDocCount),
+    std::printf("warm-up: %d prompts stored %d documents (%d segment copies)", warmups, static_cast<int>(kReuseDocuments),
                 store->stats().segments);
     if (warm_up_reuse >= 0.0f) {
         std::printf(", %lld positions reused at %.0f%% before the new ones were computed", static_cast<long long>(warm_reused),
@@ -544,7 +429,7 @@ int main(int argc, char** argv) {
     for (int32_t i = 0; i < prompts; ++i) {
         const std::vector<size_t> docs = pick(3 + rng() % 3);
         const size_t question = docs[rng() % docs.size()];
-        auto prompt = builder.build(docs, question);
+        auto prompt = reuse_corpus_prompt(style, docs, question);
         if (!prompt) return 1;
         std::vector<int32_t> tokens;
         std::vector<TokenSegment> segments;
@@ -668,6 +553,14 @@ int main(int argc, char** argv) {
                     100.0 * static_cast<double>(t.first_agree) / prompts, t.ttft / prompts, prefix_ttft / t.ttft,
                     static_cast<double>(t.reused) / prompts, static_cast<double>(t.recomputed) / prompts,
                     t.rows_ms / prompts, t.blend_ms / prompts, 100.0 * t.kept_deviation / prompts);
+    }
+    if (calibrated >= 0.0f) {
+        const size_t f = static_cast<size_t>(std::find(fractions.begin(), fractions.end(), calibrated) - fractions.begin());
+        const double measured = tallies[f].kl_sum / static_cast<double>(tallies[f].positions);
+        std::printf("\ncalibrated %.0f%% (%s): KL %.5f, bound %.5f on the calibration's prompts; measured here %.5f, %s the "
+                    "target %.4f\n",
+                    100.0 * calibrated, calibrated_met ? "kept" : "refused, the largest share", calibrated_kl,
+                    calibrated_bound, measured, measured <= calibrate ? "within" : "above", calibrate);
     }
     return 0;
 }

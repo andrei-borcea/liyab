@@ -782,7 +782,8 @@ liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segmen
     if (engine == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine is required");
     const liyab::Engine::SegmentReuseInfo info = engine->engine->segment_reuse();
     if (out != nullptr) {
-        *out = liyab_segment_reuse_info{info.fraction, info.kl, info.top1, info.from_cache ? 1 : 0};
+        *out = liyab_segment_reuse_info{info.fraction, info.kl, info.top1, info.from_cache ? 1 : 0,
+                                        info.calibrating ? 1 : 0, info.progress, info.bound};
     }
     return info.status.is_ok() ? LIYAB_OK : fail(info.status);
 }

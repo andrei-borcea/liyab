@@ -3,12 +3,14 @@
 // variant the engine runs, blocks run at scattered positions, and the
 // engine's segment reuse built on them.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <filesystem>
@@ -679,6 +681,9 @@ EngineConfig reuse_config(const std::string& path) {
     c.prefix_cache_mb = 64;
     c.segment_reuse = true;
     c.segment_reuse_max_kl = 1000.0f;  // a random model: the first share on the grid meets it
+    // Kept for the test process: the first engine calibrates in the
+    // background, the next ones read the result.
+    c.cache_dir = test::temp_dir() + "/liyab_reuse_" + std::to_string(test::process_id()) + "_calibrations";
     return c;
 }
 
@@ -731,6 +736,18 @@ std::string run(Engine& e, const std::string& prompt, const std::vector<PromptSe
     return out;
 }
 
+// The background calibration's end (the engine idle meanwhile), within
+// minutes; the info as it is then.
+Engine::SegmentReuseInfo wait_calibrated(Engine& e) {
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    Engine::SegmentReuseInfo info = e.segment_reuse();
+    while (info.calibrating && std::chrono::steady_clock::now() < give_up) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        info = e.segment_reuse();
+    }
+    return info;
+}
+
 const std::string& reuse_model() {
     static const std::string path = [] {
         const std::string p = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_reuse_engine.gguf";
@@ -748,10 +765,12 @@ TEST_CASE("Engine: segments are kept, reused elsewhere, and a request that marks
     auto engine = Engine::create(reuse_config(reuse_model()));
     REQUIRE(engine.has_value());
     Engine& e = *engine.value();
-    const Engine::SegmentReuseInfo info = e.segment_reuse();
+    const Engine::SegmentReuseInfo info = wait_calibrated(e);
     CHECK(info.status.is_ok());
+    CHECK(!info.calibrating);
+    CHECK(info.progress == 1.0f);
     CHECK(info.fraction == kReuseFractions[0]);
-    CHECK(!info.from_cache);
+    CHECK(info.bound >= info.kl);
     EngineConfig plain = reuse_config(reuse_model());
     plain.prefix_cache_mb = 0;
     plain.segment_reuse = false;
@@ -806,6 +825,7 @@ TEST_CASE("Engine: a segment longer than two chunks of several pages is kept and
     auto engine = Engine::create(reuse_config(reuse_model()));
     REQUIRE(engine.has_value());
     Engine& e = *engine.value();
+    REQUIRE(wait_calibrated(e).status.is_ok());
     EngineConfig plain = reuse_config(reuse_model());
     plain.prefix_cache_mb = 0;
     plain.segment_reuse = false;
@@ -842,6 +862,7 @@ TEST_CASE("Engine: the prefix cache and saved contexts keep only exact rows of a
     auto engine = Engine::create(reuse_config(reuse_model()));
     REQUIRE(engine.has_value());
     Engine& e = *engine.value();
+    REQUIRE(wait_calibrated(e).status.is_ok());
     EngineConfig plain = reuse_config(reuse_model());
     plain.prefix_cache_mb = 0;
     plain.segment_reuse = false;
@@ -919,7 +940,18 @@ TEST_CASE("Engine: segment reuse off, refused with a reason, or never meeting it
     for (size_t i = 0; i < refusals.size(); ++i) {
         auto engine = Engine::create(refusals[i].config);
         REQUIRE(engine.has_value());
-        const Engine::SegmentReuseInfo info = engine.value()->segment_reuse();
+        // The strict target, measured for the first time: calibrating in the
+        // background, the marked prompt processed as usual meanwhile.
+        if (i == 2) {
+            const Engine::SegmentReuseInfo pending = engine.value()->segment_reuse();
+            CHECK(pending.calibrating);
+            CHECK(pending.status.code() == ErrorCode::Busy);
+            GenerationStats st{};
+            CHECK(run(*engine.value(), m.text, m.segments, &st) == want);
+            CHECK(st.segment_reused_tokens == 0);
+        }
+        const Engine::SegmentReuseInfo info = wait_calibrated(*engine.value());
+        CHECK(!info.calibrating);
         CHECK(info.status.code() == ErrorCode::Unsupported);
         CHECK(info.status.message().find(refusals[i].why) != std::string::npos);
         if (i == 3) CHECK(info.from_cache);
@@ -953,8 +985,17 @@ TEST_CASE("C API: generation and prefill with marked segments, the calibration, 
     liyab_engine* engine = nullptr;
     REQUIRE(liyab_engine_create(&c, &engine) == LIYAB_OK);
     liyab_segment_reuse_info info{};
+    CHECK(liyab_engine_segment_reuse(engine, &info) == LIYAB_ERR_BUSY);  // calibrating in the background
+    CHECK(info.calibrating == 1);
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    while (liyab_engine_segment_reuse(engine, &info) == LIYAB_ERR_BUSY && std::chrono::steady_clock::now() < give_up) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     CHECK(liyab_engine_segment_reuse(engine, &info) == LIYAB_OK);
+    CHECK(info.calibrating == 0);
+    CHECK(info.progress == 1.0f);
     CHECK(info.fraction == kReuseFractions[0]);
+    CHECK(info.bound >= info.kl);
     liyab_sampling_params params;
     liyab_sampling_params_default(&params);
     params.temperature = 0.0f;
@@ -997,39 +1038,137 @@ TEST_CASE("C API: generation and prefill with marked segments, the calibration, 
     CHECK(liyab_engine_segment_reuse(nullptr, nullptr) == LIYAB_ERR_INVALID_ARGUMENT);
 }
 
-TEST_CASE("Calibration finds the smallest share on its grid within the target, and refuses when none is") {
+TEST_CASE("Calibration finds the smallest share whose bound, and every larger one's, is within the target") {
     TransformerOptions options;
-    options.context_length = 8192;  // the calibration's text in the tiny vocabulary's byte tokens
+    options.context_length = 8192;  // the corpus's prompts in the tiny vocabulary's byte tokens
     test::TinyModelSpec spec;
     spec.n_layers = 4;  // blocks after the selection's, which only the selected tokens run
     auto l = load("calibrate", spec, options);
     REQUIRE(l != nullptr);
     auto tokenizer = Tokenizer::load(l->model->file());
     REQUIRE(tokenizer.has_value());
-    ReuseSettings settings;
-    auto loose = calibrate_reuse(*l->model, *tokenizer, settings, 1000.0, l->route, *l->pool, 32);
-    REQUIRE(loose.has_value());
-    CHECK(loose->met);
-    CHECK(loose->fraction == kReuseFractions[0]);
-    CHECK(loose->kl > 0.0);
-    CHECK(loose->top1 > 0.0 && loose->top1 <= 1.0);
-    CHECK(l->model->n_past() == 0);  // the context is left empty
-    auto strict = calibrate_reuse(*l->model, *tokenizer, settings, 1e-12, l->route, *l->pool, 32);
-    REQUIRE(strict.has_value());
-    CHECK(!strict->met);
-    CHECK(strict->fraction == kReuseFractions[std::size(kReuseFractions) - 1]);
-    // A finer target needs a larger share (the KL falls as more is recomputed).
-    auto middle = calibrate_reuse(*l->model, *tokenizer, settings, loose->kl * 0.5, l->route, *l->pool, 32);
-    REQUIRE(middle.has_value());
-    CHECK(!middle->met || middle->fraction > loose->fraction);
-    // A question-guided criterion: each question gets a pass of its own.
+    const ReusePromptStyle plain_text;  // the tiny model has no chat template
+    // A stage at a time, stopped once and resumed: the same result.
+    auto job = ReuseCalibrator::create(*l->model, *tokenizer, plain_text, ReuseSettings{}, 1000.0);
+    REQUIRE(job.has_value());
+    ReuseCalibrator& c = **job;
+    CHECK(c.positions() > 0);
+    CHECK(c.progress() == 0.0f);
+    std::atomic<bool> stop{true};
+    auto stopped = c.step(*l->model, l->route, *l->pool, 32, &stop);
+    CHECK(stopped.status().code() == ErrorCode::Cancelled);
+    CHECK(c.progress() == 0.0f);
+    int steps = 0;
+    for (;;) {
+        auto r = c.step(*l->model, l->route, *l->pool, 32);
+        REQUIRE(r.has_value());
+        ++steps;
+        if (*r) break;
+    }
+    CHECK(c.done());
+    CHECK(c.progress() == 1.0f);
+    CHECK(steps > 10);
+    const ReuseCalibration& loose = c.result();
+    CHECK(loose.met);
+    CHECK(loose.fraction == kReuseFractions[0]);
+    CHECK(loose.kl > 0.0);
+    CHECK(loose.bound >= loose.kl);
+    CHECK(loose.top1 > 0.0 && loose.top1 <= 1.0);
+    REQUIRE(loose.kls.size() == std::size(kReuseFractions));
+    REQUIRE(loose.bounds.size() == std::size(kReuseFractions));
+    // None within: refused, at the largest share.
+    const ReuseCalibration strict = c.result_for(1e-12);
+    CHECK(!strict.met);
+    CHECK(strict.fraction == kReuseFractions[std::size(kReuseFractions) - 1]);
+    // A target between the bounds: the smallest share whose bound, and
+    // every larger share's, is within it.
+    const double target = *std::max_element(loose.bounds.begin() + 2, loose.bounds.end());
+    const ReuseCalibration middle = c.result_for(target);
+    size_t want = std::size(kReuseFractions);
+    for (size_t k = std::size(kReuseFractions); k-- > 0 && loose.bounds[k] <= target;) want = k;
+    CHECK(middle.met);
+    CHECK(middle.fraction == kReuseFractions[want]);
+    CHECK(want <= 2);
+    // calibrate_reuse(): every stage at once, the context left empty; with
+    // a question-guided criterion, each question gets a pass of its own.
     ReuseSettings guided;
     guided.criterion = ReuseCriterion::Impact;
-    auto g = calibrate_reuse(*l->model, *tokenizer, guided, 1000.0, l->route, *l->pool, 32);
+    auto g = calibrate_reuse(*l->model, *tokenizer, plain_text, guided, 1000.0, l->route, *l->pool, 32);
     REQUIRE(g.has_value());
     CHECK(g->met);
     CHECK(g->kl > 0.0);
+    CHECK(g->kls.size() == std::size(kReuseFractions));
     CHECK(l->model->n_past() == 0);
+}
+
+TEST_CASE("Engine: the calibration runs in the background, gives way to calls, and leaves the context as it was") {
+    const std::string dir = test::temp_dir() + "/liyab_reuse_" + std::to_string(test::process_id()) + "_background";
+    std::filesystem::remove_all(dir);
+    EngineConfig plain = reuse_config(reuse_model());
+    plain.prefix_cache_mb = 0;
+    plain.segment_reuse = false;
+    auto fresh_engine = Engine::create(plain);
+    REQUIRE(fresh_engine.has_value());
+    auto exact = [&](const std::string& prompt) {
+        fresh_engine.value()->reset_context();
+        return run(*fresh_engine.value(), prompt);
+    };
+    const Marked m = rag({doc_text(21, 40), doc_text(22, 40)}, "meanwhile");
+    EngineConfig config = reuse_config(reuse_model());
+    config.cache_dir = dir;
+    {
+        auto engine = Engine::create(config);  // returns at once: the calibration has not run
+        REQUIRE(engine.has_value());
+        Engine& e = *engine.value();
+        Engine::SegmentReuseInfo info = e.segment_reuse();
+        CHECK(info.calibrating);
+        CHECK(info.status.code() == ErrorCode::Busy);
+        // Meanwhile a marked prompt is processed as usual.
+        GenerationStats st{};
+        CHECK(run(e, m.text, m.segments, &st) == exact(m.text));
+        CHECK(st.segment_reused_tokens == 0);
+        // A context in progress, then idle time: the calibration runs on a
+        // context of its own, and a call stops it (no Busy) and continues
+        // the conversation's context, which it found as it was left.
+        REQUIRE(e.prefill(m.text, true).is_ok());
+        const uint64_t restores = e.prefix_cache_stats().restores;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2600));
+        const std::string next = m.text + " hello";
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(run(e, next, {}, &st) == exact(next));
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(st.cached_prefix_tokens >= static_cast<int32_t>(e.tokenize(m.text, true)->size()) - 1);
+        CHECK(e.prefix_cache_stats().restores == restores);  // the live context, not a copy set aside
+        CHECK(waited < 30.0);
+        info = wait_calibrated(e);
+        CHECK(info.status.is_ok());
+        CHECK(!info.from_cache);
+        CHECK(info.progress == 1.0f);
+    }
+    // Kept in cache_dir: the next engine has it at once.
+    {
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        const Engine::SegmentReuseInfo info = engine.value()->segment_reuse();
+        CHECK(!info.calibrating);
+        CHECK(info.from_cache);
+        CHECK(info.status.is_ok());
+        CHECK(info.fraction == kReuseFractions[0]);
+    }
+    // An engine closed while its calibration runs stops it.
+    {
+        EngineConfig closing = reuse_config(reuse_model());
+        closing.cache_dir.clear();  // nothing kept: it calibrates
+        auto engine = Engine::create(closing);
+        REQUIRE(engine.has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2600));
+        CHECK(engine.value()->segment_reuse().calibrating);
+        const auto t0 = std::chrono::steady_clock::now();
+        engine.value().reset();
+        CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 30.0);
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(reuse_config(reuse_model()).cache_dir);
 }
 
 TEST_MAIN()

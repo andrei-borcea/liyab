@@ -12,6 +12,7 @@
 #include "core/log.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
+#include "liyab/experimental/forward_hooks.h"
 
 namespace liyab {
 
@@ -409,54 +410,102 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
 
 namespace {
 
-// The calibration's text: an assistant's documents about a regional railway.
-// Plain text (no chat template), so every model is measured the same way.
-constexpr std::string_view kCalibrationSystem =
-    "You answer travellers' questions for the Valley Line railway. Use only the documents below and quote times "
-    "and prices exactly.";
-constexpr std::string_view kCalibrationDocs[] = {
-    "Timetable, weekdays. Trains leave Northgate for Ashford at 06:10, 06:40 and then every half hour until 21:40, "
-    "with a last train at 23:05. The journey takes 52 minutes and calls at Millbrook, Fernhill and Old Quarry. On "
-    "Saturdays the first train leaves at 07:10; on Sundays trains run every hour from 08:10 to 22:10. Engineering "
-    "works close the line between Fernhill and Ashford on the second Sunday of each month, when buses replace "
-    "trains and the journey takes about 75 minutes.",
-    "Fares and passes. A single ticket from Northgate to Ashford costs 9.40, a return 15.80 and a day return after "
-    "09:30 only 11.20. Children under 5 travel free; children from 5 to 15 and holders of the senior card pay half. "
-    "A monthly pass costs 182 and can be shared within one household on weekends. Tickets bought on board cost 2.00 "
-    "more, unless the ticket machine at the departure station was out of order.",
-    "Bicycles and luggage. Each train carries up to six bicycles in the marked area of the middle carriage; they "
-    "travel free outside the peak hours of 07:00 to 09:00 and 16:30 to 18:30, when a bicycle ticket costs 3.00. "
-    "Folded bicycles count as luggage. Pushchairs and wheelchairs always have priority in the multi-purpose area. "
-    "Luggage over 25 kg, or longer than two metres, must be booked two days ahead.",
-    "Delays and refunds. If a train arrives at the passenger's destination 20 minutes or more behind schedule, 25% "
-    "of the ticket price is refunded; from 60 minutes, 50%. Pass holders receive a credit of one day per three "
-    "delays in a month. Claims are made online within 28 days, with the ticket number and the train's departure "
-    "time. Delays caused by severe weather warnings are refunded at the same rates.",
-};
-// Three questions, each reading other documents, asked after the same
-// documents: they share one pass over them, and triple what is scored.
-constexpr std::string_view kCalibrationQuestions[] = {
-    "I bought a day return after ten and my train back reached Northgate 70 minutes late. What do I get back, and "
-    "how do I claim it?",
-    "Can I take my bicycle on the 08:10 from Northgate on a weekday, and what will it cost?",
-    "My daughter is 12. What does she pay for a single from Northgate to Ashford if we buy it on the train, and how "
-    "long is the journey?",
+// The corpus (kReuseDocuments): the knowledge base of a company that builds
+// electric cargo bikes, and one question per document.
+constexpr std::string_view kCorpusSystem =
+    "You are the assistant of Harbor & Pine, a small company that builds and services electric cargo bikes. Answer "
+    "the question using only the documents below. Quote numbers exactly and say which document they come from. If "
+    "the documents do not answer the question, say so in one sentence.";
+
+constexpr std::string_view kCorpusDocuments[kReuseDocuments] = {
+    "Warranty policy (revised March). Frames are covered for seven years against defects in materials and "
+    "workmanship. Motors and controllers are covered for two years or 10,000 km, whichever comes first. Batteries "
+    "are covered for two years and must keep at least 70% of their rated capacity during that time; a battery below "
+    "that level is replaced, not repaired. Wear parts such as brake pads, chains, tyres and cassettes are not "
+    "covered. Damage from crashes, from cleaning with a pressure washer or from motors tuned past 25 km/h voids the "
+    "warranty of the affected parts. Claims need the frame number and the original invoice.",
+    "Battery care sheet. Store the battery between 10 and 25 degrees Celsius and at 40 to 60 percent charge when the "
+    "bike is not used for more than two weeks. Never charge below 0 degrees: let a cold battery warm up indoors for "
+    "an hour first. A full charge of the 720 Wh pack takes about 5 hours with the standard 4 A charger and 2.5 hours "
+    "with the fast charger. Expect about 800 full cycles before the capacity falls to 80 percent. If the battery "
+    "case is cracked, swollen or smells of solvent, stop using it and bring it to a service point in its box.",
+    "Service intervals. The first inspection is due after 300 km or three months. After that, a standard service "
+    "every 2,000 km or once a year covers brakes, drivetrain, wheel truing, bolt torques and a firmware update. "
+    "Heavy cargo users (over 100 kg of load most days) should halve the interval. Hydraulic brake fluid is replaced "
+    "every two years. A standard service costs 129 euros; parts are extra. The service book must be stamped at "
+    "every visit to keep the frame warranty valid beyond the third year.",
+    "Model line-up for the coming season. The Courier has a 120 cm front box, carries 100 kg in the box and 180 kg "
+    "in total, and weighs 38 kg. The Courier Long adds 30 cm of box and a second battery slot. The Nimbus is a "
+    "longtail for two children with a 65 kg rear rack and a total load of 200 kg. All three use a 90 Nm mid-drive "
+    "motor and a hub gear with a belt. Prices start at 5,490 euros for the Courier, 6,290 for the Courier Long and "
+    "4,990 for the Nimbus.",
+    "Delivery and returns. Bikes ordered online ship within 10 working days, fully assembled, on a pallet. Delivery "
+    "inside the country costs 89 euros; collection from the workshop in Leeuwarden is free. Customers have 14 days "
+    "after delivery to return a bike that has been ridden less than 50 km, in its original packaging; the return "
+    "transport is paid by the customer. Accessories can be returned within 30 days unless they were fitted to a "
+    "bike. Refunds are paid within 14 days of receiving the return.",
+    "Workshop notes, belt drives. A belt stretched by more than 2% or with cracked teeth must be replaced. Belt "
+    "tension is set with the phone app: the target frequency is 45 to 50 Hz for the Courier and 50 to 55 Hz for the "
+    "Nimbus. A squeaking belt is usually misaligned, not dry: check the rear wheel alignment before adding any "
+    "silicone spray, and never use chain oil. A belt lasts about 15,000 km, roughly three times as long as a chain "
+    "on the same bike.",
+    "Error codes of the display. E01: the motor sensor lost contact, check the plug under the bottom bracket. E07: "
+    "battery temperature outside the allowed range, let it cool down or warm up. E12: the speed sensor sees no "
+    "magnet, check the gap of 2 to 5 mm at the rear wheel. E21: controller overload after a long climb with full "
+    "load; the motor resumes after five minutes. E30: firmware mismatch between display and motor, run an update "
+    "from the app. Any other code means the bike must go to a service point.",
+    "Accessory compatibility. The rain cover fits every Courier box but not the Nimbus. The child seat adapter is "
+    "for the Nimbus only and holds seats up to 22 kg. The second battery slot exists only on the Courier Long, and "
+    "both batteries must be the same 720 Wh type. Front lights draw power from the main battery; the rear light "
+    "runs on it too since frame number HP-2300. Trailers are allowed behind the Nimbus only, up to 40 kg, with the "
+    "reinforced axle nut kit.",
+    "Leasing for companies. Businesses can lease any model for 36 or 48 months. The monthly rate includes the yearly "
+    "standard service, theft insurance with a 10% deductible and a replacement bike within 48 hours when a repair "
+    "takes longer than three days. At the end of the term the bike can be bought for 15% of its list price or "
+    "returned. Leasing contracts need a company registration number and at least two bikes per contract.",
+    "Theft and insurance. Every bike leaves the workshop with a frame number engraved under the bottom bracket and a "
+    "GPS tracker inside the down tube. The tracker's subscription is free for the first year and costs 4 euros per "
+    "month afterwards. Insurance through our partner covers theft and accidental damage for 9% of the bike's price "
+    "per year. A theft must be reported to the police within 24 hours, and the report number is needed for the "
+    "claim.",
+    "Riding with children. Children under four years ride in the box with the five-point harness of the bench "
+    "fastened. The bench holds two children of up to 25 kg each on the Courier. The Nimbus carries two children on "
+    "the rear rack with the side bars and foot plates mounted. A helmet is mandatory for every child on board. Do "
+    "not leave children in a parked cargo bike without the parking stand fully down and the brake lock engaged.",
+    "Firmware release notes, version 4.2. Adds a walk assist mode for pushing the loaded bike uphill at up to 6 km/h. "
+    "The range estimate now learns from the last 50 km instead of the last 10 km. Fixes a bug that showed E12 after "
+    "the wheel had been removed and refitted. Lowers the motor's peak power by 5% when the battery is below 15% so "
+    "that the last kilometres are not lost. Updating takes about 12 minutes; keep the bike switched on and the "
+    "phone within 2 metres.",
 };
 
-// One calibration prompt: the documents in `order`, and their byte ranges;
-// then question `q`.
-std::string calibration_prompt(std::span<const int> order, size_t q, std::vector<PromptSegment>& documents) {
-    std::string text(kCalibrationSystem);
-    documents.clear();
-    for (const int d : order) {
-        text += "\n\n";
-        documents.push_back({text.size(), text.size() + kCalibrationDocs[d].size()});
-        text += kCalibrationDocs[d];
+constexpr std::string_view kCorpusQuestions[kReuseDocuments] = {
+    "How long is the motor covered, and what voids the warranty?",
+    "My bike stood in the garage all winter at full charge. Was that right, and how should I charge it now?",
+    "I carry about 150 kg most days. How often should my bike be serviced and what does it cost?",
+    "Which model can carry two children, and how much does it cost?",
+    "Can I return a bike I rode for 30 km, and who pays the transport?",
+    "The belt squeaks. What should I check first and what must I avoid?",
+    "The display shows E12 after I refitted the rear wheel. What does it mean and how do I fix it?",
+    "Can I mount a second battery on my Courier, and which battery types can be combined?",
+    "What happens at the end of a company lease?",
+    "My bike was stolen yesterday. What do I need for the insurance claim?",
+    "How many children can ride on the Courier, and what is required for them?",
+    "What changes in firmware 4.2, and how long does the update take?",
+};
+
+std::string json_string(std::string_view s) {
+    std::string out = "\"";
+    for (const char ch : s) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            default: out += ch;
+        }
     }
-    text += "\n\nQuestion: ";
-    text += kCalibrationQuestions[q];
-    text += "\nAnswer:";
-    return text;
+    return out + "\"";
 }
 
 std::vector<double> log_probs(std::span<const float> logits) {
@@ -469,201 +518,405 @@ std::vector<double> log_probs(std::span<const float> logits) {
     return out;
 }
 
+// The calibration's prompts. Three store the 12 documents, four documents
+// each; four arrange 3 to 5 of them in other orders, and after each the
+// three questions are asked in turn: every document is stored, and every
+// question asked, once.
+constexpr size_t kStoreOrders[][4] = {{3, 0, 2, 1}, {6, 4, 7, 5}, {9, 11, 8, 10}};
+struct Arrangement {
+    std::array<size_t, 5> documents;
+    size_t count;
+    std::array<size_t, 3> questions;
+};
+constexpr Arrangement kArrangements[] = {
+    {{5, 1, 9}, 3, {1, 9, 5}},
+    {{2, 10, 7, 0}, 4, {10, 0, 7}},
+    {{11, 3, 6, 8, 4}, 5, {6, 11, 3}},
+    {{8, 2, 4, 9}, 4, {4, 2, 8}},
+};
+constexpr size_t kStorePrompts = std::size(kStoreOrders);
+constexpr size_t kShares = std::size(kReuseFractions);
+
 }  // namespace
 
-Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& tokenizer, const ReuseSettings& settings,
-                                         double max_kl, const Route& route, ThreadPool& pool, int32_t chunk) {
+Result<ReusePrompt> reuse_corpus_prompt(const ReusePromptStyle& style, std::span<const size_t> documents,
+                                        size_t question) {
+    if (question >= kReuseDocuments) return Status(ErrorCode::InvalidArgument, "no such question in the corpus");
+    std::string system(kCorpusSystem);
+    for (size_t i = 0; i < documents.size(); ++i) {
+        if (documents[i] >= kReuseDocuments) return Status(ErrorCode::InvalidArgument, "no such document in the corpus");
+        system += "\n\n";
+        if (style.numbered) system += "Document " + std::to_string(i + 1) + ":\n";
+        system += kCorpusDocuments[documents[i]];
+    }
+    ReusePrompt p;
+    if (style.chat != nullptr) {
+        const std::string request = "{\"messages\": [{\"role\": \"system\", \"content\": " + json_string(system) +
+                                    "}, {\"role\": \"user\", \"content\": " + json_string(kCorpusQuestions[question]) +
+                                    "}], \"add_generation_prompt\": true" +
+                                    (style.thinking_off ? ", \"enable_thinking\": false" : "") + "}";
+        auto rendered = style.chat->render_chat(request, style.special);
+        if (!rendered) return rendered.status();
+        p.text = std::move(rendered).value();
+    } else {
+        p.text = system + "\n\nQuestion: " + std::string(kCorpusQuestions[question]) + "\nAnswer:";
+    }
+    size_t from = 0;
+    for (const size_t d : documents) {
+        const size_t at = p.text.find(kCorpusDocuments[d], from);
+        if (at == std::string::npos) return Status(ErrorCode::Internal, "a document is not in the rendered prompt");
+        p.documents.push_back({at, at + kCorpusDocuments[d].size()});
+        from = at + kCorpusDocuments[d].size();
+    }
+    return p;
+}
+
+struct ReuseCalibrator::State {
+    const Tokenizer* tokenizer = nullptr;
+    ReuseSettings settings;
+    double max_kl = 0.0;
+    bool guided = false;  // the criterion reads the question: a reuse pass per question
+    int32_t vocab = 0;
+    int32_t positions = 0;
+    std::unique_ptr<KvStore> store;  // the documents' copies
+
+    struct Prompt {
+        std::vector<int32_t> tokens;
+        std::vector<TokenSegment> segments;  // the documents
+        int32_t documents_end = 0;           // the end of the last one
+    };
+    struct Question {
+        Prompt prompt;
+        std::vector<std::vector<float>> reference;  // the full prefill's log-probabilities, per scored position
+        std::vector<int32_t> answer;                // its greedy answer, fed back
+    };
+    struct Arranged {
+        std::vector<Question> questions;
+        bool shared = true;  // the documents are the same tokens before every question
+    };
+    std::vector<Prompt> store_prompts;
+    std::vector<Arranged> arranged;
+
+    // Per share and question: KL summed over the scored positions, how many,
+    // and how many agreed on the top token.
+    struct Tally {
+        double kl = 0.0;
+        int64_t n = 0;
+        int64_t agree = 0;
+    };
+    std::vector<std::vector<Tally>> tallies;  // [share][question]
+
+    size_t stage = 0;
+    size_t stages = 0;
+    double ms = 0.0;
+    ReuseCalibration result;
+};
+
+ReuseCalibrator::ReuseCalibrator(std::unique_ptr<State> state) : s_(std::move(state)) {}
+ReuseCalibrator::~ReuseCalibrator() = default;
+
+Result<std::unique_ptr<ReuseCalibrator>> ReuseCalibrator::create(const Transformer& model, const Tokenizer& tokenizer,
+                                                                 const ReusePromptStyle& style,
+                                                                 const ReuseSettings& settings, double max_kl) {
     LIYAB_RETURN_IF_ERROR(model.reuse_support());
-    const auto t0 = Clock::now();
-    ReuseCalibration out;
+    auto st = std::make_unique<State>();
+    State& s = *st;
+    s.tokenizer = &tokenizer;
+    s.settings = settings;
+    s.max_kl = max_kl;
+    s.guided = settings.criterion == ReuseCriterion::Attention || settings.criterion == ReuseCriterion::Impact;
+    s.vocab = model.config().n_vocab;
+    const bool bos = tokenizer.add_bos_default();
+    auto encode = [&](std::span<const size_t> documents, size_t question, State::Prompt& out) -> Status {
+        auto prompt = reuse_corpus_prompt(style, documents, question);
+        if (!prompt) return prompt.status();
+        LIYAB_RETURN_IF_ERROR(encode_segmented(tokenizer, prompt->text, 0, prompt->documents, bos, out.tokens,
+                                               out.segments));
+        if (out.segments.size() != documents.size() || out.tokens.size() <= static_cast<size_t>(out.segments.back().end) + 1) {
+            return Status(ErrorCode::Internal, "calibration: a document or the question encodes to nothing");
+        }
+        out.documents_end = out.segments.back().end;
+        s.positions = std::max(s.positions, static_cast<int32_t>(out.tokens.size()) + kCalibrationAnswer + 1);
+        return Status::ok();
+    };
+    int64_t document_tokens = 0;
+    for (const auto& order : kStoreOrders) {
+        State::Prompt p;
+        LIYAB_RETURN_IF_ERROR(encode(order, order[0], p));
+        for (const TokenSegment& d : p.segments) document_tokens += d.end - d.begin;
+        s.store_prompts.push_back(std::move(p));
+    }
+    for (const Arrangement& a : kArrangements) {
+        State::Arranged arranged;
+        const std::span<const size_t> documents(a.documents.data(), a.count);
+        for (const size_t q : a.questions) {
+            State::Question question;
+            LIYAB_RETURN_IF_ERROR(encode(documents, q, question.prompt));
+            if (!arranged.questions.empty()) {
+                // Encoded piece by piece, the documents' tokens do not depend
+                // on the question after them, unless the template writes
+                // something before them that does: then each question gets
+                // a pass of its own.
+                const State::Prompt& first = arranged.questions.front().prompt;
+                const auto end = static_cast<size_t>(first.documents_end);
+                arranged.shared = arranged.shared && question.prompt.documents_end == first.documents_end &&
+                                  std::equal(first.tokens.begin(), first.tokens.begin() + static_cast<std::ptrdiff_t>(end),
+                                             question.prompt.tokens.begin());
+            }
+            arranged.questions.push_back(std::move(question));
+        }
+        s.arranged.push_back(std::move(arranged));
+    }
     KvStore::Config sc;
     const uint64_t parts[] = {model.context_fingerprint(), kReuseCalibrationVersion};
     sc.seed = kv_seed_key(parts);
     sc.chunk_tokens = model.kv_cache().config().page_tokens;
     sc.chunk_bytes = model.kv_cache().page_bytes();
-    sc.ram_bytes = model.kv_cache().rows_bytes(4096);  // room for every document's copy several times over
-    auto store = KvStore::open(sc);
-    if (!store) return Status(ErrorCode::Internal, "calibration: no store");
-    const bool bos = tokenizer.add_bos_default();
+    // Every document once, with a page of slack per document.
+    sc.ram_bytes = model.kv_cache().rows_bytes(static_cast<int32_t>(document_tokens)) +
+                   model.kv_cache().page_bytes() * static_cast<size_t>(kReuseDocuments + 4);
+    s.store = KvStore::open(sc);
+    if (!s.store) return Status(ErrorCode::Internal, "calibration: no store");
+    size_t questions = 0;
+    for (const State::Arranged& a : s.arranged) questions += a.questions.size();
+    s.tallies.assign(kShares, std::vector<State::Tally>(questions));
+    s.stages = kStorePrompts + s.arranged.size() * (1 + kShares);
+    return std::unique_ptr<ReuseCalibrator>(new ReuseCalibrator(std::move(st)));
+}
+
+int32_t ReuseCalibrator::positions() const noexcept { return s_->positions; }
+
+float ReuseCalibrator::progress() const noexcept {
+    return s_->stages == 0 ? 1.0f : static_cast<float>(s_->stage) / static_cast<float>(s_->stages);
+}
+
+bool ReuseCalibrator::done() const noexcept { return s_->stage >= s_->stages; }
+
+const ReuseCalibration& ReuseCalibrator::result() const noexcept { return s_->result; }
+
+Result<bool> ReuseCalibrator::step(Transformer& model, const Route& route, ThreadPool& pool, int32_t chunk,
+                                   const std::atomic<bool>* stop) {
+    State& s = *s_;
+    if (s.stage >= s.stages) return true;
+    if (model.config().n_vocab != s.vocab || chunk < 1) {
+        return Status(ErrorCode::InvalidArgument, "calibration: another model, or no pass size");
+    }
+    const auto t0 = Clock::now();
+    ForwardHooks hooks;
+    hooks.cancel = stop;
+    const Status cancelled(ErrorCode::Cancelled, "calibration stopped");
+    auto stopped = [&] { return stop != nullptr && stop->load(std::memory_order_relaxed); };
+    // A pass of the context's next tokens; a stopped pass is abandoned.
+    auto run = [&](std::span<const int32_t> tokens, Transformer::Logits logits) -> Result<std::span<const float>> {
+        auto r = model.forward(tokens, logits, route, pool, &hooks);
+        if (!r && r.status().code() == ErrorCode::Cancelled) {
+            (void)model.abandon_pass();
+            return cancelled;
+        }
+        return r;
+    };
     auto prefill = [&](std::span<const int32_t> tokens) -> Status {
         for (size_t i = 0; i < tokens.size(); i += static_cast<size_t>(chunk)) {
-            const auto part = tokens.subspan(i, std::min(static_cast<size_t>(chunk), tokens.size() - i));
-            auto r = model.forward(part, Transformer::Logits::None, route, pool);
+            auto r = run(tokens.subspan(i, std::min(static_cast<size_t>(chunk), tokens.size() - i)),
+                         Transformer::Logits::None);
             if (!r) return r.status();
         }
         return Status::ok();
     };
-    auto step = [&](int32_t token) -> Result<std::vector<double>> {
-        auto r = model.forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
-        if (!r) return r.status();
-        return log_probs(*r);
+    // The prompt up to position `to`, from where the context is.
+    auto prefill_to = [&](const State::Prompt& p, int32_t to) -> Status {
+        const int32_t from = model.n_past();
+        if (from >= to) return Status::ok();
+        return prefill(std::span(p.tokens).subspan(static_cast<size_t>(from), static_cast<size_t>(to - from)));
     };
-    auto encode = [&](std::span<const int> order, size_t q, std::vector<int32_t>& tokens,
-                      std::vector<TokenSegment>& segments) {
-        std::vector<PromptSegment> documents;
-        const std::string text = calibration_prompt(order, q, documents);
-        tokens.clear();
-        segments.clear();
-        return encode_segmented(tokenizer, text, 0, documents, bos, tokens, segments);
+    auto finish = [&](Status st) -> Result<bool> {
+        s.ms += ms_since(t0);
+        if (!st.is_ok()) return st;
+        ++s.stage;
+        if (s.stage == s.stages) s.result = result_for(s.max_kl);
+        return s.stage >= s.stages;
     };
-    struct Question {
-        std::vector<int32_t> tokens;                 // the whole prompt: the documents, then this question
-        std::vector<std::vector<double>> reference;  // the full prefill's distributions
-        std::vector<int32_t> answer;                 // its greedy answer, fed back
-    };
-    struct Case {
-        std::vector<TokenSegment> segments;  // the documents (the same tokens before every question)
-        int32_t documents_end = 0;
-        std::vector<Question> questions;
-    };
-    auto finish = [&](Status s) -> Result<ReuseCalibration> {
+
+    if (s.stage < kStorePrompts) {
+        // Stored from an earlier prompt: the documents processed in another order.
+        const State::Prompt& p = s.store_prompts[s.stage];
         model.reset();
-        if (!s.is_ok()) return s;
-        out.ms = ms_since(t0);
-        return out;
-    };
-    // The context holds a question's prompt up to some point past its
-    // documents: the rest processed, then the first answer token's
+        if (Status st = prefill_to(p, p.documents_end); !st.is_ok()) return finish(st);
+        keep_segments(model, *s.store, p.tokens, p.segments, s.settings.min_tokens);
+        return finish(Status::ok());
+    }
+    const size_t t = s.stage - kStorePrompts;
+    State::Arranged& a = s.arranged[t / (1 + kShares)];
+    const size_t share = t % (1 + kShares);
+    size_t first_question = 0;  // index of the arrangement's first question among all
+    for (size_t i = 0; i < t / (1 + kShares); ++i) first_question += s.arranged[i].questions.size();
+
+    // The context holds a question's prompt from its documents' end on, at
+    // most: the rest of it processed, then the first answer token's
     // distribution and the reference answer's next ones (teacher-forced).
-    auto answer_from_here = [&](const Question& q) -> Result<std::vector<std::vector<double>>> {
-        const auto n = static_cast<int32_t>(q.tokens.size());
-        LIYAB_RETURN_IF_ERROR(prefill(std::span(q.tokens).subspan(static_cast<size_t>(model.n_past()),
-                                                                 static_cast<size_t>(n - 1 - model.n_past()))));
-        auto first = step(q.tokens.back());
+    auto answer = [&](const State::Question& q) -> Result<std::vector<std::vector<double>>> {
+        const auto n = static_cast<int32_t>(q.prompt.tokens.size());
+        LIYAB_RETURN_IF_ERROR(prefill_to(q.prompt, n - 1));
+        auto first = run(std::span(q.prompt.tokens).last(1), Transformer::Logits::Last);
         if (!first) return first.status();
-        std::vector<std::vector<double>> mine = {std::move(first).value()};
+        std::vector<std::vector<double>> mine = {log_probs(*first)};
         if (!q.answer.empty()) {
-            auto rows = model.forward(q.answer, Transformer::Logits::All, route, pool);
+            auto rows = run(q.answer, Transformer::Logits::All);
             if (!rows) return rows.status();
-            const auto vocab = static_cast<size_t>(model.config().n_vocab);
-            for (size_t a = 0; a < q.answer.size(); ++a) {
-                mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
+            const auto vocab = static_cast<size_t>(s.vocab);
+            for (size_t i = 0; i < q.answer.size(); ++i) {
+                mine.push_back(log_probs(std::span<const float>(rows->data() + i * vocab, vocab)));
             }
         }
         return mine;
     };
-    // The documents stored from one order...
-    {
-        const int order[] = {0, 1, 2, 3};
-        std::vector<int32_t> tokens;
-        std::vector<TokenSegment> segments;
-        if (Status s = encode(order, 0, tokens, segments); !s.is_ok()) return finish(s);
-        model.reset();
-        if (Status s = prefill(tokens); !s.is_ok()) return finish(s);
-        keep_segments(model, *store, tokens, segments, settings.min_tokens);
-    }
-    // ...answered in two others, first from a full prefill: the documents
-    // once, then each question after them.
-    std::vector<Case> cases;
-    for (const auto& order : {std::array<int, 4>{2, 0, 3, 1}, std::array<int, 4>{1, 3, 0, 2}}) {
-        Case c;
-        for (size_t q = 0; q < std::size(kCalibrationQuestions); ++q) {
-            Question question;
-            std::vector<TokenSegment> segments;
-            if (Status s = encode(order, q, question.tokens, segments); !s.is_ok() || segments.empty()) {
-                return finish(s.is_ok() ? Status(ErrorCode::Internal, "calibration: no documents") : s);
-            }
-            if (q == 0) {
-                c.segments = segments;
-                c.documents_end = segments.back().end;
-            }
-            // Encoded piece by piece, the documents' tokens do not depend on
-            // the question after them.
-            const auto end = static_cast<size_t>(c.documents_end);
-            const std::vector<int32_t>& first = q == 0 ? question.tokens : c.questions.front().tokens;
-            if (segments.size() != c.segments.size() || segments.back().end != c.documents_end ||
-                question.tokens.size() <= end + 1 ||
-                !std::equal(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(end), question.tokens.begin())) {
-                return finish(Status(ErrorCode::Internal, "calibration: the documents encode differently"));
-            }
-            c.questions.push_back(std::move(question));
+
+    if (share == 0) {
+        // The reference: each question answered from a full prefill, greedy,
+        // up to its end of generation (included: where it ends is part of
+        // what reuse may change; what a model says past it is not an answer).
+        for (State::Question& q : a.questions) {
+            q.reference.clear();
+            q.answer.clear();
         }
         model.reset();
-        if (Status s = prefill(std::span(c.questions.front().tokens).first(static_cast<size_t>(c.documents_end)));
-            !s.is_ok()) {
-            return finish(s);
-        }
-        for (Question& q : c.questions) {
-            if (Status s = model.truncate(c.documents_end); !s.is_ok()) return finish(s);
-            const auto n = static_cast<int32_t>(q.tokens.size());
-            if (Status s = prefill(std::span(q.tokens).subspan(static_cast<size_t>(c.documents_end),
-                                                              static_cast<size_t>(n - 1 - c.documents_end)));
-                !s.is_ok()) {
-                return finish(s);
+        for (State::Question& q : a.questions) {
+            const State::Prompt& p = q.prompt;
+            if (a.shared && model.n_past() >= p.documents_end) {
+                if (Status st = model.truncate(p.documents_end); !st.is_ok()) return finish(st);
+            } else {
+                model.reset();
             }
-            auto dist = step(q.tokens.back());
-            if (!dist) return finish(dist.status());
-            // Up to the answer's end of generation, included: where it ends is
-            // part of what reuse may change; what a model says past it is not
-            // an answer.
-            for (int32_t a = 0; a <= kCalibrationAnswer; ++a) {
-                const auto best = static_cast<int32_t>(std::max_element(dist->begin(), dist->end()) - dist->begin());
-                q.reference.push_back(std::move(dist).value());
-                if (a == kCalibrationAnswer || tokenizer.is_end_of_generation(best)) break;
-                q.answer.push_back(best);
-                dist = step(best);
+            if (Status st = prefill_to(p, static_cast<int32_t>(p.tokens.size()) - 1); !st.is_ok()) return finish(st);
+            auto dist = run(std::span(p.tokens).last(1), Transformer::Logits::Last);
+            for (int32_t i = 0;; ++i) {
                 if (!dist) return finish(dist.status());
+                const auto best = static_cast<int32_t>(std::max_element(dist->begin(), dist->end()) - dist->begin());
+                const std::vector<double> lp = log_probs(*dist);
+                q.reference.emplace_back(lp.begin(), lp.end());
+                if (i == kCalibrationAnswer || s.tokenizer->is_end_of_generation(best)) break;
+                q.answer.push_back(best);
+                dist = run(std::span<const int32_t>(&q.answer.back(), 1), Transformer::Logits::Last);
             }
+            if (stopped()) return finish(cancelled);
         }
-        cases.push_back(std::move(c));
+        return finish(Status::ok());
     }
-    // The smallest fraction whose answers stay within max_kl. The documents
-    // are reused once per order and every question asked after them; the
-    // question-guided criteria rank tokens by what the question reads, so
-    // for them each question has a pass of its own.
-    const bool guided = settings.criterion == ReuseCriterion::Attention || settings.criterion == ReuseCriterion::Impact;
-    for (const float fraction : kReuseFractions) {
-        ReuseSettings s = settings;
-        s.fraction = fraction;
-        double kl_sum = 0.0;
-        int64_t agree = 0, positions = 0;
-        auto tally = [&](const Question& q, const std::vector<std::vector<double>>& mine) {
-            for (size_t p = 0; p < mine.size(); ++p) {
-                const std::vector<double>& ref = q.reference[p];
-                double k = 0.0;
-                for (size_t i = 0; i < ref.size(); ++i) k += std::exp(ref[i]) * (ref[i] - mine[p][i]);
-                kl_sum += std::max(k, 0.0);
-                agree += std::max_element(ref.begin(), ref.end()) - ref.begin() ==
-                         std::max_element(mine[p].begin(), mine[p].end()) - mine[p].begin();
-                ++positions;
-            }
-        };
-        // From an empty context: the exact prefix processed, the documents of
-        // `tokens` reused up to `limit`, those not reused processed.
-        auto reuse_documents = [&](const Case& c, const std::vector<int32_t>& tokens, int32_t limit) -> Status {
-            const int32_t exact = c.segments.front().begin;
-            model.reset();
-            LIYAB_RETURN_IF_ERROR(prefill(std::span(tokens).first(static_cast<size_t>(exact))));
-            auto reused = reuse_segments(model, *store, tokens, c.segments, exact, limit, s, route, pool, chunk);
-            if (!reused) return reused.status();
-            return prefill(std::span(tokens).subspan(static_cast<size_t>(reused->end),
-                                                      static_cast<size_t>(std::max(c.documents_end - reused->end, 0))));
-        };
-        for (const Case& c : cases) {
-            if (!guided) {
-                if (Status st = reuse_documents(c, c.questions.front().tokens, c.documents_end); !st.is_ok()) {
-                    return finish(st);
-                }
-            }
-            for (const Question& q : c.questions) {
-                Status st = guided ? reuse_documents(c, q.tokens, static_cast<int32_t>(q.tokens.size()) - 1)
-                                   : model.truncate(c.documents_end);
-                if (!st.is_ok()) return finish(st);
-                auto mine = answer_from_here(q);
-                if (!mine) return finish(mine.status());
-                tally(q, *mine);
-            }
+
+    // One share: the documents reused (once for every question when they are
+    // shared and the criterion does not read the question), each question
+    // answered, its positions scored against the reference.
+    ReuseSettings rs = s.settings;
+    rs.fraction = kReuseFractions[share - 1];
+    auto reuse_documents = [&](const State::Prompt& p, int32_t limit) -> Status {
+        const int32_t exact = p.segments.front().begin;
+        model.reset();
+        LIYAB_RETURN_IF_ERROR(prefill_to(p, exact));
+        auto reused = reuse_segments(model, *s.store, p.tokens, p.segments, exact, limit, rs, route, pool, chunk, stop);
+        if (!reused) return reused.status();
+        return prefill_to(p, p.documents_end);
+    };
+    const bool shared = a.shared && !s.guided;
+    std::vector<State::Tally> got(a.questions.size());
+    if (shared) {
+        if (Status st = reuse_documents(a.questions.front().prompt, a.questions.front().prompt.documents_end); !st.is_ok()) {
+            return finish(st);
         }
-        out.fraction = fraction;
-        out.kl = kl_sum / static_cast<double>(positions);
-        out.top1 = static_cast<double>(agree) / static_cast<double>(positions);
-        out.kls.push_back(out.kl);
-        if (out.kl <= max_kl) {
-            out.met = true;
-            break;
+    }
+    for (size_t i = 0; i < a.questions.size(); ++i) {
+        const State::Question& q = a.questions[i];
+        const auto n = static_cast<int32_t>(q.prompt.tokens.size());
+        Status st = shared ? model.truncate(q.prompt.documents_end)
+                           : reuse_documents(q.prompt, s.guided ? n - 1 : q.prompt.documents_end);
+        if (!st.is_ok()) return finish(st);
+        auto mine = answer(q);
+        if (!mine) return finish(mine.status());
+        for (size_t p = 0; p < mine->size() && p < q.reference.size(); ++p) {
+            const std::vector<float>& ref = q.reference[p];
+            const std::vector<double>& m = (*mine)[p];
+            double k = 0.0;
+            size_t ref_best = 0, best = 0;
+            for (size_t v = 0; v < ref.size(); ++v) {
+                k += std::exp(static_cast<double>(ref[v])) * (ref[v] - m[v]);
+                if (ref[v] > ref[ref_best]) ref_best = v;
+                if (m[v] > m[best]) best = v;
+            }
+            got[i].kl += std::max(k, 0.0);
+            got[i].n += 1;
+            got[i].agree += ref_best == best ? 1 : 0;
+        }
+        if (stopped()) return finish(cancelled);
+    }
+    for (size_t i = 0; i < got.size(); ++i) s.tallies[share - 1][first_question + i] = got[i];
+    if (share == kShares) {
+        for (State::Question& q : a.questions) {
+            q.reference = {};  // this arrangement is measured: its distributions are not needed again
+            q.reference.shrink_to_fit();
         }
     }
     return finish(Status::ok());
+}
+
+ReuseCalibration ReuseCalibrator::result_for(double max_kl) const {
+    const State& s = *s_;
+    ReuseCalibration out;
+    out.ms = s.ms;
+    std::vector<double> top1(kShares, 0.0);
+    for (size_t k = 0; k < kShares; ++k) {
+        double kl = 0.0;
+        int64_t n = 0, agree = 0;
+        std::vector<double> means;
+        for (const State::Tally& t : s.tallies[k]) {
+            kl += t.kl;
+            n += t.n;
+            agree += t.agree;
+            if (t.n > 0) means.push_back(t.kl / static_cast<double>(t.n));
+        }
+        out.question_kls.push_back(means);
+        const double mean = n > 0 ? kl / static_cast<double>(n) : 0.0;
+        // The questions' own means vary more than positions within one answer
+        // do (an answer's tokens move together): their spread sets the margin.
+        double sd = 0.0;
+        if (means.size() > 1) {
+            const double m = std::accumulate(means.begin(), means.end(), 0.0) / static_cast<double>(means.size());
+            for (const double v : means) sd += (v - m) * (v - m);
+            sd = std::sqrt(sd / static_cast<double>(means.size() - 1));
+        }
+        const double se = means.empty() ? 0.0 : sd / std::sqrt(static_cast<double>(means.size()));
+        out.kls.push_back(mean);
+        out.bounds.push_back(mean + kCalibrationBoundZ * se);
+        top1[k] = n > 0 ? static_cast<double>(agree) / static_cast<double>(n) : 0.0;
+    }
+    // The smallest share whose bound, and every larger share's, is within
+    // the target.
+    int64_t chosen = -1;
+    for (auto k = static_cast<int64_t>(kShares) - 1; k >= 0 && out.bounds[static_cast<size_t>(k)] <= max_kl; --k) {
+        chosen = k;
+    }
+    out.met = chosen >= 0;
+    const auto at = static_cast<size_t>(out.met ? chosen : static_cast<int64_t>(kShares) - 1);
+    out.fraction = kReuseFractions[at];
+    out.kl = out.kls[at];
+    out.bound = out.bounds[at];
+    out.top1 = top1[at];
+    return out;
+}
+
+Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& tokenizer, const ReusePromptStyle& style,
+                                         const ReuseSettings& settings, double max_kl, const Route& route,
+                                         ThreadPool& pool, int32_t chunk) {
+    auto calibrator = ReuseCalibrator::create(model, tokenizer, style, settings, max_kl);
+    if (!calibrator) return calibrator.status();
+    for (;;) {
+        auto done = (*calibrator)->step(model, route, pool, chunk);
+        if (!done) {
+            model.reset();
+            return done.status();
+        }
+        if (*done) break;
+    }
+    model.reset();
+    return (*calibrator)->result();
 }
 
 int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const int32_t> tokens,

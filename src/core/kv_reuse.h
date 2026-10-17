@@ -25,9 +25,10 @@
 //    move early keep moving through the later blocks). Measured against
 //    the others (ReuseCriterion, with liyab-reuse: README), it gave the
 //    lowest KL for the work from 20% on, its selection pass counted. The
-//    fraction is not a constant: calibrate_reuse() measures, per model, the
-//    smallest one that keeps the next-token distributions of a fixed
-//    RAG-shaped prompt within a KL target of a full prefill.
+//    fraction is not a constant: the calibration (ReuseCalibrator) measures,
+//    per model, the smallest one that keeps the next-token distributions of
+//    RAG-shaped prompts in the model's chat template within a KL target of a
+//    full prefill, with a margin for what its prompts cannot tell apart.
 //
 // What a reused segment's tokens cost: the blocks up to select_block, then
 // the fraction of them through the remaining blocks; the tokens between
@@ -44,10 +45,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
+#include "core/chat_template.h"
 #include "core/kv_store.h"
 #include "core/tokenizer.h"
 #include "core/transformer.h"
@@ -164,44 +168,124 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
 int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const int32_t> tokens,
                       std::span<const TokenSegment> segments, int32_t min_tokens);
 
-// ---- Calibration -------------------------------------------------------------
-// The recompute fraction for one model and cache, measured instead of set:
-// on a fixed RAG-shaped text (core/kv_reuse.cpp: a system line, four
-// documents about a railway, three questions that read different ones), the
-// documents are stored from one order; then, in two other orders, each
-// question is answered both ways, with a full prefill and with the
-// documents reused at each fraction of kReuseFractions in turn (the
-// documents processed or reused once per order, every question asked after
-// them). The score is the mean KL divergence of the next-token
-// distributions, KL(full || reuse), at the first answer token and the next
-// kCalibrationAnswer tokens of the full prefill's greedy answer
-// (teacher-forced). The fraction kept is the smallest whose score is within
-// `max_kl`; none: reuse would need about as much work as processing the
-// documents, and is not worth it. The score covers at most 6 x
-// (kCalibrationAnswer + 1) = 102 positions, so one token whose distribution
-// turns moves it by a hundredth of that token's KL: a choice still coarse,
-// kept so because it runs at load (EngineConfig::segment_reuse).
-inline constexpr float kReuseFractions[] = {0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.45f};
-inline constexpr int32_t kCalibrationAnswer = 16;
-// Changing the texts, the grid or the procedure changes every model's
-// result: bump it so results kept in a cache directory are measured again.
-inline constexpr uint32_t kReuseCalibrationVersion = 2;
+// ---- RAG-shaped prompts ------------------------------------------------------
+// The reuse corpus: the system prompt of a small company's assistant,
+// kReuseDocuments documents of its knowledge base, and one question per
+// document (question d is answered by document d). The calibration draws
+// its prompts from it, and liyab-reuse its measurements, in other
+// arrangements.
+inline constexpr size_t kReuseDocuments = 12;
 
-struct ReuseCalibration {
-    bool met = false;        // a fraction on the grid met the target
-    float fraction = 0.0f;   // that fraction (met), else the last one tried
-    double kl = 0.0;         // its score
-    double top1 = 0.0;       // its top-1 agreement with the full prefill, in [0, 1]
-    double ms = 0.0;         // time the calibration took
-    std::vector<double> kls;  // the score at each share tried, in kReuseFractions order
+// How a prompt of the corpus is written: through a model's chat template
+// (the system prompt and the documents as the system message, the question
+// as the user's, the assistant's turn opened, thinking off when the template
+// has the switch), as real prompts are; without one, as plain text ending in
+// "Question: ...\nAnswer:".
+struct ReusePromptStyle {
+    const ChatTemplate* chat = nullptr;            // must outlive the prompts' use; null: plain text
+    jinja::Value special = jinja::Value::object();  // its special-token variables (bos_token, eos_token...)
+    bool thinking_off = false;                     // the template reads enable_thinking: set it false
+    bool numbered = true;                          // "Document N:" before each document
 };
 
-// Calibrates `settings` (its fraction is what is searched; the criterion and
-// the rest are kept) for `model` against `max_kl`. Uses the model's context
-// (left empty) and a store of its own in RAM. Unsupported per
-// reuse_support(); other errors from the passes.
-Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& tokenizer, const ReuseSettings& settings,
-                                         double max_kl, const Route& route, ThreadPool& pool, int32_t chunk);
+struct ReusePrompt {
+    std::string text;
+    std::vector<PromptSegment> documents;  // byte ranges of the documents in `text`, in order
+};
+
+// The prompt holding the corpus's documents `documents` (indices, in that
+// order) and the question about document `question`. Errors from the chat
+// template; InvalidArgument for an index outside the corpus.
+Result<ReusePrompt> reuse_corpus_prompt(const ReusePromptStyle& style, std::span<const size_t> documents,
+                                        size_t question);
+
+// ---- Calibration -------------------------------------------------------------
+// The recompute fraction for one model and cache, measured instead of set, on
+// prompts shaped like real ones: the corpus's prompts in the model's own chat
+// template. Three prompts store its 12 documents; four others arrange 3 to 5
+// of them in other orders, each followed in turn by three questions about
+// them. Each question is answered both ways: with a full prefill, and with the
+// documents reused at each fraction of kReuseFractions (the documents
+// processed or reused once per arrangement, every question asked after them;
+// the question-guided criteria, which select by what the question reads, get
+// a pass per question). Scored, as liyab-reuse scores: KL(full || reuse) of
+// the next-token distributions at the first answer token and the next
+// kCalibrationAnswer of the full prefill's greedy answer (teacher-forced, up
+// to its end of generation), over the whole vocabulary.
+//
+// A share's score is the mean over those positions, and its bound that mean
+// plus kCalibrationBoundZ standard errors of the 12 questions' own means. The
+// fraction kept is the smallest whose bound, and every larger share's, is
+// within `max_kl`: a share that met the target by chance on these prompts, or
+// sits between two that miss it, is not kept. None: reuse would need about as
+// much work as processing the documents, or cannot be trusted to stay within
+// the target, and the model is refused.
+inline constexpr float kReuseFractions[] = {0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.45f};
+inline constexpr int32_t kCalibrationAnswer = 32;
+inline constexpr double kCalibrationBoundZ = 1.645;  // one-sided 95%
+// Changing the texts, the grid or the procedure changes every model's
+// result: bump it so results kept in a cache directory are measured again.
+inline constexpr uint32_t kReuseCalibrationVersion = 3;
+
+struct ReuseCalibration {
+    bool met = false;         // a fraction on the grid met the target
+    float fraction = 0.0f;    // that fraction (met), else the largest
+    double kl = 0.0;          // its mean KL
+    double bound = 0.0;       // its upper bound (see above)
+    double top1 = 0.0;        // its top-1 agreement with the full prefill, in [0, 1]
+    double ms = 0.0;          // time the stages took, stopped ones included
+    std::vector<double> kls;     // the mean KL at each share, in kReuseFractions order
+    std::vector<double> bounds;  // and its bound
+    std::vector<std::vector<double>> question_kls;  // [share][question]: each question's mean KL (what carries it)
+};
+
+// The calibration as a job of stages, each a few passes over one prompt's
+// documents, which a caller can stop between two blocks and resume later:
+// the engine runs it in the background while no call uses it. Its state
+// between stages: the documents' copies (a store of its own in RAM, ~the
+// corpus's KV rows) and, while an arrangement is measured, its reference
+// distributions (3 x 33 vocabulary rows of floats). Not thread-safe.
+class ReuseCalibrator {
+public:
+    // Encodes the prompts (`style`'s chat template must outlive the
+    // calibrator) for `model`'s cache. Unsupported per reuse_support();
+    // errors from the template or the tokenizer.
+    static Result<std::unique_ptr<ReuseCalibrator>> create(const Transformer& model, const Tokenizer& tokenizer,
+                                                           const ReusePromptStyle& style, const ReuseSettings& settings,
+                                                           double max_kl);
+    ~ReuseCalibrator();
+    ReuseCalibrator(const ReuseCalibrator&) = delete;
+    ReuseCalibrator& operator=(const ReuseCalibrator&) = delete;
+
+    // Runs the next stage on `model`'s context, which it uses from empty and
+    // leaves in any state (the engine lends it a context of its own:
+    // Transformer::swap_context). The model must be the one create() saw.
+    // true once every stage ran (result()); Cancelled when `stop` was set
+    // during the stage, which is then run again by the next call; other
+    // errors from the passes.
+    Result<bool> step(Transformer& model, const Route& route, ThreadPool& pool, int32_t chunk,
+                      const std::atomic<bool>* stop = nullptr);
+    // The context positions a stage needs (the longest prompt and answer).
+    [[nodiscard]] int32_t positions() const noexcept;
+    // Stages run so far, over all of them.
+    [[nodiscard]] float progress() const noexcept;
+    [[nodiscard]] bool done() const noexcept;
+    // The result against create()'s target, once done().
+    [[nodiscard]] const ReuseCalibration& result() const noexcept;
+    // The fraction another target would keep, from the same measurements
+    // (once done()).
+    [[nodiscard]] ReuseCalibration result_for(double max_kl) const;
+
+private:
+    struct State;
+    explicit ReuseCalibrator(std::unique_ptr<State> state);
+    std::unique_ptr<State> s_;
+};
+
+// Every stage at once, on the model's context (left empty).
+Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& tokenizer, const ReusePromptStyle& style,
+                                         const ReuseSettings& settings, double max_kl, const Route& route,
+                                         ThreadPool& pool, int32_t chunk);
 
 }  // namespace liyab
 

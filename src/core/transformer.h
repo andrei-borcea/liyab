@@ -379,6 +379,16 @@ public:
     // Q/K norm after RoPE zeroes a rotated key channel (its rotation could
     // not be undone).
     [[nodiscard]] Status reuse_support() const;
+    // A context of its own for background work (segment reuse's calibration
+    // while the engine is idle): swaps the KV cache and the position count
+    // with `kv` and `n_past`, so the work runs on another cache and the
+    // conversation's comes back untouched by swapping again. `kv` comes from
+    // make_kv_cache(). Unsupported with recurrent blocks (their states are
+    // part of a context too); InvalidArgument for a cache of another layout.
+    Status swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past);
+    // An empty KV cache laid out like the context's (format, pages, rows)
+    // for `positions` positions; its pages are mapped as they are used.
+    [[nodiscard]] Result<std::unique_ptr<KvCache>> make_kv_cache(int32_t positions) const;
     // Rewrites the keys of slots [first, first + count) of `image` (an image
     // of `slots` positions in KvCache::read_rows()' layout), stored for
     // positions from + i, as this model stores the keys of positions to + i.

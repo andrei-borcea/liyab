@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <thread>
 
 #include "core/chat_template.h"
 #include "core/grammar.h"
@@ -220,7 +222,8 @@ struct Engine::Impl {
     size_t last_prompt_end = 0;
     // Segment reuse (EngineConfig::segment_reuse, core/kv_reuse.h). `reuse`
     // holds the calibrated settings and `reuse_info` whether it is on (set at
-    // creation, read-only afterwards). `exact_end` is the first position of
+    // creation, or when the background calibration ends: under `busy`, and
+    // under reuse_info_mutex for segment_reuse()). `exact_end` is the first position of
     // `context` whose rows were reused away from their prefix (kExact:
     // none): a request that did not opt in never continues them, and the
     // prefix cache never keeps them, so its restores stay exact. The request
@@ -230,6 +233,24 @@ struct Engine::Impl {
     static constexpr size_t kExact = SIZE_MAX;
     ReuseSettings reuse;
     SegmentReuseInfo reuse_info;
+    mutable std::mutex reuse_info_mutex;
+    // The calibration, run in the background (calibrate_in_background): the
+    // job, the prompts' style (the chat template's), the context it runs on
+    // (swapped with the conversation's for each stage), its thread, and how
+    // calls stop it: each one counts itself in `calls_in_flight` and sets
+    // `calibration_stop`, which the calibration checks between blocks.
+    std::unique_ptr<ReuseCalibrator> calibrator;
+    ReusePromptStyle reuse_style;
+    std::unique_ptr<KvCache> calibration_kv;
+    int32_t calibration_n_past = 0;
+    std::thread calibration_thread;
+    std::mutex calibration_mutex;  // calibration_closing, last_call
+    std::condition_variable calibration_wake;
+    bool calibration_closing = false;
+    Clock::time_point last_call = Clock::now();  // when the last call ended (or the engine was made)
+    std::atomic<int32_t> calls_in_flight{0};
+    std::atomic<bool> calibration_holds{false};  // the calibration has `busy`
+    std::atomic<bool> calibration_stop{false};
     size_t exact_end = kExact;
     std::span<const PromptSegment> request_marks;
     bool request_marks_tokens = false;
@@ -477,6 +498,7 @@ struct Engine::Impl {
     [[nodiscard]] bool prefix_cache_on() const { return store != nullptr; }
 
     ~Impl() {
+        stop_calibration();
         // The context left goes to storage, so a later engine or process
         // continues it instead of processing it again. Best effort: a
         // destructor cannot report a failure.
@@ -887,13 +909,13 @@ struct Engine::Impl {
 
     // Whether segment reuse can run (EngineConfig::segment_reuse), and the
     // share of reused tokens processed again: measured once per model and
-    // settings (calibrate_reuse, on the CPU like the key scales, so it
-    // depends on the model and the kernels only) and kept in cache_dir.
+    // settings (ReuseCalibrator, on the CPU like the key scales, so it
+    // depends on the model and the kernels only) and kept in cache_dir. The
+    // measurement does not hold up loading: it runs in the background while
+    // the engine is idle (calibrate_in_background), and until it ends
+    // segment reuse is not on, so marked prompts are processed as usual.
     void prepare_segment_reuse() {
-        auto off = [&](Status why) {
-            reuse_info.status = std::move(why);
-            if (config.segment_reuse) LIYAB_LOG_INFO("segment reuse: off: %s", reuse_info.status.message().c_str());
-        };
+        auto off = [&](Status why) { set_reuse_off(std::move(why)); };
         if (!config.segment_reuse) return off(Status(ErrorCode::Unsupported, "off in EngineConfig::segment_reuse"));
         if (draft) return off(Status(ErrorCode::Unsupported, "not with a draft model (no prefix cache)"));
         if (Status s = target->reuse_support(); !s.is_ok()) return off(s);
@@ -912,40 +934,204 @@ struct Engine::Impl {
             reuse_info.from_cache = true;
             std::error_code ignored;
             std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(), ignored);
-        } else {
-            auto c = calibrate_reuse(*target, *tokenizer, reuse, config.segment_reuse_max_kl, draft_route(), *pool,
-                                     target->max_batch());
-            if (!c) return off(c.status());
-            met = c->met;
-            reuse.fraction = c->fraction;
-            reuse_info.fraction = c->fraction;
-            reuse_info.kl = c->kl;
-            reuse_info.top1 = c->top1;
-            std::string tried;
-            for (size_t i = 0; i < c->kls.size(); ++i) {
-                char one[48];
-                std::snprintf(one, sizeof one, "%s%.0f%%: %.4f", i > 0 ? ", " : "", 100.0 * kReuseFractions[i], c->kls[i]);
-                tried += one;
-            }
-            LIYAB_LOG_INFO("segment reuse: calibrated in %.0f ms: %.0f%% of reused tokens processed again, KL %.4f, "
-                           "top-1 %.1f%% (target KL %.4f; tried %s)",
-                           c->ms, 100.0 * c->fraction, c->kl, 100.0 * c->top1, config.segment_reuse_max_kl,
-                           tried.c_str());
-            if (!path.empty()) keep_reuse_calibration(config.cache_dir, path, id, met);
+            return publish_reuse(met);
         }
+        // Prompts shaped like real ones: through the model's chat template
+        // (plain text without one), thinking off where it has the switch.
+        reuse_style.chat = chat_template ? &*chat_template : nullptr;
+        if (chat_template) reuse_style.special = chat_special;
+        const auto source = target->file().get_string("tokenizer.chat_template");
+        reuse_style.thinking_off = source && source->find("enable_thinking") != std::string::npos;
+        auto job = ReuseCalibrator::create(*target, *tokenizer, reuse_style, reuse, config.segment_reuse_max_kl);
+        if (!job) return off(job.status());
+        calibrator = std::move(job).value();
+        std::lock_guard<std::mutex> lock(reuse_info_mutex);
+        reuse_info.calibrating = true;
+        reuse_info.progress = 0.0f;
+        reuse_info.status = Status(ErrorCode::Busy,
+                                   "calibrating in the background while the engine is idle; until then marked "
+                                   "prompts are processed as usual");
+        LIYAB_LOG_INFO("segment reuse: calibrating in the background (%s prompts)",
+                       reuse_style.chat != nullptr ? "chat-template" : "plain-text");
+    }
+
+    void set_reuse_off(Status why) {
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.calibrating = false;
+            reuse_info.status = std::move(why);
+        }
+        if (config.segment_reuse) LIYAB_LOG_INFO("segment reuse: off: %s", reuse_info.status.message().c_str());
+    }
+
+    // On with the calibrated share, or off when no share met the target.
+    void publish_reuse(bool met) {
         if (!met) {
-            char why[200];
+            char why[240];
             std::snprintf(why, sizeof why,
-                          "processing %.0f%% of reused tokens again still left KL %.4f, above the target %.4f",
-                          100.0 * reuse_info.fraction, reuse_info.kl, config.segment_reuse_max_kl);
-            return off(Status(ErrorCode::Unsupported, why));
+                          "processing %.0f%% of reused tokens again still left KL %.4f (bound %.4f), above the "
+                          "target %.4f",
+                          100.0 * reuse_info.fraction, reuse_info.kl, reuse_info.bound, config.segment_reuse_max_kl);
+            return set_reuse_off(Status(ErrorCode::Unsupported, why));
         }
-        reuse.fraction = reuse_info.fraction;
-        reuse_info.status = Status::ok();
-        LIYAB_LOG_INFO("segment reuse: on, %.0f%% of reused tokens processed again (KL %.4f, top-1 %.1f%%)%s",
-                       100.0 * reuse.fraction, reuse_info.kl, 100.0 * reuse_info.top1,
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse.fraction = reuse_info.fraction;
+            reuse_info.calibrating = false;
+            reuse_info.progress = 1.0f;
+            reuse_info.status = Status::ok();
+        }
+        LIYAB_LOG_INFO("segment reuse: on, %.0f%% of reused tokens processed again (KL %.4f, bound %.4f, top-1 "
+                       "%.1f%%)%s",
+                       100.0 * reuse.fraction, reuse_info.kl, reuse_info.bound, 100.0 * reuse_info.top1,
                        reuse_info.from_cache ? ", as measured before" : "");
     }
+
+    // ---- The calibration in the background -----------------------------------
+    // A thread runs it one stage at a time (a few passes over one prompt's
+    // documents) once no call has used the engine for kCalibrationIdle, on a
+    // context of its own swapped in for the stage, so the conversation's is
+    // left as it was. A call arriving meanwhile stops the stage between two
+    // blocks and waits for that (Call); the stage runs again at the next
+    // idle time. Started at the end of Engine::create(), stopped by ~Impl.
+    static constexpr auto kCalibrationIdle = std::chrono::seconds(2);
+    void start_calibration() {
+        if (!calibrator) return;
+        {
+            std::lock_guard<std::mutex> lock(calibration_mutex);
+            last_call = Clock::now();
+        }
+        calibration_thread = std::thread([this] { calibrate_in_background(); });
+    }
+    void stop_calibration() {
+        {
+            std::lock_guard<std::mutex> lock(calibration_mutex);
+            calibration_closing = true;
+        }
+        calibration_stop.store(true);
+        calibration_wake.notify_all();
+        if (calibration_thread.joinable()) calibration_thread.join();
+    }
+    void calibrate_in_background() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> wait(calibration_mutex);
+                for (;;) {
+                    if (calibration_closing) return;
+                    const auto now = Clock::now();
+                    const auto ready = last_call + kCalibrationIdle;
+                    if (now >= ready && calls_in_flight.load() == 0) break;
+                    // A call ending notifies; the timeout covers the idle time.
+                    calibration_wake.wait_until(wait, std::max(ready, now + std::chrono::milliseconds(100)));
+                }
+            }
+            // Before the lock, so a call that finds `busy` taken knows to wait.
+            calibration_holds.store(true);
+            std::unique_lock<std::mutex> lock(busy, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                calibration_holds.store(false);
+                std::unique_lock<std::mutex> wait(calibration_mutex);
+                calibration_wake.wait_for(wait, std::chrono::milliseconds(100));
+                continue;
+            }
+            // A call that arrived before this store set the flag earlier and
+            // counts in calls_in_flight; one arriving after sets it again.
+            calibration_stop.store(false);
+            bool over = false;
+            if (calls_in_flight.load() == 0) over = calibration_stage();
+            lock.unlock();
+            calibration_holds.store(false);
+            if (over) return;
+        }
+    }
+    // One stage, `busy` held: true when the calibration is over (segment
+    // reuse then on or off).
+    bool calibration_stage() {
+        if (!calibration_kv) {
+            auto kv = target->make_kv_cache(calibrator->positions());
+            if (!kv) return end_calibration(kv.status());
+            calibration_kv = std::move(kv).value();
+            calibration_n_past = 0;
+        }
+        if (Status s = target->swap_context(calibration_kv, calibration_n_past); !s.is_ok()) return end_calibration(s);
+        Result<bool> r = false;
+        {
+            const PowerManager::Work thermal(*power);  // thermal sampling while this runs
+            r = calibrator->step(*target, draft_route(), *pool, target->max_batch(), &calibration_stop);
+        }
+        // The conversation's context back (the same caches: cannot fail).
+        (void)target->swap_context(calibration_kv, calibration_n_past);
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.progress = calibrator->progress();
+        }
+        if (!r) return r.status().code() == ErrorCode::Cancelled ? false : end_calibration(r.status());
+        if (!*r) return false;
+        const ReuseCalibration& c = calibrator->result();
+        {
+            std::lock_guard<std::mutex> lock(reuse_info_mutex);
+            reuse_info.fraction = c.fraction;
+            reuse_info.kl = c.kl;
+            reuse_info.bound = c.bound;
+            reuse_info.top1 = c.top1;
+        }
+        std::string tried;
+        for (size_t i = 0; i < c.kls.size(); ++i) {
+            char one[64];
+            std::snprintf(one, sizeof one, "%s%.0f%%: %.4f (%.4f)", i > 0 ? ", " : "", 100.0 * kReuseFractions[i],
+                          c.kls[i], c.bounds[i]);
+            tried += one;
+        }
+        LIYAB_LOG_INFO("segment reuse: calibrated in %.0f ms of background work: %.0f%% of reused tokens processed "
+                       "again, KL %.4f (bound %.4f), top-1 %.1f%% (target KL %.4f; KL (bound) by share: %s)",
+                       c.ms, 100.0 * c.fraction, c.kl, c.bound, 100.0 * c.top1, config.segment_reuse_max_kl,
+                       tried.c_str());
+        if (!config.cache_dir.empty()) {
+            const uint64_t id = reuse_calibration_id();
+            keep_reuse_calibration(config.cache_dir, reuse_calibration_path(config.cache_dir, id), id, c.met);
+        }
+        publish_reuse(c.met);
+        calibrator.reset();
+        calibration_kv.reset();
+        return true;
+    }
+    bool end_calibration(Status why) {
+        set_reuse_off(std::move(why));
+        calibrator.reset();
+        calibration_kv.reset();
+        return true;
+    }
+
+    // One call's hold on the engine: false (Busy) while another call runs.
+    // The background calibration is not a call: one arriving while it runs
+    // stops it between two blocks and waits for that, a fraction of a
+    // second. `wait`: wait for another call too (reset_context()).
+    class Call {
+    public:
+        explicit Call(Impl& s, bool wait = false) : s_(s), lock_(s.busy, std::defer_lock) {
+            s.calls_in_flight.fetch_add(1);
+            s.calibration_stop.store(true);
+            if (wait || (!lock_.try_lock() && s.calibration_holds.load())) lock_.lock();
+            if (!lock_.owns_lock()) s.calls_in_flight.fetch_sub(1);
+        }
+        ~Call() {
+            if (!lock_.owns_lock()) return;
+            lock_.unlock();
+            {
+                std::lock_guard<std::mutex> lock(s_.calibration_mutex);
+                s_.last_call = Clock::now();
+            }
+            s_.calls_in_flight.fetch_sub(1);
+            s_.calibration_wake.notify_all();
+        }
+        Call(const Call&) = delete;
+        Call& operator=(const Call&) = delete;
+        explicit operator bool() const noexcept { return lock_.owns_lock(); }
+
+    private:
+        Impl& s_;
+        std::unique_lock<std::mutex> lock_;
+    };
 
     // What a calibration depends on: the model, the cache and its key
     // scales (context_fingerprint), the kernels, the procedure's version,
@@ -970,7 +1156,7 @@ struct Engine::Impl {
         std::snprintf(name, sizeof name, "reuse-%016llx.bin", static_cast<unsigned long long>(id));
         return os::path_utf8(os::utf8_path(dir) / name);
     }
-    // A kept calibration: magic, version, id, met, fraction, KL, top-1.
+    // A kept calibration: magic, version, id, met, fraction, KL, top-1, bound.
     static constexpr char kReuseMagic[4] = {'L', 'Y', 'R', 'C'};
     bool read_reuse_calibration(const std::string& path, uint64_t id, bool& met) {
         std::ifstream in(os::utf8_path(path), std::ios::binary);
@@ -979,7 +1165,7 @@ struct Engine::Impl {
         uint64_t stored = 0;
         uint8_t ok = 0;
         float fraction = 0.0f;
-        double kl = 0.0, top1 = 0.0;
+        double kl = 0.0, top1 = 0.0, bound = 0.0;
         in.read(magic, sizeof magic);
         in.read(reinterpret_cast<char*>(&version), sizeof version);
         in.read(reinterpret_cast<char*>(&stored), sizeof stored);
@@ -987,6 +1173,7 @@ struct Engine::Impl {
         in.read(reinterpret_cast<char*>(&fraction), sizeof fraction);
         in.read(reinterpret_cast<char*>(&kl), sizeof kl);
         in.read(reinterpret_cast<char*>(&top1), sizeof top1);
+        in.read(reinterpret_cast<char*>(&bound), sizeof bound);
         if (!in || std::memcmp(magic, kReuseMagic, sizeof magic) != 0 || version != kReuseCalibrationVersion ||
             stored != id || !(fraction >= 0.0f && fraction <= 1.0f)) {
             return false;
@@ -995,6 +1182,7 @@ struct Engine::Impl {
         reuse_info.fraction = fraction;
         reuse_info.kl = kl;
         reuse_info.top1 = top1;
+        reuse_info.bound = bound;
         return true;
     }
     // Written through a temporary file; the directory keeps the
@@ -1016,6 +1204,7 @@ struct Engine::Impl {
             out.write(reinterpret_cast<const char*>(&reuse_info.fraction), sizeof reuse_info.fraction);
             out.write(reinterpret_cast<const char*>(&reuse_info.kl), sizeof reuse_info.kl);
             out.write(reinterpret_cast<const char*>(&reuse_info.top1), sizeof reuse_info.top1);
+            out.write(reinterpret_cast<const char*>(&reuse_info.bound), sizeof reuse_info.bound);
             if (!out) {
                 LIYAB_LOG_WARN("segment reuse: cannot write %s", tmp.c_str());
                 std::filesystem::remove(os::utf8_path(tmp), ec);
@@ -1615,6 +1804,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     LIYAB_LOG_INFO("engine ready in %.0f ms: attention on %s, FFN on %s, %d threads%s", ms_since(t_create),
                    route.attention->description().c_str(), route.ffn->description().c_str(),
                    impl->pool->max_threads(), impl->speculative ? ", speculative decoding" : "");
+    impl->start_calibration();
 
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
 }
@@ -1788,13 +1978,16 @@ Engine::PrefixCacheStats Engine::prefix_cache_stats() const {
     return impl_->prefix_stats;
 }
 
-Engine::SegmentReuseInfo Engine::segment_reuse() const { return impl_->reuse_info; }
+Engine::SegmentReuseInfo Engine::segment_reuse() const {
+    std::lock_guard<std::mutex> lock(impl_->reuse_info_mutex);
+    return impl_->reuse_info;
+}
 
 Status Engine::prefill(std::string_view text, bool add_bos) { return prefill(text, {}, add_bos); }
 
 Status Engine::prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
     LIYAB_RETURN_IF_ERROR(check_segments(segments, text.size(), text));
@@ -1898,8 +2091,8 @@ Status write_replacing(const std::string& path, const std::function<Status(std::
 }  // namespace
 
 Status Engine::save_state(const std::string& path) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
     return write_replacing(path, [&s](std::ostream& out) {
@@ -1911,8 +2104,8 @@ Status Engine::save_state(const std::string& path) {
 
 Status Engine::save_state(const std::string& path, std::string_view text) {
     {
-        std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-        if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+        const Impl::Call call(*impl_);
+        if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
         Impl& s = *impl_;
         if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
         const bool live = s.context_text_tokens > 0 && text.starts_with(s.context_text);
@@ -1987,8 +2180,8 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
 }
 
 Result<int32_t> Engine::load_state(const std::string& path) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
     s.clear_context();
@@ -2035,14 +2228,14 @@ Result<int32_t> Engine::load_state(const std::string& path) {
 }
 
 void Engine::reset_context() {
-    std::lock_guard<std::mutex> lock(impl_->busy);
+    const Impl::Call call(*impl_, /*wait=*/true);
     impl_->clear_context();
 }
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     auto tokens = impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     return generate_locked(*tokens, params, on_token, &prompt);
@@ -2050,8 +2243,8 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token, const ForceCallback& force) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     auto tokens = impl_->encode_continuation(prompt, params.add_bos);
     if (!tokens) return tokens.status();
     return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
@@ -2062,8 +2255,8 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
     if (options.grammar && options.continuation) {
         return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
     }
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size(), prompt));
     const Impl::Request request(*impl_, options.segments, /*tokens=*/false);
     auto tokens = impl_->request_reuse ? impl_->encode_segments(prompt, params.add_bos)
@@ -2075,8 +2268,8 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
 
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     return generate_locked(prompt, params, on_token, nullptr);
 }
 
@@ -2085,8 +2278,8 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     if (options.grammar && options.continuation) {
         return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
     }
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size()));
     const Impl::Request request(*impl_, options.segments, /*tokens=*/true);
     if (impl_->request_reuse) {
@@ -2609,8 +2802,8 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
                                                       const EmbedOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     Pooling pooling = options.pooling;
@@ -2663,8 +2856,8 @@ Result<std::vector<float>> Engine::rerank(std::string_view query, std::span<cons
                                           const RerankOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
-    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     const std::string& tmpl = options.prompt_template.empty() ? s.pooling.rerank_template : options.prompt_template;

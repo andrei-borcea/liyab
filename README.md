@@ -624,15 +624,26 @@ each of those as a scheduling problem.
     first two blocks again with the tokens around it; the share whose keys and values moved most there runs
     through the rest of the model, the others keep their reused rows. The whole span from the end of the exact
     prefix to the last reused token goes block by block, in passes in order, so each token sees every position
-    before it. The share is not a constant: at load the engine measures, on a fixed RAG-shaped text (a system
-    line and four documents stored in one order, then three questions asked after them in two other orders), the
-    smallest share of 5, 10, 15, 20, 30 or 45% whose next-token distributions stay within `segment_reuse_max_kl`
-    (default 0.02) of processing the whole prompt, and keeps it in `cache_dir`. A model that needs more is refused. `Engine::segment_reuse()`
-    gives the share and the calibration's KL and top-1, `GenerationStats` and `PrefixCacheStats` what was reused.
+    before it. The share is not a constant: the engine measures it per model on prompts shaped like real ones,
+    the documents of the corpus below in the model's own chat template: three prompts store them, four others
+    arrange 3 to 5 of them in other orders, each followed in turn by three questions about them. For each share
+    of 5, 10, 15, 20, 30 and 45% it takes the mean KL of the answers against processing the whole prompt, and a
+    bound above it (1.645 standard errors of the 12 questions' own means); it keeps the smallest share whose
+    bound, and every larger share's, is within `segment_reuse_max_kl` (default 0.02). With none, the model is
+    refused. `Engine::segment_reuse()` gives the share and the calibration's KL, bound and top-1,
+    `GenerationStats` and `PrefixCacheStats` what was reused.
+  * **Calibrated in the background.** Loading does not wait for the measurement: it runs once the engine has
+    been idle for 2 s, a stage (a few passes over one prompt's documents) at a time, on a context of its own
+    swapped in for the stage, so the conversation's context stays as it was. A call arriving meanwhile stops
+    the stage between two blocks, waiting a fraction of a second instead of getting `Busy`, and the stage runs
+    again at the next idle time. Until the measurement ends segment reuse is off: marked prompts are processed as
+    usual, and `Engine::segment_reuse()` reports `Busy` with its progress. The result is kept in `cache_dir`, so
+    the next engine has it at once (without one, every load measures again).
   * **Measured on the Mac** (`liyab-reuse`; CPU, Q8_0 cache with key scaling; on a Mac other jobs loaded heavily,
     so times are compared within each run). 8 prompts per model: the system prompt of a small company's
     assistant, 3–5 of its 12 documents in random order (77–80% of ~555 tokens) and a question, through the
-    model's chat template, after warm-up prompts had stored the documents in other orders. Quality against
+    model's chat template, after warm-up prompts had stored the documents in other orders. (The calibration
+    draws on the same corpus, in other arrangements.) Quality against
     processing the whole prompt, at the first answer token and each next one up to the end of the greedy answer
     (at most 33); the first token's time against the lossless path, the part before the first document restored
     from the prefix cache and the rest processed:
@@ -665,16 +676,26 @@ each of those as a scheduling problem.
     Qwen3-0.6B and 30% on Llama, and gives 0.030 and 0.013 where random tokens at 30% give 0.039 and 0.018.
     So the deviation at block 1 is the default (`liyab-reuse --criterion`, `--select-block` and `--first-tokens`
     measure the others).
-  * **The calibration** scores up to 102 answer tokens: its three questions share one pass over the documents
-    per order. With one question (34 tokens) its KL did not fall as the share grew (Qwen3-0.6B: 0.035, 0.035,
-    0.032, 0.037, 0.036 from 5 to 30%). Now, from 5 to 45%, Llama 3.2 1B gives 0.0097, 0.0081, 0.0077, 0.0071,
-    0.0060 and 0.0043, Qwen3-0.6B 0.029, 0.034, 0.027, 0.028, 0.025 and 0.019: at the default target Llama takes
-    5% and Qwen3-0.6B 45% (a target of 0.03 would take 5%). It costs about as much as processing 2,000 tokens
-    when the first share meets the target, 5,000 when every share is tried: 51 s on Llama 3.2 1B and 64 s on
-    Qwen3-0.6B (BF16 weights on the Mac's CPU), once per model and cache format. Its text is gentler than the
-    corpus above: Llama 3.2 1B has 0.0097 at 5% there, and 0.027 at 0% and 0.020 at 10% on the corpus, with or
-    without its chat template. So the target bounds that text, not every prompt, and the table above is the
-    guide for choosing it.
+  * **The calibration against the measurement.** The share the calibration keeps holds on the prompts measured
+    above (`liyab-reuse --calibrate 0.02` runs both), or the model is refused:
+
+    | Model | Kept at the default target | Calibration: mean KL (bound) | Measured above at that share |
+    | :--- | ---: | ---: | ---: |
+    | Llama 3.2 1B | 45% | 0.0120 (0.0160) | 0.0086 |
+    | Qwen3-0.6B | refused (45%, the largest) | 0.0364 (0.0543) | 0.0180 |
+    | Qwen3.5-0.8B | refused: hybrid | | |
+
+    Its prompts ask more than the measured ones. From 5 to 45% Llama's calibration gives 0.035, 0.027, 0.022,
+    0.019, 0.019 and 0.012 (bounds 0.045 to 0.016), where the measured prompts give 0.020 at 10% and 0.013 at
+    20%. Qwen3-0.6B's stays at 0.036–0.042 whatever the share, carried by a few of its 12 questions (at 45%,
+    0.14 and 0.07 for two of them, under 0.022 for seven), while the measured prompts fall to 0.018 at 45%. So
+    the share kept errs on the safe side: Llama 3.2 1B gets its first token 1.8× sooner at the default target,
+    where 20% (2.7×) would have stayed within it on the measured prompts. Earlier, with plain-text prompts, four
+    documents and one or three questions, the calibration was the gentler one (Llama 3.2 1B: 0.0097 at 5%
+    against 0.027 at 0% and 0.020 at 10% measured), which is why it now uses the model's chat template, the
+    corpus's numbered documents and a bound. It took 205 s of background work on Llama 3.2 1B and 90 s on
+    Qwen3-0.6B (BF16 weights on the Mac's CPU), about as much as processing 15,000 tokens, once per model and
+    cache format.
   * **Hybrid models are refused**, with the reason in `Engine::segment_reuse()`: their recurrent blocks must run
     over the whole prompt in order, so every token still goes through every block, and reusing the attention
     blocks' keys and values would skip only their key and value projections (1.3% of a prompt token's matrix work
@@ -1012,7 +1033,7 @@ any of them anywhere reuses their KV instead of processing them again.
 
 ```cpp
 config.prefix_cache_mb = 256;
-config.segment_reuse = true;       // calibrated once per model at load, kept in config.cache_dir
+config.segment_reuse = true;       // calibrated once per model in the background (off until then), kept in config.cache_dir
 liyab::GenerateOptions options;
 for (const std::string& doc : documents) {  // byte ranges of the documents in the rendered prompt
     const size_t at = prompt.find(doc);
@@ -1057,7 +1078,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_save_state` / `_load_state` | Persist and restore the context across processes |
 | `liyab_engine_save_state_of` | Persist the context a text continues, also one the prefix cache set aside |
 | `liyab_engine_prefix_cache_stats` | What the prefix cache holds (RAM, storage, chunks, contexts, segments) and how it was used (thread-safe) |
-| `liyab_engine_generate_segmented` / `_prefill_segmented` / `_segment_reuse` | Segment reuse (opt-in, lossy): generation and prefill with marked parts of the prompt; whether it is on, and its calibrated share |
+| `liyab_engine_generate_segmented` / `_prefill_segmented` / `_segment_reuse` | Segment reuse (opt-in, lossy): generation and prefill with marked parts of the prompt; whether it is on and its calibrated share, or how far its background calibration got (`LIYAB_ERR_BUSY` until it ends) |
 | `liyab_engine_trim_memory` / `_warm_memory` | Give the expert cache back while idle / refill it from its hot list |
 | `liyab_engine_save_expert_profile` / `_load_expert_profile` | Carry the expert hot list to a later process |
 | `liyab_engine_memory_plan` / `_context_length` | How the model uses memory; the resolved context length |
@@ -1826,7 +1847,7 @@ interpreter: `describe_model_registry`.
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; segments kept as contexts no prompt's chain reaches, found by their tokens whatever position they were computed at, the most recently used copy first, a segment that starts another kept apart, on storage for a later store |
-| `test_kv_reuse` | KV reused away from its prefix: rows copied out of and into any positions bit for bit (values in keys too); keys moved to other positions equal to the keys computed there, within two rounding steps, for every RoPE variant (adjacent and half pairs, partial rotation, `rope_freqs` with linear scaling, YaRN, LongRoPE, Q/K norms after RoPE, windowed and global RoPE tables, latent attention's RoPE key) and every cache format, key scales included, with values, unrotated latents and moves by 0 keeping their bits; blocks run at scattered positions giving the rows and logits of a whole pass bit for bit (dense, windowed, latent attention, MoE); hybrid models and sliding-window caches refused; segments reused with every token recomputed giving a full prefill's rows and logits bit for bit for every criterion (dense, key-scaled, windowed, latent attention), stored in chunks of one, two and four pages and starting inside a page, a copy reused where it was computed needing none, a damaged copy processed instead; a segment's tokens the same wherever it appears, BOS outside it, malformed ranges refused; through the engine: segments kept and reused elsewhere, one longer than two of the store's chunks reused whole, a request that marks none getting a fresh context's reply (the reused rows processed again, set aside and saved only up to the first one, restored state included), refusals with their reasons (off, no prefix cache, a hybrid model, a target never met, read back from `cache_dir`) leaving marked prompts exact; the calibration's smallest share within its target (a question-guided criterion with a pass per question); the C API |
+| `test_kv_reuse` | KV reused away from its prefix: rows copied out of and into any positions bit for bit (values in keys too); keys moved to other positions equal to the keys computed there, within two rounding steps, for every RoPE variant (adjacent and half pairs, partial rotation, `rope_freqs` with linear scaling, YaRN, LongRoPE, Q/K norms after RoPE, windowed and global RoPE tables, latent attention's RoPE key) and every cache format, key scales included, with values, unrotated latents and moves by 0 keeping their bits; blocks run at scattered positions giving the rows and logits of a whole pass bit for bit (dense, windowed, latent attention, MoE); hybrid models and sliding-window caches refused; segments reused with every token recomputed giving a full prefill's rows and logits bit for bit for every criterion (dense, key-scaled, windowed, latent attention), stored in chunks of one, two and four pages and starting inside a page, a copy reused where it was computed needing none, a damaged copy processed instead; a segment's tokens the same wherever it appears, BOS outside it, malformed ranges refused; through the engine: segments kept and reused elsewhere, one longer than two of the store's chunks reused whole, a request that marks none getting a fresh context's reply (the reused rows processed again, set aside and saved only up to the first one, restored state included), refusals with their reasons (off, no prefix cache, a hybrid model, a target never met, read back from `cache_dir`) leaving marked prompts exact; the calibration in stages, stopped and resumed, keeping the smallest share whose bound, and every larger share's, is within its target (a question-guided criterion with a pass per question); in the background: the engine created at once, marked prompts processed as usual until the calibration ends, a call stopping it without `Busy` and finding its context as it left it, the result read back from `cache_dir`, an engine closed while it runs; the C API (`Busy` while calibrating) |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
@@ -1920,8 +1941,10 @@ Benchmarks and tools built with the tests:
   to the first token. `--criterion`, `--select-block`, `--refine`, `--first-tokens` and `--absolute` select how
   the recomputed tokens are chosen, `--no-numbers` leaves the documents unnumbered and `--dump` prints the
   positions that moved most. `--shift D` measures turning keys alone (a text's rows moved D positions away and
-  back), `--calibrate KL` runs the engine's calibration; a hybrid model is refused with the share of a prompt
-  token's work reusing its attention blocks' keys and values would skip.
+  back). `--calibrate KL` runs the engine's calibration against that target (with its questions' own KL), then
+  measures the share it kept (the largest when it refuses) on the tool's own prompts and prints both; a hybrid
+  model is refused with the share of a prompt token's work reusing its attention blocks' keys and values would
+  skip.
 
   ```bash
   build/liyab-reuse -m Qwen3-0.6B-BF16.gguf --prompts 8 --fractions 0,0.1,0.2,0.3
