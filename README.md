@@ -1851,11 +1851,14 @@ Benchmarks and tools built with the tests:
   template). Documents are first stored by warm-up prompts; each measured prompt is then answered from a full
   prefill (the reference, and its greedy answer), with the part before the first document taken as restored
   (lossless), and with the documents reused at each recompute share of `--fractions`. It reports KL(full ||
-  reuse) over the whole vocabulary and the top-1 agreement at the first answer token and the next `--answer`
-  ones (teacher-forced on the reference's answer), and the times to the first token. `--criterion`,
-  `--select-block`, `--first-tokens` and `--absolute` select how the recomputed tokens are chosen; `--shift D`
-  measures turning keys alone (a text's rows moved D positions away and back); a hybrid model is refused with
-  the share of a prompt token's work reusing its attention blocks' keys and values would skip.
+  reuse) over the whole vocabulary and the top-1 agreement at the first answer token and each next one up to
+  the reference answer's end of generation (at most `--answer`, teacher-forced on the reference), how many
+  greedy answers come out the same, and the times to the first token. `--criterion`, `--select-block`,
+  `--refine`, `--first-tokens` and `--absolute` select how the recomputed tokens are chosen, `--no-numbers`
+  leaves the documents unnumbered and `--dump` prints the positions that moved most. `--shift D` measures
+  turning keys alone (a text's rows moved D positions away and back), `--calibrate KL` runs the engine's
+  calibration; a hybrid model is refused with the share of a prompt token's work reusing its attention blocks'
+  keys and values would skip.
 
   ```bash
   build/liyab-reuse -m Qwen3-0.6B-BF16.gguf --prompts 8 --fractions 0,0.1,0.2,0.3

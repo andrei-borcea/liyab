@@ -101,6 +101,10 @@ struct ReuseSettings {
     int32_t select_block = 1;
     // Deviation: each row's change relative to its size (true) or absolute.
     bool relative = true;
+    // Deviation: blocks after select_block that narrow the selection again
+    // (gradual filtering): at select_block the share kept is fraction x 2^refine,
+    // halved at each of the next `refine` blocks, measured anew at each.
+    int32_t refine = 0;
     // The first tokens of each reused segment, recomputed whatever the
     // criterion picks (they lean the most on what precedes them).
     int32_t first_tokens = 0;

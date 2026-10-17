@@ -19,15 +19,19 @@
 // Time to the first token is the prompt's processing plus the step that
 // gives the first token's logits. Quality is the KL divergence KL(full ||
 // reuse) over the whole vocabulary and the top-1 agreement at the first
-// answer token and at each of the next --answer tokens, teacher-forced on
-// the full path's greedy answer.
+// answer token and at each next one up to the full path's greedy answer's
+// end of generation (at most --answer of them), teacher-forced on that
+// answer; and how many greedy answers come out the same (top-1 everywhere).
+// --dump prints the positions that moved most; --no-numbers leaves the
+// documents unnumbered.
 //
 // --shift D measures the turning alone: the rows of a text's first part are
 // moved D positions away and back (two moves, each rounding a quantized key
 // again), and the rest of the text is processed on them; the KL against the
-// unmoved context bounds what moving costs. Hybrid models are refused (see
-// Transformer::reuse_support), with the share of a prompt's work reusing
-// their attention blocks' keys and values would skip.
+// unmoved context bounds what moving costs. --calibrate KL runs the engine's
+// calibration (kv_reuse.h) against that target. Hybrid models are refused
+// (see Transformer::reuse_support), with the share of a prompt's work
+// reusing their attention blocks' keys and values would skip.
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS), CPU backend.
 #include <algorithm>
@@ -171,13 +175,13 @@ struct Builder {
     const ChatTemplate* chat = nullptr;
     jinja::Value special;
     bool thinking_off = false;
+    bool numbered = true;  // "Document N:" before each document
 
     Result<Prompt> build(const std::vector<size_t>& docs, size_t question) const {
         std::string system = kSystem;
         for (size_t i = 0; i < docs.size(); ++i) {
-            system += "\n\nDocument ";
-            system += std::to_string(i + 1);
-            system += ":\n";
+            system += "\n\n";
+            if (numbered) system += "Document " + std::to_string(i + 1) + ":\n";
             system += kDocs[docs[i]];
         }
         Prompt p;
@@ -253,6 +257,7 @@ struct Tally {
     double first_kl = 0.0;
     int64_t first_agree = 0;
     double ttft = 0.0;
+    int64_t identical = 0;  // prompts whose greedy answer is the reference's
     int64_t reused = 0, recomputed = 0, computed = 0;
     double rows_ms = 0.0, blend_ms = 0.0;
 };
@@ -262,7 +267,7 @@ int usage() {
                  "usage: liyab-reuse -m model.gguf [--kv f16|q8_0|q4_0|q4_1] [--threads N] [--prompts N]\n"
                  "                   [--fractions F,F,...] [--criterion deviation|first|random] [--select-block B]\n"
                  "                   [--first-tokens K] [--absolute] [--answer N] [--seed S] [--plain]\n"
-                 "                   [--shift D] [--no-key-scaling]\n");
+                 "                   [--shift D] [--no-key-scaling] [--calibrate MAX_KL] [--dump] [--no-numbers]\n");
     return 2;
 }
 
@@ -272,8 +277,9 @@ int main(int argc, char** argv) {
     std::string model_path;
     KvCacheType kv_type = KvCacheType::Q8_0;
     int32_t threads = 0, prompts = 8, answer = 32, shift = 0;
+    double calibrate = -1.0;  // >= 0: run the engine's calibration against this target
     uint64_t seed = 7;
-    bool plain = false, key_scaling = true;
+    bool plain = false, key_scaling = true, dump = false, numbered = true;
     std::vector<float> fractions = {0.0f, 0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.5f, 1.0f};
     ReuseSettings settings;
     for (int i = 1; i < argc; ++i) {
@@ -292,10 +298,14 @@ int main(int argc, char** argv) {
         else if (arg == "--answer") answer = std::atoi(next());
         else if (arg == "--seed") seed = std::strtoull(next(), nullptr, 10);
         else if (arg == "--plain") plain = true;
+        else if (arg == "--dump") dump = true;
+        else if (arg == "--no-numbers") numbered = false;
         else if (arg == "--shift") shift = std::atoi(next());
+        else if (arg == "--calibrate") calibrate = std::atof(next());
         else if (arg == "--no-key-scaling") key_scaling = false;
         else if (arg == "--select-block") settings.select_block = std::atoi(next());
         else if (arg == "--first-tokens") settings.first_tokens = std::atoi(next());
+        else if (arg == "--refine") settings.refine = std::atoi(next());
         else if (arg == "--absolute") settings.relative = false;
         else if (arg == "--criterion") {
             const std::string v = next();
@@ -413,6 +423,18 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // --- The engine's calibration ------------------------------------------------
+    if (calibrate >= 0.0) {
+        auto r = calibrate_reuse(*model, *tokenizer, settings, calibrate, run.route, pool, run.chunk);
+        if (!r) {
+            std::fprintf(stderr, "calibration: %s\n", r.status().to_string().c_str());
+            return 1;
+        }
+        std::printf("calibration against KL %.4f: %s at %.0f%% recomputed, KL %.5f, top-1 %.1f%%, %.0f ms\n", calibrate,
+                    r->met ? "met" : "not met", 100.0 * r->fraction, r->kl, 100.0 * r->top1, r->ms);
+        return 0;
+    }
+
     // --- RAG prompts -----------------------------------------------------------
     std::optional<ChatTemplate> chat;
     Builder builder;
@@ -433,6 +455,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    builder.numbered = numbered;
     std::printf("prompts: %s, %d measured, %d answer tokens scored after the first\n",
                 builder.chat != nullptr ? "the model's chat template" : "plain text", prompts, answer);
 
@@ -504,15 +527,17 @@ int main(int argc, char** argv) {
         auto first = run.step(tokens.back());
         if (!first) return 1;
         full_ttft += ms_since(t0);
+        // The greedy answer, up to its end of generation (included: whether
+        // and where the answer ends is part of what reuse may change).
         std::vector<std::vector<double>> ref = {log_probs(*first)};
         std::vector<int32_t> said = {static_cast<int32_t>(argmax(*first))};
-        for (int32_t a = 0; a < answer; ++a) {
+        while (static_cast<int32_t>(said.size()) <= answer && !tokenizer->is_end_of_generation(said.back())) {
             auto next = run.step(said.back());
             if (!next) return 1;
             ref.push_back(log_probs(*next));
             said.push_back(static_cast<int32_t>(argmax(*next)));
         }
-        said.pop_back();  // the answer tokens fed back: `answer` of them
+        said.pop_back();  // the answer tokens fed back: one per scored position after the first
 
         // Prefix only (lossless): the part before the first document restored.
         model->reset();
@@ -548,44 +573,63 @@ int main(int argc, char** argv) {
             t.rows_ms += reused->rows_ms;
             t.blend_ms += reused->blend_ms;
             std::vector<std::vector<double>> mine = {log_probs(*got)};
-            auto rows = model->forward(said, Transformer::Logits::All, run.route, pool);
-            if (!rows) return 1;
-            const auto vocab = static_cast<size_t>(c.n_vocab);
-            for (int32_t a = 0; a < answer; ++a) {
-                mine.push_back(log_probs(std::span<const float>(rows->data() + static_cast<size_t>(a) * vocab, vocab)));
+            if (!said.empty()) {
+                auto rows = model->forward(said, Transformer::Logits::All, run.route, pool);
+                if (!rows) return 1;
+                const auto vocab = static_cast<size_t>(c.n_vocab);
+                for (size_t a = 0; a < said.size(); ++a) {
+                    mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
+                }
+            }
+            bool identical = true;  // the greedy answer this path gives is the reference's
+            if (dump && f == 0) {
+                std::string text;
+                for (size_t a = 0; a < said.size(); ++a) text += tokenizer->piece(said[a]);
+                std::printf("prompt %d (docs", i);
+                for (const size_t d : docs) std::printf(" %zu", d);
+                std::printf(", question %zu): \"%s\"\n", question, text.c_str());
             }
             for (size_t p = 0; p < mine.size(); ++p) {
                 const double k = kl(ref[p], mine[p]);
-                const bool same = std::max_element(ref[p].begin(), ref[p].end()) - ref[p].begin() ==
-                                  std::max_element(mine[p].begin(), mine[p].end()) - mine[p].begin();
+                const auto ref_best = static_cast<int32_t>(std::max_element(ref[p].begin(), ref[p].end()) - ref[p].begin());
+                const auto my_best = static_cast<int32_t>(std::max_element(mine[p].begin(), mine[p].end()) - mine[p].begin());
+                const bool same = ref_best == my_best;
+                if (dump && f == 0 && k > 0.05) {
+                    std::printf("  position %zu: KL %.3f, '%s' %.2f here -> '%s' %.2f reused\n", p, k,
+                                tokenizer->piece(ref_best).c_str(), std::exp(ref[p][static_cast<size_t>(ref_best)]),
+                                tokenizer->piece(my_best).c_str(), std::exp(mine[p][static_cast<size_t>(my_best)]));
+                }
                 t.kl_sum += k;
                 t.kls.push_back(k);
                 t.agree += same;
+                identical = identical && same;
                 ++t.positions;
                 if (p == 0) {
                     t.first_kl += k;
                     t.first_agree += same;
                 }
             }
+            t.identical += identical;
         }
         std::fprintf(stderr, "\r%d / %d prompts", i + 1, prompts);
     }
     std::fprintf(stderr, "\n");
     const char* names[] = {"deviation", "first", "random"};
-    std::printf("criterion %s (select block %d, %s, first tokens %d); %.0f tokens per prompt, %.0f%% of them in documents\n",
+    std::printf("criterion %s (select block %d, %s, first tokens %d, refine %d); %.0f tokens per prompt, %.0f%% of them in documents\n",
                 names[static_cast<int>(settings.criterion)], settings.select_block,
-                settings.relative ? "relative" : "absolute", settings.first_tokens,
+                settings.relative ? "relative" : "absolute", settings.first_tokens, settings.refine,
                 static_cast<double>(prompt_tokens) / prompts, 100.0 * static_cast<double>(doc_tokens) / static_cast<double>(prompt_tokens));
     std::printf("time to first token: full %.1f ms, prefix restored %.1f ms\n\n", full_ttft / prompts,
                 prefix_ttft / prompts);
-    std::printf("fraction | KL mean  median   p95      max      | top-1  | first token KL top-1 | TTFT ms  vs prefix | reused recomputed | rows ms blend ms\n");
+    std::printf("fraction | KL mean  median   p95      max      | top-1  | same answer | first token KL top-1 | TTFT ms  vs prefix | reused recomputed | rows ms blend ms\n");
     for (size_t f = 0; f < fractions.size(); ++f) {
         Tally& t = tallies[f];
         std::sort(t.kls.begin(), t.kls.end());
         const auto np = static_cast<double>(t.positions);
-        std::printf("%8.2f | %.5f %.5f %.5f %.5f | %5.1f%% | %.5f %5.1f%%       | %8.1f %5.2fx    | %6.0f %6.0f     | %6.1f %8.1f\n",
+        std::printf("%8.2f | %.5f %.5f %.5f %.5f | %5.1f%% | %3d of %3d  | %.5f %5.1f%%       | %8.1f %5.2fx    | %6.0f %6.0f     | %6.1f %8.1f\n",
                     fractions[f], t.kl_sum / np, t.kls[t.kls.size() / 2], t.kls[static_cast<size_t>(0.95 * (np - 1))],
-                    t.kls.back(), 100.0 * static_cast<double>(t.agree) / np, t.first_kl / prompts,
+                    t.kls.back(), 100.0 * static_cast<double>(t.agree) / np, static_cast<int>(t.identical), prompts,
+                    t.first_kl / prompts,
                     100.0 * static_cast<double>(t.first_agree) / prompts, t.ttft / prompts, prefix_ttft / t.ttft,
                     static_cast<double>(t.reused) / prompts, static_cast<double>(t.recomputed) / prompts,
                     t.rows_ms / prompts, t.blend_ms / prompts);

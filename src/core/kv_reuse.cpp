@@ -196,7 +196,13 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         result.reused += filled[static_cast<size_t>(p - exact)];
     }
     result.computed = static_cast<int32_t>(active.size()) - result.reused;
-    const auto keep = static_cast<int32_t>(std::lround(settings.fraction * static_cast<float>(result.reused)));
+    // Reused positions kept at a selection: `fraction` of them in the end,
+    // twice as many at each refining block before (Deviation).
+    auto kept_at = [&](int32_t step) {
+        const double share = std::min(1.0, static_cast<double>(settings.fraction) * std::ldexp(1.0, step));
+        return static_cast<int32_t>(std::lround(share * static_cast<double>(result.reused)));
+    };
+    int32_t keep = kept_at(0);
     // Positions recomputed whatever the criterion: the first tokens of each segment.
     std::vector<uint8_t> forced(active.size(), 0);
     for (const Use& u : uses) {
@@ -279,7 +285,10 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
             return fail(Status(ErrorCode::Cancelled, "segment reuse cancelled"));
         }
         const int32_t slot = model.kv_slot_of(layer);
-        const bool select = settings.criterion == ReuseCriterion::Deviation && layer == select_block && slot >= 0;
+        const int32_t refine = std::clamp(settings.refine, 0, cfg.n_layers - 1 - select_block);
+        const bool select = settings.criterion == ReuseCriterion::Deviation && layer >= select_block &&
+                            layer <= select_block + refine && slot >= 0;
+        if (select) keep = kept_at(select_block + refine - layer);
         if (select) {
             before.assign(active.size() * static_cast<size_t>(heads) * row * 2, 0);
             for (size_t i = 0; i < active.size(); ++i) {
@@ -445,10 +454,12 @@ Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& to
         if (Status s = prefill(std::span(c.tokens).first(c.tokens.size() - 1)); !s.is_ok()) return finish(s);
         auto dist = step(c.tokens.back());
         if (!dist) return finish(dist.status());
+        // Up to the answer's end of generation, included: where it ends is part
+        // of what reuse may change; what a model says past it is not an answer.
         for (int32_t a = 0; a <= kCalibrationAnswer; ++a) {
             const auto best = static_cast<int32_t>(std::max_element(dist->begin(), dist->end()) - dist->begin());
             c.reference.push_back(std::move(dist).value());
-            if (a == kCalibrationAnswer) break;
+            if (a == kCalibrationAnswer || tokenizer.is_end_of_generation(best)) break;
             c.answer.push_back(best);
             dist = step(best);
             if (!dist) return finish(dist.status());
@@ -477,10 +488,12 @@ Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& to
             auto first = step(c.tokens.back());
             if (!first) return finish(first.status());
             std::vector<std::vector<double>> mine = {std::move(first).value()};
-            auto rows = model.forward(c.answer, Transformer::Logits::All, route, pool);
-            if (!rows) return finish(rows.status());
-            for (size_t a = 0; a < c.answer.size(); ++a) {
-                mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
+            if (!c.answer.empty()) {
+                auto rows = model.forward(c.answer, Transformer::Logits::All, route, pool);
+                if (!rows) return finish(rows.status());
+                for (size_t a = 0; a < c.answer.size(); ++a) {
+                    mine.push_back(log_probs(std::span<const float>(rows->data() + a * vocab, vocab)));
+                }
             }
             for (size_t p = 0; p < mine.size(); ++p) {
                 const std::vector<double>& ref = c.reference[p];
