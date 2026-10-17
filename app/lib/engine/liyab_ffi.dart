@@ -97,6 +97,45 @@ final class LiyabEngineConfig extends Struct {
   external Pointer<Utf8> cacheDir;
   @Int32()
   external int suffixDrafts;
+  @Int32()
+  external int poolingKvCacheType;
+}
+
+/// liyab_pooling: what a model does with its final hidden states (liyab_engine_pooling).
+abstract final class LiyabPooling {
+  static const auto = -1;
+  static const none = 0; // a generative model
+  static const mean = 1;
+  static const cls = 2;
+  static const last = 3; // embedding models such as Qwen3-Embedding
+  static const rank = 4; // rerankers such as Qwen3-Reranker
+}
+
+final class LiyabEmbedParams extends Struct {
+  @Int32()
+  external int pooling;
+  @Int32()
+  external int dimensions;
+  @Int32()
+  external int normalize;
+  @Int32()
+  external int truncate;
+}
+
+final class LiyabRerankParams extends Struct {
+  external Pointer<Utf8> promptTemplate;
+  external Pointer<Pointer<Utf8>> labels;
+  @Size()
+  external int nLabels;
+}
+
+final class LiyabPoolingStats extends Struct {
+  @Int32()
+  external int tokens;
+  @Int32()
+  external int reusedTokens;
+  @Double()
+  external double ms;
 }
 
 final class LiyabSamplingParams extends Struct {
@@ -340,7 +379,24 @@ final class LiyabLib {
                 Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
                 Pointer<Void>,
                 Pointer<LiyabGenerationStats>,
-                Pointer<LiyabGrammarStats>)>('liyab_engine_generate_structured');
+                Pointer<LiyabGrammarStats>)>('liyab_engine_generate_structured'),
+        embedParamsDefault = lib.lookupFunction<Void Function(Pointer<LiyabEmbedParams>),
+            void Function(Pointer<LiyabEmbedParams>)>('liyab_embed_params_default'),
+        rerankParamsDefault = lib.lookupFunction<Void Function(Pointer<LiyabRerankParams>),
+            void Function(Pointer<LiyabRerankParams>)>('liyab_rerank_params_default'),
+        pooling = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>('liyab_engine_pooling'),
+        embeddingSize = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
+            'liyab_engine_embedding_size'),
+        embed = lib.lookupFunction<
+            Int32 Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<Size>, Size, Pointer<LiyabEmbedParams>,
+                Pointer<Float>, Size, Pointer<LiyabPoolingStats>),
+            int Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<Size>, int, Pointer<LiyabEmbedParams>,
+                Pointer<Float>, int, Pointer<LiyabPoolingStats>)>('liyab_engine_embed'),
+        rerank = lib.lookupFunction<
+            Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, Size,
+                Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, int,
+                Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>)>('liyab_engine_rerank');
 
   /// libliyab.so from the APK on Android; linked into the app on iOS.
   static final LiyabLib instance =
@@ -404,6 +460,18 @@ final class LiyabLib {
       Pointer<Void>,
       Pointer<LiyabGenerationStats>,
       Pointer<LiyabGrammarStats>) generateStructured;
+
+  /// Pooling models (embeddings, reranking): parameter defaults, what the loaded model pools (LiyabPooling) and
+  /// its vector size, and the blocking calls (texts as UTF-8 pointers with byte lengths; vectors written one after
+  /// another, scores one per document). See liyab_engine_embed / liyab_engine_rerank.
+  final void Function(Pointer<LiyabEmbedParams>) embedParamsDefault;
+  final void Function(Pointer<LiyabRerankParams>) rerankParamsDefault;
+  final int Function(Pointer<Void>) pooling;
+  final int Function(Pointer<Void>) embeddingSize;
+  final int Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<Size>, int, Pointer<LiyabEmbedParams>,
+      Pointer<Float>, int, Pointer<LiyabPoolingStats>) embed;
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, int,
+      Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>) rerank;
 
   /// Why grammar text does not compile (null when it does).
   String? grammarError(String text) => using((arena) {

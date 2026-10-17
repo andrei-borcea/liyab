@@ -114,6 +114,16 @@ public:
     // only) and attention-head masking.
     Result<std::span<const float>> forward(std::span<const int32_t> tokens, Logits logits, const Route& route,
                                            ThreadPool& pool, const ForwardHooks* hooks = nullptr);
+    // Pooling models (embeddings, ranking heads; core/pooling.h): the final
+    // hidden states of rows `rows` of the last forward() pass (indices into
+    // its tokens), after the output norm and before the LM head, n_embd floats
+    // each, written in order to `out` (at least rows.size() * n_embd floats).
+    // A pass leaves its residual stream in place whatever logits it returned,
+    // so this costs one norm per row and no pass of its own, and gives the
+    // very values the LM head multiplies. Valid until the next forward(), not
+    // after one that exited early. InvalidArgument for a row outside the last
+    // pass or a short `out`.
+    Status final_hidden(std::span<const int32_t> rows, std::span<float> out) const;
     // Block after which the last forward() exited early, or -1.
     [[nodiscard]] int32_t last_exit_layer() const noexcept { return last_exit_layer_; }
     // FFN blocks skipped by ForwardHooks::ffn_skip during the last forward().

@@ -141,6 +141,21 @@ struct TinyModelSpec {
     // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
+
+    // Pooling models (core/pooling.h), off by default like the features above:
+    // only metadata and tensors of their own, drawn from a generator of their
+    // own, so the other weights stay those of the same spec without them.
+    int32_t pooling_type = -1;            // >= 0: <arch>.pooling_type
+    int32_t add_eos = -1;                 // >= 0: tokenizer.ggml.add_eos_token (nonzero: true)
+    std::vector<std::string> cls_labels;  // non-empty: <arch>.classifier.output_labels
+    // > 0: a ranking head cls.output.weight of this many rows (in output_type):
+    // the output head's rows of the tokens in cls_rows_from when given (its
+    // size must be cls_rows), else random.
+    int32_t cls_rows = 0;
+    std::vector<int32_t> cls_rows_from;
+    bool cls_bias = false;          // cls.output.bias
+    bool cls_dense = false;         // cls.weight: a two-layer head (refused by the engine)
+    std::string rerank_template;    // non-empty: tokenizer.chat_template.rerank
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

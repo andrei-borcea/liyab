@@ -1,8 +1,10 @@
 // The local API: prompt building, reasoning and stop sequences, and the
-// OpenAI, Anthropic and gRPC front ends over real sockets with a scripted model.
+// OpenAI, Anthropic, rerank and gRPC front ends over real sockets with a
+// scripted model (embeddings and reranking with a scripted pooling model).
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grpc/grpc.dart' as grpc;
@@ -12,6 +14,7 @@ import 'package:liyab/api/local_api.dart';
 import 'package:liyab/api/tool_calls.dart';
 import 'package:liyab/chat/chat_template.dart';
 import 'package:liyab/engine/engine_service.dart';
+import 'package:liyab/engine/liyab_ffi.dart' show LiyabPooling;
 import 'package:protobuf/protobuf.dart';
 
 /// Replies with `pieces`, then GenerationDone; records prompts and stops.
@@ -35,6 +38,51 @@ class FakeBackend implements ApiBackend {
   @override
   String? grammarError(String grammar) =>
       grammar.contains('"pattern"') ? "JSON schema at #/properties/x: keyword 'pattern' is not supported" : null;
+
+  // A pooling model, scripted: each text's vector is [its length, its first code unit, 1, 2, ...] cut to
+  // `dimensions`, and a document's score the share of the query's words it contains. Calls are recorded.
+  @override
+  int pooling = LiyabPooling.none;
+  final embedCalls = <(List<String>, int)>[];
+  final rerankCalls = <(String, List<String>)>[];
+  String? poolingError; // set: the engine refuses the call with this message
+  Duration poolingDelay = Duration.zero; // a call's time, unless abandoned first
+  var abandons = 0;
+
+  // As EngineService: an abandoned call stops at once and fails.
+  Future<void> _work(Future<void>? abandoned) async {
+    var gone = false;
+    await Future.any([Future<void>.delayed(poolingDelay), if (abandoned != null) abandoned.then((_) => gone = true)]);
+    if (gone) {
+      ++abandons;
+      throw EngineException('cancelled');
+    }
+  }
+
+  @override
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned}) async {
+    embedCalls.add((texts, dimensions));
+    await _work(abandoned);
+    if (poolingError != null) throw EngineException(poolingError!);
+    final size = dimensions > 0 ? dimensions : 4;
+    return Embeddings([
+      for (final t in texts)
+        Float32List.fromList([
+          for (var j = 0; j < size; ++j) j == 0 ? t.length.toDouble() : (j == 1 ? (t.isEmpty ? 0.0 : t.codeUnitAt(0).toDouble()) : j - 1.0)
+        ]),
+    ], texts.fold(0, (n, t) => n + t.length));
+  }
+
+  @override
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned}) async {
+    rerankCalls.add((query, documents));
+    await _work(abandoned);
+    if (poolingError != null) throw EngineException(poolingError!);
+    final words = query.toLowerCase().split(' ');
+    return RerankScores([
+      for (final d in documents) words.where(d.toLowerCase().contains).length / words.length,
+    ], query.length * documents.length + documents.fold(0, (n, d) => n + d.length));
+  }
 
   bool loaded = true; // false: released while idle, as after a start without a window
   @override
@@ -545,6 +593,163 @@ t1 ::= "now>\n" ""''');
       final (noFormat, message) = await call('POST', '/v1/chat/completions', body: ask({'tools': openAiTools([clock])}));
       expect(noFormat, 400);
       expect(jsonDecode(message)['error']['message'], contains('tool-call format'));
+    });
+
+    test('OpenAI embeddings: one call for all inputs, floats or base64, dimensions, usage; what is refused', () async {
+      backend.pooling = LiyabPooling.last;
+      final (status, body) = await call('POST', '/v1/embeddings', body: {'model': 'any', 'input': 'Hello'});
+      expect(status, 200);
+      final o = jsonDecode(body) as Map<String, Object?>;
+      expect(o['object'], 'list');
+      expect(o['model'], 'test-model.gguf');
+      expect(o['data'], [
+        {
+          'object': 'embedding',
+          'index': 0,
+          'embedding': [5.0, 72.0, 1.0, 2.0],
+        },
+      ]);
+      expect(o['usage'], {'prompt_tokens': 5, 'total_tokens': 5});
+      expect(backend.embedCalls.single.$1, ['Hello']);
+      expect(backend.embedCalls.single.$2, 0);
+
+      // A batch in one call; base64 as the official clients ask: float32, little-endian.
+      final (_, encoded) = await call('POST', '/v1/embeddings',
+          body: {'input': ['ab', 'Query: c', ''], 'encoding_format': 'base64', 'dimensions': 3});
+      expect(backend.embedCalls.last.$1, ['ab', 'Query: c', '']);
+      expect(backend.embedCalls.last.$2, 3);
+      final data = (jsonDecode(encoded)['data'] as List).cast<Map<String, Object?>>();
+      expect([for (final d in data) d['index']], [0, 1, 2]);
+      List<double> floats(Object? b64) => Float32List.view(Uint8List.fromList(base64Decode(b64 as String)).buffer);
+      expect(floats(data[0]['embedding']), [2.0, 97.0, 1.0]);
+      expect(floats(data[1]['embedding']), [8.0, 81.0, 1.0]);
+      expect(floats(data[2]['embedding']), [0.0, 0.0, 1.0]);
+
+      for (final bad in [
+        {'input': <String>[]},
+        {'input': [1, 2, 3]},
+        {'input': 7},
+        <String, Object?>{},
+        {'input': 'x', 'encoding_format': 'int8'},
+        {'input': 'x', 'dimensions': 0},
+        {'input': 'x', 'dimensions': 'many'},
+      ]) {
+        final (code, error) = await call('POST', '/v1/embeddings', body: bad);
+        expect(code, 400, reason: '$bad');
+        expect(jsonDecode(error)['error']['type'], 'invalid_request_error');
+      }
+      backend.poolingError = 'input 0 has 9000 tokens; the context holds 4096';
+      final (tooLong, why) = await call('POST', '/v1/embeddings', body: {'input': 'x'});
+      expect(tooLong, 400);
+      expect(jsonDecode(why)['error']['message'], contains('9000 tokens'));
+      backend.poolingError = null;
+      expect((await call('POST', '/v1/embeddings', body: {'input': 'x'}, headers: const {})).$1, 401);
+
+      // An embedding model writes no text; other models do not embed.
+      final (chat, refusal) = await call('POST', '/v1/chat/completions', body: {
+        'messages': [
+          {'role': 'user', 'content': 'Hi'},
+        ],
+      });
+      expect(chat, 400);
+      expect(jsonDecode(refusal)['error']['message'], contains('/v1/embeddings'));
+      expect(backend.prompts, isEmpty);
+      backend.pooling = LiyabPooling.rank;
+      final (ranker, rankerWhy) = await call('POST', '/v1/embeddings', body: {'input': 'x'});
+      expect(ranker, 400);
+      expect(jsonDecode(rankerWhy)['error']['message'], contains('/v1/rerank'));
+      backend.pooling = LiyabPooling.none;
+      final (generative, generativeWhy) = await call('POST', '/v1/embeddings', body: {'input': 'x'});
+      expect(generative, 400);
+      expect(jsonDecode(generativeWhy)['error']['message'], contains('not an embedding model'));
+      expect(backend.embedCalls, hasLength(3));
+    });
+
+    test('rerank (Jina / Cohere shape): sorted results, top_n, documents echoed or not; what is refused', () async {
+      backend.pooling = LiyabPooling.rank;
+      final documents = [
+        'Paris is in France',
+        {'text': 'the capital of France is Paris'},
+        'Rome is the capital of Italy',
+      ];
+      final (status, body) = await call('POST', '/v1/rerank',
+          body: {'model': 'any', 'query': 'capital of France', 'documents': documents});
+      expect(status, 200);
+      final o = jsonDecode(body) as Map<String, Object?>;
+      expect(o['model'], 'test-model.gguf');
+      expect((o['id'] as String).startsWith('rerank-'), isTrue);
+      expect(o['results'], [
+        {
+          'index': 1,
+          'relevance_score': 1.0,
+          'document': {'text': 'the capital of France is Paris'},
+        },
+        {
+          'index': 2,
+          'relevance_score': 2 / 3,
+          'document': {'text': 'Rome is the capital of Italy'},
+        },
+        {
+          'index': 0,
+          'relevance_score': 1 / 3,
+          'document': {'text': 'Paris is in France'},
+        },
+      ]);
+      expect((o['usage'] as Map)['total_tokens'], greaterThan(0));
+      expect(backend.rerankCalls.single.$2, ['Paris is in France', 'the capital of France is Paris', 'Rome is the capital of Italy']);
+
+      for (final path in ['/v2/rerank', '/rerank']) {
+        final (code, top) = await call('POST', path,
+            body: {'query': 'capital of France', 'documents': documents, 'top_n': 2, 'return_documents': false});
+        expect(code, 200, reason: path);
+        expect(jsonDecode(top)['results'], [
+          {'index': 1, 'relevance_score': 1.0},
+          {'index': 2, 'relevance_score': 2 / 3},
+        ]);
+      }
+      for (final bad in [
+        {'documents': ['a']},
+        {'query': '', 'documents': ['a']},
+        {'query': 'q', 'documents': 'a'},
+        {'query': 'q', 'documents': <String>[]},
+        {'query': 'q', 'documents': [3]},
+        {'query': 'q', 'documents': ['a'], 'top_n': 0},
+        {'query': 'q', 'documents': ['a'], 'return_documents': 'yes'},
+      ]) {
+        final (code, _) = await call('POST', '/v1/rerank', body: bad);
+        expect(code, 400, reason: '$bad');
+      }
+      backend.pooling = LiyabPooling.last;
+      final (embedding, why) = await call('POST', '/v1/rerank', body: {'query': 'q', 'documents': ['a']});
+      expect(embedding, 400);
+      expect(jsonDecode(why)['error']['message'], contains('not a reranker'));
+      expect(backend.rerankCalls, hasLength(3));
+    });
+
+    test('a client that goes away stops its embedding or reranking call', () async {
+      backend.poolingDelay = const Duration(seconds: 30);
+      for (final (pooling, path, body) in [
+        (LiyabPooling.last, '/v1/embeddings', <String, Object?>{'input': ['a', 'b']}),
+        (LiyabPooling.rank, '/v1/rerank', <String, Object?>{'query': 'q', 'documents': ['a', 'b']}),
+      ]) {
+        backend.pooling = pooling;
+        final before = backend.abandons;
+        final calls = backend.embedCalls.length + backend.rerankCalls.length;
+        final client = HttpClient();
+        final req = await client.open('POST', '127.0.0.1', api.boundHttpPort!, path);
+        req.headers.set('authorization', 'Bearer $token');
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode(body));
+        unawaited(req.close().then((r) => r.drain<void>()).catchError((_) {}));
+        for (var i = 0; i < 200 && backend.embedCalls.length + backend.rerankCalls.length == calls; ++i) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        client.close(force: true);
+        for (var i = 0; i < 200 && backend.abandons == before; ++i) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(backend.abandons, before + 1, reason: path);
+      }
     });
 
     test('a client that goes away mid-stream stops its generation', () async {

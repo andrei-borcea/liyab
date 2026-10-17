@@ -34,7 +34,9 @@ running them over `adb`). The app builds with `scripts/build_flutter_app.sh` (An
   Gated DeltaNet; dense or MoE FFN) needs only a row in `src/core/architecture.cpp`; each block's structure is
   planned from the tensors, and what the file states (RoPE scaling, soft caps, the q·k scale) is read from it. Prove it
   with a `test_golden` case and a conformance run against the Hugging Face model (README, *Adding a model*). Open a
-  *Model support* issue with the GGUF's `general.architecture` and tensor names first.
+  *Model support* issue with the GGUF's `general.architecture` and tensor names first. An embedding model or a
+  reranker on a supported architecture needs no code: its GGUF's pooling metadata drives `embed()` / `rerank()`
+  (README, *Embeddings and reranking*); check it with `tools/pooling_reference.py` and `liyab-embed`.
 * **Kernels.** Faster NEON / i8mm paths for formats that still use the generic decode (TQ1_0, NVFP4, lattice
   I-quants), x86 SIMD kernels, Vulkan and Metal kernels. Every kernel is checked against the reference decoder.
 * **Measurements on your device.** `liyab-cli --device` and a run of `liyab-cli` with the phase breakdown on a phone

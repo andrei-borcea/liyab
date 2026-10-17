@@ -1,12 +1,16 @@
-// OpenAI API (chat completions, completions, models) over the local API's
-// core. Reasoning is returned as `reasoning_content`, as vLLM does. Tools
+// OpenAI API (chat completions, completions, embeddings, models) over the
+// local API's core. Reasoning is returned as `reasoning_content`, as vLLM does. Tools
 // (`tools`, `tool_choice`, `parallel_tool_calls`; calls in `tool_calls`, also
 // streamed as deltas; results in `tool` messages) and `response_format`
 // (json_object, json_schema) are constrained decoding: calls always parse and
 // their arguments, like a json_schema answer, are valid against the schema.
-// Not supported: images and other non-text content, n > 1, logprobs.
+// Embeddings come from the loaded embedding model, as float lists or base64
+// (the official clients' default), with `dimensions` for models trained for
+// it. Not supported: images and other non-text content, n > 1, logprobs,
+// token arrays as embedding input.
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import '../agent/tool_format.dart';
 import 'api_core.dart';
@@ -176,6 +180,45 @@ class OpenAiApi {
 
   Future<void> chat(Map<String, Object?> body, ApiConnection conn) =>
       _respond(chatRequest(body), body, conn, chat: true);
+
+  /// /v1/embeddings: `input` (a string or a list of strings), `encoding_format` ("float" or "base64"),
+  /// `dimensions`; `model` and `user` are accepted and ignored. The texts, the dimensions (0: all) and whether the
+  /// vectors go out as base64.
+  static (List<String>, int, bool) embeddingRequest(Map<String, Object?> body) {
+    final input = switch (body['input']) {
+      String text => [text],
+      List list when list.every((x) => x is String) => List<String>.from(list),
+      List _ => throw const ApiError(400, 'input must be a string or a list of strings (token arrays are not supported)'),
+      _ => throw const ApiError(400, 'input is required: a string or a list of strings'),
+    };
+    if (input.isEmpty) throw const ApiError(400, 'input must not be empty');
+    final format = body['encoding_format'] ?? 'float';
+    if (format != 'float' && format != 'base64') throw const ApiError(400, 'encoding_format must be float or base64');
+    final dimensions = body['dimensions'];
+    if (dimensions != null && (dimensions is! int || dimensions <= 0)) {
+      throw const ApiError(400, 'dimensions must be a positive integer');
+    }
+    return (input, dimensions as int? ?? 0, format == 'base64');
+  }
+
+  Future<void> embeddings(Map<String, Object?> body, ApiConnection conn) async {
+    final (input, dimensions, base64) = embeddingRequest(body);
+    final result = await core.embed(input, dimensions: dimensions, gone: conn.gone);
+    return conn.json(200, {
+      'object': 'list',
+      'data': [
+        for (final (i, v) in result.vectors.indexed)
+          {
+            'object': 'embedding',
+            'index': i,
+            // base64: the vector's float32 values, little-endian, as OpenAI sends them.
+            'embedding': base64 ? base64Encode(Uint8List.view(v.buffer, v.offsetInBytes, v.lengthInBytes)) : v,
+          },
+      ],
+      'model': core.backend.modelName,
+      'usage': {'prompt_tokens': result.tokens, 'total_tokens': result.tokens},
+    });
+  }
 
   Future<void> completion(Map<String, Object?> body, ApiConnection conn) =>
       _respond(completionRequest(body), body, conn, chat: false);

@@ -272,6 +272,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32("tokenizer.ggml.bos_token_id", 1);
     w.add_u32("tokenizer.ggml.eos_token_id", 2);
     w.add_bool("tokenizer.ggml.add_bos_token", true);
+    if (s.pooling_type >= 0) w.add_u32(a + ".pooling_type", static_cast<uint32_t>(s.pooling_type));
+    if (s.add_eos >= 0) w.add_bool("tokenizer.ggml.add_eos_token", s.add_eos != 0);
+    if (!s.cls_labels.empty()) w.add_string_array(a + ".classifier.output_labels", s.cls_labels);
+    if (!s.rerank_template.empty()) w.add_string("tokenizer.chat_template.rerank", s.rerank_template);
 
     std::mt19937_64 rng(s.seed);
     std::mt19937_64 router_rng(s.seed ^ 0x5eed);
@@ -290,9 +294,41 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     const int64_t d = s.n_embd;
     const int64_t hd = d / s.n_head;
     const int64_t kv = hd * s.n_head_kv;
-    w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, random(d * n_vocab, 0.5f));
+    const std::vector<float> embd = random(d * n_vocab, 0.5f);
+    w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, embd);
     w.add_tensor("output_norm.weight", {d}, DType::F32, norm_weights(d));
-    if (!s.tied_output) w.add_tensor("output.weight", {d, n_vocab}, s.output_type, random(d * n_vocab, s.weight_scale));
+    std::vector<float> output;  // the LM head's values (the embeddings when tied)
+    if (!s.tied_output) {
+        output = random(d * n_vocab, s.weight_scale);
+        w.add_tensor("output.weight", {d, n_vocab}, s.output_type, output);
+    }
+    if (s.cls_rows > 0) {  // ranking head: copied rows of the LM head, or its own draws
+        const std::vector<float>& head = s.tied_output ? embd : output;
+        // A generator and a distribution of their own: a shared distribution
+        // caches values, which would shift the draws of the weights after it.
+        std::mt19937_64 cls_rng(s.seed ^ 0xc15);
+        std::normal_distribution<float> cls_normal(0.0f, 1.0f);
+        std::vector<float> rows;
+        for (int32_t r = 0; r < s.cls_rows; ++r) {
+            if (!s.cls_rows_from.empty()) {
+                const auto at = head.begin() + static_cast<std::ptrdiff_t>(s.cls_rows_from[static_cast<size_t>(r)] * d);
+                rows.insert(rows.end(), at, at + d);
+            } else {
+                for (int64_t j = 0; j < d; ++j) rows.push_back(cls_normal(cls_rng) * s.weight_scale * 4.0f);
+            }
+        }
+        w.add_tensor("cls.output.weight", {d, s.cls_rows}, s.tied_output ? s.embd_type : s.output_type, rows);
+        if (s.cls_bias) {
+            std::vector<float> bias;
+            for (int32_t r = 0; r < s.cls_rows; ++r) bias.push_back(cls_normal(cls_rng));
+            w.add_tensor("cls.output.bias", {s.cls_rows}, DType::F32, bias);
+        }
+        if (s.cls_dense) {
+            std::vector<float> dense;
+            for (int64_t j = 0; j < d * d; ++j) dense.push_back(cls_normal(cls_rng) * s.weight_scale);
+            w.add_tensor("cls.weight", {d, d}, DType::F32, dense);
+        }
+    }
     if (s.rope_freqs) {
         const int64_t pairs = (s.rope_dim > 0 ? s.rope_dim : hd) / 2;
         std::vector<float> factors(static_cast<size_t>(pairs));

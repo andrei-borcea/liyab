@@ -8,6 +8,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "core/chat_template.h"
 #include "core/log.h"
@@ -109,6 +111,27 @@ liyab::TokenCallback wrap(liyab_token_callback callback, void* user_data) {
     };
 }
 
+// Borrowed views of a C array of texts (lengths NULL: NUL-terminated).
+std::vector<std::string_view> text_views(const char* const* texts, const size_t* lengths, size_t n) {
+    std::vector<std::string_view> views(n);
+    for (size_t i = 0; i < n; ++i) {
+        views[i] = lengths != nullptr ? std::string_view(texts[i], lengths[i]) : std::string_view(texts[i]);
+    }
+    return views;
+}
+
+bool texts_valid(const char* const* texts, const size_t* lengths, size_t n) {
+    if (n > 0 && texts == nullptr) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (texts[i] == nullptr && (lengths == nullptr || lengths[i] > 0)) return false;
+    }
+    return true;
+}
+
+void put_stats(const liyab::PoolingStats& s, liyab_pooling_stats* out) {
+    if (out != nullptr) *out = liyab_pooling_stats{s.tokens, s.reused_tokens, s.ms};
+}
+
 // liyab_log_buffer_*: messages kept for UIs that poll.
 std::mutex g_log_mutex;
 std::string g_log;
@@ -204,6 +227,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->egls = d.experimental.egls ? 1 : 0;
     config->egls_threshold = d.experimental.egls_threshold;
     config->tdss = d.experimental.tdss ? (d.experimental.tdss_force ? 2 : 1) : 0;
+    config->pooling_kv_cache_type = static_cast<liyab_kv_cache_type>(d.pooling_kv_cache_type);
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -218,6 +242,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
             return fail(LIYAB_ERR_INVALID_ARGUMENT, "config, config->model_path and out_engine are required");
         }
         if (config->kv_cache_type < LIYAB_KV_F16 || config->kv_cache_type > LIYAB_KV_Q4_1 ||
+            config->pooling_kv_cache_type < LIYAB_KV_F16 || config->pooling_kv_cache_type > LIYAB_KV_Q4_1 ||
             config->backend < LIYAB_BACKEND_AUTO || config->backend > LIYAB_BACKEND_NEUROPILOT ||
             config->power_profile < LIYAB_POWER_PERFORMANCE || config->power_profile > LIYAB_POWER_LOW_POWER) {
             return fail(LIYAB_ERR_INVALID_ARGUMENT, "enum value out of range in liyab_engine_config");
@@ -260,6 +285,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         if (config->prefix_cache_dir != nullptr) c.prefix_cache_dir = config->prefix_cache_dir;
         c.prefix_cache_disk_mb = config->prefix_cache_disk_mb;
         if (config->cache_dir != nullptr) c.cache_dir = config->cache_dir;
+        c.pooling_kv_cache_type = static_cast<liyab::KvCacheType>(config->pooling_kv_cache_type);
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());
@@ -603,6 +629,91 @@ liyab_status liyab_engine_generate_structured(liyab_engine* engine, const char* 
             *grammar_stats = liyab_grammar_stats{result->constrained_tokens, result->grammar_ms};
         }
         return finish_generation(result, stats);
+    });
+}
+
+void liyab_embed_params_default(liyab_embed_params* params) {
+    if (params == nullptr) return;
+    const liyab::EmbedOptions d;
+    *params = liyab_embed_params{static_cast<liyab_pooling>(d.pooling), d.dimensions, d.normalize ? 1 : 0,
+                                 d.truncate ? 1 : 0};
+}
+
+void liyab_rerank_params_default(liyab_rerank_params* params) {
+    if (params == nullptr) return;
+    *params = liyab_rerank_params{nullptr, nullptr, 0};
+}
+
+int32_t liyab_engine_pooling(const liyab_engine* engine) {
+    return engine == nullptr ? -1 : static_cast<int32_t>(engine->engine->pooling());
+}
+
+int32_t liyab_engine_embedding_size(const liyab_engine* engine) {
+    return engine == nullptr ? 0 : engine->engine->embedding_size();
+}
+
+liyab_status liyab_engine_embed(liyab_engine* engine, const char* const* texts, const size_t* lengths, size_t n_texts,
+                                const liyab_embed_params* params, float* out, size_t out_capacity,
+                                liyab_pooling_stats* stats) {
+    return guarded([&]() -> liyab_status {
+        if (stats != nullptr) *stats = liyab_pooling_stats{};
+        if (engine == nullptr || !texts_valid(texts, lengths, n_texts) || (out == nullptr && n_texts > 0)) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine, texts and out are required");
+        }
+        liyab::EmbedOptions options;
+        if (params != nullptr) {
+            if (params->pooling < LIYAB_POOLING_AUTO || params->pooling > LIYAB_POOLING_RANK) {
+                return fail(LIYAB_ERR_INVALID_ARGUMENT, "pooling out of range in liyab_embed_params");
+            }
+            options.pooling = static_cast<liyab::Pooling>(params->pooling);
+            options.dimensions = params->dimensions;
+            options.normalize = params->normalize != 0;
+            options.truncate = params->truncate != 0;
+        }
+        const int32_t size = engine->engine->embedding_size();
+        const auto dims = static_cast<size_t>(options.dimensions > 0 && options.dimensions <= size ? options.dimensions
+                                                                                                     : size);
+        if (out_capacity < n_texts * dims) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "out holds " + std::to_string(out_capacity) + " floats; " +
+                                                        std::to_string(n_texts * dims) + " are needed");
+        }
+        liyab::PoolingStats s;
+        const auto views = text_views(texts, lengths, n_texts);
+        auto vectors = engine->engine->embed(views, options, &s);
+        put_stats(s, stats);
+        if (!vectors) return fail(vectors.status());
+        for (size_t i = 0; i < vectors->size(); ++i) std::copy((*vectors)[i].begin(), (*vectors)[i].end(), out + i * dims);
+        return LIYAB_OK;
+    });
+}
+
+liyab_status liyab_engine_rerank(liyab_engine* engine, const char* query, const char* const* documents,
+                                 const size_t* lengths, size_t n_documents, const liyab_rerank_params* params,
+                                 float* out_scores, liyab_pooling_stats* stats) {
+    return guarded([&]() -> liyab_status {
+        if (stats != nullptr) *stats = liyab_pooling_stats{};
+        if (engine == nullptr || query == nullptr || !texts_valid(documents, lengths, n_documents) ||
+            (out_scores == nullptr && n_documents > 0)) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine, query, documents and out_scores are required");
+        }
+        liyab::RerankOptions options;
+        if (params != nullptr) {
+            if (params->prompt_template != nullptr) options.prompt_template = params->prompt_template;
+            if (params->n_labels > 0 && params->labels == nullptr) {
+                return fail(LIYAB_ERR_INVALID_ARGUMENT, "liyab_rerank_params: n_labels without labels");
+            }
+            for (size_t i = 0; i < params->n_labels; ++i) {
+                if (params->labels[i] == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "a rerank label is NULL");
+                options.labels.emplace_back(params->labels[i]);
+            }
+        }
+        liyab::PoolingStats s;
+        const auto views = text_views(documents, lengths, n_documents);
+        auto scores = engine->engine->rerank(query, views, options, &s);
+        put_stats(s, stats);
+        if (!scores) return fail(scores.status());
+        std::copy(scores->begin(), scores->end(), out_scores);
+        return LIYAB_OK;
     });
 }
 

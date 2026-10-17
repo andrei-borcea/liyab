@@ -110,6 +110,7 @@ add_library(liyab_core OBJECT
   src/core/speculative_decoder.cpp
   src/core/draft_budget.cpp
   src/core/suffix_drafter.cpp
+  src/core/pooling.cpp
   src/core/engine.cpp
   src/backends/cpu/cpu_backend.cpp
   src/backends/qnn/qnn_backend.cpp
@@ -297,6 +298,7 @@ endif()
 if(LIYAB_BUILD_TESTS)
   enable_testing()
   set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden test_grammar)
+  list(APPEND _liyab_tests test_pooling)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()
@@ -328,4 +330,8 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-tok tools/liyab_tok.cpp)
   target_link_libraries(liyab-tok PRIVATE liyab_core)
   target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Pooling models: embeddings and reranker scores against a Hugging Face reference, and their throughput.
+  add_executable(liyab-embed tools/liyab_embed.cpp)
+  target_link_libraries(liyab-embed PRIVATE liyab_core)
+  target_include_directories(liyab-embed PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()

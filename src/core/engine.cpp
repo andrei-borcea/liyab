@@ -25,6 +25,7 @@
 #include "core/tokenizer.h"
 #include "core/direct_io.h"
 #include "core/key_scaling.h"
+#include "core/pooling.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
 #include "liyab/mmap_loader.h"
@@ -167,7 +168,8 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.context_length = config.context_length;
     options.sliding_window = config.sliding_window;
     options.sink_tokens = config.kv_sink_tokens;
-    options.kv_type = config.kv_cache_type;
+    // A pooling model holds one input at a time: its own KV format (EngineConfig::pooling_kv_cache_type).
+    options.kv_type = declares_pooling(**file) ? config.pooling_kv_cache_type : config.kv_cache_type;
     options.max_batch = max_batch;
     options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
@@ -539,6 +541,10 @@ struct Engine::Impl {
             clear_context();
             return 0;
         }
+        // An empty context (reset_context(), or embed() / rerank(), which use
+        // the context and leave it empty): a prompt that continues a context
+        // the prefix cache set aside gets it back.
+        if (context.empty()) return prefix_cache_on() ? restore_cached(tokens, limit, 0) : 0;
         size_t common = 0;
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
@@ -959,6 +965,60 @@ struct Engine::Impl {
         const auto threads = static_cast<int32_t>(std::lround(pool->max_threads() * policy.thread_fraction));
         pool->set_active_threads(std::max(1, threads));
     }
+
+    // Pooling models (Engine::embed / rerank; core/pooling.h): what the GGUF
+    // declares, or why it could not be read (reported by the calls).
+    PoolingModel pooling;
+    Status pooling_error;
+
+    // One pooling input: BOS when the model uses one, the text, EOS when the
+    // GGUF asks for it. Longer than the context: cut to fit (`truncate`,
+    // keeping BOS and EOS) or InvalidArgument naming input `index` of `what`.
+    Result<std::vector<int32_t>> encode_pooled(std::string_view text, bool truncate, size_t index,
+                                               const char* what) const {
+        auto tokens = tokenizer->encode(text, tokenizer->add_bos_default());
+        if (!tokens) return tokens.status();
+        std::vector<int32_t>& t = tokens.value();
+        const auto limit = static_cast<size_t>(target->context_length());
+        const size_t eos = pooling.add_eos ? 1 : 0;
+        if (t.size() + eos > limit) {
+            if (!truncate) {
+                return Status(ErrorCode::InvalidArgument, std::string(what) + " " + std::to_string(index) + " has " +
+                                                              std::to_string(t.size() + eos) +
+                                                              " tokens; the context holds " + std::to_string(limit));
+            }
+            t.resize(limit - eos);  // a leading BOS stays: the cut is at the end of the text
+        }
+        if (pooling.add_eos) t.push_back(pooling.eos);
+        if (t.empty()) {
+            return Status(ErrorCode::InvalidArgument, std::string(what) + " " + std::to_string(index) + " is empty");
+        }
+        return tokens;
+    }
+
+    // Runs pooled sequences (run_pooled) the way prefill() runs a prompt
+    // (power policy, route, chunks; cancel() stops it), with the context to
+    // itself: a conversation in progress is set aside first, as a prompt that
+    // replaces it would set it aside (prefix cache), and the context is left
+    // empty. Lossy experimental hooks are not applied: vectors and scores are
+    // the model's own.
+    Result<PooledRun> run_pooling(std::span<const std::vector<int32_t>> sequences, const PoolTarget& pool_target) {
+        cancel.store(false, std::memory_order_relaxed);
+        if (!draft && prefix_cache_on() && context.size() == static_cast<size_t>(target->n_past())) stash_context();
+        clear_context();
+        const PowerManager::Work thermal(*power);
+        const PowerPolicy policy = power->policy();
+        apply_policy(policy);
+        const Route route = policy.throttled ? throttled_route() : normal_route();
+        ForwardHooks forward_hooks;
+        forward_hooks.cancel = &cancel;
+        auto run = run_pooled(*target, sequences, pool_target, route, *this->pool, prefill_chunk(), &forward_hooks);
+        clear_context();
+        if (!run && run.status().code() == ErrorCode::Cancelled) {
+            return Status(ErrorCode::Cancelled, "the embedding or reranking call was cancelled");
+        }
+        return run;
+    }
 };
 
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -1002,6 +1062,22 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     if (!tokenizer) return tokenizer.status();
     impl->tokenizer.emplace(std::move(tokenizer).value());
     impl->load_chat_template();
+    if (auto pooling = read_pooling_model(impl->target->file(), impl->target->config())) {
+        impl->pooling = std::move(pooling).value();
+        const PoolingModel& p = impl->pooling;
+        if (p.declared != Pooling::None || p.head != nullptr) {
+            static constexpr const char* kNames[] = {"none", "mean", "cls", "last token", "rank"};
+            LIYAB_LOG_INFO("pooling: %s%s%s%s", kNames[static_cast<int>(p.declared)],
+                           p.add_eos ? ", inputs end with EOS" : "",
+                           p.head != nullptr ? ", ranking head" : "",
+                           p.rerank_template.empty() ? "" : ", rerank prompt template");
+        }
+        if (!p.head_error.is_ok()) LIYAB_LOG_WARN("pooling: %s", p.head_error.message().c_str());
+    } else {
+        // Not fatal: the model may still generate; embed() and rerank() report it.
+        impl->pooling_error = pooling.status();
+        LIYAB_LOG_WARN("pooling: %s", pooling.status().message().c_str());
+    }
     LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->target));
 
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
@@ -1260,6 +1336,16 @@ std::string Engine::describe() const {
     if (impl_->draft) {
         out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
                " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
+    }
+    if (const PoolingModel& p = impl_->pooling; p.declared != Pooling::None) {  // an embedding model or a reranker
+        static constexpr const char* kKinds[] = {"", "embeddings, mean of the tokens", "first token (CLS)",
+                                                 "embeddings, last token", "reranking"};
+        out += "Pooling:    " + std::string(kKinds[static_cast<int>(p.declared)]);
+        out += p.declared == Pooling::Rank
+                   ? (p.head != nullptr ? ", ranking head of " + std::to_string(p.head->rows()) + " labels"
+                                        : ", no usable ranking head")
+                   : ", " + std::to_string(c.n_embd) + " values per vector";
+        out += p.add_eos ? ", inputs end with EOS\n" : "\n";
     }
     return out;
 }
@@ -1959,6 +2045,119 @@ bool Engine::has_chat_template() const noexcept { return impl_->chat_template.ha
 Result<std::string> Engine::render_chat(std::string_view request_json) const {
     if (!impl_->chat_template) return impl_->chat_template_error;
     return impl_->chat_template->render_chat(request_json, impl_->chat_special);
+}
+
+Pooling Engine::pooling() const noexcept { return impl_->pooling.declared; }
+
+int32_t Engine::embedding_size() const noexcept { return impl_->target->config().n_embd; }
+
+Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::string_view> texts,
+                                                      const EmbedOptions& options, PoolingStats* stats) {
+    const auto t_start = Clock::now();
+    if (stats != nullptr) *stats = PoolingStats{};
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (!s.pooling_error.is_ok()) return s.pooling_error;
+    Pooling pooling = options.pooling;
+    if (pooling == Pooling::Auto) {
+        pooling = s.pooling.declared;
+        switch (pooling) {
+            case Pooling::None:
+                return Status(ErrorCode::Unsupported,
+                              "the model declares no pooling (pooling_type): it is not an embedding model; ask for "
+                              "Mean or Last pooling explicitly to embed with it anyway");
+            case Pooling::Rank:
+                return Status(ErrorCode::Unsupported, "the model is a reranker (pooling_type rank): use rerank()");
+            case Pooling::Cls:
+                return Status(ErrorCode::Unsupported,
+                              "the model declares first-token (CLS) pooling, which needs a bidirectional encoder: in "
+                              "a causal decoder the first token's state does not depend on the text");
+            default:
+                break;
+        }
+    } else if (pooling != Pooling::Mean && pooling != Pooling::Last) {
+        return Status(ErrorCode::InvalidArgument, "EmbedOptions::pooling must be Auto, Mean or Last");
+    }
+    const int32_t size = s.target->config().n_embd;
+    if (options.dimensions < 0 || options.dimensions > size) {
+        return Status(ErrorCode::InvalidArgument,
+                      "EmbedOptions::dimensions must be between 0 and " + std::to_string(size));
+    }
+    std::vector<std::vector<int32_t>> sequences;
+    sequences.reserve(texts.size());
+    for (size_t i = 0; i < texts.size(); ++i) {
+        auto tokens = s.encode_pooled(texts[i], options.truncate, i, "input");
+        if (!tokens) return tokens.status();
+        sequences.push_back(std::move(tokens).value());
+    }
+    PoolTarget target;
+    target.pooling = pooling;
+    auto run = s.run_pooling(sequences, target);
+    if (!run) return run.status();
+    auto vectors = finish_embeddings(run->values, static_cast<size_t>(size), options.dimensions, options.normalize);
+    const double ms = ms_since(t_start);
+    LIYAB_LOG_INFO("embed: %zu inputs, %lld tokens (%lld shared) in %.0f ms", texts.size(),
+                   static_cast<long long>(run->tokens), static_cast<long long>(run->reused), ms);
+    if (stats != nullptr) {
+        *stats = PoolingStats{static_cast<int32_t>(run->tokens), static_cast<int32_t>(run->reused), ms};
+    }
+    return vectors;
+}
+
+Result<std::vector<float>> Engine::rerank(std::string_view query, std::span<const std::string_view> documents,
+                                          const RerankOptions& options, PoolingStats* stats) {
+    const auto t_start = Clock::now();
+    if (stats != nullptr) *stats = PoolingStats{};
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (!s.pooling_error.is_ok()) return s.pooling_error;
+    const std::string& tmpl = options.prompt_template.empty() ? s.pooling.rerank_template : options.prompt_template;
+    if (tmpl.empty()) {
+        return Status(ErrorCode::InvalidArgument,
+                      "no rerank prompt: the model has none (tokenizer.chat_template.rerank) and "
+                      "RerankOptions::prompt_template is empty");
+    }
+    PoolTarget target;
+    target.pooling = Pooling::Last;
+    for (const std::string& label : options.labels) {
+        auto ids = s.tokenizer->encode(label, false);
+        if (!ids) return ids.status();
+        if (ids->size() != 1) {
+            return Status(ErrorCode::InvalidArgument, "the rerank label '" + label + "' is " +
+                                                          std::to_string(ids->size()) + " tokens, not one");
+        }
+        target.logit_ids.push_back(ids->front());
+    }
+    if (target.logit_ids.empty() && s.pooling.head == nullptr) {
+        if (!s.pooling.head_error.is_ok()) return s.pooling.head_error;
+        return Status(ErrorCode::Unsupported,
+                      "the model has no ranking head (cls.output.weight, pooling_type rank); pass "
+                      "RerankOptions::labels to score with its LM head");
+    }
+    std::vector<std::vector<int32_t>> sequences;
+    sequences.reserve(documents.size());
+    for (size_t i = 0; i < documents.size(); ++i) {
+        auto prompt = format_rerank_prompt(tmpl, query, documents[i]);
+        if (!prompt) return prompt.status();
+        auto tokens = s.encode_pooled(*prompt, false, i, "the pair of document");
+        if (!tokens) return tokens.status();
+        sequences.push_back(std::move(tokens).value());
+    }
+    auto run = s.run_pooling(sequences, target);
+    if (!run) return run.status();
+    Result<std::vector<float>> scores =
+        target.logit_ids.empty() ? head_scores(s.pooling, *s.cpu, run->values, s.target->config().n_embd)
+                                 : Result<std::vector<float>>(label_scores(run->values, target.logit_ids.size()));
+    if (!scores) return scores.status();
+    const double ms = ms_since(t_start);
+    LIYAB_LOG_INFO("rerank: %zu documents, %lld tokens (%lld shared) in %.0f ms", documents.size(),
+                   static_cast<long long>(run->tokens), static_cast<long long>(run->reused), ms);
+    if (stats != nullptr) {
+        *stats = PoolingStats{static_cast<int32_t>(run->tokens), static_cast<int32_t>(run->reused), ms};
+    }
+    return scores;
 }
 
 Result<ChatFormat> Engine::chat_format(std::string_view probe_json) const {

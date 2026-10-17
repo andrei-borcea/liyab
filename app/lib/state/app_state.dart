@@ -443,6 +443,34 @@ class AppState extends ChangeNotifier implements ApiBackend {
     return Generation(events.stream, generation.stop);
   }
 
+  /// What the loaded model pools (LiyabPooling): none for a generative model; an embedding model or a reranker
+  /// serves the local API's /v1/embeddings or /v1/rerank and writes no text.
+  @override
+  int pooling = LiyabPooling.none;
+
+  @override
+  Future<Embeddings> embed(List<String> texts, {int dimensions = 0, Future<void>? abandoned}) =>
+      _apiCall(() => engine.embed(texts, dimensions: dimensions, abandoned: abandoned));
+
+  @override
+  Future<RerankScores> rerank(String query, List<String> documents, {Future<void>? abandoned}) =>
+      _apiCall(() => engine.rerank(query, documents, abandoned: abandoned));
+
+  /// Another app's embedding or reranking request: API work like a generation (the model stays loaded, and
+  /// hidden, the work service keeps the process running), and the engine's context is not the chat's once it ran.
+  Future<T> _apiCall<T>(Future<T> Function() call) async {
+    _chatContext = false;
+    ++_apiGenerations;
+    _updateWork();
+    try {
+      return await call();
+    } finally {
+      --_apiGenerations;
+      _updateWork();
+      if (_away) _armRelease(); // counted from the last request
+    }
+  }
+
   /// Whether the engine's context is this chat's once the commands queued so far have run (another app's request
   /// replaces it; the engine keeps the chat's aside and restores it on the chat's next prompt). Parking saves the
   /// context as the conversation's only then: another one saved in its place would be restored with the chat
@@ -469,6 +497,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     modelPath = null;
     modelName = '';
     description = '';
+    pooling = LiyabPooling.none;
     messages.clear();
     status = 'No model loaded';
     device.lastModel = null;
@@ -541,6 +570,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
       device.lastModel = path;
       memory = model.memory;
       contextLength = model.contextLength;
+      pooling = model.pooling;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
       if (model.memory.tight) {
         status = '$name · needs about ${(model.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB of memory to '
@@ -556,7 +586,12 @@ class AppState extends ChangeNotifier implements ApiBackend {
       for (final line in description.split('\n')) {
         _log('  $line');
       }
-      _preparing = keepChat ? _restoreConversation() : prepareSystemPrompt();
+      // A pooling model (embeddings, reranking) has no conversation to prepare or restore.
+      _preparing = pooling != LiyabPooling.none
+          ? null
+          : keepChat
+              ? _restoreConversation()
+              : prepareSystemPrompt();
       unawaited(_loadExpertProfile());
       if (!keepChat) _discardConversation();
     } on EngineException catch (e) {
@@ -705,7 +740,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// else processed (about a minute on a 35B MoE with tools) and saved for the
   /// next start. The first message then only costs its own tokens.
   Future<void> prepareSystemPrompt() async {
-    if (!engine.loaded) return;
+    if (!engine.loaded || pooling != LiyabPooling.none) return; // a pooling model does not chat
     final block = await _systemBlock();
     if (block == _prepared) return;
     _prepared = block;
@@ -816,7 +851,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// The draft's words, then with `message` the whole message as it would be sent now.
   Future<void> _prefillDraft(String text, {bool message = true}) async {
-    if (generating || loading || _away || !engine.loaded) return;
+    if (generating || loading || _away || !engine.loaded || pooling != LiyabPooling.none) return;
     if (_drafting) {
       _draftNext = (text, message); // the latest request wins
       return;
@@ -950,9 +985,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
     engine.preempt(); // a system prompt still being prepared yields to the message
     await _preparing;
     final wakingMs = asked.elapsedMilliseconds; // the model loading again, or its context being prepared
-    if (!engine.loaded) {
+    if (!engine.loaded || pooling != LiyabPooling.none) {
       message
-        ..error = 'The model could not be loaded'
+        ..error = !engine.loaded
+            ? 'The model could not be loaded'
+            // An embedding model or a reranker serves other apps (the local API) and writes no text.
+            : 'This model ${pooling == LiyabPooling.rank ? 'ranks documents' : 'makes embeddings'} for other apps '
+                '(the local API) and does not chat: load a chat model to talk'
         ..streaming = false;
       generating = false;
       notifyListeners();

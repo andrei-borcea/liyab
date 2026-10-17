@@ -1119,6 +1119,23 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
     return Status::ok();
 }
 
+Status Transformer::final_hidden(std::span<const int32_t> rows, std::span<float> out) const {
+    const ModelConfig& c = config_;
+    const size_t d = static_cast<size_t>(c.n_embd);
+    if (out.size() < rows.size() * d) return Status(ErrorCode::InvalidArgument, "final_hidden: output buffer too small");
+    // x_ holds the last pass's residual stream, one row per token (forward() sizes it to the pass).
+    const size_t pass_rows = x_.size() / d;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i] < 0 || static_cast<size_t>(rows[i]) >= pass_rows) {
+            return Status(ErrorCode::InvalidArgument, "final_hidden: row outside the last pass");
+        }
+        // The same norm compute_logits() applies before the LM head.
+        rmsnorm(x_.data() + static_cast<size_t>(rows[i]) * d, output_norm_.data(), out.data() + i * d, c.n_embd,
+                c.rms_eps);
+    }
+    return Status::ok();
+}
+
 Status Transformer::project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n) {
     const ModelConfig& c = config_;
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);

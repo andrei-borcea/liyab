@@ -102,6 +102,7 @@ typedef struct liyab_engine_config {
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
+    liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -400,6 +401,77 @@ LIYAB_C_API liyab_status liyab_engine_generate_structured(liyab_engine* engine, 
                                                           liyab_continuation_callback continuation, void* user_data,
                                                           liyab_generation_stats* stats,
                                                           liyab_grammar_stats* grammar_stats);
+
+/*
+ * Pooling models: embeddings and reranking (Engine::embed / rerank and
+ * Pooling in liyab/engine.h have the whole contract). An embedding model
+ * (Qwen3-Embedding) turns each text into one vector, a reranker
+ * (Qwen3-Reranker) scores each document against a query; what a model does
+ * comes from its GGUF (pooling_type, add_eos_token, ranking head, rerank
+ * prompt). An engine serves one call at a time (LIYAB_ERR_BUSY while a
+ * generation, a prefill or another call runs); liyab_engine_cancel stops a
+ * call between passes (LIYAB_ERR_CANCELLED). The context is used and left
+ * empty (a conversation is set aside in the prefix cache when one is
+ * configured).
+ */
+typedef enum liyab_pooling {
+    LIYAB_POOLING_AUTO = -1, /* embed: the model's own pooling_type (it must be MEAN or LAST) */
+    LIYAB_POOLING_NONE = 0,  /* the model declares none: a generative model */
+    LIYAB_POOLING_MEAN = 1,  /* mean of every token's final hidden state */
+    LIYAB_POOLING_CLS = 2,   /* first token: encoder models (refused for embedding by a decoder) */
+    LIYAB_POOLING_LAST = 3,  /* last token: decoder embedding models (Qwen3-Embedding) */
+    LIYAB_POOLING_RANK = 4   /* ranking head over the last token: rerankers (liyab_engine_rerank) */
+} liyab_pooling;
+
+typedef struct liyab_embed_params {
+    liyab_pooling pooling; /* LIYAB_POOLING_AUTO (default), _MEAN or _LAST */
+    int32_t dimensions;    /* > 0: keep the first N values (Matryoshka models: Qwen3-Embedding 32..1024); 0 (default): all */
+    int32_t normalize;     /* nonzero (default): unit-length vectors; 0: as pooled */
+    int32_t truncate;      /* nonzero: cut inputs longer than the context (keeping BOS/EOS); 0 (default): fail */
+} liyab_embed_params;
+
+typedef struct liyab_rerank_params {
+    const char* prompt_template; /* NULL (default): the model's rerank prompt; else one with {query} and {document} */
+    const char* const* labels;   /* NULL (default): the model's ranking head; else n_labels one-token texts scored */
+    size_t n_labels;             /*   with the LM head, the first positive (a reranker without a head: "yes", "no") */
+} liyab_rerank_params;
+
+typedef struct liyab_pooling_stats {
+    int32_t tokens;        /* tokens of every input, special tokens included */
+    int32_t reused_tokens; /* of them, shared with another input and not processed again */
+    double ms;             /* wall time of the call */
+} liyab_pooling_stats;
+
+LIYAB_C_API void liyab_embed_params_default(liyab_embed_params* params);
+LIYAB_C_API void liyab_rerank_params_default(liyab_rerank_params* params);
+/* The pooling the loaded model declares (a liyab_pooling value: NONE for a
+ * generative model); -1 for a NULL engine. Thread-safe. */
+LIYAB_C_API int32_t liyab_engine_pooling(const liyab_engine* engine);
+/* Values per vector of liyab_engine_embed without `dimensions`: the model's
+ * hidden size (1024 for Qwen3-Embedding-0.6B); 0 for a NULL engine. */
+LIYAB_C_API int32_t liyab_engine_embedding_size(const liyab_engine* engine);
+/*
+ * Embeds `n_texts` UTF-8 texts: texts[i] holds lengths[i] bytes (`lengths`
+ * NULL: each text is NUL-terminated). Writes the vectors one after another to
+ * `out`: n_texts * dims floats, dims being params->dimensions when set, else
+ * liyab_engine_embedding_size(); `out_capacity` (in floats) must hold them
+ * (else LIYAB_ERR_INVALID_ARGUMENT before any work). `params` and `stats`
+ * may be NULL (defaults / not reported). An instruction is part of the text
+ * (Qwen3-Embedding queries: "Instruct: {task}\nQuery:{query}").
+ */
+LIYAB_C_API liyab_status liyab_engine_embed(liyab_engine* engine, const char* const* texts, const size_t* lengths,
+                                            size_t n_texts, const liyab_embed_params* params, float* out,
+                                            size_t out_capacity, liyab_pooling_stats* stats);
+/*
+ * Scores `n_documents` UTF-8 documents (lengths as for liyab_engine_embed)
+ * against the NUL-terminated `query`, writing one score in (0, 1) per
+ * document to `out_scores` (higher: more relevant; in input order, not
+ * sorted). `params` and `stats` may be NULL.
+ */
+LIYAB_C_API liyab_status liyab_engine_rerank(liyab_engine* engine, const char* query, const char* const* documents,
+                                             const size_t* lengths, size_t n_documents,
+                                             const liyab_rerank_params* params, float* out_scores,
+                                             liyab_pooling_stats* stats);
 
 #ifdef __cplusplus
 }
