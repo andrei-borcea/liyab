@@ -375,6 +375,12 @@ public:
     [[nodiscard]] int32_t kv_slot_of(int32_t layer) const noexcept {
         return layers_[static_cast<size_t>(layer)].kv_slot;
     }
+    // The queries the last pass's attention scored with, at the last block it
+    // ran (run_block_at: of its last pass of at most `chunk` tokens): n_head x
+    // head_dim floats per token, rotated and key-scaled as the cached keys
+    // they meet (a latent-attention head's absorbed query). Valid until the
+    // next pass.
+    [[nodiscard]] std::span<const float> last_queries() const noexcept { return q_; }
 
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as

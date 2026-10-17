@@ -89,6 +89,13 @@ enum class ReuseCriterion : int32_t {
     Deviation,  // every reused token runs blocks [0, select_block]; those whose rows moved most go on
     First,      // the first `fraction` of each reused segment's tokens (no measurement)
     Random,     // a random `fraction` of the reused tokens (seeded; a baseline)
+    // The prompt's tail (the tokens after the last reused one up to `limit`:
+    // the question, the reply's opening) runs with the span, and at
+    // select_block the reused tokens are ranked by the attention its last
+    // tokens pay them (Attention), or by that attention times how far their
+    // rows moved (Impact): what the answer will read, weighed by how wrong it is.
+    Attention,
+    Impact,
 };
 
 struct ReuseSettings {
@@ -122,6 +129,9 @@ struct ReuseResult {
     int32_t first_reused = -1; // the first position whose rows are approximate; -1: none
     double rows_ms = 0.0;      // reading and moving the stored rows
     double blend_ms = 0.0;     // the block-by-block pass
+    // Deviation: the share of the reused tokens' summed deviation (at the
+    // last selection block) that the ones kept carry: how concentrated it is.
+    double kept_deviation = 0.0;
 };
 
 // Reuses stored segments of `tokens` (the prompt; `segments` ascending) after
@@ -175,6 +185,7 @@ struct ReuseCalibration {
     double kl = 0.0;         // its score
     double top1 = 0.0;       // its top-1 agreement with the full prefill, in [0, 1]
     double ms = 0.0;         // time the calibration took
+    std::vector<double> kls;  // the score at each share tried, in kReuseFractions order
 };
 
 // Calibrates `settings` (its fraction is what is searched; the criterion and

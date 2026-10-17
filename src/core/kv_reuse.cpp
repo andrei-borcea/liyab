@@ -179,6 +179,13 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
     if (uses.empty()) return result;
     end = exact;
     for (const Use& u : uses) end = std::max(end, u.hi);
+    // The question-guided criteria need the tail's queries: it runs with the span.
+    const bool guided = settings.criterion == ReuseCriterion::Attention || settings.criterion == ReuseCriterion::Impact;
+    const int32_t tail_begin = end;
+    if (guided && limit > end) {
+        if (Status s = kv.reserve(limit); !s.is_ok()) return fail(s);
+        end = limit;
+    }
     filled.resize(static_cast<size_t>(end - exact));
     if (Status s = model.adopt_context(end, {}, {}, false); !s.is_ok()) return fail(s);
     result.rows_ms = ms_since(t_rows);
@@ -247,7 +254,8 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         return chosen;
     };
     const int32_t select_block = std::clamp(settings.select_block, 0, cfg.n_layers - 1);
-    if (settings.criterion != ReuseCriterion::Deviation) {
+    const bool measured = settings.criterion == ReuseCriterion::Deviation || guided;
+    if (!measured) {
         // Chosen before block 0: the others never run.
         std::vector<double> score(active.size(), 0.0);
         if (settings.criterion == ReuseCriterion::First) {
@@ -286,8 +294,7 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         }
         const int32_t slot = model.kv_slot_of(layer);
         const int32_t refine = std::clamp(settings.refine, 0, cfg.n_layers - 1 - select_block);
-        const bool select = settings.criterion == ReuseCriterion::Deviation && layer >= select_block &&
-                            layer <= select_block + refine && slot >= 0;
+        const bool select = measured && layer >= select_block && layer <= select_block + refine && slot >= 0;
         if (select) keep = kept_at(select_block + refine - layer);
         if (select) {
             before.assign(active.size() * static_cast<size_t>(heads) * row * 2, 0);
@@ -319,7 +326,63 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
             score[i] = settings.relative ? change / std::max(size, 1e-30) + (values ? v_change / std::max(v_size, 1e-30) : 0.0)
                                          : change + v_change;
         }
-        compact(choose(score));
+        if (guided) {
+            // The attention the tail's last tokens (the pass's last rows: their
+            // queries at this block) pay each position, summed over their heads.
+            const std::span<const float> q = model.last_queries();
+            const int32_t hd = cache.config().head_dim;
+            const auto q_row = static_cast<size_t>(cfg.n_head) * static_cast<size_t>(hd);
+            const auto m = static_cast<int32_t>(q.size() / q_row);
+            const int32_t group = cfg.n_head / heads;
+            const int32_t window = cfg.blocks[static_cast<size_t>(layer)].windowed ? cfg.sliding_window : 0;
+            std::vector<double> mass(static_cast<size_t>(end), 0.0);
+            std::vector<float> key(static_cast<size_t>(hd)), logits;
+            // Keys dequantized once per position and KV head.
+            std::vector<float> keys(static_cast<size_t>(end) * static_cast<size_t>(heads) * static_cast<size_t>(hd));
+            for (int32_t p = 0; p < end; ++p) {
+                for (int32_t g = 0; g < heads; ++g) {
+                    quant::dequantize_row(cache.dtype(), cache.k_row(slot, p, g),
+                                          keys.data() + (static_cast<size_t>(p) * static_cast<size_t>(heads) + static_cast<size_t>(g)) * static_cast<size_t>(hd), hd);
+                }
+            }
+            for (int32_t r = 0; r < m; ++r) {
+                const size_t i = active.size() - static_cast<size_t>(m) + static_cast<size_t>(r);
+                const int32_t pos = active[i];
+                if (pos < tail_begin) continue;
+                const int32_t first = window > 0 ? std::max(0, pos - window + 1) : 0;
+                logits.resize(static_cast<size_t>(pos - first + 1));
+                for (int32_t h = 0; h < cfg.n_head; ++h) {
+                    const float* qh = q.data() + static_cast<size_t>(r) * q_row + static_cast<size_t>(h) * static_cast<size_t>(hd);
+                    const int32_t g = h / group;
+                    float top = -INFINITY;
+                    for (int32_t p = first; p <= pos; ++p) {
+                        const float* k = keys.data() + (static_cast<size_t>(p) * static_cast<size_t>(heads) + static_cast<size_t>(g)) * static_cast<size_t>(hd);
+                        float dot = 0.0f;
+                        for (int32_t c = 0; c < hd; ++c) dot += qh[c] * k[c];
+                        dot *= cfg.attn_scale;
+                        if (cfg.attn_softcap > 0.0f) dot = cfg.attn_softcap * std::tanh(dot / cfg.attn_softcap);
+                        logits[static_cast<size_t>(p - first)] = dot;
+                        top = std::max(top, dot);
+                    }
+                    double sum = 0.0;
+                    for (float& v : logits) sum += v = std::exp(v - top);
+                    for (int32_t p = first; p <= pos; ++p) mass[static_cast<size_t>(p)] += logits[static_cast<size_t>(p - first)] / sum;
+                }
+            }
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (!reused[i]) continue;
+                const double a = mass[static_cast<size_t>(active[i])];
+                score[i] = settings.criterion == ReuseCriterion::Impact ? a * score[i] : a;
+            }
+        }
+        const std::vector<uint8_t> chosen = choose(score);
+        double total = 0.0, kept = 0.0;
+        for (size_t i = 0; i < active.size(); ++i) {
+            total += score[i];
+            kept += chosen[i] ? score[i] : 0.0;
+        }
+        result.kept_deviation = total > 0.0 ? kept / total : 0.0;
+        compact(chosen);
     }
     for (size_t i = 0; i < active.size(); ++i) result.recomputed += reused[i];
     result.end = end;
@@ -508,6 +571,7 @@ Result<ReuseCalibration> calibrate_reuse(Transformer& model, const Tokenizer& to
         out.fraction = fraction;
         out.kl = kl_sum / static_cast<double>(positions);
         out.top1 = static_cast<double>(agree) / static_cast<double>(positions);
+        out.kls.push_back(out.kl);
         if (out.kl <= max_kl) {
             out.met = true;
             break;

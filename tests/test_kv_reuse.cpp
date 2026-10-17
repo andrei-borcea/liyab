@@ -501,7 +501,8 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
         std::vector<uint8_t> want_rows(m.kv_cache().rows_bytes(n2 - 1));
         REQUIRE(m.kv_cache().read_rows_at(0, n2 - 1, want_rows.data(), n2 - 1, 0).is_ok());
         const std::vector<float> want = last_logits(*l, p2.back());
-        for (const ReuseCriterion criterion : {ReuseCriterion::Deviation, ReuseCriterion::First, ReuseCriterion::Random}) {
+        for (const ReuseCriterion criterion : {ReuseCriterion::Deviation, ReuseCriterion::First, ReuseCriterion::Random,
+                                               ReuseCriterion::Attention, ReuseCriterion::Impact}) {
             ReuseSettings all;
             all.fraction = 1.0f;
             all.criterion = criterion;
@@ -509,13 +510,15 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
             REQUIRE(prefill(*l, x));
             auto r = reuse_segments(m, *store, p2, p2_segments, 20, n2 - 1, all, l->route, *l->pool, 7);
             REQUIRE(r.has_value());
-            CHECK(r->end == 120);
+            // The question-guided criteria run the tail (Q) with the span.
+            const bool guided = criterion == ReuseCriterion::Attention || criterion == ReuseCriterion::Impact;
+            CHECK(r->end == (guided ? n2 - 1 : 120));
             CHECK(r->reused == 90);
             CHECK(r->recomputed == 90);
-            CHECK(r->computed == 10);
+            CHECK(r->computed == (guided ? 21 : 10));
             CHECK(r->segments == 2);
             CHECK(r->first_reused == 20);
-            REQUIRE(prefill(*l, std::span(p2).subspan(120, p2.size() - 121)));
+            REQUIRE(prefill(*l, std::span(p2).subspan(static_cast<size_t>(r->end), p2.size() - 1 - static_cast<size_t>(r->end))));
             std::vector<uint8_t> rows(want_rows.size());
             REQUIRE(m.kv_cache().read_rows_at(0, n2 - 1, rows.data(), n2 - 1, 0).is_ok());
             CHECK(rows == want_rows);

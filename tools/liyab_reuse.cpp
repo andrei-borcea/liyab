@@ -260,12 +260,13 @@ struct Tally {
     int64_t identical = 0;  // prompts whose greedy answer is the reference's
     int64_t reused = 0, recomputed = 0, computed = 0;
     double rows_ms = 0.0, blend_ms = 0.0;
+    double kept_deviation = 0.0;  // summed over prompts
 };
 
 int usage() {
     std::fprintf(stderr,
                  "usage: liyab-reuse -m model.gguf [--kv f16|q8_0|q4_0|q4_1] [--threads N] [--prompts N]\n"
-                 "                   [--fractions F,F,...] [--criterion deviation|first|random] [--select-block B]\n"
+                 "                   [--fractions F,F,...] [--criterion deviation|first|random|attention|impact] [--select-block B]\n"
                  "                   [--first-tokens K] [--absolute] [--answer N] [--seed S] [--plain]\n"
                  "                   [--shift D] [--no-key-scaling] [--calibrate MAX_KL] [--dump] [--no-numbers]\n");
     return 2;
@@ -312,6 +313,8 @@ int main(int argc, char** argv) {
             if (v == "deviation") settings.criterion = ReuseCriterion::Deviation;
             else if (v == "first") settings.criterion = ReuseCriterion::First;
             else if (v == "random") settings.criterion = ReuseCriterion::Random;
+            else if (v == "attention") settings.criterion = ReuseCriterion::Attention;
+            else if (v == "impact") settings.criterion = ReuseCriterion::Impact;
             else return usage();
         } else if (arg == "--fractions") {
             fractions.clear();
@@ -430,8 +433,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "calibration: %s\n", r.status().to_string().c_str());
             return 1;
         }
-        std::printf("calibration against KL %.4f: %s at %.0f%% recomputed, KL %.5f, top-1 %.1f%%, %.0f ms\n", calibrate,
+        std::printf("calibration against KL %.4f: %s at %.0f%% recomputed, KL %.5f, top-1 %.1f%%, %.0f ms; tried", calibrate,
                     r->met ? "met" : "not met", 100.0 * r->fraction, r->kl, 100.0 * r->top1, r->ms);
+        for (size_t i = 0; i < r->kls.size(); ++i) std::printf(" %.0f%%: %.5f", 100.0 * kReuseFractions[i], r->kls[i]);
+        std::printf("\n");
         return 0;
     }
 
@@ -572,6 +577,7 @@ int main(int argc, char** argv) {
             t.computed += reused->computed;
             t.rows_ms += reused->rows_ms;
             t.blend_ms += reused->blend_ms;
+            t.kept_deviation += reused->kept_deviation;
             std::vector<std::vector<double>> mine = {log_probs(*got)};
             if (!said.empty()) {
                 auto rows = model->forward(said, Transformer::Logits::All, run.route, pool);
@@ -614,25 +620,25 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "\r%d / %d prompts", i + 1, prompts);
     }
     std::fprintf(stderr, "\n");
-    const char* names[] = {"deviation", "first", "random"};
+    const char* names[] = {"deviation", "first", "random", "attention", "impact"};
     std::printf("criterion %s (select block %d, %s, first tokens %d, refine %d); %.0f tokens per prompt, %.0f%% of them in documents\n",
                 names[static_cast<int>(settings.criterion)], settings.select_block,
                 settings.relative ? "relative" : "absolute", settings.first_tokens, settings.refine,
                 static_cast<double>(prompt_tokens) / prompts, 100.0 * static_cast<double>(doc_tokens) / static_cast<double>(prompt_tokens));
     std::printf("time to first token: full %.1f ms, prefix restored %.1f ms\n\n", full_ttft / prompts,
                 prefix_ttft / prompts);
-    std::printf("fraction | KL mean  median   p95      max      | top-1  | same answer | first token KL top-1 | TTFT ms  vs prefix | reused recomputed | rows ms blend ms\n");
+    std::printf("fraction | KL mean  median   p95      max      | top-1  | same answer | first token KL top-1 | TTFT ms  vs prefix | reused recomputed | rows ms blend ms | deviation kept\n");
     for (size_t f = 0; f < fractions.size(); ++f) {
         Tally& t = tallies[f];
         std::sort(t.kls.begin(), t.kls.end());
         const auto np = static_cast<double>(t.positions);
-        std::printf("%8.2f | %.5f %.5f %.5f %.5f | %5.1f%% | %3d of %3d  | %.5f %5.1f%%       | %8.1f %5.2fx    | %6.0f %6.0f     | %6.1f %8.1f\n",
+        std::printf("%8.2f | %.5f %.5f %.5f %.5f | %5.1f%% | %3d of %3d  | %.5f %5.1f%%       | %8.1f %5.2fx    | %6.0f %6.0f     | %6.1f %8.1f | %5.1f%%\n",
                     fractions[f], t.kl_sum / np, t.kls[t.kls.size() / 2], t.kls[static_cast<size_t>(0.95 * (np - 1))],
                     t.kls.back(), 100.0 * static_cast<double>(t.agree) / np, static_cast<int>(t.identical), prompts,
                     t.first_kl / prompts,
                     100.0 * static_cast<double>(t.first_agree) / prompts, t.ttft / prompts, prefix_ttft / t.ttft,
                     static_cast<double>(t.reused) / prompts, static_cast<double>(t.recomputed) / prompts,
-                    t.rows_ms / prompts, t.blend_ms / prompts);
+                    t.rows_ms / prompts, t.blend_ms / prompts, 100.0 * t.kept_deviation / prompts);
     }
     return 0;
 }

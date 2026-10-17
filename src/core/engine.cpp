@@ -861,9 +861,16 @@ struct Engine::Impl {
             reuse_info.fraction = c->fraction;
             reuse_info.kl = c->kl;
             reuse_info.top1 = c->top1;
+            std::string tried;
+            for (size_t i = 0; i < c->kls.size(); ++i) {
+                char one[48];
+                std::snprintf(one, sizeof one, "%s%.0f%%: %.4f", i > 0 ? ", " : "", 100.0 * kReuseFractions[i], c->kls[i]);
+                tried += one;
+            }
             LIYAB_LOG_INFO("segment reuse: calibrated in %.0f ms: %.0f%% of reused tokens processed again, KL %.4f, "
-                           "top-1 %.1f%% (target KL %.4f)",
-                           c->ms, 100.0 * c->fraction, c->kl, 100.0 * c->top1, config.segment_reuse_max_kl);
+                           "top-1 %.1f%% (target KL %.4f; tried %s)",
+                           c->ms, 100.0 * c->fraction, c->kl, 100.0 * c->top1, config.segment_reuse_max_kl,
+                           tried.c_str());
             if (!path.empty()) keep_reuse_calibration(config.cache_dir, path, id, met);
         }
         if (!met) {
