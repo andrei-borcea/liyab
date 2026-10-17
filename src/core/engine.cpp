@@ -959,9 +959,18 @@ struct Engine::Impl {
     // with 64, for 81 MiB more peak memory than 512. Other models keep
     // max_batch passes.
     static constexpr int32_t kStreamedPrefillChunk = 1024;
+    // Latent attention (DeepSeek-V2/V3 structures) prefills in passes of at
+    // least kLatentPrefillChunk tokens: its expanded form expands every
+    // position a pass sees once per pass, which a pass of 64 tokens deep in a
+    // context does not repay (the chooser keeps such passes absorbed). On
+    // Youtu-LLM-2B (Q8_0, Mac CPU) an 8,192-token prompt took 142 s in passes
+    // of 64 (absorbed) and 68 s in passes of 512 (expanded); 1,024 gained
+    // nothing more. The form of each pass is still chosen by measured cost.
+    static constexpr int32_t kLatentPrefillChunk = 512;
     [[nodiscard]] int32_t prefill_chunk() const {
-        return target->expert_store() != nullptr ? std::max(target->max_batch(), kStreamedPrefillChunk)
-                                                 : target->max_batch();
+        if (target->expert_store() != nullptr) return std::max(target->max_batch(), kStreamedPrefillChunk);
+        if (target->config().mla.kv_rank > 0) return std::max(target->max_batch(), kLatentPrefillChunk);
+        return target->max_batch();
     }
 
     void apply_policy(const PowerPolicy& policy) {

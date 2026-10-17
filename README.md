@@ -378,7 +378,9 @@ What the port does differently from the POSIX platforms:
 
     The form is chosen from measured cost: each form's work is counted per pass from its batch size and context,
     and the time each form took per multiply-add on this device sets the threshold, so it follows the machine
-    instead of a constant. Both forms compute the same function and round differently: outputs are not
+    instead of a constant. The engine prefills these models in passes of 512 tokens (64 for other models, 1,024 with
+    streamed experts): a pass of 64 tokens deep in a context does not repay expanding every position it sees, and
+    stays absorbed. Both forms compute the same function and round differently: outputs are not
     bit-identical across forms (each form on its own is, and `test_golden` pins both). `TransformerOptions::
     latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled
     for the per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the
