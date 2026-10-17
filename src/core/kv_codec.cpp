@@ -798,6 +798,92 @@ bool kv_decode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, st
     return false;
 }
 
+bool kv_encode_chunk(KvEncoding encoding, const KvRowLayout& layout, int32_t page_slots,
+                     std::span<const std::span<const uint8_t>> pages, std::vector<uint8_t>& out, ThreadPool* pool,
+                     const KvCodecCosts* costs) {
+    const size_t slot_bytes = layout.image_bytes(1);
+    if (slot_bytes == 0 || page_slots <= 0) return false;
+    out.clear();
+    put<uint32_t>(out, static_cast<uint32_t>(pages.size()));
+    const size_t directory = out.size();
+    out.resize(directory + 5 * pages.size());
+    std::vector<uint8_t> page_out;
+    bool any = false;
+    size_t raw = 0;
+    for (size_t k = 0; k < pages.size(); ++k) {
+        const std::span<const uint8_t> page = pages[k];
+        raw += page.size();
+        const auto slots = static_cast<int32_t>(page.size() / slot_bytes);
+        if (page.size() % slot_bytes != 0 || slots > page_slots) return false;
+        const bool coded = kv_encode(encoding, layout, slots, page, page_out, pool, costs);
+        const std::span<const uint8_t> stored = coded ? std::span<const uint8_t>(page_out) : page;
+        out[directory + 5 * k] = coded ? 1 : 0;
+        const auto bytes = static_cast<uint32_t>(stored.size());
+        std::memcpy(out.data() + directory + 5 * k + 1, &bytes, sizeof bytes);
+        out.insert(out.end(), stored.begin(), stored.end());
+        any = any || coded;
+    }
+    return any && out.size() < raw;
+}
+
+bool kv_decode_chunk(KvEncoding encoding, const KvRowLayout& layout, int32_t page_slots, int32_t slots,
+                     std::span<const uint8_t> in, std::span<const std::span<uint8_t>> out, ThreadPool* pool) {
+    const size_t slot_bytes = layout.image_bytes(1);
+    if (slot_bytes == 0 || page_slots <= 0 || slots <= 0) return false;
+    const auto pages = static_cast<size_t>((slots + page_slots - 1) / page_slots);
+    size_t at = 0;
+    uint32_t stored_pages = 0;
+    if (!get(in, at, stored_pages) || stored_pages != pages) return false;
+    std::vector<uint8_t> kinds(pages);
+    std::vector<uint32_t> sizes(pages);
+    for (size_t k = 0; k < pages; ++k) {
+        if (!get(in, at, kinds[k]) || !get(in, at, sizes[k]) || kinds[k] > 1) return false;
+    }
+    // Out as one sequence of bytes split into parts: page k goes to
+    // [k * page bytes, + its bytes), directly when one part holds it all.
+    size_t total = 0;
+    for (const std::span<uint8_t> part : out) total += part.size();
+    if (total != layout.image_bytes(slots)) return false;
+    size_t part = 0, part_at = 0;  // where the next page starts in `out`
+    std::vector<uint8_t> scratch;
+    for (size_t k = 0; k < pages; ++k) {
+        const int32_t n = std::min(page_slots, slots - static_cast<int32_t>(k) * page_slots);
+        const size_t bytes = layout.image_bytes(n);
+        if (sizes[k] > in.size() - at) return false;
+        const std::span<const uint8_t> src = in.subspan(at, sizes[k]);
+        at += sizes[k];
+        while (part < out.size() && part_at == out[part].size()) {
+            ++part;
+            part_at = 0;
+        }
+        if (part >= out.size()) return false;
+        const bool direct = out[part].size() - part_at >= bytes;
+        const std::span<uint8_t> dst = direct ? out[part].subspan(part_at, bytes) : (scratch.resize(bytes), std::span<uint8_t>(scratch));
+        if (kinds[k] == 0) {
+            if (src.size() != bytes) return false;
+            std::memcpy(dst.data(), src.data(), bytes);
+        } else if (!kv_decode(encoding, layout, n, src, dst, pool)) {
+            return false;
+        }
+        if (direct) {
+            part_at += bytes;
+            continue;
+        }
+        for (size_t done = 0; done < bytes;) {  // scattered over several parts
+            while (part < out.size() && part_at == out[part].size()) {
+                ++part;
+                part_at = 0;
+            }
+            if (part >= out.size()) return false;
+            const size_t len = std::min(bytes - done, out[part].size() - part_at);
+            std::memcpy(out[part].data() + part_at, scratch.data() + done, len);
+            done += len;
+            part_at += len;
+        }
+    }
+    return at == in.size();
+}
+
 double kv_calibrate_decode(const KvRowLayout& layout, int32_t slots, ThreadPool* pool) {
     Runs r;
     if (!runs_of(layout, slots, r)) return 0;

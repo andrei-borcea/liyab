@@ -124,6 +124,21 @@ struct KvCodecCosts {
 bool kv_encode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, std::span<const uint8_t> image,
                std::vector<uint8_t>& out, ThreadPool* pool = nullptr, const KvCodecCosts* costs = nullptr);
 
+// A store chunk of several KV pages (core/kv_store.h): `pages` are the page
+// images in order (KvCache::read_rows, `page_slots` positions each but a
+// partial last one). Each page is encoded on its own as kv_encode() does,
+// or kept raw where that does not apply or pay: u32 page count, then per
+// page a u8 (1: encoded, 0: raw) and its u32 size, then the pages. False
+// when no page is encoded (the chunk is then stored raw).
+bool kv_encode_chunk(KvEncoding encoding, const KvRowLayout& layout, int32_t page_slots,
+                     std::span<const std::span<const uint8_t>> pages, std::vector<uint8_t>& out,
+                     ThreadPool* pool = nullptr, const KvCodecCosts* costs = nullptr);
+// Decodes a chunk of `slots` positions written by kv_encode_chunk() into
+// `out`, its rows as parts in any partition (the cache's pages in place, or
+// scratch). False when it is malformed.
+bool kv_decode_chunk(KvEncoding encoding, const KvRowLayout& layout, int32_t page_slots, int32_t slots,
+                     std::span<const uint8_t> in, std::span<const std::span<uint8_t>> out, ThreadPool* pool = nullptr);
+
 // Wall-clock nanoseconds the lossless decoder takes per coded symbol for
 // chunks of `layout` and `slots` positions on `pool` (best of 3 on a
 // synthetic chunk); 0 when the layout is invalid.

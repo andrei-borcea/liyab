@@ -14,8 +14,9 @@
 
 #include "core/kv_codec.h"
 #include "core/kv_store.h"
-#include "core/quant.h"
 #include "core/thread_pool.h"
+#include "liyab/mmap_loader.h"
+#include "core/quant.h"
 #include "liyab/engine.h"
 #include "liyab/kv_cache.h"
 #include "test_model.h"
@@ -362,20 +363,37 @@ KvStore::PutResult put(KvStore& store, const std::vector<int32_t>& tokens, std::
     KvStore::ContextSource src;
     src.tokens = tokens;
     src.text = "";
-    src.rows = [&tokens](int32_t chunk, int32_t n, uint8_t* out) {
+    // The rows as parts, as a cache's pages are: a whole chunk in two (two
+    // pages), a partial one in one. The store writes storage straight from
+    // them and copies them once for RAM.
+    std::vector<std::vector<uint8_t>> images;
+    src.rows = [&](int32_t chunk, int32_t n) {
+        images.emplace_back(static_cast<size_t>(n) * kPosBytes);
+        uint8_t* out = images.back().data();
         for (int32_t s = 0; s < n; ++s) {
             const int32_t pos = chunk * kChunk + s;
             for (size_t b = 0; b < kPosBytes; ++b) out[static_cast<size_t>(s) * kPosBytes + b] = row_byte(tokens[static_cast<size_t>(pos)], pos, b);
         }
-        return Status::ok();
+        const std::span<const uint8_t> all(images.back());
+        if (n < kChunk) return std::vector<std::span<const uint8_t>>{all};
+        return std::vector<std::span<const uint8_t>>{all.first(all.size() / 2), all.subspan(all.size() / 2)};
     };
     src.states = std::move(marks);
-    src.state = [&tokens](int32_t pos, float* out) {
-        const std::vector<float> s = state_image(tokens, pos);
-        std::copy(s.begin(), s.end(), out);
-        return Status::ok();
+    // An image in two parts, as a model's per-block states are.
+    std::vector<std::vector<float>> states;
+    src.state_parts = [&](int32_t pos) {
+        states.push_back(state_image(tokens, pos));
+        const std::span<const float> all(states.back());
+        return std::vector<std::span<const float>>{all.first(3), all.subspan(3)};
     };
     return store.put(src, storage_only);
+}
+
+// A state image read in two parts, as into a model's per-block states.
+Status read_state(KvStore& store, const KvKey& key, std::vector<float>& out) {
+    const std::span<float> all(out);
+    const std::span<float> parts[] = {all.first(5), all.subspan(5)};
+    return store.read_state(key, parts);
 }
 
 // Whether the store gives back the right bytes for the first `n` positions of `tokens` along `plan`.
@@ -383,7 +401,8 @@ bool rows_match(KvStore& store, const KvStore::Plan& plan, const std::vector<int
     for (size_t i = 0; i < plan.chunks.size(); ++i) {
         const int32_t n = plan.chunk_sizes[i];
         std::vector<uint8_t> image(static_cast<size_t>(n) * kPosBytes);
-        if (!store.read_chunk(plan.chunks[i], image).is_ok()) return false;
+        const std::span<uint8_t> into(image);
+        if (!store.read_chunk(plan.chunks[i], {&into, 1}).is_ok()) return false;
         for (int32_t s = 0; s < n; ++s) {
             const int32_t pos = static_cast<int32_t>(i) * kChunk + s;
             if (pos >= plan.positions) break;
@@ -413,6 +432,25 @@ std::string store_dir(const std::string& name) {
 }
 
 }  // namespace
+
+TEST_CASE("The KV store's payload hash, taken in pieces, is xxhash64 of the whole") {
+    std::mt19937 rng(9);
+    std::vector<uint8_t> data(3000);
+    for (uint8_t& b : data) b = static_cast<uint8_t>(rng());
+    bool same = true;
+    for (size_t length : {size_t{0}, size_t{1}, size_t{7}, size_t{31}, size_t{32}, size_t{33}, size_t{100}, size_t{3000}}) {
+        for (int trial = 0; trial < 20; ++trial) {
+            KvStreamHash hash;
+            for (size_t at = 0; at < length;) {
+                const size_t n = std::min(length - at, static_cast<size_t>(rng() % 70));
+                hash.update(data.data() + at, n);
+                at += n;
+            }
+            same = same && hash.digest() == xxhash64(data.data(), length);
+        }
+    }
+    CHECK(same);
+}
 
 TEST_CASE("The KV store keeps a shared prefix once and restores a prompt up to where it diverges") {
     std::mt19937 rng(7);
@@ -478,9 +516,9 @@ TEST_CASE("The KV store restores a hybrid model up to the deepest state its prom
     CHECK(p.snapshots[0].pos == 20);
     CHECK(rows_match(*store, p, prompt));
     std::vector<float> state(kStateFloats);
-    REQUIRE(store->read_state(p.state, state).is_ok());
+    REQUIRE(read_state(*store, p.state, state).is_ok());
     CHECK(state == state_image(x, 70));
-    REQUIRE(store->read_state(p.snapshots[0].key, state).is_ok());
+    REQUIRE(read_state(*store, p.snapshots[0].key, state).is_ok());
     CHECK(state == state_image(x, 20));
     prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 50), {7, 7, 7});
     p = store->plan(prompt, prompt.size());
@@ -577,7 +615,7 @@ TEST_CASE("The KV store's files outlive it, in LRU order, and what it cannot tru
         CHECK(p.snapshots.size() == 2);
         CHECK(rows_match(*store, p, a));
         std::vector<float> state(kStateFloats);
-        REQUIRE(store->read_state(p.state, state).is_ok());
+        REQUIRE(read_state(*store, p.state, state).is_ok());
         CHECK(state == state_image(a, 100));
     }
     // A lower cap: B goes first (A was used after it), then C; A stays.
@@ -738,6 +776,54 @@ double lossy_error(const KvRowLayout& l, const std::vector<float>& a, const std:
     return worst;
 }
 
+// A store chunk of two pages (kPage positions each), as the engine's chunks
+// of whole pages are: its rows are the page images one after the other.
+constexpr int32_t kPage = kChunk / 2;
+
+std::vector<uint8_t> chunk_image(const KvRowLayout& l, std::span<const int32_t> tokens, int32_t first, int32_t n) {
+    std::vector<uint8_t> all;
+    for (int32_t at = 0; at < n; at += kPage) {
+        const std::vector<uint8_t> page = kv_image(l, tokens, first + at, std::min(kPage, n - at));
+        all.insert(all.end(), page.begin(), page.end());
+    }
+    return all;
+}
+
+// The rows of a context as the store asks for them: one part per page, kept in `keep`.
+std::function<std::vector<std::span<const uint8_t>>(int32_t, int32_t)> page_rows(
+    const KvRowLayout& l, const std::vector<int32_t>& tokens, std::vector<std::vector<uint8_t>>& keep) {
+    return [&l, &tokens, &keep](int32_t chunk, int32_t n) {
+        std::vector<std::span<const uint8_t>> parts;
+        for (int32_t at = 0; at < n; at += kPage) {
+            keep.push_back(kv_image(l, tokens, chunk * kChunk + at, std::min(kPage, n - at)));
+        }
+        for (size_t k = keep.size() - static_cast<size_t>((n + kPage - 1) / kPage); k < keep.size(); ++k) parts.emplace_back(keep[k]);
+        return parts;
+    };
+}
+
+// Reads chunk `key` of n positions into one buffer through two parts cut
+// off the page boundary (so decoding scatters), as a restore's pages and
+// scratch are.
+Status read_split(KvStore& store, const KvKey& key, std::vector<uint8_t>& image) {
+    const size_t cut = image.size() / 3;
+    const std::span<uint8_t> parts[] = {std::span<uint8_t>(image).first(cut), std::span<uint8_t>(image).subspan(cut)};
+    return store.read_chunk(key, parts);
+}
+
+// Lossy restore of a chunk within bounds, page by page.
+bool chunk_close(const KvRowLayout& l, const std::vector<uint8_t>& want, const std::vector<uint8_t>& got, int32_t n) {
+    size_t at = 0;
+    for (int32_t first = 0; first < n; first += kPage) {
+        const int32_t m = std::min(kPage, n - first);
+        const size_t bytes = l.image_bytes(m);
+        const std::span<const uint8_t> a(want.data() + at, bytes), b(got.data() + at, bytes);
+        if (lossy_error(l, kv_values(l, a, m), kv_values(l, b, m), m) > 1.0) return false;
+        at += bytes;
+    }
+    return true;
+}
+
 }  // namespace
 
 TEST_CASE("KV chunk encodings: lossless gives the bytes back for every cache type, lossy stays within its steps") {
@@ -799,6 +885,7 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
         const uint64_t parts[] = {77};
         c.seed = kv_seed_key(parts);
         c.chunk_tokens = kChunk;
+        c.page_tokens = kPage;
         c.chunk_bytes = l.image_bytes(kChunk);
         c.dir = dir;
         c.disk_bytes = size_t{64} << 20;
@@ -811,11 +898,8 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
     auto put_rows = [&](KvStore& store, const std::vector<int32_t>& tokens) {
         KvStore::ContextSource src;
         src.tokens = tokens;
-        src.rows = [&](int32_t chunk, int32_t n, uint8_t* out) {
-            const std::vector<uint8_t> image = kv_image(l, tokens, chunk * kChunk, n);
-            std::copy(image.begin(), image.end(), out);
-            return Status::ok();
-        };
+        std::vector<std::vector<uint8_t>> keep;
+        src.rows = page_rows(l, tokens, keep);
         return store.put(src, /*storage_only=*/true);
     };
     // Whether `tokens` are restored: bit for bit, or (lossy) close.
@@ -825,10 +909,10 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
         for (size_t i = 0; i < plan.chunks.size(); ++i) {
             const int32_t n = plan.chunk_sizes[i];
             std::vector<uint8_t> image(l.image_bytes(n));
-            if (!store.read_chunk(plan.chunks[i], image).is_ok()) return false;
-            const std::vector<uint8_t> want = kv_image(l, tokens, static_cast<int32_t>(i) * kChunk, n);
+            if (!read_split(store, plan.chunks[i], image).is_ok()) return false;
+            const std::vector<uint8_t> want = chunk_image(l, tokens, static_cast<int32_t>(i) * kChunk, n);
             if (exact && image != want) return false;
-            if (lossy_error(l, kv_values(l, want, n), kv_values(l, image, n), n) > 1.0) return false;
+            if (!chunk_close(l, want, image, n)) return false;
         }
         return true;
     };
@@ -906,7 +990,7 @@ TEST_CASE("The KV store keeps chunks compressed on storage, counts their stored 
         const KvStore::Plan plan = store->plan(b, b.size());
         REQUIRE(!plan.chunks.empty());
         std::vector<uint8_t> image(l.image_bytes(plan.chunk_sizes[0]));
-        CHECK(store->read_chunk(plan.chunks[0], image).code() == ErrorCode::IoError);
+        CHECK(read_split(*store, plan.chunks[0], image).code() == ErrorCode::IoError);
         CHECK(store->plan(b, b.size()).positions == 0);
     }
     std::filesystem::remove_all(dir);
@@ -920,6 +1004,7 @@ TEST_CASE("The KV store codes chunks only where it pays, measures that once, and
         const uint64_t parts[] = {78};
         c.seed = kv_seed_key(parts);
         c.chunk_tokens = kChunk;
+        c.page_tokens = kPage;
         c.chunk_bytes = l.image_bytes(kChunk);
         c.dir = dir;
         c.disk_bytes = size_t{64} << 20;
@@ -932,30 +1017,23 @@ TEST_CASE("The KV store codes chunks only where it pays, measures that once, and
     auto put_rows = [&](KvStore& store, const std::vector<int32_t>& tokens) {
         KvStore::ContextSource src;
         src.tokens = tokens;
-        src.rows = [&](int32_t chunk, int32_t n, uint8_t* out) {
-            const std::vector<uint8_t> image = kv_image(l, tokens, chunk * kChunk, n);
-            std::copy(image.begin(), image.end(), out);
-            return Status::ok();
-        };
+        std::vector<std::vector<uint8_t>> keep;
+        src.rows = page_rows(l, tokens, keep);
         return store.put(src, /*storage_only=*/true);
     };
-    // read_chunks() over the whole plan, each image checked as it arrives.
-    auto batch_restored = [&](KvStore& store, const std::vector<int32_t>& tokens) {
+    // A restore's reads: read_ahead() over the plan, then read_chunk() in
+    // order (`skip`: one chunk left out, as a restore skips rows it keeps).
+    auto batch_restored = [&](KvStore& store, const std::vector<int32_t>& tokens, size_t skip = SIZE_MAX) {
         const KvStore::Plan plan = store.plan(tokens, tokens.size());
         if (plan.positions != static_cast<int32_t>(tokens.size())) return false;
-        std::vector<std::vector<uint8_t>> images(plan.chunks.size());
-        bool same = true;
-        const Status s = store.read_chunks(
-            plan.chunks,
-            [&](size_t i) {
-                images[i].assign(l.image_bytes(plan.chunk_sizes[i]), 0);
-                return std::span<uint8_t>(images[i]);
-            },
-            [&](size_t i) {
-                same = same && images[i] == kv_image(l, tokens, static_cast<int32_t>(i) * kChunk, plan.chunk_sizes[i]);
-                return Status::ok();
-            });
-        return s.is_ok() && same;
+        store.read_ahead(plan.chunks);
+        for (size_t i = 0; i < plan.chunks.size(); ++i) {
+            if (i == skip) continue;
+            std::vector<uint8_t> image(l.image_bytes(plan.chunk_sizes[i]));
+            if (!read_split(store, plan.chunks[i], image).is_ok()) return false;
+            if (image != chunk_image(l, tokens, static_cast<int32_t>(i) * kChunk, plan.chunk_sizes[i])) return false;
+        }
+        return true;
     };
     std::mt19937 rng(9);
     const std::vector<int32_t> a = random_tokens(rng, 150);
@@ -980,18 +1058,16 @@ TEST_CASE("The KV store codes chunks only where it pays, measures that once, and
         const KvStore::Stats st = store->stats();
         CHECK(st.chunk_file_bytes < st.chunk_raw_bytes);
         CHECK(batch_restored(*store, a));
-        // A failure of the caller's stops the batch and is returned.
+        CHECK(batch_restored(*store, a, 0));
+        CHECK(batch_restored(*store, a, 3));
+        // Reads out of the announced order forget it and still give the rows.
         const KvStore::Plan plan = store->plan(a, a.size());
-        std::vector<uint8_t> image(l.image_bytes(kChunk));
-        size_t calls = 0;
-        const Status s = store->read_chunks(
-            plan.chunks, [&](size_t) { return std::span<uint8_t>(image); },
-            [&](size_t) {
-                ++calls;
-                return Status(ErrorCode::Cancelled, "stop");
-            });
-        CHECK(s.code() == ErrorCode::Cancelled);
-        CHECK(calls == 1);
+        store->read_ahead(plan.chunks);
+        for (size_t i = plan.chunks.size(); i-- > 0;) {
+            std::vector<uint8_t> image(l.image_bytes(plan.chunk_sizes[i]));
+            CHECK(read_split(*store, plan.chunks[i], image).is_ok());
+            CHECK(image == chunk_image(l, a, static_cast<int32_t>(i) * kChunk, plan.chunk_sizes[i]));
+        }
         // A damaged file in the middle: removed, with what follows it; the batch fails.
         std::filesystem::path victim;
         for (const auto& e : std::filesystem::directory_iterator(dir)) {

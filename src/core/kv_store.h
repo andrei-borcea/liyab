@@ -2,10 +2,12 @@
 //
 // What it keeps. Contexts the engine sets aside (a conversation another
 // prompt replaced, one an embedding call interrupted, the context left when
-// the engine is destroyed) are cut into chunks of `chunk_tokens` positions,
-// one page of the paged KV cache each (KvCache::read_rows). A chunk holds the
-// KV rows of its positions and the tokens they encode; the last chunk of a
-// context may be partial. Each chunk is keyed by a hash chained over every
+// the engine is destroyed) are cut into chunks of `chunk_tokens` positions, a
+// whole number of pages of the paged KV cache (KvCache::read_rows), whose
+// images it holds one after the other. A chunk holds the KV rows of its
+// positions and the tokens they encode; the last chunk of a context may be
+// partial. The engine sizes chunks at about 2 MiB (Engine::Impl::open_store):
+// each is a file on storage, whose creation costs as much as writing ~1 MB. Each chunk is keyed by a hash chained over every
 // token before it and its own (kv_chain_key), rooted in a seed that covers
 // what the bytes depend on: the model file, the cache layout and type, the
 // key scales the keys were stored with, the kernel set and the backends that
@@ -74,24 +76,26 @@
 // (os::FileLock) while open; another engine, in this process or another,
 // that finds it held runs without the storage tier.
 //
-// Compressed chunks on storage. A chunk is written encoded (core/kv_codec.h):
-// losslessly by default (KvEncoding::Lossless) where that pays on this
-// device (the read time saved exceeds the decode time, with speeds measured
-// once: calibrate()), re-quantized to 4 bits when Config::lossy asks for it
-// (KvEncoding::Lossy4), raw when its encoding does not apply or does not
-// pay. read_chunks() reads ahead while it decodes. FileHeader::encoding names it,
+// Compressed chunks on storage. A chunk is written encoded (core/kv_codec.h,
+// page by page: kv_encode_chunk()) losslessly (KvEncoding::Lossless) where
+// that pays on this device: a stream is coded only when the read time its
+// smaller size saves exceeds its decode time, with read and decode speeds
+// measured once (calibrate()); a chunk where nothing pays is stored raw, so
+// it is read exactly as before. With Config::lossy it is re-quantized to 4
+// bits instead (KvEncoding::Lossy4). FileHeader::encoding names it,
 // `raw_bytes` is the decoded size; every cap counts the stored size
-// (Item::file_bytes), and the payload hash covers the stored bytes. RAM holds
-// raw rows: chunks are encoded when they go to storage (put(), or moving out
-// of RAM), and decoded by read_chunk() into the caller's image, on
-// Config::pool when given. A lossy store's seed is derived from Config::seed
-// (so its chunks are never returned to a store that did not opt in, in this
-// process or a later one), and a Lossy4 file under a lossless store's own
-// seed is removed as untrusted. Raw files of earlier builds stay readable; a
-// file of an encoding a build does not know is removed when the directory is
-// opened, never misread. State images are stored raw: a lossless coding of
-// their 32-bit floats would save ~13% (measured on Qwen3.5-0.8B), not worth
-// a second codec yet.
+// (Item::file_bytes), and the payload hash covers the stored bytes. RAM
+// holds raw rows: chunks are encoded when they go to storage (put(), or
+// moving out of RAM), and decoded by read_chunk() into the caller's parts,
+// on Config::pool. While one compressed chunk decodes, the file of the next
+// one read_ahead() named is read on a thread of its own. A lossy store's
+// seed is derived from Config::seed, so its chunks are never returned to a
+// store that did not opt in, in this process or a later one; a Lossy4 file
+// under a lossless store's own seed is removed as untrusted. Raw files stay
+// readable; a file of an encoding a build does not know is removed when the
+// directory is opened, never misread. State images are stored raw: a
+// lossless coding of their 32-bit floats would save ~13% (measured on
+// Qwen3.5-0.8B), which on fast storage would not pay its decode time.
 //
 // Extension points (later branches build on these, nothing else changes):
 //  * Chunks reused away from their prefix (feat/kv-reuse): every chunk also
@@ -148,19 +152,39 @@ KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcep
 // Returns how many were removed.
 int32_t remove_kv_dedup_files(const std::string& dir);
 
+// xxHash64 (seed 0) of bytes given in pieces: the store hashes a payload
+// block by block as it writes or reads it, while the block is still in the
+// CPU's cache, instead of in a second pass over the whole payload. The
+// digest equals xxhash64() of the concatenated bytes, so files keep one
+// format whichever way they were hashed.
+class KvStreamHash {
+public:
+    void update(const void* data, size_t bytes) noexcept;
+    [[nodiscard]] uint64_t digest() const noexcept;
+
+private:
+    void stripe(const uint8_t* p) noexcept;
+    uint64_t v_[4] = {0x9E3779B185EBCA87ULL + 0xC2B2AE3D27D4EB4FULL, 0xC2B2AE3D27D4EB4FULL, 0,
+                      0 - 0x9E3779B185EBCA87ULL};
+    uint64_t total_ = 0;
+    uint8_t buffer_[32] = {};
+    size_t buffered_ = 0;
+};
+
 class KvStore {
 public:
     struct Config {
         KvKey seed;                 // see kv_seed_key(); chunks of other seeds are never returned
-        int32_t chunk_tokens = 64;  // positions per chunk: one KV page
+        int32_t chunk_tokens = 64;  // positions per chunk: whole KV pages
         size_t chunk_bytes = 0;     // bytes of a whole chunk's rows (KvCache::rows_bytes(chunk_tokens))
         size_t state_floats = 0;    // values of one recurrent-state image; 0: attention-only model
         size_t ram_bytes = 0;       // RAM cap; 0: no RAM tier
         std::string dir;            // storage tier directory (created when missing); empty: none
         size_t disk_bytes = 0;      // storage cap; 0: no storage tier
-        // The geometry of chunk images (kv_row_layout() of the cache);
-        // invalid: chunks are stored raw.
+        // The geometry of the cache's page images (kv_row_layout()) and the
+        // positions per page; invalid layout: chunks are stored raw.
         KvRowLayout layout;
+        int32_t page_tokens = 0;    // 0: chunk_tokens
         // Chunks re-quantized to 4 bits on storage (KvEncoding::Lossy4):
         // changes the output, opt-in. Changes the seed.
         bool lossy = false;
@@ -168,9 +192,9 @@ public:
         // it from the thread calling the store, one job at a time.
         ThreadPool* pool = nullptr;
         // Where the measured costs of reading and decoding (KvCodecCosts)
-        // are kept, per device, directory, layout and thread count (16 sets
-        // at most, least recently used out first); empty: measured each time
-        // the store opens. See calibrate().
+        // are kept, per directory, layout and thread count (16 sets at most,
+        // least recently used out first); empty: measured each time the
+        // store opens. See calibrate().
         std::string calibration_dir;
         // Costs to use instead of measuring them (tests, tools).
         std::optional<KvCodecCosts> costs;
@@ -209,18 +233,21 @@ public:
     };
 
     // A context to set aside: its tokens and text, a source of each chunk's
-    // rows and, on hybrid models, of the state images to keep.
+    // rows and, on hybrid models, of the state images to keep. Storage is
+    // written straight from the views (no copy); RAM copies once.
     struct ContextSource {
         std::span<const int32_t> tokens;
         std::string_view text;
         size_t text_tokens = 0;
-        // Writes the rows of positions [chunk * chunk_tokens, + n) to `out`
-        // (KvCache::read_rows of logical page `chunk`).
-        std::function<Status(int32_t chunk, int32_t n, uint8_t* out)> rows;
+        // The rows of positions [chunk * chunk_tokens, + n) as parts in
+        // order, rows_bytes(n) in all: the cache's whole pages in place, a
+        // partial last page packed (KvCache::read_rows). Valid while put() runs.
+        std::function<std::vector<std::span<const uint8_t>>(int32_t chunk, int32_t n)> rows;
         // Ascending, the last at tokens.size() (Transformer::kept_states()).
         std::vector<StateMark> states;
-        // Writes the state image at `pos` (state_floats values) to `out`.
-        std::function<Status(int32_t pos, float* out)> state;
+        // The state image at `pos` as its parts in order, state_floats values
+        // in all (Transformer::kept_state_parts()).
+        std::function<std::vector<std::span<const float>>(int32_t pos)> state_parts;
     };
     struct PutResult {
         bool whole = false;          // every chunk and state is stored, with the record
@@ -253,23 +280,25 @@ public:
     [[nodiscard]] Plan plan(std::span<const int32_t> tokens, size_t limit) const;
     // Marks a plan's chunks and states used (the front of the LRU order).
     void used(const Plan& plan);
-    // A chunk's whole image (rows_bytes of its token count) or a state
-    // image, into `out` of exactly that size. IoError for a damaged or
-    // unreadable file, which is removed (with what depends on it);
-    // InvalidArgument for an unknown key or a wrong size.
-    Status read_chunk(const KvKey& key, std::span<uint8_t> out);
-    // Reads the chunks `keys` in order, chunk i into dest(i) (its whole image,
-    // as read_chunk() takes it), calling done(i) once it is there. The next
-    // chunk's file is read on a thread of its own while the current one is
-    // decoded, so a restore costs about the longer of the two, not their sum.
-    // dest(i + 1) is asked for before done(i) is called. Stops at the first
-    // failure: read_chunk()'s errors (a damaged file is removed), or done()'s.
-    Status read_chunks(std::span<const KvKey> keys, const std::function<std::span<uint8_t>(size_t)>& dest,
-                       const std::function<Status(size_t)>& done);
+    // A chunk's whole image (rows_bytes of its token count: the KV pages it
+    // restores, or scratch for those it does not) or a state image
+    // (Transformer::recurrent_parts() or a snapshot buffer) into `parts` in
+    // order, of exactly that size, with no intermediate copy; read in blocks,
+    // each hashed while still in cache. IoError for a damaged or unreadable
+    // file, which is removed (with what depends on it), and the destination's
+    // content is then undefined; InvalidArgument for an unknown key or a
+    // wrong size.
+    Status read_chunk(const KvKey& key, std::span<const std::span<uint8_t>> parts);
+    // The chunks a restore is about to read with read_chunk(), in order: while
+    // a compressed one decodes, the file of the next one is read on a thread
+    // of its own, so a restore costs about the longer of reading and
+    // decoding, not their sum. Raw chunks are read as without it. A
+    // read_chunk() of another key, or put(), forgets the list.
+    void read_ahead(std::span<const KvKey> keys);
     // What reading and decoding cost here (see calibrate()); zeros without a
     // storage tier or a layout.
     [[nodiscard]] const KvCodecCosts& codec_costs() const noexcept { return costs_; }
-    Status read_state(const KvKey& key, std::span<float> out);
+    Status read_state(const KvKey& key, std::span<const std::span<float>> parts);
     // The keys of the chunks holding `tokens` (all stored: else empty).
     [[nodiscard]] std::vector<KvKey> chunk_path(std::span<const int32_t> tokens) const;
 
@@ -363,7 +392,12 @@ private:
     // RAM -> storage. When it cannot be written: evicted when `or_evict`,
     // else left in RAM. True when it is on storage.
     bool demote(Kind kind, const KvKey& key, bool or_evict);
-    bool place(Kind kind, Item& it, bool storage_only);  // a new item: RAM, else storage
+    // Where a new item goes: RAM when it fits there, older items moved out;
+    // else storage, older items evicted; None when neither has room.
+    enum class Tier : uint8_t { None, Ram, Disk };
+    // `disk_size`: the item's file size, asked for only when it goes to storage.
+    Tier make_place(Kind kind, const Item& it, bool storage_only, const std::function<size_t()>& disk_size);
+    void account(Kind kind, Item& it, bool on_disk);  // a placed item: counted, in its tier's LRU
     void evict(Kind kind, const KvKey& key);             // at chunk granularity
     void drop_chunk(const KvKey& key);                   // with every chunk after it
     void drop_one_chunk(const KvKey& key);
@@ -375,22 +409,27 @@ private:
     void drop_state(const KvKey& key);
     void drop_record(const KvKey& leaf, bool collect);
     void release(Kind kind, Item& it);  // frees its payload or file, out of its tier
-    // Encodes an item's payload (in `data`) for storage into encoded_ and
-    // returns the size its file will have. write_item_file() then writes
-    // encoded_: nothing may encode in between (making room on storage only
-    // evicts, it never writes).
-    size_t encode_for_disk(Kind kind, Item& it);
-    bool write_item_file(Kind kind, Item& it);  // the file of the item encode_for_disk() was last called for
+    [[nodiscard]] size_t file_size(Kind kind, const Item& it) const noexcept;
+    // Encodes a chunk's payload `parts` for storage into encoded_ (where that
+    // applies and pays) and returns the size the item's file will have.
+    // write_item_file() then writes encoded_: nothing may encode in between
+    // (making room on storage only evicts, it never writes).
+    size_t encode_for_disk(Kind kind, const Item& it, std::span<const std::span<const uint8_t>> parts);
+    // The file of an item whose payload is `parts` in order (its `data` when
+    // in RAM), hashed block by block as it is written; encoded_ instead when
+    // encode_for_disk() encoded it.
+    bool write_item_file(Kind kind, Item& it, std::span<const std::span<const uint8_t>> parts);
     bool write_record_file(RecordEntry& entry);
 
     void scan();  // indexes the directory (see the header comment)
-    // The costs the lossless encoding weighs (KvCodecCosts): kept in
-    // Config::calibration_dir, else measured: reading a file written to the
-    // storage directory, uncached (core/direct_io.h), and decoding a
-    // synthetic chunk of the layout on the pool. Measured once, then fixed,
-    // so what is coded is deterministic. When reads cannot be measured, or
-    // only through the page cache, nothing is coded (a restore never pays for
-    // it).
+    // The costs the lossless encoding weighs (KvCodecCosts): Config::costs,
+    // else kept in Config::calibration_dir, else measured: a probe file
+    // written to the storage directory and read back uncached
+    // (core/direct_io.h) and through the store's own buffered, hashed read
+    // (a read costs the larger), and decoding a synthetic chunk of the
+    // layout on the pool. Measured once, then fixed, so what is coded is
+    // deterministic. When reads cannot be measured uncached, nothing is
+    // coded: a restore never pays for it.
     void calibrate();
 
     Config config_;
@@ -408,8 +447,17 @@ private:
     std::map<uint64_t, std::pair<Kind, KvKey>> lru_[2];  // [0] RAM, [1] storage; oldest first
     std::vector<uint8_t> scratch_;
     std::vector<uint8_t> encoded_;  // see encode_for_disk()
-    KvCodecCosts costs_;
     KvEncoding encoded_as_ = KvEncoding::Raw;
+    KvKey encoded_key_;
+    KvCodecCosts costs_;
+    // read_ahead(): the keys, where the next read_chunk() is expected, and
+    // the stored bytes of the chunk read ahead (hash checked: `ahead_ok_`).
+    std::vector<KvKey> ahead_keys_;
+    size_t ahead_next_ = 0;
+    KvKey ahead_key_;
+    bool ahead_valid_ = false;
+    bool ahead_ok_ = false;
+    std::vector<uint8_t> ahead_bytes_;
 };
 
 }  // namespace liyab
