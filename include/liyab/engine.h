@@ -32,7 +32,9 @@ struct ExperimentalConfig {
     float egls_threshold = 0.002f;        // skip a block's FFN when its entropy delta is below this
     bool tdss = false;                    // 2:4 sparse FFN weights while thermally throttled (lossy)
     bool tdss_force = false;              // use the sparse FFN even when cool (benchmarks)
-    std::string kv_dedup_dir;             // non-empty: persistent prefix KV cache in this directory
+    // (KV dedup, the experimental persistent prefix KV cache, is retired: the
+    // prefix cache's store keeps a shared prefix once, on storage across
+    // processes, for every model, within its caps; see prefix_cache_dir.)
 };
 
 struct EngineConfig {
@@ -90,23 +92,37 @@ struct EngineConfig {
     // output then depends on I/O timing. 0: off.
     float moe_skip_slow = 0.0f;
     // Prefix cache, MiB of RAM at most (0: off): contexts another
-    // conversation's prompt replaced are kept (KV pages, recurrent states and
-    // the text they encode, LRU) and restored when a prompt continues one,
-    // instead of processing it again. Taken out of memory_budget_mb; on a MoE
-    // whose experts stream, only as far as the expert cache can spare: it
-    // never takes the cache under 10% of the experts, so it never causes a
-    // requantization (requant_bits -1). On Qwen3.6-35B-A3B a 2000-token
-    // conversation costs ~85 MiB.
+    // conversation's prompt replaced (or an embed() / rerank() call) are kept
+    // and restored when a prompt continues one, instead of processing it
+    // again, cut back to where the two diverge. They are kept in a
+    // content-addressed store of KV chunks: one KV page of tokens each, keyed
+    // by every token before it plus the model, cache layout, key scales and
+    // kernels, so a prefix conversations share (system prompt, tools) is
+    // stored once and any prompt starting with it restores it; recurrent
+    // (DeltaNet) states are kept as images at the positions the context's
+    // state snapshots hold, and a hybrid model restores up to the deepest
+    // one its prompt reaches. Least recently used chunks out first. Taken out
+    // of memory_budget_mb; on a MoE whose experts stream, only as far as the
+    // expert cache can spare: it never takes the cache under 10% of the
+    // experts, so it never causes a requantization (requant_bits -1). On
+    // Qwen3.6-35B-A3B a 2000-token conversation costs ~21 MiB of chunks plus
+    // 62.8 MiB per state image.
     int64_t prefix_cache_mb = 0;
-    // Prefix cache on storage: contexts set aside that RAM does not hold
-    // (prefix_cache_mb, possibly 0) are written to files in this directory
-    // (created if missing), up to prefix_cache_disk_mb (0: off), least
-    // recently used out first, and read back when a prompt continues one.
-    // No RAM spent: worth it wherever RAM is tight and storage is fast (UFS 4
-    // writes or reads a ~100 MB context in a fraction of a second; processing
-    // it again takes minutes on a large MoE). The engine owns the ctx-*.state
-    // files there: it removes its own when destroyed and, when created, those
-    // that processes which ended left behind.
+    // Prefix cache on storage: what RAM does not hold (prefix_cache_mb,
+    // possibly 0) goes to files in this directory (created if missing), at
+    // most prefix_cache_disk_mb (0: off), least recently used out first, and
+    // is read back when a prompt continues it. No RAM spent: worth it
+    // wherever RAM is tight and storage is fast (UFS 4 writes or reads a
+    // ~100 MB context in a fraction of a second; processing it again takes
+    // minutes on a large MoE). The files outlive the engine: when destroyed,
+    // it sets its context aside there too, and a later engine (or process)
+    // with the same model and settings restores from them; other models'
+    // files are kept and count against the cap. Writes go through a
+    // temporary file and a rename; when it opens the directory the engine
+    // removes what it cannot trust (interrupted writes, damaged files, other
+    // format versions, the ctx-*.state files of builds before the store).
+    // One engine at a time uses a directory (an OS lock on kv.lock there):
+    // another one, in this process or another, runs without the storage tier.
     std::string prefix_cache_dir;
     int64_t prefix_cache_disk_mb = 0;
     // What the engine measures once per model and keeps, in this directory
@@ -381,8 +397,8 @@ public:
     // prompt, prepared right after loading). Follows the same reuse rules as
     // generate(). Not reentrant (Busy); cancel() stops it between chunks.
     Status prefill(std::string_view text, bool add_bos = true);
-    // Forgets the context (the next call starts from scratch, or from a
-    // context the prefix cache set aside that its prompt continues).
+    // Forgets the context (the next call starts from scratch, or from what
+    // the prefix cache keeps of its prompt).
     void reset_context();
     // Saves the context (e.g. a prefilled system prompt) to `path`: KV pages,
     // recurrent states (with the oldest and the pinned state snapshots on
@@ -393,9 +409,11 @@ public:
     Status save_state(const std::string& path);
     // Saves the context that `text` continues (a conversation's text so far):
     // the live one when it does, else the longest one the prefix cache set
-    // aside for it, written as kept (nothing is restored or processed), so a
-    // conversation another prompt replaced (a request through an app's API)
-    // can still be saved. InvalidArgument when no context continues `text`.
+    // aside for it, written from its store as kept (nothing is restored or
+    // processed), so a conversation another prompt replaced (a request
+    // through an app's API) can still be saved. InvalidArgument when no
+    // context continues `text`; Unsupported when a hybrid model's set-aside
+    // context lost its recurrent states (they did not fit the cache).
     Status save_state(const std::string& path, std::string_view text);
     // Replaces the context with one save_state() wrote for this model file
     // loaded with the same cache settings, so the next prompt that continues
@@ -549,6 +567,28 @@ public:
     // query), the context is left empty, one call at a time, cancellable.
     Result<std::vector<float>> rerank(std::string_view query, std::span<const std::string_view> documents,
                                       const RerankOptions& options = {}, PoolingStats* stats = nullptr);
+
+    // ---- Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir) ------
+    // What its store holds and how it was used since the engine was created.
+    // All zero without a prefix cache. Thread-safe: may be read while a
+    // generation runs (the figures are those after the last use).
+    struct PrefixCacheStats {
+        uint64_t ram_bytes = 0;          // KV chunks and state images in RAM
+        uint64_t ram_cap_bytes = 0;      // prefix_cache_mb as granted (0: no RAM tier)
+        uint64_t storage_bytes = 0;      // the store's files in prefix_cache_dir, every model's
+        uint64_t storage_cap_bytes = 0;  // prefix_cache_disk_mb (0: no storage tier)
+        int32_t chunks = 0;              // this model's, in RAM and on storage
+        int32_t state_images = 0;        // recurrent-state images (hybrid models)
+        int32_t contexts = 0;            // stored contexts (texts a prompt is matched against)
+        uint64_t set_asides = 0;         // contexts set aside
+        uint64_t chunks_written = 0;     // chunks they added
+        uint64_t chunks_reused = 0;      // chunks they found stored already (shared prefixes)
+        double set_aside_ms = 0.0;       // total time setting aside
+        uint64_t restores = 0;           // prompts that restored a prefix
+        uint64_t restored_tokens = 0;    // positions restored
+        double restore_ms = 0.0;         // total time restoring
+    };
+    [[nodiscard]] PrefixCacheStats prefix_cache_stats() const;
 
 private:
     struct Impl;

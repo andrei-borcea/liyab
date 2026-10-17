@@ -76,7 +76,8 @@ Liyab is built around those constraints:
   tokens and asks the governor for lower clocks, so the same tokens cost fewer watts. It does not run flat out and
   then collapse.
 * **Serving a single user well.** Context is reused across turns, including the recurrent state of hybrid models.
-  A prefix cache brings back earlier conversations. Prefill can be cancelled and resumed. Structured output covers
+  A prefix cache of KV chunks brings back earlier conversations, keeps a shared system prompt once and outlives a
+  restart. Prefill can be cancelled and resumed. Structured output covers
   tool calls. A local OpenAI, Anthropic Messages and gRPC API lets other apps on the device use the same model.
 * **A private agent on top.** The Liyab app replaces the system assistant. It answers questions about your day from
   your own calendar, notifications, messages and calls, and nothing leaves the phone.
@@ -118,7 +119,7 @@ These rules decide what goes into the code:
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
-| Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
+| Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Structured output: grammar-constrained decoding (JSON Schema, grammar text; tool calls in the app and the local API) and forced continuations | ✅ |
 | Embeddings and reranking: decoder embedding models and rerankers as their GGUF declares them (last-token or mean pooling, ranking heads, or LM-head labels), shared prefixes computed once | ✅ cross-checked against Hugging Face transformers |
@@ -532,17 +533,35 @@ each of those as a scheduling problem.
 * **State snapshots for hybrid models.** Four are kept: the oldest one, the end of the last prompt (pinned, so
   background drafts cannot evict it), and the two newest others (a draft's words and the whole draft after them).
   They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
-* **Prefix cache across conversations** (`prefix_cache_mb`). A context that an unrelated prompt replaces is kept in
-  RAM as a serialized state (KV pages plus recurrent states) with the text it encodes, in an LRU of at most that
-  size. The whole context is kept, the last reply included, with a hybrid model's state snapshots (the last
-  prompt's end among them). A later prompt that continues that text is restored, cut back to where the two diverge,
-  instead of being processed again, even when its earlier replies would encode to other tokens. The output equals
-  that of a context never interrupted (tested on attention-only and hybrid models). A 2,000-token conversation on
-  the 35B costs ~85 MiB, plus 62.8 MiB per state snapshot kept. In RAM (`prefix_cache_mb`) the cache comes out of
-  the memory budget; on a MoE whose experts stream, only as far as the expert cache can spare above 10% of the
-  experts, so it never causes a requantization. On storage (`prefix_cache_dir`, `prefix_cache_disk_mb`) it costs no
-  RAM at all: contexts that RAM does not hold go to files, least recently used out first. On the phone a 4,907-token chat on the 35B (114 MiB) was set aside in 81 ms and
-  restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
+* **Prefix cache across conversations** (`prefix_cache_mb`, `prefix_cache_dir`). A context that an unrelated
+  prompt replaces (or an embedding call) is set aside in a content-addressed store of KV chunks. A chunk is one page
+  of the paged KV cache (64 tokens), keyed by a hash chained over every token before it and rooted in what its bytes
+  depend on (the model file, cache layout and type, key scales, kernels and backends). A prefix that several
+  conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
+  and setting a conversation aside again writes only its new chunks. A later prompt is restored up to the longest
+  prefix the store holds, chunk by chunk, then cut to where the two diverge, even when its earlier replies would
+  encode to other tokens: the store keeps the text each context encodes. The rows the live context already holds
+  for the same tokens stay where they are. Recurrent states cannot be cut into chunks, so a hybrid model keeps them
+  as images at the positions the prefix cache always kept (the end of the context, the end of its last prompt and
+  the oldest snapshot). Each image is attached to a chunk holding its prefix and moves to another such chunk when
+  that one goes; a prompt restores up to the deepest one it reaches. The output equals that of a context never
+  interrupted (tested on attention-only and hybrid models, in RAM, on storage and in a later engine).
+  * **Tiers and caps.** RAM (`prefix_cache_mb`) holds the most recently used chunks. It comes out of the memory
+    budget; on a MoE whose experts stream, only as far as the expert cache can spare above 10% of the experts, so
+    it never causes a requantization. What RAM cannot hold goes to storage (`prefix_cache_dir`,
+    `prefix_cache_disk_mb`), which costs no RAM at all. What storage cannot hold goes, least recently used first:
+    a chunk with every chunk after it, a state image on its own. Room is made before anything is written, so
+    neither tier is ever above its cap. A 2,000-token conversation on the 35B costs ~21 MiB of chunks plus
+    62.8 MiB per state image.
+  * **Across runs.** The storage tier outlives the engine. When destroyed, the engine sets its context aside
+    there too, and a later engine or process with the same model and settings restores from it: a system prompt
+    or a conversation comes back after a restart without being processed again. Other models' chunks stay and
+    count against the cap. Files are written to a temporary name and renamed. When it opens the directory, the
+    engine removes interrupted writes, damaged files, other format versions, broken chains and the files of
+    builds before the store; a chunk whose payload hash does not match when read is removed and the prompt
+    processed. One engine at a time uses a directory (an OS lock); another one runs without the storage tier.
+  * On the phone, with the earlier per-context cache, a 4,907-token chat on the 35B (114 MiB) was set aside in
+    81 ms and restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user
   request therefore never waits behind background work.
@@ -899,6 +918,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_prefill` / `_reset_context` | Process a prefix ahead of time / forget the context |
 | `liyab_engine_save_state` / `_load_state` | Persist and restore the context across processes |
 | `liyab_engine_save_state_of` | Persist the context a text continues, also one the prefix cache set aside |
+| `liyab_engine_prefix_cache_stats` | What the prefix cache holds (RAM, storage, chunks, contexts) and how it was used (thread-safe) |
 | `liyab_engine_trim_memory` / `_warm_memory` | Give the expert cache back while idle / refill it from its hot list |
 | `liyab_engine_save_expert_profile` / `_load_expert_profile` | Carry the expert hot list to a later process |
 | `liyab_engine_memory_plan` / `_context_length` | How the model uses memory; the resolved context length |
@@ -1022,8 +1042,10 @@ liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts
 liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the text itself (suffix drafts)
 liyab-cli -m model.gguf -p "..." --context-lookup           # ... by context lookup instead
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model
-liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts in a 256 MiB LRU
-liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 /tmp/ctx  # ... or in files, without RAM
+liyab-cli -m model.gguf -p "..." --prefix-cache 256         # keep replaced contexts as KV chunks, 256 MiB of RAM
+liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 ~/.cache/liyab/ctx  # ... or in files, kept across runs
+liyab-cli -m model.gguf -p "$SYSTEM$Q2" --prefix-cache-disk 1024 ~/.cache/liyab/ctx --prefix-stats
+                                                            # a later run gets the shared $SYSTEM back from them
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
@@ -1627,7 +1649,7 @@ Facts measured while building Liyab that shaped the code, kept here because they
 
 These are built with `-DLIYAB_ENABLE_EXPERIMENTAL=ON` (`scripts/build_android.sh --experimental`; the app's build
 includes them, all off by default). Enable them through `EngineConfig::experimental`, the C config or `liyab-cli
---early-exit P --prune-heads R --egls T --tdss hot|always --kv-dedup DIR`.
+--early-exit P --prune-heads R --egls T --tdss hot|always`.
 
 | Module | What it does | Measured | Verdict |
 | :--- | :--- | :--- | :--- |
@@ -1636,8 +1658,12 @@ includes them, all off by default). Enable them through `EngineConfig::experimen
 | **EGLS** | Skips a block's FFN when the residual's entropy barely changes | TinyLlama: +5–48% | Output diverges early: not viable without a model trained for it |
 | **JIT unpacker** | Emits unrolled AArch64 NEON unpack routines at runtime (W^X) | +37% for a 4,096-element row | Row-sized routines only; not on the hot path; unavailable on iOS |
 | **TDSS (2:4 sparsity)** | While throttled, FFN switches to a 2:4 magnitude-pruned copy (`TBL` gather + `SDOT`) | −54% decode on the phone | Counterproductive without sparse units |
-| **KV dedup** | Persists a prompt's KV pages to files keyed by hash; a later session mmaps them read-only | 447-token system prompt: TTFT 6.4 s → 1.06 s | Attention-only models; no eviction yet |
 | **io_uring loader** | `O_DIRECT` reads via raw io_uring syscalls | — | Android denies `io_uring_setup` to apps; kept for platforms that allow it |
+
+KV dedup, which persisted a prompt's KV pages to files keyed by hash for later sessions, is now part of the prefix
+cache: its store keeps a shared prefix once, on storage across runs, for hybrid models too, within its caps (KV
+dedup's files had no bound). The C config's `kv_dedup_dir` is kept for the struct's layout; the engine ignores it
+and removes the snapshot files it left there.
 
 ---
 
@@ -1652,11 +1678,11 @@ interpreter: `describe_model_registry`.
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
-| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
+| `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage (persisting for a later engine within its cap, a shared system prompt kept once and restored for a new conversation, damaged files removed with the output unchanged, one engine per directory); key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
-| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory |
+| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
@@ -1883,6 +1909,11 @@ Implemented features are described above. These are next, in order:
   emergency moves the work to the CPU, whose kernels round differently from the GPU's, so a reply can change from
   that token on.
 * **NPUs** are detected and ranked, but have no compute kernels yet; their work runs on the GPU or CPU.
+* **Prefix cache on dense hybrid models.** A prompt processed in 64-token passes leaves the model's oldest state
+  snapshot at its first pass, not at the system prompt's end, and contexts set aside keep that one (as saved
+  contexts do). So a new conversation gets the system prompt back from the store only where it was processed in
+  one pass (a MoE whose experts stream: 1,024-token passes); the app restores it from its own saved state instead.
+  Attention-only models restore any prefix.
 * **Vulkan:**
   * batched prefill runs the matvec kernel once per token (no tiled GEMM yet);
   * models that fit in RAM are copied into GPU memory;
@@ -1969,12 +2000,12 @@ src/core/               engine, architecture registry and model description, tra
                         (embeddings, reranking), loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
-                        sampler, speculative decoding (draft budget, suffix drafter), power manager, device
-                        detection, thread pool, OS services (os.h: memory, UTF-8 paths, file replacement;
-                        POSIX and Windows)
+                        sampler, speculative decoding (draft budget, suffix drafter), the prefix cache's KV
+                        store (kv_store.h), power manager, device detection, thread pool, OS services (os.h:
+                        memory, UTF-8 paths, file replacement, file locks; POSIX and Windows)
 src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*), metal/, vulkan/ (+ shaders/),
                         qnn/ and neuropilot/ (runtime probes)
-src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
+src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, io_uring loader
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
                         liyab-embed, conform_reference.py, tokenizer_reference.py, chat_template_reference.py

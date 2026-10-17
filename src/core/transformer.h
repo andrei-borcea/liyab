@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <span>
@@ -256,6 +257,26 @@ public:
     // Unsupported with a sliding window (released positions are gone).
     // IoError when the stream fails.
     Status write_state(std::ostream& out) const;
+    // A context held outside the model, as the engine's KV store keeps it
+    // (core/kv_store.h): positions [0, n), the KV page `page(p)` returns for
+    // each p < ceil(n / page_tokens) (page_bytes() bytes, valid until the
+    // next call), the recurrent states at n and the snapshots below n.
+    struct SnapshotImage {
+        int32_t pos = 0;
+        bool pinned = false;
+        std::span<const float> data;  // recurrent_state_bytes() / sizeof(float) values
+    };
+    struct ContextImage {
+        int32_t n = 0;
+        std::function<const uint8_t*(int32_t page)> page;
+        std::span<const float> state;  // empty without recurrent blocks
+        std::vector<SnapshotImage> snapshots;
+    };
+    // Writes `image` in write_state()'s format, as if it were the context
+    // (the key scales in use, which the store's chunks were stored with).
+    // Unsupported with a sliding window; InvalidArgument for an image that
+    // does not fit this model; IoError when the stream fails.
+    Status write_state(std::ostream& out, const ContextImage& image) const;
     // Replaces the context with one write_state() saved, its snapshots
     // included (truncate() returns to them as in the context that was saved),
     // and takes a state snapshot at its end (pinned unless a saved one is).
@@ -264,6 +285,33 @@ public:
     // to them. InvalidArgument when the fingerprint differs; the context is
     // empty after any failure.
     Status read_state(std::istream& in);
+    // What the context's bytes depend on (the fingerprint read_state()
+    // checks, the page size and the key scales in use): the root of the KV
+    // store's keys, together with what the engine adds (kernels, route).
+    [[nodiscard]] uint64_t context_fingerprint() const noexcept;
+    // The recurrent-state images write_state() keeps, ascending: the oldest
+    // and the pinned snapshot below n_past(), then n_past() itself, with the
+    // pinned flags read_state() gives them back (the end pinned unless a
+    // snapshot below is). Empty without recurrent blocks or at position 0.
+    struct KeptState {
+        int32_t pos = 0;
+        bool pinned = false;
+    };
+    [[nodiscard]] std::vector<KeptState> kept_states() const;
+    // Copies the recurrent states at `pos`, one of kept_states(), to `out`
+    // (recurrent_state_bytes() / sizeof(float) values). InvalidArgument otherwise.
+    Status copy_kept_state(int32_t pos, std::span<float> out) const;
+    // Takes positions [0, n) as the context once the caller has written their
+    // KV rows (KvCache::reserve() and write_rows(); rows below n_past() may be
+    // left as they are where they hold the same tokens): frees the pages past
+    // n, sets the recurrent states to `state` (empty without recurrent
+    // blocks) and the snapshots below n to `snapshots` (ascending, fewer than
+    // kStateSnapshots), discards the rollback checkpoints, then takes a
+    // snapshot at n, pinned when `pin_end`. InvalidArgument for an image that
+    // does not fit (wrong sizes, positions, unmapped pages); the context is
+    // then empty.
+    Status adopt_context(int32_t n, std::span<const float> state, std::span<const SnapshotImage> snapshots,
+                         bool pin_end);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -276,10 +324,6 @@ public:
     // a pass will never be rolled back (a plain decoding step) turn it off to
     // skip the state copies; positions processed meanwhile cannot be returned to.
     void set_checkpointing(bool on) noexcept { checkpointing_ = on; }
-    // Declares positions [0, n) cached after their KV pages were attached
-    // externally (KvCache::attach_external_pages). Requires an empty context.
-    // Unsupported for hybrid models (KV pages do not carry recurrent states).
-    Status adopt_cached_prefix(int32_t n);
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
@@ -446,6 +490,8 @@ private:
     bool checkpointing_ = true;
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
     [[nodiscard]] std::array<int64_t, 9> state_fingerprint() const noexcept;
+    Status write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
+                       std::span<const float> state, std::span<const SnapshotImage> snapshots, bool live) const;
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
         std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order

@@ -104,10 +104,10 @@ typedef struct liyab_engine_config {
     int32_t egls;                 /* nonzero: entropy-guided FFN skipping (lossy) */
     float egls_threshold;         /* default 0.002 */
     int32_t tdss;                 /* 1: 2:4 sparse FFN while throttled, 2: always (lossy) */
-    const char* kv_dedup_dir;     /* non-NULL: persistent prefix KV cache directory */
+    const char* kv_dedup_dir;     /* retired (KV dedup; the prefix cache's store replaces it): ignored, except that the snapshot files it left in this directory are removed; kept for the struct's layout */
     float moe_skip_slow;          /* MoE streaming: skip a chosen expert not yet in RAM whose router weight share is below this for every token using it (lossy; output then depends on I/O timing); 0 off */
-    int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one; 0 off (see EngineConfig) */
-    const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: such contexts that RAM does not hold go to files here */
+    int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one (a store of KV chunks: shared prefixes kept once); 0 off (see EngineConfig) */
+    const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: what RAM does not hold goes to files here, which outlive the engine (it sets its context aside there when destroyed) and later engines restore from */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
@@ -272,7 +272,8 @@ LIYAB_C_API liyab_status liyab_engine_prefill(liyab_engine* engine, const char* 
  * the model; it returns LIYAB_ERR_CANCELLED and keeps the context processed so
  * far. Never affects liyab_engine_generate. See Engine::cancel_prefill. */
 LIYAB_C_API void liyab_engine_cancel_prefill(liyab_engine* engine);
-/* Forgets the context: the next call starts from scratch. */
+/* Forgets the context: the next call starts from scratch (or from what the
+ * prefix cache keeps of its prompt). */
 LIYAB_C_API liyab_status liyab_engine_reset_context(liyab_engine* engine);
 /* Saves the context (e.g. a prefilled system prompt) to `path`, and restores
  * it for the same model file loaded with the same cache settings, so a later
@@ -283,9 +284,9 @@ LIYAB_C_API liyab_status liyab_engine_save_state(liyab_engine* engine, const cha
 LIYAB_C_API liyab_status liyab_engine_load_state(liyab_engine* engine, const char* path, int32_t* out_tokens);
 /* Saves the context that the `text_len` bytes of `text` continue (a
  * conversation's text so far): the live one, or the longest one the prefix
- * cache set aside for it, written as kept, so a conversation another prompt
- * replaced can still be saved. LIYAB_ERR_INVALID_ARGUMENT when none does.
- * See Engine::save_state. */
+ * cache set aside for it, written from its store as kept, so a conversation
+ * another prompt replaced can still be saved. LIYAB_ERR_INVALID_ARGUMENT when
+ * none does. See Engine::save_state. */
 LIYAB_C_API liyab_status liyab_engine_save_state_of(liyab_engine* engine, const char* path, const char* text,
                                                     size_t text_len);
 /* Gives memory back to the OS while the engine is idle (an app in the
@@ -481,6 +482,31 @@ LIYAB_C_API liyab_status liyab_engine_rerank(liyab_engine* engine, const char* q
                                              const size_t* lengths, size_t n_documents,
                                              const liyab_rerank_params* params, float* out_scores,
                                              liyab_pooling_stats* stats);
+
+/*
+ * Prefix cache (prefix_cache_mb, prefix_cache_dir in liyab_engine_config):
+ * what its store holds and how it was used since the engine was created
+ * (Engine::PrefixCacheStats has the whole contract). All zero without a
+ * prefix cache. Thread-safe: may be read while a generation runs.
+ */
+typedef struct liyab_prefix_cache_stats {
+    uint64_t ram_bytes;          /* KV chunks and state images in RAM */
+    uint64_t ram_cap_bytes;      /* prefix_cache_mb as granted (0: no RAM tier) */
+    uint64_t storage_bytes;      /* the store's files in prefix_cache_dir, every model's */
+    uint64_t storage_cap_bytes;  /* prefix_cache_disk_mb (0: no storage tier) */
+    int32_t chunks;              /* this model's, in RAM and on storage */
+    int32_t state_images;        /* recurrent-state images (hybrid models) */
+    int32_t contexts;            /* stored contexts */
+    uint64_t set_asides;         /* contexts set aside */
+    uint64_t chunks_written;     /* chunks they added */
+    uint64_t chunks_reused;      /* chunks they found stored already (shared prefixes) */
+    double set_aside_ms;         /* total time setting aside */
+    uint64_t restores;           /* prompts that restored a prefix */
+    uint64_t restored_tokens;    /* positions restored */
+    double restore_ms;           /* total time restoring */
+} liyab_prefix_cache_stats;
+
+LIYAB_C_API liyab_status liyab_engine_prefix_cache_stats(const liyab_engine* engine, liyab_prefix_cache_stats* out_stats);
 
 #ifdef __cplusplus
 }

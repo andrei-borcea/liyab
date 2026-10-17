@@ -86,9 +86,9 @@ public:
     // Multiplies channel c of the keys of positions [0, end) of layer l, KV
     // head h by factors[(l * n_head_kv + h) * head_dim + c], requantizing each
     // row (a saved context brought to other per-channel key scales; with
-    // values_in_keys the values in those rows move with them). Owned pages
-    // only: InvalidArgument when a position's page is unmapped or external,
-    // or for the wrong number of factors.
+    // values_in_keys the values in those rows move with them).
+    // InvalidArgument when a position's page is unmapped, or for the wrong
+    // number of factors.
     Status scale_keys(int32_t end, std::span<const float> factors);
     // Forgets positions >= n (rollback). Fails when a query at n would need
     // positions whose pages were already released.
@@ -98,19 +98,32 @@ public:
     void release_unreachable(int32_t n_past, int32_t keep_back);
     void clear() noexcept;
 
-    // --- Prefix sharing (used by the experimental KV dedup) ---------------
+    // --- Pages as bytes (saved contexts, the engine's KV store) ------------
     // Bytes of logical page `logical` (all layers, K then V; K only with
-    // values_in_keys), or nullptr.
+    // values_in_keys), or nullptr when it is not mapped.
     [[nodiscard]] const uint8_t* page_data(int32_t logical) const noexcept;
-    // The same page, writable, for restoring a saved state: an owned page that
-    // reserve() mapped; nullptr for unmapped or external pages.
+    // The same page, writable, for restoring a saved state: a page that
+    // reserve() mapped; nullptr when it is not mapped.
     [[nodiscard]] uint8_t* mutable_page_data(int32_t logical) noexcept;
-    // Maps logical pages 0..n-1 to caller-owned read-only memory (e.g. an
-    // mmap'd snapshot), without copying. The cache must be empty and use full
-    // attention; the memory must outlive the mapping (until clear()). New
-    // positions are written to owned pages only, so the prefix length must be
-    // pages.size() * page_tokens.
-    Status attach_external_pages(std::span<const uint8_t* const> pages);
+    // Rows of positions as a chunk image: the engine's KV store keeps a
+    // context as chunks of one page each (core/kv_store.h), the last one
+    // possibly partial. An image of n positions of one page is laid out as the
+    // page is, with n slots instead of page_tokens: [K | V][layer][slot <
+    // n][kv_head][row] (K only with values_in_keys), so the image of a whole
+    // page is that page's bytes. Its size, rows_bytes(n), grows linearly with n.
+    [[nodiscard]] size_t rows_bytes(int32_t n) const noexcept;
+    // Copies the rows of the first n positions of logical page `logical` into
+    // `out` (rows_bytes(n) bytes). InvalidArgument when the page is not mapped
+    // or n is outside [1, page_tokens].
+    Status read_rows(int32_t logical, int32_t n, uint8_t* out) const;
+    // Writes slots [from, to) of `image`, an image of n positions as
+    // read_rows() writes it, to the same slots of logical page `logical`,
+    // which reserve() mapped. InvalidArgument when the page is not mapped,
+    // the range is not within [0, n] or n is outside [1, page_tokens].
+    Status write_rows(int32_t logical, const uint8_t* image, int32_t n, int32_t from, int32_t to);
+    // Expands an image of n positions into a whole page's layout at `page`
+    // (page_bytes(); the slots past n zeroed), as write_state() writes pages.
+    void image_to_page(const uint8_t* image, int32_t n, uint8_t* page) const noexcept;
 
     [[nodiscard]] int32_t pages_in_use() const noexcept;
     [[nodiscard]] int32_t pages_allocated() const noexcept { return static_cast<int32_t>(pool_.size()); }
@@ -124,11 +137,14 @@ private:
     void free_page(size_t logical) noexcept;
     [[nodiscard]] int32_t sink_page_count() const noexcept;
     [[nodiscard]] uint8_t* page_ptr(size_t logical) const noexcept;
+    // Copies `count` slots of every plane and layer from an image of
+    // `src_slots` positions (from slot src_first) to one of `dst_slots`
+    // (to slot dst_first); a page is an image of page_tokens slots.
+    void copy_slots(const uint8_t* src, int32_t src_slots, int32_t src_first, uint8_t* dst, int32_t dst_slots,
+                    int32_t dst_first, int32_t count) const noexcept;
 
-    // table_ entries: >= 0 owned pool page, kUnmapped, or <= kExternalBase
-    // for external page (kExternalBase - entry).
+    // table_ entries: >= 0 pool page, or kUnmapped.
     static constexpr int32_t kUnmapped = -1;
-    static constexpr int32_t kExternalBase = -2;
 
     KvCacheConfig config_;
     DType dtype_ = DType::Q8_0;
@@ -138,7 +154,6 @@ private:
     std::vector<std::unique_ptr<uint8_t[]>> pool_;  // physical pages (never shrinks; reused)
     std::vector<int32_t> free_;                     // free physical page ids
     std::vector<int32_t> table_;                    // logical page -> physical id (see kUnmapped)
-    std::vector<const uint8_t*> external_;          // attached read-only pages
     int32_t released_below_ = 0;                    // logical pages < this (beyond sinks) were released
 };
 

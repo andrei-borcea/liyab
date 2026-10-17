@@ -2906,7 +2906,8 @@ TEST_CASE("A conversation the prefix cache set aside is saved as kept, and resto
     spec.delta_net_interval = 2;
     EngineConfig config = engine_config(model_path("prefix_qwen35", spec));
     config.backend = BackendKind::Cpu;
-    config.prefix_cache_dir = test::temp_dir();
+    config.prefix_cache_dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_saved_as_kept";
+    std::filesystem::remove_all(config.prefix_cache_dir);
     for (const int ram_mb : {64, 0}) {  // the copy in RAM, then on storage
         config.prefix_cache_mb = ram_mb;
         config.prefix_cache_disk_mb = ram_mb > 0 ? 0 : 64;
@@ -2940,9 +2941,35 @@ TEST_CASE("A conversation the prefix cache set aside is saved as kept, and resto
         CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(a, true)->size()) + 5);
         std::remove(file.c_str());
     }
+    std::filesystem::remove_all(config.prefix_cache_dir);
 }
 
-TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and removes its files") {
+namespace {
+
+// The prefix cache's store in `dir`: its files (kv-*; not the lock) and every byte there.
+size_t store_files(const std::string& dir) {
+    size_t n = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        n += it->path().filename().string().starts_with("kv-") ? 1 : 0;
+    }
+    return n;
+}
+
+uint64_t dir_bytes(const std::string& dir) {
+    uint64_t bytes = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code size_ec;
+        const auto size = it->file_size(size_ec);
+        if (!size_ec) bytes += size;
+    }
+    return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later engines too") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";
     spec.n_layers = 4;
@@ -2950,12 +2977,7 @@ TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and r
     EngineConfig config = engine_config(model_path("prefix_qwen35", spec));
     config.backend = BackendKind::Cpu;
     const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_prefix_files";
-    auto files = [&] {
-        size_t n = 0;
-        std::error_code ec;
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) ++n;
-        return n;
-    };
+    std::filesystem::remove_all(dir);
     auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
         std::string text;
         auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
@@ -2970,36 +2992,63 @@ TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and r
         a += i % 3 ? " hello" : " world";
         b += i % 2 ? " world" : " hello world";
     }
-    auto reference = Engine::create(config);
+    auto reference = Engine::create(config);  // never interrupted
     REQUIRE(reference.has_value());
     config.prefix_cache_mb = 0;  // no RAM: storage only
     config.prefix_cache_dir = dir;
     config.prefix_cache_disk_mb = 64;
+    const uint64_t cap = uint64_t{64} << 20;
+    std::string next_a, last_a;
+    GenerationStats held{};
     {
-        // A file an ended process left behind is removed; the engine's own go when it is destroyed.
+        // A file of a build before the store is removed when the engine opens the directory.
         std::filesystem::create_directories(dir);
         std::ofstream(dir + "/ctx-1-1-1.state") << "stale";
         auto cached = Engine::create(config);
         REQUIRE(cached.has_value());
-        CHECK(files() == 0);
+        CHECK(!std::filesystem::exists(dir + "/ctx-1-1-1.state"));
+        CHECK(store_files(dir) == 0);
         Engine& e = *cached.value();
         const std::string reply_a = run(e, a);
         run(e, b);  // A's context goes to storage
-        CHECK(files() == 1);
-        const std::string next_a = a + reply_a + " hello";
+        Engine::PrefixCacheStats ps = e.prefix_cache_stats();
+        CHECK(ps.ram_bytes == 0);
+        CHECK(ps.storage_bytes > 0);
+        CHECK(ps.storage_bytes == dir_bytes(dir));
+        CHECK(ps.storage_cap_bytes == cap);
+        CHECK(ps.contexts == 1);
+        CHECK(ps.set_asides == 1);
+        next_a = a + reply_a + " hello";
         GenerationStats st{};
         const std::string out = run(e, next_a, &st);
-        CHECK(files() == 1);  // A's file read back and removed; B's context went to storage in its place
-        GenerationStats held{};
         REQUIRE(reference.value()->prefill(a, true).is_ok());
         CHECK(out == run(*reference.value(), next_a, &held));
         CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
+        CHECK(e.prefix_cache_stats().restores == 1);
+        last_a = next_a + out + " world";
         run(e, b);  // B back from storage, A to it
-        CHECK(files() == 1);
+        ps = e.prefix_cache_stats();
+        CHECK(ps.restores == 2);
+        CHECK(ps.storage_bytes <= cap);
+        CHECK(ps.storage_bytes == dir_bytes(dir));
     }
-    CHECK(files() == 0);
+    // The files outlive the engine, which set its context (B) aside there
+    // too: a later one restores A from them, exactly.
+    CHECK(store_files(dir) > 0);
+    CHECK(dir_bytes(dir) <= cap);
+    {
+        auto later = Engine::create(config);
+        REQUIRE(later.has_value());
+        CHECK(later.value()->prefix_cache_stats().contexts == 2);
+        GenerationStats st{};
+        const std::string out = run(*later.value(), last_a, &st);
+        CHECK(out == run(*reference.value(), last_a, &held));
+        CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
+        CHECK(later.value()->prefix_cache_stats().restores == 1);
+    }
     // Little RAM, many conversations: the least recently used move from RAM
-    // to storage, each to its own file, and come back exactly from there.
+    // to storage and come back exactly from there; neither tier goes above
+    // its cap.
     config.prefix_cache_mb = 1;  // a dozen of these contexts
     {
         auto cached = Engine::create(config);
@@ -3010,29 +3059,253 @@ TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and r
             for (int i = 0; i < 200; ++i) text += (i + c) % 3 ? " hello" : " world";
             conversations.push_back(text);
             replies.push_back(run(*cached.value(), text));
+            const Engine::PrefixCacheStats ps = cached.value()->prefix_cache_stats();
+            CHECK(ps.ram_bytes <= (uint64_t{1} << 20));
+            CHECK(ps.storage_bytes <= cap);
         }
-        CHECK(files() >= 10);  // 39 set aside, a dozen or so in RAM
+        const Engine::PrefixCacheStats ps = cached.value()->prefix_cache_stats();
+        CHECK(ps.ram_bytes > 0);
+        CHECK(ps.storage_bytes == dir_bytes(dir));
+        CHECK(ps.contexts >= 20);  // 39 set aside, besides A's and B's
         const std::string next = conversations[0] + replies[0] + " hello";
         GenerationStats st{};
         const std::string out = run(*cached.value(), next, &st);
         auto fresh = Engine::create(engine_config(model_path("prefix_qwen35", spec)));
         REQUIRE(fresh.has_value() && fresh.value()->prefill(conversations[0], true).is_ok());
-        GenerationStats held{};
         CHECK(out == run(*fresh.value(), next, &held));
         CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);
     }
-    CHECK(files() == 0);
-    // Storage too small for a context: nothing kept, nothing restored.
+    // A lower cap: the least recently used go when the directory is opened.
     config.prefix_cache_mb = 0;
+    config.prefix_cache_disk_mb = 1;
+    {
+        auto small = Engine::create(config);
+        REQUIRE(small.has_value());
+        CHECK(small.value()->prefix_cache_stats().storage_bytes <= (uint64_t{1} << 20));
+        CHECK(dir_bytes(dir) <= (uint64_t{1} << 20));
+    }
+    CHECK(dir_bytes(dir) <= (uint64_t{1} << 20));
+    // No storage tier: the directory is left as it is.
     config.prefix_cache_disk_mb = 0;
     {
+        const size_t before = store_files(dir);
         auto cached = Engine::create(config);
         REQUIRE(cached.has_value());
-        const std::string reply_a = run(*cached.value(), a);
+        run(*cached.value(), a);
         run(*cached.value(), b);
-        CHECK(files() == 0);
+        CHECK(store_files(dir) == before);
+        CHECK(cached.value()->prefix_cache_stats().set_asides == 0);
     }
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Conversations sharing a system prompt keep it once, and a new one restores it exactly") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        EngineConfig config = engine_config(model_path(std::string("prefix_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        // Passes of 256 tokens (max_batch follows draft_tokens; no drafting
+        // without a draft model or lookup): the system prompt is processed
+        // in one pass, so its end is a hybrid model's oldest snapshot, the
+        // one set-aside contexts keep, as on a MoE whose experts stream
+        // (1024-token passes). With 64-token passes the oldest is at 64.
+        config.draft_tokens = 255;
+        auto fresh = Engine::create(config);
+        config.prefix_cache_mb = 64;
+        auto cached = Engine::create(config);
+        REQUIRE(cached.has_value() && fresh.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string system = "system:";
+        for (int i = 0; i < 150; ++i) system += i % 4 ? " hello" : " world";
+        // Each question is longer than the system prompt, so the next one
+        // sets the conversation aside; they part after a few words.
+        auto question = [](int q) {
+            std::string text = q % 2 ? " world world" : " hello hello";
+            for (int i = 0; i < 220; ++i) text += (i / (q + 1)) % 2 ? " hello" : " world";
+            return text;
+        };
+        // The system prompt as the app prepares it: processed once, saved,
+        // and restored after a load (its end is then the oldest snapshot, the
+        // one a hybrid model's set-aside contexts keep).
+        const std::string file = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_" + arch + "_system.bin";
+        REQUIRE(fresh.value()->prefill(system, true).is_ok());
+        REQUIRE(fresh.value()->save_state(file).is_ok());
+        Engine& e = *cached.value();
+        REQUIRE(e.load_state(file).has_value());
+        const auto system_tokens = static_cast<int32_t>(e.tokenize(system, true)->size());
+        for (int q = 0; q < 3; ++q) run(e, system + question(q));
+        // Two conversations set aside: the second found the system prompt's
+        // whole chunks stored already.
+        Engine::PrefixCacheStats ps = e.prefix_cache_stats();
+        const uint64_t restores = ps.restores;  // attention-only: the third question restored the first's start
+        CHECK(ps.set_asides == 2);
+        CHECK(ps.chunks_reused >= static_cast<uint64_t>(system_tokens / 64));
+        CHECK(ps.chunks < static_cast<int32_t>(ps.chunks_written + ps.chunks_reused));
+        // A new conversation with nothing live: the system prompt comes from the store.
+        e.reset_context();
+        const std::string next = system + question(7);
+        GenerationStats st{};
+        const std::string out = run(e, next, &st);
+        REQUIRE(fresh.value()->load_state(file).has_value());
+        CHECK(out == run(*fresh.value(), next));
+        CHECK(st.cached_prefix_tokens >= system_tokens);
+        if (std::string(arch) == "qwen35") CHECK(st.cached_prefix_tokens == system_tokens);  // its state image
+        CHECK(e.prefix_cache_stats().restores == restores + 1);
+        std::remove(file.c_str());
+    }
+}
+
+TEST_CASE("A later engine restores the prefix an earlier one left on storage") {
+    for (const char* arch : {"llama", "qwen35"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
+        EngineConfig config = engine_config(model_path(std::string("prefix_") + arch, spec));
+        config.backend = BackendKind::Cpu;
+        config.draft_tokens = 255;  // one pass for the system prompt (see the test above)
+        auto fresh = Engine::create(config);
+        REQUIRE(fresh.has_value());
+        const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_later_" + arch;
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_dir = dir;
+        config.prefix_cache_disk_mb = 64;
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string system = "system:";
+        for (int i = 0; i < 200; ++i) system += i % 3 ? " hello" : " world";
+        // The system prompt saved once and restored after the load, as the app does.
+        const std::string file = dir + "_system.bin";
+        REQUIRE(fresh.value()->prefill(system, true).is_ok());
+        REQUIRE(fresh.value()->save_state(file).is_ok());
+        {
+            auto first = Engine::create(config);
+            REQUIRE(first.has_value());
+            REQUIRE(first.value()->load_state(file).has_value());
+            run(*first.value(), system + " world hello world");
+        }  // destroyed: its context goes to storage
+        auto later = Engine::create(config);
+        REQUIRE(later.has_value());
+        const std::string prompt = system + " hello hello world";
+        GenerationStats st{};
+        const std::string out = run(*later.value(), prompt, &st);
+        const auto system_tokens = static_cast<int32_t>(later.value()->tokenize(system, true)->size());
+        CHECK(st.cached_prefix_tokens >= system_tokens);
+        CHECK(out == run(*fresh.value(), prompt));
+        std::remove(file.c_str());
+        later.value().reset();  // destroyed: the directory is released
+        std::filesystem::remove_all(dir);
+    }
+}
+
+TEST_CASE("The prefix cache removes what it cannot trust on storage, and the output stays exact") {
+    test::TinyModelSpec spec;
+    spec.n_layers = 4;
+    EngineConfig config = engine_config(model_path("prefix_llama", spec));
+    config.backend = BackendKind::Cpu;
+    auto reference = Engine::create(config);
+    REQUIRE(reference.has_value());
+    const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_untrusted";
+    std::filesystem::remove_all(dir);
+    config.prefix_cache_dir = dir;
+    config.prefix_cache_disk_mb = 64;
+    auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+        std::string text;
+        auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+    std::string a, b;
+    for (int i = 0; i < 300; ++i) {
+        a += i % 3 ? " hello" : " world";
+        b += i % 2 ? " world" : " hello world";
+    }
+    std::string next_a;
+    {
+        auto e = Engine::create(config);
+        REQUIRE(e.has_value());
+        next_a = a + run(*e.value(), a) + " hello";
+        run(*e.value(), b);
+    }
+    std::vector<std::filesystem::path> chunks;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".chunk") chunks.push_back(entry.path());
+    }
+    REQUIRE(chunks.size() >= 4);
+    std::sort(chunks.begin(), chunks.end());
+    // A write a crash cut short, a file that is not the store's format, a
+    // truncated chunk: removed when the directory is opened.
+    const std::string name(32, 'a');
+    std::ofstream(dir + "/kv-" + name + ".chunk.tmp") << "partial";
+    std::ofstream(dir + "/kv-" + std::string(32, 'b') + ".chunk") << "not a chunk";
+    std::filesystem::resize_file(chunks[0], std::filesystem::file_size(chunks[0]) - 1);
+    // The others with one payload byte changed: found when read.
+    for (size_t i = 1; i < chunks.size(); ++i) {
+        std::fstream f(chunks[i], std::ios::in | std::ios::out | std::ios::binary);
+        f.seekg(-1, std::ios::end);
+        const char last = static_cast<char>(f.get());
+        f.seekp(-1, std::ios::end);
+        f.put(static_cast<char>(last ^ 0x5A));
+    }
+    {
+        auto e = Engine::create(config);
+        REQUIRE(e.has_value());
+        CHECK(!std::filesystem::exists(dir + "/kv-" + name + ".chunk.tmp"));
+        CHECK(!std::filesystem::exists(dir + "/kv-" + std::string(32, 'b') + ".chunk"));
+        CHECK(!std::filesystem::exists(chunks[0]));
+        GenerationStats st{};
+        const std::string out = run(*e.value(), next_a, &st);
+        REQUIRE(reference.value()->prefill(a, true).is_ok());
+        CHECK(out == run(*reference.value(), next_a));
+        // Whatever was restored passed its hash; a damaged chunk is gone.
+        size_t damaged_left = 0;
+        for (size_t i = 1; i < chunks.size(); ++i) damaged_left += std::filesystem::exists(chunks[i]) ? 1 : 0;
+        CHECK(damaged_left < chunks.size() - 1);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("One engine at a time uses a prefix cache directory") {
+    test::TinyModelSpec spec;
+    spec.n_layers = 4;
+    EngineConfig config = engine_config(model_path("prefix_llama", spec));
+    config.backend = BackendKind::Cpu;
+    config.prefix_cache_dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_one_engine";
+    config.prefix_cache_disk_mb = 16;
+    std::filesystem::remove_all(config.prefix_cache_dir);
+    {
+        auto first = Engine::create(config);
+        auto second = Engine::create(config);  // the first holds the directory: no storage tier
+        REQUIRE(first.has_value() && second.has_value());
+        CHECK(first.value()->prefix_cache_stats().storage_cap_bytes == (uint64_t{16} << 20));
+        CHECK(second.value()->prefix_cache_stats().storage_cap_bytes == 0);
+    }
+    auto third = Engine::create(config);  // released with the first
+    REQUIRE(third.has_value());
+    CHECK(third.value()->prefix_cache_stats().storage_cap_bytes == (uint64_t{16} << 20));
+    third.value().reset();  // destroyed: the directory is released
+    std::filesystem::remove_all(config.prefix_cache_dir);
 }
 
 TEST_CASE("A prefill cancelled mid-pass keeps its work and the output stays exact") {

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/kv_store.h"
 #include "core/log.h"
 #include "liyab/liyab.h"
 
@@ -279,7 +280,9 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.experimental.egls_threshold = config->egls_threshold;
         c.experimental.tdss = config->tdss != 0;
         c.experimental.tdss_force = config->tdss == 2;
-        if (config->kv_dedup_dir != nullptr) c.experimental.kv_dedup_dir = config->kv_dedup_dir;
+        // KV dedup is retired (the prefix cache's store replaces it): the
+        // field stays for the struct's layout, and what it left there goes.
+        if (config->kv_dedup_dir != nullptr) liyab::remove_kv_dedup_files(config->kv_dedup_dir);
         c.moe_skip_slow = config->moe_skip_slow;
         c.prefix_cache_mb = config->prefix_cache_mb;
         if (config->prefix_cache_dir != nullptr) c.prefix_cache_dir = config->prefix_cache_dir;
@@ -715,6 +718,16 @@ liyab_status liyab_engine_rerank(liyab_engine* engine, const char* query, const 
         std::copy(scores->begin(), scores->end(), out_scores);
         return LIYAB_OK;
     });
+}
+
+liyab_status liyab_engine_prefix_cache_stats(const liyab_engine* engine, liyab_prefix_cache_stats* out_stats) {
+    if (engine == nullptr || out_stats == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    const liyab::Engine::PrefixCacheStats s = engine->engine->prefix_cache_stats();
+    *out_stats = liyab_prefix_cache_stats{s.ram_bytes,     s.ram_cap_bytes,  s.storage_bytes,   s.storage_cap_bytes,
+                                          s.chunks,        s.state_images,   s.contexts,        s.set_asides,
+                                          s.chunks_written, s.chunks_reused, s.set_aside_ms,    s.restores,
+                                          s.restored_tokens, s.restore_ms};
+    return LIYAB_OK;
 }
 
 }  // extern "C"

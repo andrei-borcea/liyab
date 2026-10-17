@@ -269,12 +269,16 @@ void usage() {
                  "  --experts N        MoE: at most N experts per token (lossy; default: the model's)\n"
                  "  --skip-slow W      MoE streaming: skip a chosen expert not yet in RAM whose router weight\n"
                  "                     share is below W (e.g. 0.1) for every token using it (lossy; default 0)\n"
-                 "  --prefix-cache MB  keep contexts replaced by an unrelated prompt in an in-RAM LRU of\n"
-                 "                     at most this size, restored when a later prompt continues one; with\n"
-                 "                     --memory-budget, MoE streaming gives it only what the expert cache\n"
-                 "                     can spare above 10%% of the experts (default 0)\n"
-                 "  --prefix-cache-disk MB DIR  keep such contexts that RAM does not hold in files in DIR,\n"
-                 "                     up to MB of storage (default 0: off)\n"
+                 "  --prefix-cache MB  keep contexts replaced by an unrelated prompt in RAM, at most this\n"
+                 "                     size, as KV chunks keyed by content (a shared prefix kept once),\n"
+                 "                     restored when a later prompt continues one; with --memory-budget,\n"
+                 "                     MoE streaming gives it only what the expert cache can spare above\n"
+                 "                     10%% of the experts (default 0)\n"
+                 "  --prefix-cache-disk MB DIR  keep what RAM does not hold in files in DIR, up to MB of\n"
+                 "                     storage (default 0: off); the run's context goes there too when it\n"
+                 "                     ends, so a later run whose prompt starts with the same text (a\n"
+                 "                     system prompt) restores it instead of processing it again\n"
+                 "  --prefix-stats     print what the prefix cache holds and did, after the run\n"
                  "  --cache-dir DIR    keep what is measured once per model in DIR (the key scales of a\n"
                  "                     quantized KV cache), so later runs skip it (default: measured each run)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
@@ -283,8 +287,7 @@ void usage() {
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
                  "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
                  "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
-                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n"
-                 "  --kv-dedup DIR     persistent prefix KV cache (reuse system-prompt KV across runs)\n");
+                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n");
 }
 
 }  // namespace
@@ -310,6 +313,7 @@ int main(int argc, char** argv) {
     bool device_only = false;
     bool tokenize_only = false;
     bool json = false;
+    bool prefix_stats = false;  // --prefix-stats
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -326,6 +330,7 @@ int main(int argc, char** argv) {
         else if (arg == "-p" || arg == "--prompt") prompt = next();
         else if (arg == "--then") follow_ups.emplace_back(next());
         else if (arg == "--json") json = true;
+        else if (arg == "--prefix-stats") prefix_stats = true;
         else if (arg == "-n") params.max_tokens = std::atoi(next());
         else if (arg == "--temp") params.temperature = static_cast<float>(std::atof(next()));
         else if (arg == "--top-k") params.top_k = std::atoi(next());
@@ -365,8 +370,6 @@ int main(int argc, char** argv) {
         } else if (arg == "--egls") {
             config.egls = 1;
             config.egls_threshold = static_cast<float>(std::atof(next()));
-        } else if (arg == "--kv-dedup") {
-            config.kv_dedup_dir = next();
         } else if (arg == "--tdss") {
             const std::string v = next();
             config.tdss = v == "always" ? 2 : 1;
@@ -465,6 +468,21 @@ int main(int argc, char** argv) {
         if (json) print_json_turn(static_cast<int>(turn) + 1, stats, reply.text);
         if (stats.cancelled) break;
         if (turn < follow_ups.size()) turn_prompt += reply.text + follow_ups[turn];
+    }
+    if (prefix_stats) {
+        liyab_prefix_cache_stats p{};
+        liyab_engine_prefix_cache_stats(g_engine, &p);
+        const double mib = 1.0 / (1024.0 * 1024.0);
+        std::fprintf(stderr,
+                     "prefix cache: %.1f of %.0f MiB RAM, %.1f of %.0f MiB storage | %d chunks, %d state images, %d "
+                     "contexts | set aside %llu (%llu chunks new, %llu shared) in %.1f ms | restored %llu prompts, "
+                     "%llu tokens, in %.1f ms\n",
+                     static_cast<double>(p.ram_bytes) * mib, static_cast<double>(p.ram_cap_bytes) * mib,
+                     static_cast<double>(p.storage_bytes) * mib, static_cast<double>(p.storage_cap_bytes) * mib, p.chunks,
+                     p.state_images, p.contexts, static_cast<unsigned long long>(p.set_asides),
+                     static_cast<unsigned long long>(p.chunks_written), static_cast<unsigned long long>(p.chunks_reused),
+                     p.set_aside_ms, static_cast<unsigned long long>(p.restores),
+                     static_cast<unsigned long long>(p.restored_tokens), p.restore_ms);
     }
     liyab_engine_destroy(g_engine);
     g_engine = nullptr;

@@ -86,7 +86,7 @@ final class LiyabEngineConfig extends Struct {
   external double eglsThreshold;
   @Int32()
   external int tdss;
-  external Pointer<Utf8> kvDedupDir;
+  external Pointer<Utf8> kvDedupDir; // retired (KV dedup, replaced by the prefix cache's store): kept for the layout
   @Float()
   external double moeSkipSlow;
   @Int64()

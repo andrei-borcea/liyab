@@ -108,8 +108,6 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
           _x.kvCacheType, const [(1, 'Q8_0'), (0, 'F16'), (2, 'Q4_0'), (3, 'Q4_1')], (v) => _x.kvCacheType = v),
       choice('Threads', 'Cores the engine computes on.', _x.threads,
           const [(0, 'Auto'), (2, '2'), (3, '3'), (4, '4'), (5, '5'), (6, '6'), (7, '7'), (8, '8')], (v) => _x.threads = v),
-      toggle('Persistent prefix KV cache', 'Keeps processed prompt prefixes on storage across runs (KV dedup).',
-          _x.kvDedup, (v) => _x.kvDedup = v),
       const SizedBox(height: 8),
       Row(children: [
         FilledButton.tonal(

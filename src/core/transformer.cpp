@@ -655,47 +655,121 @@ std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
             static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
 }
 
+uint64_t Transformer::context_fingerprint() const noexcept {
+    const std::array<int64_t, 9> fp = state_fingerprint();
+    const uint64_t page = kv_->page_bytes();
+    const uint64_t seed = xxhash64(fp.data(), sizeof fp, xxhash64(&page, sizeof page));
+    return xxhash64(key_scale_.data(), key_scale_.size() * sizeof(float), seed);
+}
+
+std::vector<Transformer::KeptState> Transformer::kept_states() const {
+    std::vector<KeptState> kept;
+    if (states_.empty() || n_past_ == 0) return kept;
+    bool pinned_below = false;
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) {
+            kept.push_back({snap.pos, snap.pinned});
+            pinned_below = pinned_below || snap.pinned;
+        }
+    }
+    kept.push_back({n_past_, !pinned_below});  // as read_state() pins the end
+    return kept;
+}
+
+Status Transformer::copy_kept_state(int32_t pos, std::span<float> out) const {
+    if (states_.empty() || out.size() != recurrent_state_bytes() / sizeof(float)) {
+        return Status(ErrorCode::InvalidArgument, "copy_kept_state: no recurrent states, or the wrong size");
+    }
+    if (pos == n_past_) {
+        float* to = out.data();
+        for (const RecurrentState& st : states_) {
+            to = std::copy(st.conv.begin(), st.conv.end(), to);
+            to = std::copy(st.ssm.begin(), st.ssm.end(), to);
+        }
+        return Status::ok();
+    }
+    for (const StateSnapshot& snap : snapshots_) {
+        if (snap.pos == pos) {
+            std::copy(snap.data.begin(), snap.data.end(), out.begin());
+            return Status::ok();
+        }
+    }
+    return Status(ErrorCode::InvalidArgument, "copy_kept_state: no state snapshot at that position");
+}
+
 Status Transformer::write_state(std::ostream& out) const {
     if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
-    put(out, kStateMagic);
-    put(out, kStateVersion);
-    for (const int64_t v : state_fingerprint()) put(out, v);
-    put(out, static_cast<uint64_t>(key_scale_.size()));
-    out.write(reinterpret_cast<const char*>(key_scale_.data()),
-              static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
-    put(out, n_past_);
-    const int32_t pages = (n_past_ + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
-    put(out, static_cast<uint64_t>(kv_->page_bytes()));
-    put(out, pages);
-    for (int32_t p = 0; p < pages; ++p) {
-        const uint8_t* data = kv_->page_data(p);
-        if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
-        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
-    }
-    put(out, static_cast<int32_t>(states_.size()));
-    for (const RecurrentState& st : states_) {
-        put(out, static_cast<uint64_t>(st.conv.size()));
-        put(out, static_cast<uint64_t>(st.ssm.size()));
-        out.write(reinterpret_cast<const char*>(st.conv.data()), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
-        out.write(reinterpret_cast<const char*>(st.ssm.data()), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
-    }
     // The snapshots below the end (one at the end is the states above), so a
     // restored context rewinds where the live one would: the next prompt
     // re-sends the last reply as text, which may encode differently, and
     // without the last prompt's snapshot a hybrid model would keep nothing.
     // The oldest (the system prompt's end) and the pinned one are enough; a
     // draft's is not worth its size (62.8 MiB each on a 35B).
-    std::vector<const StateSnapshot*> kept;
+    std::vector<SnapshotImage> kept;
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) kept.push_back(&snap);
+        if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) {
+            kept.push_back({snap.pos, snap.pinned, snap.data});
+        }
     }
-    put(out, static_cast<int32_t>(kept.size()));
-    for (const StateSnapshot* snap : kept) {
-        put(out, snap->pos);
-        put(out, static_cast<uint8_t>(snap->pinned));
-        put(out, static_cast<uint64_t>(snap->data.size()));
-        out.write(reinterpret_cast<const char*>(snap->data.data()),
-                  static_cast<std::streamsize>(snap->data.size() * sizeof(float)));
+    return write_image(out, n_past_, [this](int32_t p) { return kv_->page_data(p); }, {}, kept, true);
+}
+
+Status Transformer::write_state(std::ostream& out, const ContextImage& image) const {
+    if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
+    const size_t floats = recurrent_state_bytes() / sizeof(float);
+    if (image.n < 0 || image.n > context_length_ || !image.page || image.state.size() != (states_.empty() ? 0 : floats) ||
+        static_cast<int32_t>(image.snapshots.size()) >= kStateSnapshots ||
+        (states_.empty() && !image.snapshots.empty())) {
+        return Status(ErrorCode::InvalidArgument, "the context image does not fit this model");
+    }
+    int32_t below = 0;
+    for (const SnapshotImage& snap : image.snapshots) {
+        if (snap.pos <= below || snap.pos >= image.n || snap.data.size() != floats) {
+            return Status(ErrorCode::InvalidArgument, "the context image's snapshots do not fit this model");
+        }
+        below = snap.pos;
+    }
+    return write_image(out, image.n, image.page, image.state, image.snapshots, false);
+}
+
+// The body of both write_state()s: `state` holds the recurrent states at n
+// as one image, or `live` takes them from states_ (no copy of the live ones).
+Status Transformer::write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
+                                std::span<const float> state, std::span<const SnapshotImage> snapshots,
+                                bool live) const {
+    put(out, kStateMagic);
+    put(out, kStateVersion);
+    for (const int64_t v : state_fingerprint()) put(out, v);
+    put(out, static_cast<uint64_t>(key_scale_.size()));
+    out.write(reinterpret_cast<const char*>(key_scale_.data()),
+              static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
+    put(out, n);
+    const int32_t pages = (n + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
+    put(out, static_cast<uint64_t>(kv_->page_bytes()));
+    put(out, pages);
+    for (int32_t p = 0; p < pages; ++p) {
+        const uint8_t* data = page(p);
+        if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
+    }
+    put(out, static_cast<int32_t>(states_.size()));
+    const float* from = state.data();
+    for (const RecurrentState& st : states_) {
+        put(out, static_cast<uint64_t>(st.conv.size()));
+        put(out, static_cast<uint64_t>(st.ssm.size()));
+        const float* conv = live ? st.conv.data() : from;
+        const float* ssm = live ? st.ssm.data() : from + st.conv.size();
+        out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
+        out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
+        if (!live) from += st.conv.size() + st.ssm.size();
+    }
+    put(out, static_cast<int32_t>(snapshots.size()));
+    for (const SnapshotImage& snap : snapshots) {
+        put(out, snap.pos);
+        put(out, static_cast<uint8_t>(snap.pinned));
+        put(out, static_cast<uint64_t>(snap.data.size()));
+        out.write(reinterpret_cast<const char*>(snap.data.data()),
+                  static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
     }
     return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
 }
@@ -2289,17 +2363,46 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     return std::span<const float>(logits_.data(), logits_.size());
 }
 
-Status Transformer::adopt_cached_prefix(int32_t n) {
-    if (config_.hybrid()) {
-        return Status(ErrorCode::Unsupported, "cached KV prefixes do not include recurrent (DeltaNet) states");
+Status Transformer::adopt_context(int32_t n, std::span<const float> state, std::span<const SnapshotImage> snapshots,
+                                  bool pin_end) {
+    auto fail = [this](const char* why) {
+        reset();
+        return Status(ErrorCode::InvalidArgument, why);
+    };
+    const size_t floats = recurrent_state_bytes() / sizeof(float);
+    if (n < 0 || n > context_length_ || kv_->window() > 0) return fail("the context does not fit this cache");
+    if (state.size() != (states_.empty() ? 0 : floats) || static_cast<int32_t>(snapshots.size()) >= kStateSnapshots ||
+        (states_.empty() && !snapshots.empty())) {
+        return fail("the context's recurrent states do not fit this model");
     }
-    if (n_past_ != 0 || n < 0 || n > context_length_) {
-        return Status(ErrorCode::InvalidArgument, "a cached prefix can only be adopted by an empty context");
+    int32_t below = 0;
+    for (const SnapshotImage& snap : snapshots) {
+        if (snap.pos <= below || snap.pos >= n || snap.data.size() != floats) {
+            return fail("the context's state snapshots do not fit this model");
+        }
+        below = snap.pos;
     }
     for (int32_t p = 0; p * kv_->config().page_tokens < n; ++p) {
-        if (kv_->page_data(p) == nullptr) return Status(ErrorCode::InvalidArgument, "cached prefix pages are not mapped");
+        if (kv_->page_data(p) == nullptr) return fail("the context's cache pages are not mapped");
+    }
+    if (n == 0) {
+        reset();
+        return Status::ok();
+    }
+    if (Status s = kv_->truncate(n); !s.is_ok()) return fail("cannot truncate the cache");
+    const float* from = state.data();
+    for (RecurrentState& st : states_) {
+        std::copy_n(from, st.conv.size(), st.conv.begin());
+        std::copy_n(from + st.conv.size(), st.ssm.size(), st.ssm.begin());
+        from += st.conv.size() + st.ssm.size();
+    }
+    std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
+    snapshots_.clear();
+    for (const SnapshotImage& snap : snapshots) {
+        snapshots_.push_back(StateSnapshot{snap.pos, std::vector<float>(snap.data.begin(), snap.data.end()), snap.pinned});
     }
     n_past_ = n;
+    snapshot_state(pin_end);
     return Status::ok();
 }
 

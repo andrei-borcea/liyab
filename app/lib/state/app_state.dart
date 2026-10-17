@@ -528,6 +528,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
       final gpu = device.useGpu;
       _prepared = null;
       final experimental = device.experimental;
+      await _removeRetiredKvDedup();
       final model = await engine.load(LoadOptions(
         modelPath: path,
         backend: gpu ? LiyabBackend.vulkan : LiyabBackend.cpu,
@@ -537,17 +538,16 @@ class AppState extends ChangeNotifier implements ApiBackend {
         powerProfile: device.powerProfile,
         // A context another conversation replaces (other apps through the local API, a chat left for a new one)
         // goes to storage, not RAM: it comes back in a fraction of a second when its conversation goes on, instead
-        // of being processed again (minutes on a large MoE), and the memory budget stays with the model.
+        // of being processed again (minutes on a large MoE), and the memory budget stays with the model. The engine
+        // keeps it as chunks keyed by content, so the system prompt and tools are stored once for every chat.
         prefixCacheDir: '${(await getApplicationSupportDirectory()).path}/prefix-cache',
-        // Bounded, and the engine removes the files as contexts come back, and all of them when the model unloads:
-        // room for the largest context of a 35B MoE (~320 MB at 24k tokens) and a smaller one.
+        // Bounded (least recently used out first, never above it), and kept across unloads and restarts: the engine
+        // sets its context aside there when the model unloads, and a later load restores from it. Room for the
+        // largest context of a 35B MoE (~320 MB at 24k tokens) and a smaller one.
         prefixCacheDiskMb: 512,
         // Measured once per model (0.3 s on a 4B, 1.4 s on the 35B MoE), then read back at every load.
         cacheDir: '${(await getApplicationSupportDirectory()).path}/engine-cache',
-        experimental: {
-          ...experimental.toJson(),
-          if (experimental.kvDedup) 'kvDedupDir': (await _kvDedupDir()).path,
-        },
+        experimental: experimental.toJson(),
       ));
       // The model's own chat template when it keeps each turn's prompt a prefix of the next one's (context
       // reuse needs it), else the built-in format its vocabulary implies.
@@ -647,9 +647,16 @@ class AppState extends ChangeNotifier implements ApiBackend {
     return '${dir.path}/$modelName.experts';
   }
 
-  /// Where the experimental persistent prefix KV cache lives (the engine needs an existing directory).
-  Future<Directory> _kvDedupDir() async =>
-      Directory('${(await getApplicationSupportDirectory()).path}/kv-dedup').create(recursive: true);
+  /// The snapshots of KV dedup, the experimental persistent prefix cache the engine's prefix cache replaced: they
+  /// had no bound, and nothing reads them any more.
+  Future<void> _removeRetiredKvDedup() async {
+    try {
+      final dir = Directory('${(await getApplicationSupportDirectory()).path}/kv-dedup');
+      if (dir.existsSync()) await dir.delete(recursive: true);
+    } on FileSystemException catch (e) {
+      _log('Old KV dedup files not removed: $e');
+    }
+  }
 
   /// The context being prepared after a load (system prompt or saved conversation).
   Future<void>? _preparing;

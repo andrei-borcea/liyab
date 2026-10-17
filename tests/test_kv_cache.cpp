@@ -1,12 +1,18 @@
 // Tests for the paged, quantized KV cache: memory consumption, page reuse,
-// attention sinks, rollback rules and INT4 / INT8 quantization accuracy.
+// attention sinks, rollback rules and INT4 / INT8 quantization accuracy; its
+// pages as chunk images, and the engine's KV store of such chunks.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
+#include <span>
+#include <string>
 #include <vector>
 
+#include "core/kv_store.h"
 #include "core/quant.h"
 #include "liyab/engine.h"
 #include "liyab/kv_cache.h"
@@ -238,3 +244,387 @@ TEST_CASE("Engine with an INT4 sliding-window KV cache uses less KV memory") {
 }
 
 TEST_MAIN()
+
+TEST_CASE("Chunk images of KV pages: out and back in bit for bit, whole and partial, values in keys too") {
+    for (const bool values_in_keys : {false, true}) {
+        KvCacheConfig c = small_config(KvCacheType::Q8_0);
+        if (values_in_keys) {
+            c.values_in_keys = true;
+            c.value_offset = 32;
+        }
+        auto a = KvCache::create(c);
+        auto b = KvCache::create(c);
+        REQUIRE(a.has_value() && b.has_value());
+        KvCache& src = *a.value();
+        KvCache& dst = *b.value();
+        const int32_t n = 2 * c.page_tokens + 5;  // two whole pages and a partial one
+        REQUIRE(src.reserve(n).is_ok());
+        for (int32_t layer = 0; layer < c.n_layers; ++layer) {
+            for (int32_t pos = 0; pos < n; ++pos) {
+                // Every KV head of the position at once, as the model stores them.
+                const std::vector<float> k = row_for(pos * 7 + layer * 131, 64 * static_cast<size_t>(c.n_head_kv));
+                const std::vector<float> v = row_for(pos * 5 + layer * 17 + 1000, k.size());
+                src.store(layer, pos, k.data(), v.data());
+            }
+        }
+        CHECK(src.rows_bytes(c.page_tokens) == src.page_bytes());
+        CHECK(src.rows_bytes(5) * static_cast<size_t>(c.page_tokens) == src.page_bytes() * 5);
+        // Out as chunk images, in again into another cache: every row the same bits.
+        REQUIRE(dst.reserve(n).is_ok());
+        for (int32_t p = 0; p * c.page_tokens < n; ++p) {
+            const int32_t rows = std::min(c.page_tokens, n - p * c.page_tokens);
+            std::vector<uint8_t> image(src.rows_bytes(rows));
+            REQUIRE(src.read_rows(p, rows, image.data()).is_ok());
+            // The partial page in two parts, to cover a write from inside an image.
+            if (rows < c.page_tokens) {
+                REQUIRE(dst.write_rows(p, image.data(), rows, 0, 2).is_ok());
+                REQUIRE(dst.write_rows(p, image.data(), rows, 2, rows).is_ok());
+            } else {
+                REQUIRE(dst.write_rows(p, image.data(), rows, 0, rows).is_ok());
+            }
+            // And expanded into a page's layout: the rows in place, the rest zero.
+            std::vector<uint8_t> page(src.page_bytes(), 0xEE);
+            src.image_to_page(image.data(), rows, page.data());
+            bool same_rows = true;
+            const size_t row = dtype_row_bytes(src.dtype(), 64);
+            for (int32_t layer = 0; layer < c.n_layers; ++layer) {
+                for (int32_t slot = 0; slot < rows; ++slot) {
+                    const int32_t pos = p * c.page_tokens + slot;
+                    for (int32_t h = 0; h < c.n_head_kv; ++h) {
+                        const size_t at = (static_cast<size_t>(layer * c.page_tokens + slot) * c.n_head_kv + h) * row;
+                        same_rows = same_rows && std::memcmp(page.data() + at, src.k_row(layer, pos, h), row) == 0;
+                    }
+                }
+            }
+            CHECK(same_rows);
+            if (rows < c.page_tokens) CHECK(page.back() == 0);
+        }
+        bool same = true;
+        const size_t row = dtype_row_bytes(src.dtype(), 64);
+        for (int32_t layer = 0; layer < c.n_layers; ++layer) {
+            for (int32_t pos = 0; pos < n; ++pos) {
+                for (int32_t h = 0; h < c.n_head_kv; ++h) {
+                    same = same && std::memcmp(src.k_row(layer, pos, h), dst.k_row(layer, pos, h), row) == 0;
+                    if (!values_in_keys) same = same && std::memcmp(src.v_row(layer, pos, h), dst.v_row(layer, pos, h), row) == 0;
+                }
+            }
+        }
+        CHECK(same);
+        std::vector<uint8_t> image(src.rows_bytes(4));
+        CHECK(!src.read_rows(9, 4, image.data()).is_ok());           // not mapped
+        CHECK(!src.read_rows(0, c.page_tokens + 1, image.data()).is_ok());
+        CHECK(!dst.write_rows(0, image.data(), 4, 3, 5).is_ok());    // past the image
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The KV store (core/kv_store.h), on synthetic chunks: a position's rows are
+// a function of its token, a state image one of the tokens before it, as the
+// store assumes (identical prefixes, identical bytes).
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int32_t kChunk = 16;
+constexpr size_t kPosBytes = 32;
+constexpr size_t kStateFloats = 8;
+
+KvStore::Config store_config(size_t ram, const std::string& dir = {}, size_t disk = 0, bool hybrid = false,
+                             uint64_t seed = 1) {
+    KvStore::Config c;
+    const uint64_t parts[] = {seed};
+    c.seed = kv_seed_key(parts);
+    c.chunk_tokens = kChunk;
+    c.chunk_bytes = kChunk * kPosBytes;
+    c.state_floats = hybrid ? kStateFloats : 0;
+    c.ram_bytes = ram;
+    c.dir = dir;
+    c.disk_bytes = disk;
+    return c;
+}
+
+uint8_t row_byte(int32_t token, int32_t pos, size_t b) {
+    return static_cast<uint8_t>(token * 31 + pos * 7 + static_cast<int32_t>(b));
+}
+
+std::vector<float> state_image(std::span<const int32_t> tokens, int32_t pos) {
+    std::vector<float> s(kStateFloats);
+    double acc = 0;
+    for (int32_t i = 0; i < pos; ++i) acc = acc * 0.5 + tokens[static_cast<size_t>(i)];
+    for (size_t i = 0; i < s.size(); ++i) s[i] = static_cast<float>(acc + static_cast<double>(i));
+    return s;
+}
+
+// A context as the engine sets it aside, with states at `marks` (hybrid stores).
+KvStore::PutResult put(KvStore& store, const std::vector<int32_t>& tokens, std::vector<KvStore::StateMark> marks = {},
+                       bool storage_only = false) {
+    KvStore::ContextSource src;
+    src.tokens = tokens;
+    src.text = "";
+    src.rows = [&tokens](int32_t chunk, int32_t n, uint8_t* out) {
+        for (int32_t s = 0; s < n; ++s) {
+            const int32_t pos = chunk * kChunk + s;
+            for (size_t b = 0; b < kPosBytes; ++b) out[static_cast<size_t>(s) * kPosBytes + b] = row_byte(tokens[static_cast<size_t>(pos)], pos, b);
+        }
+        return Status::ok();
+    };
+    src.states = std::move(marks);
+    src.state = [&tokens](int32_t pos, float* out) {
+        const std::vector<float> s = state_image(tokens, pos);
+        std::copy(s.begin(), s.end(), out);
+        return Status::ok();
+    };
+    return store.put(src, storage_only);
+}
+
+// Whether the store gives back the right bytes for the first `n` positions of `tokens` along `plan`.
+bool rows_match(KvStore& store, const KvStore::Plan& plan, const std::vector<int32_t>& tokens) {
+    for (size_t i = 0; i < plan.chunks.size(); ++i) {
+        const int32_t n = plan.chunk_sizes[i];
+        std::vector<uint8_t> image(static_cast<size_t>(n) * kPosBytes);
+        if (!store.read_chunk(plan.chunks[i], image).is_ok()) return false;
+        for (int32_t s = 0; s < n; ++s) {
+            const int32_t pos = static_cast<int32_t>(i) * kChunk + s;
+            if (pos >= plan.positions) break;
+            for (size_t b = 0; b < kPosBytes; ++b) {
+                if (image[static_cast<size_t>(s) * kPosBytes + b] != row_byte(tokens[static_cast<size_t>(pos)], pos, b)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<int32_t> random_tokens(std::mt19937& rng, size_t n) {
+    std::vector<int32_t> t(n);
+    for (int32_t& x : t) x = 1 + static_cast<int32_t>(rng() % 5000);
+    return t;
+}
+
+std::vector<int32_t> join(std::vector<int32_t> a, const std::vector<int32_t>& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+
+std::string store_dir(const std::string& name) {
+    const std::string dir = test::temp_dir() + "/liyab_kvs_" + std::to_string(test::process_id()) + "_" + name;
+    std::filesystem::remove_all(dir);
+    return dir;
+}
+
+}  // namespace
+
+TEST_CASE("The KV store keeps a shared prefix once and restores a prompt up to where it diverges") {
+    std::mt19937 rng(7);
+    auto store = KvStore::open(store_config(size_t{1} << 20));
+    REQUIRE(store != nullptr);
+    const std::vector<int32_t> x = random_tokens(rng, 100);  // six whole chunks and 4 tokens
+    KvStore::PutResult r = put(*store, x);
+    CHECK(r.whole);
+    CHECK(r.chunks == 7);
+    CHECK(r.chunks_written == 7);
+    KvStore::Plan p = store->plan(x, x.size() - 1);
+    CHECK(p.positions == 99);
+    CHECK(p.chunks.size() == 7);
+    CHECK(p.chunk_sizes.back() == 4);
+    CHECK(rows_match(*store, p, x));
+    // Another context sharing 40 tokens: its first two chunks are stored already.
+    const std::vector<int32_t> y = join(std::vector<int32_t>(x.begin(), x.begin() + 40), random_tokens(rng, 50));
+    r = put(*store, y);
+    CHECK(r.chunks == 6);
+    CHECK(r.chunks_written == 4);
+    CHECK(store->stats().chunks_ram == 11);
+    // A prompt that leaves X after 50 tokens: three whole chunks, then X's
+    // fourth (which holds the most of it) cut where they part.
+    std::vector<int32_t> z(x.begin(), x.begin() + 50);
+    z.push_back(9999);
+    z.push_back(9998);
+    p = store->plan(z, z.size());
+    CHECK(p.positions == 50);
+    CHECK(p.chunks.size() == 4);
+    CHECK(rows_match(*store, p, z));
+    // Limits are kept, and an unknown prompt gets nothing.
+    CHECK(store->plan(x, 37).positions == 37);
+    CHECK(store->plan(random_tokens(rng, 80), 80).positions == 0);
+    // Records: the texts the engine matches; setting X aside again with more
+    // tokens replaces its older record.
+    CHECK(store->records().size() == 2);
+    put(*store, join(x, random_tokens(rng, 20)));
+    CHECK(store->records().size() == 2);
+    // The same chunk tokens elsewhere: found by their content key.
+    const std::span<const int32_t> first(x.data(), kChunk);
+    const KvKey content = kv_content_key(store_config(0).seed, first);
+    CHECK(store->chunks_with_content(content).size() == 1);
+    put(*store, join(random_tokens(rng, kChunk), std::vector<int32_t>(x.begin(), x.begin() + 3 * kChunk)));
+    const auto found = store->chunks_with_content(content);
+    REQUIRE(found.size() == 2);
+    CHECK(found[0].start != found[1].start);
+}
+
+TEST_CASE("The KV store restores a hybrid model up to the deepest state its prompt reaches") {
+    std::mt19937 rng(11);
+    auto store = KvStore::open(store_config(size_t{1} << 20, {}, 0, /*hybrid=*/true));
+    REQUIRE(store != nullptr);
+    const std::vector<int32_t> x = random_tokens(rng, 100);
+    // The oldest snapshot, the last prompt's end (pinned), the end.
+    KvStore::PutResult r = put(*store, x, {{20, false}, {70, true}, {100, false}});
+    CHECK(r.whole);
+    CHECK(r.states_written == 3);
+    std::vector<int32_t> prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 80), {7, 7, 7});
+    KvStore::Plan p = store->plan(prompt, prompt.size());
+    CHECK(p.positions == 70);
+    CHECK(p.state_pinned);
+    REQUIRE(p.snapshots.size() == 1);
+    CHECK(p.snapshots[0].pos == 20);
+    CHECK(rows_match(*store, p, prompt));
+    std::vector<float> state(kStateFloats);
+    REQUIRE(store->read_state(p.state, state).is_ok());
+    CHECK(state == state_image(x, 70));
+    REQUIRE(store->read_state(p.snapshots[0].key, state).is_ok());
+    CHECK(state == state_image(x, 20));
+    prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 50), {7, 7, 7});
+    p = store->plan(prompt, prompt.size());
+    CHECK(p.positions == 20);
+    CHECK(p.snapshots.empty());
+    CHECK(store->plan(x, 99).positions == 70);  // the end needs every token: the limit leaves the last one out
+    CHECK(store->plan(x, 100).positions == 100);
+    // Another conversation from the same start shares the image at 20 (inside
+    // a chunk each holds): it stays while either chunk does.
+    const std::vector<int32_t> y = join(std::vector<int32_t>(x.begin(), x.begin() + 20), random_tokens(rng, 40));
+    r = put(*store, y, {{20, false}, {50, true}, {60, false}});
+    CHECK(r.states_written == 2);
+    CHECK(store->stats().states == 5);
+    prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 20), {3, 3, 3, 3});
+    CHECK(store->plan(prompt, prompt.size()).positions == 20);
+}
+
+TEST_CASE("The KV store stays within its caps, least recently used out first, a chunk never before what continues it") {
+    std::mt19937 rng(3);
+    const std::vector<int32_t> system = random_tokens(rng, 2 * kChunk);
+    const size_t context_bytes = 7 * kChunk * kPosBytes;  // a 100-token context's chunks
+    const size_t cap = 3 * context_bytes;
+    auto store = KvStore::open(store_config(cap));
+    REQUIRE(store != nullptr);
+    std::vector<std::vector<int32_t>> contexts;
+    bool within = true, chains = true;
+    for (int i = 0; i < 12; ++i) {
+        contexts.push_back(join(system, random_tokens(rng, 68)));
+        put(*store, contexts.back());
+        within = within && store->stats().ram_bytes <= cap;
+        for (const KvStore::Record* rec : store->records()) chains = chains && !store->chunk_path(rec->tokens).empty();
+    }
+    CHECK(within);
+    CHECK(chains);
+    // The newest come back whole; the oldest only as far as the shared system prompt.
+    CHECK(store->plan(contexts.back(), 100).positions == 100);
+    CHECK(store->plan(contexts.front(), 100).positions == static_cast<int32_t>(system.size()));
+    // A context used again is the most recent: it outlives newer ones.
+    KvStore::Plan p = store->plan(contexts[9], 100);
+    REQUIRE(p.positions == 100);
+    store->used(p);
+    for (int i = 0; i < 2; ++i) put(*store, join(system, random_tokens(rng, 68)));
+    CHECK(store->plan(contexts[9], 100).positions == 100);
+    CHECK(store->plan(contexts[10], 100).positions < 100);
+    // With storage behind RAM: what RAM cannot hold moves there, and comes back the same.
+    const std::string dir = store_dir("tiers");
+    {
+        auto tiered = KvStore::open(store_config(context_bytes, dir, 4 * context_bytes));
+        REQUIRE(tiered != nullptr);
+        CHECK(tiered->has_storage());
+        for (int i = 0; i < 12; ++i) {
+            put(*tiered, contexts[static_cast<size_t>(i)]);
+            const KvStore::Stats st = tiered->stats();
+            within = within && st.ram_bytes <= context_bytes && st.disk_bytes <= 4 * context_bytes;
+        }
+        CHECK(within);
+        const KvStore::Stats st = tiered->stats();
+        CHECK(st.chunks_disk > 0);
+        CHECK(st.chunks_ram > 0);
+        p = tiered->plan(contexts[9], 100);
+        CHECK(p.positions == 100);
+        CHECK(rows_match(*tiered, p, contexts[9]));
+        // Too large for both tiers: its first chunks are kept, no record.
+        const std::vector<int32_t> huge = random_tokens(rng, 100 * kChunk);
+        const KvStore::PutResult r = put(*tiered, huge);
+        CHECK(!r.whole);
+        CHECK(tiered->stats().disk_bytes <= 4 * context_bytes);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("The KV store's files outlive it, in LRU order, and what it cannot trust is removed") {
+    std::mt19937 rng(5);
+    const std::string dir = store_dir("files");
+    const std::vector<int32_t> a = random_tokens(rng, 100), b = random_tokens(rng, 100), c = random_tokens(rng, 100);
+    {
+        auto store = KvStore::open(store_config(0, dir, size_t{1} << 20, /*hybrid=*/true));
+        REQUIRE(store != nullptr);
+        put(*store, a, {{30, false}, {90, true}, {100, false}});
+        put(*store, b, {{100, true}});
+        put(*store, c, {{100, true}});
+        store->used(store->plan(a, 100));  // A again: the most recent
+        // One store per directory.
+        auto second = KvStore::open(store_config(size_t{1} << 20, dir, size_t{1} << 20, true));
+        REQUIRE(second != nullptr);
+        CHECK(!second->has_storage());
+    }
+    {
+        auto store = KvStore::open(store_config(0, dir, size_t{1} << 20, true));
+        REQUIRE(store != nullptr);
+        CHECK(store->records().size() == 3);
+        const KvStore::Plan p = store->plan(a, 100);
+        CHECK(p.positions == 100);
+        CHECK(p.snapshots.size() == 2);
+        CHECK(rows_match(*store, p, a));
+        std::vector<float> state(kStateFloats);
+        REQUIRE(store->read_state(p.state, state).is_ok());
+        CHECK(state == state_image(a, 100));
+    }
+    // A lower cap: B goes first (A was used after it), then C; A stays.
+    const size_t one = [&] {
+        size_t bytes = 0;
+        for (const auto& e : std::filesystem::directory_iterator(dir)) bytes += e.file_size();
+        return bytes / 3 + 2048;
+    }();
+    {
+        auto store = KvStore::open(store_config(0, dir, one, true));
+        REQUIRE(store != nullptr);
+        CHECK(store->stats().disk_bytes <= one);
+        CHECK(store->plan(a, 100).positions == 100);
+        CHECK(store->plan(b, 100).positions == 0);
+    }
+    // Another seed's files are kept and counted, never returned.
+    {
+        auto other = KvStore::open(store_config(0, dir, size_t{1} << 20, true, /*seed=*/2));
+        REQUIRE(other != nullptr);
+        CHECK(other->records().empty());
+        CHECK(other->plan(a, 100).positions == 0);
+        CHECK(other->stats().foreign_files > 0);
+        put(*other, b, {{100, true}});
+    }
+    // Untrusted files: an interrupted write, another format, a truncated
+    // chunk (its chain goes with it), an older build's prefix-cache file.
+    std::vector<std::filesystem::path> chunks;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".chunk") chunks.push_back(e.path());
+    }
+    REQUIRE(!chunks.empty());
+    std::ofstream(dir + "/kv-" + std::string(32, '1') + ".state.tmp") << "cut short";
+    std::ofstream(dir + "/kv-" + std::string(32, '2') + ".ctx") << "not a record";
+    std::ofstream(dir + "/ctx-42-1-1.state") << "older build";
+    std::ofstream(dir + "/notes.txt") << "not the store's";
+    for (const auto& path : chunks) std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    {
+        auto store = KvStore::open(store_config(0, dir, size_t{1} << 20, true));
+        REQUIRE(store != nullptr);
+        CHECK(store->stats().removed_files > 3);
+        CHECK(store->plan(a, 100).positions == 0);
+        CHECK(store->records().empty());
+    }
+    size_t left = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        left += name.starts_with("kv-") || name.starts_with("ctx-") ? 1 : 0;
+    }
+    CHECK(left == 0);  // every chunk was damaged: nothing of the store is left
+    CHECK(std::filesystem::exists(dir + "/notes.txt"));
+    std::filesystem::remove_all(dir);
+}
