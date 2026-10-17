@@ -1885,16 +1885,25 @@ TEST_CASE("Automatic latent form: single tokens absorbed, a long first batch exp
 // Through the engine: describe() reports the latent cache's own size (one
 // Q8_0 row of rope_dim + kv_rank values per position and block, no V rows).
 TEST_CASE("An engine runs latent attention and reports its cache of latents") {
-    auto engine = Engine::create(engine_config(model_path("latent", latent_spec(64))));
-    REQUIRE(engine.has_value());
-    const std::vector<int32_t> out = run(*engine.value(), {1, 270, 300, 5}, greedy(12));
-    CHECK(!out.empty());  // pieces, not tokens: byte tokens of a split character come out together
-    const std::string described = engine.value()->describe();
-    char expected[64];
-    // 2 transformer blocks, each a row of 96 values: 3 Q8_0 blocks of 34 bytes.
-    std::snprintf(expected, sizeof expected, "%.1f KiB/token", 2.0 * 3 * 34 / 1024.0);
-    CHECK(described.find(expected) != std::string::npos);
-    if (described.find(expected) == std::string::npos) std::printf("%s\n", described.c_str());
+    // Every form (EngineConfig::latent_form), over a prompt longer than one
+    // pass of 64 tokens: the cache is the same whatever the form.
+    std::vector<int32_t> prompt = {1};
+    for (int32_t i = 1; i < 150; ++i) prompt.push_back(3 + (i * 37) % 250);
+    for (const LatentAttentionForm form :
+         {LatentAttentionForm::Auto, LatentAttentionForm::Absorbed, LatentAttentionForm::Expanded}) {
+        EngineConfig config = engine_config(model_path("latent", latent_spec(64)));
+        config.latent_form = form;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        const std::vector<int32_t> out = run(*engine.value(), prompt, greedy(12));
+        CHECK(!out.empty());  // pieces, not tokens: byte tokens of a split character come out together
+        const std::string described = engine.value()->describe();
+        char expected[64];
+        // 2 transformer blocks, each a row of 96 values: 3 Q8_0 blocks of 34 bytes.
+        std::snprintf(expected, sizeof expected, "%.1f KiB/token", 2.0 * 3 * 34 / 1024.0);
+        CHECK(described.find(expected) != std::string::npos);
+        if (described.find(expected) == std::string::npos) std::printf("%s\n", described.c_str());
+    }
 }
 
 // Key scaling over latent rows: the factors divide the latent channels too,
