@@ -112,7 +112,7 @@ typedef struct liyab_engine_config {
     const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
     liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
-    int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model (kept in cache_dir); 0 (default) off */
+    int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model inside liyab_engine_create, which waits for it (kept in cache_dir; see EngineConfig); 0 (default) off */
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.02) */
 } liyab_engine_config;
 
