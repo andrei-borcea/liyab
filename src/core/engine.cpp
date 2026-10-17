@@ -1679,6 +1679,13 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     const bool whole = options != nullptr && options->grammar.has_value();
     bool span_started = false;  // set by structure() when it opened a span
     bool output_done = false;   // the whole output's grammar matched completely
+    // Token healing (run_forced): the active span's last forced text, as where
+    // it starts in what structure() returned and the span's state before it.
+    struct Heal {
+        size_t offset;
+        int32_t state;
+    };
+    std::optional<Heal> heal;
     std::vector<float> masked;
     auto start_span = [&](const Grammar& g) {
         span.reset();
@@ -1694,11 +1701,13 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         const auto t0 = Clock::now();
         std::string out;
         span_started = false;
+        heal.reset();
         for (int guard = 0; guard < 64; ++guard) {
             if (span) {
                 const grammar::StateTable& t = *span->table;
                 if (t.accepting(span->state) && !t.extendable(span->state)) {
                     span.reset();
+                    heal.reset();
                     if (whole) {
                         output_done = true;
                         break;
@@ -1707,6 +1716,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 }
                 std::string f = span->table->forced_text(span->state);
                 if (f.empty()) break;
+                heal = Heal{out.size(), span->state};
                 span->state = span->table->advance(span->state, f);
                 out += f;
                 continue;
@@ -1764,10 +1774,37 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     // SentencePiece space prefix), which is what a grammar follows; a
     // ForceCallback's text keeps the encoding it always had (the same
     // tokens on byte-level BPE vocabularies).
-    auto run_forced = [&](const std::string& forced, const PowerPolicy& policy, const Route& route) -> Status {
+    //
+    // Token healing: forced text ends where the grammar offers a choice, and
+    // its last token can be the start of a longer token the model writes
+    // there (a forced ` {` where Qwen writes ` {"`, a forced `<` where it
+    // writes `</`). Forcing it would make the model go on from a token
+    // boundary it never saw in training, which skews the choice (measured:
+    // optional arguments dropped after ` {`, a parameter added after `<`).
+    // When a longer token the span allows starts with that last token, it
+    // is not forced: the span goes back to the state before it and the next
+    // token, sampled under the mask, is the model's (that token or a longer
+    // one). The pass stays the same size or shrinks, so this costs no step.
+    auto run_forced = [&](std::string forced, const PowerPolicy& policy, const Route& route) -> Status {
         auto forced_tokens =
             options != nullptr ? s.tokenizer->encode_continuation(forced, last) : s.tokenizer->encode(forced, false);
         if (!forced_tokens) return forced_tokens.status();
+        if (span && heal && !forced_tokens->empty()) {
+            const std::string& tail = s.tokenizer->piece(forced_tokens->back());
+            // Only a token within the span's own forced text, whose bytes the
+            // span's states cover (text a callback forced before it has none).
+            if (!tail.empty() && heal->offset <= forced.size() && tail.size() <= forced.size() - heal->offset) {
+                const size_t keep = forced.size() - tail.size();
+                const int32_t before = span->table->advance(
+                    heal->state, std::string_view(forced).substr(heal->offset, keep - heal->offset));
+                if (before >= 0 && span->table->extends(before, tail, s.trie())) {
+                    forced_tokens->pop_back();
+                    forced.resize(keep);
+                    span->state = before;
+                }
+            }
+        }
+        heal.reset();
         if (forced_tokens->empty()) return Status::ok();
         const bool sample_next = (s.speculative != nullptr || !s.decode_only_hooks()) && !output_done;
         std::vector<int32_t> batch{last};

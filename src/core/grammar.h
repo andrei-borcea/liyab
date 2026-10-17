@@ -202,6 +202,14 @@ public:
     // Whether the state allows `token` (its piece, or an end-of-generation
     // token where the state accepts).
     bool allows(int32_t state, int32_t token, const Tokenizer& tokenizer, const VocabTrie& trie);
+    // Whether the state allows a token whose piece is `piece` followed by
+    // at least one more byte: a token the model could write in place of
+    // `piece` and what comes after it (` {"` for a forced ` {`). The engine
+    // leaves such a last forced token to the model (token healing, see
+    // GenerateOptions in liyab/engine.h). Walks only the trie's subtree under
+    // `piece`, skipping what the state rejects; false when `piece` is not a
+    // path of the trie or the state rejects it.
+    bool extends(int32_t state, std::string_view piece, const VocabTrie& trie);
     // Leaves only the `k` highest logits among allowed tokens (ties: the
     // lower id first) and sets every other logit to -infinity: what masking
     // and then keeping the top k leaves, found by checking the most likely

@@ -196,6 +196,11 @@ using ForceCallback = std::function<std::string(std::string_view generated)>;
 //    the model in one batched pass, as ForceCallback text does, and counts in
 //    GenerationStats::forced_tokens. Forcing stops at a choice and never ends
 //    inside a character.
+//  * Token healing: when a longer token the grammar allows starts with the
+//    forced text's last token (` {"` after a forced ` {`), that last token is
+//    not forced; the model samples it or the longer one, under the mask, so
+//    it goes on from the tokenization it was trained on. A forced token the
+//    model would have merged with its next choice skews that choice.
 //  * Speculative decoding (a draft model or lookup drafts) is off while a
 //    grammar is active: tokens are decoded one at a time, since drafts would
 //    need a mask at every verified position. Unconstrained stretches of the

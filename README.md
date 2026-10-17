@@ -119,7 +119,7 @@ These rules decide what goes into the code:
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations (LRU of serialized contexts, in RAM or on storage) | ✅ |
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
-| Structured output: grammar-constrained decoding (JSON Schema, grammar text) and forced continuations (tool-call syntax and names in the app) | ✅ |
+| Structured output: grammar-constrained decoding (JSON Schema, grammar text; tool calls in the app and the local API) and forced continuations | ✅ |
 | Embeddings and reranking: decoder embedding models and rerankers as their GGUF declares them (last-token or mean pooling, ranking heads, or LM-head labels), shared prefixes computed once | ✅ cross-checked against Hugging Face transformers |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
@@ -523,8 +523,8 @@ each of those as a scheduling problem.
   and may return text the output must continue with. The engine runs that text through the model in one batched
   pass, like a short prefill, and emits it as output. That pass also gives the logits of the token after the forced
   text, which is sampled from them, so forced text costs no decoding step of its own (the CPU backend computes a row
-  the same bits in any batch, so the output is the same as with a separate step). The app uses this to force the
-  fixed syntax of tool calls and to complete a tool name as soon as only one fits. It works with speculative
+  the same bits in any batch, so the output is the same as with a separate step). Constrained decoding (below)
+  forces a grammar's fixed text through the same pass: the syntax and names of tool calls. It works with speculative
   decoding too: the callback is asked after every token, and tokens a step verified past a forced point are rolled
   back. Forced text that ends inside a character is emitted up to it, the rest with the token that completes it.
   Forced tokens are counted apart from sampled ones, with the time their passes took, and
@@ -551,6 +551,15 @@ each of those as a scheduling problem.
     writes it (`", "` and `": "`) by default, so the model samples only values and choices; any white space is an
     option. End-of-generation tokens are allowed only where the grammar accepts, and a whole-output grammar ends the
     generation as soon as its match is complete.
+  * **Token healing.** Forced text ends where the grammar offers a choice, and its last token can be the start of a
+    longer token the model writes there: Qwen writes ` {"` after `"arguments":` and `</` before `function>`. Forced
+    alone, ` {` or `<` makes the model go on from a token boundary it never saw in training, which skews its choice.
+    Through the app's tool calls, Qwen3-0.6B then mostly wrote `{}` and left out its optional arguments (a date in
+    10 of 50 replies, against 30 when it wrote that token itself), and Qwen3.5-0.8B added a parameter it did not
+    need. So when a longer token the grammar allows starts with the forced text's last token, that token is left
+    to the model, which samples it or the longer one under the mask; the batched pass only gets shorter, so it
+    costs no step. With it, Qwen3-0.6B gave a date in 30 of 50 replies again, and Qwen3.5-0.8B's greedy calls are
+    the ones it writes when only their syntax and names are forced.
   * **Cost.** On an M4 Pro (Qwen3-0.6B, Qwen3.5-0.8B, Llama 3.2 1B, Qwen2.5-0.5B), constrained decoding cost
     0.14–0.24 ms per token greedy, 0.25–0.62 ms with top-k sampling, and 0.09–0.12 ms with whole masks once a
     state's mask is cached, against decode steps of 18–92 ms. A state's first whole mask takes 1.5–2.7 ms (inside a
@@ -1016,9 +1025,30 @@ cancellation and live counters go straight to the C API, which makes them thread
 * **How tools are called.** Tools are described and called in the model's own format, read from its GGUF chat
   template: Qwen3.5/3.6 XML calls or Qwen2.5/3 JSON calls. A reply can make up to 4 calls, each shown above the
   answer ("Read your calendar: 3 events").
-  * Calls are **structured output**: after `<tool_call>` the fixed syntax is forced, a tool name is completed as soon
-    as it is unambiguous, and the call is closed. The model chooses only what it should: whether to call, which tool,
-    and the arguments.
+  * Calls are **constrained decoding**, the path the local API's calls take: the model chooses to write
+    `<tool_call>`, and from there the call is one constrained span (see
+    [constrained decoding](#context-memory-and-serving)) that admits only the names of the enabled tools and arguments
+    valid against the chosen tool's JSON Schema, the one its description in the system prompt shows. Names, keys and
+    separators are fixed by the grammar (forced, or sampled under its mask where the model's own token covers
+    them, see token healing), so the model chooses only whether to call, which tool and the values. Every call
+    parses, names only declared parameters and has the required ones.
+  * Times are local: a date-time in the shape the prompt shows by example (`2026-10-09T08:00`, seconds optional), a
+    day alone for its midnight, or a time alone for today (a "since" still to come today means yesterday's). The
+    engine's JSON Schema subset cannot say this (`date-time` requires a UTC offset, `pattern` is refused), so these
+    values follow a grammar of their own, and a time the model writes always parses (a free value such as "today"
+    would leave the tool to its default range). The time alone is there because small models write one when the
+    day is today, and years are 20xx so that a first digit tells a time from a date: with dates only, Qwen2.5-0.5B's
+    `16:30:00` was bent into the year 1606.
+  * Text outside a call is sampled with no mask, token for token as in an unconstrained reply. Each step's log line
+    gives the tokens a call's grammar constrained and the grammar's time ("9 constrained, grammar 4.3 ms").
+  * **Measured** on a shared M4 Pro's CPU through the app's own prompt and path, with Android's six tools and ten
+    questions asked five times each at the app's settings: Qwen2.5-0.5B made 45 calls, all valid. With only their
+    syntax and names forced, 15 of its 45 were not: times that do not parse (`16 October 2026, 10:30 UTC+03:00`,
+    `2026-10-10T08:00; default 24 h ago`), parameters the tool does not have, calls that do not parse. Qwen3-0.6B (25
+    calls) and Qwen3.5-0.8B (28) wrote valid calls either way, also at temperature 1.0 on harder questions with
+    relative times. A call's grammar cost 0.6–0.9 ms per constrained token against decode steps of about 80 ms
+    in the same runs (a call has 15–35 constrained tokens), and asking the structure after each token of a reply
+    without a call cost 20–60 µs a token. Greedy replies without a call came out the same, token for token.
   * Results are compact text with ISO dates. On Qwen3.6's tokenizer, 6 events take 190 tokens instead of 428 as
     JSON, which saves ~18 s of prefill on the 35B.
   * The system prompt tells the model to treat tool results as data, not instructions.
@@ -1154,10 +1184,14 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   renders them.
   * **Every call is valid.** The model chooses to write `<tool_call>`; from there the call is one constrained span
     (see [constrained decoding](#context-memory-and-serving)): only the names of the request's tools, and only
-    arguments valid against the chosen tool's schema. Names, keys and separators are forced, so the model samples
-    only the tool and the values. With `tool_choice` `required` or a named tool, the call is forced right away
+    arguments valid against the chosen tool's schema. Names, keys and separators are fixed by the grammar (forced,
+    or sampled under its mask where the model's own token covers them), so the model chooses only the tool and the
+    values. With `tool_choice` `required` or a named tool, the call is forced right away
     (after the reasoning, when the model reasons). In XML calls, string parameters are written raw, as Qwen's
-    parser reads them, and every other type as JSON.
+    parser reads them, and every other type as JSON. A raw string of free characters (with a `minLength`, a
+    `maxLength` long enough to hold the 13 characters of `\n</parameter>`, or a `format` the engine does not check,
+    such as `email` or `uri`) is written without `<`: such a value could otherwise take in the closing tag and go
+    on, and the call would never end. The first `\n</parameter>` closes every value.
   * **A tool whose schema uses a keyword the engine cannot enforce** (`pattern`, `uniqueItems`...) keeps working:
     its arguments are then constrained to any JSON object (any parameters in XML), not to its schema.
   * **`response_format`** `json_object` or `json_schema` constrains the whole answer to a JSON object or to the
@@ -1577,12 +1611,12 @@ downloaded.
 | `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts; hybrid snapshots, also restored from a saved context; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage; key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier) |
-| `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
+| `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
-| `app/test` | Tool-call formats and forced continuations; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses |
+| `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), each shape of a time read as local time, XML string values under a length bound or an unchecked format that cannot take in their closing tag, a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; with `LIYAB_TOOL_MODEL=a.gguf,b.gguf` on a Mac, real models answer questions for each tool through the app's prompt and structure, every call valid, and the grammar's cost per token is printed; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses |
 
 Benchmarks and tools built with the tests:
 
@@ -1755,8 +1789,6 @@ Implemented features are described above. These are next, in order:
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need. Then verification of the suffix drafts' whole tree in one pass, with tree attention masks.
 5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
-6. **Constrained arguments for the app's own tools.** The local API's calls are constrained by their schemas; the
-   assistant's own tool calls still force only their syntax and names.
 7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
    pass (a mask per input), which the GPU path needs most: a pass costs it ~35 ms of fixed work, against ~3 ms on

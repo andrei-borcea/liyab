@@ -300,6 +300,38 @@ t1 ::= "now>\n" "")");
                        "</function>\n</tool_call>"));
 }
 
+// A Qwen XML call whose string value has free characters under a bound
+// ({"type": "string", "maxLength": 80}): %string's characters can run over
+// the markup that follows them, so after a whole call the value could still
+// be going on and the call's span never ended. ToolDialect.callGrammar now
+// writes such a value without '<' (app/test/agent_calls_test.dart expects
+// this text): the call ends where it closes.
+TEST_CASE("grammar: an XML call's bounded string value cannot run over its closing tag") {
+    const Grammar runs_over = text_grammar(R"(root ::= "\n" "<function=" (t0) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=title>\n" %string {"type":"string","maxLength":80} "\n</parameter>\n"
+t0 ::= "note>\n" p0-0?)");
+    const Grammar closes = text_grammar(R"(root ::= "\n" "<function=" (t0) "</function>\n</tool_call>"
+p0-0 ::= "<parameter=title>\n" [^<]{0,80} "\n</parameter>\n"
+t0 ::= "note>\n" p0-0?)");
+    const std::string call = "\n<function=note>\n<parameter=title>\nShopping\n</parameter>\n</function>\n</tool_call>";
+    // The same call with the closing tags taken in by the value, which goes on.
+    const std::string taken_in = "\n<function=note>\n<parameter=title>\nShopping\n</parameter>\n</function>\n</tool_call>\nx"
+                                 "\n</parameter>\n</function>\n</tool_call>";
+    for (const Grammar* g : {&runs_over, &closes}) {
+        CHECK(g->matches(call));
+        grammar::StateTable t(g->program());
+        const int32_t end = t.advance(t.initial(), call);
+        REQUIRE(end >= 0);
+        CHECK(t.accepting(end));
+        // A span ends when its match is complete and nothing can follow (Engine::generate).
+        CHECK(t.extendable(end) == (g == &runs_over));
+        CHECK(g->matches(taken_in) == (g == &runs_over));
+    }
+    // Lines and every other character are still text; the bound still holds.
+    CHECK(closes.matches("\n<function=note>\n<parameter=title>\nMilk\nEggs > 2/day\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(!closes.matches("\n<function=note>\n<parameter=title>\n" + std::string(81, 'x') + "\n</parameter>\n</function>\n</tool_call>"));
+}
+
 TEST_CASE("grammar: a table past its bound starts over and keeps following the input") {
     // Each position of a bounded string is its own state: 300 positions, a table of at most 40.
     const Grammar g = schema(R"({"type": "string", "maxLength": 300})");
@@ -708,6 +740,56 @@ TEST_CASE("constrained generation: deterministic, and unconstrained generation u
     }).has_value());
     with_options = generate(e, "hello world", sampling(0.9f, 5, 40), GenerateOptions{}).text;
     CHECK(plain == with_options);
+}
+
+TEST_CASE("constrained generation: a forced token the model would extend is left to it (token healing)") {
+    auto file = MmapLoader::open(tiny_model());
+    REQUIRE(file.has_value());
+    auto tok = Tokenizer::load(*file.value());
+    REQUIRE(tok.has_value());
+    auto trie = grammar::VocabTrie::build(*tok);
+    // The tiny vocabulary holds every substring of "▁world": a forced " wor"
+    // can be the start of " world", but of no token ending in "q" or "z".
+    const Grammar heals = text_grammar(R"(root ::= " wor" ("ld" | "m"))");
+    const Grammar keeps = text_grammar(R"(root ::= " wor" ("q" | "z"))");
+    grammar::StateTable th(heals.program());
+    grammar::StateTable tk(keeps.program());
+    CHECK(th.forced_text(th.initial()) == " wor");
+    CHECK(th.extends(th.initial(), " wor", *trie));
+    CHECK(th.extends(th.initial(), " wo", *trie));
+    CHECK(!tk.extends(tk.initial(), " wor", *trie));
+    CHECK(!th.extends(th.initial(), " he", *trie));   // the state rejects it
+    CHECK(!th.extends(th.initial(), " wox", *trie));  // no token starts so
+    CHECK(!th.extends(th.advance(th.initial(), " worl"), "d", *trie));  // nothing follows " world"
+
+    auto engine = Engine::create(config_for(tiny_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    std::set<std::string> firsts;
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+        std::string healed;
+        std::string first;
+        auto sh = e.generate("hello world", sampling(1.5f, seed, 20), [&](std::string_view piece, int32_t) {
+            if (healed.empty()) first = piece;
+            healed += piece;
+            return true;
+        }, GenerateOptions{.grammar = heals});
+        REQUIRE(sh.has_value());
+        CHECK(heals.matches(healed));
+        firsts.insert(first);
+        // With no longer token to write, the forced text stays forced, whole.
+        std::string kept;
+        auto sk = e.generate("hello world", sampling(1.5f, seed, 20), [&](std::string_view piece, int32_t) {
+            if (kept.empty()) CHECK(piece == " wor");
+            kept += piece;
+            return true;
+        }, GenerateOptions{.grammar = keeps});
+        REQUIRE(sk.has_value());
+        CHECK(keeps.matches(kept));
+        CHECK(sk->forced_tokens >= 1);
+    }
+    // The model wrote the start of " world" itself (a token of its choosing), not a forced " wor" every time.
+    CHECK((firsts.size() > 1 || !firsts.contains(" wor")));
 }
 
 TEST_CASE("C API: grammars, a constrained whole output and constrained spans") {

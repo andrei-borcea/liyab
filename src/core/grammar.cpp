@@ -792,6 +792,40 @@ bool StateTable::allows(int32_t state, int32_t token, const Tokenizer& tokenizer
     return advance(state, tokenizer.piece(token)) >= 0;
 }
 
+bool StateTable::extends(int32_t state, std::string_view piece, const VocabTrie& trie) {
+    if (piece.empty()) return false;
+    // The node that spells `piece`: siblings follow in byte order (the trie
+    // was built from sorted pieces), each one subtree past the last.
+    const VocabTrie::Node* nodes = trie.nodes.data();
+    uint32_t i = 0;
+    auto end = static_cast<uint32_t>(trie.nodes.size());
+    for (const char c : piece) {
+        const auto b = static_cast<uint8_t>(c);
+        while (i < end && nodes[i].byte < b) i = nodes[i].subtree_end;
+        if (i >= end || nodes[i].byte != b) return false;
+        state = advance(state, b);
+        if (state < 0) return false;
+        end = nodes[i].subtree_end;
+        ++i;  // its first child, when it has children (else i == end)
+    }
+    // Any token below it whose bytes the state accepts, as mask() walks:
+    // `at[d]` is the state after the first d bytes of the current path.
+    std::vector<int32_t> at(static_cast<size_t>(trie.max_depth) + 1, kDead);
+    at[piece.size()] = state;
+    for (uint32_t j = i; j < end;) {
+        const VocabTrie::Node& node = nodes[j];
+        const int32_t to = advance(at[node.depth - 1], node.byte);
+        if (to < 0) {
+            j = node.subtree_end;
+            continue;
+        }
+        if (node.tok_begin != node.tok_end) return true;
+        at[node.depth] = to;
+        ++j;
+    }
+    return false;
+}
+
 bool StateTable::keep_top_allowed(int32_t state, const Tokenizer& tokenizer, const VocabTrie& trie,
                                   std::span<float> logits, size_t k) {
     const size_t n = logits.size();
