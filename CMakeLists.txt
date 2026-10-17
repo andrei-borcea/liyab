@@ -125,6 +125,7 @@ add_library(liyab_core OBJECT
   src/core/power_manager.cpp
   src/core/kv_cache.cpp
   src/core/kv_store.cpp
+  src/core/kv_codec.cpp
   src/core/triple_buffer_loader.cpp
   src/core/unicode.cpp
   src/core/regex.cpp
