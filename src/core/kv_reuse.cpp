@@ -10,6 +10,7 @@
 #include <random>
 
 #include "core/log.h"
+#include "core/portable_math.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/experimental/forward_hooks.h"
@@ -375,7 +376,7 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
                         float dot = 0.0f;
                         for (int32_t c = 0; c < hd; ++c) dot += qh[c] * k[c];
                         dot *= cfg.attn_scale;
-                        if (cfg.attn_softcap > 0.0f) dot = cfg.attn_softcap * std::tanh(dot / cfg.attn_softcap);
+                        if (cfg.attn_softcap > 0.0f) dot = cfg.attn_softcap * portable_tanh(dot / cfg.attn_softcap);
                         logits[static_cast<size_t>(p - first)] = dot;
                         top = std::max(top, dot);
                     }

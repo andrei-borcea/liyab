@@ -10,6 +10,7 @@
 #include <random>
 
 #include "core/log.h"
+#include "core/portable_math.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 
@@ -39,6 +40,8 @@ float silu(float x) { return x / (1.0f + std::exp(-x)); }
 // 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))).
 float gelu_tanh(float x) {
     constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    // The C library's tanh (not portable_tanh): Apple's and Android's agree on
+    // every golden model's GELU, and switching would change pinned hashes.
     return 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + 0.044715f * x * x * x)));
 }
 
@@ -1275,7 +1278,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             }
         }
         if (softcap > 0.0f) {  // Gemma 2: the scaled scores squashed into (-cap, cap) before the softmax
-            for (size_t i = 0; i < ugroup * len; ++i) scores[i] = softcap * std::tanh(scores[i] / softcap);
+            for (size_t i = 0; i < ugroup * len; ++i) scores[i] = softcap * portable_tanh(scores[i] / softcap);
         }
         for (int32_t j = 0; j < group; ++j) {
             const size_t at = static_cast<size_t>(j) * stride;
@@ -1405,13 +1408,14 @@ Status Transformer::matmul_group(const Route& route, Backend* backend, std::span
 }
 
 void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool) {
-    // Elementwise, so chunking cannot change a bit. tanh costs ~5 ns per
+    // Elementwise, so chunking cannot change a bit (portable_tanh: the same
+    // bits on every platform, which test_golden pins). tanh costs ~5 ns per
     // element: one thread over Gemma 2's 256k vocabulary took 1-2 ms per token.
     // Below this size the fork/join (a few us) is not worth it.
     constexpr size_t kParallelMin = 16384;
     float* p = logits.data();
     auto run = [p, cap](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) p[i] = cap * std::tanh(p[i] / cap);
+        for (int64_t i = begin; i < end; ++i) p[i] = cap * portable_tanh(p[i] / cap);
     };
     if (logits.size() < kParallelMin || pool.max_threads() == 1) {
         run(0, static_cast<int64_t>(logits.size()));
@@ -2087,7 +2091,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                             for (size_t j = 0; j < block && j0 + j < count; ++j) {
                                 for (size_t r = 0; r < static_cast<size_t>(kScoreKeys) && i + r < c1; ++r) {
                                     float sc = dots[j][r] * scale;
-                                    if (softcap > 0.0f) sc = softcap * std::tanh(sc / softcap);
+                                    if (softcap > 0.0f) sc = softcap * portable_tanh(sc / softcap);
                                     scores[(j0 + j) * urows + i + r] = sc;
                                 }
                             }

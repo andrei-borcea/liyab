@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "core/portable_math.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
@@ -210,6 +211,52 @@ TEST_CASE("ThreadPool::parallel_for runs every index exactly once") {
     }
 }
 
+TEST_CASE("portable_tanh: within 1.32 ulp of tanh, odd, monotone, saturating, and the same bits everywhere") {
+    // Arguments: a uniform sweep over [-12, 12], every power-of-two decade
+    // down to 1e-30, and a dense run around the branch point 0.625.
+    std::vector<float> xs;
+    for (int i = -1200000; i <= 1200000; ++i) xs.push_back(static_cast<float>(i) * 1e-5f);
+    for (float v = 1e-30f; v < 12.0f; v *= 1.0001f) {
+        xs.push_back(v);
+        xs.push_back(-v);
+    }
+    float near = 0.625f;
+    for (int i = 0; i < 4000; ++i) near = std::nextafter(near, 0.0f);
+    for (int i = 0; i < 8000; ++i, near = std::nextafter(near, 1.0f)) xs.push_back(near);
+    double worst = 0.0;
+    bool odd = true;
+    std::vector<float> ys(xs.size());
+    for (size_t i = 0; i < xs.size(); ++i) {
+        const float y = portable_tanh(xs[i]);
+        ys[i] = y;
+        const double ref = std::tanh(static_cast<double>(xs[i]));
+        const float mag = static_cast<float>(std::fabs(ref));
+        const double ulp = static_cast<double>(std::nextafter(mag, 2.0f) - mag);
+        if (ref != 0.0) worst = std::max(worst, std::fabs(static_cast<double>(y) - ref) / ulp);
+        odd = odd && portable_tanh(-xs[i]) == -y;
+    }
+    std::printf("  portable_tanh: worst error %.4f ulp over %zu arguments\n", worst, xs.size());
+    CHECK(worst <= 1.32);
+    CHECK(odd);
+    std::vector<float> sorted = xs;
+    std::sort(sorted.begin(), sorted.end());
+    bool monotone = true;
+    for (size_t i = 1; i < sorted.size(); ++i) monotone = monotone && portable_tanh(sorted[i - 1]) <= portable_tanh(sorted[i]);
+    CHECK(monotone);
+    CHECK(portable_tanh(10.0f) == 1.0f);
+    CHECK(portable_tanh(-1e30f) == -1.0f);
+    CHECK(portable_tanh(INFINITY) == 1.0f);
+    CHECK(portable_tanh(-INFINITY) == -1.0f);
+    CHECK(std::isnan(portable_tanh(NAN)));
+    CHECK(portable_tanh(0.0f) == 0.0f);
+    CHECK(std::signbit(portable_tanh(-0.0f)));
+    // The point of the function: these bits are the same on every platform
+    // and compiler (pinned on the Mac; the phone and x86-64 must give them).
+    const uint64_t h = xxhash64(ys.data(), ys.size() * sizeof(float));
+    std::printf("  portable_tanh: results hash %016llx\n", static_cast<unsigned long long>(h));
+    CHECK(h == 0x1f63ba73ed842e5bull);
+}
+
 TEST_CASE("Final logit soft-cap: same bits for 1 and N threads, and its cost per token") {
     // Gemma 2's vocabulary (256000) plus odd sizes around the inline/parallel
     // cut-over, so uneven chunks are covered too.
@@ -224,7 +271,7 @@ TEST_CASE("Final logit soft-cap: same bits for 1 and N threads, and its cost per
             v = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 200.0f;  // well past the cap both ways
         }
         std::vector<float> want = src;
-        for (float& v : want) v = cap * std::tanh(v / cap);  // the former single-thread loop
+        for (float& v : want) v = cap * portable_tanh(v / cap);  // the single-thread loop
         for (ThreadPool* pool : {&one, &many}) {
             for (const int32_t active : {1, 3, 8}) {
                 pool->set_active_threads(active);

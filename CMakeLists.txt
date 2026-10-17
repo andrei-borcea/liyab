@@ -139,6 +139,7 @@ add_library(liyab_core OBJECT
   src/core/json_schema.cpp
   src/core/architecture.cpp
   src/core/key_scaling.cpp
+  src/core/portable_math.cpp
   src/core/transformer.cpp
   src/core/expert_store.cpp
   src/core/direct_io.cpp
