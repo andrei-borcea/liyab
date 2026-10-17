@@ -478,9 +478,11 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
     s.mla_kv_rank = 64;
     archs.push_back({"deepseek2", s});
     for (const Arch& a : archs) {
-      // Chunks of one page and of two: a segment's pages are packed and
-      // read back page by page (its documents span two and three pages).
-      for (const int32_t pages : {1, 2}) {
+      // Chunks of one page, two and four (the most a store's chunk holds): a
+      // segment's pages are packed and read back page by page. Its documents
+      // span 6 and 10 pages of 16 tokens, start inside a page, and end inside
+      // a chunk.
+      for (const int32_t pages : {1, 2, 4}) {
         auto l = load(a.name, a.spec, {}, a.scale_keys);
         REQUIRE(l != nullptr);
         Transformer& m = *l->model;
@@ -798,6 +800,39 @@ TEST_CASE("Engine: segments are kept, reused elsewhere, and a request that marks
     const size_t before_a = e.tokenize(r3.text.substr(0, r3.segments[0].begin), true)->size() + 2;
     CHECK(st.cached_prefix_tokens > 0);
     CHECK(static_cast<size_t>(st.cached_prefix_tokens) <= before_a);
+}
+
+TEST_CASE("Engine: a segment longer than two chunks of several pages is kept and reused whole") {
+    auto engine = Engine::create(reuse_config(reuse_model()));
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    EngineConfig plain = reuse_config(reuse_model());
+    plain.prefix_cache_mb = 0;
+    plain.segment_reuse = false;
+    auto fresh_engine = Engine::create(plain);
+    REQUIRE(fresh_engine.has_value());
+    // The store's chunks hold several pages (up to 256 tokens); the long
+    // document needs more than two of them and starts inside a page.
+    const int32_t chunk = e.prefix_cache_stats().chunk_tokens;
+    REQUIRE(chunk > 0);
+    const std::string long_doc = doc_text(10, 3 * chunk), short_doc = doc_text(11, 30);
+    const auto long_tokens = e.tokenize(long_doc, false);
+    REQUIRE(long_tokens.has_value());
+    REQUIRE(long_tokens->size() > static_cast<size_t>(2 * chunk));
+    const Marked first = rag({long_doc, short_doc}, "first");
+    GenerationStats st{};
+    run(e, first.text, first.segments, &st);
+    CHECK(e.prefix_cache_stats().segments_kept == 2);
+    // After the short one, in another position: every chunk of the long one
+    // is read back, its pages turned to their new positions.
+    const Marked second = rag({short_doc, long_doc}, "second");
+    const std::string reply = run(e, second.text, second.segments, &st);
+    CHECK(reply.find('<') == std::string::npos);
+    CHECK(st.segment_reused_tokens > 2 * chunk);
+    CHECK(st.segment_recomputed_tokens > 0);
+    // Unmarked, the same prompt gets a fresh context's reply.
+    fresh_engine.value()->reset_context();
+    CHECK(run(e, second.text) == run(*fresh_engine.value(), second.text));
 }
 
 TEST_CASE("Engine: the prefix cache and saved contexts keep only exact rows of a context that reused segments") {
