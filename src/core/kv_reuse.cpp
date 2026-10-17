@@ -336,7 +336,7 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
             const int32_t group = cfg.n_head / heads;
             const int32_t window = cfg.blocks[static_cast<size_t>(layer)].windowed ? cfg.sliding_window : 0;
             std::vector<double> mass(static_cast<size_t>(end), 0.0);
-            std::vector<float> key(static_cast<size_t>(hd)), logits;
+            std::vector<float> logits;
             // Keys dequantized once per position and KV head.
             std::vector<float> keys(static_cast<size_t>(end) * static_cast<size_t>(heads) * static_cast<size_t>(hd));
             for (int32_t p = 0; p < end; ++p) {
@@ -371,8 +371,8 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
             }
             for (size_t i = 0; i < active.size(); ++i) {
                 if (!reused[i]) continue;
-                const double a = mass[static_cast<size_t>(active[i])];
-                score[i] = settings.criterion == ReuseCriterion::Impact ? a * score[i] : a;
+                const double attention = mass[static_cast<size_t>(active[i])];
+                score[i] = settings.criterion == ReuseCriterion::Impact ? attention * score[i] : attention;
             }
         }
         const std::vector<uint8_t> chosen = choose(score);
