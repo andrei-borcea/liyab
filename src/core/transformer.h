@@ -52,6 +52,57 @@ struct Route {
     Backend* cpu = nullptr;
 };
 
+// How multi-head latent attention (ModelConfig::mla) attends in a forward
+// pass. Both forms read the same cache of latents and compute the same
+// function; they round differently (see Transformer::latent_attention_mixer).
+enum class LatentForm : uint8_t {
+    // Per pass, the form LatentFormChooser predicts faster from the costs it
+    // measured on this machine; a single-token pass (decoding) is absorbed.
+    Auto,
+    Absorbed,  // every pass: absorbed queries over the cached [k_pe | latent] rows
+    Expanded,  // every pass of two tokens or more: per-head keys and values expanded from the latents
+};
+
+// Picks latent attention's form for a pass from measured costs. Each form's
+// work is counted in multiply-adds of the parts that differ between them
+// (work()); each timed pass (record()) updates that form's measured time per
+// multiply-add, a running ratio of decayed sums, so the larger passes weigh
+// more and the estimate follows the machine (threads, clocks) as it changes.
+// A form not measured yet borrows the other's rate, and with neither measured
+// both cost the same per multiply-add: the counts decide alone. The resulting
+// threshold on batch size and context is the machine's own, not a constant.
+// Not thread-safe (one per Transformer, used from forward()).
+class LatentFormChooser {
+public:
+    // Multiply-adds of the form-dependent parts of a pass of `n` tokens over
+    // `visible` (token, visible position) pairs in total, `positions` of them
+    // distinct (the union the expanded form expands): per token the absorbed
+    // form projects each head's query onto the latent and the weighted
+    // latent back out (kv_rank x (nope + v) per head) and attends over
+    // rope_dim + kv_rank channels, accumulating kv_rank; the expanded form
+    // expands each distinct position's keys and values (kv_rank x (nope +
+    // v) per head, plus the weights' decoding, counted as one more position)
+    // and attends over nope + rope_dim channels, accumulating v.
+    struct Work {
+        double absorbed = 0.0;
+        double expanded = 0.0;
+    };
+    [[nodiscard]] static Work work(const ModelConfig& c, int64_t n, int64_t visible, int64_t positions);
+    // True when the expanded form is predicted faster for `w`.
+    [[nodiscard]] bool expand(const Work& w) const noexcept;
+    // A pass that ran in the expanded (or absorbed) form: `macs` of its work
+    // took `ms` (its form-dependent parts, every latent block summed).
+    void record(bool expanded, double macs, double ms) noexcept;
+    // Measured nanoseconds per multiply-add; 0 while the form has no measurement.
+    [[nodiscard]] double ns_per_mac(bool expanded) const noexcept;
+    // Weight of the past in the running sums, per recorded pass.
+    static constexpr double kDecay = 0.75;
+
+private:
+    double ms_[2] = {0.0, 0.0};    // [absorbed, expanded]: decayed sums of measured times
+    double macs_[2] = {0.0, 0.0};  // and of the work they covered
+};
+
 struct TransformerOptions {
     int32_t context_length = 0;   // 0: automatic (kKvBudgetBytes of KV, 4096..32768, at most the training context)
     int32_t sliding_window = 0;   // 0: full attention
@@ -93,6 +144,9 @@ struct TransformerOptions {
     // Q6_K_R8 / Q8_0_R4) for the CPU's i8mm kernels (set only when the CPU
     // computes every block; lossless).
     bool repack_cpu = false;
+    // Latent attention (DeepSeek-V2/V3 and models converted alike): the
+    // form passes attend in. Ignored by other models.
+    LatentForm latent_form = LatentForm::Auto;
 };
 
 class Transformer {
@@ -171,6 +225,13 @@ public:
     // (16 spans), 7 threads took 5 tasks' time for 4.6 tasks' work.
     static constexpr int32_t kAttentionMinSpan = 32;
     static constexpr int32_t kAttentionMaxSpans = 84;
+    // Latent attention's expanded form holds one tile of expanded keys and
+    // values at a time: the largest power of two of positions in
+    // [kLatentTileMin, kLatentTileMax] whose rows fit kLatentTileBytes (256
+    // positions, 5 MiB, on DeepSeek-V2-Lite's 16 heads of 192 + 128).
+    static constexpr size_t kLatentTileBytes = size_t{8} << 20;
+    static constexpr int32_t kLatentTileMin = 16;
+    static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
@@ -200,6 +261,21 @@ public:
         uint64_t skipped = 0;  // chosen experts skipped instead of waited for (skip_slow)
     };
     [[nodiscard]] const ExpertPredictions& expert_predictions() const noexcept { return predictions_; }
+
+    // Latent attention: the form passes attend in (TransformerOptions::
+    // latent_form), changeable between passes; the cache holds latents in
+    // either form, so a context continues in the other. No effect on other
+    // models.
+    [[nodiscard]] LatentForm latent_form() const noexcept { return latent_form_; }
+    void set_latent_form(LatentForm form) noexcept { latent_form_ = form; }
+    // Passes run in each form so far (cumulative; passes of models without
+    // latent attention are not counted), and what the automatic choice measured.
+    struct LatentStats {
+        int64_t absorbed_passes = 0;
+        int64_t expanded_passes = 0;
+    };
+    [[nodiscard]] const LatentStats& latent_stats() const noexcept { return latent_stats_; }
+    [[nodiscard]] const LatentFormChooser& latent_chooser() const noexcept { return latent_chooser_; }
 
     // Discards cached positions >= n (speculative-decoding rollback, a chat
     // turn that rewrites the end of the context). KV caches simply drop
@@ -354,22 +430,46 @@ private:
     Transformer() = default;
     Status bind_weights();
     void rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const;
+    // The same over heads `stride` floats apart (rope_dim channels rotated at
+    // the start of each): latent attention's expanded queries.
+    void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
     // Mixers: read the normalized input from xb_, leave the block output (before
     // the residual add) in xb_.
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
-    // Multi-head latent attention (ModelConfig::mla): absorbed queries
-    // against the cached [k_pe | latent] rows, the weighted latent expanded
-    // per head, then attn_output.
+    // Multi-head latent attention (ModelConfig::mla), in the form forward()
+    // chose for the pass (latent_expanded_): absorbed queries against the
+    // cached [k_pe | latent] rows and the weighted latent expanded per head,
+    // or keys and values expanded per head from the cached latents
+    // (latent_expanded()); then attn_output.
     Status latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                   ThreadPool& pool, const uint8_t* head_mask);
     // Latent attention's projections of the n normalized rows in xb_: each
     // token's key row [k_pe | RMSNorm(latent)] into k_ (unrotated) and, with
-    // `queries`, its absorbed queries [q_pe | W_kb,h^T q_nope,h] per head
-    // into q_ (unrotated). On `backend`; the per-head matrices run on the CPU.
+    // `queries`, its queries [q_nope | q_pe] per head into mla_q_
+    // (unrotated). On `backend`.
     Status latent_project(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, Backend* backend,
                           bool queries);
+    // Absorbed form: each head's query from mla_q_ as [q_pe | W_kb,h^T
+    // q_nope,h] into q_ (unrotated). The per-head matrices run on the CPU.
+    Status latent_absorb(const BlockWeights& w, int32_t n, const Route& route);
+    // Expanded form, once the batch's key rows are stored and its queries in
+    // mla_q_ rotated: attends each head over the positions the batch sees,
+    // their keys [W_kb,h c | k_pe] and values W_vb,h c expanded from the
+    // cached rows tile by tile, and leaves each token's heads (v_dim
+    // channels each) in att_. See the definition for the layout and why the
+    // result does not depend on the batch.
+    Status latent_expanded(int32_t layer, const BlockWeights& w, int32_t n, ThreadPool& pool,
+                           const uint8_t* head_mask);
+    // The positions the n tokens of the pass see in a block with `window`,
+    // merged into ascending disjoint ranges [first, end) (mla_union_), and
+    // the number of (token, visible position) pairs.
+    int64_t latent_visible(int32_t n, int32_t window);
+    // Expanded form: positions per tile of expanded keys and values, from
+    // the model's shape only (so tile bounds, which set the order a token's
+    // softmax is merged in, never depend on the pass).
+    [[nodiscard]] int32_t latent_tile() const noexcept;
     // Per-head slices of a [cols, rows, n_head] tensor as matmul items, one
     // contiguous input and output block per head: input head h, token t at
     // in + (h * n + t) * cols, output at out + (h * n + t) * rows.
@@ -484,6 +584,18 @@ private:
     std::vector<float> mla_heads_in_, mla_heads_out_;  // latent attention: per-head matmul inputs and outputs
     std::vector<TensorView> mla_head_views_;           // latent attention: per-head slices of attn_k_b / attn_v_b
     std::vector<Backend::MatmulItem> mla_items_;
+    // Latent attention, expanded form: packed expansion weights, a tile's
+    // latents and expanded rows, the positions they hold, per (token, head)
+    // running softmax maximum and sum, the batch's visible ranges.
+    std::vector<float> mla_wp_, mla_c_, mla_ex_, mla_max_, mla_sum_;
+    std::vector<size_t> mla_col_offset_;
+    std::vector<int32_t> mla_rows_;
+    std::vector<std::pair<int32_t, int32_t>> mla_union_;
+    LatentForm latent_form_ = LatentForm::Auto;  // TransformerOptions::latent_form
+    LatentFormChooser latent_chooser_;
+    LatentStats latent_stats_;
+    bool latent_expanded_ = false;  // the current pass's form
+    double latent_ms_ = 0.0;        // the current pass's form-dependent time, every latent block
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order

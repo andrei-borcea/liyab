@@ -35,6 +35,14 @@ struct ExperimentalConfig {
     std::string kv_dedup_dir;             // non-empty: persistent prefix KV cache in this directory
 };
 
+// How a model with multi-head latent attention (DeepSeek-V2/V3 and models
+// converted to their architecture) attends; see EngineConfig::latent_form.
+enum class LatentAttentionForm : int32_t {
+    Auto = 0,      // per pass, the form measured faster on this device for its batch and context; decoding absorbed
+    Absorbed = 1,  // always over the cached latents with absorbed queries
+    Expanded = 2,  // every pass of two tokens or more over per-head keys and values expanded from the latents
+};
+
 struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
     std::string draft_model_path;     // optional: enables speculative decoding
@@ -158,6 +166,13 @@ struct EngineConfig {
     // 0.9995 with transformers' embeddings and moved scores by up to 0.004,
     // against 0.9999997 and 0.00006 with F16 (README, Embeddings and reranking).
     KvCacheType pooling_kv_cache_type = KvCacheType::F16;
+    // Latent attention only (ignored by other models): the form prefill
+    // passes attend in. Both forms compute the same function over the same
+    // cache of latents and round differently, so Auto, which follows measured
+    // speed, can round a long prompt differently from one run to the next;
+    // Absorbed or Expanded give repeatable bits. Decoding steps are always
+    // absorbed.
+    LatentAttentionForm latent_form = LatentAttentionForm::Auto;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated

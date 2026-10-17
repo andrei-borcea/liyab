@@ -29,6 +29,9 @@
 // stores keys per-channel scaled, as the engine does (core/key_scaling.h);
 // --no-key-scaling stores them as computed, to measure what the scaling saves.
 // The two runs are separate processes: a 35B MoE does not fit twice in RAM.
+// The text goes through in passes of --batch tokens (64 by default);
+// --latent-form pins how a latent-attention model attends (auto, absorbed or
+// expanded), to measure what one form's rounding moves against the other.
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS), on the CPU
 // backend, with the engine's expert streaming (--memory-budget and
@@ -52,7 +55,7 @@
 namespace {
 
 constexpr int32_t kTop = 32;
-constexpr int32_t kChunk = 64;
+constexpr int32_t kChunk = 64;  // default tokens per pass (--batch)
 // Reference file: magic, version, token count, token ids (int32), position
 // count, positions. Written by --save and by tools/conform_reference.py.
 constexpr char kMagic[4] = {'L', 'Y', 'K', 'L'};
@@ -70,11 +73,14 @@ int usage() {
                  "                [--requant 4|5] [--expert-mass P] [--memory-budget MB] [--expert-cache MB]\n"
                  "                [--experts N] [--threads N] [--max-tokens N (default 512)]\n"
                  "                [--kv f16|q8_0|q4_0|q4_1 (default q8_0)] [--no-key-scaling] [--ref-tokens]\n"
-                 "                [--max-kl KL] [--min-top1 PERCENT]\n"
+                 "                [--max-kl KL] [--min-top1 PERCENT] [--batch N (default 64)]\n"
+                 "                [--latent-form auto|absorbed|expanded]\n"
                  "  --no-key-scaling   quantized caches: store keys as computed, not per-channel scaled\n"
                  "  --ref-tokens       compare on the reference's token ids, not this build's encoding\n"
                  "  --max-kl KL        fail (exit 1) when the mean KL divergence exceeds KL\n"
-                 "  --min-top1 P       fail (exit 1) when the top-1 agreement is below P percent\n");
+                 "  --min-top1 P       fail (exit 1) when the top-1 agreement is below P percent\n"
+                 "  --batch N          tokens per forward pass\n"
+                 "  --latent-form F    latent attention: auto (default), absorbed or expanded\n");
     return 2;
 }
 
@@ -129,6 +135,8 @@ int main(int argc, char** argv) {
     bool key_scaling = true;
     liyab::KvCacheType kv_type = liyab::KvCacheType::Q8_0;
     double max_kl = -1.0, min_top1 = -1.0;  // < 0: no gate
+    int32_t chunk = kChunk;
+    liyab::LatentForm latent_form = liyab::LatentForm::Auto;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -155,6 +163,14 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--max-kl") max_kl = std::atof(next());
         else if (arg == "--min-top1") min_top1 = std::atof(next());
+        else if (arg == "--batch") chunk = std::max(1, std::atoi(next()));
+        else if (arg == "--latent-form") {
+            const std::string v = next();
+            if (v == "auto") latent_form = liyab::LatentForm::Auto;
+            else if (v == "absorbed") latent_form = liyab::LatentForm::Absorbed;
+            else if (v == "expanded") latent_form = liyab::LatentForm::Expanded;
+            else return usage();
+        }
         else return usage();
     }
     if (model_path.empty() || text_path.empty() || save_path.empty() == compare_path.empty()) return usage();
@@ -176,8 +192,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     liyab::TransformerOptions options;
-    options.context_length = max_tokens + kChunk;
-    options.max_batch = kChunk;
+    options.context_length = max_tokens + chunk;
+    options.max_batch = chunk;
+    options.latent_form = latent_form;
     options.kv_type = kv_type;
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
     options.requant_bits = requant;
@@ -269,8 +286,8 @@ int main(int argc, char** argv) {
     std::vector<double> kls;
     int32_t agree = 0;
     std::vector<int32_t> order(vocab);
-    for (size_t begin = 0; begin + 1 < tokens.size(); begin += kChunk) {
-        const size_t end = std::min(tokens.size() - 1, begin + kChunk);
+    for (size_t begin = 0; begin + 1 < tokens.size(); begin += static_cast<size_t>(chunk)) {
+        const size_t end = std::min(tokens.size() - 1, begin + static_cast<size_t>(chunk));
         const std::span<const int32_t> chunk(tokens.data() + begin, end - begin);
         auto logits = model->forward(chunk, liyab::Transformer::Logits::All, route, pool);
         if (!logits) {

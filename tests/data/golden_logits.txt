@@ -1,6 +1,11 @@
 # Logit hashes pinned by tests/test_golden.cpp: <platform> <case> <FNV-1a of the logits' bits>.
 # Rewritten with LIYAB_GOLDEN_UPDATE=1 when a change is meant to move outputs (say why in the commit).
 arm64-neon-dotprod deepseek2-mla 191166464f5adf1d
+arm64-neon-dotprod deepseek2-mla-expanded c027906501ac8cb4
+arm64-neon-dotprod deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c
+arm64-neon-dotprod deepseek2-mla-expanded-keyscaled b610cfab0bcf3fb4
+arm64-neon-dotprod deepseek2-mla-expanded-qlora-moe-yarn 24d4c8ba64bacadc
+arm64-neon-dotprod deepseek2-mla-expanded-sliding 0d89eaaf02efa8b0
 arm64-neon-dotprod deepseek2-mla-f16kv d7bd154c444cbaec
 arm64-neon-dotprod deepseek2-mla-keyscaled e1808726e057431c
 arm64-neon-dotprod deepseek2-mla-qlora-moe-yarn 98b521db8e47d3d4
@@ -32,6 +37,11 @@ arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-avx2 deepseek2-mla 191166464f5adf1d
+x86_64-avx2 deepseek2-mla-expanded 38ed3ca545816896
+x86_64-avx2 deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c
+x86_64-avx2 deepseek2-mla-expanded-keyscaled b610cfab0bcf3fb4
+x86_64-avx2 deepseek2-mla-expanded-qlora-moe-yarn 24d4c8ba64bacadc
+x86_64-avx2 deepseek2-mla-expanded-sliding dc4328d711a31311
 x86_64-avx2 deepseek2-mla-f16kv d7bd154c444cbaec
 x86_64-avx2 deepseek2-mla-keyscaled e1808726e057431c
 x86_64-avx2 deepseek2-mla-qlora-moe-yarn fa1627ae04d2e05d
@@ -63,6 +73,11 @@ x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
+x86_64-scalar deepseek2-mla-expanded 3ed966c7eb7877ca
+x86_64-scalar deepseek2-mla-expanded-f16kv e2777a2c65681852
+x86_64-scalar deepseek2-mla-expanded-keyscaled 35e12500a79be29c
+x86_64-scalar deepseek2-mla-expanded-qlora-moe-yarn 33242bd3f2b84c9c
+x86_64-scalar deepseek2-mla-expanded-sliding d17ea21687c14420
 x86_64-scalar deepseek2-mla-f16kv 169d4c05b54192ae
 x86_64-scalar deepseek2-mla-keyscaled e43125c7bb4e1823
 x86_64-scalar deepseek2-mla-qlora-moe-yarn 38cb498803f9eb18

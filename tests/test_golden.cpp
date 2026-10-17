@@ -201,16 +201,33 @@ std::vector<GoldenCase> cases() {
     s.k_norm_outlier = 60.0f;  // key scaling with two RoPE tables
     add("gemma3-keyscaled", s, {}, true);
 
+    // Latent attention in each form, pinned (LatentForm::Auto chooses between
+    // them by measured speed): absorbed, then the same models expanded for
+    // the batched prefill (decoding steps stay absorbed).
+    TransformerOptions absorbed;
+    absorbed.latent_form = LatentForm::Absorbed;
+    TransformerOptions absorbed_f16 = f16_kv;
+    absorbed_f16.latent_form = LatentForm::Absorbed;
+    TransformerOptions expanded;
+    expanded.latent_form = LatentForm::Expanded;
+    TransformerOptions expanded_f16 = f16_kv;
+    expanded_f16.latent_form = LatentForm::Expanded;
+    TransformerOptions expanded_window = window;
+    expanded_window.latent_form = LatentForm::Expanded;
     s = {};
     s.arch = "deepseek2";  // latent attention: the Q8_0 cache holds [k_pe | latent] per position, values its latent
     s.n_layers = 3;
     s.n_head_kv = 1;
     s.rope_dim = 32;
     s.mla_kv_rank = 64;
-    add("deepseek2-mla", s);
-    add("deepseek2-mla-f16kv", s, f16_kv);
+    add("deepseek2-mla", s, absorbed);
+    add("deepseek2-mla-f16kv", s, absorbed_f16);
+    add("deepseek2-mla-expanded", s, expanded);
+    add("deepseek2-mla-expanded-f16kv", s, expanded_f16);
+    add("deepseek2-mla-expanded-sliding", s, expanded_window);  // sinks and a window over the expanded rows
     s.k_norm_outlier = 60.0f;  // large latent channels: key scaling over keys and the values in them
-    add("deepseek2-mla-keyscaled", s, {}, true);
+    add("deepseek2-mla-keyscaled", s, absorbed, true);
+    add("deepseek2-mla-expanded-keyscaled", s, expanded, true);
     s.k_norm_outlier = 0.0f;
     s.mla_q_rank = 64;  // low-rank queries, a dense leading block, MoE with a shared expert, YaRN with DeepSeek's mscale
     s.n_expert = 4;
@@ -222,7 +239,8 @@ std::vector<GoldenCase> cases() {
     s.yarn_factor = 4.0f;
     s.yarn_ctx = 32;
     s.yarn_log_mul = 0.0707f;
-    add("deepseek2-mla-qlora-moe-yarn", s);
+    add("deepseek2-mla-qlora-moe-yarn", s, absorbed);
+    add("deepseek2-mla-expanded-qlora-moe-yarn", s, expanded);
 
     s = {};
     s.arch = "phi3";  // fused attn_qkv and [gate | up], LongRoPE, every block windowed

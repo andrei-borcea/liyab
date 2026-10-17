@@ -178,6 +178,9 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.max_experts = config.moe_max_experts;
     options.skip_slow = config.moe_skip_slow;
     options.repack_cpu = repack_cpu && !config.triple_buffer_loading;
+    options.latent_form = config.latent_form == LatentAttentionForm::Absorbed   ? LatentForm::Absorbed
+                          : config.latent_form == LatentAttentionForm::Expanded ? LatentForm::Expanded
+                                                                                : LatentForm::Auto;
     return Transformer::load(std::move(file).value(), options);
 }
 

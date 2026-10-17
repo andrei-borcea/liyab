@@ -18,6 +18,16 @@
 // file's layouts and, on i8mm CPUs, in the repacked ones the CPU backend
 // loads them into (Q4_K_R8, Q5_K_R8, Q6_K_R8, Q8_0_R4).
 //
+// --prefill times a model's prefill instead: prompts of each --tokens length
+// (synthetic token ids: attention and dense blocks cost what real text
+// costs; a MoE routes them like any text) in passes of --batch tokens on the
+// CPU, the best of --repeat runs, in tokens per second. --latent-form sets
+// how a latent-attention model attends (auto, absorbed or expanded) and the
+// line reports how many passes took each form.
+//
+//   liyab-bench --prefill model.gguf [--tokens 512,2048,8192] [--batch 512]
+//               [--latent-form auto|absorbed|expanded] [--kv q8_0|f16] [--threads N] [--repeat 3]
+//
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS).
 #include <algorithm>
 #include <atomic>
@@ -32,8 +42,10 @@
 
 #include "core/quant.h"
 #include "core/thread_pool.h"
+#include "core/transformer.h"
 #include "liyab/device_detect.h"
 #include "liyab/backend.h"
+#include "liyab/mmap_loader.h"
 
 namespace {
 
@@ -71,21 +83,122 @@ std::vector<int32_t> parse_threads(const char* s) {
     return out;
 }
 
+struct PrefillOptions {
+    std::string model;
+    std::vector<int32_t> lengths = {512, 2048, 8192};
+    int32_t batch = 512;
+    int32_t threads = 0;  // 0: performance cores
+    int32_t repeat = 3;
+    liyab::LatentForm form = liyab::LatentForm::Auto;
+    liyab::KvCacheType kv = liyab::KvCacheType::Q8_0;
+};
+
+// Prefill speed of a model: each length from an empty context, in passes of
+// `batch` tokens, no logits; the best of `repeat` runs.
+int prefill_bench(const PrefillOptions& o) {
+    const int32_t longest = *std::max_element(o.lengths.begin(), o.lengths.end());
+    auto file = liyab::MmapLoader::open(o.model);
+    if (!file) {
+        std::fprintf(stderr, "%s\n", file.status().to_string().c_str());
+        return 1;
+    }
+    liyab::TransformerOptions options;
+    options.context_length = longest + o.batch;
+    options.max_batch = o.batch;
+    options.kv_type = o.kv;
+    options.latent_form = o.form;
+    auto loaded = liyab::Transformer::load(std::move(file).value(), options);
+    if (!loaded) {
+        std::fprintf(stderr, "%s\n", loaded.status().to_string().c_str());
+        return 1;
+    }
+    auto model = std::move(loaded).value();
+    liyab::ThreadPool pool(o.threads > 0 ? o.threads : liyab::performance_core_count());
+    auto cpu = liyab::make_cpu_backend(pool);
+    const liyab::Route route{cpu.get(), cpu.get(), cpu.get()};
+    const int32_t vocab = model->config().n_vocab;
+    std::vector<int32_t> tokens(static_cast<size_t>(longest));
+    std::mt19937 rng(7);
+    for (int32_t& t : tokens) t = 3 + static_cast<int32_t>(rng() % static_cast<uint32_t>(vocab - 3));
+    std::printf("%s: %d threads, passes of %d tokens, kv %s\n", o.model.c_str(), pool.max_threads(), o.batch,
+                o.kv == liyab::KvCacheType::F16 ? "f16" : "q8_0");
+    for (const int32_t length : o.lengths) {
+        double best = 0.0, attention_ms = 0.0;
+        int64_t absorbed = 0, expanded = 0;
+        for (int32_t r = 0; r < std::max(1, o.repeat); ++r) {
+            model->reset();
+            const auto stats = model->latent_stats();
+            const double attention0 = model->phase_times().attention;
+            const auto t0 = Clock::now();
+            for (int32_t at = 0; at < length; at += o.batch) {
+                const auto n = static_cast<size_t>(std::min(o.batch, length - at));
+                auto out = model->forward(std::span<const int32_t>(tokens).subspan(static_cast<size_t>(at), n),
+                                          liyab::Transformer::Logits::None, route, pool);
+                if (!out) {
+                    std::fprintf(stderr, "%s\n", out.status().to_string().c_str());
+                    return 1;
+                }
+            }
+            const double s = std::chrono::duration<double>(Clock::now() - t0).count();
+            if (length / s > best) {
+                best = length / s;
+                attention_ms = model->phase_times().attention - attention0;
+                absorbed = model->latent_stats().absorbed_passes - stats.absorbed_passes;
+                expanded = model->latent_stats().expanded_passes - stats.expanded_passes;
+            }
+        }
+        std::printf("  %6d tokens: %8.1f tok/s (attention %.0f ms)", length, best, attention_ms);
+        if (model->config().mla.kv_rank > 0) {
+            std::printf(" | latent passes: %lld absorbed, %lld expanded", static_cast<long long>(absorbed),
+                        static_cast<long long>(expanded));
+        }
+        std::printf("\n");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::vector<int32_t> threads;
     double seconds = 1.0;
+    PrefillOptions prefill;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--threads" && i + 1 < argc) {
+        const bool has_value = i + 1 < argc;
+        if (arg == "--threads" && has_value) {
             threads = parse_threads(argv[++i]);
-        } else if (arg == "--seconds" && i + 1 < argc) {
+            prefill.threads = threads.empty() ? 0 : threads.back();
+        } else if (arg == "--seconds" && has_value) {
             seconds = std::atof(argv[++i]);
+        } else if (arg == "--prefill" && has_value) {
+            prefill.model = argv[++i];
+        } else if (arg == "--tokens" && has_value) {
+            prefill.lengths = parse_threads(argv[++i]);
+        } else if (arg == "--batch" && has_value) {
+            prefill.batch = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--repeat" && has_value) {
+            prefill.repeat = std::atoi(argv[++i]);
+        } else if (arg == "--kv" && has_value) {
+            const std::string v = argv[++i];
+            prefill.kv = v == "f16" ? liyab::KvCacheType::F16 : liyab::KvCacheType::Q8_0;
+        } else if (arg == "--latent-form" && has_value) {
+            const std::string v = argv[++i];
+            prefill.form = v == "absorbed"   ? liyab::LatentForm::Absorbed
+                           : v == "expanded" ? liyab::LatentForm::Expanded
+                                             : liyab::LatentForm::Auto;
         } else {
-            std::fprintf(stderr, "usage: liyab-bench [--threads 1,2,4,8] [--seconds 1.0]\n");
+            std::fprintf(stderr,
+                         "usage: liyab-bench [--threads 1,2,4,8] [--seconds 1.0]\n"
+                         "       liyab-bench --prefill model.gguf [--tokens 512,2048,8192] [--batch 512]\n"
+                         "                   [--latent-form auto|absorbed|expanded] [--kv q8_0|f16] [--threads N]\n"
+                         "                   [--repeat 3]\n");
             return arg == "--help" || arg == "-h" ? 0 : 1;
         }
+    }
+    if (!prefill.model.empty()) {
+        if (prefill.lengths.empty()) return 1;
+        return prefill_bench(prefill);
     }
     const int32_t big = liyab::performance_core_count();
     liyab::ThreadPool pool(std::max(big, threads.empty() ? 0 : *std::max_element(threads.begin(), threads.end())));
