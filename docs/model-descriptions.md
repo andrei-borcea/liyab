@@ -171,13 +171,17 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
-| Gemma 2 2B (`gemma2`) | attention logit soft-capping at 50; final logit soft-capping at 30. Everything else is expressible: GeGLU, √d embeddings, both sandwich norms, every 2nd block global (`swa_period` 2, window 4096) |
-| DeepSeek-V2-Lite-Chat (`deepseek2`) | multi-head latent attention (`attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b` unused; value heads of 128 with key heads of 192); YaRN RoPE scaling; attention scale 0.1147 instead of 1/√192. Its MoE is expressible: softmax top 6 of 64, no renormalization, an ungated shared expert, a dense first block. A note: `tokenizer_config.json` asks for a BOS and the GGUF follows it, while transformers 5 adds none |
 | Mistral-Nemo-Instruct-2407 (`llama`) | the `tekken` BPE pre-tokenizer. The architecture is the `llama` row (head size 128 from `key_length`) |
 | OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
 | Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
 | SmolLM3 3B (`smollm3`) | blocks without RoPE (block 3 of the 4 traced; the configuration's `no_rope_layers` lists every 4th); the `smaug-bpe` pre-tokenizer |
 | SmolLM2 360M (`llama`) | the `smollm` pre-tokenizer. The architecture is the `llama` row |
+
+Gemma 2 and DeepSeek-V2 were in this table until the engine gained what the tool listed for them: logit
+soft-capping (Gemma 2), and multi-head latent attention, YaRN and the file's attention scale (DeepSeek-V2). The
+tool now reproduces the registry's `gemma2` row exactly. For latent attention it reports an unknown rather than a
+row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
+such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
 
 ## Limits
 

@@ -777,8 +777,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.unknown.append(f"block {b['index']}: {u}")
     mla = {"attn_kv_a_mqa.weight", "attn_kv_b.weight", "attn_k_b.weight", "attn_v_b.weight", "attn_q_a.weight"}
     if any(mla & blocks.get(i, set()) for i in range(n_layers)):
-        d.missing.append("multi-head latent attention: keys and values decompressed from a shared latent "
-                         "(attn_kv_a_mqa, attn_kv_a_norm, attn_kv_b), with a separate rotary part")
+        if "attn_kv_a_mqa.weight" in engine.block_tensors:
+            # The engine runs latent attention from the file's tensors and geometry, but this tool has no rule
+            # comparing them with the reference's: it cannot say the model runs, so it proposes no row.
+            d.unknown.append("multi-head latent attention: the engine runs it, but its facts are not compared with "
+                             "the reference by this tool; check the model with liyab-kl")
+        else:
+            d.missing.append("multi-head latent attention: keys and values decompressed from a shared latent "
+                             "(attn_kv_a_mqa, attn_kv_a_norm, attn_kv_b), with a separate rotary part")
 
     # --- RoPE: pairing (reference + converter), frequencies, NoPE blocks ---
     layouts = set()

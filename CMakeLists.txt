@@ -402,7 +402,7 @@ endif()
 # characters work. The library itself converts every path it opens (it cannot
 # rely on its host's manifest), and liyab-cli reads its UTF-16 command line.
 if(WIN32)
-  foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok)
+  foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok liyab-embed)
     if(TARGET ${exe})
       if(MSVC)
         target_sources(${exe} PRIVATE ${PROJECT_SOURCE_DIR}/cmake/windows/utf8.manifest)  # merged by mt.exe

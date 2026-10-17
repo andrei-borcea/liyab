@@ -1853,29 +1853,29 @@ Implemented features are described above. These are next, in order:
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need. Then verification of the suffix drafts' whole tree in one pass, with tree attention masks.
 5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
-7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
+6. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
    pass (a mask per input), which the GPU path needs most: a pass costs it ~35 ms of fixed work, against ~3 ms on
    the CPU.
-8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
+7. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
-9. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
+8. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
    (a format the engine already decodes): with half of each block's least used experts in it, `liyab-kl` measured
    KL 0.016 and 94.7% top-1 agreement; with all experts, 0.040 and 91.2%, 29% fewer bytes per expert. Next: Q3_K's
    decode cost on the phone, then the tier (a mixed file written once on the device). Binary factorization
    (LittleBit-style) and a non-uniform 3-bit codebook were measured and not chosen.
-10. **The agent.** Planned in this order:
+9. **The agent.** Planned in this order:
     * voice input (on-device speech recognition);
     * actions confirmed by the user (alarms, events, replies);
     * reliable message reading (persisted notification history, RCS);
     * local memory over your own data;
     * the screen content through a voice-interaction service.
-11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
+10. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
     it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and
     command bar as on macOS), which first needs the engine's [Windows port](#windows-x64) built and tested on
     Windows and the x86-64 kernels validated on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP,
     NeuroPilot); app localization.
-12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
+11. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
 ## Known limitations
 

@@ -7,8 +7,6 @@
 // and a conversation set aside, hybrid models and sliding windows, the KV
 // format of pooling models. tools/liyab-embed checks real models against
 // Hugging Face transformers.
-#include <unistd.h>
-
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -32,7 +30,7 @@ using namespace liyab;
 namespace {
 
 std::string temp_path(const std::string& name) {
-    return test::temp_dir() + "/liyab_pooling_" + std::to_string(getpid()) + "_" + name;
+    return test::temp_dir() + "/liyab_pooling_" + std::to_string(test::process_id()) + "_" + name;
 }
 
 // Models written once per process and removed at exit.
