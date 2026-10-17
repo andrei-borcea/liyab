@@ -1,6 +1,8 @@
 #include "core/expert_store.h"
 
+#if defined(__linux__)
 #include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +13,7 @@
 #include <string>
 
 #include "core/log.h"
+#include "core/os.h"
 #include "core/quant.h"
 
 namespace liyab {
@@ -88,14 +91,13 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
         n_slots += sc.n_slots;
         s->arena_bytes_ += sc.n_slots * sc.bytes;
     }
-    void* arena = nullptr;
-    if (posix_memalign(&arena, kAlign, s->arena_bytes_) != 0) {
-        return Status(ErrorCode::OutOfMemory, "cannot allocate the expert cache");
-    }
+    void* arena = os::aligned_alloc(kAlign, s->arena_bytes_);
+    if (arena == nullptr) return Status(ErrorCode::OutOfMemory, "cannot allocate the expert cache");
     s->arena_ = static_cast<uint8_t*>(arena);
     // Best effort: locked pages are never swapped or compressed (Android
-    // usually caps RLIMIT_MEMLOCK, in which case the cache stays pageable).
-    s->locked_ = mlock(s->arena_, s->arena_bytes_) == 0;
+    // usually caps RLIMIT_MEMLOCK, in which case the cache stays pageable;
+    // Windows never locks it, see os::lock_memory).
+    s->locked_ = os::lock_memory(s->arena_, s->arena_bytes_);
     s->slots_.resize(n_slots);
     size_t offset = 0;
     for (size_t c = 0; c < s->classes_.size(); ++c) {
@@ -138,8 +140,8 @@ ExpertStore::~ExpertStore() {
     ready_cv_.notify_all();
     for (std::thread& t : io_threads_) t.join();
     if (arena_ != nullptr) {
-        if (locked_) munlock(arena_, arena_bytes_);
-        std::free(arena_);
+        if (locked_) os::unlock_memory(arena_, arena_bytes_);
+        os::aligned_free(arena_);
     }
 }
 
@@ -511,7 +513,7 @@ size_t ExpertStore::trim() {
     // Locked pages cannot be dropped; the cache stays pageable from now on
     // (re-locking would fault the whole arena back in).
     if (locked_) {
-        munlock(arena_, arena_bytes_);
+        os::unlock_memory(arena_, arena_bytes_);
         locked_ = false;
     }
 #if defined(__linux__)

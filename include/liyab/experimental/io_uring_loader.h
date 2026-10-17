@@ -1,10 +1,11 @@
 // Liyab (experimental) — page-cache-bypassing direct I/O for weight streaming.
 //
 // Reads model blocks from flash into application-owned, 4 KiB-aligned
-// buffers (posix_memalign) with O_DIRECT, so streamed weights do not evict
-// other data from the OS page cache and no kernel→user copy is made from
-// cached pages. On Linux the reads are issued through io_uring with up to
-// `queue_depth` requests in flight (raw syscalls, no liburing dependency).
+// buffers (posix_memalign; _aligned_malloc on Windows) with O_DIRECT, so
+// streamed weights do not evict other data from the OS page cache and no
+// kernel→user copy is made from cached pages. On Linux the reads are issued
+// through io_uring with up to `queue_depth` requests in flight (raw syscalls,
+// no liburing dependency).
 //
 // Platform reality (the reader degrades automatically and reports why):
 //  * Android 14+ blocks io_uring for regular apps (SELinux), and seccomp
@@ -12,6 +13,9 @@
 //    pread on a worker thread. Shell / rooted / Linux-SBC processes keep it.
 //  * O_DIRECT is unsupported on some filesystems (tmpfs): buffered pread.
 //  * Apple platforms have neither: pread with F_NOCACHE (no caching).
+//  * Windows has no io_uring either: ReadFile at an offset, opened with
+//    FILE_FLAG_NO_BUFFERING (IoMethod::PreadDirect; same alignment rules as
+//    O_DIRECT), or through the file cache where the volume refuses it.
 //  * DMA-BUF: apps cannot allocate from /dev/dma_heap directly; GPU-visible
 //    memory goes through AHardwareBuffer / Vulkan imports. This module stops
 //    at aligned host buffers, which those APIs can import.
@@ -56,7 +60,7 @@ struct DirectReaderOptions {
     uint32_t queue_depth = 8;          // reads in flight (io_uring)
     size_t chunk_bytes = size_t{1} << 20;  // rounded up to 4 KiB
     bool use_io_uring = true;
-    bool bypass_page_cache = true;     // O_DIRECT / F_NOCACHE
+    bool bypass_page_cache = true;     // O_DIRECT / F_NOCACHE / FILE_FLAG_NO_BUFFERING
 };
 
 struct ReadChunk {
@@ -67,6 +71,7 @@ struct ReadChunk {
 
 class LIYAB_API DirectReader {
 public:
+    // `path` is UTF-8.
     static Result<std::unique_ptr<DirectReader>> open(const std::string& path, const DirectReaderOptions& options = {});
     ~DirectReader();
     DirectReader(const DirectReader&) = delete;
@@ -94,8 +99,16 @@ private:
                         const std::function<bool(const ReadChunk&)>& on_chunk);
     Status stream_uring(uint64_t begin, uint64_t end, uint64_t want_begin, uint64_t want_end,
                         const std::function<bool(const ReadChunk&)>& on_chunk);
+    // Reads up to `length` bytes at `offset` (pread; ReadFile on Windows),
+    // retrying interrupted reads. Returns the bytes read, 0 at the end of the
+    // file, or -1 with the error described in `error`.
+    int64_t read_at(uint8_t* dst, size_t length, uint64_t offset, std::string& error) const;
 
+#if defined(_WIN32)
+    void* handle_ = nullptr;  // HANDLE
+#else
     int fd_ = -1;
+#endif
     uint64_t file_size_ = 0;
     IoMethod method_ = IoMethod::PreadBuffered;
     std::string fallback_reason_;

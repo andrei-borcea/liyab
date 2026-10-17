@@ -33,7 +33,10 @@ struct CpuFeatures {
     bool avx2 = false;     // x86-64 AVX2: the "avx2" kernel set needs it with fma and f16c
     bool fma = false;      // x86-64 FMA3
     bool f16c = false;     // x86-64 F16C (fp16 <-> fp32 conversions, the F16 KV cache)
-    int32_t cores = 0;
+    int32_t cores = 0;              // logical processors (on Windows, over every processor group)
+    // The cores the thread pool sizes itself by: on Linux / Android the CPUs
+    // within 70% of the fastest one's max frequency; on Apple and Windows the
+    // physical cores of the performance level / highest efficiency class.
     int32_t performance_cores = 0;
 };
 
@@ -61,7 +64,9 @@ struct DeviceInfo {
 };
 
 // Inspects the running device (system properties, sysctl, /proc, runtime
-// libraries). Safe to call from any thread; takes a few milliseconds.
+// libraries; on Windows the processor name the registry records, the memory
+// status and the processor topology). Safe to call from any thread; takes a
+// few milliseconds.
 LIYAB_API DeviceInfo detect_device();
 // The CPU part only (feature registers / sysctl and core counts): cheap,
 // thread-safe.
@@ -70,7 +75,8 @@ LIYAB_API CpuFeatures detect_cpu();
 // Pure classifier over identifiers as exposed by the OS. Any argument may be
 // empty. On Android pass ro.soc.manufacturer, ro.soc.model, ro.board.platform
 // and ro.hardware (or /proc/cpuinfo "Hardware"); on Apple pass "Apple", the
-// CPU brand string, hw.machine and "".
+// CPU brand string, hw.machine and ""; on Windows "", the processor name, ""
+// and "".
 LIYAB_API SocInfo classify_soc(std::string_view manufacturer, std::string_view model, std::string_view platform,
                                std::string_view hardware);
 

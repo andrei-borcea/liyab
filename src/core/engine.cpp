@@ -14,8 +14,6 @@
 #include <optional>
 #include <sstream>
 
-#include <unistd.h>
-
 #include "core/chat_template.h"
 #include "core/grammar.h"
 #include "core/log.h"
@@ -25,6 +23,7 @@
 #include "core/tokenizer.h"
 #include "core/direct_io.h"
 #include "core/key_scaling.h"
+#include "core/os.h"
 #include "core/pooling.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
@@ -68,13 +67,13 @@ uint64_t key_scales_id(const Transformer& model) {
 std::string key_scales_path(const std::string& dir, uint64_t id) {
     char name[32];
     std::snprintf(name, sizeof name, "keys-%016llx.bin", static_cast<unsigned long long>(id));
-    return (std::filesystem::path(dir) / name).string();
+    return os::path_utf8(os::utf8_path(dir) / name);
 }
 
 // The factors kept at `path` for `id` (empty: the model needs none);
 // nothing when no file was kept or it is damaged (they are then measured again).
 std::optional<std::vector<float>> read_key_scales(const std::string& path, uint64_t id) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(os::utf8_path(path), std::ios::binary);
     char magic[4] = {};
     uint32_t version = 0;
     uint64_t stored_id = 0, count = 0;
@@ -97,11 +96,11 @@ std::optional<std::vector<float>> read_key_scales(const std::string& path, uint6
 // measurement at the next load: logged, not returned.
 void keep_key_scales(const std::string& dir, uint64_t id, std::span<const float> scales) {
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
+    std::filesystem::create_directories(os::utf8_path(dir), ec);
     const std::string path = key_scales_path(dir, id);
     const std::string tmp = path + ".tmp";
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
         const uint32_t version = kKeyScalingVersion;
         const uint64_t count = scales.size();
         out.write(kKeyScalesMagic, sizeof kKeyScalesMagic);
@@ -111,19 +110,19 @@ void keep_key_scales(const std::string& dir, uint64_t id, std::span<const float>
         out.write(reinterpret_cast<const char*>(scales.data()), static_cast<std::streamsize>(scales.size_bytes()));
         if (!out) {
             LIYAB_LOG_WARN("keys: cannot write %s", tmp.c_str());
-            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(os::utf8_path(tmp), ec);
             return;
         }
     }
-    std::filesystem::rename(tmp, path, ec);
+    std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
     if (ec) {
         LIYAB_LOG_WARN("keys: cannot keep the key scales in %s: %s", dir.c_str(), ec.message().c_str());
         return;
     }
     std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
-    std::filesystem::directory_iterator it(dir, ec), end;
+    std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
     for (; !ec && it != end; it.increment(ec)) {
-        const std::string name = it->path().filename().string();
+        const std::string name = os::path_utf8(it->path().filename());
         if (name.starts_with("keys-") && name.ends_with(".bin")) {
             std::error_code ignored;
             kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
@@ -375,7 +374,7 @@ struct Engine::Impl {
 
     ~Impl() {
         for (const PrefixEntry& e : prefix_cache) {
-            if (!e.file.empty()) std::remove(e.file.c_str());
+            if (!e.file.empty()) os::remove_file(e.file);
         }
     }
 
@@ -391,23 +390,23 @@ struct Engine::Impl {
     // process id keeps other processes (or an earlier one) from colliding,
     // the engine's address the other engines of this one.
     std::string prefix_file(uint64_t id) const {
-        return prefix_cache_dir + "/ctx-" + std::to_string(::getpid()) + "-" +
+        return prefix_cache_dir + "/ctx-" + std::to_string(os::process_id()) + "-" +
                std::to_string(reinterpret_cast<uintptr_t>(this)) + "-" + std::to_string(id) + ".state";
     }
 
     // Writes entry `id`'s state to storage; the file, or empty when it could not be written.
     std::string write_prefix_file(uint64_t id, const std::function<Status(std::ostream&)>& write) const {
         const std::string path = prefix_file(id);
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        std::ofstream out(os::utf8_path(path), std::ios::binary | std::ios::trunc);
         if (out && write(out).is_ok() && out.flush()) return path;
         out.close();
-        std::remove(path.c_str());
+        os::remove_file(path);
         LIYAB_LOG_WARN("prefix cache: cannot write %s", path.c_str());
         return {};
     }
 
     void drop_prefix_entry(std::vector<PrefixEntry>::iterator it) {
-        if (!it->file.empty()) std::remove(it->file.c_str());
+        if (!it->file.empty()) os::remove_file(it->file);
         prefix_cache.erase(it);
     }
 
@@ -449,7 +448,7 @@ struct Engine::Impl {
         // every return process the last reply again (123 tokens, 8 s on a 35B).
         for (auto it = prefix_cache.begin(); it != prefix_cache.end();) {  // an older copy of the same conversation
             if (it->tokens.size() <= context.size() && std::equal(it->tokens.begin(), it->tokens.end(), context.begin())) {
-                if (!it->file.empty()) std::remove(it->file.c_str());
+                if (!it->file.empty()) os::remove_file(it->file);
                 it = prefix_cache.erase(it);
             } else {
                 ++it;
@@ -507,7 +506,7 @@ struct Engine::Impl {
             std::istringstream in(it->state);
             read = target->read_state(in);
         } else {
-            std::ifstream in(it->file, std::ios::binary);
+            std::ifstream in(os::utf8_path(it->file), std::ios::binary);
             read = in ? target->read_state(in) : Status(ErrorCode::IoError, "cannot read " + it->file);
         }
         if (!read.is_ok()) {
@@ -716,7 +715,8 @@ struct Engine::Impl {
             const auto kept = read_key_scales(path, id);
             if (kept && model.set_key_scales(*kept).is_ok()) {
                 std::error_code ignored;
-                std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ignored);
+                std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(),
+                                                 ignored);
                 LIYAB_LOG_INFO("keys: %s (%s)", kept->empty() ? "no scaling needed" : "per-channel scales",
                                path.c_str());
                 return Status::ok();
@@ -1159,14 +1159,14 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     // starts, files left by processes that ended (other process ids).
     if (config.prefix_cache_disk_mb > 0 && !config.prefix_cache_dir.empty()) {
         std::error_code ec;
-        std::filesystem::create_directories(config.prefix_cache_dir, ec);
+        std::filesystem::create_directories(os::utf8_path(config.prefix_cache_dir), ec);
         if (ec) {
             LIYAB_LOG_WARN("prefix cache: cannot use %s: %s", config.prefix_cache_dir.c_str(), ec.message().c_str());
         } else {
-            const std::string own = "ctx-" + std::to_string(::getpid()) + "-";
-            std::filesystem::directory_iterator it(config.prefix_cache_dir, ec), end;
+            const std::string own = "ctx-" + std::to_string(os::process_id()) + "-";
+            std::filesystem::directory_iterator it(os::utf8_path(config.prefix_cache_dir), ec), end;
             for (; !ec && it != end; it.increment(ec)) {
-                const std::string name = it->path().filename().string();
+                const std::string name = os::path_utf8(it->path().filename());
                 std::error_code ignored;
                 if (name.starts_with("ctx-") && name.ends_with(".state") && !name.starts_with(own)) {
                     std::filesystem::remove(it->path(), ignored);
@@ -1222,20 +1222,20 @@ Status Engine::save_expert_profile(const std::string& path) const {
                               static_cast<int64_t>(keys.size())};
     const std::string tmp = path + ".tmp";
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
         out.write(kExpertProfileMagic, sizeof kExpertProfileMagic);
         out.write(reinterpret_cast<const char*>(header), sizeof header);
         out.write(reinterpret_cast<const char*>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(int32_t)));
         if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) return Status(ErrorCode::IoError, "cannot rename " + tmp);
+    if (!os::replace_file(tmp, path)) return Status(ErrorCode::IoError, "cannot rename " + tmp);
     return Status::ok();
 }
 
 Status Engine::load_expert_profile(const std::string& path) {
     ExpertStore* store = impl_->target->expert_store();
     if (store == nullptr) return Status::ok();
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(os::utf8_path(path), std::ios::binary);
     char magic[4] = {};
     int64_t header[4] = {};
     in.read(magic, sizeof magic);
@@ -1420,17 +1420,17 @@ void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, c
 Status write_replacing(const std::string& path, const std::function<Status(std::ostream&)>& write) {
     const std::string tmp = path + ".tmp";
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
         if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
         if (Status s = write(out); !s.is_ok()) {
             out.close();
-            std::remove(tmp.c_str());
+            os::remove_file(tmp);
             return s;
         }
         if (!out.flush()) return Status(ErrorCode::IoError, "cannot write " + tmp);
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
+    if (!os::replace_file(tmp, path)) {
+        os::remove_file(tmp);
         return Status(ErrorCode::IoError, "cannot replace " + path);
     }
     return Status::ok();
@@ -1471,7 +1471,7 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                 if (best->file.empty()) {
                     out.write(best->state.data(), static_cast<std::streamsize>(best->state.size()));
                 } else {
-                    std::ifstream in(best->file, std::ios::binary);
+                    std::ifstream in(os::utf8_path(best->file), std::ios::binary);
                     if (!in) return Status(ErrorCode::IoError, "cannot read " + best->file);
                     out << in.rdbuf();
                 }
@@ -1489,7 +1489,7 @@ Result<int32_t> Engine::load_state(const std::string& path) {
     Impl& s = *impl_;
     if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
     s.clear_context();
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(os::utf8_path(path), std::ios::binary);
     if (!in) return Status(ErrorCode::IoError, "cannot read " + path);
     LIYAB_RETURN_IF_ERROR(s.target->read_state(in));
     uint32_t magic = 0;

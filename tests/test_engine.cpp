@@ -1,7 +1,6 @@
 // End-to-end tests: quantization kernels, tokenizer, the transformer against
 // an independent float reference, KV-cache rollback and sliding window,
 // speculative decoding invariants, and the Engine through C++ and C APIs.
-#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -35,7 +34,7 @@ using namespace liyab;
 namespace {
 
 std::string temp_path(const std::string& name) {
-    return test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_" + name;
+    return test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_" + name;
 }
 
 // Float32 model so the reference comparison is tight.
@@ -2931,7 +2930,7 @@ TEST_CASE("A conversation the prefix cache set aside is saved as kept, and resto
         Engine& e = *engine.value();
         const std::string next_a = a + run(e, a) + " hello";
         run(e, b);  // another conversation: A's context goes to the prefix cache
-        const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_set_aside.bin";
+        const std::string file = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_set_aside.bin";
         CHECK(!e.save_state(file, "unrelated text").is_ok());
         REQUIRE(e.save_state(file, next_a).is_ok());
         REQUIRE(loader.value()->load_state(file).has_value());
@@ -2950,7 +2949,7 @@ TEST_CASE("The prefix cache keeps contexts on storage when RAM holds none, and r
     spec.delta_net_interval = 2;
     EngineConfig config = engine_config(model_path("prefix_qwen35", spec));
     config.backend = BackendKind::Cpu;
-    const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_prefix_files";
+    const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_prefix_files";
     auto files = [&] {
         size_t n = 0;
         std::error_code ec;
@@ -3116,7 +3115,7 @@ TEST_CASE("After cancelled work a turn still reuses a context whose text re-enco
     REQUIRE(own.has_value());
     REQUIRE(held == static_cast<int32_t>(own->size()) + 1);  // "▁hel" + "lo" instead of "▁hello"
 
-    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_split_state.bin";
+    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_split_state.bin";
     // 0: a prefill typed ahead, cancelled for the user's message; 1: a
     // generation stopped while its prompt is processed; 2: as 0, then the
     // context saved and restored by a new engine (a later process).
@@ -3410,7 +3409,7 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
         REQUIRE(saver.has_value() && loader.has_value() && fresh.has_value());
         const std::string system = "hello world hello";
         REQUIRE(saver.value()->prefill(system, true).is_ok());
-        const std::string file = dir + "/liyab_" + std::to_string(getpid()) + "_state.bin";
+        const std::string file = dir + "/liyab_" + std::to_string(test::process_id()) + "_state.bin";
         REQUIRE(saver.value()->save_state(file).is_ok());
         auto restored = loader.value()->load_state(file);
         REQUIRE(restored.has_value());
@@ -3433,11 +3432,11 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     EngineConfig other = engine_config(f32_model());
     auto engine = Engine::create(other);
     REQUIRE(engine.has_value());
-    auto wrong = engine.value()->load_state(dir + "/liyab_" + std::to_string(getpid()) + "_state.bin");  // the hybrid model's
+    auto wrong = engine.value()->load_state(dir + "/liyab_" + std::to_string(test::process_id()) + "_state.bin");  // the hybrid model's
     CHECK(!wrong.has_value());
     CHECK(wrong.status().code() == ErrorCode::InvalidArgument);
     CHECK(!engine.value()->load_state(dir + "/liyab_missing_state.bin").has_value());
-    std::remove((dir + "/liyab_" + std::to_string(getpid()) + "_state.bin").c_str());
+    std::remove((dir + "/liyab_" + std::to_string(test::process_id()) + "_state.bin").c_str());
 }
 
 TEST_CASE("A saved hybrid context keeps its snapshots: a restored one reuses what the live one would") {
@@ -3471,7 +3470,7 @@ TEST_CASE("A saved hybrid context keeps its snapshots: a restored one reuses wha
     REQUIRE(saver.has_value() && fresh.has_value());
     converse(*saver.value());
     const auto system_tokens = static_cast<int32_t>(saver.value()->tokenize(system, true)->size());
-    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_snapshots.bin";
+    const std::string file = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_snapshots.bin";
     REQUIRE(saver.value()->save_state(file).is_ok());
 
     for (const std::string& prompt : {turn1 + "hello world" + " hello", system + " hello"}) {

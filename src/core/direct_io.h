@@ -2,11 +2,13 @@
 //
 // Streamed weights are read once per use, so going through the page cache
 // only costs memory and evicts weights that are meant to stay resident.
-// DirectFile opens with O_DIRECT (Linux / Android) or F_NOCACHE (Apple) and
-// falls back to buffered reads where direct I/O is refused or untrustworthy:
-// on FUSE (Android's /storage/emulated, where direct reads were seen to
-// return success without the file's bytes) and whenever a direct read of the
-// first and middle block differs from a buffered one.
+// DirectFile opens with O_DIRECT (Linux / Android), F_NOCACHE (Apple) or
+// FILE_FLAG_NO_BUFFERING (Windows) and falls back to buffered reads where
+// direct I/O is refused or untrustworthy: on FUSE (Android's
+// /storage/emulated, where direct reads were seen to return success without
+// the file's bytes), whenever a direct read of the first and middle block
+// differs from a buffered one, and on Windows when the volume refuses an
+// unbuffered read of the first block (sectors larger than kAlign).
 //
 // Measured on a Snapdragon 8 Elite phone (UFS 4, f2fs): one reader peaks at
 // ~2.6 GB/s with 1 MiB requests and ~3.6 GB/s with 4 MiB; two to four
@@ -27,9 +29,12 @@ namespace liyab {
 
 class DirectFile {
 public:
-    // Alignment of offsets, lengths and buffers for direct I/O.
+    // Alignment of offsets, lengths and buffers for direct I/O: a multiple of
+    // the 512 B and 4 KiB logical blocks of phone flash and PC disks alike
+    // (Windows' unbuffered reads ask the same of offset, length and buffer).
     static constexpr size_t kAlign = 4096;
 
+    // `path` is UTF-8.
     static Result<std::unique_ptr<DirectFile>> open(const std::string& path);
     ~DirectFile();
     DirectFile(const DirectFile&) = delete;
@@ -38,7 +43,8 @@ public:
     // Reads `length` bytes at `offset` into `dst`. `offset`, `length` and
     // `dst` must be kAlign-aligned; a read reaching past the end of the file
     // stops there (callers size their requests from the file layout).
-    // Thread-safe (pread).
+    // Thread-safe: pread, or on Windows one overlapped ReadFile per request,
+    // so concurrent requests on one file run in parallel there too.
     Status read(uint64_t offset, size_t length, uint8_t* dst) const;
     // Same, split into `parts` concurrent requests of >= 4 MiB each.
     Status read_parallel(uint64_t offset, size_t length, uint8_t* dst, int32_t parts) const;
@@ -48,7 +54,11 @@ public:
 
 private:
     DirectFile() = default;
+#if defined(_WIN32)
+    void* handle_ = nullptr;  // HANDLE, opened FILE_FLAG_OVERLAPPED
+#else
     int fd_ = -1;
+#endif
     bool direct_ = false;
     std::string path_;
 };

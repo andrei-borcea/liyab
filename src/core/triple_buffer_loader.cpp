@@ -1,10 +1,10 @@
 #include "liyab/triple_buffer_loader.h"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+
+#include "core/os.h"
 
 namespace liyab {
 
@@ -22,7 +22,7 @@ Result<std::unique_ptr<TripleBufferLoader>> TripleBufferLoader::create(std::vect
     if (items.empty() || !fetch) return Status(ErrorCode::InvalidArgument, "triple buffer needs items and a fetch stage");
     // Page alignment satisfies O_DIRECT (4 KiB blocks) and zero-copy GPU
     // wrapping (Metal requires page-aligned host memory; 16 KiB on Apple).
-    const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t page = os::page_size();
     if (alignment == 0) alignment = std::max<size_t>(4096, page);
     if ((alignment & (alignment - 1)) != 0) return Status(ErrorCode::InvalidArgument, "alignment must be a power of two");
 
@@ -43,10 +43,8 @@ Result<std::unique_ptr<TripleBufferLoader>> TripleBufferLoader::create(std::vect
             }
             continue;
         }
-        void* p = nullptr;
-        if (posix_memalign(&p, alignment, loader->slot_bytes_) != 0) {
-            return Status(ErrorCode::OutOfMemory, "cannot allocate triple-buffer slots");
-        }
+        void* p = os::aligned_alloc(alignment, loader->slot_bytes_);
+        if (p == nullptr) return Status(ErrorCode::OutOfMemory, "cannot allocate triple-buffer slots");
         slot.buffer = static_cast<uint8_t*>(p);
     }
     loader->items_ = std::move(items);
@@ -68,7 +66,7 @@ TripleBufferLoader::~TripleBufferLoader() {
     for (Slot& slot : slots_) {
         if (slot.buffer == nullptr) continue;
         if (memory_.release) memory_.release(slot.buffer);
-        else std::free(slot.buffer);
+        else os::aligned_free(slot.buffer);
     }
 }
 

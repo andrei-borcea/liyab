@@ -1,16 +1,15 @@
 // Tests for SoC classification, backend ranking, live device detection and
 // the thermal side of the power manager (sysfs parsing, policy, pacing).
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 
 #include "liyab/device_detect.h"
 #include "liyab/power_manager.h"
@@ -101,14 +100,14 @@ TEST_CASE("detect_device inspects the running machine") {
 }
 
 TEST_CASE("read_sysfs_thermal classifies skin and SoC zones") {
-    const std::string root = test::temp_dir() + "/liyab_thermal_" + std::to_string(getpid());
+    const std::string root = test::temp_dir() + "/liyab_thermal_" + std::to_string(test::process_id());
+    std::error_code ec;
     auto zone = [&](int i, const char* type, const char* temp) {
         const std::string dir = root + "/thermal_zone" + std::to_string(i);
-        mkdir(dir.c_str(), 0755);
+        std::filesystem::create_directories(dir, ec);
         std::ofstream(dir + "/type") << type << "\n";
         std::ofstream(dir + "/temp") << temp << "\n";
     };
-    mkdir(root.c_str(), 0755);
     zone(0, "skin-therm", "41500");      // millidegrees
     zone(1, "cpu-1-0-usr", "72000");
     zone(2, "gpuss-0", "78");             // already in degrees
@@ -121,7 +120,7 @@ TEST_CASE("read_sysfs_thermal classifies skin and SoC zones") {
     CHECK_NEAR(*s.skin_c, 41.5, 1e-3);
     CHECK_NEAR(*s.soc_c, 78.0, 1e-3);
     CHECK(!read_sysfs_thermal(root + "/missing").skin_c.has_value());
-    std::system(("rm -rf '" + root + "'").c_str());
+    std::filesystem::remove_all(root, ec);
 }
 
 TEST_CASE("PowerManager samples only while work is in hand") {

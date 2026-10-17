@@ -1,8 +1,10 @@
 #include "liyab/experimental/io_uring_loader.h"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -10,6 +12,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include "core/os.h"
+
+#if defined(_WIN32)
+#include "core/windows_api.h"
+#endif
 
 #if defined(__linux__)
 #include <linux/io_uring.h>
@@ -32,16 +40,22 @@ constexpr size_t kAlign = 4096;  // covers 512 B and 4 KiB logical blocks (UFS u
 uint64_t align_down(uint64_t v) { return v & ~uint64_t{kAlign - 1}; }
 uint64_t align_up(uint64_t v) { return (v + kAlign - 1) & ~uint64_t{kAlign - 1}; }
 
-std::string errno_text(const char* what, int err) { return std::string(what) + ": " + std::strerror(err); }
+[[maybe_unused]] std::string errno_text(const char* what, int err) { return std::string(what) + ": " + std::strerror(err); }
 
 }  // namespace
 
 const char* io_method_name(IoMethod method) noexcept {
     switch (method) {
         case IoMethod::IoUring: return "io_uring";
+#if defined(_WIN32)
+        case IoMethod::PreadDirect: return "ReadFile+FILE_FLAG_NO_BUFFERING";
+        case IoMethod::PreadNoCache: return "pread+F_NOCACHE";
+        case IoMethod::PreadBuffered: return "ReadFile (file cache)";
+#else
         case IoMethod::PreadDirect: return "pread+O_DIRECT";
         case IoMethod::PreadNoCache: return "pread+F_NOCACHE";
         case IoMethod::PreadBuffered: return "pread (page cache)";
+#endif
     }
     return "unknown";
 }
@@ -53,10 +67,8 @@ Result<AlignedBuffer> AlignedBuffer::allocate(size_t bytes, size_t alignment) {
     if (bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
         return Status(ErrorCode::InvalidArgument, "aligned buffer needs a size and a power-of-two alignment");
     }
-    void* p = nullptr;
-    if (posix_memalign(&p, std::max(alignment, sizeof(void*)), bytes) != 0) {
-        return Status(ErrorCode::OutOfMemory, "posix_memalign failed");
-    }
+    void* p = os::aligned_alloc(std::max(alignment, sizeof(void*)), bytes);
+    if (p == nullptr) return Status(ErrorCode::OutOfMemory, "aligned allocation failed");
     AlignedBuffer buffer;
     buffer.data_ = static_cast<uint8_t*>(p);
     buffer.size_ = bytes;
@@ -70,7 +82,7 @@ AlignedBuffer::AlignedBuffer(AlignedBuffer&& other) noexcept : data_(other.data_
 
 AlignedBuffer& AlignedBuffer::operator=(AlignedBuffer&& other) noexcept {
     if (this != &other) {
-        std::free(data_);
+        os::aligned_free(data_);
         data_ = other.data_;
         size_ = other.size_;
         other.data_ = nullptr;
@@ -79,7 +91,7 @@ AlignedBuffer& AlignedBuffer::operator=(AlignedBuffer&& other) noexcept {
     return *this;
 }
 
-AlignedBuffer::~AlignedBuffer() { std::free(data_); }
+AlignedBuffer::~AlignedBuffer() { os::aligned_free(data_); }
 
 // ---------------------------------------------------------------------------
 // io_uring ring (raw syscalls; layout per include/uapi/linux/io_uring.h)
@@ -185,6 +197,40 @@ Result<std::unique_ptr<DirectReader>> DirectReader::open(const std::string& path
     reader->options_.queue_depth = std::clamp<uint32_t>(options.queue_depth, 1, 256);
     reader->options_.chunk_bytes = static_cast<size_t>(align_up(std::max<size_t>(options.chunk_bytes, kAlign)));
 
+#if defined(_WIN32)
+    const std::wstring wide = os::widen(path);
+    const auto open_file = [&](DWORD flags) {
+        // FILE_SHARE_DELETE: the model stays deletable while it is read, as on POSIX.
+        return CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           flags, nullptr);
+    };
+    HANDLE file = INVALID_HANDLE_VALUE;
+    if (options.bypass_page_cache) {
+        // The counterpart of O_DIRECT, with the same rules: offsets, lengths
+        // and buffers in multiples of the sector size, which kAlign is.
+        file = open_file(FILE_FLAG_NO_BUFFERING);
+        if (file != INVALID_HANDLE_VALUE) {
+            reader->method_ = IoMethod::PreadDirect;
+        } else {
+            const DWORD error = GetLastError();
+            reader->fallback_reason_ = "FILE_FLAG_NO_BUFFERING refused: " + os::error_text(error);
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        file = open_file(FILE_ATTRIBUTE_NORMAL);
+        if (file == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            return Status(ErrorCode::IoError, "cannot open '" + path + "': " + os::error_text(error));
+        }
+    }
+    reader->handle_ = file;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size)) {
+        const DWORD error = GetLastError();
+        return Status(ErrorCode::IoError, "GetFileSizeEx: " + os::error_text(error));
+    }
+    reader->file_size_ = static_cast<uint64_t>(size.QuadPart);
+#else
 #if defined(__linux__)
     if (options.bypass_page_cache) {
         reader->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -207,6 +253,7 @@ Result<std::unique_ptr<DirectReader>> DirectReader::open(const std::string& path
     struct stat st {};
     if (fstat(reader->fd_, &st) != 0) return Status(ErrorCode::IoError, errno_text("fstat", errno));
     reader->file_size_ = static_cast<uint64_t>(st.st_size);
+#endif
 
     for (uint32_t i = 0; i < reader->options_.queue_depth; ++i) {
         auto slot = AlignedBuffer::allocate(reader->options_.chunk_bytes, kAlign);
@@ -243,8 +290,39 @@ Result<std::unique_ptr<DirectReader>> DirectReader::open(const std::string& path
 
 DirectReader::~DirectReader() {
     ring_.reset();  // before closing the file it may reference
+#if defined(_WIN32)
+    if (handle_ != nullptr) CloseHandle(static_cast<HANDLE>(handle_));
+#else
     if (fd_ >= 0) close(fd_);
+#endif
 }
+
+#if defined(_WIN32)
+int64_t DirectReader::read_at(uint8_t* dst, size_t length, uint64_t offset, std::string& error) const {
+    // The handle is synchronous (the reader is used from one thread): ReadFile
+    // reads at the OVERLAPPED's offset and returns once the bytes are in.
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(offset);
+    at.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    DWORD read = 0;
+    const auto want = static_cast<DWORD>(std::min<size_t>(length, size_t{1} << 30));  // ReadFile's length is 32-bit
+    if (ReadFile(static_cast<HANDLE>(handle_), dst, want, &read, &at)) return read;
+    const DWORD code = GetLastError();
+    if (code == ERROR_HANDLE_EOF) return 0;
+    error = "ReadFile: " + os::error_text(code);
+    return -1;
+}
+#else
+int64_t DirectReader::read_at(uint8_t* dst, size_t length, uint64_t offset, std::string& error) const {
+    for (;;) {
+        const ssize_t n = pread(fd_, dst, length, static_cast<off_t>(offset));
+        if (n >= 0) return n;
+        if (errno == EINTR) continue;
+        error = errno_text("pread", errno);
+        return -1;
+    }
+}
+#endif
 
 Status DirectReader::stream(uint64_t offset, uint64_t length, const std::function<bool(const ReadChunk&)>& on_chunk) {
     const uint64_t want_begin = std::min(offset, file_size_);
@@ -315,11 +393,9 @@ Status DirectReader::read_into(uint64_t offset, size_t length, uint8_t* dst) {
 #endif
     for (size_t pos = 0; pos < length && offset + pos < file_size_;) {
         const size_t len = std::min(options_.chunk_bytes, length - pos);
-        const ssize_t n = pread(fd_, dst + pos, len, static_cast<off_t>(offset + pos));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return Status(ErrorCode::IoError, errno_text("pread", errno));
-        }
+        std::string error;
+        const int64_t n = read_at(dst + pos, len, offset + pos, error);
+        if (n < 0) return Status(ErrorCode::IoError, error);
         if (n == 0) break;
         pos += static_cast<size_t>(n);
     }
@@ -344,11 +420,9 @@ Status DirectReader::stream_pread(uint64_t begin, uint64_t end, uint64_t want_be
     AlignedBuffer& buffer = slots_[0];
     for (uint64_t pos = begin; pos < end && pos < file_size_;) {
         const size_t len = static_cast<size_t>(std::min<uint64_t>(options_.chunk_bytes, end - pos));
-        const ssize_t n = pread(fd_, buffer.data(), len, static_cast<off_t>(pos));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return Status(ErrorCode::IoError, errno_text("pread", errno));
-        }
+        std::string error;
+        const int64_t n = read_at(buffer.data(), len, pos, error);
+        if (n < 0) return Status(ErrorCode::IoError, error);
         if (n == 0) break;
         const bool keep_going = deliver(buffer.data(), pos, static_cast<uint64_t>(n), want_begin, want_end, on_chunk);
 #if defined(__linux__)

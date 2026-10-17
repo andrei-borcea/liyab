@@ -33,7 +33,7 @@ from the command line and **~12–16 tok/s in the app**.
 * [Why Liyab](#why-liyab)
 * [Design principles](#design-principles)
 * [What it does today](#what-it-does-today)
-* [Quick start](#quick-start)
+* [Quick start](#quick-start): host, Android, iOS, [Windows](#windows-x64), CMake options
 * [Architecture](#architecture)
 * [Supported models](#supported-models)
 * [Models larger than RAM](#models-larger-than-ram)
@@ -113,6 +113,7 @@ These rules decide what goes into the code:
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
 | CPU backend: NEON + SDOT; i8mm (SMMLA) layouts for Q4_K/Q5_K/Q6_K/Q8_0; WFE-waiting thread pool with chunks claimed on demand | ✅ |
 | CPU backend on x86-64: AVX2 + FMA + F16C kernels chosen at run time by CPUID, scalar fallback in the same binary | 🟡 tested under Rosetta 2 only |
+| Windows x64 port of the engine, `liyab-cli`, the tests and tools: file mapping, unbuffered direct reads, processor groups and hybrid cores, UTF-8 paths and console; MSVC or clang-cl | 🟡 written, not yet compiled or run on Windows ([Windows](#windows-x64)) |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
@@ -135,7 +136,8 @@ These rules decide what goes into the code:
 ## Quick start
 
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
-iOS: Xcode 15+. The app: Flutter 3.x, Android SDK platform 36, JDK 17.
+iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,
+Android SDK platform 36, JDK 17.
 
 ```bash
 # Build and test on the host (macOS / Linux)
@@ -172,6 +174,46 @@ The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK 
 `.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
 reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 
+### Windows (x64)
+
+The engine library (`liyab.dll`), `liyab-cli`, the tests and the tools are ported to Windows x64. The port has not
+been compiled or run on Windows yet (see [Known limitations](#known-limitations)). In an "x64 Native Tools Command
+Prompt for VS 2022":
+
+```bat
+rem clang-cl (Visual Studio's "C++ Clang tools"); leave out the two compiler options to build with cl.exe
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIYAB_ENABLE_EXPERIMENTAL=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+cmake --build build
+ctest --test-dir build --output-on-failure
+build\liyab-cli.exe --device
+```
+
+What the port does differently from the POSIX platforms:
+
+* **Mapping.** The GGUF is mapped with `CreateFileMappingW` / `MapViewOfFile` as one view. `PrefetchVirtualMemory`
+  and `VirtualUnlock` (which takes unlocked pages out of the working set) stand in for `madvise`'s `WILLNEED` and
+  `DONTNEED`; a mapped view has no `SEQUENTIAL` or `RANDOM` hint. The file stays deletable while it is mapped.
+* **Direct reads.** `DirectFile` opens with `FILE_FLAG_NO_BUFFERING` (offsets, lengths and buffers in 4 KiB
+  multiples, as with `O_DIRECT`) and reads with overlapped `ReadFile`, one event per request: requests made through
+  a synchronous handle would run one after another. A volume that refuses an unbuffered read of the first block gets
+  buffered reads.
+* **Threads.** The pool's default size counts the physical cores of the highest efficiency class (an Intel hybrid's
+  P-cores; every core of a homogeneous CPU), SMT siblings excluded. On machines with more than 64 logical
+  processors, which Windows splits into processor groups, each worker is moved to a group so that the pool spreads
+  over them. Workers wait with `PAUSE` and are named with `SetThreadDescription`.
+* **Device.** The CPU name comes from the registry, memory from `GlobalMemoryStatusEx`, AVX2/FMA/F16C from
+  `__cpuidex` / `_xgetbv` under MSVC and clang-cl.
+* **Text.** Every path is UTF-8, as on the other platforms: the library converts paths to UTF-16 for Windows.
+  `liyab-cli` reads its UTF-16 command line and switches the console to UTF-8 while it runs; the executables
+  declare UTF-8 as their code page in their manifest (Windows 10 1903 and later).
+* **Linking.** `liyab.dll` exports the C and the C++ API; CMake's `liyab` target defines `LIYAB_DLL_IMPORT` for the
+  code that links it. An app that loads the DLL at run time (FFI) only needs the C API's exported names.
+* **Not available on Windows:** the GPU and NPU backends (`LIYAB_USE_VULKAN`, `LIYAB_USE_QNN`,
+  `LIYAB_USE_NEUROPILOT` stop the configuration), thermal readings (Windows has no thermal status, headroom forecast
+  or sensor zones Liyab reads, so the steering of [Heat and power](#heat-and-power) stays idle while the profiles'
+  rate caps and core shares still apply), and locking the expert cache in RAM (`VirtualLock` is capped by the
+  working-set minimum).
+
 ### CMake options
 
 | Option | Default | Effect |
@@ -180,10 +222,10 @@ reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 | `LIYAB_ARM_DOTPROD` | ON on arm64 | `-march=armv8.2-a+dotprod+fp16` on Android/iOS/Linux (SDOT) |
 | `LIYAB_USE_AVX2` | ON on x86-64 | AVX2 + FMA + F16C kernels, used when CPUID reports them (the library itself keeps the x86-64 baseline) |
 | `LIYAB_USE_METAL` | ON on Apple | Metal GPU backend |
-| `LIYAB_USE_VULKAN` | ON on Android | Vulkan GPU backend and probe (loader opened with `dlopen`; shaders need `glslc` from the NDK or the Vulkan SDK) |
-| `LIYAB_USE_QNN` / `LIYAB_USE_NEUROPILOT` | ON on Android | NPU runtime probes (no SDK needed) |
+| `LIYAB_USE_VULKAN` | ON on Android | Vulkan GPU backend and probe (loader opened with `dlopen`; shaders need `glslc` from the NDK or the Vulkan SDK); not available on Windows |
+| `LIYAB_USE_QNN` / `LIYAB_USE_NEUROPILOT` | ON on Android | NPU runtime probes (no SDK needed); not available on Windows |
 | `LIYAB_ENABLE_EXPERIMENTAL` | OFF | [Experimental modules](#experimental-modules) and `test_experimental` |
-| `LIYAB_BUILD_SHARED` | ON | Shared (`.so`/`.dylib`) or static library |
+| `LIYAB_BUILD_SHARED` | ON | Shared (`.so`/`.dylib`/`.dll`) or static library |
 | `LIYAB_BUILD_TESTS` / `LIYAB_BUILD_CLI` | ON | Unit tests, benchmarks and `liyab-cli` |
 
 ---
@@ -428,8 +470,8 @@ available memory or of `memory_budget_mb`.
 * **Storage that is fast only when used right.** UFS 4 reaches ~4.4 GB/s with 2–4 direct requests of ≥ 256 KiB in
   flight, random or sequential alike, but stays under 1.2 GB/s with 16 KiB requests (see the
   [flash chart](#charts)).
-  * `DirectFile` reads with `O_DIRECT`, so there is no page-cache copy and resident weights are not evicted. It
-    splits large reads into concurrent 4 MiB requests.
+  * `DirectFile` reads with `O_DIRECT` (`F_NOCACHE` on Apple, `FILE_FLAG_NO_BUFFERING` on Windows), so there is no
+    page-cache copy and resident weights are not evicted. It splits large reads into concurrent 4 MiB requests.
   * On FUSE (Android's `/storage/emulated`), direct reads were seen to return success without the file's bytes, so
     Liyab never uses them there, and it self-tests direct against buffered reads before trusting any file.
 * **Dense models.** As many blocks as fit stay resident. The others stream through a 3-slot pipeline (fetch →
@@ -1830,8 +1872,8 @@ Implemented features are described above. These are next, in order:
     * the screen content through a voice-interaction service.
 11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
     it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and
-    command bar as on macOS), which first needs a Windows port of the engine (the x86-64 AVX2 kernels are in place)
-    and validation of those kernels on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP,
+    command bar as on macOS), which first needs the engine's [Windows port](#windows-x64) built and tested on
+    Windows and the x86-64 kernels validated on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP,
     NeuroPilot); app localization.
 12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
@@ -1850,7 +1892,7 @@ Implemented features are described above. These are next, in order:
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
 * **x86-64:**
   * the AVX2 kernels have been run only under Rosetta 2 on Apple silicon, not yet on an Intel or AMD CPU, and the
-    `x86_64-*` golden hashes come from there (macOS libm); Linux and Windows builds are not tested;
+    `x86_64-*` golden hashes come from there (macOS libm); Linux x86-64 builds are not tested, nor is Windows (below);
   * their native speed is not measured. Rosetta's timings do not carry over: it translates `VPSIGNB` (~13 ns) and
     `VPSHUFB` (~12 ns) into long sequences, so there the AVX2 set is 2.3–4.3× faster than the scalar one on Q4_K
     and F32 but 1.5–2.5× slower on Q8_0, Q4_0 and Q6_K, whose scalar loops the compiler vectorizes with SSE2.
@@ -1860,6 +1902,17 @@ Implemented features are described above. These are next, in order:
     decode path; there are no AVX-VNNI, AVX-512 or repacked layouts, and CPUs without AVX2 run scalar kernels;
   * the transformer's element-wise loops (norms, softmax, RoPE) are plain C++ left to the compiler, and the DeltaNet
     recurrence has a NEON path but no x86 one.
+* **Windows:**
+  * the [port](#windows-x64) has not been compiled or run on Windows yet: it was written against the Win32 API for
+    MSVC and clang-cl and checked only through the macOS builds (arm64, x86-64, and a `-pedantic` x86-64 build that
+    finds no GNU language extension in the code Windows compiles), so its first Windows build may still need fixes;
+  * `test_golden` compares Windows' results with the `x86_64-*` hashes recorded on macOS. The forward pass calls
+    the C runtime's `exp`, `tanh`, `log1p`, `pow`, `sin` and `cos`, which Windows implements with its own code: if a
+    result rounds differently there, those hashes need entries of their own;
+  * x64 only (Windows on Arm is not ported); no GPU or NPU backend; no thermal readings; the expert cache is never
+    locked in RAM;
+  * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
+    of their own, such as a temporary directory under a user name with accents.
 * **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
   expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): Youtu-LLM's `youtu` is not one yet, so its text cannot be encoded.
@@ -1917,7 +1970,8 @@ src/core/               engine, architecture registry and model description, tra
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
                         sampler, speculative decoding (draft budget, suffix drafter), power manager, device
-                        detection, thread pool
+                        detection, thread pool, OS services (os.h: memory, UTF-8 paths, file replacement;
+                        POSIX and Windows)
 src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*), metal/, vulkan/ (+ shaders/),
                         qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV dedup, io_uring loader
@@ -1942,6 +1996,8 @@ docs/model-descriptions.md  how tools/describe_model.py establishes a model's re
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
 scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py, thread_cpu.py
+cmake/                  embed_spirv.cmake (Vulkan shaders into the library); windows/: the UTF-8 code page
+                        manifest of the Windows executables
 ```
 
 ## Contributing

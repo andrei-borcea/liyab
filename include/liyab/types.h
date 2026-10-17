@@ -10,8 +10,19 @@
 #include <utility>
 #include <variant>
 
+// Symbols of the library's public API. On Windows a DLL exports only what is
+// marked: liyab.dll's own sources are compiled with LIYAB_DLL_EXPORT, code
+// that uses liyab.dll defines LIYAB_DLL_IMPORT (the CMake target `liyab` sets
+// it for its users), and code linking the static library or the objects
+// defines neither.
 #if defined(_WIN32)
+#if defined(LIYAB_DLL_EXPORT)
 #define LIYAB_API __declspec(dllexport)
+#elif defined(LIYAB_DLL_IMPORT)
+#define LIYAB_API __declspec(dllimport)
+#else
+#define LIYAB_API
+#endif
 #else
 #define LIYAB_API __attribute__((visibility("default")))
 #endif

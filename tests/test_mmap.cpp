@@ -1,7 +1,6 @@
 // Tests for the zero-copy loader: file mapping, paging hints (madvise),
 // GGUF parsing and validation, layer-window prefetching and the NEON INT4
 // unpacking kernel.
-#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +21,7 @@ using namespace liyab;
 
 namespace {
 
-std::string temp_path(const char* name) { return test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_" + name; }
+std::string temp_path(const char* name) { return test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_" + name; }
 
 void write_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()),
@@ -72,9 +71,9 @@ TEST_CASE("MappedFile reports missing and empty files") {
     std::remove(empty.c_str());
 }
 
-TEST_CASE("madvise WILLNEED / DONTNEED / SEQUENTIAL are accepted and DONTNEED keeps data intact") {
+TEST_CASE("Paging hints WILLNEED / DONTNEED / SEQUENTIAL are accepted and DONTNEED keeps data intact") {
     const std::string path = temp_path("advise.bin");
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t page = os::page_size();
     std::vector<uint8_t> bytes(8 * page + 17);
     std::mt19937 rng(42);
     for (auto& b : bytes) b = static_cast<uint8_t>(rng());
@@ -84,7 +83,11 @@ TEST_CASE("madvise WILLNEED / DONTNEED / SEQUENTIAL are accepted and DONTNEED ke
     REQUIRE(opened.has_value());
     const MappedFile& file = *opened.value();
 
+#if defined(_WIN32)
+    CHECK(!file.advise_sequential());  // no such hint for a mapped view on Windows
+#else
     CHECK(file.advise_sequential());
+#endif
     // Unaligned ranges are widened to whole pages internally.
     CHECK(file.advise_willneed(page + 5, 3 * page));
     file.touch(page + 5, 3 * page);

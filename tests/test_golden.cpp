@@ -16,7 +16,6 @@
 // to move outputs rewrites the platform's hashes (LIYAB_GOLDEN_UPDATE=1) and
 // says why in its commit. A platform with no pinned hashes is skipped with a
 // note, so a new CPU target never fails before its hashes are recorded.
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -49,7 +48,7 @@ namespace {
 std::string platform() {
 #if defined(__aarch64__)
     std::string s = "arm64-";
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(_M_X64)
     std::string s = "x86_64-";
 #else
     std::string s = "other-";
@@ -254,7 +253,7 @@ void hash_floats(uint64_t& h, std::span<const float> values) {
 // batch with every row's logits, then 6 decoding steps. Returns false (and
 // reports why) when the model does not load or a pass fails.
 bool run_case(const GoldenCase& c, uint64_t& hash) {
-    const std::string path = test::temp_dir() + "/liyab_" + std::to_string(getpid()) + "_golden.gguf";
+    const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_golden.gguf";
     test::write_tiny_model(path, c.spec);
     // Removed once the model is gone: streamed experts are read through the path.
     struct Remove {
