@@ -620,8 +620,14 @@ each of those as a scheduling problem.
     * Qwen3.5-0.8B (hybrid): 44.5% reused, against nothing (rewinding went back to the start, the nearest state
       snapshot). Every resumed turn was restored: 0.19–0.30 s to the first token against 12–18 s. New chats still
       process the system block, whose end has no state snapshot when it is not prepared on its own. A set-aside
-      wrote 2–4 chunks and 2 state images, ~40 MiB, in 8–13 ms; storage peaked at 310 MiB (349 MiB once the engine
-      set its context aside when destroyed). After the restart: 0.17 s to the first token instead of 18.4 s.
+      wrote 1–2 chunks of 4 pages and 2 state images, ~40 MiB, in 9–11 ms; storage peaked at 312 MiB (352 MiB once
+      the engine set its context aside when destroyed). After the restart: 0.17 s to the first token instead of
+      18.4 s.
+    * Throughput, Qwen3.5-0.8B with a 25.8k-token context and three state images (218.6 MiB), alternating runs:
+      set aside in 43–49 ms (4.7–5.3 GB/s) and restored in 28–31 ms (7.5–8.3 GB/s), where the earlier cache wrote
+      its one file in 23–25 ms and read it back in 41–47 ms. State images are read into the model's states and the
+      snapshots' own buffers, and written from them, with no copy in between; each 1 MiB block is hashed while it
+      is in cache (xxHash64 runs at ~25 GB/s, reading from the page cache at ~17).
     * Decoding is as fast as before (alternating runs, best of 3: 68.6, 67.9, 62.9 tok/s before; 68.9, 68.6,
       63.3 after).
   * On the phone, with the earlier per-context cache, a 4,907-token chat on the 35B (114 MiB) was set aside in
