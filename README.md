@@ -737,7 +737,7 @@ each of those as a scheduling problem.
     arrange 3 to 5 of them in other orders, each followed in turn by three questions about them. For each share
     of 5, 10, 15, 20, 30 and 45% it takes the mean KL of the answers against processing the whole prompt, and a
     bound above it (1.645 standard errors of the 12 questions' own means); it keeps the smallest share whose
-    bound, and every larger share's, is within `segment_reuse_max_kl` (default 0.02). With none, the model is
+    bound, and every larger share's, is within `segment_reuse_max_kl` (default 0.03). With none, the model is
     refused. `Engine::segment_reuse()` gives the share and the calibration's KL, bound and top-1,
     `GenerationStats` and `PrefixCacheStats` what was reused.
   * **Calibrated in the background.** Loading does not wait for the measurement: it runs once the engine has
@@ -785,20 +785,21 @@ each of those as a scheduling problem.
     So the deviation at block 1 is the default (`liyab-reuse --criterion`, `--select-block` and `--first-tokens`
     measure the others).
   * **The calibration against the measurement.** The share the calibration keeps holds on the prompts measured
-    above (`liyab-reuse --calibrate 0.02` runs both), or the model is refused:
+    above (`liyab-reuse --calibrate 0.03` runs both), or the model is refused:
 
-    | Model | Kept at the default target | Calibration: mean KL (bound) | Measured above at that share |
-    | :--- | ---: | ---: | ---: |
-    | Llama 3.2 1B | 45% | 0.0120 (0.0160) | 0.0086 |
-    | Qwen3-0.6B | refused (45%, the largest) | 0.0364 (0.0543) | 0.0180 |
-    | Qwen3.5-0.8B | refused: hybrid | | |
+    | Model | Kept at the default target (0.03) | Calibration: mean KL (bound) | Measured above at that share | First token sooner |
+    | :--- | ---: | ---: | ---: | ---: |
+    | Llama 3.2 1B | 15% | 0.0219 (0.0280) | 0.0162 | 3.0× |
+    | Qwen3-0.6B | refused (45%, the largest) | 0.0364 (0.0543) | 0.0180 | |
+    | Qwen3.5-0.8B | refused: hybrid | | | |
 
     Its prompts ask more than the measured ones. From 5 to 45% Llama's calibration gives 0.035, 0.027, 0.022,
     0.019, 0.019 and 0.012 (bounds 0.045 to 0.016), where the measured prompts give 0.020 at 10% and 0.013 at
     20%. Qwen3-0.6B's stays at 0.036–0.042 whatever the share, carried by a few of its 12 questions (at 45%,
     0.14 and 0.07 for two of them, under 0.022 for seven), while the measured prompts fall to 0.018 at 45%. So
-    the share kept errs on the safe side: Llama 3.2 1B gets its first token 1.8× sooner at the default target,
-    where 20% (2.7×) would have stayed within it on the measured prompts. Earlier, with plain-text prompts, four
+    the share kept errs on the safe side: at a target of 0.02 Llama 3.2 1B kept 45% and got its first token
+    1.8× sooner, where 20% (2.7×) would have stayed within 0.02 on the measured prompts; the default is 0.03,
+    where it keeps 15% (3.0×) and measures 0.016. Earlier, with plain-text prompts, four
     documents and one or three questions, the calibration was the gentler one (Llama 3.2 1B: 0.0097 at 5%
     against 0.027 at 0% and 0.020 at 10% measured), which is why it now uses the model's chat template, the
     corpus's numbered documents and a bound. It took 205 s of background work on Llama 3.2 1B and 90 s on

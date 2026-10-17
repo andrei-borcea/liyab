@@ -242,7 +242,7 @@ struct EngineConfig {
     // KL(whole prompt processed || segments reused), over the answers to
     // RAG-shaped prompts in the model's chat template (core/kv_reuse.h), with
     // a margin for what those prompts cannot tell apart.
-    float segment_reuse_max_kl = 0.02f;
+    float segment_reuse_max_kl = 0.03f;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
