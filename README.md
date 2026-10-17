@@ -698,8 +698,15 @@ each of those as a scheduling problem.
       is in cache (xxHash64 runs at ~25 GB/s, reading from the page cache at ~17).
     * Decoding is as fast as before (alternating runs, best of 3: 68.6, 67.9, 62.9 tok/s before; 68.9, 68.6,
       63.3 after).
-  * On the phone, with the earlier per-context cache, a 4,907-token chat on the 35B (114 MiB) was set aside in
-    81 ms and restored in 95 ms, where processing a 4,009-token one again had taken 163 s.
+  * On the phone (Snapdragon 8 Elite, Qwen3.6-35B-A3B, the app's 512 MiB on storage), a chat of 1,355 tokens
+    that a local-API request replaced was set aside in 73 ms (2 of its 8 chunks new, its 2 state images: 127.7
+    MiB written) and restored in 151 ms when the next message came, which then processed 17 new tokens and
+    gave its first token 1.66 s after sending. The same chat set aside again one message later wrote 1 new
+    chunk and its 2 state images (126.0 MiB) in 87 ms and came back in 127 ms. Most of what is written is the
+    DeltaNet state images (62.8 MiB each), which change with every turn; the KV chunks are written once. The
+    store's files outlived an update of the app: the next load kept 9 chunks and 2 contexts. (With the earlier
+    per-context cache, a 4,907-token chat (114 MiB) was set aside in 81 ms and restored in 95 ms, where
+    processing a 4,009-token one again had taken 163 s.)
 * **Segment reuse: KV reused away from its prefix** (`segment_reuse`; opt-in and lossy). An agent's prompts carry
   documents, memory snippets and tool results in the middle, and a change before them forced everything after them
   to be processed again. A request can mark parts of its prompt (`GenerateOptions::segments`,
@@ -1503,8 +1510,9 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   generation, even while it is still queued or its prompt is being processed, and its embedding or reranking call,
   queued or running.
 * **Your chat keeps its place.** A request's prompt replaces the chat's context in the engine, which sets the chat's
-  aside on storage (the prefix cache: at most 512 MB, no RAM) and restores it on your next message: 95 ms for a
-  4,907-token chat on the 35B, where processing a 4,009-token one again had taken 163 s.
+  aside on storage (the prefix cache: at most 512 MB, no RAM) and restores it on your next message: 151 ms for a
+  1,355-token chat on the 35B (127 ms the next time), its first token 1.66 s after sending, where processing a
+  4,009-token chat again had taken 163 s.
 * **Listening without Liyab open.** With notification access granted, Android binds Liyab's notification listener
   on its own (at boot, after it stopped the process), which starts Liyab's process without a window. With the local
   API on, that process starts the app's Dart side and the API listens at once, under its listening service; the
