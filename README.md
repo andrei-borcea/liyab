@@ -371,22 +371,24 @@ What the port does differently from the POSIX platforms:
       position and head that scores 576 channels and accumulates 512;
     * expanded (prefill batches): per-head keys `[W_kb c | k_pe]` and values `W_vb c` are expanded from the cached
       latents of the positions the batch sees, a tile of at most 256 positions at a time (5 MiB on
-      DeepSeek-V2-Lite, never the whole context: the cache keeps latents only), and the batch attends over them:
-      192 channels scored and 128 accumulated per position and head, for the cost of expanding each position once
-      per pass instead of projecting each token's query. Tiles have absolute bounds and are merged in order, so a
-      token's result is the same however its prompt was split into passes and however many threads run.
+      DeepSeek-V2-Lite, plus 8 MiB of the decoded `attn_k_b` and `attn_v_b` of the block being run; never the
+      whole context: the cache keeps latents only), and the batch attends over them: 192 channels scored and 128
+      accumulated per position and head, for the cost of expanding each position once per pass instead of
+      projecting each token's query. Tiles have absolute bounds and are merged in order, so a token's result is the
+      same however its prompt was split into passes and however many threads run.
 
-    The form is chosen from measured cost: each form's work is counted per pass from its batch size and context,
-    and the time each form took per multiply-add on this device sets the threshold, so it follows the machine
-    instead of a constant. The engine prefills these models in passes of 512 tokens (64 for other models, 1,024 with
-    streamed experts): a pass of 64 tokens deep in a context does not repay expanding every position it sees, and
-    stays absorbed. Both forms compute the same function and round differently: outputs are not
-    bit-identical across forms (each form on its own is, and `test_golden` pins both). `TransformerOptions::
-    latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled
-    for the per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the
-    absorbed form multiplies the attention output back, the expanded one the latents before it expands them. Files
-    converted before `attn_kv_b` was split into `attn_k_b` and
-    `attn_v_b` are refused with a request to convert them again, and so is group-limited expert routing
+    The form is chosen from measured cost: each form's work is counted per pass from its batch size and context, and
+    the time each form took per multiply-add on this device sets the threshold, so it follows the machine instead of
+    a constant. The engine prefills these models in passes of 512 tokens (64 for other models, 1,024 with streamed
+    experts): a pass of 64 tokens deep in a context does not repay expanding every position it sees, and stays
+    absorbed. Both forms compute the same function and round differently: outputs are not bit-identical across
+    forms (each form on its own is, and `test_golden` pins both); against transformers both give a mean KL of
+    0.00000 with an F16 cache, and the expanded form is the closer with a Q8_0 one ([Correctness](#correctness)).
+    `TransformerOptions::latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled for the
+    per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the absorbed form
+    multiplies the attention output back, the expanded one the latents before it expands them. Files converted
+    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
+    and so is group-limited expert routing
     (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
@@ -1509,6 +1511,7 @@ cache the forward passes agree:
 | Phi-3.5-mini-instruct (`phi3`, LongRoPE short factors) | 512 | 0.00000 | 99.80% |
 | Phi-3.5-mini-instruct, a longer text past its 4,096-position original context (long factors) | 4,200 | 0.00000 | 99.95% |
 | Youtu-LLM-2B (`deepseek2`: latent attention, low-rank queries; reference ids, its pre-tokenizer is not a row yet) | 512 | 0.00000 | 100.00% |
+| Youtu-LLM-2B, latent attention in the expanded form (passes of 512 tokens) | 512 | 0.00000 | 99.80% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
 
@@ -1526,6 +1529,26 @@ positions; weights drawn wide, so attention and outputs are sharp and a wrong pa
 * DeepSeek-V3's structure with one expert group (low-rank queries, sigmoid scores with a selection bias,
   renormalized top-3 scaled by 2.5, one shared expert): median KL 0.00001, top-1 99.80%; the mean, 0.0037, is one
   position whose expert choice flipped at a near-tie.
+
+**Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
+the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
+for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B
+on the reference's ids, and a new random model with DeepSeek-V2-Lite's structure built by transformers' DeepSeek-V2
+code at V2-Lite's attention widths, 16 heads, a 512-wide latent, keys of 128 + 64 and values of 128, converted to
+F32), 511 positions:
+
+| Model, KV cache | Absorbed: mean KL / top-1 | Expanded: mean KL / top-1 |
+| :--- | ---: | ---: |
+| Youtu-LLM-2B (BF16), F16 | 0.00000 / 100.00% | 0.00000 / 99.80% |
+| Youtu-LLM-2B (BF16), Q8_0 without key scaling (its calibration text cannot be encoded yet) | 0.00115 / 97.26% | 0.00098 / 98.43% |
+| random V2-Lite structure (F32), F16 | 0.00000 / 99.02% | 0.00000 / 99.02% |
+| random V2-Lite structure (F32), Q8_0 with key scaling | 0.00308 / 67.51% | 0.00186 / 74.76% |
+
+With an F16 cache the forms are indistinguishable at this precision (on the random model, the expanded form against
+the absorbed one: KL 0.00000, top-1 99.61%, the rest near-ties of a random model's flat distributions). With a Q8_0
+cache the expanded form is the closer of the two: the absorbed form rounds each 576-wide absorbed query to Q8_0 to
+score it against the cache, the expanded one scores in float against the decoded latents. Passes of 64 or 512 tokens
+give the same expanded figures, as they must.
 
 **Tokenizers against Hugging Face.** `liyab-tok` compared Liyab's ids with those of each model's own
 `tokenizer.json`, run by the Hugging Face `tokenizers` library (`tools/tokenizer_reference.py`), on three texts:
