@@ -22,10 +22,12 @@
 //    blocks (up to select_block) with the tokens around it, and those whose
 //    keys and values there moved the most from their reused rows go on
 //    through the rest of the model (the deviation criterion; KV rows that
-//    move early keep moving through the later blocks). The fraction is not
-//    a constant: calibrate_reuse() measures, per model, the smallest one
-//    that keeps the next-token distributions of a fixed RAG-shaped prompt
-//    within a KL target of a full prefill.
+//    move early keep moving through the later blocks). Measured against
+//    the others (ReuseCriterion, with liyab-reuse: README), it gave the
+//    lowest KL for the work from 20% on, its selection pass counted. The
+//    fraction is not a constant: calibrate_reuse() measures, per model, the
+//    smallest one that keeps the next-token distributions of a fixed
+//    RAG-shaped prompt within a KL target of a full prefill.
 //
 // What a reused segment's tokens cost: the blocks up to select_block, then
 // the fraction of them through the remaining blocks; the tokens between
@@ -172,7 +174,11 @@ int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const 
 // reuse), at the first answer token and the next kCalibrationAnswer tokens
 // of the full prefill's greedy answer (teacher-forced). The fraction kept is
 // the smallest whose score is within `max_kl`; none: reuse would need about
-// as much work as processing the documents, and is not worth it.
+// as much work as processing the documents, and is not worth it. The score
+// covers at most 2 x (kCalibrationAnswer + 1) positions, so one token whose
+// distribution turns moves it by a 34th of that token's KL: a coarse
+// choice, kept short because it runs at load (~40 s for a 1B model on a
+// loaded Mac).
 inline constexpr float kReuseFractions[] = {0.05f, 0.1f, 0.15f, 0.2f, 0.3f, 0.45f};
 inline constexpr int32_t kCalibrationAnswer = 16;
 // Changing the texts, the grid or the procedure changes every model's

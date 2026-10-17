@@ -630,12 +630,55 @@ each of those as a scheduling problem.
     30 or 45% whose next-token distributions stay within `segment_reuse_max_kl` (default 0.02) of processing the
     whole prompt, and keeps it in `cache_dir`. A model that needs more is refused. `Engine::segment_reuse()`
     gives the share and the calibration's KL and top-1, `GenerationStats` and `PrefixCacheStats` what was reused.
+  * **Measured on the Mac** (`liyab-reuse`; CPU, Q8_0 cache with key scaling; on a Mac other jobs loaded heavily,
+    so times are compared within each run). 8 prompts per model: the system prompt of a small company's
+    assistant, 3–5 of its 12 documents in random order (77–80% of ~555 tokens) and a question, through the
+    model's chat template, after warm-up prompts had stored the documents in other orders. Quality against
+    processing the whole prompt, at the first answer token and each next one up to the end of the greedy answer
+    (at most 33); the first token's time against the lossless path, the part before the first document restored
+    from the prefix cache and the rest processed:
+
+    | Model | Processed again | Mean KL | Median KL | Top-1 | Same greedy answer | First token sooner |
+    | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Qwen3-0.6B | 0% | 0.049 | 0.0013 | 95.7% | 2 of 8 | 5.5× |
+    | | 10% | 0.041 | 0.0012 | 96.2% | 3 of 8 | 3.7× |
+    | | 20% | 0.030 | 0.0008 | 95.7% | 1 of 8 | 2.8× |
+    | | 30% | 0.026 | 0.0006 | 98.3% | 4 of 8 | 2.5× |
+    | Llama 3.2 1B | 0% | 0.027 | 0.0034 | 96.5% | 3 of 8 | 4.2× |
+    | | 10% | 0.020 | 0.0025 | 97.2% | 4 of 8 | 3.2× |
+    | | 20% | 0.013 | 0.0021 | 98.0% | 4 of 8 | 2.7× |
+    | | 30% | 0.011 | 0.0015 | 98.4% | 4 of 8 | 2.2× |
+
+    The first token comes as much sooner as the work left predicts: the selection runs 2 of Qwen3-0.6B's 28
+    blocks (2 of Llama's 16) for every reused token, the share processed again all of them. The mean KL is a
+    few answer tokens' doing: the median is 6 (Llama) to 48 (Qwen3) times lower, the largest single token's KL
+    0.3–1.9. A reused document costs the store its rows, ~60 KiB per token on Qwen3-0.6B and ~17 KiB on Llama
+    3.2 1B.
+  * **Which tokens are processed again matters**, at equal work too. Mean KL on Qwen3-0.6B at 10, 20 and 30%:
+    the deviation criterion 0.041, 0.030, 0.026; random tokens 0.045, 0.043, 0.039; each document's first ones
+    0.052, 0.041, 0.056; ranked by the attention the prompt's last tokens pay them (the question taken into the
+    pass) 0.037, 0.038, 0.034, and by that attention times their deviation 0.042, 0.037, 0.026; the deviation
+    with each document's first 8 tokens added 0.046 and 0.036 (10 and 20%), compared at block 3 instead of
+    block 1 0.039 and 0.037. On Llama 3.2 1B random tokens give 0.025, 0.022, 0.018. Random needs no selection
+    pass, yet with it counted the deviation still leads: at 20% it costs 26% of the documents' work on
+    Qwen3-0.6B and 30% on Llama, and gives 0.030 and 0.013 where random tokens at 30% give 0.039 and 0.018.
+    So the deviation at block 1 is the default (`liyab-reuse --criterion`, `--select-block` and `--first-tokens`
+    measure the others).
+  * **The calibration** (once per model and cache format, ~40 s on that loaded Mac) puts Llama 3.2 1B at 5%
+    (KL 0.019 on its text). Qwen3-0.6B stays above the default target up to 45% (0.029; 0.032–0.037 from 5 to
+    30%), so it is refused at it; a target of 0.04 would take 5%. The calibration scores up to 34 answer tokens,
+    and one token whose distribution turns moves their mean by ~0.03: the share it picks is coarse, and the table
+    above, over 8 prompts, is the finer guide for choosing a target.
   * **Hybrid models are refused**, with the reason in `Engine::segment_reuse()`: their recurrent blocks must run
     over the whole prompt in order, so every token still goes through every block, and reusing the attention
     blocks' keys and values would skip only their key and value projections (1.3% of a prompt token's matrix work
     on Qwen3.5-0.8B). Marked prompts are then processed as usual. Windowed blocks (Gemma) take part like global
     ones, each turned with its own RoPE table, a recomputed token seeing its window; with the engine's own
     sliding window there is no prefix cache, so no segment reuse.
+  * **Off, nothing changes.** The forward pass, split into the steps this reuse runs block by block at scattered
+    positions, gives the same bits (golden logits, arm64 and x86) at the same speed: alternating runs on the Mac
+    before and after, a 520-token prompt and 96 tokens, prefill median 5.59 and 5.61 s, decoding 72.2 and 72.1
+    tok/s on Qwen3-0.6B, 9.49 and 9.53 s, 42.0 and 43.7 tok/s on Llama 3.2 1B, the same replies.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user
   request therefore never waits behind background work.
