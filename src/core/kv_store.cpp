@@ -409,6 +409,10 @@ size_t KvStore::file_size(Kind kind, const Item& it) const noexcept {
 size_t KvStore::encode_for_disk(Kind kind, const Item& it, std::span<const std::span<const uint8_t>> parts) {
     encoded_as_ = KvEncoding::Raw;
     if (kind != Kind::Chunk || !config_.layout.valid()) return file_size(kind, it);
+    // A coded stream saves less than its own size: where decoding a symbol
+    // costs at least as much as reading a byte, nothing can pay, and the
+    // chunk is written raw without trying (a set-aside costs what it did).
+    if (!config_.lossy && costs_.read_ns_per_byte <= costs_.decode_ns_per_symbol) return file_size(kind, it);
     const auto& ch = static_cast<const Chunk&>(it);
     const int32_t page = config_.page_tokens;
     const auto slots = static_cast<int32_t>(ch.tokens.size());

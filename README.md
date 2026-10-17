@@ -566,27 +566,45 @@ each of those as a scheduling problem.
     engine removes interrupted writes, damaged files, other format versions, broken chains and the files of
     builds before the store; a chunk whose payload hash does not match when read is removed and the prompt
     processed. One engine at a time uses a directory (an OS lock); another one runs without the storage tier.
-  * **Compressed on storage.** What fills the storage cap is the KV rows, so chunks are written compressed
-    (`src/core/kv_codec.cpp`) and decoded when read back; RAM keeps them as they are, and every cap counts the
-    bytes written. Measured on real pages of Qwen3-0.6B, Qwen3.5-0.8B and Llama 3.2 1B, KV bytes are close to
-    random except the exponents of 16-bit floats, which stay near the largest one their channel takes in the
-    chunk. The lossless encoding therefore stores each 16-bit float (F16 values, Q8_0 block scales) as its low
+  * **Compressed on storage, only where it pays.** What fills the storage cap is the KV rows, so a chunk can be
+    written compressed (`src/core/kv_codec.cpp`) and decoded when read back; RAM keeps rows as they are, and every
+    cap counts the bytes written. Measured on real pages of Qwen3-0.6B, Qwen3.5-0.8B and Llama 3.2 1B, KV bytes are
+    close to random except the exponents of 16-bit floats, which stay near the largest one their channel takes in
+    the page. The lossless encoding therefore stores each 16-bit float (F16 values, Q8_0 block scales) as its low
     byte plus a symbol for its high byte relative to its channel's largest exponent, and codes those symbols with
     our own static rANS coder (12-bit tables per plane, 4 interleaved states, branchless refills). Q8_0 quants are
     coded too, a key channel that changes less from one position to the next than it is large (the slowly turning
-    RoPE pairs) as those differences; a stream that would save less than 1/8 of its bytes (the value quants,
-    ~5%) stays raw, because decoding a coded byte costs about what reading it from UFS 4 does. Layers decode in
-    parallel on the engine's threads. Measured with `liyab-kl --store-codec` over 2,047 positions (31 chunks;
-    every reply and logit identical) and on the Mac's chunk files (M4 Pro, best of 3):
+    RoPE pairs) as those differences. Pages are encoded one by one and decoded straight into the cache's pages,
+    layers in parallel on the engine's threads. With every stream coded (`liyab-kl --store-codec`, 2,047
+    positions, every logit identical; decode and encode on the Mac's chunk files, M4 Pro, best of 3):
 
     | Cache | Stored / raw | Contexts per 512 MB (2,000 tokens) | Decode, 1 thread / 10 | Encode, 10 threads |
     | :--- | ---: | ---: | ---: | ---: |
     | F16 (Qwen3-0.6B, Qwen3.5-0.8B, Llama 3.2 1B) | 1 / 1.168–1.177 | Qwen3-0.6B 2.34 → 2.74 | 0.65–0.89 / 0.11–0.16 ms per MiB | 0.34–0.55 ms per MiB |
-    | Q8_0 (same) | 1 / 1.039–1.092 | Qwen3-0.6B 4.41 → 4.60 | 0.83–1.2 / 0.13–0.29 ms per MiB | 0.5–0.8 ms per MiB |
+    | Q8_0 (same) | 1 / 1.11–1.13 | Qwen3-0.6B 4.41 → 4.90 | 0.83–1.7 / 0.13–0.4 ms per MiB | 0.5–0.8 ms per MiB |
 
-    Q8_0, the default cache, gains least: its quants are nearly random bytes. Old raw chunk files stay readable;
-    a build that does not know an encoding removes its files when it opens the directory. Recurrent state images
-    are stored raw.
+    Restores come first, so a stream is coded only when the read time its smaller size saves exceeds the time
+    decoding it takes, on this device: once per storage directory, cache layout and thread count, the store
+    writes an 8 MiB probe file next to its chunks, reads it back uncached (`O_DIRECT` / `F_NOCACHE`) and through
+    its own buffered, hashed read (a read costs the slower of the two), and decodes a synthetic chunk of the
+    layout on the pool. The result is kept in `cache_dir` (`kv-costs-*.bin`, 16 sets at most), so what is coded
+    is fixed afterwards; where reads cannot be measured uncached, nothing is coded. A coded stream saves less than
+    its own size, so where decoding a symbol costs at least as much as reading a byte nothing can pay: chunks are
+    then written raw without trying, and set-asides and restores are exactly those of raw chunks. While a
+    compressed chunk decodes, the next one's file is read on a thread of its own (`KvStore::read_ahead()`).
+    On the Mac (M4 Pro: reads 8.4–8.8 GB/s, decoding 0.23–0.46 ns per symbol on 10 threads) nothing pays,
+    and restores equal the raw store's (alternating runs, 5 each; "coded" forces every stream coded):
+
+    | Context | Raw store | This build (raw chosen) | Coded | Storage, raw → coded |
+    | :--- | ---: | ---: | ---: | ---: |
+    | Qwen3.5-0.8B Q8_0, 27.9k tokens | 36.3–40.3 ms | 36.3–37.8 ms | 156–192 ms | 213 → 194 MiB |
+    | Qwen3.5-0.8B F16, 27.9k tokens | 59.8–61.5 ms | 60.0–62.2 ms | 84.6–86.8 ms | 367 → 320 MiB |
+    | Qwen3-0.6B Q8_0, 8.3k tokens | 73.2–75.1 ms | 73.1–75.1 ms | 155–161 ms | 480 → 430 MiB |
+    | Qwen3-0.6B F16, 8.3k tokens | 137–141 ms | 134–140 ms | 192–201 ms | 903 → 772 MiB |
+
+    Old raw chunk files stay readable; a build that does not know an encoding removes its files when it opens the
+    directory. Recurrent state images are stored raw: their 32-bit floats would code ~13% smaller (Qwen3.5-0.8B),
+    which on such storage would not pay either.
   * **Lossy, opt-in** (`prefix_cache_lossy`, `--prefix-cache-lossy`): chunks re-quantized to 4 bits on their way
     to storage. Keys channel by channel, each (layer, KV head, channel) with its own minimum and step over the
     chunk's 64 positions, so the few large, nearly constant key channels of some models keep their own range
@@ -1754,7 +1772,7 @@ interpreter: `describe_model_registry`.
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
-| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; chunk encodings: lossless bit for bit for F16, Q8_0, Q4_0 and Q4_1, two planes and one, whole and partial chunks, on one thread and on a pool, malformed payloads failing cleanly, the 4-bit encoding within one step of what it quantizes over; compressed chunks on storage counted by their files, read by a later store, older raw files still read, a lossy store's chunks kept apart from a lossless one's, a damaged compressed payload removed when read |
+| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; chunk encodings: lossless bit for bit for F16, Q8_0, Q4_0 and Q4_1, two planes and one, whole and partial chunks, on one thread and on a pool, malformed payloads failing cleanly, the 4-bit encoding within one step of what it quantizes over; compressed chunks on storage counted by their files, read by a later store, older raw files still read, a lossy store's chunks kept apart from a lossless one's, a damaged compressed payload removed when read, chunks of two pages read into parts cut off the page boundary; coding only where the given costs say it pays (raw files otherwise), measured costs kept and found again, reads ahead in order, with a chunk skipped and out of order |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |

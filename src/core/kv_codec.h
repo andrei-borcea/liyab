@@ -37,7 +37,7 @@
 // Order-0 coding with the per-channel exponent reference reached the measured
 // entropy within a percent; conditioning quants on their channel's magnitude
 // gained about 1% more and was left out. F16 rows come out ~1.17x smaller,
-// Q8_0 rows 1.04-1.09x.
+// Q8_0 rows 1.11-1.13x, with every stream coded.
 //
 // Lossy (KvEncoding::Lossy4, opt-in: KvStore::Config::lossy). Rows are
 // re-quantized to 4 bits on their way to storage:
