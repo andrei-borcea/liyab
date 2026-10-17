@@ -234,6 +234,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->pooling_kv_cache_type = static_cast<liyab_kv_cache_type>(d.pooling_kv_cache_type);
     config->segment_reuse = d.segment_reuse ? 1 : 0;
     config->segment_reuse_max_kl = d.segment_reuse_max_kl;
+    config->prefix_cache_lossy = d.prefix_cache_lossy ? 1 : 0;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -296,6 +297,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.pooling_kv_cache_type = static_cast<liyab::KvCacheType>(config->pooling_kv_cache_type);
         c.segment_reuse = config->segment_reuse != 0;
         c.segment_reuse_max_kl = config->segment_reuse_max_kl;
+        c.prefix_cache_lossy = config->prefix_cache_lossy != 0;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

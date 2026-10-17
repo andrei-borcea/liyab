@@ -4,10 +4,19 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 #include <tuple>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+
+#include "core/direct_io.h"
 #include "core/log.h"
+#include "core/thread_pool.h"
 #include "liyab/mmap_loader.h"  // xxhash64
 
 namespace liyab {
@@ -329,7 +338,15 @@ int32_t remove_kv_dedup_files(const std::string& dir) {
     return removed;
 }
 
-KvStore::KvStore(const Config& config) : config_(config) {}
+KvStore::KvStore(const Config& config) : config_(config) {
+    if (config_.page_tokens <= 0) config_.page_tokens = config_.chunk_tokens;
+    // A lossy store keys its chunks apart: they are never returned to one that
+    // did not opt in.
+    if (config_.lossy) {
+        static constexpr char kLossy[] = "kv-lossy4";
+        config_.seed = hash_after(config_.seed, kLossy, sizeof kLossy - 1);
+    }
+}
 
 KvStore::~KvStore() = default;  // the RAM tier is freed; files stay for later engines; the lock is released
 
@@ -350,6 +367,7 @@ std::unique_ptr<KvStore> KvStore::open(const Config& config) {
         } else {
             store->disk_on_ = true;
             store->scan();
+            store->calibrate();
         }
     }
     if (config.ram_bytes == 0 && !store->disk_on_) return nullptr;
@@ -401,11 +419,55 @@ size_t KvStore::file_size(Kind kind, const Item& it) const noexcept {
     return sizeof(FileHeader) + tokens * sizeof(int32_t) + it.payload_bytes;
 }
 
+size_t KvStore::encode_for_disk(Kind kind, const Item& it, std::span<const std::span<const uint8_t>> parts) {
+    encoded_as_ = KvEncoding::Raw;
+    if (kind != Kind::Chunk || !config_.layout.valid()) return file_size(kind, it);
+    // A coded stream saves less than its own size: where decoding a symbol
+    // costs at least as much as reading a byte, nothing can pay, and the
+    // chunk is written raw without trying (a set-aside costs what it did).
+    if (!config_.lossy && costs_.read_ns_per_byte <= costs_.decode_ns_per_symbol) return file_size(kind, it);
+    const auto& ch = static_cast<const Chunk&>(it);
+    const int32_t page = config_.page_tokens;
+    const auto slots = static_cast<int32_t>(ch.tokens.size());
+    if (config_.layout.image_bytes(slots) != it.payload_bytes) return file_size(kind, it);
+    // The payload as page images: the parts when they are the pages (put()),
+    // else the contiguous rows (from RAM) cut into pages.
+    std::vector<std::span<const uint8_t>> pages;
+    const size_t page_bytes = config_.layout.image_bytes(page);
+    bool by_page = parts.size() == static_cast<size_t>((slots + page - 1) / page);
+    for (size_t k = 0; by_page && k < parts.size(); ++k) {
+        by_page = parts[k].size() == config_.layout.image_bytes(std::min(page, slots - static_cast<int32_t>(k) * page));
+    }
+    if (by_page) {
+        pages.assign(parts.begin(), parts.end());
+    } else if (parts.size() == 1) {
+        for (size_t at = 0; at < parts[0].size(); at += page_bytes) {
+            pages.push_back(parts[0].subspan(at, std::min(page_bytes, parts[0].size() - at)));
+        }
+    } else {
+        return file_size(kind, it);
+    }
+    // Lossy when asked for, else (or where it does not apply) lossless where it pays, else raw.
+    for (const KvEncoding e : {config_.lossy ? KvEncoding::Lossy4 : KvEncoding::Lossless, KvEncoding::Lossless}) {
+        if (kv_encode_chunk(e, config_.layout, page, pages, encoded_, config_.pool, &costs_)) {
+            encoded_as_ = e;
+            encoded_key_ = it.key;
+            return sizeof(FileHeader) + ch.tokens.size() * sizeof(int32_t) + encoded_.size();
+        }
+    }
+    return file_size(kind, it);
+}
+
 bool KvStore::write_item_file(Kind kind, Item& it, std::span<const std::span<const uint8_t>> parts) {
     FileHeader h{};
     std::memcpy(h.magic, kMagic, sizeof kMagic);
     h.version = kFormat;
-    h.encoding = static_cast<uint32_t>(KvEncoding::Raw);
+    // A chunk encode_for_disk() encoded is written encoded.
+    const bool encoded = kind == Kind::Chunk && encoded_as_ != KvEncoding::Raw && encoded_key_ == it.key;
+    const KvEncoding encoding = encoded ? encoded_as_ : KvEncoding::Raw;
+    const std::span<const uint8_t> encoded_payload(encoded_);
+    if (encoded) parts = {&encoded_payload, 1};
+    h.encoding = static_cast<uint32_t>(encoding);
     put_key(h.key, it.key);
     put_key(h.seed, it.seed);
     std::span<const uint8_t> meta;
@@ -427,9 +489,10 @@ bool KvStore::write_item_file(Kind kind, Item& it, std::span<const std::span<con
     }
     size_t payload = 0;
     for (const std::span<const uint8_t> part : parts) payload += part.size();
-    if (payload != it.payload_bytes) return false;
+    if (encoded ? payload >= it.payload_bytes : payload != it.payload_bytes) return false;
     h.meta_bytes = meta.size();
-    h.payload_bytes = h.raw_bytes = payload;
+    h.payload_bytes = payload;
+    h.raw_bytes = it.payload_bytes;
     if (!write_file(path_of(it.key, kind == Kind::Chunk ? ".chunk" : ".state"), h, meta, parts)) {
         LIYAB_LOG_WARN("prefix cache: cannot write to %s", config_.dir.c_str());
         return false;
@@ -437,6 +500,8 @@ bool KvStore::write_item_file(Kind kind, Item& it, std::span<const std::span<con
     it.file_bytes = sizeof h + meta.size() + payload;
     it.payload_offset = sizeof h + meta.size();
     it.payload_hash = h.payload_hash;
+    it.encoding = encoding;
+    encoded_as_ = KvEncoding::Raw;
     return true;
 }
 
@@ -504,10 +569,9 @@ bool KvStore::demote(Kind kind, const KvKey& key, bool or_evict) {
     Item* it = item(kind, key);
     if (it == nullptr || !it->placed) return false;
     if (it->on_disk) return true;
-    if (disk_on_ && make_room(true, file_size(kind, *it), it->clock)) {
+    const std::span<const uint8_t> payload(it->data.get(), it->payload_bytes);
+    if (disk_on_ && make_room(true, encode_for_disk(kind, *it, {&payload, 1}), it->clock)) {
         it = item(kind, key);  // making room never evicts newer items, but stay safe
-        const std::span<const uint8_t> payload(it != nullptr ? it->data.get() : nullptr,
-                                               it != nullptr ? it->payload_bytes : 0);
         if (it != nullptr && write_item_file(kind, *it, {&payload, 1})) {
             lru_[0].erase(it->clock);
             ram_used_ -= it->payload_bytes;
@@ -525,9 +589,10 @@ bool KvStore::demote(Kind kind, const KvKey& key, bool or_evict) {
     return false;
 }
 
-KvStore::Tier KvStore::make_place(Kind kind, const Item& it, bool storage_only) {
+KvStore::Tier KvStore::make_place(Kind kind, const Item& it, bool storage_only,
+                                  const std::function<size_t()>& disk_size) {
     if (!storage_only && config_.ram_bytes > 0 && make_room(false, it.payload_bytes, it.clock)) return Tier::Ram;
-    if (disk_on_ && make_room(true, file_size(kind, it), it.clock)) return Tier::Disk;
+    if (disk_on_ && make_room(true, disk_size ? disk_size() : file_size(kind, it), it.clock)) return Tier::Disk;
     return Tier::None;
 }
 
@@ -673,6 +738,8 @@ void KvStore::drop_record(const KvKey& leaf, bool collect) {
 
 KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) {
     PutResult result;
+    ahead_keys_.clear();
+    ahead_valid_ = false;
     const auto n = static_cast<int32_t>(source.tokens.size());
     if (n <= 0 || (storage_only && !disk_on_) || !source.rows) return result;
     const int32_t c = config_.chunk_tokens;
@@ -771,15 +838,16 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
             const auto n = static_cast<int32_t>(tokens.size());
             // The rows in place (the cache's pages): RAM keeps a copy,
             // storage is written from them.
-            const Tier tier = make_place(Kind::Chunk, ch, storage_only);
-            std::vector<std::span<const uint8_t>> parts;
+            // On storage it takes its encoded size, known once encoded (the
+            // rows are views: asking for them costs nothing).
+            std::vector<std::span<const uint8_t>> parts = source.rows(j, n);
             size_t bytes = 0;
-            if (tier != Tier::None) {
-                parts = source.rows(j, n);
-                for (const std::span<const uint8_t> part : parts) bytes += part.size();
-            }
+            for (const std::span<const uint8_t> part : parts) bytes += part.size();
+            const Tier tier = bytes != ch.payload_bytes
+                                  ? Tier::None
+                                  : make_place(Kind::Chunk, ch, storage_only, [&] { return encode_for_disk(Kind::Chunk, ch, parts); });
             bool stored = false;
-            if (tier != Tier::None && bytes != ch.payload_bytes) {
+            if (bytes != ch.payload_bytes) {
                 LIYAB_LOG_WARN("prefix cache: the rows of a chunk could not be read");
             } else if (tier == Tier::Ram) {
                 ch.data.reset(new uint8_t[ch.payload_bytes]);  // every byte is copied in below
@@ -837,7 +905,7 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
             const KvKey key = state.key;
             auto [it, inserted] = states_.emplace(key, std::move(state));
             State& st = it->second;
-            const Tier tier = make_place(Kind::State, st, storage_only);
+            const Tier tier = make_place(Kind::State, st, storage_only, nullptr);
             bool stored = false;
             if (tier == Tier::Ram) {
                 st.data.reset(new uint8_t[st.payload_bytes]);
@@ -1106,6 +1174,148 @@ void KvStore::used(const Plan& plan) {
     touch_files(order);
 }
 
+void KvStore::read_ahead(std::span<const KvKey> keys) {
+    ahead_keys_.assign(keys.begin(), keys.end());
+    ahead_next_ = 0;
+    ahead_valid_ = false;
+}
+
+void KvStore::calibrate() {
+    costs_ = {};
+    if (!disk_on_ || !config_.layout.valid()) return;
+    if (config_.costs) {
+        costs_ = *config_.costs;
+        return;
+    }
+    // What is measured, and how: bump when the decoder or the measurement changes.
+    constexpr uint64_t kCostsVersion = 2;
+    constexpr char kCostsMagic[4] = {'L', 'Y', 'K', 'C'};
+    constexpr size_t kKeptSets = 16;
+    const KvRowLayout& l = config_.layout;
+    const uint64_t parts[] = {kCostsVersion,
+                              static_cast<uint64_t>(l.type),
+                              static_cast<uint64_t>(l.planes),
+                              static_cast<uint64_t>(l.layers),
+                              static_cast<uint64_t>(l.heads),
+                              static_cast<uint64_t>(l.head_dim),
+                              static_cast<uint64_t>(config_.chunk_tokens),
+                              static_cast<uint64_t>(config_.pool != nullptr ? config_.pool->max_threads() : 1),
+                              xxhash64(config_.dir.data(), config_.dir.size())};
+    const uint64_t id = xxhash64(parts, sizeof parts);
+    std::string kept;
+    if (!config_.calibration_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(os::utf8_path(config_.calibration_dir), ec);
+        char name[40];
+        std::snprintf(name, sizeof name, "/kv-costs-%016llx.bin", static_cast<unsigned long long>(id));
+        kept = config_.calibration_dir + name;
+        if (std::FILE* f = os::open_file(kept, "rb")) {
+            char magic[4] = {};
+            uint64_t stored_id = 0;
+            KvCodecCosts c;
+            const bool ok = std::fread(magic, sizeof magic, 1, f) == 1 && std::memcmp(magic, kCostsMagic, 4) == 0 &&
+                            std::fread(&stored_id, sizeof stored_id, 1, f) == 1 && stored_id == id &&
+                            std::fread(&c.read_ns_per_byte, sizeof(double), 1, f) == 1 &&
+                            std::fread(&c.decode_ns_per_symbol, sizeof(double), 1, f) == 1 &&
+                            c.read_ns_per_byte >= 0 && c.decode_ns_per_symbol >= 0;
+            std::fclose(f);
+            if (ok) {
+                costs_ = c;
+                touch_file(kept);
+                return;
+            }
+        }
+    }
+    // Reads: a file as large as a few chunks, written to the storage
+    // directory and read back uncached in one request, as a chunk file is.
+    constexpr size_t kProbeBytes = size_t{8} << 20;
+    const std::string probe = config_.dir + "/kv-calibration.tmp";
+    double read_ns = 0;
+    {
+        std::vector<uint8_t> bytes(kProbeBytes + DirectFile::kAlign);
+        const auto misalign = reinterpret_cast<uintptr_t>(bytes.data()) % DirectFile::kAlign;
+        uint8_t* buf = bytes.data() + (misalign == 0 ? 0 : DirectFile::kAlign - misalign);
+        uint64_t x = 0x9E3779B97F4A7C15ULL;  // incompressible, should the file system compress
+        for (size_t i = 0; i < kProbeBytes; i += 8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            std::memcpy(buf + i, &x, 8);
+        }
+        bool written = false;
+        if (std::FILE* f = os::open_file(probe, "wb")) {
+            written = std::fwrite(buf, 1, kProbeBytes, f) == kProbeBytes;
+            written = std::fclose(f) == 0 && written;
+        }
+        if (written) {
+            auto file = DirectFile::open(probe);
+            // Only an uncached read measures the storage: through the page
+            // cache the probe would come back at RAM speed and make coding
+            // look free.
+            if (file && (*file)->direct()) {
+                for (int rep = 0; rep < 2; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (!(*file)->read(0, kProbeBytes, buf).is_ok()) {
+                        read_ns = 0;
+                        break;
+                    }
+                    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+                    read_ns = rep == 0 ? ns : std::min(read_ns, ns);
+                }
+            }
+            // The store's own read (buffered, then hashed) costs CPU time a
+            // device read does not show, more than the device time where
+            // storage is fast: a read costs the larger of the two.
+            if (read_ns > 0) {
+                double cpu_ns = 0;
+                for (int rep = 0; rep < 2; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const std::span<uint8_t> into(buf, kProbeBytes);
+                    if (!read_payload(probe, 0, xxhash64(buf, kProbeBytes), {&into, 1})) {
+                        cpu_ns = 0;
+                        read_ns = 0;
+                        break;
+                    }
+                    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+                    cpu_ns = rep == 0 ? ns : std::min(cpu_ns, ns);
+                }
+                read_ns = read_ns > 0 ? std::max(read_ns, cpu_ns) : 0;
+            }
+        }
+    }
+    os::remove_file(probe);
+    const double decode = kv_calibrate_decode(l, config_.chunk_tokens, config_.pool);
+    if (read_ns <= 0 || decode <= 0) {
+        // Nothing measured: nothing is coded, so restores never pay for it.
+        costs_ = {0, 1};
+        LIYAB_LOG_INFO("prefix cache: storage reads could not be measured uncached; chunks stored raw");
+    } else {
+        costs_ = {read_ns / static_cast<double>(kProbeBytes), decode};
+        LIYAB_LOG_INFO("prefix cache: storage reads %.2f GB/s, decoding %.2f ns per coded symbol: chunks coded where "
+                       "that pays",
+                       1.0 / costs_.read_ns_per_byte, costs_.decode_ns_per_symbol);
+    }
+    if (kept.empty()) return;
+    if (std::FILE* f = os::open_file(kept + ".tmp", "wb")) {
+        bool ok = std::fwrite(kCostsMagic, 4, 1, f) == 1 && std::fwrite(&id, sizeof id, 1, f) == 1 &&
+                  std::fwrite(&costs_.read_ns_per_byte, sizeof(double), 1, f) == 1 &&
+                  std::fwrite(&costs_.decode_ns_per_symbol, sizeof(double), 1, f) == 1;
+        ok = std::fclose(f) == 0 && ok;
+        if (!ok || !os::replace_file(kept + ".tmp", kept)) os::remove_file(kept + ".tmp");
+    }
+    // At most kKeptSets sets, least recently used out first.
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> sets;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(os::utf8_path(config_.calibration_dir), ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string name = os::path_utf8(it->path().filename());
+        std::error_code time_ec;
+        if (name.starts_with("kv-costs-") && name.ends_with(".bin")) sets.emplace_back(it->last_write_time(time_ec), it->path());
+    }
+    std::sort(sets.begin(), sets.end());
+    for (size_t i = 0; i + kKeptSets < sets.size(); ++i) std::filesystem::remove(sets[i].second, ec);
+}
+
 Status KvStore::read_chunk(const KvKey& key, std::span<const std::span<uint8_t>> parts) {
     auto it = chunks_.find(key);
     if (it == chunks_.end() || !ours(it->second) || !it->second.placed) {
@@ -1123,7 +1333,55 @@ Status KvStore::read_chunk(const KvKey& key, std::span<const std::span<uint8_t>>
         }
         return Status::ok();
     }
-    if (read_payload(path_of(key, ".chunk"), ch.payload_offset, ch.payload_hash, parts)) return Status::ok();
+    // The key read_ahead() expected next, or the list is forgotten.
+    size_t at = ahead_next_;
+    while (at < ahead_keys_.size() && !(ahead_keys_[at] == key)) ++at;
+    if (at == ahead_keys_.size()) {
+        ahead_keys_.clear();
+        ahead_valid_ = false;
+    }
+    ahead_next_ = at + 1;
+    if (ch.encoding == KvEncoding::Raw) {
+        if (read_payload(path_of(key, ".chunk"), ch.payload_offset, ch.payload_hash, parts)) return Status::ok();
+    } else {
+        bool ok = false;
+        if (ahead_valid_ && ahead_key_ == key) {
+            scratch_.swap(ahead_bytes_);
+            ok = ahead_ok_;
+        } else {
+            scratch_.resize(ch.file_bytes - ch.payload_offset);
+            const std::span<uint8_t> stored(scratch_);
+            ok = read_payload(path_of(key, ".chunk"), ch.payload_offset, ch.payload_hash, {&stored, 1});
+        }
+        ahead_valid_ = false;
+        // The next compressed chunk's file, read while this one decodes.
+        std::thread reader;
+        if (ok && ahead_next_ < ahead_keys_.size()) {
+            const auto next = chunks_.find(ahead_keys_[ahead_next_]);
+            if (next != chunks_.end() && ours(next->second) && next->second.placed && next->second.on_disk &&
+                next->second.encoding != KvEncoding::Raw) {
+                ahead_key_ = next->first;
+                ahead_bytes_.resize(next->second.file_bytes - next->second.payload_offset);
+                reader = std::thread([this, path = path_of(next->first, ".chunk"), offset = next->second.payload_offset,
+                                      hash = next->second.payload_hash] {
+#if defined(__APPLE__)
+                    // The default QoS may put the reader on an efficiency core,
+                    // slower than the decoding it is meant to keep up with.
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+                    const std::span<uint8_t> into(ahead_bytes_);
+                    ahead_ok_ = read_payload(path, offset, hash, {&into, 1});
+                });
+            }
+        }
+        ok = ok && kv_decode_chunk(ch.encoding, config_.layout, config_.page_tokens, static_cast<int32_t>(ch.tokens.size()),
+                                   scratch_, parts, config_.pool);
+        if (reader.joinable()) {
+            reader.join();
+            ahead_valid_ = true;
+        }
+        if (ok) return Status::ok();
+    }
     LIYAB_LOG_WARN("prefix cache: a chunk file is damaged or unreadable; removed");
     evict(Kind::Chunk, key);
     return Status(ErrorCode::IoError, "prefix cache: a chunk file is damaged or unreadable");
@@ -1237,6 +1495,8 @@ KvStore::Stats KvStore::stats() const {
             ++s.foreign_files;
         } else if (ch.on_disk) {
             ++s.chunks_disk;
+            s.chunk_file_bytes += ch.file_bytes;
+            s.chunk_raw_bytes += ch.payload_bytes;
         } else {
             ++s.chunks_ram;
         }
@@ -1343,8 +1603,15 @@ void KvStore::scan() {
         ch.content = get_key(f->h.content);
         ch.start = f->h.start;
         const auto count = static_cast<size_t>(std::max(f->h.count, 0));
+        // Raw: the rows as they are; an encoding: smaller than the rows. Any
+        // other value is an encoding this build does not know.
+        const uint32_t enc = f->h.encoding;
         bool ok = f->h.count > 0 && f->meta.size() == count * sizeof(int32_t) &&
-                  f->h.encoding == static_cast<uint32_t>(KvEncoding::Raw) && f->h.raw_bytes == f->h.payload_bytes;
+                  (enc == static_cast<uint32_t>(KvEncoding::Raw)
+                       ? f->h.raw_bytes == f->h.payload_bytes
+                       : (enc == static_cast<uint32_t>(KvEncoding::Lossless) ||
+                          enc == static_cast<uint32_t>(KvEncoding::Lossy4)) &&
+                             f->h.payload_bytes < f->h.raw_bytes);
         if (ok) {
             ch.tokens.resize(count);
             std::memcpy(ch.tokens.data(), f->meta.data(), f->meta.size());
@@ -1357,7 +1624,11 @@ void KvStore::scan() {
             }
         }
         if (ok && ch.seed == config_.seed) {
-            ok = count <= c && ch.start % config_.chunk_tokens == 0 && f->h.payload_bytes == rows_bytes(static_cast<int32_t>(count)) &&
+            // This store's own chunks: lossy ones only when it is lossy (its
+            // seed then differs anyway), encoded ones only with a layout.
+            ok = count <= c && ch.start % config_.chunk_tokens == 0 && f->h.raw_bytes == rows_bytes(static_cast<int32_t>(count)) &&
+                 (enc == static_cast<uint32_t>(KvEncoding::Raw) || config_.layout.valid()) &&
+                 (enc != static_cast<uint32_t>(KvEncoding::Lossy4) || config_.lossy) &&
                  kv_chain_key(ch.parent, ch.tokens) == ch.key && kv_content_key(ch.seed, ch.tokens) == ch.content &&
                  (ch.start == 0 || chunks_.at(ch.parent).tokens.size() == c);
         }
@@ -1366,7 +1637,8 @@ void KvStore::scan() {
             continue;
         }
         ch.placed = ch.on_disk = true;
-        ch.payload_bytes = static_cast<size_t>(f->h.payload_bytes);
+        ch.payload_bytes = static_cast<size_t>(f->h.raw_bytes);
+        ch.encoding = static_cast<KvEncoding>(f->h.encoding);
         ch.file_bytes = f->size;
         ch.payload_offset = sizeof(FileHeader) + f->meta.size();
         ch.payload_hash = f->h.payload_hash;

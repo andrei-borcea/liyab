@@ -684,6 +684,14 @@ struct Engine::Impl {
             sc.dir = cfg.prefix_cache_dir;
             sc.disk_bytes = static_cast<size_t>(cfg.prefix_cache_disk_mb) << 20;
         }
+        // Chunks go to storage compressed where that pays (core/kv_codec.h),
+        // encoded and decoded on the engine's pool: the store is used under
+        // the engine's lock, never while a forward pass runs.
+        sc.layout = kv_row_layout(kv.config());
+        sc.page_tokens = kv.config().page_tokens;
+        sc.lossy = cfg.prefix_cache_lossy;
+        sc.pool = pool.get();
+        sc.calibration_dir = cfg.cache_dir;  // what reads and decoding cost here, measured once
         store = KvStore::open(sc);
         if (!store) return;
         const KvStore::Stats st = store->stats();
@@ -798,6 +806,7 @@ struct Engine::Impl {
         };
         std::vector<Pending> pending;
         std::vector<std::span<uint8_t>> parts;
+        store->read_ahead(plan.chunks);  // compressed chunks: the next file is read while one decodes
         for (size_t i = 0; i < plan.chunks.size(); ++i) {
             const auto start = static_cast<int32_t>(i) * c;
             const int32_t n = plan.chunk_sizes[i];

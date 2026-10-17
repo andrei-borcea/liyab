@@ -277,10 +277,15 @@ void usage() {
                  "  --prefix-cache-disk MB DIR  keep what RAM does not hold in files in DIR, up to MB of\n"
                  "                     storage (default 0: off); the run's context goes there too when it\n"
                  "                     ends, so a later run whose prompt starts with the same text (a\n"
-                 "                     system prompt) restores it instead of processing it again\n"
+                 "                     system prompt) restores it instead of processing it again; chunks\n"
+                 "                     are compressed losslessly where that pays on this device (measured\n"
+                 "                     once, kept in --cache-dir)\n"
+                 "  --prefix-cache-lossy  store them re-quantized to 4 bits instead (lossy: 3.4x smaller\n"
+                 "                     than F16 rows, 1.8x than Q8_0; see the README for its cost)\n"
                  "  --prefix-stats     print what the prefix cache holds and did, after the run\n"
                  "  --cache-dir DIR    keep what is measured once per model in DIR (the key scales of a\n"
-                 "                     quantized KV cache), so later runs skip it (default: measured each run)\n"
+                 "                     quantized KV cache, what reading and decoding prefix-cache chunks\n"
+                 "                     cost), so later runs skip it (default: measured each run)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -361,6 +366,8 @@ int main(int argc, char** argv) {
         else if (arg == "--prefix-cache-disk") {
             config.prefix_cache_disk_mb = std::atoll(next());
             config.prefix_cache_dir = next();
+        } else if (arg == "--prefix-cache-lossy") {
+            config.prefix_cache_lossy = 1;
         }
         else if (arg == "--cache-dir") config.cache_dir = next();
         else if (arg == "--threads") config.n_threads = std::atoi(next());

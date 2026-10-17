@@ -28,6 +28,15 @@
 // model's own BOS rule (tokenizer.ggml.add_bos_token). A quantized KV cache
 // stores keys per-channel scaled, as the engine does (core/key_scaling.h);
 // --no-key-scaling stores them as computed, to measure what the scaling saves.
+//
+// --store-codec lossless|lossy4 measures an encoding of the prefix cache's
+// chunks on storage (core/kv_codec.h): every KV page the text fills is
+// encoded and decoded again as the store would write and read it, and the
+// positions after it attend to the decoded rows, as after a restore. It
+// prints the compression ratio and the encode / decode time per MiB (with the
+// thread pool, and decoding on one thread); a lossless encoding must give the
+// same bytes back (exit status 1 otherwise), so its comparison against a
+// reference saved without the option shows KL 0.
 // The two runs are separate processes: a 35B MoE does not fit twice in RAM.
 // The text goes through in passes of --batch tokens (64 by default);
 // --latent-form pins how a latent-attention model attends (auto, absorbed or
@@ -38,6 +47,7 @@
 // backend, with the engine's expert streaming (--memory-budget and
 // --expert-cache like liyab-cli; --requant applies only when experts stream).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +57,7 @@
 #include <string>
 #include <vector>
 
+#include "core/kv_codec.h"
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
 #include "core/transformer.h"
@@ -75,13 +86,16 @@ int usage() {
                  "                [--experts N] [--threads N] [--max-tokens N (default 512)]\n"
                  "                [--kv f16|q8_0|q4_0|q4_1 (default q8_0)] [--no-key-scaling] [--ref-tokens]\n"
                  "                [--max-kl KL] [--min-top1 PERCENT] [--batch N (default 64)]\n"
-                 "                [--latent-form auto|absorbed|expanded]\n"
+                 "                [--latent-form auto|absorbed|expanded] [--store-codec lossless|lossy4]\n"
                  "  --no-key-scaling   quantized caches: store keys as computed, not per-channel scaled\n"
                  "  --ref-tokens       compare on the reference's token ids, not this build's encoding\n"
                  "  --max-kl KL        fail (exit 1) when the mean KL divergence exceeds KL\n"
                  "  --min-top1 P       fail (exit 1) when the top-1 agreement is below P percent\n"
                  "  --batch N          tokens per forward pass\n"
-                 "  --latent-form F    latent attention: auto (default), absorbed or expanded\n");
+                 "  --latent-form F    latent attention: auto (default), absorbed or expanded\n"
+                 "  --store-codec C    encode and decode every KV page the text fills as the prefix cache\n"
+                 "                     stores chunks (lossless | lossy4), later positions attending to the\n"
+                 "                     decoded rows; prints the ratio and the time per MiB\n");
     return 2;
 }
 
@@ -134,6 +148,7 @@ int main(int argc, char** argv) {
     int64_t budget_mb = 0, expert_cache_mb = -1;
     bool ref_tokens = false;
     bool key_scaling = true;
+    liyab::KvEncoding store_codec = liyab::KvEncoding::Raw;  // Raw: pages stay as computed
     liyab::KvCacheType kv_type = liyab::KvCacheType::Q8_0;
     double max_kl = -1.0, min_top1 = -1.0;  // < 0: no gate
     int32_t chunk = kChunk;
@@ -154,6 +169,12 @@ int main(int argc, char** argv) {
         else if (arg == "--max-tokens") max_tokens = std::atoi(next());
         else if (arg == "--ref-tokens") ref_tokens = true;
         else if (arg == "--no-key-scaling") key_scaling = false;
+        else if (arg == "--store-codec") {
+            const std::string c = next();
+            if (c == "lossless") store_codec = liyab::KvEncoding::Lossless;
+            else if (c == "lossy4") store_codec = liyab::KvEncoding::Lossy4;
+            else return usage();
+        }
         else if (arg == "--kv") {
             const std::string v = next();
             if (v == "f16") kv_type = liyab::KvCacheType::F16;
@@ -294,6 +315,11 @@ int main(int argc, char** argv) {
     std::vector<double> kls;
     int32_t agree = 0;
     std::vector<int32_t> order(vocab);
+    struct {
+        int32_t pages = 0;  // round-tripped so far
+        size_t raw = 0, stored = 0;
+        double encode_ms = 0, decode_ms = 0, decode1_ms = 0;
+    } codec;
     for (size_t begin = 0; begin + 1 < tokens.size(); begin += static_cast<size_t>(chunk)) {
         const size_t end = std::min(tokens.size() - 1, begin + static_cast<size_t>(chunk));
         const std::span<const int32_t> chunk(tokens.data() + begin, end - begin);
@@ -303,6 +329,42 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<float> rows(logits->begin(), logits->end());
+        if (store_codec != liyab::KvEncoding::Raw) {
+            // Every page filled by now goes through the encoding, as the store
+            // writes a chunk and reads it back.
+            liyab::KvCache& kv = model->mutable_kv_cache();
+            const int32_t page = kv.config().page_tokens;
+            const liyab::KvRowLayout layout = liyab::kv_row_layout(kv.config());
+            for (; static_cast<size_t>(codec.pages + 1) * static_cast<size_t>(page) <= end; ++codec.pages) {
+                std::vector<uint8_t> image(kv.rows_bytes(page)), back(image.size()), stored;
+                if (!kv.read_rows(codec.pages, page, image.data()).is_ok()) return 1;
+                auto t0 = std::chrono::steady_clock::now();
+                const bool encoded = liyab::kv_encode(store_codec, layout, page, image, stored, &pool);
+                auto t1 = std::chrono::steady_clock::now();
+                if (!encoded) {
+                    std::fprintf(stderr, "--store-codec: the encoding does not apply to this cache\n");
+                    return 1;
+                }
+                const bool decoded = liyab::kv_decode(store_codec, layout, page, stored, back, &pool);
+                auto t2 = std::chrono::steady_clock::now();
+                std::vector<uint8_t> again(image.size());
+                liyab::kv_decode(store_codec, layout, page, stored, again, nullptr);
+                auto t3 = std::chrono::steady_clock::now();
+                if (!decoded || again != back ||
+                    (store_codec == liyab::KvEncoding::Lossless && back != image)) {
+                    std::fprintf(stderr, "--store-codec: page %d does not decode to %s\n", codec.pages,
+                                 decoded ? "the same bytes" : "anything");
+                    return 1;
+                }
+                if (!kv.write_rows(codec.pages, back.data(), page, 0, page).is_ok()) return 1;
+                const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                codec.raw += image.size();
+                codec.stored += stored.size();
+                codec.encode_ms += ms(t0, t1);
+                codec.decode_ms += ms(t1, t2);
+                codec.decode1_ms += ms(t2, t3);
+            }
+        }
         for (size_t r = 0; r < chunk.size(); ++r) {
             const size_t t = begin + r;
             float* row = rows.data() + r * vocab;
@@ -342,6 +404,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "\r%zu / %zu positions", end, tokens.size() - 1);
     }
     std::fprintf(stderr, "\n");
+    if (codec.pages > 0) {
+        const double mib = static_cast<double>(codec.raw) / (1024.0 * 1024.0);
+        std::printf("store codec: %d pages, %.2f MiB -> %.2f MiB (ratio %.3f) | per MiB: encode %.3f ms, decode %.3f ms "
+                    "(%d threads), %.3f ms (1 thread)\n",
+                    codec.pages, mib, static_cast<double>(codec.stored) / (1024.0 * 1024.0),
+                    static_cast<double>(codec.raw) / static_cast<double>(codec.stored), codec.encode_ms / mib,
+                    codec.decode_ms / mib, pool.max_threads(), codec.decode1_ms / mib);
+    }
 
     if (compare_path.empty()) {
         std::ofstream out(save_path, std::ios::binary);

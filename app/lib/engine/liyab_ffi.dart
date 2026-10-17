@@ -103,6 +103,7 @@ final class LiyabEngineConfig extends Struct {
   external int segmentReuse; // segment reuse (lossy, opt-in per request); 0: off
   @Float()
   external double segmentReuseMaxKl;
+  external int prefixCacheLossy;
 }
 
 /// liyab_pooling: what a model does with its final hidden states (liyab_engine_pooling).

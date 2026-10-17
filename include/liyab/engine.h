@@ -142,12 +142,25 @@ struct EngineConfig {
     // format versions, the ctx-*.state files of builds before the store).
     // One engine at a time uses a directory (an OS lock on kv.lock there):
     // another one, in this process or another, runs without the storage tier.
+    // Chunks are written compressed losslessly only where that pays on the
+    // device (the read time saved exceeds the decode time, both measured once
+    // and kept in cache_dir; on fast flash or SSD nothing pays and chunks stay
+    // raw), and decoded on the engine's threads when read back; the cap
+    // counts the bytes written. Earlier builds' raw files stay readable.
     std::string prefix_cache_dir;
     int64_t prefix_cache_disk_mb = 0;
+    // Chunks on storage are compressed losslessly where that pays (README,
+    // Prefix cache). true re-quantizes them to 4 bits instead (keys per channel over the
+    // chunk's positions, values in 32-channel blocks): 3.4x smaller than an
+    // F16 cache's rows, 1.8x than Q8_0, at a measured cost (README); lossy,
+    // so off by default. A lossy engine keys its chunks apart: they are never
+    // restored by an engine without it, nor its lossless ones by it.
+    bool prefix_cache_lossy = false;
     // What the engine measures once per model and keeps, in this directory
     // (created if missing): today the key scales of a quantized KV cache
     // (README, KV cache), a few KB per model, at most 16 models, least
-    // recently used out first. Empty: measured again at every load (on the
+    // recently used out first, and what reading and decoding prefix-cache
+    // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16). Empty: measured again at every load (on the
     // reference phone 0.27 s for a 4B model, 1.4 s for a 35B MoE whose experts
     // stream, 7.4 s for a dense 27B larger than RAM).
     std::string cache_dir;

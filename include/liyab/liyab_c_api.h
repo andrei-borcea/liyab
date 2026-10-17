@@ -109,11 +109,12 @@ typedef struct liyab_engine_config {
     int64_t prefix_cache_mb;      /* RAM at most for contexts other conversations replaced, restored when a prompt continues one (a store of KV chunks: shared prefixes kept once); 0 off (see EngineConfig) */
     const char* prefix_cache_dir; /* non-NULL with prefix_cache_disk_mb > 0: what RAM does not hold goes to files here, which outlive the engine (it sets its context aside there when destroyed) and later engines restore from */
     int64_t prefix_cache_disk_mb; /* storage at most for them; 0 off */
-    const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (today the key scales of a quantized KV cache, a few KB per model); NULL: measured at every load */
+    const char* cache_dir;        /* non-NULL: what the engine measures once per model is kept here (the key scales of a quantized KV cache, a few KB per model; what reading and decoding prefix-cache chunks cost on this device); NULL: measured at every load */
     int32_t suffix_drafts;        /* with lookup_drafts: nonzero (the default) drafts from the suffix drafter (this and earlier conversations of the engine, ~2 MiB at most), 0 by context lookup (see EngineConfig); a zero-filled config without liyab_engine_config_default gets context lookup */
     liyab_kv_cache_type pooling_kv_cache_type; /* KV cache of a pooling model (embeddings, reranker: its GGUF declares a pooling_type), instead of kv_cache_type; LIYAB_KV_F16 by default (see EngineConfig) */
     int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model in the background while the engine is idle, off until then (kept in cache_dir; see EngineConfig); 0 (default) off */
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.02) */
+    int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of compressed losslessly (lossy; 0 default, see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
