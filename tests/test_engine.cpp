@@ -3218,6 +3218,22 @@ TEST_CASE("A chat after a long shared system prompt is set aside and comes back;
         REQUIRE(e.prefill(a2 + out + draft1, true).is_ok());
         REQUIRE(e.prefill(a2 + out + draft2, true).is_ok());
         CHECK(e.prefix_cache_stats().set_asides == before);
+        // A short chat C, then A again. Leaving C rewinds it to the system
+        // prompt on an attention-only model (40 tokens to process again: C
+        // is not set aside), to its start on a hybrid one (no snapshot below:
+        // C is set aside). Either way the store gives A back, more than the
+        // live context keeps.
+        e.reset_context();
+        std::string c = " c:";
+        for (int i = 0; i < 40; ++i) c += i % 2 ? " world" : " hello";
+        run(e, system + c);
+        const uint64_t aside = e.prefix_cache_stats().set_asides, restores = e.prefix_cache_stats().restores;
+        const std::string a3 = a2 + out + " world";
+        const std::string out3 = run(e, a3, &st);
+        CHECK(out3 == run(*reference.value(), a3));
+        CHECK(st.cached_prefix_tokens >= static_cast<int32_t>(e.tokenize(a1, true)->size()) + 5);
+        CHECK(e.prefix_cache_stats().restores == restores + 1);
+        CHECK(e.prefix_cache_stats().set_asides == aside + (std::string(arch) == "qwen35" ? 1 : 0));
     }
 }
 

@@ -94,11 +94,13 @@ struct EngineConfig {
     // Prefix cache, MiB of RAM at most (0: off): contexts another
     // conversation's prompt replaced (or an embed() / rerank() call) are kept
     // and restored when a prompt continues one, instead of processing it
-    // again, cut back to where the two diverge. A prompt replaces the context
-    // when it shares less than half of it, or leaves it before the end of its
-    // last prompt with at least 128 tokens to drop (another chat after a long
-    // shared system prompt, an edited message); a draft typed ahead and then
-    // edited after the last reply does not. Contexts are kept in a
+    // again, cut back to where the two diverge (whenever that gives back more
+    // than the live context keeps). A prompt replaces the context when it
+    // shares less than half of it, or leaves it before the end of its last
+    // prompt and rewinding would process at least 128 tokens again (another
+    // chat after a long shared system prompt, an edited message; on a hybrid
+    // model, back to its nearest state snapshot); a draft typed ahead and
+    // then edited after the last reply does not. Contexts are kept in a
     // content-addressed store of KV chunks: one KV page of tokens each, keyed
     // by every token before it plus the model, cache layout, key scales and
     // kernels, so a prefix conversations share (system prompt, tools) is

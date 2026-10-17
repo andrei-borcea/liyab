@@ -628,21 +628,25 @@ struct Engine::Impl {
         const size_t n = std::min({context.size(), tokens.size(), limit});
         while (common < n && context[common] == tokens[common]) ++common;
         if (common == context.size()) return common;  // pure continuation: nothing to drop
-        // Set aside when the prompt replaces the context: it shares less
-        // than half of it, or leaves it before its last prompt's end with at
-        // least kMinPrefixEntry tokens to drop (another chat after a long
-        // shared system prompt). A draft edited after the last reply is not:
-        // it would write state images at every keystroke.
-        const bool replaced = common < context.size() / 2 ||
-                              (common < last_prompt_end && context.size() - common >= kMinPrefixEntry);
-        if (prefix_cache_on() && replaced) {
-            stash_context();
-            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
-            if (context.empty()) return 0;  // a cached context failed to restore
-        }
         // Attention-only models rewind to any position; hybrid ones to the
         // nearest recurrent-state checkpoint or snapshot below it.
         const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
+        if (prefix_cache_on()) {
+            // Set aside when the prompt replaces the context: it shares less
+            // than half of it, or leaves it before its last prompt's end and
+            // rewinding would process at least kMinPrefixEntry tokens again
+            // (another chat after a long shared system prompt; on a hybrid
+            // model, back to its nearest snapshot, possibly the start). A
+            // draft edited after the last reply is not: it would write state
+            // images at every keystroke.
+            const bool replaced = common < context.size() / 2 ||
+                                  (common < last_prompt_end && context.size() - keep >= kMinPrefixEntry);
+            if (replaced) stash_context();
+            // The store may hold more of this prompt than the context keeps
+            // (the conversation it continues, set aside earlier).
+            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
+            if (context.empty()) return 0;  // a cached context failed to restore
+        }
         // Diverging from the context costs a recomputation from `keep`: say
         // where, so a slow turn can be traced to its cause.
         LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, context.size(),

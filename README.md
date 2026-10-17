@@ -535,9 +535,11 @@ each of those as a scheduling problem.
   They are set aside from the expert cache's budget (62.8 MiB each on the 35B).
 * **Prefix cache across conversations** (`prefix_cache_mb`, `prefix_cache_dir`). A context that another prompt
   replaces (or an embedding call) is set aside in a content-addressed store of KV chunks. A prompt replaces it when
-  it shares less than half of it, or leaves it before the end of its last prompt with at least 128 tokens to drop:
-  another chat after a long shared system prompt, an edited message. A draft typed ahead and edited after the last
-  reply keeps using the context's own snapshots instead. A chunk is one page
+  it shares less than half of it, or leaves it before the end of its last prompt and rewinding would process at
+  least 128 tokens again: another chat after a long shared system prompt, an edited message (on a hybrid model,
+  rewinding goes back to the nearest state snapshot). A draft typed ahead and edited after the last reply keeps
+  using the context's own snapshots instead. Whenever a prompt leaves the context, the store is asked for more of
+  it than the context keeps. A chunk is one page
   of the paged KV cache (64 tokens), keyed by a hash chained over every token before it and rooted in what its bytes
   depend on (the model file, cache layout and type, key scales, kernels and backends). A prefix that several
   conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
