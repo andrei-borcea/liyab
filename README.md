@@ -1602,7 +1602,8 @@ includes them, all off by default). Enable them through `EngineConfig::experimen
 ## Testing
 
 The tests depend on nothing beyond the compiler. They generate small GGUF models on the fly, so nothing needs to be
-downloaded.
+downloaded. One check is in Python (standard library only) and is registered when CMake finds a Python 3
+interpreter: `describe_model_registry`.
 
 | Suite | Covers |
 | :--- | :--- |
@@ -1616,6 +1617,7 @@ downloaded.
 | `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
+| `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
 | `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), each shape of a time read as local time, XML string values under a length bound or an unchecked format that cannot take in their closing tag, a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; with `LIYAB_TOOL_MODEL=a.gguf,b.gguf` on a Mac, real models answer questions for each tool through the app's prompt and structure, every call valid, and the grammar's cost per token is printed; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses |
 
 Benchmarks and tools built with the tests:
@@ -1692,6 +1694,25 @@ Benchmarks and tools built with the tests:
       --cases tests/data/pooling_cases.json --out pooling.ref.json
   build/liyab-embed -m Qwen3-Embedding-0.6B-f16.gguf --cases tests/data/pooling_cases.json --ref pooling.ref.json
   build/liyab-embed -m Qwen3-Reranker-0.6B-BF16.gguf --cases tests/data/pooling_cases.json --ref pooling.ref.json
+  ```
+
+* `tools/describe_model.py`: the registry row a model needs, established from its Hugging Face implementation
+  and a GGUF of it, or the precise list of parts Liyab does not implement yet; it never guesses a fact it cannot
+  establish. `tools/reference_trace.py` runs a reduced copy of the transformers model with random weights and
+  recomputes what it observes (block order and residual adds, norm formulas, RoPE pairing and frequencies, Q/K norm
+  order, attention scale, window and soft-cap, FFN activation, MoE routing, embedding and logit scaling); the GGUF's
+  metadata, tensor names and a few weights of both checkpoints (one key projection, one block's norms, read with
+  HTTP range requests when remote) give the rest. `--gate` adds the row to a scratch copy of the sources (the
+  repository is not touched), builds `liyab-kl` and `liyab-tok` there, and accepts the row only if the tokenizer
+  gives the model's own ids on three texts and `liyab-kl --kv f16` passes against transformers. How each fact is
+  established and what the tool said about the supported architectures and others:
+  [docs/model-descriptions.md](docs/model-descriptions.md).
+
+  ```bash
+  tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
+  tools/describe_model.py --model unsloth/gemma-2-2b-it \
+      --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf     # a few MB of the file
+  tools/describe_model.py --model baidu/ERNIE-4.5-0.3B-PT --gguf ERNIE-4.5-0.3B-PT-F16.gguf --gate
   ```
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
@@ -1777,7 +1798,8 @@ Implemented features are described above. These are next, in order:
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
    Hugging Face (`liyab-kl`); YaRN RoPE and logit soft-capping are read from the file (Gemma 2 runs), and experts
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
-   Youtu-LLM). Next:
+   Youtu-LLM). A model's row is established from its Hugging Face implementation and a GGUF and verified by the
+   conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
    * group-limited expert routing (DeepSeek-V3), and attention in the expanded form for long prefills of latent
      attention;
    * per-block KV caches, so blocks with a sliding window keep only their window's rows;
@@ -1843,6 +1865,9 @@ Implemented features are described above. These are next, in order:
   supported either (a new one is a table row): Youtu-LLM's `youtu` is not one yet, so its text cannot be encoded.
   The model runs on token ids with an F16 KV cache only: a quantized cache's key scaling must encode its
   calibration text first, and the engine refuses to load the model when it cannot.
+  `tools/describe_model.py` lists what each model lacks; for Mistral-Nemo (its `tekken` pre-tokenizer only), OLMo 2,
+  Granite, SmolLM2 (its `smollm` pre-tokenizer only) and SmolLM3, see
+  [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
 * **Latent attention** attends in the absorbed form also during prefill: per position and head it scores 576
   channels and accumulates 512 on DeepSeek-V2-Lite where expanded keys and values would take 192 and 128, so a long
   prompt costs more attention work than an expanded form would (the decode step, which reads the cache, is what
@@ -1899,7 +1924,9 @@ src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, KV d
 src/c_api/              C ABI implementation
 tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
                         liyab-embed, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
-                        and pooling_reference.py (Hugging Face references),
+                        and pooling_reference.py (Hugging Face references), describe_model.py and
+                        reference_trace.py (registry rows established from the Hugging Face implementation and
+                        verified),
                         gguf_vocab.py, gguf_fuse_experts.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
@@ -1910,6 +1937,8 @@ app/                    the Liyab app (Flutter): lib/engine (FFI + scheduler), l
                         command-bar window, device and data channels)
 docs/benchmarks/        measurements (results.json) and the charts drawn from them
 docs/research/          measured studies (cold-experts.md: smaller representations of rarely used experts)
+docs/model-descriptions.md  how tools/describe_model.py establishes a model's registry row, and what it said
+                        about the supported architectures, new models and unsupported ones
 docs/brand/             the Liyab mark, app icon, the README's animated images and the social preview
                         (tools/gen_brand_svgs.py)
 scripts/                build_android.sh, build_ios.sh, build_flutter_app.sh, phone_regression.py, thread_cpu.py
@@ -1937,6 +1966,11 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   then `liyab-kl --compare … --kv f16`). When the weights are too large to fetch, a small random model built by
   transformers' own code for the architecture and converted to GGUF checks the same paths. New kinds of blocks still
   need engine code (see the [roadmap](#roadmap)).
+  `tools/describe_model.py --model <id> --gguf <file> --gate` does the description and the conformance run for you:
+  it establishes the row from the reference implementation and the GGUF, or lists the parts Liyab lacks, then
+  builds a scratch copy with the row and accepts it only if the tokenizer and `liyab-kl` checks pass
+  ([docs/model-descriptions.md](docs/model-descriptions.md)). An `ArchSpec` field added to `architecture.h` needs
+  its rule in that tool too: until then it refuses to propose rows.
 * **Before a pull request:** `ctest --test-dir build --output-on-failure` on the host, the test suites on an ARM64
   device for kernel changes, and `flutter analyze && flutter test` in `app/` for app changes.
 
