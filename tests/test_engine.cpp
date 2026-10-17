@@ -3105,14 +3105,15 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
         spec.arch = arch;
         spec.n_layers = 4;
         if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
-        EngineConfig config = engine_config(model_path(std::string("prefix_") + arch, spec));
+        spec.context_length = 1024;  // a system prompt of several chunks and a question
+        EngineConfig config = engine_config(model_path(std::string("prefix_1k_") + arch, spec));
         config.backend = BackendKind::Cpu;
-        // Passes of 256 tokens (max_batch follows draft_tokens; no drafting
+        // Passes of 1024 tokens (max_batch follows draft_tokens; no drafting
         // without a draft model or lookup): the system prompt is processed
         // in one pass, so its end is a hybrid model's oldest snapshot, the
         // one set-aside contexts keep, as on a MoE whose experts stream
         // (1024-token passes). With 64-token passes the oldest is at 64.
-        config.draft_tokens = 255;
+        config.draft_tokens = 1023;
         auto fresh = Engine::create(config);
         config.prefix_cache_mb = 64;
         auto cached = Engine::create(config);
@@ -3127,9 +3128,10 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
             return st ? text : std::string("<error>");
         };
         std::string system = "system:";
-        for (int i = 0; i < 150; ++i) system += i % 4 ? " hello" : " world";
-        // Each question is longer than the system prompt, so the next one
-        // sets the conversation aside; they part after a few words.
+        for (int i = 0; i < 600; ++i) system += i % 4 ? " hello" : " world";
+        // Each question drops more than 128 tokens when the next one comes,
+        // so the next one sets the conversation aside; they part after a few
+        // words.
         auto question = [](int q) {
             std::string text = q % 2 ? " world world" : " hello hello";
             for (int i = 0; i < 220; ++i) text += (i / (q + 1)) % 2 ? " hello" : " world";
@@ -3150,7 +3152,9 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
         Engine::PrefixCacheStats ps = e.prefix_cache_stats();
         const uint64_t restores = ps.restores;  // attention-only: the third question restored the first's start
         CHECK(ps.set_asides == 2);
-        CHECK(ps.chunks_reused >= static_cast<uint64_t>(system_tokens / 64));
+        REQUIRE(ps.chunk_tokens > 0);
+        CHECK(system_tokens / ps.chunk_tokens >= 2);
+        CHECK(ps.chunks_reused >= static_cast<uint64_t>(system_tokens / ps.chunk_tokens));
         CHECK(ps.chunks < static_cast<int32_t>(ps.chunks_written + ps.chunks_reused));
         // A new conversation with nothing live: the system prompt comes from the store.
         e.reset_context();

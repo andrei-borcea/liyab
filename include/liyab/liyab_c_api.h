@@ -510,6 +510,7 @@ typedef struct liyab_prefix_cache_stats {
     uint64_t restores;           /* prompts that restored a prefix */
     uint64_t restored_tokens;    /* positions restored */
     double restore_ms;           /* total time restoring */
+    int32_t chunk_tokens;        /* positions per chunk: whole KV pages, about 2 MiB */
     /* Segment reuse */
     int32_t segments;                    /* stored segment copies */
     uint64_t segments_kept;              /* segments stored */

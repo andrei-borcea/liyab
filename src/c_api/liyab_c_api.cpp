@@ -733,8 +733,9 @@ liyab_status liyab_engine_prefix_cache_stats(const liyab_engine* engine, liyab_p
     *out_stats = liyab_prefix_cache_stats{s.ram_bytes,     s.ram_cap_bytes,  s.storage_bytes,   s.storage_cap_bytes,
                                           s.chunks,        s.state_images,   s.contexts,        s.set_asides,
                                           s.chunks_written, s.chunks_reused, s.set_aside_ms,    s.restores,
-                                          s.restored_tokens, s.restore_ms,  s.segments,        s.segments_kept,
-                                          s.segment_reuses, s.segment_reused_tokens, s.segment_recomputed_tokens};
+                                          s.restored_tokens, s.restore_ms,    s.chunk_tokens,    s.segments,
+                                          s.segments_kept, s.segment_reuses, s.segment_reused_tokens,
+                                          s.segment_recomputed_tokens};
     return LIYAB_OK;
 }
 

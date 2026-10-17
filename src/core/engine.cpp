@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -491,7 +492,7 @@ struct Engine::Impl {
     // (Transformer::context_fingerprint): the kernels and backends that
     // computed them and every option that changes hidden states, so chunks
     // are only restored where recomputing them would give the same bits.
-    [[nodiscard]] KvKey store_seed(bool repacked) const {
+    [[nodiscard]] KvKey store_seed(bool repacked, int32_t chunk_pages) const {
         auto hash = [](std::string_view text) { return xxhash64(text.data(), text.size()); };
         auto kind = [&](const Backend* b) {  // "cpu", "metal", "vulkan": not the thread count it describes
             const std::string d = b->description();
@@ -502,7 +503,7 @@ struct Engine::Impl {
             std::memcpy(&u, &f, sizeof u);
             return static_cast<uint64_t>(u);
         };
-        constexpr uint64_t kStoreSeedVersion = 1;
+        constexpr uint64_t kStoreSeedVersion = 1;  // chunk_pages below: chunks of another size are other keys
         const Route route = normal_route();
         const ExperimentalConfig& x = config.experimental;
         const uint64_t parts[] = {kStoreSeedVersion,
@@ -520,7 +521,8 @@ struct Engine::Impl {
                                       (x.tdss ? 8u : 0u) | (x.tdss_force ? 16u : 0u),
                                   bits(x.early_exit_threshold),
                                   bits(x.egls_threshold),
-                                  bits(x.head_keep_ratio)};
+                                  bits(x.head_keep_ratio),
+                                  static_cast<uint64_t>(chunk_pages)};
         return kv_seed_key(parts);
     }
 
@@ -548,10 +550,21 @@ struct Engine::Impl {
             LIYAB_LOG_INFO("prefix cache: off with a draft model");
             return;
         }
+        // Chunks of about kChunkBytes, in whole pages: each is a file on
+        // storage, and creating and renaming a file costs ~120 us on a Mac
+        // (APFS), about writing 1 MB, so pages of a few hundred KB (Qwen3.5,
+        // the 35B: 0.4-0.7 MB) would make a long context hundreds of small
+        // files. At most kMaxChunkPages, so a prefix several conversations
+        // share is still kept to within 256 tokens (the rest of its last
+        // chunk is each conversation's own).
+        constexpr size_t kChunkBytes = size_t{2} << 20;
+        constexpr int32_t kMaxChunkPages = 4;
+        const auto chunk_pages =
+            static_cast<int32_t>(std::clamp<size_t>(kChunkBytes / kv.page_bytes(), 1, kMaxChunkPages));
         KvStore::Config sc;
-        sc.seed = store_seed(repacked);
-        sc.chunk_tokens = kv.config().page_tokens;
-        sc.chunk_bytes = kv.page_bytes();
+        sc.seed = store_seed(repacked, chunk_pages);
+        sc.chunk_tokens = kv.config().page_tokens * chunk_pages;
+        sc.chunk_bytes = kv.page_bytes() * static_cast<size_t>(chunk_pages);
         sc.state_floats = target->recurrent_state_bytes() / sizeof(float);
         sc.ram_bytes = ram;
         if (disk) {
@@ -580,6 +593,7 @@ struct Engine::Impl {
         prefix_stats.chunks = st.chunks_ram + st.chunks_disk;
         prefix_stats.state_images = st.states;
         prefix_stats.contexts = st.records;
+        prefix_stats.chunk_tokens = store->chunk_tokens();
         prefix_stats.segments = st.segments;
     }
 
@@ -598,17 +612,36 @@ struct Engine::Impl {
         // return process the last reply again (123 tokens, 8 s on a 35B).
         const auto watch = Clock::now();
         const KvCache& kv = target->kv_cache();
-        const size_t floats = target->recurrent_state_bytes() / sizeof(float);
         KvStore::ContextSource source;
         source.tokens = std::span<const int32_t>(context).first(exact);
         std::tie(source.text, source.text_tokens) = text_of(exact);
-        source.rows = [&kv](int32_t chunk, int32_t n, uint8_t* out) { return kv.read_rows(chunk, n, out); };
+        // Storage is written straight from the cache's pages and the model's
+        // states: a chunk's image is its pages' images one after the other,
+        // a whole page's being the page itself; only a partial last page is
+        // packed (into `packed`, alive while put() runs).
+        const int32_t page_tokens = kv.config().page_tokens;
+        const int32_t chunk_pages = store->chunk_tokens() / page_tokens;
+        std::deque<std::vector<uint8_t>> packed;
+        source.rows = [&](int32_t chunk, int32_t n) {
+            std::vector<std::span<const uint8_t>> parts;
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                const int32_t page = chunk * chunk_pages + k;
+                const int32_t rows = std::min(page_tokens, n - k * page_tokens);
+                const uint8_t* data = kv.page_data(page);
+                if (data != nullptr && rows == page_tokens) {
+                    parts.emplace_back(data, kv.page_bytes());
+                } else {
+                    packed.emplace_back(kv.rows_bytes(rows));
+                    if (!kv.read_rows(page, rows, packed.back().data()).is_ok()) return std::vector<std::span<const uint8_t>>();
+                    parts.emplace_back(packed.back());
+                }
+            }
+            return parts;
+        };
         // (Segment reuse runs on attention-only models only: a hybrid
         // model's context is always exact, so its states are its end's.)
         for (const Transformer::KeptState& k : target->kept_states()) source.states.push_back({k.pos, k.pinned});
-        source.state = [this, floats](int32_t pos, float* out) {
-            return target->copy_kept_state(pos, std::span<float>(out, floats));
-        };
+        source.state_parts = [this](int32_t pos) { return target->kept_state_parts(pos); };
         const KvStore::PutResult put = store->put(source, storage_only);
         const double ms = ms_since(watch);
         const double mib = 1.0 / (1024.0 * 1024.0);
@@ -639,38 +672,65 @@ struct Engine::Impl {
         const int32_t positions = plan.positions;
         LIYAB_RETURN_IF_ERROR(kv.reserve(positions));
         const int32_t c = store->chunk_tokens();
-        std::vector<uint8_t> image;
+        const int32_t page_tokens = kv.config().page_tokens;
+        const int32_t chunk_pages = c / page_tokens;
+        // A chunk's pages that it restores whole are read straight into the
+        // cache; the others (partial, or partly kept in place) into scratch,
+        // then copied to the rows wanted. The whole chunk is read either way:
+        // its hash covers all of it.
+        std::vector<std::vector<uint8_t>> scratch;
+        struct Pending {
+            int32_t page, rows, from, to;
+            size_t slot;
+        };
+        std::vector<Pending> pending;
+        std::vector<std::span<uint8_t>> parts;
         for (size_t i = 0; i < plan.chunks.size(); ++i) {
             const auto start = static_cast<int32_t>(i) * c;
             const int32_t n = plan.chunk_sizes[i];
             const int32_t from = std::max(static_cast<int32_t>(rows_from) - start, 0);
             const int32_t to = std::min(positions - start, n);
             if (from >= to) continue;
-            if (from == 0 && to == c && n == c) {  // a whole page: read straight into it
-                uint8_t* page = kv.mutable_page_data(static_cast<int32_t>(i));
-                if (page == nullptr) return Status(ErrorCode::Internal, "a restored page is not mapped");
-                LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], std::span<uint8_t>(page, kv.page_bytes())));
-            } else {
-                image.resize(kv.rows_bytes(n));
-                LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], image));
-                LIYAB_RETURN_IF_ERROR(kv.write_rows(static_cast<int32_t>(i), image.data(), n, from, to));
+            parts.clear();
+            pending.clear();
+            size_t used = 0;
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                const int32_t page = static_cast<int32_t>(i) * chunk_pages + k;
+                const int32_t first = k * page_tokens;
+                const int32_t rows = std::min(page_tokens, n - first);
+                uint8_t* data = kv.mutable_page_data(page);
+                if (data != nullptr && rows == page_tokens && from <= first && first + rows <= to) {
+                    parts.emplace_back(data, kv.page_bytes());
+                    continue;
+                }
+                if (scratch.size() <= used) scratch.emplace_back();
+                scratch[used].resize(kv.rows_bytes(rows));
+                parts.emplace_back(scratch[used]);
+                const int32_t lo = std::clamp(from - first, 0, rows), hi = std::clamp(to - first, 0, rows);
+                pending.push_back({page, rows, lo, hi, used});
+                ++used;
+            }
+            LIYAB_RETURN_IF_ERROR(store->read_chunk(plan.chunks[i], parts));
+            for (const Pending& p : pending) {
+                if (p.from < p.to) LIYAB_RETURN_IF_ERROR(kv.write_rows(p.page, scratch[p.slot].data(), p.rows, p.from, p.to));
             }
         }
-        const size_t floats = target->recurrent_state_bytes() / sizeof(float);
-        std::vector<float> state;
-        std::vector<std::vector<float>> snapshots;
-        std::vector<Transformer::SnapshotImage> images;
-        if (floats > 0) {
-            state.resize(floats);
-            LIYAB_RETURN_IF_ERROR(store->read_state(plan.state, state));
-            snapshots.reserve(plan.snapshots.size());
+        // Recurrent states straight into the model and into the buffers of
+        // the snapshots being replaced: no intermediate copy, no allocation
+        // or zero-fill of 62.8 MiB images on a 35B.
+        std::vector<Transformer::OwnedSnapshot> snapshots;
+        if (target->recurrent_state_bytes() > 0) {
+            target->begin_restore();
+            const std::vector<std::span<float>> live = target->recurrent_parts();
+            LIYAB_RETURN_IF_ERROR(store->read_state(plan.state, live));
             for (const KvStore::RecordState& rs : plan.snapshots) {
-                snapshots.emplace_back(floats);
-                LIYAB_RETURN_IF_ERROR(store->read_state(rs.key, snapshots.back()));
-                images.push_back({rs.pos, rs.pinned, snapshots.back()});
+                Transformer::OwnedSnapshot snap{rs.pos, rs.pinned, target->take_snapshot_buffer()};
+                const std::span<float> into(snap.data);
+                LIYAB_RETURN_IF_ERROR(store->read_state(rs.key, {&into, 1}));
+                snapshots.push_back(std::move(snap));
             }
         }
-        return target->adopt_context(positions, state, images, plan.state_pinned);
+        return target->adopt_context(positions, std::move(snapshots), plan.state_pinned);
     }
 
     // Restores the longest prefix of `tokens` (at most `limit` of them) the
@@ -1870,22 +1930,32 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                 if (keys.empty()) return Status(ErrorCode::IoError, "the context set aside is no longer complete");
                 const KvCache& kv = s.target->kv_cache();
                 const int32_t c = s.store->chunk_tokens();
+                const int32_t page_tokens = kv.config().page_tokens;
                 const auto n = static_cast<int32_t>(record.tokens.size());
+                // Pages in order: each chunk's image read once, then cut into
+                // its pages' images (all whole but a context's last).
                 std::vector<uint8_t> image, page(kv.page_bytes());
+                int32_t image_chunk = -1;
                 Status read = Status::ok();
                 Transformer::ContextImage context;
                 context.n = n;
                 context.page = [&](int32_t p) -> const uint8_t* {
-                    const int32_t rows = std::min(c, n - p * c);
-                    image.resize(kv.rows_bytes(rows));
-                    read = s.store->read_chunk(keys[static_cast<size_t>(p)], image);
-                    if (!read.is_ok()) return nullptr;
-                    kv.image_to_page(image.data(), rows, page.data());
+                    const int32_t chunk = p * page_tokens / c;
+                    if (chunk != image_chunk) {
+                        image.resize(kv.rows_bytes(std::min(c, n - chunk * c)));
+                        const std::span<uint8_t> into(image);
+                        read = s.store->read_chunk(keys[static_cast<size_t>(chunk)], {&into, 1});
+                        if (!read.is_ok()) return nullptr;
+                        image_chunk = chunk;
+                    }
+                    const int32_t first = p * page_tokens - chunk * c;  // positions of the chunk before this page
+                    const int32_t rows = std::min(page_tokens, n - p * page_tokens);
+                    kv.image_to_page(image.data() + kv.rows_bytes(first), rows, page.data());
                     return page.data();
                 };
                 const size_t floats = s.target->recurrent_state_bytes() / sizeof(float);
-                std::vector<float> state;
-                std::vector<std::vector<float>> snapshots;
+                Transformer::StateBuffer state;  // images are not zero-filled before they are read
+                std::vector<Transformer::StateBuffer> snapshots;
                 if (floats > 0) {
                     const auto end = std::find_if(record.states.begin(), record.states.end(),
                                                   [n](const KvStore::RecordState& rs) { return rs.pos == n; });
@@ -1893,12 +1963,14 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                         return Status(ErrorCode::Unsupported, "the recurrent states of the context set aside were not kept");
                     }
                     state.resize(floats);
-                    LIYAB_RETURN_IF_ERROR(s.store->read_state(end->key, state));
+                    const std::span<float> into(state);
+                    LIYAB_RETURN_IF_ERROR(s.store->read_state(end->key, {&into, 1}));
                     snapshots.reserve(record.states.size());
                     for (const KvStore::RecordState& rs : record.states) {
                         if (rs.pos >= n) continue;
                         snapshots.emplace_back(floats);
-                        LIYAB_RETURN_IF_ERROR(s.store->read_state(rs.key, snapshots.back()));
+                        const std::span<float> snap(snapshots.back());
+                        LIYAB_RETURN_IF_ERROR(s.store->read_state(rs.key, {&snap, 1}));
                         context.snapshots.push_back({rs.pos, rs.pinned, snapshots.back()});
                     }
                     context.state = state;

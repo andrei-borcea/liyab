@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <numeric>
 #include <random>
 
@@ -131,6 +132,7 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
     // damaged is dropped (its positions are then processed like the others).
     KvCache& kv = model.mutable_kv_cache();
     const int32_t c = store.chunk_tokens();
+    const int32_t page_tokens = kv.config().page_tokens;  // a chunk is whole pages, its image theirs in order
     int32_t end = exact;
     for (const Use& u : uses) end = std::max(end, u.hi);
     auto fail = [&](Status s) {
@@ -138,7 +140,8 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         return s;
     };
     if (Status s = kv.reserve(end); !s.is_ok()) return fail(s);
-    std::vector<uint8_t> image;
+    std::vector<std::vector<uint8_t>> images;  // one per page of a chunk
+    std::vector<std::span<uint8_t>> parts;
     std::vector<uint8_t> filled;  // per position of [exact, end): its rows came from a copy
     filled.assign(static_cast<size_t>(end - exact), 0);
     for (Use& u : uses) {
@@ -149,20 +152,31 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         for (size_t i = 0; i < u.copy.chunks.size() && ok; ++i) {
             const int32_t start = static_cast<int32_t>(i) * c;
             const int32_t n = u.copy.chunk_sizes[i];
-            const int32_t s0 = std::max(first, start) - start, s1 = std::min(last, start + n) - start;
-            if (s0 >= s1) continue;
-            image.resize(kv.rows_bytes(n));
+            if (std::max(first, start) >= std::min(last, start + n)) continue;
+            parts.clear();
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                if (images.size() <= static_cast<size_t>(k)) images.emplace_back();
+                images[static_cast<size_t>(k)].resize(kv.rows_bytes(std::min(page_tokens, n - k * page_tokens)));
+                parts.emplace_back(images[static_cast<size_t>(k)]);
+            }
             // A damaged file is removed with every chunk after it, which may
             // take a chunk of another copy listed here (copies that start
             // alike share chunks): either way that copy is dropped.
-            Status s = store.read_chunk(u.copy.chunks[i], image);
+            Status s = store.read_chunk(u.copy.chunks[i], parts);
             if (!s.is_ok()) {
                 ok = false;
                 break;
             }
-            const int32_t from = u.copy.base + start + s0 - 1, to = u.segment.begin + start + s0 - 1;
-            if (s = model.move_keys(image.data(), n, s0, s1 - s0, from, to, &pool); !s.is_ok()) return fail(s);
-            if (s = kv.write_rows_at(to, image.data(), n, s0, s1 - s0); !s.is_ok()) return fail(s);
+            // Each page's image: the slots it holds of the positions used.
+            for (int32_t k = 0; k * page_tokens < n; ++k) {
+                const int32_t at = start + k * page_tokens, rows = std::min(page_tokens, n - k * page_tokens);
+                const int32_t s0 = std::max(first, at) - at, s1 = std::min(last, at + rows) - at;
+                if (s0 >= s1) continue;
+                uint8_t* image = images[static_cast<size_t>(k)].data();
+                const int32_t from = u.copy.base + at + s0 - 1, to = u.segment.begin + at + s0 - 1;
+                if (s = model.move_keys(image, rows, s0, s1 - s0, from, to, &pool); !s.is_ok()) return fail(s);
+                if (s = kv.write_rows_at(to, image, rows, s0, s1 - s0); !s.is_ok()) return fail(s);
+            }
         }
         if (!ok) {
             LIYAB_LOG_WARN("segment reuse: a stored segment could not be read; its tokens are processed");
@@ -187,7 +201,7 @@ Result<ReuseResult> reuse_segments(Transformer& model, KvStore& store, std::span
         end = limit;
     }
     filled.resize(static_cast<size_t>(end - exact));
-    if (Status s = model.adopt_context(end, {}, {}, false); !s.is_ok()) return fail(s);
+    if (Status s = model.adopt_context(end, {}, false); !s.is_ok()) return fail(s);
     result.rows_ms = ms_since(t_rows);
 
     // The span [exact, end) block by block: every position not reused, and
@@ -584,6 +598,7 @@ int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const 
                       std::span<const TokenSegment> segments, int32_t min_tokens) {
     const KvCache& kv = model.kv_cache();
     const int32_t c = store.chunk_tokens();
+    const int32_t page_tokens = kv.config().page_tokens;
     const int32_t held = std::min<int32_t>(model.n_past(), static_cast<int32_t>(tokens.size()));
     int32_t kept = 0;
     for (const TokenSegment& s : segments) {
@@ -594,14 +609,24 @@ int32_t keep_segments(const Transformer& model, KvStore& store, std::span<const 
         const int32_t n = s.end - s.begin;
         KvStore::ContextSource source;
         source.tokens = stored;
-        // Chain position p holds segment token p - 1: the context's position
-        // begin + p - 1. The two markers get zero rows (never read).
-        source.rows = [&](int32_t chunk, int32_t count, uint8_t* out) {
-            std::memset(out, 0, kv.rows_bytes(count));
-            const int32_t start = chunk * c;
-            const int32_t p0 = std::max(start, 1), p1 = std::min(start + count, n + 1);
-            if (p0 >= p1) return Status::ok();
-            return kv.read_rows_at(s.begin + p0 - 1, p1 - p0, out, count, p0 - start);
+        // A chunk's image is its pages' images in order. Chain position p
+        // holds segment token p - 1: the context's position begin + p - 1,
+        // rarely on a page boundary, so every page image is packed (into
+        // `packed`, alive while put() runs). The two markers get zero rows
+        // (never read).
+        std::deque<std::vector<uint8_t>> packed;
+        source.rows = [&](int32_t chunk, int32_t count) {
+            std::vector<std::span<const uint8_t>> parts;
+            for (int32_t k = 0; k * page_tokens < count; ++k) {
+                const int32_t start = chunk * c + k * page_tokens, rows = std::min(page_tokens, count - k * page_tokens);
+                packed.emplace_back(kv.rows_bytes(rows), uint8_t{0});
+                const int32_t p0 = std::max(start, 1), p1 = std::min(start + rows, n + 1);
+                if (p0 < p1 && !kv.read_rows_at(s.begin + p0 - 1, p1 - p0, packed.back().data(), rows, p0 - start).is_ok()) {
+                    return std::vector<std::span<const uint8_t>>();
+                }
+                parts.emplace_back(packed.back());
+            }
+            return parts;
         };
         if (store.put(source).whole) ++kept;
     }

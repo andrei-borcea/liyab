@@ -83,15 +83,33 @@ bool parse_hex(std::string_view s, KvKey& k) {
     return true;
 }
 
-// Writes header, metadata and payload to `path` through a temporary file.
-bool write_file(const std::string& path, const FileHeader& h, std::span<const uint8_t> meta,
-                std::span<const uint8_t> payload) {
+// Payloads move in blocks of this size, each hashed right after it is read
+// or before it is written: it is still in the CPU's cache (a phone core's L2
+// holds 2-3 MiB), so the hash costs a pass over cache, not a second pass
+// over memory (a 35B's state image is 62.8 MiB).
+constexpr size_t kIoBlock = size_t{1} << 20;
+
+// Writes header, metadata and the payload `parts` to `path` through a
+// temporary file. The header goes last, once the payload's hash is known
+// (its place is written first, then rewritten).
+bool write_file(const std::string& path, FileHeader& h, std::span<const uint8_t> meta,
+                std::span<const std::span<const uint8_t>> parts) {
     const std::string tmp = path + ".tmp";
     std::FILE* f = os::open_file(tmp, "wb");
     if (f == nullptr) return false;
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
     ok = ok && (meta.empty() || std::fwrite(meta.data(), 1, meta.size(), f) == meta.size());
-    ok = ok && (payload.empty() || std::fwrite(payload.data(), 1, payload.size(), f) == payload.size());
+    KvStreamHash hash;
+    for (const std::span<const uint8_t> part : parts) {
+        for (size_t at = 0; ok && at < part.size(); at += kIoBlock) {
+            const size_t n = std::min(kIoBlock, part.size() - at);
+            hash.update(part.data() + at, n);
+            ok = std::fwrite(part.data() + at, 1, n, f) == n;
+        }
+    }
+    h.payload_hash = hash.digest();
+    h.header_hash = header_hash(h, meta.data(), meta.size());
+    ok = ok && std::fseek(f, 0, SEEK_SET) == 0 && std::fwrite(&h, sizeof h, 1, f) == 1;
     ok = std::fflush(f) == 0 && ok;
     ok = std::fclose(f) == 0 && ok;
     if (!ok || !os::replace_file(tmp, path)) {
@@ -101,14 +119,23 @@ bool write_file(const std::string& path, const FileHeader& h, std::span<const ui
     return true;
 }
 
-// Reads `out.size()` payload bytes at `offset` of `path` and checks their hash.
-bool read_payload(const std::string& path, size_t offset, uint64_t hash, std::span<uint8_t> out) {
+// Reads the payload at `offset` of `path` into `parts` in order, block by
+// block, and checks its hash.
+bool read_payload(const std::string& path, size_t offset, uint64_t hash, std::span<const std::span<uint8_t>> parts) {
     std::FILE* f = os::open_file(path, "rb");
     if (f == nullptr) return false;
-    bool ok = std::fseek(f, static_cast<long>(offset), SEEK_SET) == 0 &&
-              std::fread(out.data(), 1, out.size(), f) == out.size();
+    bool ok = std::fseek(f, static_cast<long>(offset), SEEK_SET) == 0;
+    KvStreamHash h;
+    for (const std::span<uint8_t> part : parts) {
+        for (size_t at = 0; ok && at < part.size(); at += kIoBlock) {
+            const size_t n = std::min(kIoBlock, part.size() - at);
+            ok = std::fread(part.data() + at, 1, n, f) == n;
+            if (ok) h.update(part.data() + at, n);
+        }
+    }
+    // Nothing may follow the payload: the size was checked when the directory was opened.
     std::fclose(f);
-    return ok && xxhash64(out.data(), out.size()) == hash;
+    return ok && h.digest() == hash;
 }
 
 void touch_file(const std::string& path) {
@@ -184,6 +211,89 @@ KvKey kv_chain_key(const KvKey& parent, std::span<const int32_t> tokens) noexcep
 
 KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcept {
     return hash_after(KvKey{seed.hi ^ kContentDomain, seed.lo ^ kContentDomain}, tokens.data(), tokens.size_bytes());
+}
+
+// --- KvStreamHash: XXH64 in pieces (the same steps as xxhash64()) -------------------
+namespace {
+constexpr uint64_t kX1 = 0x9E3779B185EBCA87ULL, kX2 = 0xC2B2AE3D27D4EB4FULL, kX3 = 0x165667B19E3779F9ULL,
+                   kX4 = 0x85EBCA77C2B2AE63ULL, kX5 = 0x27D4EB2F165667C5ULL;
+inline uint64_t rotl64(uint64_t x, int r) noexcept { return (x << r) | (x >> (64 - r)); }
+inline uint64_t xround(uint64_t acc, uint64_t in) noexcept { return rotl64(acc + in * kX2, 31) * kX1; }
+inline uint64_t xmerge(uint64_t h, uint64_t v) noexcept { return (h ^ xround(0, v)) * kX1 + kX4; }
+inline uint64_t load64(const uint8_t* p) noexcept {
+    uint64_t v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+inline uint32_t load32(const uint8_t* p) noexcept {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+}  // namespace
+
+void KvStreamHash::stripe(const uint8_t* p) noexcept {
+    v_[0] = xround(v_[0], load64(p));
+    v_[1] = xround(v_[1], load64(p + 8));
+    v_[2] = xround(v_[2], load64(p + 16));
+    v_[3] = xround(v_[3], load64(p + 24));
+}
+
+void KvStreamHash::update(const void* data, size_t bytes) noexcept {
+    const auto* p = static_cast<const uint8_t*>(data);
+    total_ += bytes;
+    if (buffered_ + bytes < sizeof buffer_) {
+        std::memcpy(buffer_ + buffered_, p, bytes);
+        buffered_ += bytes;
+        return;
+    }
+    if (buffered_ > 0) {
+        const size_t take = sizeof buffer_ - buffered_;
+        std::memcpy(buffer_ + buffered_, p, take);
+        stripe(buffer_);
+        p += take;
+        bytes -= take;
+        buffered_ = 0;
+    }
+    // The stripes in locals, as xxhash64() keeps them: this loop is the cost.
+    uint64_t v1 = v_[0], v2 = v_[1], v3 = v_[2], v4 = v_[3];
+    for (; bytes >= 32; p += 32, bytes -= 32) {
+        v1 = xround(v1, load64(p));
+        v2 = xround(v2, load64(p + 8));
+        v3 = xround(v3, load64(p + 16));
+        v4 = xround(v4, load64(p + 24));
+    }
+    v_[0] = v1;
+    v_[1] = v2;
+    v_[2] = v3;
+    v_[3] = v4;
+    std::memcpy(buffer_, p, bytes);
+    buffered_ = bytes;
+}
+
+uint64_t KvStreamHash::digest() const noexcept {
+    uint64_t h;
+    if (total_ >= 32) {
+        h = rotl64(v_[0], 1) + rotl64(v_[1], 7) + rotl64(v_[2], 12) + rotl64(v_[3], 18);
+        h = xmerge(xmerge(xmerge(xmerge(h, v_[0]), v_[1]), v_[2]), v_[3]);
+    } else {
+        h = kX5;  // seed 0
+    }
+    h += total_;
+    const uint8_t* p = buffer_;
+    const uint8_t* const end = buffer_ + buffered_;
+    for (; p + 8 <= end; p += 8) h = rotl64(h ^ xround(0, load64(p)), 27) * kX1 + kX4;
+    if (p + 4 <= end) {
+        h = rotl64(h ^ (static_cast<uint64_t>(load32(p)) * kX1), 23) * kX2 + kX3;
+        p += 4;
+    }
+    for (; p < end; ++p) h = rotl64(h ^ (*p * kX5), 11) * kX1;
+    h ^= h >> 33;
+    h *= kX2;
+    h ^= h >> 29;
+    h *= kX3;
+    h ^= h >> 32;
+    return h;
 }
 
 std::vector<int32_t> kv_segment_tokens(std::span<const int32_t> tokens, int32_t base) {
@@ -291,7 +401,7 @@ size_t KvStore::file_size(Kind kind, const Item& it) const noexcept {
     return sizeof(FileHeader) + tokens * sizeof(int32_t) + it.payload_bytes;
 }
 
-bool KvStore::write_item_file(Kind kind, Item& it) {
+bool KvStore::write_item_file(Kind kind, Item& it, std::span<const std::span<const uint8_t>> parts) {
     FileHeader h{};
     std::memcpy(h.magic, kMagic, sizeof kMagic);
     h.version = kFormat;
@@ -315,16 +425,16 @@ bool KvStore::write_item_file(Kind kind, Item& it) {
         h.count = static_cast<int32_t>(s.tokens.size());
         meta = {reinterpret_cast<const uint8_t*>(s.tokens.data()), s.tokens.size() * sizeof(int32_t)};
     }
-    const std::span<const uint8_t> payload(it.data.get(), it.payload_bytes);
+    size_t payload = 0;
+    for (const std::span<const uint8_t> part : parts) payload += part.size();
+    if (payload != it.payload_bytes) return false;
     h.meta_bytes = meta.size();
-    h.payload_bytes = h.raw_bytes = payload.size();
-    h.payload_hash = xxhash64(payload.data(), payload.size());
-    h.header_hash = header_hash(h, meta.data(), meta.size());
-    if (!write_file(path_of(it.key, kind == Kind::Chunk ? ".chunk" : ".state"), h, meta, payload)) {
+    h.payload_bytes = h.raw_bytes = payload;
+    if (!write_file(path_of(it.key, kind == Kind::Chunk ? ".chunk" : ".state"), h, meta, parts)) {
         LIYAB_LOG_WARN("prefix cache: cannot write to %s", config_.dir.c_str());
         return false;
     }
-    it.file_bytes = sizeof h + meta.size() + payload.size();
+    it.file_bytes = sizeof h + meta.size() + payload;
     it.payload_offset = sizeof h + meta.size();
     it.payload_hash = h.payload_hash;
     return true;
@@ -361,9 +471,7 @@ bool KvStore::write_record_file(RecordEntry& entry) {
     put_key(h.seed, entry.seed);
     h.count = static_cast<int32_t>(r.tokens.size());
     h.meta_bytes = meta.size();
-    h.payload_hash = xxhash64(nullptr, 0);
-    h.header_hash = header_hash(h, meta.data(), meta.size());
-    if (!write_file(path_of(r.leaf, ".ctx"), h, meta, {})) {
+    if (!write_file(path_of(r.leaf, ".ctx"), h, meta, {})) {  // sets both hashes
         os::remove_file(path_of(r.leaf, ".ctx"));
         return false;
     }
@@ -398,7 +506,9 @@ bool KvStore::demote(Kind kind, const KvKey& key, bool or_evict) {
     if (it->on_disk) return true;
     if (disk_on_ && make_room(true, file_size(kind, *it), it->clock)) {
         it = item(kind, key);  // making room never evicts newer items, but stay safe
-        if (it != nullptr && write_item_file(kind, *it)) {
+        const std::span<const uint8_t> payload(it != nullptr ? it->data.get() : nullptr,
+                                               it != nullptr ? it->payload_bytes : 0);
+        if (it != nullptr && write_item_file(kind, *it, {&payload, 1})) {
             lru_[0].erase(it->clock);
             ram_used_ -= it->payload_bytes;
             it->data.reset();
@@ -415,23 +525,22 @@ bool KvStore::demote(Kind kind, const KvKey& key, bool or_evict) {
     return false;
 }
 
-bool KvStore::place(Kind kind, Item& it, bool storage_only) {
-    if (!storage_only && config_.ram_bytes > 0 && make_room(false, it.payload_bytes, it.clock)) {
-        it.placed = true;
-        it.on_disk = false;
-        ram_used_ += it.payload_bytes;
-        lru_[0][it.clock] = {kind, it.key};
-        return true;
-    }
-    if (disk_on_ && make_room(true, file_size(kind, it), it.clock) && write_item_file(kind, it)) {
+KvStore::Tier KvStore::make_place(Kind kind, const Item& it, bool storage_only) {
+    if (!storage_only && config_.ram_bytes > 0 && make_room(false, it.payload_bytes, it.clock)) return Tier::Ram;
+    if (disk_on_ && make_room(true, file_size(kind, it), it.clock)) return Tier::Disk;
+    return Tier::None;
+}
+
+void KvStore::account(Kind kind, Item& it, bool on_disk) {
+    it.placed = true;
+    it.on_disk = on_disk;
+    if (on_disk) {
         it.data.reset();
-        it.placed = true;
-        it.on_disk = true;
         disk_used_ += it.file_bytes;
-        lru_[1][it.clock] = {kind, it.key};
-        return true;
+    } else {
+        ram_used_ += it.payload_bytes;
     }
-    return false;
+    lru_[on_disk ? 1 : 0][it.clock] = {kind, it.key};
 }
 
 void KvStore::release(Kind kind, Item& it) {
@@ -581,7 +690,7 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
         int32_t chunk;
     };
     std::vector<Mark> marks;
-    if (config_.state_floats > 0 && source.state) {
+    if (config_.state_floats > 0 && source.state_parts) {
         for (const StateMark& m : source.states) {
             if (m.pos > 0 && m.pos <= n) marks.push_back({m, prefix_key(source.tokens, keys, m.pos), (m.pos - 1) / c});
         }
@@ -656,15 +765,36 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
             chunk.tokens.assign(tokens.begin(), tokens.end());
             chunk.content = kv_content_key(config_.seed, tokens);
             chunk.payload_bytes = rows_bytes(static_cast<int32_t>(tokens.size()));
-            chunk.data = std::make_unique<uint8_t[]>(chunk.payload_bytes);
-            if (Status s = source.rows(j, static_cast<int32_t>(tokens.size()), chunk.data.get()); !s.is_ok()) {
-                LIYAB_LOG_WARN("prefix cache: %s", s.to_string().c_str());
-                chain = false;
-                continue;
-            }
             const KvKey key = chunk.key;
             auto [it, inserted] = chunks_.emplace(key, std::move(chunk));
-            if (!place(Kind::Chunk, it->second, storage_only)) {
+            Chunk& ch = it->second;
+            const auto n = static_cast<int32_t>(tokens.size());
+            // The rows in place (the cache's pages): RAM keeps a copy,
+            // storage is written from them.
+            const Tier tier = make_place(Kind::Chunk, ch, storage_only);
+            std::vector<std::span<const uint8_t>> parts;
+            size_t bytes = 0;
+            if (tier != Tier::None) {
+                parts = source.rows(j, n);
+                for (const std::span<const uint8_t> part : parts) bytes += part.size();
+            }
+            bool stored = false;
+            if (tier != Tier::None && bytes != ch.payload_bytes) {
+                LIYAB_LOG_WARN("prefix cache: the rows of a chunk could not be read");
+            } else if (tier == Tier::Ram) {
+                ch.data.reset(new uint8_t[ch.payload_bytes]);  // every byte is copied in below
+                size_t at = 0;
+                for (const std::span<const uint8_t> part : parts) {
+                    std::memcpy(ch.data.get() + at, part.data(), part.size());
+                    at += part.size();
+                }
+                account(Kind::Chunk, ch, false);
+                stored = true;
+            } else if (tier == Tier::Disk && write_item_file(Kind::Chunk, ch, parts)) {
+                account(Kind::Chunk, ch, true);
+                stored = true;
+            }
+            if (!stored) {
                 chunks_.erase(it);
                 chain = false;
                 continue;
@@ -693,14 +823,36 @@ KvStore::PutResult KvStore::put(const ContextSource& source, bool storage_only) 
                                                       static_cast<size_t>(m.mark.pos - m.chunk * c));
             state.tokens.assign(prefix.begin(), prefix.end());
             state.payload_bytes = config_.state_floats * sizeof(float);
-            state.data = std::make_unique<uint8_t[]>(state.payload_bytes);
-            if (Status s = source.state(m.mark.pos, reinterpret_cast<float*>(state.data.get())); !s.is_ok()) {
-                LIYAB_LOG_WARN("prefix cache: %s", s.to_string().c_str());
+            // The image in place (the model's states or a snapshot's buffer).
+            std::vector<std::span<const uint8_t>> parts;
+            size_t bytes = 0;
+            for (const std::span<const float> part : source.state_parts(m.mark.pos)) {
+                parts.emplace_back(reinterpret_cast<const uint8_t*>(part.data()), part.size_bytes());
+                bytes += part.size_bytes();
+            }
+            if (bytes != state.payload_bytes) {
+                LIYAB_LOG_WARN("prefix cache: no recurrent-state image at position %d", m.mark.pos);
                 continue;
             }
             const KvKey key = state.key;
             auto [it, inserted] = states_.emplace(key, std::move(state));
-            if (!place(Kind::State, it->second, storage_only)) {
+            State& st = it->second;
+            const Tier tier = make_place(Kind::State, st, storage_only);
+            bool stored = false;
+            if (tier == Tier::Ram) {
+                st.data.reset(new uint8_t[st.payload_bytes]);
+                size_t at = 0;
+                for (const std::span<const uint8_t> part : parts) {
+                    std::memcpy(st.data.get() + at, part.data(), part.size());
+                    at += part.size();
+                }
+                account(Kind::State, st, false);
+                stored = true;
+            } else if (tier == Tier::Disk && write_item_file(Kind::State, st, parts)) {
+                account(Kind::State, st, true);
+                stored = true;
+            }
+            if (!stored) {
                 states_.erase(it);
                 continue;
             }
@@ -954,33 +1106,48 @@ void KvStore::used(const Plan& plan) {
     touch_files(order);
 }
 
-Status KvStore::read_chunk(const KvKey& key, std::span<uint8_t> out) {
+Status KvStore::read_chunk(const KvKey& key, std::span<const std::span<uint8_t>> parts) {
     auto it = chunks_.find(key);
     if (it == chunks_.end() || !ours(it->second) || !it->second.placed) {
         return Status(ErrorCode::InvalidArgument, "prefix cache: no such chunk");
     }
     Chunk& ch = it->second;
-    if (out.size() != ch.payload_bytes) return Status(ErrorCode::InvalidArgument, "prefix cache: wrong chunk size");
+    size_t total = 0;
+    for (const std::span<uint8_t> part : parts) total += part.size();
+    if (total != ch.payload_bytes) return Status(ErrorCode::InvalidArgument, "prefix cache: wrong chunk size");
     if (!ch.on_disk) {
-        std::memcpy(out.data(), ch.data.get(), out.size());
+        size_t at = 0;
+        for (const std::span<uint8_t> part : parts) {
+            std::memcpy(part.data(), ch.data.get() + at, part.size());
+            at += part.size();
+        }
         return Status::ok();
     }
-    if (read_payload(path_of(key, ".chunk"), ch.payload_offset, ch.payload_hash, out)) return Status::ok();
+    if (read_payload(path_of(key, ".chunk"), ch.payload_offset, ch.payload_hash, parts)) return Status::ok();
     LIYAB_LOG_WARN("prefix cache: a chunk file is damaged or unreadable; removed");
     evict(Kind::Chunk, key);
     return Status(ErrorCode::IoError, "prefix cache: a chunk file is damaged or unreadable");
 }
 
-Status KvStore::read_state(const KvKey& key, std::span<float> out) {
+Status KvStore::read_state(const KvKey& key, std::span<const std::span<float>> parts) {
     auto it = states_.find(key);
     if (it == states_.end() || !ours(it->second) || !it->second.placed) {
         return Status(ErrorCode::InvalidArgument, "prefix cache: no such state");
     }
     State& s = it->second;
-    const std::span<uint8_t> bytes(reinterpret_cast<uint8_t*>(out.data()), out.size_bytes());
-    if (bytes.size() != s.payload_bytes) return Status(ErrorCode::InvalidArgument, "prefix cache: wrong state size");
+    std::vector<std::span<uint8_t>> bytes;
+    size_t total = 0;
+    for (const std::span<float> part : parts) {
+        bytes.emplace_back(reinterpret_cast<uint8_t*>(part.data()), part.size_bytes());
+        total += part.size_bytes();
+    }
+    if (total != s.payload_bytes) return Status(ErrorCode::InvalidArgument, "prefix cache: wrong state size");
     if (!s.on_disk) {
-        std::memcpy(bytes.data(), s.data.get(), bytes.size());
+        size_t at = 0;
+        for (const std::span<uint8_t> part : bytes) {
+            std::memcpy(part.data(), s.data.get() + at, part.size());
+            at += part.size();
+        }
         return Status::ok();
     }
     if (read_payload(path_of(key, ".state"), s.payload_offset, s.payload_hash, bytes)) return Status::ok();

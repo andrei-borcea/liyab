@@ -27,8 +27,10 @@
 #include <functional>
 #include <iosfwd>
 #include <memory>
+#include <new>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/architecture.h"
@@ -298,20 +300,62 @@ public:
         bool pinned = false;
     };
     [[nodiscard]] std::vector<KeptState> kept_states() const;
-    // Copies the recurrent states at `pos`, one of kept_states(), to `out`
-    // (recurrent_state_bytes() / sizeof(float) values). InvalidArgument otherwise.
-    Status copy_kept_state(int32_t pos, std::span<float> out) const;
+    // The recurrent states at `pos`, one of kept_states(), as the parts of a
+    // state image in order ([conv | ssm] of each recurrent block; one part
+    // for a snapshot), read in place: written to storage without a copy.
+    // Valid until the context changes; empty for another position.
+    [[nodiscard]] std::vector<std::span<const float>> kept_state_parts(int32_t pos) const;
+
+    // Float storage for recurrent-state images that is not zero-filled when
+    // sized: every value is written before it is read, and a 35B's image is
+    // 62.8 MiB, whose zero-fill and first touch cost as much as reading it
+    // back from storage.
+    template <typename T>
+    struct UninitializedAllocator : std::allocator<T> {
+        template <typename U>
+        struct rebind {
+            using other = UninitializedAllocator<U>;
+        };
+        UninitializedAllocator() = default;
+        template <typename U>
+        UninitializedAllocator(const UninitializedAllocator<U>&) noexcept {}
+        template <typename U>
+        void construct(U* p) noexcept {
+            ::new (static_cast<void*>(p)) U;  // default-initialized: left as it is
+        }
+        template <typename U, typename... Args>
+        void construct(U* p, Args&&... args) {
+            ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+        }
+    };
+    using StateBuffer = std::vector<float, UninitializedAllocator<float>>;
+
+    // Restoring a context image in place (the engine's KV store), with no
+    // intermediate copy of the recurrent states. begin_restore() keeps the
+    // buffers of the current snapshots for reuse (the context is being
+    // replaced: they are already the right size and in memory);
+    // recurrent_parts() are the live recurrent states, in image order, for a
+    // state image to be read into; take_snapshot_buffer() gives the buffer
+    // for one snapshot image (a kept one, else a new one, not zero-filled).
+    // adopt_context() then makes positions [0, n) the context.
+    void begin_restore();
+    [[nodiscard]] std::vector<std::span<float>> recurrent_parts();
+    [[nodiscard]] StateBuffer take_snapshot_buffer();
+    struct OwnedSnapshot {
+        int32_t pos = 0;
+        bool pinned = false;
+        StateBuffer data;  // recurrent_state_bytes() / sizeof(float) values
+    };
     // Takes positions [0, n) as the context once the caller has written their
     // KV rows (KvCache::reserve() and write_rows(); rows below n_past() may be
-    // left as they are where they hold the same tokens): frees the pages past
-    // n, sets the recurrent states to `state` (empty without recurrent
-    // blocks) and the snapshots below n to `snapshots` (ascending, fewer than
-    // kStateSnapshots), discards the rollback checkpoints, then takes a
-    // snapshot at n, pinned when `pin_end`. InvalidArgument for an image that
-    // does not fit (wrong sizes, positions, unmapped pages); the context is
-    // then empty.
-    Status adopt_context(int32_t n, std::span<const float> state, std::span<const SnapshotImage> snapshots,
-                         bool pin_end);
+    // left as they are where they hold the same tokens) and its recurrent
+    // states (recurrent_parts()): frees the pages past n, moves `snapshots`
+    // in as the snapshots below n (ascending, fewer than kStateSnapshots),
+    // discards the rollback checkpoints, then takes a snapshot at n, pinned
+    // when `pin_end`, in a buffer begin_restore() kept when one is left (the
+    // others are freed). InvalidArgument for an image that does not fit
+    // (sizes, positions, unmapped pages); the context is then empty.
+    Status adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end);
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -562,10 +606,14 @@ private:
                        std::span<const float> state, std::span<const SnapshotImage> snapshots, bool live) const;
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
-        std::vector<float> data;   // [conv | ssm] of every recurrent block, in states_ order
+        StateBuffer data;          // [conv | ssm] of every recurrent block, in states_ order
         bool pinned = false;       // the end of the last prompt (see snapshot_state)
     };
     std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_
+    // Snapshot buffers begin_restore() kept for the context being restored
+    // (at most kStateSnapshots with snapshots_): no allocation, first touch
+    // or zero-fill per restore.
+    std::vector<StateBuffer> spare_buffers_;
     ExpertPredictions predictions_;
     std::vector<int32_t> predicted_;  // sorted experts predicted for block predicted_layer_
     int32_t predicted_layer_ = -1;

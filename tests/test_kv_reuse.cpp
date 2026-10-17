@@ -372,7 +372,7 @@ TEST_CASE("Blocks run at scattered positions give the rows and logits a whole pa
         m.reset();
         REQUIRE(m.forward(std::span(t).first(k), Transformer::Logits::None, l->route, *l->pool).has_value());
         REQUIRE(m.mutable_kv_cache().reserve(n).is_ok());
-        REQUIRE(m.adopt_context(n, {}, {}, false).is_ok());
+        REQUIRE(m.adopt_context(n, {}, false).is_ok());
         std::vector<int32_t> positions;
         for (int32_t p = k; p < n; ++p) positions.push_back(p);
         std::vector<float> x(positions.size() * d);

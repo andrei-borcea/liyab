@@ -587,6 +587,7 @@ void Transformer::reset() noexcept {
     }
     std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
     snapshots_.clear();
+    spare_buffers_.clear();
     n_past_ = 0;
 }
 
@@ -611,6 +612,9 @@ void Transformer::snapshot_state(bool pin) {
         while (victim + 1 < snapshots_.size() && snapshots_[victim].pinned) ++victim;
         snap = std::move(snapshots_[victim]);
         snapshots_.erase(snapshots_.begin() + static_cast<std::ptrdiff_t>(victim));
+    } else if (!spare_buffers_.empty()) {
+        snap.data = std::move(spare_buffers_.back());
+        spare_buffers_.pop_back();
     }
     snap.pinned = pin;
     snap.pos = n_past_;
@@ -676,25 +680,44 @@ std::vector<Transformer::KeptState> Transformer::kept_states() const {
     return kept;
 }
 
-Status Transformer::copy_kept_state(int32_t pos, std::span<float> out) const {
-    if (states_.empty() || out.size() != recurrent_state_bytes() / sizeof(float)) {
-        return Status(ErrorCode::InvalidArgument, "copy_kept_state: no recurrent states, or the wrong size");
-    }
+std::vector<std::span<const float>> Transformer::kept_state_parts(int32_t pos) const {
+    std::vector<std::span<const float>> parts;
+    if (states_.empty()) return parts;
     if (pos == n_past_) {
-        float* to = out.data();
         for (const RecurrentState& st : states_) {
-            to = std::copy(st.conv.begin(), st.conv.end(), to);
-            to = std::copy(st.ssm.begin(), st.ssm.end(), to);
+            parts.emplace_back(st.conv);
+            parts.emplace_back(st.ssm);
         }
-        return Status::ok();
+        return parts;
     }
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos == pos) {
-            std::copy(snap.data.begin(), snap.data.end(), out.begin());
-            return Status::ok();
-        }
+        if (snap.pos == pos) parts.emplace_back(snap.data);
     }
-    return Status(ErrorCode::InvalidArgument, "copy_kept_state: no state snapshot at that position");
+    return parts;
+}
+
+void Transformer::begin_restore() {
+    for (StateSnapshot& snap : snapshots_) spare_buffers_.push_back(std::move(snap.data));
+    snapshots_.clear();
+}
+
+std::vector<std::span<float>> Transformer::recurrent_parts() {
+    std::vector<std::span<float>> parts;
+    for (RecurrentState& st : states_) {
+        parts.emplace_back(st.conv);
+        parts.emplace_back(st.ssm);
+    }
+    return parts;
+}
+
+Transformer::StateBuffer Transformer::take_snapshot_buffer() {
+    StateBuffer buffer;
+    if (!spare_buffers_.empty()) {
+        buffer = std::move(spare_buffers_.back());
+        spare_buffers_.pop_back();
+    }
+    buffer.resize(recurrent_state_bytes() / sizeof(float));  // not zero-filled (StateBuffer)
+    return buffer;
 }
 
 Status Transformer::write_state(std::ostream& out) const {
@@ -2561,20 +2584,18 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     return std::span<const float>(logits_.data(), logits_.size());
 }
 
-Status Transformer::adopt_context(int32_t n, std::span<const float> state, std::span<const SnapshotImage> snapshots,
-                                  bool pin_end) {
+Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end) {
     auto fail = [this](const char* why) {
         reset();
         return Status(ErrorCode::InvalidArgument, why);
     };
     const size_t floats = recurrent_state_bytes() / sizeof(float);
     if (n < 0 || n > context_length_ || kv_->window() > 0) return fail("the context does not fit this cache");
-    if (state.size() != (states_.empty() ? 0 : floats) || static_cast<int32_t>(snapshots.size()) >= kStateSnapshots ||
-        (states_.empty() && !snapshots.empty())) {
+    if (static_cast<int32_t>(snapshots.size()) >= kStateSnapshots || (states_.empty() && !snapshots.empty())) {
         return fail("the context's recurrent states do not fit this model");
     }
     int32_t below = 0;
-    for (const SnapshotImage& snap : snapshots) {
+    for (const OwnedSnapshot& snap : snapshots) {
         if (snap.pos <= below || snap.pos >= n || snap.data.size() != floats) {
             return fail("the context's state snapshots do not fit this model");
         }
@@ -2588,19 +2609,17 @@ Status Transformer::adopt_context(int32_t n, std::span<const float> state, std::
         return Status::ok();
     }
     if (Status s = kv_->truncate(n); !s.is_ok()) return fail("cannot truncate the cache");
-    const float* from = state.data();
-    for (RecurrentState& st : states_) {
-        std::copy_n(from, st.conv.size(), st.conv.begin());
-        std::copy_n(from + st.conv.size(), st.ssm.size(), st.ssm.begin());
-        from += st.conv.size() + st.ssm.size();
-    }
     std::fill(checkpoint_pos_.begin(), checkpoint_pos_.end(), -1);
+    // A restore normally starts from begin_restore(), which moved the
+    // snapshots' buffers to spare_buffers_; any left here are kept the same way.
+    for (StateSnapshot& snap : snapshots_) spare_buffers_.push_back(std::move(snap.data));
     snapshots_.clear();
-    for (const SnapshotImage& snap : snapshots) {
-        snapshots_.push_back(StateSnapshot{snap.pos, std::vector<float>(snap.data.begin(), snap.data.end()), snap.pinned});
+    for (OwnedSnapshot& snap : snapshots) {
+        snapshots_.push_back(StateSnapshot{snap.pos, std::move(snap.data), snap.pinned});
     }
     n_past_ = n;
-    snapshot_state(pin_end);
+    snapshot_state(pin_end);  // in a kept buffer when one is left
+    spare_buffers_.clear();   // the others: never more memory than before the restore
     return Status::ok();
 }
 

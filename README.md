@@ -540,9 +540,10 @@ each of those as a scheduling problem.
   least 128 tokens again: another chat after a long shared system prompt, an edited message (on a hybrid model,
   rewinding goes back to the nearest state snapshot). A draft typed ahead and edited after the last reply keeps
   using the context's own snapshots instead. Whenever a prompt leaves the context, the store is asked for more of
-  it than the context keeps. A chunk is one page
-  of the paged KV cache (64 tokens), keyed by a hash chained over every token before it and rooted in what its bytes
-  depend on (the model file, cache layout and type, key scales, kernels and backends). A prefix that several
+  it than the context keeps. A chunk is a whole number of pages of the paged KV cache, about 2 MiB and at most
+  256 tokens (each is a file on storage, and creating one costs about as much as writing a megabyte), keyed by a
+  hash chained over every token before it and rooted in what its bytes depend on (the model file, cache layout and
+  type, key scales, kernels and backends). A prefix that several
   conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
   and setting a conversation aside again writes only its new chunks. A later prompt is restored up to the longest
   prefix the store holds, chunk by chunk, then cut to where the two diverge, even when its earlier replies would

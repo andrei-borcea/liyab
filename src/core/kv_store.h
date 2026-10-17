@@ -2,10 +2,12 @@
 //
 // What it keeps. Contexts the engine sets aside (a conversation another
 // prompt replaced, one an embedding call interrupted, the context left when
-// the engine is destroyed) are cut into chunks of `chunk_tokens` positions,
-// one page of the paged KV cache each (KvCache::read_rows). A chunk holds the
-// KV rows of its positions and the tokens they encode; the last chunk of a
-// context may be partial. Each chunk is keyed by a hash chained over every
+// the engine is destroyed) are cut into chunks of `chunk_tokens` positions, a
+// whole number of pages of the paged KV cache (KvCache::read_rows), whose
+// images it holds one after the other. A chunk holds the KV rows of its
+// positions and the tokens they encode; the last chunk of a context may be
+// partial. The engine sizes chunks at about 2 MiB (Engine::Impl::open_store):
+// each is a file on storage, whose creation costs as much as writing ~1 MB. Each chunk is keyed by a hash chained over every
 // token before it and its own (kv_chain_key), rooted in a seed that covers
 // what the bytes depend on: the model file, the cache layout and type, the
 // key scales the keys were stored with, the kernel set and the backends that
@@ -143,6 +145,25 @@ KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcep
 // Returns how many were removed.
 int32_t remove_kv_dedup_files(const std::string& dir);
 
+// xxHash64 (seed 0) of bytes given in pieces: the store hashes a payload
+// block by block as it writes or reads it, while the block is still in the
+// CPU's cache, instead of in a second pass over the whole payload. The
+// digest equals xxhash64() of the concatenated bytes, so files keep one
+// format whichever way they were hashed.
+class KvStreamHash {
+public:
+    void update(const void* data, size_t bytes) noexcept;
+    [[nodiscard]] uint64_t digest() const noexcept;
+
+private:
+    void stripe(const uint8_t* p) noexcept;
+    uint64_t v_[4] = {0x9E3779B185EBCA87ULL + 0xC2B2AE3D27D4EB4FULL, 0xC2B2AE3D27D4EB4FULL, 0,
+                      0 - 0x9E3779B185EBCA87ULL};
+    uint64_t total_ = 0;
+    uint8_t buffer_[32] = {};
+    size_t buffered_ = 0;
+};
+
 // A segment's tokens as the store keeps them (see the header comment):
 // kv_segment_base(base), the segment's tokens, kSegmentEnd. `base` (>= 0) is
 // the position of the segment's first token where its rows were computed.
@@ -161,7 +182,7 @@ class KvStore {
 public:
     struct Config {
         KvKey seed;                 // see kv_seed_key(); chunks of other seeds are never returned
-        int32_t chunk_tokens = 64;  // positions per chunk: one KV page
+        int32_t chunk_tokens = 64;  // positions per chunk: whole KV pages
         size_t chunk_bytes = 0;     // bytes of a whole chunk's rows (KvCache::rows_bytes(chunk_tokens))
         size_t state_floats = 0;    // values of one recurrent-state image; 0: attention-only model
         size_t ram_bytes = 0;       // RAM cap; 0: no RAM tier
@@ -202,18 +223,21 @@ public:
     };
 
     // A context to set aside: its tokens and text, a source of each chunk's
-    // rows and, on hybrid models, of the state images to keep.
+    // rows and, on hybrid models, of the state images to keep. Storage is
+    // written straight from the views (no copy); RAM copies once.
     struct ContextSource {
         std::span<const int32_t> tokens;
         std::string_view text;
         size_t text_tokens = 0;
-        // Writes the rows of positions [chunk * chunk_tokens, + n) to `out`
-        // (KvCache::read_rows of logical page `chunk`).
-        std::function<Status(int32_t chunk, int32_t n, uint8_t* out)> rows;
+        // The rows of positions [chunk * chunk_tokens, + n) as parts in
+        // order, rows_bytes(n) in all: the cache's whole pages in place, a
+        // partial last page packed (KvCache::read_rows). Valid while put() runs.
+        std::function<std::vector<std::span<const uint8_t>>(int32_t chunk, int32_t n)> rows;
         // Ascending, the last at tokens.size() (Transformer::kept_states()).
         std::vector<StateMark> states;
-        // Writes the state image at `pos` (state_floats values) to `out`.
-        std::function<Status(int32_t pos, float* out)> state;
+        // The state image at `pos` as its parts in order, state_floats values
+        // in all (Transformer::kept_state_parts()).
+        std::function<std::vector<std::span<const float>>(int32_t pos)> state_parts;
     };
     struct PutResult {
         bool whole = false;          // every chunk and state is stored, with the record
@@ -246,12 +270,16 @@ public:
     [[nodiscard]] Plan plan(std::span<const int32_t> tokens, size_t limit) const;
     // Marks a plan's chunks and states used (the front of the LRU order).
     void used(const Plan& plan);
-    // A chunk's whole image (rows_bytes of its token count) or a state
-    // image, into `out` of exactly that size. IoError for a damaged or
-    // unreadable file, which is removed (with what depends on it);
-    // InvalidArgument for an unknown key or a wrong size.
-    Status read_chunk(const KvKey& key, std::span<uint8_t> out);
-    Status read_state(const KvKey& key, std::span<float> out);
+    // A chunk's whole image (rows_bytes of its token count: the KV pages it
+    // restores, or scratch for those it does not) or a state image
+    // (Transformer::recurrent_parts() or a snapshot buffer) into `parts` in
+    // order, of exactly that size, with no intermediate copy; read in blocks,
+    // each hashed while still in cache. IoError for a damaged or unreadable
+    // file, which is removed (with what depends on it), and the destination's
+    // content is then undefined; InvalidArgument for an unknown key or a
+    // wrong size.
+    Status read_chunk(const KvKey& key, std::span<const std::span<uint8_t>> parts);
+    Status read_state(const KvKey& key, std::span<const std::span<float>> parts);
     // The keys of the chunks holding `tokens` (all stored: else empty).
     [[nodiscard]] std::vector<KvKey> chunk_path(std::span<const int32_t> tokens) const;
 
@@ -358,7 +386,11 @@ private:
     // RAM -> storage. When it cannot be written: evicted when `or_evict`,
     // else left in RAM. True when it is on storage.
     bool demote(Kind kind, const KvKey& key, bool or_evict);
-    bool place(Kind kind, Item& it, bool storage_only);  // a new item: RAM, else storage
+    // Where a new item goes: RAM when it fits there, older items moved out;
+    // else storage, older items evicted; None when neither has room.
+    enum class Tier : uint8_t { None, Ram, Disk };
+    Tier make_place(Kind kind, const Item& it, bool storage_only);
+    void account(Kind kind, Item& it, bool on_disk);  // a placed item: counted, in its tier's LRU
     void evict(Kind kind, const KvKey& key);             // at chunk granularity
     void drop_chunk(const KvKey& key);                   // with every chunk after it
     void drop_one_chunk(const KvKey& key);
@@ -371,7 +403,9 @@ private:
     void drop_record(const KvKey& leaf, bool collect);
     void release(Kind kind, Item& it);  // frees its payload or file, out of its tier
     [[nodiscard]] size_t file_size(Kind kind, const Item& it) const noexcept;
-    bool write_item_file(Kind kind, Item& it);  // the file of an item with its payload in `data`
+    // The file of an item whose payload is `parts` in order (its `data` when
+    // in RAM), hashed block by block as it is written.
+    bool write_item_file(Kind kind, Item& it, std::span<const std::span<const uint8_t>> parts);
     bool write_record_file(RecordEntry& entry);
 
     void scan();  // indexes the directory (see the header comment)

@@ -101,13 +101,13 @@ struct EngineConfig {
     // chat after a long shared system prompt, an edited message; on a hybrid
     // model, back to its nearest state snapshot); a draft typed ahead and
     // then edited after the last reply does not. Contexts are kept in a
-    // content-addressed store of KV chunks: one KV page of tokens each, keyed
-    // by every token before it plus the model, cache layout, key scales and
-    // kernels, so a prefix conversations share (system prompt, tools) is
-    // stored once and any prompt starting with it restores it; recurrent
-    // (DeltaNet) states are kept as images at the positions the context's
-    // state snapshots hold, and a hybrid model restores up to the deepest
-    // one its prompt reaches. Least recently used chunks out first. Taken out
+    // content-addressed store of KV chunks (whole KV pages, about 2 MiB, at
+    // most 256 tokens), each keyed by every token before it plus the model,
+    // cache layout, key scales and kernels, so a prefix conversations share
+    // (system prompt, tools) is stored once and any prompt starting with it
+    // restores it; recurrent (DeltaNet) states are kept as images at the
+    // positions the context's state snapshots hold, and a hybrid model
+    // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
     // of memory_budget_mb; on a MoE whose experts stream, only as far as the
     // expert cache can spare: it never takes the cache under 10% of the
     // experts, so it never causes a requantization (requant_bits -1). On
@@ -651,6 +651,7 @@ public:
         int32_t chunks = 0;              // this model's, in RAM and on storage
         int32_t state_images = 0;        // recurrent-state images (hybrid models)
         int32_t contexts = 0;            // stored contexts (texts a prompt is matched against)
+        int32_t chunk_tokens = 0;        // positions per chunk: whole KV pages, about 2 MiB
         uint64_t set_asides = 0;         // contexts set aside
         uint64_t chunks_written = 0;     // chunks they added
         uint64_t chunks_reused = 0;      // chunks they found stored already (shared prefixes)
