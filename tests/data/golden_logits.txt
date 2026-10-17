@@ -4,6 +4,7 @@ arm64-neon-dotprod deepseek2-mla 191166464f5adf1d
 arm64-neon-dotprod deepseek2-mla-f16kv d7bd154c444cbaec
 arm64-neon-dotprod deepseek2-mla-keyscaled e1808726e057431c
 arm64-neon-dotprod deepseek2-mla-qlora-moe-yarn 98b521db8e47d3d4
+arm64-neon-dotprod ernie4_5 843d1f69e41d69be
 arm64-neon-dotprod gemma2 9b6a987e9aefe81a
 arm64-neon-dotprod gemma2-attn-scale 843fee0cd832c3fb
 arm64-neon-dotprod gemma3 19faef709b9415e5
@@ -35,6 +36,7 @@ x86_64-avx2 deepseek2-mla 191166464f5adf1d
 x86_64-avx2 deepseek2-mla-f16kv d7bd154c444cbaec
 x86_64-avx2 deepseek2-mla-keyscaled e1808726e057431c
 x86_64-avx2 deepseek2-mla-qlora-moe-yarn fa1627ae04d2e05d
+x86_64-avx2 ernie4_5 843d1f69e41d69be
 x86_64-avx2 gemma2 bbddcfdacc84a2f9
 x86_64-avx2 gemma2-attn-scale d6c431b6d159cb6a
 x86_64-avx2 gemma3 44220e7c3a456955
@@ -66,6 +68,7 @@ x86_64-scalar deepseek2-mla e5ed5527b3ed36da
 x86_64-scalar deepseek2-mla-f16kv 169d4c05b54192ae
 x86_64-scalar deepseek2-mla-keyscaled e43125c7bb4e1823
 x86_64-scalar deepseek2-mla-qlora-moe-yarn 38cb498803f9eb18
+x86_64-scalar ernie4_5 2a2c3fdf395984c3
 x86_64-scalar gemma2 5d7c25fc539f2a8c
 x86_64-scalar gemma2-attn-scale 0b8ca19040011fd4
 x86_64-scalar gemma3 240a514ba039cfa9

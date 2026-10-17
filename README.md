@@ -363,6 +363,19 @@ What the port does differently from the POSIX platforms:
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already, for Gemma 2 too;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE;
+  * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
+    proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
+    The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
+    (`tokenizer.ggml.add_bos_token` true, or absent, which for a SentencePiece vocabulary means true) and, by
+    leaving `tokenizer.ggml.add_space_prefix` out, for a space before the text, while the model's own tokenizer
+    adds neither. Liyab reads the file as written, so such a file encodes text unlike the model's tokenizer from the
+    first token on (the forward pass itself matches the reference). Fix a copy once; the tensors are copied as
+    they are:
+
+    ```bash
+    tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gguf \
+        --bool tokenizer.ggml.add_bos_token=false --bool tokenizer.ggml.add_space_prefix=false
+    ```
   * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with one expert group, and the models converted to
     their architecture, such as Youtu-LLM-2B): multi-head latent attention, queries from one projection or a
     low-rank pair with its norm, dense FFNs in the leading blocks and MoE with shared experts in the others (from
@@ -1988,7 +2001,7 @@ tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-exper
                         and pooling_reference.py (Hugging Face references), describe_model.py and
                         reference_trace.py (registry rows established from the Hugging Face implementation and
                         verified),
-                        gguf_vocab.py, gguf_fuse_experts.py, expert_study.py (cold-expert study),
+                        gguf_vocab.py, gguf_fuse_experts.py, gguf_set_keys.py, expert_study.py (cold-expert study),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
