@@ -186,6 +186,19 @@ KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcep
     return hash_after(KvKey{seed.hi ^ kContentDomain, seed.lo ^ kContentDomain}, tokens.data(), tokens.size_bytes());
 }
 
+std::vector<int32_t> kv_segment_tokens(std::span<const int32_t> tokens, int32_t base) {
+    std::vector<int32_t> out;
+    out.reserve(tokens.size() + 2);
+    out.push_back(kv_segment_base(base));
+    out.insert(out.end(), tokens.begin(), tokens.end());
+    out.push_back(kSegmentEnd);
+    return out;
+}
+
+bool kv_is_segment(std::span<const int32_t> tokens) noexcept {
+    return tokens.size() >= 2 && tokens.front() <= kv_segment_base(0) && tokens.back() == kSegmentEnd;
+}
+
 int32_t remove_kv_dedup_files(const std::string& dir) {
     int32_t removed = 0;
     std::vector<std::filesystem::path> found;
@@ -997,8 +1010,30 @@ std::vector<KvKey> KvStore::chunk_path(std::span<const int32_t> tokens) const {
 std::vector<const KvStore::Record*> KvStore::records() const {
     std::vector<const Record*> out;
     for (const auto& [leaf, e] : records_) {
-        if (e.seed == config_.seed) out.push_back(&e.record);
+        if (e.seed == config_.seed && !kv_is_segment(e.record.tokens)) out.push_back(&e.record);
     }
+    return out;
+}
+
+std::vector<KvStore::SegmentCopy> KvStore::segments(std::span<const int32_t> tokens) const {
+    std::vector<std::pair<uint64_t, SegmentCopy>> found;  // (recency, copy)
+    for (const auto& [leaf, e] : records_) {
+        const std::vector<int32_t>& t = e.record.tokens;
+        if (e.seed != config_.seed || t.size() != tokens.size() + 2 || !kv_is_segment(t) ||
+            !std::equal(tokens.begin(), tokens.end(), t.begin() + 1)) {
+            continue;
+        }
+        SegmentCopy copy;
+        copy.base = kv_segment_base(0) - t.front();
+        copy.chunks = chunk_path(t);
+        if (copy.chunks.empty()) continue;  // cannot happen while the record lives; stay safe
+        for (const KvKey& key : copy.chunks) copy.chunk_sizes.push_back(static_cast<int32_t>(chunks_.at(key).tokens.size()));
+        found.emplace_back(chunks_.at(leaf).clock, std::move(copy));
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<SegmentCopy> out;
+    out.reserve(found.size());
+    for (auto& f : found) out.push_back(std::move(f.second));
     return out;
 }
 
@@ -1047,10 +1082,12 @@ KvStore::Stats KvStore::stats() const {
         }
     }
     for (const auto& [key, e] : records_) {
-        if (e.seed == config_.seed) {
+        if (e.seed != config_.seed) {
+            if (e.on_disk) ++s.foreign_files;
+        } else if (kv_is_segment(e.record.tokens)) {
+            ++s.segments;
+        } else {
             ++s.records;
-        } else if (e.on_disk) {
-            ++s.foreign_files;
         }
     }
     return s;

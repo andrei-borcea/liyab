@@ -156,6 +156,57 @@ void KvCache::image_to_page(const uint8_t* image, int32_t n, uint8_t* page) cons
     copy_slots(image, n, 0, page, config_.page_tokens, 0, n);
 }
 
+Status KvCache::read_rows_at(int32_t pos, int32_t count, uint8_t* image, int32_t slots, int32_t first) const {
+    if (pos < 0 || count < 0 || first < 0 || slots < 1 || first + count > slots) {
+        return Status(ErrorCode::InvalidArgument, "read_rows_at: the slots are not inside the image");
+    }
+    // One copy per run of positions inside a page (copy_slots moves every
+    // plane and layer of the run).
+    for (int32_t done = 0; done < count;) {
+        const int32_t p = pos + done;
+        const int32_t slot = p % config_.page_tokens;
+        const int32_t run = std::min(count - done, config_.page_tokens - slot);
+        const uint8_t* page = page_data(p / config_.page_tokens);
+        if (page == nullptr) return Status(ErrorCode::InvalidArgument, "read_rows_at: a page is not mapped");
+        copy_slots(page, config_.page_tokens, slot, image, slots, first + done, run);
+        done += run;
+    }
+    return Status::ok();
+}
+
+Status KvCache::write_rows_at(int32_t pos, const uint8_t* image, int32_t slots, int32_t first, int32_t count) {
+    if (pos < 0 || count < 0 || first < 0 || slots < 1 || first + count > slots) {
+        return Status(ErrorCode::InvalidArgument, "write_rows_at: the slots are not inside the image");
+    }
+    for (int32_t done = 0; done < count;) {
+        const int32_t p = pos + done;
+        const int32_t slot = p % config_.page_tokens;
+        const int32_t run = std::min(count - done, config_.page_tokens - slot);
+        uint8_t* page = mutable_page_data(p / config_.page_tokens);
+        if (page == nullptr) return Status(ErrorCode::InvalidArgument, "write_rows_at: a page is not mapped");
+        copy_slots(image, slots, first + done, page, config_.page_tokens, slot, run);
+        done += run;
+    }
+    return Status::ok();
+}
+
+size_t KvCache::image_key_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept {
+    // The K plane: [layer][slot][kv_head][row], as a page with `slots` slots.
+    return ((static_cast<size_t>(layer) * static_cast<size_t>(slots) + static_cast<size_t>(slot)) *
+                static_cast<size_t>(config_.n_head_kv) +
+            static_cast<size_t>(kv_head)) *
+           row_bytes_;
+}
+
+size_t KvCache::image_value_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept {
+    const size_t key = image_key_offset(slots, layer, slot, kv_head);
+    if (config_.values_in_keys) return key + value_skip_;
+    // The V plane follows the K plane of the whole image.
+    return static_cast<size_t>(config_.n_layers) * static_cast<size_t>(slots) * static_cast<size_t>(config_.n_head_kv) *
+               row_bytes_ +
+           key;
+}
+
 uint8_t* KvCache::row(int32_t layer, int32_t pos, int32_t kv_head, bool value) const noexcept {
     const auto logical = static_cast<size_t>(pos / config_.page_tokens);
     const auto slot = static_cast<size_t>(pos % config_.page_tokens);

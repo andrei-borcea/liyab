@@ -124,6 +124,26 @@ public:
     // Expands an image of n positions into a whole page's layout at `page`
     // (page_bytes(); the slots past n zeroed), as write_state() writes pages.
     void image_to_page(const uint8_t* image, int32_t n, uint8_t* page) const noexcept;
+    // Rows at any position, for KV reused away from where it was computed
+    // (the engine's segment reuse): a segment of a prompt rarely starts on
+    // a page boundary. Copies the rows of positions [pos, pos + count) into
+    // slots [first, first + count) of `image`, an image of `slots` positions
+    // laid out as read_rows() writes one, across as many pages as they span.
+    // InvalidArgument when a position's page is not mapped or the slots are
+    // not inside the image.
+    Status read_rows_at(int32_t pos, int32_t count, uint8_t* image, int32_t slots, int32_t first) const;
+    // Writes slots [first, first + count) of `image` (an image of `slots`
+    // positions) to positions [pos, pos + count), whose pages reserve()
+    // mapped. InvalidArgument otherwise.
+    Status write_rows_at(int32_t pos, const uint8_t* image, int32_t slots, int32_t first, int32_t count);
+    // Byte offset, in an image of `slots` positions, of the key row of
+    // `kv_head` at `slot` of `layer`: head_row_bytes() long (with
+    // values_in_keys its value channels follow from value_offset).
+    [[nodiscard]] size_t image_key_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept;
+    // The same for its value row (with values_in_keys, inside the key row).
+    [[nodiscard]] size_t image_value_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept;
+    // Bytes of one cached row: head_dim values in the cache's format.
+    [[nodiscard]] size_t head_row_bytes() const noexcept { return row_bytes_; }
 
     [[nodiscard]] int32_t pages_in_use() const noexcept;
     [[nodiscard]] int32_t pages_allocated() const noexcept { return static_cast<int32_t>(pool_.size()); }

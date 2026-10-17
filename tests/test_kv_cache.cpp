@@ -550,6 +550,75 @@ TEST_CASE("The KV store stays within its caps, least recently used out first, a 
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("The KV store keeps segments as contexts no prompt reaches, found by their tokens wherever they were computed") {
+    std::mt19937 rng(13);
+    const std::string dir = store_dir("segments");
+    const std::vector<int32_t> doc = random_tokens(rng, 40);  // 42 positions with its markers: three chunks
+    const std::vector<int32_t> longer = join(doc, random_tokens(rng, 9));
+    {
+        auto store = KvStore::open(store_config(0, dir, size_t{1} << 20));  // storage only: files a later store finds
+        REQUIRE(store != nullptr);
+        const std::vector<int32_t> at100 = kv_segment_tokens(doc, 100);
+        CHECK(kv_is_segment(at100));
+        CHECK(!kv_is_segment(doc));
+        CHECK(put(*store, at100).whole);
+        std::vector<KvStore::SegmentCopy> copies = store->segments(doc);
+        REQUIRE(copies.size() == 1);
+        CHECK(copies[0].base == 100);
+        REQUIRE(copies[0].chunks.size() == 3);
+        CHECK(copies[0].chunk_sizes.back() == 42 - 2 * kChunk);
+        KvStore::Plan as_read;
+        as_read.positions = static_cast<int32_t>(at100.size());
+        as_read.chunks = copies[0].chunks;
+        as_read.chunk_sizes = copies[0].chunk_sizes;
+        CHECK(rows_match(*store, as_read, at100));
+        // Never a prefix: a prompt of the same tokens restores nothing, and
+        // segments are neither contexts nor texts a prompt is matched against.
+        CHECK(store->plan(doc, doc.size()).positions == 0);
+        CHECK(store->records().empty());
+        CHECK(store->stats().segments == 1);
+        CHECK(store->stats().records == 0);
+        // The same tokens computed elsewhere: a second copy, the newest first;
+        // using the older brings it to the front.
+        put(*store, kv_segment_tokens(doc, 7));
+        copies = store->segments(doc);
+        REQUIRE(copies.size() == 2);
+        CHECK(copies[0].base == 7);
+        CHECK(copies[1].base == 100);
+        KvStore::Plan older;
+        older.chunks = copies[1].chunks;
+        store->used(older);
+        CHECK(store->segments(doc)[0].base == 100);
+        // A segment that starts another stays its own (the end marker), and
+        // other or shorter tokens find nothing.
+        put(*store, kv_segment_tokens(longer, 100));
+        CHECK(store->segments(doc).size() == 2);
+        CHECK(store->segments(longer).size() == 1);
+        CHECK(store->segments(std::span(doc).first(39)).empty());
+        // Contexts and segments side by side.
+        const std::vector<int32_t> context = join(doc, random_tokens(rng, 30));
+        put(*store, context);
+        CHECK(store->records().size() == 1);
+        CHECK(store->plan(context, context.size()).positions == static_cast<int32_t>(context.size()));
+        CHECK(store->stats().segments == 3);
+    }
+    {
+        // On storage they outlive the store, as contexts do.
+        auto store = KvStore::open(store_config(0, dir, size_t{1} << 20));
+        REQUIRE(store != nullptr);
+        CHECK(store->stats().removed_files == 0);
+        const std::vector<KvStore::SegmentCopy> copies = store->segments(doc);
+        REQUIRE(copies.size() == 2);
+        KvStore::Plan as_read;
+        as_read.positions = static_cast<int32_t>(doc.size() + 2);
+        as_read.chunks = copies[0].chunks;
+        as_read.chunk_sizes = copies[0].chunk_sizes;
+        CHECK(rows_match(*store, as_read, kv_segment_tokens(doc, copies[0].base)));
+        CHECK(store->segments(longer).size() == 1);
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("The KV store's files outlive it, in LRU order, and what it cannot trust is removed") {
     std::mt19937 rng(5);
     const std::string dir = store_dir("files");

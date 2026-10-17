@@ -83,13 +83,21 @@
 //    (decoding into the caller's image) and scan() (accepting it); a file of
 //    an encoding a build does not know is removed when the directory is
 //    opened, never misread.
-//  * Chunks reused away from their prefix (feat/kv-reuse): every chunk also
-//    carries a position-independent content key (kv_content_key: the seed
-//    and its own tokens, not what precedes them) and its start position,
-//    indexed by chunks_with_content(). Reusing one elsewhere needs its keys
-//    rotated to the new positions and attention that tolerates the missing
-//    cross-chunk context; until then chunks are only restored where they
-//    were stored.
+//  * Chunks reused away from their prefix: every chunk also carries a
+//    position-independent content key (kv_content_key: the seed and its own
+//    tokens, not what precedes them) and its start position, indexed by
+//    chunks_with_content().
+//  * Segments (segment reuse, core/kv_reuse.h): the KV of one segment of a
+//    prompt (a document, a tool result) kept to be reused wherever the same
+//    tokens appear again. A segment is stored as a context of its own whose
+//    tokens are kv_segment_tokens(): the segment's tokens between two ids no
+//    vocabulary has (negative), the first naming the position its rows were
+//    computed at, which its keys turn with. So it gets the chunks, record,
+//    tiers, caps, LRU order and files of any context with no change to the
+//    format, and no prompt's chain ever reaches it: plan() never restores a
+//    segment as a prefix (its rows depend on what preceded it where it was
+//    computed, so they are exact only there). segments() finds a segment's
+//    stored copies; records() and record_for_text() list contexts only.
 //
 // Thread-compatible: the engine calls it under its own lock, one call at a time.
 #ifndef LIYAB_CORE_KV_STORE_H
@@ -134,6 +142,15 @@ KvKey kv_content_key(const KvKey& seed, std::span<const int32_t> tokens) noexcep
 // files), from `dir`, which older builds were given for it; other files stay.
 // Returns how many were removed.
 int32_t remove_kv_dedup_files(const std::string& dir);
+
+// A segment's tokens as the store keeps them (see the header comment):
+// kv_segment_base(base), the segment's tokens, kSegmentEnd. `base` (>= 0) is
+// the position of the segment's first token where its rows were computed.
+inline constexpr int32_t kSegmentEnd = -1;
+[[nodiscard]] constexpr int32_t kv_segment_base(int32_t base) noexcept { return -2 - base; }
+[[nodiscard]] std::vector<int32_t> kv_segment_tokens(std::span<const int32_t> tokens, int32_t base);
+// Whether stored tokens are a segment's (kv_segment_tokens), not a context's.
+[[nodiscard]] bool kv_is_segment(std::span<const int32_t> tokens) noexcept;
 
 // How a chunk's payload is stored on storage (see the header comment).
 enum class KvEncoding : uint32_t {
@@ -238,7 +255,7 @@ public:
     // The keys of the chunks holding `tokens` (all stored: else empty).
     [[nodiscard]] std::vector<KvKey> chunk_path(std::span<const int32_t> tokens) const;
 
-    // The stored contexts of this seed.
+    // The stored contexts of this seed (segments are not contexts: see segments()).
     [[nodiscard]] std::vector<const Record*> records() const;
     // The longest record whose text `text` starts with (text_tokens > 0), or nullptr.
     [[nodiscard]] const Record* record_for_text(std::string_view text) const;
@@ -254,6 +271,21 @@ public:
     };
     [[nodiscard]] std::vector<ChunkInfo> chunks_with_content(const KvKey& content) const;
 
+    // The stored copies of a segment holding exactly `tokens` (put() with
+    // kv_segment_tokens(tokens, base) stores one), the most recently used
+    // first: the position its rows were computed at, and its chunks in order
+    // (chunk i holds positions [i * chunk_tokens, ...) of kv_segment_tokens,
+    // whose position 0 is the base marker). A copy's chunks are all stored
+    // while it is listed (a record lives as long as its last chunk, and a
+    // chunk goes with every chunk after it); reading one may still fail on a
+    // damaged file, which removes the copy (read_chunk()).
+    struct SegmentCopy {
+        int32_t base = 0;
+        std::vector<KvKey> chunks;
+        std::vector<int32_t> chunk_sizes;
+    };
+    [[nodiscard]] std::vector<SegmentCopy> segments(std::span<const int32_t> tokens) const;
+
     struct Stats {
         size_t ram_bytes = 0;      // chunk and state payloads in RAM
         size_t ram_cap = 0;
@@ -262,9 +294,10 @@ public:
         int32_t chunks_ram = 0;    // this seed's
         int32_t chunks_disk = 0;
         int32_t states = 0;
-        int32_t records = 0;
+        int32_t records = 0;        // stored contexts (segments not included)
         int32_t foreign_files = 0;  // other seeds' files kept on storage
         int32_t removed_files = 0;  // untrusted files removed when the directory was opened
+        int32_t segments = 0;       // stored segment copies (see segments())
     };
     [[nodiscard]] Stats stats() const;
 

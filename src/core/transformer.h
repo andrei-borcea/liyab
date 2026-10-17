@@ -327,6 +327,55 @@ public:
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
+    // ---- KV reused away from its prefix (segment reuse, core/kv_reuse.h) ----
+    // Whether this model's KV rows can be moved to other positions and
+    // partly recomputed there, and why not: Unsupported for hybrid models
+    // (their recurrent blocks must run over the whole prompt, in order),
+    // with a sliding-window cache (released positions are gone), and when a
+    // Q/K norm after RoPE zeroes a rotated key channel (its rotation could
+    // not be undone).
+    [[nodiscard]] Status reuse_support() const;
+    // Rewrites the keys of slots [first, first + count) of `image` (an image
+    // of `slots` positions in KvCache::read_rows()' layout), stored for
+    // positions from + i, as this model stores the keys of positions to + i.
+    // Exact up to rounding for every RoPE this engine runs, since RoPE turns
+    // each rotated pair by an angle proportional to the position: each pair
+    // is turned back by its stored position's angle and on by the new one's,
+    // with each block's own table (pairing, partial rotation, frequency
+    // factors, LongRoPE, YaRN, the windowed blocks' base, latent attention's
+    // RoPE part); RoPE's magnitude cancels. Key scales and a Q/K norm after
+    // RoPE are taken out before the rotation and put back after it. Only the
+    // blocks of a quantized row that hold rotated channels are dequantized
+    // and quantized again: values, unrotated channels (latent attention's
+    // latent) and every row of a move by 0 keep their bits. `pool`
+    // (optional) spreads the rows over its threads. InvalidArgument for
+    // slots outside the image or negative positions; reuse_support()'s
+    // errors otherwise.
+    Status move_keys(uint8_t* image, int32_t slots, int32_t first, int32_t count, int32_t from, int32_t to,
+                     ThreadPool* pool = nullptr) const;
+    // The token embeddings of `tokens` (n_embd floats each, scaled as
+    // forward() scales them) into `x`: the residual stream entering block 0.
+    // InvalidArgument for a token outside the vocabulary or a short `x`.
+    Status embed(std::span<const int32_t> tokens, std::span<float> x) const;
+    // Runs block `layer` for tokens at `positions` (ascending, each below
+    // n_past(): their pages mapped, every row a query reads written) whose
+    // residual streams entering the block are the rows of `x` (n_embd floats
+    // each), as forward() would for a batch at those positions: their KV rows
+    // at the block are written, each token attends to every cached position
+    // up to its own (the rows of the others as the cache holds them), and
+    // `x` is left with the streams after the block. Lets a caller recompute
+    // some positions of a context block by block, keeping the rest. Passes
+    // of at most `chunk` tokens in order, the block's weights acquired once;
+    // no hooks. Attention-only models (Unsupported otherwise, see
+    // reuse_support()); InvalidArgument for positions or sizes that do not
+    // fit.
+    Status run_block_at(int32_t layer, std::span<const int32_t> positions, std::span<float> x, int32_t chunk,
+                        const Route& route, ThreadPool& pool);
+    // The KV cache slot of block `layer`, or -1 when its mixer keeps none.
+    [[nodiscard]] int32_t kv_slot_of(int32_t layer) const noexcept {
+        return layers_[static_cast<size_t>(layer)].kv_slot;
+    }
+
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as
     // MmapLoader::layer_range(l)), or read in place when items[l] < 0; an
@@ -398,6 +447,18 @@ private:
     Transformer() = default;
     Status bind_weights();
     void rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const;
+    // Position of token t of the current batch: n_past_ + t, or positions_[t]
+    // while run_block_at() runs a batch at scattered positions.
+    [[nodiscard]] int32_t pos_of(int32_t t) const noexcept {
+        return positions_.empty() ? n_past_ + t : positions_[static_cast<size_t>(t)];
+    }
+    // Sizes the per-token scratch for a batch of n tokens.
+    void size_batch(int32_t n);
+    // One block over the batch in x_ (n rows, token t at pos_of(t)): the
+    // token mixer and the FFN with their norms and residual adds, as
+    // forward() runs it (it is forward()'s loop body).
+    Status run_block(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                     const HeadMaskHook* head_mask, FfnSkipHook* ffn_skip, FfnMatmulHook* ffn_hook);
     // Mixers: read the normalized input from xb_, leave the block output (before
     // the residual add) in xb_.
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
@@ -470,6 +531,7 @@ private:
     int32_t context_length_ = 0;
     int32_t max_batch_ = 0;
     int32_t n_past_ = 0;
+    std::span<const int32_t> positions_;  // run_block_at(): the batch's positions (see pos_of)
     int32_t last_exit_layer_ = -1;
     int32_t last_ffn_skips_ = 0;
     std::unique_ptr<KvCache> kv_;
