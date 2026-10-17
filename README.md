@@ -1510,9 +1510,17 @@ cache the forward passes agree:
 | gemma-2-2b-it, a longer text past its 4,096-position window | 4,400 | 0.00000 | 100.00% |
 | Phi-3.5-mini-instruct (`phi3`, LongRoPE short factors) | 512 | 0.00000 | 99.80% |
 | Phi-3.5-mini-instruct, a longer text past its 4,096-position original context (long factors) | 4,200 | 0.00000 | 99.95% |
-| Youtu-LLM-2B (`deepseek2`: latent attention, low-rank queries; reference ids, its pre-tokenizer is not a row yet) | 512 | 0.00000 | 100.00% |
+| Youtu-LLM-2B (`deepseek2`: latent attention, low-rank queries; BF16 converted from the Hugging Face weights) | 512 | 0.00000 | 100.00% |
+| SmolLM2-360M-Instruct (`llama`, `smollm` pre-tokenizer; bartowski f16) | 512 | 0.00000 | 100.00% |
+| ERNIE-4.5-0.3B-PT (`ernie4_5`; unsloth F16, its tokenizer keys fixed) | 512 | 0.00000 | 100.00% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
+
+Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
+mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds
+slightly other weights than the Hugging Face repository (16–36% of the values of the tensors compared are equal
+after rounding, relative error about 1e-3), so it measures mean KL 0.0016 and top-1 97.46% against it, with the
+same build and an F16 cache, where the BF16 conversion measures 0.00000.
 
 The fused Huihui copy (written by `tools/gguf_fuse_experts.py`: the converter's `--fuse-gate-up-exps` does not
 cover `qwen3moe`), its experts streamed through a 128 MB cache, gave the split file's distributions exactly (KL 0,
