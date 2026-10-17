@@ -43,7 +43,7 @@ private:
 struct TinyModelSpec {
     // Any registered architecture: "llama", "qwen2" (adds QKV bias, NeoX RoPE), "qwen3", "qwen3moe",
     // "qwen35"/"qwen35moe" (post_attention_norm before the FFN), "hunyuan-dense" (Q/K norms after RoPE),
-    // "gemma3" (scaled embeddings, GeGLU, windowed blocks; with post_norms)...
+    // "gemma2" / "gemma3" (scaled embeddings, GeGLU, windowed blocks; with post_norms)...
     std::string arch = "llama";
     int32_t n_layers = 2;
     int32_t n_embd = 128;
@@ -98,7 +98,9 @@ struct TinyModelSpec {
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
     bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
-    bool fused_gate_up = false;  // ffn_up holds [gate | up], no ffn_gate (Phi-3)
+    // ffn_up holds [gate | up], no ffn_gate (Phi-3); with n_expert > 0, ffn_gate_up_exps holds each
+    // expert's [gate | up] (the split tensors' weights, as a converter fuses them)
+    bool fused_gate_up = false;
     // > 0: LongRoPE (Phi-3) with this original context: rope_factors_short /
     // rope_factors_long and an attention factor of 1.19.
     int32_t longrope_ctx = 0;
@@ -106,6 +108,39 @@ struct TinyModelSpec {
     // non-empty swa_layers writes one flag per block (true: windowed) instead.
     int32_t swa_pattern = 0;
     std::vector<bool> swa_layers;
+    // > 0: YaRN RoPE scaling (rope.scaling.type "yarn") with this factor;
+    // yarn_ctx > 0 writes rope.scaling.original_context_length, the betas
+    // are written when > 0 and yarn_log_mul (DeepSeek's
+    // rope.scaling.yarn_log_multiplier) when != 0. Metadata only: the
+    // weights are those of the same spec without YaRN.
+    float yarn_factor = 0.0f;
+    int32_t yarn_ctx = 0;
+    float yarn_beta_fast = 0.0f;
+    float yarn_beta_slow = 0.0f;
+    float yarn_log_mul = 0.0f;
+    // > 0: attn_logit_softcapping / final_logit_softcapping (Gemma 2) and
+    // attention.scale, the q·k scale the file states. Metadata only.
+    float attn_softcap = 0.0f;
+    float final_softcap = 0.0f;
+    float attn_scale = 0.0f;
+    // > 0 (arch "deepseek2", n_head_kv 1): multi-head latent attention with
+    // a latent this wide, as the converter writes it: attn_kv_a_mqa [d ->
+    // mla_kv_rank + rope_dim], attn_kv_a_norm, per head attn_k_b [mla_nope ->
+    // mla_kv_rank] and attn_v_b [mla_kv_rank -> mla_v], attn_output [n_head *
+    // mla_v -> d], and attn_q [d -> n_head * (mla_nope + rope_dim)] or, with
+    // mla_q_rank > 0, attn_q_a, attn_q_a_norm and attn_q_b. rope_dim must be
+    // set (the shared RoPE key's width). Every width must be whole blocks
+    // of the tensor types (multiples of 32 for Q8_0 / Q4_0). k_norm_outlier
+    // then sets two channels of every attn_kv_a_norm (large latent channels,
+    // for key scaling).
+    int32_t mla_kv_rank = 0;
+    int32_t mla_q_rank = 0;
+    int32_t mla_nope = 32;
+    int32_t mla_v = 32;
+    bool mla_legacy = false;  // no *_mla keys, as in files converted before attn_kv_b was split
+    // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
+    // leading_dense_block_count; the plan follows the tensors).
+    int32_t dense_lead = 0;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

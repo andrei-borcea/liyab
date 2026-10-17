@@ -49,9 +49,10 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
     std::vector<size_t> class_blocks;
     for (size_t l = 0; l < s->experts_.size(); ++l) {
         const auto& block = s->experts_[l];
-        if (block[0] == nullptr) continue;
-        std::array<size_t, 3> area{};
+        if (block[1] == nullptr || block[2] == nullptr) continue;  // a dense block
+        std::array<size_t, 3> area{};  // a fused [gate | up] block has no gate area
         for (size_t m = 0; m < 3; ++m) {
+            if (block[m] == nullptr) continue;
             const size_t bytes = block[m]->row_bytes() * static_cast<size_t>(block[m]->ne[1]);
             area[m] = align_up(bytes + kAlign);
             s->expert_bytes_total_ += static_cast<uint64_t>(bytes) * static_cast<uint64_t>(n_expert);
@@ -215,6 +216,7 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     }
     lock.lock();
     stats_.bytes_read += length;
+    ++stats_.reads;
     if (!status.is_ok()) {
         LIYAB_LOG_ERROR("%s", status.to_string().c_str());
         e.part_failed = true;
@@ -293,13 +295,16 @@ void ExpertStore::io_loop() {
         const int32_t slot = take_slot_locked(lock, block_class_[static_cast<size_t>(key / n_expert_)]);
         if (slot < 0) return;
         e.slot = slot;
-        e.parts_left = 3;
         e.part_failed = false;
         slots_[static_cast<size_t>(slot)].entry = key;
-        parts_.emplace_back(key, 1);
-        parts_.emplace_back(key, 2);
+        // The first matrix is read here, the others (up and down, or down
+        // after a fused [gate | up]) are handed to idle threads.
+        const auto& block = experts_[static_cast<size_t>(key / n_expert_)];
+        const int32_t first = block[0] != nullptr ? 0 : 1;
+        e.parts_left = static_cast<int8_t>(3 - first);
+        for (int32_t m = first + 1; m < 3; ++m) parts_.emplace_back(key, m);
         work_cv_.notify_all();
-        read_part(lock, key, 0);
+        read_part(lock, key, first);
     }
 }
 
@@ -406,6 +411,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
     std::array<TensorView, 3> views{};
     const auto& block = experts_[static_cast<size_t>(layer)];
     for (int32_t m = 0; m < 3; ++m) {
+        if (block[static_cast<size_t>(m)] == nullptr) continue;  // no gate of its own: fused into up
         const TensorView& t = *block[static_cast<size_t>(m)];
         const Segment seg = segment(key, m);
         TensorView v = t;

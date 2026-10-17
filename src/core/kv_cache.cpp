@@ -27,6 +27,11 @@ size_t KvCache::bytes_per_token(int32_t n_layers, int32_t n_head_kv, int32_t hea
            dtype_row_bytes(to_dtype(type), head_dim);
 }
 
+size_t KvCache::bytes_per_token(const KvCacheConfig& config) noexcept {
+    const size_t both = bytes_per_token(config.n_layers, config.n_head_kv, config.head_dim, config.type);
+    return config.values_in_keys ? both / 2 : both;
+}
+
 Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
     if (config.n_layers <= 0 || config.n_head_kv <= 0 || config.head_dim <= 0 || config.page_tokens <= 0 ||
         config.max_positions <= 0 || config.window < 0 || config.sink_tokens < 0) {
@@ -36,6 +41,11 @@ Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
     if (quant::is_block_quantized(dtype) && config.head_dim % quant::kBlock != 0) {
         return Status(ErrorCode::InvalidArgument, "quantized KV cache needs head_dim to be a multiple of 32");
     }
+    if (config.values_in_keys &&
+        (config.value_offset < 0 || config.value_offset >= config.head_dim ||
+         (quant::is_block_quantized(dtype) && config.value_offset % quant::kBlock != 0))) {
+        return Status(ErrorCode::InvalidArgument, "values in keys need a block-aligned value_offset inside the row");
+    }
     if (config.window > 0 && config.sink_tokens > config.page_tokens) {
         return Status(ErrorCode::InvalidArgument, "sink_tokens must fit in the first page");
     }
@@ -43,8 +53,10 @@ Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
     cache->config_ = config;
     cache->dtype_ = dtype;
     cache->row_bytes_ = dtype_row_bytes(dtype, config.head_dim);
-    cache->page_bytes_ = 2 * static_cast<size_t>(config.n_layers) * static_cast<size_t>(config.page_tokens) *
-                         static_cast<size_t>(config.n_head_kv) * cache->row_bytes_;
+    cache->value_skip_ = config.values_in_keys ? dtype_row_bytes(dtype, config.value_offset) : 0;
+    cache->page_bytes_ = (config.values_in_keys ? 1 : 2) * static_cast<size_t>(config.n_layers) *
+                         static_cast<size_t>(config.page_tokens) * static_cast<size_t>(config.n_head_kv) *
+                         cache->row_bytes_;
     return cache;
 }
 
@@ -118,16 +130,19 @@ uint8_t* KvCache::row(int32_t layer, int32_t pos, int32_t kv_head, bool value) c
     const auto logical = static_cast<size_t>(pos / config_.page_tokens);
     const auto slot = static_cast<size_t>(pos % config_.page_tokens);
     uint8_t* page = page_ptr(logical);
-    // Page layout: [K | V], each [layer][slot][kv_head][row].
-    const size_t half = page_bytes_ / 2;
+    // Page layout: [K | V], each [layer][slot][kv_head][row]; only K with
+    // values_in_keys, where a value row starts value_skip_ bytes into its
+    // key row (whole blocks, so it decodes on its own).
     const size_t index = (static_cast<size_t>(layer) * static_cast<size_t>(config_.page_tokens) + slot) *
                              static_cast<size_t>(config_.n_head_kv) + static_cast<size_t>(kv_head);
-    return page + (value ? half : 0) + index * row_bytes_;
+    if (config_.values_in_keys) return page + index * row_bytes_ + (value ? value_skip_ : 0);
+    return page + (value ? page_bytes_ / 2 : 0) + index * row_bytes_;
 }
 
 void KvCache::store(int32_t layer, int32_t pos, const float* k, const float* v) {
     for (int32_t g = 0; g < config_.n_head_kv; ++g) {
         quant::quantize_row(dtype_, k + g * config_.head_dim, row(layer, pos, g, false), config_.head_dim);
+        if (config_.values_in_keys) continue;
         quant::quantize_row(dtype_, v + g * config_.head_dim, row(layer, pos, g, true), config_.head_dim);
     }
 }

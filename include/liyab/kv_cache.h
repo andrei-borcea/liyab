@@ -42,6 +42,14 @@ struct KvCacheConfig {
     int32_t window = 0;            // 0: full attention
     int32_t sink_tokens = 8;       // anchors kept with a sliding window
     int32_t page_tokens = 64;      // positions per page
+    // Values are not stored on their own: a value row is channels
+    // [value_offset, head_dim) of its key row. Multi-head latent attention
+    // (DeepSeek) attends over keys [RoPE part | latent] whose values are the
+    // latent itself, so one row serves both and the cache holds half the
+    // bytes. value_offset must keep value rows block-aligned in a quantized
+    // cache (a multiple of 32) and leave at least one channel.
+    bool values_in_keys = false;
+    int32_t value_offset = 0;
 };
 
 class LIYAB_API KvCache {
@@ -50,6 +58,8 @@ public:
 
     // Bytes per cached position across all layers, K and V.
     static size_t bytes_per_token(int32_t n_layers, int32_t n_head_kv, int32_t head_dim, KvCacheType type) noexcept;
+    // The same for a whole configuration: K rows only when values_in_keys.
+    static size_t bytes_per_token(const KvCacheConfig& config) noexcept;
 
     [[nodiscard]] const KvCacheConfig& config() const noexcept { return config_; }
     [[nodiscard]] DType dtype() const noexcept { return dtype_; }
@@ -66,16 +76,19 @@ public:
     // Maps pages for every position < end. ContextFull past max_positions
     // without a window; OutOfMemory when a page cannot be allocated.
     Status reserve(int32_t end);
-    // Row access; the position's page must be mapped (reserve()).
+    // Row access; the position's page must be mapped (reserve()). With
+    // values_in_keys, `v` is ignored (it may be nullptr) and v_row() points
+    // into the key row at channel value_offset.
     void store(int32_t layer, int32_t pos, const float* k, const float* v);
     [[nodiscard]] const uint8_t* k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     [[nodiscard]] const uint8_t* v_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
 
     // Multiplies channel c of the keys of positions [0, end) of layer l, KV
     // head h by factors[(l * n_head_kv + h) * head_dim + c], requantizing each
-    // row (a saved context brought to other per-channel key scales). Owned
-    // pages only: InvalidArgument when a position's page is unmapped or
-    // external, or for the wrong number of factors.
+    // row (a saved context brought to other per-channel key scales; with
+    // values_in_keys the values in those rows move with them). Owned pages
+    // only: InvalidArgument when a position's page is unmapped or external,
+    // or for the wrong number of factors.
     Status scale_keys(int32_t end, std::span<const float> factors);
     // Forgets positions >= n (rollback). Fails when a query at n would need
     // positions whose pages were already released.
@@ -86,7 +99,8 @@ public:
     void clear() noexcept;
 
     // --- Prefix sharing (used by the experimental KV dedup) ---------------
-    // Bytes of logical page `logical` (all layers, K then V), or nullptr.
+    // Bytes of logical page `logical` (all layers, K then V; K only with
+    // values_in_keys), or nullptr.
     [[nodiscard]] const uint8_t* page_data(int32_t logical) const noexcept;
     // The same page, writable, for restoring a saved state: an owned page that
     // reserve() mapped; nullptr for unmapped or external pages.
@@ -119,6 +133,7 @@ private:
     KvCacheConfig config_;
     DType dtype_ = DType::Q8_0;
     size_t row_bytes_ = 0;
+    size_t value_skip_ = 0;  // values_in_keys: bytes of a key row before its value channels
     size_t page_bytes_ = 0;
     std::vector<std::unique_ptr<uint8_t[]>> pool_;  // physical pages (never shrinks; reused)
     std::vector<int32_t> free_;                     // free physical page ids

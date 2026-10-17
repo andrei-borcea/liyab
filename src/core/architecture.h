@@ -116,6 +116,10 @@ enum class FfnKind : uint8_t {
 // The structure of one block, from the tensors present.
 struct BlockPlan {
     MixerKind mixer = MixerKind::Attention;
+    // Attention: multi-head latent attention (attn_kv_a_mqa present, see
+    // ModelConfig::mla). Keys and values come from one compressed latent per
+    // position, which is what the KV cache stores.
+    bool latent = false;
     // Attention: attn_q projects [q | gate] per head (twice as tall) and the
     // attention output is multiplied by sigmoid(gate).
     bool attn_gate = false;
@@ -128,10 +132,50 @@ struct BlockPlan {
     bool fused_qkv = false;
     FfnKind ffn = FfnKind::Dense;
     // Dense: ffn_up projects [gate | up] (twice as tall) and there is no
-    // ffn_gate (Phi-3).
+    // ffn_gate (Phi-3). Moe: ffn_gate_up_exps holds each expert's [gate | up]
+    // instead of ffn_gate_exps and ffn_up_exps.
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+};
+
+// YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
+// states it. Each rotary pair's frequency is blended between its original
+// value and that value divided by `factor`: pairs that turn more than
+// beta_fast times over the original context keep their frequency
+// (extrapolation), pairs that turn fewer than beta_slow times are divided
+// by the factor (interpolation), and the pairs between follow a linear
+// ramp. Transformer::load builds the table; the attention factor that comes
+// with it is folded into ModelConfig::rope_magnitude and attn_scale.
+struct YarnRope {
+    float factor = 0.0f;       // rope.scaling.factor; > 0: YaRN is on
+    int32_t ctx_orig = 0;      // rope.scaling.original_context_length (default: context_length)
+    float beta_fast = 32.0f;   // rope.scaling.yarn_beta_fast
+    float beta_slow = 1.0f;    // rope.scaling.yarn_beta_slow
+    // rope.scaling.yarn_ext_factor: the share of the ramp that
+    // extrapolates (0: every pair interpolated).
+    float ext_factor = 1.0f;
+    // rope.scaling.yarn_truncate: the ramp's ends are rounded outwards to
+    // whole pairs (the reference's default).
+    bool truncate = true;
+};
+
+// Multi-head latent attention (DeepSeek-V2/V3, `deepseek2`), in its absorbed
+// form. Each position's keys and values come from one latent c (kv_rank
+// wide, RMS-normalized) and one RoPE key k_pe (rope_dim, shared by every
+// head): head h's key is [W_kb,h c | k_pe] and its value W_vb,h c. Since
+// q_h . (W_kb,h c) = (W_kb,h^T q_h) . c, each head's query is projected onto
+// the latent once (attn_k_b, stored transposed per head) and attention runs
+// as one KV head of [k_pe | c] (ModelConfig::head_dim = rope_dim + kv_rank)
+// whose values are its latent channels; the weighted latent is then
+// expanded per head (attn_v_b) before attn_output. The KV cache keeps
+// rope_dim + kv_rank values per position and block instead of
+// n_head * (key + value) widths: 576 instead of 5,120 on DeepSeek-V2-Lite.
+struct LatentAttention {
+    int32_t kv_rank = 0;   // <arch>.attention.kv_lora_rank: latent width; 0: no latent attention
+    int32_t q_rank = 0;    // <arch>.attention.q_lora_rank: queries through attn_q_a, a norm and attn_q_b; 0: attn_q
+    int32_t nope_dim = 0;  // per-head query/key channels without RoPE: key_length_mla - rope_dim
+    int32_t v_dim = 0;     // per-head value width once expanded: <arch>.attention.value_length_mla
 };
 
 struct ModelConfig {
@@ -143,7 +187,8 @@ struct ModelConfig {
     int32_t n_ff = 0;
     int32_t n_head = 0;
     int32_t n_head_kv = 0;
-    int32_t head_dim = 0;
+    int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
+    int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
     int32_t rope_dim = 0;
     int32_t n_vocab = 0;
     int32_t n_ctx_train = 0;
@@ -155,8 +200,23 @@ struct ModelConfig {
     // rope_ctx_orig (the Transformer picks once, from its context length).
     int32_t rope_ctx_orig = 0;
     // Multiplies the rotated dimensions of queries and keys
-    // (<arch>.rope.scaling.attn_factor: LongRoPE's attention factor; 1 when absent).
+    // (<arch>.rope.scaling.attn_factor: LongRoPE's attention factor; 1 when
+    // absent), times YaRN's attention factor with YaRN:
+    // rope.scaling.yarn_attn_factor when the file has it, else
+    // 1 + 0.1 ln(factor); 1 when the file has a yarn_log_multiplier, whose
+    // factor goes into attn_scale instead (DeepSeek's convention).
     float rope_magnitude = 1.0f;
+    YarnRope yarn;  // factor 0: no YaRN
+    // Multiplies q·k before the softmax: <arch>.attention.scale when the
+    // file has it, else 1/sqrt(head_dim); with YaRN and a
+    // rope.scaling.yarn_log_multiplier m, times (1 + m ln(factor))^2.
+    float attn_scale = 0.0f;
+    // Logit soft-capping, cap * tanh(x / cap) (0: none): of the scaled
+    // attention scores before the softmax (<arch>.attn_logit_softcapping)
+    // and of the output logits (<arch>.final_logit_softcapping). Gemma 2.
+    float attn_softcap = 0.0f;
+    float final_softcap = 0.0f;
+    LatentAttention mla;  // kv_rank 0: plain attention
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

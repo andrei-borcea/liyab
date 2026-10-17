@@ -5,16 +5,19 @@
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
 // mixer — softmax attention (GQA, separate or fused QKV projections, RoPE in
-// either pairing with a per-block table and LongRoPE factors, optional QKV
+// either pairing with a per-block table, LongRoPE factors or YaRN, optional QKV
 // bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
-// optional sliding window) or a Gated DeltaNet linear-attention recurrence —
+// optional sliding window, optional soft cap), multi-head latent attention
+// (absorbed queries over one cached [RoPE key | latent] row per position,
+// see LatentAttention) or a Gated DeltaNet linear-attention recurrence —
 // followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and
 // up projections) or a mixture of experts (router + top-k routed experts +
 // optional gated shared expert), each optionally followed by its own norm
 // before the residual add. So hybrid models (Qwen3.5: three DeltaNet blocks
 // per attention block), models that alternate windowed and global attention
-// (Gemma 3), models with fused projections (Phi-3) and plain transformers
-// (Llama, Mistral, Qwen2/3) share one forward pass. Tensor precision is per
+// (Gemma 2 and 3), models with fused projections (Phi-3), latent attention
+// (DeepSeek) and plain transformers (Llama, Mistral, Qwen2/3) share one
+// forward pass. Tensor precision is per
 // tensor, so mixed-precision files run unconverted.
 #ifndef LIYAB_CORE_TRANSFORMER_H
 #define LIYAB_CORE_TRANSFORMER_H
@@ -291,7 +294,12 @@ private:
         kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
         kGate, kUp, kDown,           // SwiGLU FFN
         kRouter, kGateExps, kUpExps, kDownExps,  // MoE: router [n_embd x n_expert], experts stacked on dim 2
+                                                 // (fused_gate_up: kUpExps holds [gate | up], no kGateExps)
         kGateShared, kUpShared, kDownShared,     // MoE: shared expert
+        // Latent attention (kQ: attn_q when queries are not low-rank, kO: attn_output):
+        // attn_q_a / attn_q_b, attn_kv_a_mqa [n_embd x (kv_rank + rope_dim)], and per head
+        // attn_k_b [nope_dim -> kv_rank] (absorbs a query) and attn_v_b [kv_rank -> v_dim] (expands a value)
+        kQa, kQb, kKvA, kKb, kVb,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
@@ -303,6 +311,7 @@ private:
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
+        std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
         std::vector<float> conv1d;   // [channel][kernel] taps
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
         std::vector<float> ssm_dt;   // per value head: decay bias
@@ -340,6 +349,21 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // Multi-head latent attention (ModelConfig::mla): absorbed queries
+    // against the cached [k_pe | latent] rows, the weighted latent expanded
+    // per head, then attn_output.
+    Status latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                  ThreadPool& pool, const uint8_t* head_mask);
+    // Latent attention's projections of the n normalized rows in xb_: each
+    // token's key row [k_pe | RMSNorm(latent)] into k_ (unrotated) and, with
+    // `queries`, its absorbed queries [q_pe | W_kb,h^T q_nope,h] per head
+    // into q_ (unrotated). On `backend`; the per-head matrices run on the CPU.
+    Status latent_project(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, Backend* backend,
+                          bool queries);
+    // Per-head slices of a [cols, rows, n_head] tensor as matmul items, one
+    // contiguous input and output block per head: input head h, token t at
+    // in + (h * n + t) * cols, output at out + (h * n + t) * rows.
+    Status per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out, int32_t n);
     // BlockPlan::fused_qkv: projects xb_ through the block's attn_qkv on
     // `backend` and splits each token's [q | k | v] into q_, k_ and v_.
     Status project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
@@ -364,6 +388,7 @@ private:
     // Softmax attention of the batch's queries (q_) over the cached keys and
     // values of attention block `kv_slot`; `window` > 0 limits each query to
     // its last `window` positions (within what the KV cache keeps visible).
+    // Leaves each token's heads in att_, value_dim channels per head.
     void attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
@@ -445,6 +470,10 @@ private:
     std::vector<quant::BlockQ8_0> q8_queries_;          // attention: Q8_0 queries for quantized caches
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> qkv_;                           // fused attention projection: raw [q | k | v] rows
+    std::vector<float> mla_q_, mla_qa_, mla_kv_;       // latent attention: queries, low-rank queries, [latent | k_pe]
+    std::vector<float> mla_heads_in_, mla_heads_out_;  // latent attention: per-head matmul inputs and outputs
+    std::vector<TensorView> mla_head_views_;           // latent attention: per-head slices of attn_k_b / attn_v_b
+    std::vector<Backend::MatmulItem> mla_items_;
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order

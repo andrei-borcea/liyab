@@ -204,6 +204,142 @@ private:
     int d_, n_head_, n_kv_, n_layers_, hd_;
 };
 
+// Independent float reference of a deepseek2 model with multi-head latent
+// attention in the form it is trained in: every position's latent expanded
+// into per-head keys [W_kb,h c | k_pe] and values W_vb,h c, scored with
+// 1/sqrt(nope + rope) (full recompute, no cache, no absorption, no
+// quantized activations). Dense SwiGLU FFNs; the RoPE key is rotated on
+// adjacent pairs with base 10000.
+class LatentReference {
+public:
+    explicit LatentReference(const MmapLoader& f) : f_(f) {
+        d_ = static_cast<int>(*f.get_int("deepseek2.embedding_length"));
+        heads_ = static_cast<int>(*f.get_int("deepseek2.attention.head_count"));
+        layers_ = static_cast<int>(*f.get_int("deepseek2.block_count"));
+        rank_ = static_cast<int>(*f.get_int("deepseek2.attention.kv_lora_rank"));
+        q_rank_ = static_cast<int>(f.get_int("deepseek2.attention.q_lora_rank").value_or(0));
+        rd_ = static_cast<int>(*f.get_int("deepseek2.rope.dimension_count"));
+        nope_ = static_cast<int>(*f.get_int("deepseek2.attention.key_length_mla")) - rd_;
+        vd_ = static_cast<int>(*f.get_int("deepseek2.attention.value_length_mla"));
+    }
+
+    std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens) const {
+        const int n = static_cast<int>(tokens.size());
+        const int qk = nope_ + rd_;
+        const auto emb = weights("token_embd.weight");
+        std::vector<std::vector<float>> x(static_cast<size_t>(n));
+        for (int t = 0; t < n; ++t) x[t].assign(emb.begin() + tokens[t] * d_, emb.begin() + (tokens[t] + 1) * d_);
+        for (int l = 0; l < layers_; ++l) {
+            const std::string p = "blk." + std::to_string(l) + ".";
+            const auto kv_a = weights(p + "attn_kv_a_mqa.weight");
+            const auto kb = weights(p + "attn_k_b.weight");  // [head][rank][nope]
+            const auto vb = weights(p + "attn_v_b.weight");  // [head][v][rank]
+            std::vector<std::vector<float>> q(n), keys(n), values(n);  // per token: [head][qk], [head][qk], [head][v]
+            for (int t = 0; t < n; ++t) {
+                const auto h = norm(x[t], weights(p + "attn_norm.weight"));
+                q[t] = q_rank_ > 0 ? matvec(weights(p + "attn_q_b.weight"),
+                                            norm(matvec(weights(p + "attn_q_a.weight"), h), weights(p + "attn_q_a_norm.weight")))
+                                   : matvec(weights(p + "attn_q.weight"), h);
+                const auto kv = matvec(kv_a, h);  // [latent | k_pe]
+                const auto c = norm(std::vector<float>(kv.begin(), kv.begin() + rank_), weights(p + "attn_kv_a_norm.weight"));
+                std::vector<float> k_pe(kv.begin() + rank_, kv.end());
+                rope(k_pe, t);
+                keys[t].assign(static_cast<size_t>(heads_ * qk), 0.0f);
+                values[t].assign(static_cast<size_t>(heads_ * vd_), 0.0f);
+                for (int hh = 0; hh < heads_; ++hh) {
+                    for (int j = 0; j < nope_; ++j) {
+                        double acc = 0;
+                        for (int r = 0; r < rank_; ++r) acc += static_cast<double>(kb[(static_cast<size_t>(hh) * rank_ + r) * nope_ + j]) * c[r];
+                        keys[t][static_cast<size_t>(hh * qk + j)] = static_cast<float>(acc);
+                    }
+                    for (int j = 0; j < rd_; ++j) keys[t][static_cast<size_t>(hh * qk + nope_ + j)] = k_pe[j];
+                    for (int i = 0; i < vd_; ++i) {
+                        double acc = 0;
+                        for (int r = 0; r < rank_; ++r) acc += static_cast<double>(vb[(static_cast<size_t>(hh) * vd_ + i) * rank_ + r]) * c[r];
+                        values[t][static_cast<size_t>(hh * vd_ + i)] = static_cast<float>(acc);
+                    }
+                    std::vector<float> q_pe(q[t].begin() + hh * qk + nope_, q[t].begin() + (hh + 1) * qk);
+                    rope(q_pe, t);
+                    std::copy(q_pe.begin(), q_pe.end(), q[t].begin() + hh * qk + nope_);
+                }
+            }
+            const auto wo = weights(p + "attn_output.weight");
+            for (int t = 0; t < n; ++t) {
+                std::vector<float> att(static_cast<size_t>(heads_ * vd_), 0.0f);
+                for (int hh = 0; hh < heads_; ++hh) {
+                    std::vector<double> s;
+                    double mx = -1e30;
+                    for (int j = 0; j <= t; ++j) {
+                        double dot = 0;
+                        for (int i = 0; i < qk; ++i) dot += static_cast<double>(q[t][hh * qk + i]) * keys[j][hh * qk + i];
+                        s.push_back(dot / std::sqrt(static_cast<double>(qk)));
+                        mx = std::max(mx, s.back());
+                    }
+                    double sum = 0;
+                    for (double& e : s) sum += (e = std::exp(e - mx));
+                    for (int j = 0; j <= t; ++j) {
+                        for (int i = 0; i < vd_; ++i) att[hh * vd_ + i] += static_cast<float>(s[j] / sum * values[j][hh * vd_ + i]);
+                    }
+                }
+                const auto o = matvec(wo, att);
+                for (int i = 0; i < d_; ++i) x[t][i] += o[i];
+            }
+            const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
+            const auto wd = weights(p + "ffn_down.weight");
+            for (int t = 0; t < n; ++t) {
+                const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
+                auto g = matvec(wg, h);
+                const auto u = matvec(wu, h);
+                for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+                const auto down = matvec(wd, g);
+                for (int i = 0; i < d_; ++i) x[t][i] += down[i];
+            }
+        }
+        const auto out_w = f_.tensor("output.weight") ? weights("output.weight") : emb;
+        std::vector<std::vector<float>> result;
+        for (int t = 0; t < n; ++t) result.push_back(matvec(out_w, norm(x[t], weights("output_norm.weight"))));
+        return result;
+    }
+
+private:
+    std::vector<float> weights(const std::string& name) const {
+        const TensorView* t = f_.tensor(name);
+        std::vector<float> out(static_cast<size_t>(t->elements()));
+        for (int64_t r = 0; r < t->rows(); ++r) quant::dequantize_row(t->type, t->row(r), out.data() + r * t->cols(), t->cols());
+        return out;
+    }
+    static std::vector<float> matvec(const std::vector<float>& w, const std::vector<float>& x) {
+        const size_t cols = x.size(), rows = w.size() / cols;
+        std::vector<float> y(rows);
+        for (size_t r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (size_t c = 0; c < cols; ++c) acc += static_cast<double>(w[r * cols + c]) * x[c];
+            y[r] = static_cast<float>(acc);
+        }
+        return y;
+    }
+    static std::vector<float> norm(const std::vector<float>& x, const std::vector<float>& w) {
+        double ss = 0;
+        for (const float v : x) ss += static_cast<double>(v) * v;
+        const double scale = 1.0 / std::sqrt(ss / static_cast<double>(x.size()) + 1e-5);
+        std::vector<float> y(x.size());
+        for (size_t i = 0; i < x.size(); ++i) y[i] = static_cast<float>(x[i] * scale * w[i]);
+        return y;
+    }
+    // Adjacent pairs (2i, 2i + 1) of the rope_dim-wide part, as DeepSeek's interleaved RoPE.
+    void rope(std::vector<float>& v, int pos) const {
+        for (int i = 0; i < rd_ / 2; ++i) {
+            const double theta = pos * std::pow(10000.0, -2.0 * i / rd_);
+            const float a0 = v[2 * i], b0 = v[2 * i + 1];
+            v[2 * i] = static_cast<float>(a0 * std::cos(theta) - b0 * std::sin(theta));
+            v[2 * i + 1] = static_cast<float>(a0 * std::sin(theta) + b0 * std::cos(theta));
+        }
+    }
+
+    const MmapLoader& f_;
+    int d_, heads_, layers_, rank_, q_rank_, rd_, nope_, vd_;
+};
+
 double max_abs_diff(std::span<const float> a, const std::vector<float>& b) {
     double m = 0;
     for (size_t i = 0; i < b.size(); ++i) m = std::max(m, std::fabs(static_cast<double>(a[i]) - b[i]));
@@ -1221,7 +1357,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
     {
         test::TinyModelSpec spec;
-        spec.arch = "gemma2";
+        spec.arch = "gemma3n";
         auto file = MmapLoader::open(model_path("describe_unknown", spec));
         REQUIRE(file.has_value());
         auto described = describe_model(**file);
@@ -1229,7 +1365,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
         CHECK(described.status().code() == ErrorCode::Unsupported);
         // The message names the architecture and every supported one.
         const std::string message = described.status().to_string();
-        CHECK(message.find("'gemma2'") != std::string::npos);
+        CHECK(message.find("'gemma3n'") != std::string::npos);
         for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
     }
 }
@@ -1286,6 +1422,23 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         CHECK(windowed(describe("describe_llama_window", s)) == std::vector<bool>(2, false));
     }
     {
+        test::TinyModelSpec s;  // Gemma 2: the even blocks windowed, one RoPE base, the file's soft caps and scale
+        s.arch = "gemma2";
+        s.n_layers = 4;
+        s.sliding_window = 4096;
+        s.attn_softcap = 50.0f;
+        s.final_softcap = 30.0f;
+        const ModelConfig c = describe("describe_gemma2", s);
+        CHECK(windowed(c) == (Flags{true, false, true, false}));
+        CHECK(c.sliding_window == 4096);
+        CHECK(c.rope_base_swa == 0.0f);
+        CHECK(c.attn_softcap == 50.0f);
+        CHECK(c.final_softcap == 30.0f);
+        CHECK(c.attn_scale == 1.0f / std::sqrt(32.0f));  // 1/sqrt(head_dim) when the file states none
+        s.attn_scale = 1.0f / 12.0f;
+        CHECK(describe("describe_gemma2_scale", s).attn_scale == 1.0f / 12.0f);
+    }
+    {
         test::TinyModelSpec s;
         s.arch = "phi3";
         s.fused_qkv = true;
@@ -1297,6 +1450,60 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         CHECK(c.rope_ctx_orig == 256);
         CHECK(c.rope_magnitude == 1.19f);
         CHECK(c.rope_base_swa == 0.0f);  // windowed blocks rotate like the others
+    }
+    {
+        test::TinyModelSpec s;  // DeepSeek: latent attention, a dense leading block, then MoE with a shared expert
+        s.arch = "deepseek2";
+        s.n_layers = 3;
+        s.n_head_kv = 1;
+        s.rope_dim = 32;
+        s.mla_kv_rank = 64;
+        s.mla_q_rank = 64;
+        s.n_expert = 4;
+        s.n_expert_used = 2;
+        s.n_ff_shared = 64;
+        s.dense_lead = 1;
+        s.expert_weights_norm = -1;
+        const ModelConfig c = describe("describe_deepseek2", s);
+        CHECK(c.spec->rope == RopeLayout::Adjacent);
+        CHECK(c.mla.kv_rank == 64 && c.mla.q_rank == 64 && c.mla.nope_dim == 32 && c.mla.v_dim == 32);
+        CHECK(c.head_dim == 96 && c.value_dim == 64 && c.n_head_kv == 1);
+        CHECK(!c.moe_norm_weights);  // DeepSeek-V2 does not renormalize unless the file says so
+        REQUIRE(c.blocks.size() == 3);
+        for (size_t l = 0; l < 3; ++l) {
+            CHECK(c.blocks[l].latent);
+            CHECK(c.blocks[l].ffn == (l == 0 ? FfnKind::Dense : FfnKind::Moe));
+            CHECK(c.blocks[l].shared_expert == (l > 0));
+        }
+        s.mla_legacy = true;  // attn_kv_b era: refused with what to do about it
+        auto file = MmapLoader::open(model_path("describe_deepseek2_legacy", s));
+        REQUIRE(file.has_value());
+        auto legacy = describe_model(**file);
+        REQUIRE(!legacy.has_value());
+        CHECK(legacy.status().code() == ErrorCode::Unsupported);
+        CHECK(legacy.status().to_string().find("convert") != std::string::npos);
+    }
+    {
+        test::TinyModelSpec s;  // YaRN with the reference's defaults
+        s.arch = "qwen3";
+        s.yarn_factor = 4.0f;
+        s.yarn_ctx = 32;
+        const ModelConfig c = describe("describe_yarn", s);
+        CHECK(c.yarn.factor == 4.0f);
+        CHECK(c.yarn.ctx_orig == 32);
+        CHECK(c.yarn.beta_fast == 32.0f);
+        CHECK(c.yarn.beta_slow == 1.0f);
+        CHECK(c.yarn.ext_factor == 1.0f);
+        CHECK(c.yarn.truncate);
+        CHECK(c.rope_magnitude == static_cast<float>(0.1 * std::log(4.0) + 1.0));  // the attention factor
+        CHECK(c.attn_scale == 1.0f / std::sqrt(32.0f));
+        s.yarn_ctx = 0;  // the original context defaults to the training context
+        s.yarn_log_mul = 0.0707f;
+        const ModelConfig d = describe("describe_yarn_logmul", s);
+        CHECK(d.yarn.ctx_orig == s.context_length);
+        CHECK(d.rope_magnitude == 1.0f);  // DeepSeek's convention: the factor scales q·k
+        const double m = 1.0 + static_cast<double>(0.0707f) * std::log(4.0);
+        CHECK(d.attn_scale == static_cast<float>(1.0f / std::sqrt(32.0f) * m * m));
     }
 }
 
@@ -1378,6 +1585,118 @@ test::TinyModelSpec outlier_spec() {
 }
 
 }  // namespace
+
+namespace {
+
+test::TinyModelSpec latent_spec(int32_t q_rank) {
+    test::TinyModelSpec spec;
+    spec.arch = "deepseek2";
+    spec.n_head_kv = 1;
+    spec.rope_dim = 32;    // the shared RoPE key
+    spec.mla_kv_rank = 64;  // cached rows [k_pe | latent] of 96 values, values from channel 32
+    spec.mla_q_rank = q_rank;
+    return spec;
+}
+
+}  // namespace
+
+// Latent attention attends with absorbed queries over the cached [k_pe |
+// latent] rows; the model was trained with per-head keys and values
+// expanded from the latent. Both forms must give the same logits, the cache
+// must hold one row per position and block (half a K + V cache of that
+// width), and batched passes must give token-by-token passes' bits.
+TEST_CASE("Latent attention over cached latents matches an explicit per-head reference") {
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 33, 120, 7, 260};
+    for (const int32_t q_rank : {0, 64}) {  // one attn_q, or the low-rank attn_q_a / attn_q_b pair
+        test::TinyModelSpec spec = latent_spec(q_rank);
+        spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        TransformerOptions options;
+        options.kv_type = KvCacheType::F16;
+        auto model = load_transformer(model_path("latent_f32_q" + std::to_string(q_rank), spec), options);
+        REQUIRE(model != nullptr);
+        const ModelConfig& c = model->config();
+        CHECK(c.blocks[0].latent);
+        CHECK(c.head_dim == 96);
+        CHECK(c.value_dim == 64);
+        CHECK(c.attn_scale == 1.0f / std::sqrt(64.0f));  // the trained per-head width: nope 32 + rope 32
+        const KvCacheConfig& kv = model->kv_cache().config();
+        CHECK(kv.values_in_keys && kv.n_head_kv == 1 && kv.value_offset == 32);
+        CHECK(KvCache::bytes_per_token(kv) == static_cast<size_t>(c.n_layers) * 96 * 2);  // F16, keys only
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(logits.has_value());
+        const std::vector<float> batched(logits->begin(), logits->end());
+        const auto expected = LatentReference(model->file()).logits(tokens);
+        const auto vocab = static_cast<size_t>(c.n_vocab);
+        double worst = 0.0;
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            const auto row = std::span<const float>(batched).subspan(t * vocab, vocab);
+            worst = std::max(worst, max_abs_diff(row, expected[t]));
+            CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+        }
+        std::printf("  latent attention (q_rank %d) vs explicit reference: max |diff| %g\n", q_rank, worst);
+        CHECK(worst < 2e-2);
+        // Token by token: the same bits as the batched pass.
+        model->reset();
+        std::vector<float> stepwise;
+        for (const int32_t t : tokens) {
+            auto r = model->forward(std::span<const int32_t>(&t, 1), Transformer::Logits::Last, route, pool);
+            REQUIRE(r.has_value());
+            stepwise.insert(stepwise.end(), r->begin(), r->end());
+        }
+        CHECK(stepwise == batched);
+    }
+}
+
+// Through the engine: describe() reports the latent cache's own size (one
+// Q8_0 row of rope_dim + kv_rank values per position and block, no V rows).
+TEST_CASE("An engine runs latent attention and reports its cache of latents") {
+    auto engine = Engine::create(engine_config(model_path("latent", latent_spec(64))));
+    REQUIRE(engine.has_value());
+    const std::vector<int32_t> out = run(*engine.value(), {1, 270, 300, 5}, greedy(12));
+    CHECK(!out.empty());  // pieces, not tokens: byte tokens of a split character come out together
+    const std::string described = engine.value()->describe();
+    char expected[64];
+    // 2 transformer blocks, each a row of 96 values: 3 Q8_0 blocks of 34 bytes.
+    std::snprintf(expected, sizeof expected, "%.1f KiB/token", 2.0 * 3 * 34 / 1024.0);
+    CHECK(described.find(expected) != std::string::npos);
+    if (described.find(expected) == std::string::npos) std::printf("%s\n", described.c_str());
+}
+
+// Key scaling over latent rows: the factors divide the latent channels too,
+// which are the values, so attention multiplies its output back. Large
+// latent channels (a learned latent norm) are what a Q8_0 cache rounds
+// badly in keys and values alike.
+TEST_CASE("Key scaling on latent attention brings a Q8_0 cache close to F16, values included") {
+    test::TinyModelSpec spec = latent_spec(64);
+    spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+    spec.k_norm_outlier = 60.0f;
+    const std::string& path = model_path("latent_outlier", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    TransformerOptions f16;
+    f16.kv_type = KvCacheType::F16;
+    TransformerOptions q8;
+    q8.kv_type = KvCacheType::Q8_0;
+    auto reference = load_transformer(path, f16);
+    auto plain = load_transformer(path, q8);
+    auto scaled = load_transformer(path, q8);
+    REQUIRE(reference && plain && scaled);
+    REQUIRE(scaled->calibrate_keys(calibration_tokens(*scaled), route, pool).is_ok());
+    REQUIRE(scaled->key_scales().size() == static_cast<size_t>(scaled->config().n_layers) * 96);
+    const std::vector<float> want = all_logits(*reference, pool);
+    const std::vector<float> got_plain = all_logits(*plain, pool);
+    const std::vector<float> got_scaled = all_logits(*scaled, pool);
+    REQUIRE(!want.empty() && got_plain.size() == want.size() && got_scaled.size() == want.size());
+    const double err_plain = max_abs_diff(got_plain, want);
+    const double err_scaled = max_abs_diff(got_scaled, want);
+    std::printf("  latent rows, Q8_0 KV vs F16: max logit error %.4f plain, %.4f with key scaling\n", err_plain,
+                err_scaled);
+    CHECK(err_scaled * 4 < err_plain);
+}
 
 TEST_CASE("Key scaling brings a quantized KV cache close to F16 on keys with large channels") {
     const std::string& path = model_path("key_outlier", outlier_spec());
@@ -1702,6 +2021,67 @@ TEST_CASE("Expert streaming with a small cache (evictions, prefetch, direct I/O)
     }
     CHECK(max_abs_diff(after_trim, stepwise_ref) == 0.0f);
     CHECK(b->expert_store()->stats().loads > st.loads);
+}
+
+// A file may hold each expert's gate and up projections as one [gate | up]
+// matrix (ffn_gate_up_exps). Its rows are the split tensors' rows, so the
+// logits must not move by a bit, read in place or streamed; streamed, a
+// fused expert is one read per matrix: two instead of three.
+TEST_CASE("Fused [gate | up] experts give the split experts' logits bit for bit, in place and streamed") {
+    test::TinyModelSpec split;  // Q4_0 experts: block-quantized slices at unaligned offsets
+    split.arch = "qwen3moe";
+    split.n_layers = 3;
+    split.n_expert = 32;
+    split.n_expert_used = 4;
+    split.identical_experts = false;
+    split.n_ff_shared = 64;  // a shared expert next to the fused routed ones
+    test::TinyModelSpec fused = split;
+    fused.fused_gate_up = true;
+    TransformerOptions in_place;
+    in_place.expert_cache_bytes = 0;
+    TransformerOptions streamed;
+    streamed.expert_cache_bytes = 1;  // minimum: a few dozen slots for 96 experts, so experts are evicted and read again
+    auto a = load_transformer(model_path("moe_split_experts", split), in_place);
+    auto b = load_transformer(model_path("moe_fused_experts", fused), in_place);
+    auto c = load_transformer(model_path("moe_fused_experts", fused), streamed);
+    auto d = load_transformer(model_path("moe_split_experts", split), streamed);
+    REQUIRE(a != nullptr && b != nullptr && c != nullptr && d != nullptr);
+    for (const BlockPlan& plan : b->config().blocks) CHECK(plan.ffn == FfnKind::Moe && plan.fused_gate_up);
+    CHECK(!a->config().blocks[0].fused_gate_up);
+    REQUIRE(c->expert_store() != nullptr && d->expert_store() != nullptr);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 40; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto run = [&](Transformer& model, bool stepwise) {  // every row's logits, batched or token by token
+        model.reset();
+        std::vector<float> out;
+        for (size_t at = 0; at < tokens.size(); at += stepwise ? 1 : tokens.size()) {
+            const auto batch = std::span<const int32_t>(tokens).subspan(at, stepwise ? 1 : tokens.size());
+            auto r = model.forward(batch, stepwise ? Transformer::Logits::Last : Transformer::Logits::All, route, pool);
+            CHECK(r.has_value());
+            if (!r) return std::vector<float>();
+            out.insert(out.end(), r->begin(), r->end());
+        }
+        return out;
+    };
+    for (const bool stepwise : {false, true}) {
+        const std::vector<float> expected = run(*a, stepwise);
+        for (Transformer* model : {b.get(), c.get(), d.get()}) {
+            const std::vector<float> got = run(*model, stepwise);
+            REQUIRE(got.size() == expected.size());
+            CHECK(std::memcmp(got.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+        }
+    }
+    const ExpertStore::Stats fused_reads = c->expert_store()->stats();
+    const ExpertStore::Stats split_reads = d->expert_store()->stats();
+    std::printf("  fused: %llu experts read in %llu reads; split: %llu in %llu\n",
+                static_cast<unsigned long long>(fused_reads.loads), static_cast<unsigned long long>(fused_reads.reads),
+                static_cast<unsigned long long>(split_reads.loads), static_cast<unsigned long long>(split_reads.reads));
+    CHECK(fused_reads.loads > c->expert_store()->entries());  // evictions happened
+    CHECK(fused_reads.reads == 2 * fused_reads.loads);
+    CHECK(split_reads.reads == 3 * split_reads.loads);
 }
 
 TEST_CASE("Automatic requantization converts the resident Q8_0 matrices only when the expert cache is tight") {
@@ -3020,7 +3400,8 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     hybrid.n_layers = 4;
     hybrid.delta_net_interval = 2;
     const std::string dir = test::temp_dir();
-    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid)}) {
+    // ... also with latent attention: its cache pages hold key rows only, values inside them.
+    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64))}) {
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);

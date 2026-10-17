@@ -1,7 +1,9 @@
 // Tests for the paged, quantized KV cache: memory consumption, page reuse,
 // attention sinks, rollback rules and INT4 / INT8 quantization accuracy.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <unistd.h>
 #include <vector>
@@ -160,6 +162,51 @@ TEST_CASE("Quantized KV rows stay accurate; asymmetric INT4 wins on shifted data
     CHECK(err[2][0] < 0.12);
     CHECK(err[3][0] < 0.12);
     CHECK(err[3][1] < err[2][1]);  // asymmetric INT4 tracks the offset
+}
+
+// Multi-head latent attention keeps one row per position: [RoPE part |
+// latent], the latent being the value. The value rows are those channels of
+// the key rows, bit for bit, in half the memory, for every cache type.
+TEST_CASE("Values read from the key rows (latent attention): the same bits in half the memory") {
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        KvCacheConfig separate = small_config(type);
+        separate.n_head_kv = 1;
+        separate.head_dim = 96;  // 32 RoPE channels, then a 64-wide latent
+        KvCacheConfig shared = separate;
+        shared.values_in_keys = true;
+        shared.value_offset = 32;
+        CHECK(KvCache::bytes_per_token(shared) * 2 == KvCache::bytes_per_token(separate));
+        auto a = KvCache::create(separate);
+        auto b = KvCache::create(shared);
+        REQUIRE(a.has_value() && b.has_value());
+        CHECK(b.value()->page_bytes() * 2 == a.value()->page_bytes());
+        REQUIRE(a.value()->reserve(40).is_ok());
+        REQUIRE(b.value()->reserve(40).is_ok());
+        const auto latent = static_cast<size_t>(separate.head_dim - shared.value_offset);
+        for (int32_t layer = 0; layer < separate.n_layers; ++layer) {
+            for (int32_t pos = 0; pos < 40; ++pos) {
+                const std::vector<float> k = row_for(pos + 100 * layer, 96);
+                std::vector<float> v(96, 0.0f);  // the latent, at the start of a separate value row
+                std::copy(k.begin() + 32, k.end(), v.begin());
+                a.value()->store(layer, pos, k.data(), v.data());
+                b.value()->store(layer, pos, k.data(), nullptr);
+            }
+        }
+        const size_t value_bytes = dtype_row_bytes(b.value()->dtype(), static_cast<int64_t>(latent));
+        bool same = true;
+        for (int32_t layer = 0; layer < separate.n_layers; ++layer) {
+            for (int32_t pos = 0; pos < 40; ++pos) {
+                const size_t key_bytes = dtype_row_bytes(a.value()->dtype(), 96);
+                same = same && std::memcmp(a.value()->k_row(layer, pos, 0), b.value()->k_row(layer, pos, 0), key_bytes) == 0;
+                same = same && std::memcmp(a.value()->v_row(layer, pos, 0), b.value()->v_row(layer, pos, 0), value_bytes) == 0;
+            }
+        }
+        CHECK(same);
+    }
+    KvCacheConfig unaligned = small_config(KvCacheType::Q8_0);
+    unaligned.values_in_keys = true;
+    unaligned.value_offset = 16;  // splits a Q8_0 block
+    CHECK(!KvCache::create(unaligned).has_value());
 }
 
 TEST_CASE("Engine with an INT4 sliding-window KV cache uses less KV memory") {

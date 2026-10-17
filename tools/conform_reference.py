@@ -25,9 +25,18 @@ holds other weights than its Hugging Face repository, biases aside).
 Needs torch and transformers (pip install torch transformers). Run the model
 in float32 (the default) for a reference free of half-precision rounding;
 --dtype bfloat16 halves its memory for larger models.
+
+--config sets configuration fields before the model is built, as JSON, for a
+reference of a variant the repository does not ship: a GGUF copy given YaRN
+metadata is compared with the model run with the same RoPE parameters, e.g.
+--config '{"rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000,
+"factor": 4.0, "original_max_position_embeddings": 32768}}'.
+--attn-implementation picks transformers' attention kernel: Gemma 2 needs
+"eager", the default kernel leaves its attention soft cap out.
 """
 
 import argparse
+import json
 import struct
 import sys
 
@@ -47,12 +56,15 @@ def main():
     parser.add_argument("--revision", help="model revision (branch, tag or commit)")
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="run modeling code shipped with the model (only for repositories you trust)")
+    parser.add_argument("--config", help="JSON object of configuration fields to set before the model is built")
+    parser.add_argument("--attn-implementation", help='transformers attention kernel, e.g. "eager"')
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    with open(args.text, encoding="utf-8") as f:
+    # newline="" keeps "\r\n" as written: liyab-kl encodes the file's exact bytes.
+    with open(args.text, encoding="utf-8", newline="") as f:
         text = f.read()
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision,
                                               trust_remote_code=args.trust_remote_code)
@@ -62,8 +74,13 @@ def main():
     if len(ids) < 2:
         sys.exit("the text must encode to at least 2 tokens")
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, dtype=getattr(torch, args.dtype),
-                                                 trust_remote_code=args.trust_remote_code)
+    config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
+    for field, value in json.loads(args.config or "{}").items():
+        setattr(config, field, value)
+    extra = {"attn_implementation": args.attn_implementation} if args.attn_implementation else {}
+    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
+                                                 dtype=getattr(torch, args.dtype),
+                                                 trust_remote_code=args.trust_remote_code, **extra)
     model.eval()
     with torch.no_grad():
         logits = model(torch.tensor([ids])).logits[0, :-1].float()

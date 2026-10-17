@@ -117,6 +117,21 @@ std::vector<GoldenCase> cases() {
     add("qwen3", s);
     s.rope_dim = 16;  // half of the 32-wide heads
     add("qwen3-partial-rope", s);
+    s = {};
+    s.arch = "qwen3";
+    s.qk_norm = true;
+    s.yarn_factor = 4.0f;  // YaRN: default betas, attention factor 1 + 0.1 ln 4
+    s.yarn_ctx = 32;       // a ramp over the first pairs, the slower ones interpolated
+    add("qwen3-yarn", s);
+    s = {};
+    s.arch = "qwen2";
+    s.key_outlier = 60.0f;  // key scaling over YaRN's per-pair speeds
+    s.yarn_factor = 8.0f;
+    s.yarn_ctx = 48;
+    s.yarn_beta_fast = 16.0f;
+    s.yarn_beta_slow = 2.0f;
+    s.yarn_log_mul = 0.0707f;  // DeepSeek's convention: q·k scaled, rotation magnitude 1
+    add("qwen2-yarn-keyscaled", s, {}, true);
 
     s = moe_spec("qwen3moe");
     s.qk_norm = true;
@@ -125,6 +140,9 @@ std::vector<GoldenCase> cases() {
     TransformerOptions streamed;
     streamed.expert_cache_bytes = int64_t{1} << 20;  // experts read through the ExpertStore
     add("qwen3moe-streamed", s, streamed);
+    s.fused_gate_up = true;  // each expert's [gate | up] in one tensor: the split model's bits
+    add("qwen3moe-fused-gate-up", s);
+    add("qwen3moe-fused-gate-up-streamed", s, streamed);
     s = moe_spec("qwen3moe");
     s.sigmoid_gating = true;
     s.expert_bias = true;
@@ -157,6 +175,18 @@ std::vector<GoldenCase> cases() {
     add("hunyuan-dense-keyscaled", s, {}, true);
 
     s = {};
+    s.arch = "gemma2";  // Gemma 3's parts without Q/K norms, every other block windowed, soft caps
+    s.n_layers = 4;
+    s.sliding_window = 8;
+    s.post_norms = true;
+    s.tied_output = true;
+    s.attn_softcap = 1.0f;  // caps small enough to squash the tiny model's scores and logits
+    s.final_softcap = 2.0f;
+    add("gemma2", s);
+    s.attn_scale = 0.125f;  // the q·k scale the file states (attention.scale)
+    add("gemma2-attn-scale", s);
+
+    s = {};
     s.arch = "gemma3";  // scaled embeddings, GeGLU, norms after the attention and the FFN
     s.n_layers = 6;     // five windowed blocks (RoPE base 10000), then a global one
     s.sliding_window = 8;
@@ -171,6 +201,29 @@ std::vector<GoldenCase> cases() {
     add("gemma3-sliding", s, engine_window);
     s.k_norm_outlier = 60.0f;  // key scaling with two RoPE tables
     add("gemma3-keyscaled", s, {}, true);
+
+    s = {};
+    s.arch = "deepseek2";  // latent attention: the Q8_0 cache holds [k_pe | latent] per position, values its latent
+    s.n_layers = 3;
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    add("deepseek2-mla", s);
+    add("deepseek2-mla-f16kv", s, f16_kv);
+    s.k_norm_outlier = 60.0f;  // large latent channels: key scaling over keys and the values in them
+    add("deepseek2-mla-keyscaled", s, {}, true);
+    s.k_norm_outlier = 0.0f;
+    s.mla_q_rank = 64;  // low-rank queries, a dense leading block, MoE with a shared expert, YaRN with DeepSeek's mscale
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_ff_shared = 64;
+    s.dense_lead = 1;
+    s.expert_weights_norm = -1;
+    s.yarn_factor = 4.0f;
+    s.yarn_ctx = 32;
+    s.yarn_log_mul = 0.0707f;
+    add("deepseek2-mla-qlora-moe-yarn", s);
 
     s = {};
     s.arch = "phi3";  // fused attn_qkv and [gate | up], LongRoPE, every block windowed

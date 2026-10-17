@@ -23,6 +23,20 @@ constexpr ArchSpec kArchitectures[] = {
     // Hunyuan dense (Hunyuan-MT, Hunyuan 0.5B-7B): Q/K norms after RoPE. The
     // converter folds the dynamic-NTK "alpha" scaling into rope.freq_base.
     {"hunyuan-dense", RopeLayout::Halves, "ffn_norm", false, QkNormOrder::AfterRope},
+    // Gemma 2: embeddings scaled by sqrt(d), GeGLU, norms after the attention
+    // and the FFN; every other block (the even ones) attends through the
+    // sliding window, all with the one RoPE base. The soft caps of the
+    // attention scores and the logits come from the file. As for Gemma 3, the
+    // converter stores RMSNorm weights as 1 + w.
+    {.name = "gemma2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 2},
     // Gemma 3: embeddings scaled by sqrt(d), GeGLU, norms after the attention
     // and the FFN, Q/K norms; every sixth block attends globally with RoPE
     // base rope.freq_base, the others through the sliding window with base
@@ -38,6 +52,13 @@ constexpr ArchSpec kArchitectures[] = {
      .scale_embeddings = true,
      .swa_period = 6,
      .rope_base_swa = 10000.0f},
+    // DeepSeek-V2 / V3 and the models converted alike (Youtu-LLM):
+    // multi-head latent attention (planned from attn_kv_a_mqa,
+    // geometry from attention.*_lora_rank and *_mla), RoPE on adjacent pairs
+    // of the shared k_pe, a dense FFN in the leading blocks and a MoE with
+    // shared experts in the others (both from the tensors); the top-k
+    // weights are renormalized only when the file says so.
+    {"deepseek2", RopeLayout::Adjacent, "ffn_norm", false},
     // Phi-3 / Phi-3.5 / Phi-4-mini: fused attn_qkv and [gate | up] ffn_up
     // (planned from the tensors), LongRoPE factors; every block uses the
     // sliding window when the file sets one (Phi-3-mini-4k: 2047).
@@ -108,16 +129,48 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.moe_weights_scale = static_cast<float>(f.get_float(key("expert_weights_scale")).value_or(1.0));
         if (c.moe_weights_scale == 0.0f) c.moe_weights_scale = 1.0f;
         if (c.n_expert_used > c.n_expert) return Status(ErrorCode::InvalidModel, "expert_used_count > expert_count");
+        // Group-limited routing (DeepSeek-V3: top-k only among the best
+        // groups of experts) is not implemented: plain top-k would choose
+        // other experts.
+        const int64_t groups = f.get_int(key("expert_group_count")).value_or(1);
+        if (groups > 1 && f.get_int(key("expert_group_used_count")).value_or(groups) < groups) {
+            return Status(ErrorCode::Unsupported, "group-limited expert routing (" + key("expert_group_count") +
+                                                      " " + std::to_string(groups) + ") is not supported yet");
+        }
     }
     c.n_ff = static_cast<int32_t>(f.get_int(key("feed_forward_length")).value_or(0));
     if (c.n_ff <= 0 && c.n_expert == 0) return Status(ErrorCode::InvalidModel, "missing or invalid " + key("feed_forward_length"));
     LIYAB_RETURN_IF_ERROR(require_int("attention.head_count", c.n_head));
     c.n_head_kv = static_cast<int32_t>(f.get_int(key("attention.head_count_kv")).value_or(c.n_head));
     c.head_dim = static_cast<int32_t>(f.get_int(key("attention.key_length")).value_or(c.n_embd / c.n_head));
-    if (const auto vlen = f.get_int(key("attention.value_length")); vlen && *vlen != c.head_dim) {
+    c.value_dim = c.head_dim;
+    c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
+    const auto value_length = f.get_int(key("attention.value_length"));
+    if (const auto kv_rank = f.get_int(key("attention.kv_lora_rank")); kv_rank && *kv_rank > 0) {
+        // Multi-head latent attention. The converter states the absorbed
+        // geometry (one KV head of [k_pe | latent], values the latent) and
+        // the per-head one apart (*_mla): files from before it split
+        // attn_kv_b into attn_k_b / attn_v_b have neither.
+        LatentAttention& m = c.mla;
+        const auto key_mla = f.get_int(key("attention.key_length_mla"));
+        const auto value_mla = f.get_int(key("attention.value_length_mla"));
+        if (!key_mla || !value_mla) {
+            return Status(ErrorCode::Unsupported,
+                          "this " + c.arch + " file predates split attn_k_b / attn_v_b tensors (no " +
+                              key("attention.key_length_mla") + "): convert the model again with a current converter");
+        }
+        m.kv_rank = static_cast<int32_t>(*kv_rank);
+        m.q_rank = static_cast<int32_t>(f.get_int(key("attention.q_lora_rank")).value_or(0));
+        m.nope_dim = static_cast<int32_t>(*key_mla - c.rope_dim);
+        m.v_dim = static_cast<int32_t>(*value_mla);
+        c.value_dim = static_cast<int32_t>(value_length.value_or(0));
+        if (c.n_head_kv != 1 || c.head_dim != m.kv_rank + c.rope_dim || c.value_dim != m.kv_rank ||
+            m.nope_dim <= 0 || m.v_dim <= 0 || m.q_rank < 0 || *kv_rank > (int64_t{1} << 20)) {
+            return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
+        }
+    } else if (value_length && *value_length != c.head_dim) {
         return Status(ErrorCode::Unsupported, "key_length != value_length is not supported");
     }
-    c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
     c.rope_base = static_cast<float>(f.get_float(key("rope.freq_base")).value_or(10000.0));
@@ -137,9 +190,41 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (!(c.rope_magnitude > 0.0f)) {
         return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.attn_factor"));
     }
+    double qk_mscale = 1.0;  // YaRN's factor on q·k (yarn_log_multiplier), squared into attn_scale below
     if (const auto scaling = f.get_string(key("rope.scaling.type")); scaling && *scaling != "none") {
         if (*scaling == "longrope" || *scaling == "su") {
             if (!longrope) return Status(ErrorCode::InvalidModel, "LongRoPE scaling without rope_factors_long/short");
+        } else if (*scaling == "yarn") {
+            YarnRope& y = c.yarn;
+            y.factor = static_cast<float>(f.get_float(key("rope.scaling.factor")).value_or(0.0));
+            y.ctx_orig = static_cast<int32_t>(
+                f.get_int(key("rope.scaling.original_context_length")).value_or(c.n_ctx_train));
+            y.beta_fast = static_cast<float>(f.get_float(key("rope.scaling.yarn_beta_fast")).value_or(32.0));
+            y.beta_slow = static_cast<float>(f.get_float(key("rope.scaling.yarn_beta_slow")).value_or(1.0));
+            y.ext_factor = static_cast<float>(f.get_float(key("rope.scaling.yarn_ext_factor")).value_or(1.0));
+            const GgufValue* truncate = f.metadata(key("rope.scaling.yarn_truncate"));
+            if (truncate != nullptr && !truncate->as_bool()) {
+                return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.yarn_truncate"));
+            }
+            y.truncate = truncate == nullptr || *truncate->as_bool();
+            if (!(y.factor > 0.0f) || !std::isfinite(y.factor) || y.ctx_orig <= 0 || !(y.beta_fast > 0.0f) ||
+                !(y.beta_slow > 0.0f) || !(y.ext_factor >= 0.0f) || !std::isfinite(y.ext_factor)) {
+                return Status(ErrorCode::InvalidModel, "invalid YaRN parameters (" + key("rope.scaling.*") + ")");
+            }
+            // The attention factor that comes with the frequencies: the
+            // file's own, or 0.1 ln(factor) + 1. A yarn_log_multiplier m
+            // (DeepSeek, which stores 0.1 x its mscale_all_dim) scales q·k by
+            // (1 + m ln(factor))^2 instead and leaves the rotation's
+            // magnitude at 1: the reference's two mscales are equal there.
+            const double ln_factor = y.factor > 1.0f ? std::log(static_cast<double>(y.factor)) : 0.0;
+            const auto log_mul = f.get_float(key("rope.scaling.yarn_log_multiplier"));
+            const auto attn_factor = f.get_float(key("rope.scaling.yarn_attn_factor"));
+            const double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            if (log_mul) qk_mscale = 1.0 + *log_mul * ln_factor;
+            if (!(magnitude > 0.0) || !(qk_mscale > 0.0)) {
+                return Status(ErrorCode::InvalidModel, "invalid YaRN attention factor (" + key("rope.scaling.*") + ")");
+            }
+            c.rope_magnitude = static_cast<float>(c.rope_magnitude * magnitude);
         } else if (*scaling != "linear") {
             return Status(ErrorCode::Unsupported, "rope scaling '" + std::string(*scaling) + "' is not supported");
         } else {
@@ -183,6 +268,28 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (c.head_dim <= 0 || c.rope_dim <= 0 || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
     }
+    // The q·k scale: the file's, else 1/sqrt(head_dim) (computed as the
+    // attention always computed it, so existing models keep their bits).
+    // Latent attention scores the per-head [q_nope | q_pe] . [k_nope | k_pe]
+    // the model was trained with, whatever width the absorbed form attends
+    // over: 1/sqrt(nope_dim + rope_dim).
+    if (const auto scale = f.get_float(key("attention.scale"))) {
+        c.attn_scale = static_cast<float>(*scale);
+        if (!(c.attn_scale > 0.0f) || !std::isfinite(c.attn_scale)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.scale"));
+        }
+    } else {
+        const int32_t scored = c.mla.kv_rank > 0 ? c.mla.nope_dim + c.rope_dim : c.head_dim;
+        c.attn_scale = 1.0f / std::sqrt(static_cast<float>(scored));
+    }
+    if (qk_mscale != 1.0) c.attn_scale = static_cast<float>(c.attn_scale * qk_mscale * qk_mscale);
+    // Soft caps, wherever the file states them (0 or absent: none).
+    c.attn_softcap = static_cast<float>(f.get_float(key("attn_logit_softcapping")).value_or(0.0));
+    c.final_softcap = static_cast<float>(f.get_float(key("final_logit_softcapping")).value_or(0.0));
+    if (!(c.attn_softcap >= 0.0f) || !(c.final_softcap >= 0.0f) || !std::isfinite(c.attn_softcap) ||
+        !std::isfinite(c.final_softcap)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("attn_logit_softcapping / final_logit_softcapping"));
+    }
     const TensorView* embd = f.tensor("token_embd.weight");
     if (embd == nullptr || embd->cols() != c.n_embd) {
         return Status(ErrorCode::InvalidModel, "missing or malformed token_embd.weight");
@@ -200,8 +307,14 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.mixer = MixerKind::DeltaNet;
         } else {
             ++c.n_attn_layers;
+            b.latent = f.tensor(block_tensor(l, "attn_kv_a_mqa.weight")) != nullptr;
+            if (b.latent != (c.mla.kv_rank > 0)) {
+                // The KV cache is laid out for one kind of attention.
+                return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": latent attention tensors and " +
+                                                           key("attention.kv_lora_rank") + " disagree");
+            }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
-            b.attn_gate = wq != nullptr && wq->rows() == 2 * q_dim;
+            b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
         }
@@ -211,10 +324,11 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
-            if (f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr) {
-                return Status(ErrorCode::Unsupported, "fused ffn_gate_up_exps tensors are not supported yet");
-            }
             b.ffn = FfnKind::Moe;
+            // Each expert's gate and up projections as one [gate | up]
+            // matrix (a converter option, Granite MoE), instead of two tensors.
+            b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
+                              f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
         }
     }

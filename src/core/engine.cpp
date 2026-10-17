@@ -1239,7 +1239,7 @@ std::string Engine::describe() const {
                   static_cast<double>(impl_->target->file().file_size()) / (1024.0 * 1024.0 * 1024.0),
                   impl_->target->file().streaming() ? "streaming" : "resident", impl_->target->context_length(),
                   window.c_str(), std::string(dtype_traits(kv.dtype()).name).c_str(), kv.config().page_tokens,
-                  static_cast<double>(KvCache::bytes_per_token(kv.config().n_layers, c.n_head_kv, c.head_dim, kv.config().type)) /
+                  static_cast<double>(KvCache::bytes_per_token(kv.config())) /
                       1024.0,
                   impl_->weight_loader
                       ? ("triple-buffered blocks, 3 x " +

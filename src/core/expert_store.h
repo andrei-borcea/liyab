@@ -8,10 +8,13 @@
 //    on Apple) by background threads, one large aligned read per matrix, so
 //    the kernel neither duplicates them in the page cache nor evicts the
 //    resident (non-expert) weights to make room for them. The thread that
-//    starts an expert reads its first matrix and hands the other two to idle
+//    starts an expert reads its first matrix and hands the others to idle
 //    threads, which take them before any new expert: an expert the forward
 //    pass waits for arrives after one matrix's latency, not three.
-//  * A cache entry is one (block, expert): its gate, up and down matrices.
+//  * A cache entry is one (block, expert): its gate, up and down matrices,
+//    or its [gate | up] and down matrices when the file fuses gate and up
+//    (ffn_gate_up_exps): the fused matrix of an expert is contiguous, so it
+//    is one read, and such an expert takes two reads instead of three.
 //    Eviction is LFU with periodic halving (frequency + recency), skipping
 //    entries in use.
 //  * prefetch() queues predicted experts (Transformer applies a block's
@@ -50,12 +53,14 @@ public:
         uint64_t loads = 0;          // experts read from storage
         uint64_t unused = 0;         // loaded experts evicted before any use (wrong predictions)
         uint64_t dropped = 0;        // wrong guesses removed from the queue before they were read
+        uint64_t reads = 0;          // direct reads issued: one per matrix of a loaded expert
         uint64_t bytes_read = 0;
         double stall_ms = 0.0;       // compute time spent waiting for experts
     };
 
     // `experts[l]` = {gate, up, down} stacked expert tensors of block l, or
-    // all nullptr for a dense block. `repack`: rearrange the matrices of an
+    // all nullptr for a dense block; {nullptr, gate_up, down} when the block
+    // stores [gate | up] as one tensor. `repack`: rearrange the matrices of an
     // expert read for a multi-token pass (set_batch) into the CPU's i8mm
     // layout as they arrive (I/O thread; Q4_K/Q5_K/Q6_K to *_R8, Q8_0 to
     // Q8_0_R4; lossless, same size), as the resident weights are at load:
@@ -81,7 +86,8 @@ public:
     // prefetch bonus and pushed out experts that were in use). Never blocks
     // on I/O.
     void prefetch(int32_t layer, std::span<const int32_t> experts, bool predicted = true);
-    // The {gate, up, down} views of one expert, pinned until release().
+    // The {gate, up, down} views of one expert, pinned until release()
+    // ({empty, gate_up, down} for a fused block: the gate view has no data).
     // Blocks until the expert is in RAM.
     Result<std::array<TensorView, 3>> acquire(int32_t layer, int32_t expert);
     void release(int32_t layer, int32_t expert);
