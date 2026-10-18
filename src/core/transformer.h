@@ -197,6 +197,42 @@ public:
     // only) and attention-head masking.
     Result<std::span<const float>> forward(std::span<const int32_t> tokens, Logits logits, const Route& route,
                                            ThreadPool& pool, const ForwardHooks* hooks = nullptr);
+    // ---- Tree verification (speculative decoding) ----
+    // One pass over a tree of tokens: tokens[0] continues the context and
+    // token t > 0 continues token parents[t] (parents[0] = -1, 0 <= parents[t]
+    // < t), so the tree's branches are alternative continuations verified
+    // together. Every token is computed as if its branch (its ancestors, then
+    // itself) alone followed the context: at position n_past() + its depth,
+    // attending to the context and to its ancestors only (the same visible
+    // positions, in the same order and spans, as a linear pass over its
+    // branch), recurrent (DeltaNet) blocks continuing from the state after
+    // its parent. So its row of logits (one per token, in token order, as
+    // Logits::All) has the bits a linear pass over its branch gives it
+    // (attention never depends on the batch; the CPU backend's matmuls give a
+    // row the same bits in any batch). Latent attention runs in the absorbed
+    // form, as decoding does. Token t's KV rows are held at slot n_past() + t
+    // until keep_path(), which must come next: forward() and forward_tree()
+    // refuse to run before it; truncate() to n_past() or below drops the tree.
+    // Preconditions: tokens.size() <= max_batch() and, on hybrid models,
+    // <= rollback_window() (every token's recurrent state is kept until
+    // keep_path(), in the rollback checkpoints). InvalidArgument for parents
+    // that do not form such a tree or a batch too large; Unsupported for a
+    // hybrid model whose rollback window is too small. No hooks.
+    Result<std::span<const float>> forward_tree(std::span<const int32_t> tokens, std::span<const int32_t> parents,
+                                                const Route& route, ThreadPool& pool);
+    // After forward_tree(): keeps the branch `path` (token indices of the
+    // tree pass: path[0] = 0, each next one a child of the one before) as
+    // the next path.size() positions of the context and drops the rest of
+    // the tree: the branch's KV rows move to their positions
+    // (KvCache::copy_position(), none when the branch is the tree's first
+    // tokens), the recurrent states become those after path.back(), and the
+    // rollback checkpoints those of the branch's positions, so truncate()
+    // can still return into it. Exactly the context a linear pass over the
+    // branch leaves. InvalidArgument without a pending tree or for a path
+    // that is not a branch of it (the tree stays pending).
+    Status keep_path(std::span<const int32_t> path);
+    // Whether a forward_tree() pass awaits keep_path().
+    [[nodiscard]] bool tree_pending() const noexcept { return tree_base_ >= 0; }
     // Pooling models (embeddings, ranking heads; core/pooling.h): the final
     // hidden states of rows `rows` of the last forward() pass (indices into
     // its tokens), after the output norm and before the LM head, n_embd floats
@@ -686,9 +722,18 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
-    // Position of token t of the current batch: n_past_ + t, or positions_[t]
-    // while run_block_at() runs a batch at scattered positions.
+    // Position of token t of the current batch: n_past_ + t, n_past_ + its
+    // depth in a tree pass (forward_tree), or positions_[t] while
+    // run_block_at() runs a batch at scattered positions. Its RoPE angle and
+    // what it may see follow from it.
     [[nodiscard]] int32_t pos_of(int32_t t) const noexcept {
+        if (!positions_.empty()) return positions_[static_cast<size_t>(t)];
+        return n_past_ + (tree_depth_.empty() ? t : tree_depth_[static_cast<size_t>(t)]);
+    }
+    // Cache slot holding token t's KV rows: its position, except in a tree
+    // pass, where tokens at one depth are alternatives and each has the slot
+    // n_past_ + t until keep_path().
+    [[nodiscard]] int32_t row_of(int32_t t) const noexcept {
         return positions_.empty() ? n_past_ + t : positions_[static_cast<size_t>(t)];
     }
     // Sizes the per-token scratch for a batch of n tokens.
@@ -797,6 +842,15 @@ private:
     int32_t max_batch_ = 0;
     int32_t n_past_ = 0;
     std::span<const int32_t> positions_;  // run_block_at(): the batch's positions (see pos_of)
+    // Tree pass (forward_tree): per token its depth, its parent (-1: the
+    // root) and the batch index of its ancestor at each depth up to its own
+    // (tree_ancestors_[t * tree_stride_ + d]), which attention reads the rows
+    // of positions n_past_ + d through. tree_depth_ is empty outside the
+    // pass; tree_parent_ stays until keep_path(), with tree_base_ (n_past_
+    // before the pass, -1 when no tree is pending).
+    std::vector<int32_t> tree_depth_, tree_parent_, tree_ancestors_;
+    int32_t tree_stride_ = 0;
+    int32_t tree_base_ = -1;
     int32_t last_exit_layer_ = -1;
     int32_t last_ffn_skips_ = 0;
     std::unique_ptr<KvCache> kv_;

@@ -860,6 +860,8 @@ void Transformer::reset() noexcept {
     snapshots_.clear();
     spare_buffers_.clear();
     n_past_ = 0;
+    tree_base_ = -1;
+    tree_parent_.clear();
 }
 
 bool Transformer::has_position_state() const noexcept { return !states_.empty() || kv_->has_windowed_layers(); }
@@ -1429,7 +1431,14 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         const Seen vis = seen(pos);
         const int32_t n_sinks = vis.sink_end - vis.sink_begin;
         const int32_t n_visible = n_sinks + (pos - vis.first + 1);
-        auto position = [&](int32_t i) { return i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks); };
+        // A tree pass reads the rows of positions n_past_ + d (the batch's
+        // own) from the slot of the token's ancestor at depth d: its branch.
+        const int32_t* ancestors =
+            tree_depth_.empty() ? nullptr : tree_ancestors_.data() + static_cast<size_t>(t) * tree_stride_;
+        auto position = [&](int32_t i) {
+            const int32_t p = i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks);
+            return ancestors == nullptr || p < n_past_ ? p : n_past_ + ancestors[p - n_past_];
+        };
         const int32_t spans = spans_for(n_visible);
         const auto i0 = static_cast<int32_t>(int64_t{n_visible} * sp / spans);
         const auto i1 = static_cast<int32_t>(int64_t{n_visible} * (sp + 1) / spans);
@@ -1521,7 +1530,9 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         for (size_t d = 0; d < uvd; ++d) dst[d] *= inv;
     };
 
-    const int32_t max_spans = spans_of(n - 1);  // the last token sees the most positions
+    // The last token sees the most positions; in a tree pass, the deepest.
+    int32_t max_spans = spans_of(n - 1);
+    for (int32_t t = 0; !tree_depth_.empty() && t + 1 < n; ++t) max_spans = std::max(max_spans, spans_of(t));
     const int64_t pairs = int64_t{n} * c.n_head_kv;
     if (max_spans == 1 || pairs >= int64_t{pool.max_threads()} * ThreadPool::kChunksPerThread) {
         pool.parallel_for(pairs, [&](int64_t begin, int64_t end) {
@@ -2031,7 +2042,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         rope(k, c.n_head_kv, pos, rope_table);
         if (norm_after_rope) qk_norm(L, q, k);
         scale_keys(L.kv_slot, q, k);
-        kv_->store(L.kv_slot, pos, k, v);
+        kv_->store(L.kv_slot, row_of(static_cast<int32_t>(t)), k, v);
     }
     attention(L.kv_slot, L.window, n, pool, head_mask);
     if (gated) {
@@ -2481,7 +2492,7 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
             rope(k, 1, pos, rope_table);
             scale_keys(L.kv_slot, q, k);
         }
-        kv_->store(L.kv_slot, pos, k, nullptr);  // the values are this row's latent channels
+        kv_->store(L.kv_slot, row_of(static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
     }
     start = Clock::now();
     if (expanded) {
@@ -2568,6 +2579,12 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
     };
 
+    // Tree pass: a token whose parent is not the token before it (a branch
+    // other than the first) continues from its parent's state, which the
+    // parent's checkpoint holds (forward_tree() keeps one for every token).
+    const int32_t* parent = tree_depth_.empty() ? nullptr : tree_parent_.data();
+    auto branches = [&](size_t t) { return parent != nullptr && t > 0 && parent[t] != static_cast<int32_t>(t) - 1; };
+
     // 1. Causal depthwise convolution over [history, current] and SiLU, every
     //    channel through all n tokens (channels are independent, tokens are
     //    not), then the L2 norm of each query / key head. One task per head of
@@ -2580,6 +2597,10 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                 float* hist = st.conv.data() + ch * history;
                 const float* tap = L.conv1d.data() + ch * taps;
                 for (size_t t = 0; t < un; ++t) {
+                    if (branches(t)) {
+                        const float* from = slot_of(static_cast<size_t>(parent[t])) + ch * history;
+                        std::copy(from, from + history, hist);
+                    }
                     float* m = mix_.data() + t * conv_dim;
                     float acc = m[ch] * tap[history];
                     for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
@@ -2602,6 +2623,10 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
         for (auto h = static_cast<size_t>(begin); h < static_cast<size_t>(end); ++h) {
             float* S = st.ssm.data() + h * hd * hd;
             for (size_t t = 0; t < un; ++t) {
+                if (branches(t)) {
+                    const float* from = slot_of(static_cast<size_t>(parent[t])) + st.conv.size() + h * hd * hd;
+                    std::copy(from, from + hd * hd, S);
+                }
                 const float* m = mix_.data() + t * conv_dim;
                 const float* q = m + (h % hk) * hd;
                 const float* k = m + key_dim + (h % hk) * hd;
@@ -3493,6 +3518,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     last_exit_layer_ = -1;
     predicted_layer_ = -1;  // an early exit can leave a guess for a block that never ran
     if (n == 0) return Status(ErrorCode::InvalidArgument, "forward() needs at least one token");
+    if (tree_base_ >= 0) return Status(ErrorCode::InvalidArgument, "a tree pass awaits keep_path()");
     if (route.attention == nullptr || route.ffn == nullptr || route.cpu == nullptr) {
         return Status(ErrorCode::InvalidArgument, "incomplete backend route");
     }
@@ -3522,7 +3548,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     latent_expanded_ = false;
     latent_ms_ = 0.0;
     LatentFormChooser::Work latent_work;
-    const bool latent = c.mla.kv_rank > 0 && n >= 2;
+    // A tree pass is absorbed too: its tokens are decoding steps of their
+    // branches, and the expanded form's tiles assume a contiguous pass.
+    const bool latent = c.mla.kv_rank > 0 && n >= 2 && tree_depth_.empty();
     if (latent) {
         int32_t window = 0;
         for (int32_t l = 0; l < c.n_layers; ++l) {
@@ -3565,7 +3593,9 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
         }
     }
 
-    for (int32_t i = 0; i < recorded; ++i) {
+    // A tree pass's checkpoints hold its tokens' states, not positions':
+    // keep_path() marks those of the kept branch.
+    for (int32_t i = 0; i < recorded && tree_depth_.empty(); ++i) {
         const int32_t pos = n_past_ + n - 1 - i;
         checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
     }
@@ -3584,12 +3614,99 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     return std::span<const float>(logits_.data(), logits_.size());
 }
 
+Result<std::span<const float>> Transformer::forward_tree(std::span<const int32_t> tokens,
+                                                         std::span<const int32_t> parents, const Route& route,
+                                                         ThreadPool& pool) {
+    const auto n = static_cast<int32_t>(tokens.size());
+    if (tree_base_ >= 0) return Status(ErrorCode::InvalidArgument, "a tree pass awaits keep_path()");
+    if (n == 0 || parents.size() != tokens.size() || parents[0] != -1) {
+        return Status(ErrorCode::InvalidArgument, "forward_tree: a tree starts with one root token");
+    }
+    if (n > max_batch_) return Status(ErrorCode::InvalidArgument, "forward_tree: more tokens than max_batch()");
+    if (config_.hybrid() && n > rollback_window_) {
+        return Status(ErrorCode::Unsupported, "forward_tree: the rollback window cannot hold every token's state");
+    }
+    const auto un = static_cast<size_t>(n);
+    tree_depth_.assign(un, 0);
+    for (size_t t = 1; t < un; ++t) {
+        const int32_t p = parents[t];
+        if (p < 0 || p >= static_cast<int32_t>(t)) {
+            tree_depth_.clear();
+            return Status(ErrorCode::InvalidArgument, "forward_tree: a token's parent must come before it");
+        }
+        tree_depth_[t] = tree_depth_[static_cast<size_t>(p)] + 1;
+    }
+    tree_parent_.assign(parents.begin(), parents.end());
+    tree_stride_ = *std::max_element(tree_depth_.begin(), tree_depth_.end()) + 1;
+    tree_ancestors_.assign(un * static_cast<size_t>(tree_stride_), 0);
+    for (size_t t = 0; t < un; ++t) {
+        int32_t* row = tree_ancestors_.data() + t * static_cast<size_t>(tree_stride_);
+        for (auto a = static_cast<int32_t>(t); a >= 0; a = tree_parent_[static_cast<size_t>(a)]) {
+            row[tree_depth_[static_cast<size_t>(a)]] = a;
+        }
+    }
+    // Every token's recurrent state is checkpointed: a later branch starts
+    // from one, and keep_path() keeps the branch's.
+    const bool checkpointing = checkpointing_;
+    checkpointing_ = true;
+    auto logits = forward(tokens, Logits::All, route, pool);
+    checkpointing_ = checkpointing;
+    tree_depth_.clear();
+    if (!logits) {
+        tree_parent_.clear();
+        return logits.status();
+    }
+    tree_base_ = n_past_ - n;
+    return logits;
+}
+
+Status Transformer::keep_path(std::span<const int32_t> path) {
+    if (tree_base_ < 0) return Status(ErrorCode::InvalidArgument, "keep_path: no tree pass is pending");
+    if (path.empty() || path[0] != 0) return Status(ErrorCode::InvalidArgument, "keep_path: a branch starts at the root");
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] <= 0 || path[i] >= static_cast<int32_t>(tree_parent_.size()) ||
+            tree_parent_[static_cast<size_t>(path[i])] != path[i - 1]) {
+            return Status(ErrorCode::InvalidArgument, "keep_path: not a branch of the tree");
+        }
+    }
+    const int32_t base = tree_base_;
+    // Ascending: token path[i] >= i of a branch is never the target of an
+    // earlier move (path[j] >= j > i for every later j), so no row is
+    // overwritten before it is read; the moves within the n <= window ring
+    // slots below are distinct for the same reason.
+    for (size_t i = 1; i < path.size(); ++i) {
+        const int32_t to = base + static_cast<int32_t>(i);
+        LIYAB_RETURN_IF_ERROR(kv_->copy_position(base + path[i], to));
+        if (states_.empty() || rollback_window_ == 0) continue;
+        const auto from_slot = static_cast<size_t>((base + path[i]) % rollback_window_);
+        const auto to_slot = static_cast<size_t>(to % rollback_window_);
+        for (RecurrentState& st : states_) {
+            const size_t per_state = st.conv.size() + st.ssm.size();
+            if (from_slot != to_slot) {
+                std::copy_n(st.checkpoints.data() + from_slot * per_state, per_state,
+                            st.checkpoints.data() + to_slot * per_state);
+            }
+        }
+    }
+    for (size_t i = 0; i < path.size() && rollback_window_ > 0; ++i) {
+        const int32_t pos = base + static_cast<int32_t>(i);
+        checkpoint_pos_[static_cast<size_t>(pos % rollback_window_)] = pos;
+    }
+    tree_base_ = -1;
+    tree_parent_.clear();
+    // The recurrent states after path.back() come back from its checkpoint
+    // (none to restore when the branch is every token: they are current).
+    return truncate(base + static_cast<int32_t>(path.size()));
+}
+
 Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end) {
     auto fail = [this](const char* why) {
         reset();
         return Status(ErrorCode::InvalidArgument, why);
     };
     const size_t floats = recurrent_state_bytes() / sizeof(float);
+    tree_base_ = -1;  // the context is replaced: a pending tree pass with it
+    tree_parent_.clear();
     if (n < 0 || n > context_length_ || kv_->window() > 0) return fail("the context does not fit this cache");
     if (static_cast<int32_t>(snapshots.size()) >= kStateSnapshots || (!has_position_state() && !snapshots.empty())) {
         return fail("the context's recurrent states do not fit this model");
@@ -3655,6 +3772,11 @@ Status Transformer::abandon_pass() {
 
 Status Transformer::truncate(int32_t n) {
     if (n < 0 || n > n_past_) return Status(ErrorCode::InvalidArgument, "truncate beyond cached positions");
+    if (tree_base_ >= 0) {  // a pending tree's slots are no context: only what preceded it stays
+        if (n > tree_base_) return Status(ErrorCode::InvalidArgument, "truncate into a pending tree pass");
+        tree_base_ = -1;
+        tree_parent_.clear();
+    }
     if (n == n_past_) return Status::ok();
     if (n == 0) {
         reset();

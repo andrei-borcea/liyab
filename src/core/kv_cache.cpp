@@ -334,6 +334,24 @@ KvCache::RowView KvCache::row_view(int32_t layer) const noexcept {
     return v;
 }
 
+Status KvCache::copy_position(int32_t from, int32_t to) {
+    if (from < 0 || to < 0) return Status(ErrorCode::InvalidArgument, "copy_position: negative position");
+    if (from == to) return Status::ok();
+    for (const Group& g : groups_) {
+        if (!mapped(g, static_cast<size_t>(from / config_.page_tokens)) ||
+            !mapped(g, static_cast<size_t>(to / config_.page_tokens))) {
+            return Status(ErrorCode::InvalidArgument, "copy_position: a position's KV page is not mapped");
+        }
+    }
+    // A position's rows of one layer are its n_head_kv rows side by side
+    // (row()'s [slot][kv_head] order), per plane: one copy each.
+    for (int32_t layer = 0; layer < config_.n_layers; ++layer) {
+        std::memcpy(row(layer, to, 0, false), row(layer, from, 0, false), slot_bytes_);
+        if (!config_.values_in_keys) std::memcpy(row(layer, to, 0, true), row(layer, from, 0, true), slot_bytes_);
+    }
+    return Status::ok();
+}
+
 const uint8_t* KvCache::k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept {
     return row(layer, pos, kv_head, false);
 }

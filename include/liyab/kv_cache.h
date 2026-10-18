@@ -193,6 +193,15 @@ public:
         size_t heads_ = 0, row_bytes_ = 0, layer_offset_ = 0, value_offset_ = 0;
     };
     [[nodiscard]] RowView row_view(int32_t layer) const noexcept;
+    // Copies every layer's rows (keys and values, all KV heads) of position
+    // `from` over those of position `to`, bytes as stored. Speculative tree
+    // verification computes the tokens of every branch in one pass, each in
+    // a slot of its own, and then moves the accepted branch's rows to the
+    // positions they belong to (their keys were rotated for those positions
+    // already). InvalidArgument when either position's page is not mapped in
+    // some group (a windowed group's released rows); nothing is copied then.
+    // from == to is a no-op.
+    Status copy_position(int32_t from, int32_t to);
 
     // Multiplies channel c of the keys of positions [0, end) of layer l, KV
     // head h by factors[(l * n_head_kv + h) * head_dim + c], requantizing each

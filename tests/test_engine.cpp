@@ -5177,3 +5177,117 @@ TEST_CASE("Windowed models reuse the live context up to a snapshot whose window 
 }
 
 TEST_MAIN()
+
+// ---------------------------------------------------------------------------
+// Tree verification: alternative branches of drafts in one pass.
+// ---------------------------------------------------------------------------
+TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path leaves that pass's context") {
+    struct Case {
+        std::string name;
+        test::TinyModelSpec spec;
+    };
+    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")},
+                               {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)}};
+    {
+        test::TinyModelSpec s;
+        s.arch = "qwen35";
+        s.n_layers = 4;
+        s.delta_net_interval = 2;
+        cases.push_back({"hybrid", s});
+    }
+    {
+        test::TinyModelSpec s;
+        s.arch = "qwen3moe";
+        s.n_expert = 4;
+        s.n_expert_used = 2;
+        s.identical_experts = false;
+        cases.push_back({"tree_moe", s});
+    }
+    // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
+    const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
+    const std::vector<std::vector<int32_t>> paths = {{0, 4, 8}, {0, 1, 2, 3}, {0}, {0, 1, 6, 7}, {0, 4, 5}};
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    constexpr int32_t kPrefix = 40;  // past the windowed blocks' window of 16
+    for (const Case& c : cases) {
+        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16}) {
+            std::printf("  tree pass: %s %s\n", c.name.c_str(), type == KvCacheType::F16 ? "f16" : "q8_0");
+            TransformerOptions options;
+            options.context_length = 256;
+            options.max_batch = 16;
+            options.kv_type = type;
+            auto tree = load_transformer(model_path(c.name, c.spec), options);
+            auto linear = load_transformer(model_path(c.name, c.spec), options);
+            REQUIRE(tree != nullptr);
+            REQUIRE(linear != nullptr);
+            const auto vocab = static_cast<size_t>(tree->config().n_vocab);
+            std::vector<int32_t> prefix, tokens;
+            for (int32_t t = 0; t < kPrefix; ++t) prefix.push_back(stream_token(t, static_cast<int32_t>(vocab)));
+            for (int32_t i = 0; i < 9; ++i) tokens.push_back(stream_token(100 + 7 * i, static_cast<int32_t>(vocab)));
+            for (Transformer* m : {tree.get(), linear.get()}) {
+                m->set_rollback_window(16);
+                REQUIRE(m->forward(prefix, Transformer::Logits::None, route, pool).has_value());
+                m->snapshot_state();  // every branch below starts from here
+            }
+            for (const auto& path : paths) {
+                auto rows = tree->forward_tree(tokens, parents, route, pool);
+                REQUIRE(rows.has_value());
+                REQUIRE(rows->size() == tokens.size() * vocab);
+                const std::vector<float> got(rows->begin(), rows->end());
+                CHECK(tree->tree_pending());
+                CHECK(!tree->forward(std::span<const int32_t>(tokens.data(), 1), Transformer::Logits::Last, route, pool)
+                           .has_value());
+                CHECK(!tree->truncate(kPrefix + 1).is_ok());
+                // Each token's row: what a linear pass over its branch gives it.
+                bool same = true;
+                for (size_t t = 0; t < tokens.size(); ++t) {
+                    std::vector<int32_t> branch;
+                    for (auto a = static_cast<int32_t>(t); a >= 0; a = parents[static_cast<size_t>(a)]) {
+                        branch.insert(branch.begin(), tokens[static_cast<size_t>(a)]);
+                    }
+                    auto ref = linear->forward(branch, Transformer::Logits::All, route, pool);
+                    REQUIRE(ref.has_value());
+                    same = same && std::memcmp(ref->data() + (branch.size() - 1) * vocab, got.data() + t * vocab,
+                                               vocab * sizeof(float)) == 0;
+                    REQUIRE(linear->truncate(kPrefix).is_ok());
+                }
+                CHECK(same);
+                // Kept: exactly the context of the branch decoded linearly.
+                CHECK(!tree->keep_path(std::vector<int32_t>{0, 2}).is_ok());  // not a branch
+                REQUIRE(tree->keep_path(path).is_ok());
+                CHECK(!tree->tree_pending());
+                CHECK(tree->n_past() == kPrefix + static_cast<int32_t>(path.size()));
+                std::vector<int32_t> branch;
+                for (const int32_t i : path) branch.push_back(tokens[static_cast<size_t>(i)]);
+                REQUIRE(linear->forward(branch, Transformer::Logits::None, route, pool).has_value());
+                auto step_both = [&](int32_t from, int32_t count) {
+                    bool equal = true;
+                    for (int32_t t = from; t < from + count; ++t) {
+                        const int32_t token = stream_token(300 + t, static_cast<int32_t>(vocab));
+                        auto a = tree->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+                        if (!a) return false;
+                        const std::vector<float> la(a->begin(), a->end());
+                        auto b = linear->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route,
+                                                 pool);
+                        if (!b) return false;
+                        equal = equal && std::memcmp(la.data(), b->data(), la.size() * sizeof(float)) == 0;
+                    }
+                    return equal;
+                };
+                CHECK(step_both(0, 5));
+                // A rollback into the kept branch (hybrid: its checkpoints).
+                const int32_t back = kPrefix + static_cast<int32_t>(path.size()) - 1;
+                REQUIRE(tree->truncate(back).is_ok());
+                REQUIRE(linear->truncate(back).is_ok());
+                CHECK(step_both(5, 3));
+                REQUIRE(tree->truncate(kPrefix).is_ok());
+                REQUIRE(linear->truncate(kPrefix).is_ok());
+            }
+            // Parents that do not form a tree are refused, and nothing is pending.
+            const std::vector<int32_t> bad = {-1, 0, 2};
+            CHECK(!tree->forward_tree(std::span<const int32_t>(tokens.data(), 3), bad, route, pool).has_value());
+            CHECK(!tree->tree_pending());
+        }
+    }
+}
