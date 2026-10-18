@@ -259,11 +259,32 @@ void check_merged(const char* name, const test::TinyModelSpec& spec, const std::
                 scale, error);
     CHECK(moved > 0.02 * scale);       // the adapter matters
     CHECK(error < 2e-3 * scale);       // and is the merged model's
-    // Off again: the base model's bits; on again: the same bits as before.
+    // Off again: the base model's bits; on again: the same bits as before,
+    // the updates spread over the pool's threads or not.
     REQUIRE(base->model->set_adapter(nullptr).is_ok());
     CHECK(logits_of(*base) == plain);
     REQUIRE(base->model->set_adapter(adapter->get(), kUserScale).is_ok());
     CHECK(logits_of(*base) == adapted);
+    REQUIRE(base->model->set_adapter(adapter->get(), kUserScale, base->pool.get()).is_ok());
+    CHECK(logits_of(*base) == adapted);
+    ThreadPool one(1);
+    auto single = make_cpu_backend(one);
+    const Route single_route{single.get(), single.get(), single.get()};
+    base->model->reset();
+    REQUIRE(base->model->set_adapter(adapter->get(), kUserScale, &one).is_ok());
+    {
+        std::vector<float> serial;
+        const std::span<const int32_t> all(kTokens);
+        auto first = base->model->forward(all.first(kTokens.size() - 3), Transformer::Logits::All, single_route, one);
+        REQUIRE(first.has_value());
+        serial.assign(first->begin(), first->end());
+        for (size_t i = kTokens.size() - 3; i < kTokens.size(); ++i) {
+            auto step = base->model->forward(all.subspan(i, 1), Transformer::Logits::Last, single_route, one);
+            REQUIRE(step.has_value());
+            serial.insert(serial.end(), step->begin(), step->end());
+        }
+        CHECK(serial == adapted);  // one thread: the same bits
+    }
     CHECK(base->model->set_adapter(nullptr).is_ok());
     base.reset();
     merged.reset();
@@ -324,6 +345,64 @@ TEST_CASE("lora: hybrid DeltaNet blocks") {
     check_merged("hybrid_mixers", spec,
                  {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.1.attn_q.weight",
                   "blk.1.attn_output.weight"});
+}
+
+TEST_CASE("lora: the update kernel, on any number of threads, against a double-precision sum") {
+    // One adapted matrix large enough for the update to be spread over threads.
+    constexpr int64_t kCols = 1024, kRows = 4096 + 77;  // a last column chunk of 77
+    constexpr int32_t kRank = 64, kTokens = 5;
+    std::mt19937 rng(21);
+    std::uniform_real_distribution<float> u(-0.1f, 0.1f);
+    for (const DType type : {DType::F32, DType::F16, DType::BF16}) {
+        Pair p;
+        p.base = "blk.0.ffn_up.weight";
+        p.cols = kCols;
+        p.rows = kRows;
+        p.rank = kRank;
+        p.a.resize(static_cast<size_t>(kRank * kCols));
+        p.b.resize(static_cast<size_t>(kRows * kRank));
+        for (float& x : p.a) x = u(rng);
+        for (float& x : p.b) x = u(rng);
+        p.a = rounded(std::move(p.a), type, kCols);
+        p.b = rounded(std::move(p.b), type, kRank);
+        const std::string path = temp_path("kernel.gguf");
+        write_adapter(path, {p}, 128.0f, type);
+        auto adapter = LoraAdapter::load(path);
+        REQUIRE(adapter.has_value());
+        const LoraTarget* t = (*adapter)->find(p.base);
+        REQUIRE(t != nullptr && t->rows == kRows && t->rank == kRank);
+        std::vector<float> x(static_cast<size_t>(kTokens * kCols)), y0(static_cast<size_t>(kTokens * kRows));
+        for (float& v : x) v = u(rng);
+        for (float& v : y0) v = u(rng);
+        ThreadPool pool(4);
+        auto cpu = make_cpu_backend(pool);
+        auto run = [&](ThreadPool* threads) {
+            std::vector<float> y = y0;
+            LoraRunner runner;
+            const LoraRunner::Item item{t, 0, 2.0f, x.data(), y.data(), kTokens};
+            if (!runner.apply(*cpu, {&item, 1}, threads).is_ok()) return std::vector<float>();
+            return y;
+        };
+        const std::vector<float> serial = run(nullptr), parallel = run(&pool);
+        REQUIRE(!serial.empty());
+        CHECK(serial == parallel);
+        double worst = 0.0;
+        for (int32_t tok = 0; tok < kTokens; ++tok) {
+            std::vector<double> ax(kRank, 0.0);
+            for (int32_t r = 0; r < kRank; ++r) {
+                for (int64_t c = 0; c < kCols; ++c) ax[r] += static_cast<double>(p.a[r * kCols + c]) * x[tok * kCols + c];
+            }
+            for (int64_t o = 0; o < kRows; ++o) {
+                double d = 0.0;
+                for (int32_t r = 0; r < kRank; ++r) d += static_cast<double>(p.b[o * kRank + r]) * ax[r];
+                const double want = y0[tok * kRows + o] + 2.0 * d;
+                worst = std::max(worst, std::fabs(want - serial[tok * kRows + o]));
+            }
+        }
+        std::printf("  %s: largest error %.2e\n", std::string(dtype_traits(type).name).c_str(), worst);
+        CHECK(worst < 1e-4);
+        std::remove(path.c_str());
+    }
 }
 
 TEST_CASE("lora: malformed and unsupported adapters are refused") {

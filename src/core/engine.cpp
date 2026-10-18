@@ -670,7 +670,8 @@ struct Engine::Impl {
                                                           " models; this model is " + std::string(*arch));
         }
         const Status fits = target->set_adapter(&adapter, 1.0f);
-        const Status back = target->set_adapter(active != nullptr ? active->adapter.get() : nullptr, active_scale);
+        const Status back =
+            target->set_adapter(active != nullptr ? active->adapter.get() : nullptr, active_scale, pool.get());
         LIYAB_RETURN_IF_ERROR(fits);
         return back;
     }
@@ -698,7 +699,7 @@ struct Engine::Impl {
             stash_context();  // under the adapter it was computed with (no-op without a store)
             clear_context();
         }
-        if (Status s = target->set_adapter(adapter, scale); !s.is_ok()) {
+        if (Status s = target->set_adapter(adapter, scale, pool.get()); !s.is_ok()) {
             (void)target->set_adapter(nullptr);
             clear_context();
             if (store) store->set_seed(base_seed);
@@ -1304,7 +1305,7 @@ struct Engine::Impl {
             const LoraAdapter* adapter = target->adapter();
             if (adapter != nullptr) (void)target->set_adapter(nullptr);
             r = calibrator->step(*target, draft_route(), *pool, target->max_batch(), &calibration_stop);
-            if (adapter != nullptr) (void)target->set_adapter(adapter, active_scale);  // bound before: binds again
+            if (adapter != nullptr) (void)target->set_adapter(adapter, active_scale, pool.get());  // bound before
         }
         // The conversation's context back (the same caches: cannot fail).
         (void)target->swap_context(calibration_kv, calibration_n_past);

@@ -6,11 +6,10 @@
 // merging it into the weights (which would cost a copy of every adapted
 // matrix per adapter and rule out switching), the forward pass computes
 //     y = W·x + s · B·(A·x)
-// for each adapted matrix: the base matmul as before, then two small
-// matmuls (A·x has `rank` rows, B·t has the matrix's rows but only `rank`
-// columns) and an add. So several adapters can be loaded next to one base
-// model and the one in use chosen per generation, and a pass without an
-// adapter costs exactly what it did (one branch per matmul).
+// for each adapted matrix: the base matmul as before, A·x (`rank` values per
+// token) and the update added to y. So several adapters can be loaded next
+// to one base model and the one in use chosen per generation, and a pass
+// without an adapter costs exactly what it did (one branch per matmul).
 //
 // The file. A GGUF the common converters write from a PEFT adapter
 // (general.type "adapter", adapter.type "lora", adapter.lora.alpha): for
@@ -21,9 +20,23 @@
 // ffn_*_exps, ne[2] = experts) has stacked adapters, ne {cols, rank, experts}
 // and {rank, rows, experts}: expert e's update uses slice e of each. The
 // scale is s = user_scale · alpha / rank, or user_scale when the file has no
-// alpha (alpha 0), with each matrix's own rank. Tensors are read in place
-// from the mapping when F32, F16 or BF16; other types are converted to F32
-// once at load.
+// alpha (alpha 0), with each matrix's own rank.
+//
+// How it is computed. t = A·x is an ordinary matmul with `rank` rows: the
+// caller runs it on the CPU backend's kernels, in the same batched pass as
+// the base matmuls that share its input when they run there too (no extra
+// fork/join). The update y += s · B·t is the runner's own kernel: B is kept
+// transposed (Bᵀ [rank x rows], built at load), so a token's update is
+// `rank` scaled row additions over y (y += (s·t_r) · Bᵀ_r), contiguous and
+// vectorized, where B·t as a matmul would be `rows` dot products of only
+// `rank` values each (8 to 64: mostly call overhead). Columns are split
+// among threads in fixed chunks; each output
+// value adds its `rank` terms in order on one thread, so the result does
+// not depend on the thread count.
+//
+// Memory. A is read in place from the mapping when F32, F16 or BF16; other
+// types are converted to F32 once at load. Bᵀ is a copy in the type B has
+// (F32 for types other than those three): an adapter costs its file's size.
 //
 // Not supported (load() or Transformer::set_adapter() refuse them, naming
 // the tensor): adapters of the token embeddings (token_embd: they change
@@ -48,16 +61,19 @@
 
 namespace liyab {
 
+class ThreadPool;
+
 // One adapted matrix of the base model.
 struct LoraTarget {
     std::string base;       // the base model's tensor name (e.g. "blk.3.attn_q.weight")
     TensorView a;           // ne {cols, rank} (per expert: {cols, rank, experts})
-    TensorView b;           // ne {rank, rows} (per expert: {rank, rows, experts})
+    TensorView bt;          // Bᵀ: ne {rows, rank} (per expert: {rows, rank, experts}), F32 / F16 / BF16
     int32_t rank = 0;
+    int64_t rows = 0;       // of the adapted matrix (per expert)
     int32_t experts = 0;    // 0: one matrix; > 0: a stack of this many per-expert matrices
-    // A and B of expert `e` (0 for a single matrix) as 2-D views.
+    // A and Bᵀ of expert `e` (0 for a single matrix) as 2-D views.
     [[nodiscard]] TensorView a_of(int32_t e) const noexcept;
-    [[nodiscard]] TensorView b_of(int32_t e) const noexcept;
+    [[nodiscard]] TensorView bt_of(int32_t e) const noexcept;
 };
 
 // A LoRA adapter file, mapped read-only. Immutable after load(); its
@@ -78,7 +94,7 @@ public:
     // A hash of the whole file (xxHash64 of its bytes, mixed with its size):
     // what keys contexts computed with it.
     [[nodiscard]] uint64_t id() const noexcept { return id_; }
-    // Bytes of its tensors as used (mapped, or converted to F32).
+    // Bytes of its tensors as used (A mapped or converted, Bᵀ).
     [[nodiscard]] size_t bytes() const noexcept { return bytes_; }
     [[nodiscard]] int32_t max_rank() const noexcept { return max_rank_; }
     [[nodiscard]] const std::vector<LoraTarget>& targets() const noexcept { return targets_; }
@@ -100,14 +116,13 @@ private:
     std::unique_ptr<MmapLoader> file_;
     std::vector<LoraTarget> targets_;
     std::unordered_map<std::string_view, size_t> by_base_;  // keys view targets_[i].base
-    std::vector<std::vector<float>> converted_;              // F32 copies of non-float tensors
+    std::vector<std::vector<uint8_t>> owned_;               // Bᵀ, and F32 copies of A of other types
 };
 
-// Adds adapter updates to matmul outputs: y += s · B·(A·x) for each item, as
-// two batched matmuls on a backend (every item's A·x in one parallel pass,
-// then every B·t in another) and the adds. Each output value is one dot
-// product computed by one thread, so the result does not depend on the
-// thread count. Keeps its scratch between calls. Thread-compatible.
+// Adds adapter updates to matmul outputs, y += s · B·(A·x) per item, in two
+// steps (see the header comment): add_a_matmuls() queues the A·x matmuls for
+// the caller's batch on the CPU backend, then add_updates() adds the
+// updates. Keeps its scratch between calls. Thread-compatible.
 class LoraRunner {
 public:
     struct Item {
@@ -115,17 +130,26 @@ public:
         int32_t expert = 0;  // slice of a per-expert stack (0 for a matrix)
         float scale = 0.0f;  // s
         const float* x = nullptr;  // n rows of target->a.cols() values
-        float* y = nullptr;        // n rows of the matrix's rows, updated in place
+        float* y = nullptr;        // n rows of target->rows values, updated in place
         int32_t n = 0;
     };
-    // `backend` must read host memory (the CPU backend): the adapters live there.
-    Status apply(Backend& backend, std::span<const Item> items);
+    // Appends to `out` the matmuls t = A·x of `items`, into the runner's
+    // scratch, for a batch on a backend that reads host memory (the CPU
+    // backend: adapters live there). Their views stay valid until the next
+    // call to this runner.
+    void add_a_matmuls(std::span<const Item> items, std::vector<Backend::MatmulItem>& out);
+    // y += s · B·t for the same `items`, once their A matmuls ran: on `pool`
+    // when the work is large enough to pay a fork/join (else, or without a
+    // pool, on the calling thread; the same bits either way).
+    void add_updates(std::span<const Item> items, ThreadPool* pool);
+    // Both, the A matmuls alone in one batch on `backend`.
+    Status apply(Backend& backend, std::span<const Item> items, ThreadPool* pool);
 
 private:
-    std::vector<float> t_, d_;
+    std::vector<float> t_;
+    std::vector<size_t> t_at_;
     std::vector<TensorView> views_;
     std::vector<Backend::MatmulItem> matmuls_;
-    std::vector<size_t> t_at_, d_at_;
 };
 
 }  // namespace liyab

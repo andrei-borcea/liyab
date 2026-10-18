@@ -563,7 +563,8 @@ public:
     // ---- LoRA adapters (core/lora.h) ----
     // Applies `adapter` at `scale` (s = scale · alpha / rank per matrix) to
     // every later pass until changed: each adapted matrix's matmul output
-    // gets s · B·(A·x), computed on route.cpu after the base matmul (dense
+    // gets s · B·(A·x), computed on route.cpu (A·x in the base matmuls'
+    // batch when they run there too; LoraRunner) after the base matmul (dense
     // matrices, the LM head, and per-expert stacks of a mixture of experts,
     // expert e's slice for the tokens routed to it). nullptr: none, and
     // passes cost what they did without adapters (one branch per matmul).
@@ -574,7 +575,10 @@ public:
     // is: the caller decides whether rows computed with another adapter may
     // be kept (the engine never keeps them). `adapter` must outlive its use.
     // Not applied by the router's expert prediction, which only prefetches.
-    Status set_adapter(const LoraAdapter* adapter, float scale = 1.0f);
+    // `pool` (optional) spreads the updates of large matmuls over its
+    // threads (the same bits on any number); it must be the pool the CPU
+    // backend runs on, or one not in use during passes.
+    Status set_adapter(const LoraAdapter* adapter, float scale = 1.0f, ThreadPool* pool = nullptr);
     [[nodiscard]] const LoraAdapter* adapter() const noexcept { return adapter_; }
 
 private:
@@ -731,10 +735,10 @@ private:
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
                         std::span<float* const> ys, int32_t n);
-    // The active adapter's updates of matmuls ys[i] = x · ws[i]ᵀ already
-    // computed (matrices it does not adapt are skipped), on route.cpu.
-    Status apply_adapter(const Route& route, std::span<const TensorView* const> ws, const float* x,
-                         std::span<float* const> ys, int32_t n);
+    // The active adapter's items for matmuls ys[i] = x · ws[i]ᵀ (matrices it
+    // does not adapt are skipped) into adapter_items_; false when none.
+    bool collect_adapter_items(std::span<const TensorView* const> ws, const float* x, std::span<float* const> ys,
+                               int32_t n);
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of
     // x_, then the final soft-cap (if any) on `pool`.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
@@ -838,7 +842,9 @@ private:
     const LoraAdapter* adapter_ = nullptr;
     std::unordered_map<std::string_view, BoundAdapter> adapter_targets_;
     LoraRunner adapter_runner_;
+    ThreadPool* adapter_pool_ = nullptr;
     std::vector<LoraRunner::Item> adapter_items_;
+    std::vector<Backend::MatmulItem> adapter_batch_;  // base and A·x matmuls of one group
 };
 
 }  // namespace liyab

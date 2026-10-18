@@ -1111,8 +1111,8 @@ without one runs exactly as before.
 * **The file** is the GGUF LoRA format the common converters write from a PEFT adapter: `general.type` `adapter`,
   `adapter.type` `lora`, `adapter.lora.alpha`, and for each adapted matrix `<name>.lora_a` (ne {cols, rank}) and
   `<name>.lora_b` (ne {rank, rows}), a mixture of experts' expert stacks with a third dimension (one A and B per
-  expert). F32, F16 and BF16 tensors are read in place from the mapping; other types are converted to F32 once at
-  load.
+  expert). A is read in place from the mapping when F32, F16 or BF16 (other types are converted to F32 once at
+  load); B is kept transposed (see below), a copy in its own type: an adapter costs about its file's size.
 * **Scale**: s = scale · alpha / rank, with each matrix's own rank (alpha 0 or absent: s = scale); `scale` is chosen
   when the adapter is selected, 1 meaning as trained.
 * **Where it applies**: every matrix the forward pass multiplies whole: attention, DeltaNet and FFN projections
@@ -1121,11 +1121,14 @@ without one runs exactly as before.
   tensor: adapters of the token embeddings (they change a lookup, not a matmul), of latent attention's per-head
   `attn_k_b` / `attn_v_b`, activated LoRA (`adapter.alora.*`), and any matrix whose name or shape the model does not
   have.
-* **How it is computed**: per group of matmuls sharing an input (Q/K/V, gate/up, one wave of experts), two batched
-  passes of the CPU backend's own kernels, every A·x first (`rank` rows each), then every B·t (`rank` columns), then
-  the adds. Each output value is one dot product computed by one thread, so the result is the same bits for any
-  thread count. With an accelerator, the base product comes from the GPU and the update from the CPU, which reads the
-  adapter in place. Without an adapter selected, a matmul pays one branch.
+* **How it is computed**: t = A·x is a matmul of `rank` rows, run by the CPU backend's kernels in the same parallel
+  pass as the base matmuls sharing its input (Q/K/V, gate/up, one wave of experts), so it costs no fork/join of its
+  own. The update y += s·B·t is a kernel of its own over Bᵀ, transposed at load: `rank` scaled row additions per
+  token, contiguous and vectorized, where B·t as a matmul would be one dot product of only `rank` values per output
+  (mostly call overhead). Output columns go to threads in fixed chunks of 256 (small
+  updates stay on the calling thread); each value sums its `rank` terms in order on one thread, so the result is the
+  same bits for any thread count. With an accelerator, the base product comes from the GPU and A·x and the update
+  from the CPU. Without an adapter selected, a matmul pays one branch.
 * **Several at once**: `Engine::load_adapter(name, path)` maps an adapter, checked against the model (architecture,
   every matrix's name, shape and expert count), within `EngineConfig::adapter_memory_mb` (256 MiB by default, 0 turns
   adapters off). Past the cap the least recently selected adapters are released and mapped again from their files
@@ -1140,6 +1143,38 @@ without one runs exactly as before.
   model drafts without it, which may lower acceptance, not change the output.
 * **Segment reuse** is off while an adapter is selected (its share was calibrated on the base model): marked prompts
   are processed as usual, exactly.
+
+**Conformance.** Random PEFT adapters (rank 16, alpha 32, every attention, DeltaNet and FFN projection), converted
+to GGUF with the common converter, against transformers + PEFT in float32 over `tests/data/conform_text.txt`
+(`liyab-kl --lora`, `--kv f16`, CPU). Without the adapter, Liyab's distributions are 0.29–0.40 nats of KL away from
+the adapted reference; with it, as close as the base model is to its own reference:
+
+| Base GGUF | Adapter | Mean KL | Top-1 | Perplexity (reference → Liyab) |
+| :--- | :--- | ---: | ---: | :--- |
+| Qwen2.5-0.5B-Instruct F16 | none, base reference | 0.00001 | 99.80% | 25.615 → 25.615 |
+| Qwen2.5-0.5B-Instruct F16 | none, against the adapted reference | 0.289 | 67.32% | 31.590 → 25.615 |
+| Qwen2.5-0.5B-Instruct F16 | F16, 168 matrices | 0.00001 | 99.61% | 31.590 → 31.592 |
+| Qwen2.5-0.5B-Instruct F16 | F32 | 0.00001 | 99.61% | 31.590 → 31.602 |
+| Qwen2.5-0.5B-Instruct BF16 | F32 | 0.00001 | 99.41% | 31.590 → 31.602 |
+| Qwen3.5-0.8B BF16 (hybrid DeltaNet) | none, against the adapted reference | 0.403 | 67.98% | 31.483 → 21.081 |
+| Qwen3.5-0.8B BF16 (hybrid DeltaNet) | F16, 186 matrices | < 0.00001 | 100.00% | 31.483 → 31.489 |
+
+Per-expert adapters of a mixture of experts, the router, the shared expert, fused projections and latent attention
+are checked in `test_lora` against the same model with the adapter merged into its weights.
+
+**Cost per token** on the Mac (Apple M4 Pro, CPU backend, greedy, 128 tokens after a 100-token prompt; medians of 7
+runs, the configurations alternating round by round on a Mac other jobs shared, load average 12–20). Random F16
+adapters on every attention and FFN projection of every block:
+
+| Base GGUF | Decode, no adapter | rank 8 | rank 16 | rank 64 | Prefill, rank 8 / 16 / 64 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| Qwen2.5-0.5B-Instruct F16 (8.4 / 16.8 / 67 MiB adapters) | 161 tok/s | +0.42 ms (+6.6%) | +0.39 ms (+6.2%) | +1.27 ms (+20%) | −4% / −3% / −11% |
+| Llama-3.2-1B-Instruct BF16 (11 / 21 / 86 MiB adapters) | 63 tok/s | +0.68 ms (+4.3%) | +0.75 ms (+4.8%) | +1.81 ms (+11.5%) | 0% / 0% / −5% |
+
+Without an adapter selected the engine runs as before: against the build before adapters, 161 vs 159 tok/s on the
+0.5B and 63.0 vs 63.4 on the 1B (within the runs' spread). The update's cost is mostly fixed per matmul at low
+rank (on these small models a decoding step has ~100 adapted matmuls, each paying its A·x rows, its update and a
+fork/join for the larger ones); at rank 64 it grows with the adapter's bytes, which every token reads.
 
 ---
 
@@ -1385,6 +1420,7 @@ liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
 liyab-cli -m model.gguf -p "$TURN1" --then "$TURN2"           # a follow-up turn that reuses the context, as a chat does
 liyab-cli -m model.gguf -p "..." --json                     # one JSON line per turn (stats, peak RSS, reply) for scripts
+liyab-cli -m model.gguf -p "..." --lora adapter.gguf --lora-scale 0.5  # a LoRA adapter applied to every turn
 liyab-cli --help                                            # every option
 ```
 
@@ -2101,10 +2137,17 @@ Benchmarks and tools built with the tests:
     configuration fields before the model is built (a GGUF copy given YaRN metadata is compared with the model
     configured the same way), and `--attn-implementation` picks transformers' attention kernel (`eager` for
     Gemma 2: the default one leaves its soft cap out). The text is read byte for byte, `\r\n` included.
+    [LoRA adapters](#lora-adapters) are checked the same way: the script's `--lora DIR` applies a PEFT adapter
+    with PEFT (needs `peft`), and `liyab-kl --lora ADAPTER.gguf [--lora-scale S]` applies the same adapter
+    converted to GGUF.
 
   ```bash
   tools/conform_reference.py --model Qwen/Qwen3-0.6B --text tests/data/conform_text.txt --out qwen3.ref
   build/liyab-kl -m Qwen3-0.6B-BF16.gguf -f tests/data/conform_text.txt --compare qwen3.ref --max-kl 0.01 --min-top1 97
+  tools/conform_reference.py --model Qwen/Qwen2.5-0.5B-Instruct --lora my-peft-adapter --text tests/data/conform_text.txt \
+      --out lora.ref
+  build/liyab-kl -m qwen2.5-0.5b-instruct-f16.gguf --lora my-adapter-f16.gguf -f tests/data/conform_text.txt \
+      --compare lora.ref --kv f16 --max-kl 0.001
   ```
 * `liyab-experts` and `tools/expert_study.py`: measurements on a MoE's routed experts, for the
   [cold-expert study](docs/research/cold-experts.md). `liyab-experts capture` runs a text one token at a time

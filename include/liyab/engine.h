@@ -371,7 +371,8 @@ struct PromptSegment {
 // lora_a / lora_b per adapted matrix, adapter.lora.alpha) changes some of the
 // model's matrices by a low-rank update W + s·B·A. Liyab never merges it: each
 // adapted matmul adds s·B·(A·x) to the base product, computed by the
-// engine's own CPU kernels in two small batched passes, so several adapters
+// engine's own CPU kernels (A·x batched with the base matmuls, the update over
+// a transposed B; see README "LoRA adapters"), so several adapters
 // stay loaded next to one model and the one in use is chosen per generation
 // (Engine::set_adapter), and a pass without one costs what it did.
 //  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each

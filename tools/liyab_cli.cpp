@@ -6,7 +6,7 @@
 //             [--then TEXT]... [--json]
 //             [--draft draft.gguf] [--profile performance|balanced|low_power]
 //             [--backend auto|cpu|metal|vulkan] [--kv f16|q8_0|q4_0|q4_1] [--ctx N]
-//             [--window N] [--threads N] [--seed N]
+//             [--window N] [--threads N] [--seed N] [--lora ADAPTER.gguf [--lora-scale S]]
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -243,6 +243,8 @@ void usage() {
                  "  --temp T           temperature, 0 = greedy (default 0.8)\n"
                  "  --top-k K          (default 40)    --top-p P (default 0.95)\n"
                  "  --seed N           RNG seed (default random)\n"
+                 "  --lora PATH        a LoRA adapter (GGUF) loaded and selected for every turn\n"
+                 "  --lora-scale S     its scale: s = S * alpha / rank per matrix (default 1)\n"
                  "  --draft PATH       draft model for speculative decoding\n"
                  "  --draft-tokens K   tokens per speculative step (default 3)\n"
                  "  --lookup           speculative decoding without a draft model: drafts from the text\n"
@@ -319,6 +321,8 @@ int main(int argc, char** argv) {
     bool tokenize_only = false;
     bool json = false;
     bool prefix_stats = false;  // --prefix-stats
+    const char* lora_path = nullptr;  // --lora
+    float lora_scale = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -342,6 +346,8 @@ int main(int argc, char** argv) {
         else if (arg == "--top-p") params.top_p = static_cast<float>(std::atof(next()));
         else if (arg == "--seed") params.seed = std::strtoull(next(), nullptr, 10);
         else if (arg == "--draft") config.draft_model_path = next();
+        else if (arg == "--lora") lora_path = next();
+        else if (arg == "--lora-scale") lora_scale = static_cast<float>(std::atof(next()));
         else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
         else if (arg == "--lookup") config.lookup_drafts = true;
         else if (arg == "--suffix") config.lookup_drafts = config.suffix_drafts = 1;
@@ -441,6 +447,12 @@ int main(int argc, char** argv) {
         std::printf("\n");
         liyab_engine_destroy(g_engine);
         return n < 0 ? 1 : 0;
+    }
+    if (lora_path != nullptr && (liyab_engine_load_adapter(g_engine, "lora", lora_path) != LIYAB_OK ||
+                                 liyab_engine_set_adapter(g_engine, "lora", lora_scale) != LIYAB_OK)) {
+        std::fprintf(stderr, "error: %s\n", liyab_last_error());
+        liyab_engine_destroy(g_engine);
+        return 1;
     }
     std::string info(liyab_engine_describe(g_engine, nullptr, 0) + 1, '\0');
     liyab_engine_describe(g_engine, info.data(), info.size());

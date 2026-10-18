@@ -321,7 +321,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<liyab::LoraAdapter> adapter;
     if (!lora_path.empty()) {
         auto loaded_adapter = liyab::LoraAdapter::load(lora_path);
-        const liyab::Status s = loaded_adapter ? model->set_adapter(loaded_adapter->get(), lora_scale)
+        const liyab::Status s = loaded_adapter ? model->set_adapter(loaded_adapter->get(), lora_scale, &pool)
                                                : loaded_adapter.status();
         if (!s.is_ok()) {
             std::fprintf(stderr, "adapter: %s\n", s.to_string().c_str());

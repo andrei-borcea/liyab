@@ -1395,41 +1395,60 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
 
 Status Transformer::matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y,
                            int32_t n) {
-    Status s = backend->matmul(w, x, y, n);
-    if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul(w, x, y, n);
-    if (!adapter_targets_.empty() && s.is_ok()) {
+    if (!adapter_targets_.empty()) {
         const TensorView* ws[] = {&w};
         float* ys[] = {y};
-        s = apply_adapter(route, ws, x, ys, n);
+        return matmul_group(route, backend, ws, x, ys, n);
     }
+    Status s = backend->matmul(w, x, y, n);
+    if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul(w, x, y, n);
     return s;
 }
 
 Status Transformer::matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws,
                                  const float* x, std::span<float* const> ys, int32_t n) {
+    if (!adapter_targets_.empty() && collect_adapter_items(ws, x, ys, n)) {
+        // The A·x matmuls go with the base ones on the CPU backend (one
+        // parallel pass); an accelerator's base products land in host memory
+        // like the CPU's, and its A·x run on the CPU after them.
+        adapter_batch_.clear();
+        Status s = Status(ErrorCode::Unsupported, "");
+        if (backend != route.cpu) {
+            s = backend->matmul_group(ws, x, ys, n);
+            if (s.is_ok()) {
+                adapter_runner_.add_a_matmuls(adapter_items_, adapter_batch_);
+                s = route.cpu->matmul_batch(adapter_batch_);
+            }
+        }
+        if (s.code() == ErrorCode::Unsupported) {
+            adapter_batch_.clear();
+            for (size_t i = 0; i < ws.size(); ++i) adapter_batch_.push_back({ws[i], x, ys[i], n});
+            adapter_runner_.add_a_matmuls(adapter_items_, adapter_batch_);
+            s = route.cpu->matmul_batch(adapter_batch_);
+        }
+        if (s.is_ok()) adapter_runner_.add_updates(adapter_items_, adapter_pool_);
+        return s;
+    }
     Status s = backend->matmul_group(ws, x, ys, n);
     if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul_group(ws, x, ys, n);
-    if (!adapter_targets_.empty() && s.is_ok()) s = apply_adapter(route, ws, x, ys, n);
     return s;
 }
 
-Status Transformer::apply_adapter(const Route& route, std::span<const TensorView* const> ws, const float* x,
-                                  std::span<float* const> ys, int32_t n) {
+bool Transformer::collect_adapter_items(std::span<const TensorView* const> ws, const float* x,
+                                        std::span<float* const> ys, int32_t n) {
     adapter_items_.clear();
     for (size_t i = 0; i < ws.size(); ++i) {
         const auto it = adapter_targets_.find(ws[i]->name);
         if (it == adapter_targets_.end() || it->second.target->experts > 0) continue;
         adapter_items_.push_back({it->second.target, 0, it->second.scale, x, ys[i], n});
     }
-    // A group's updates in two passes on the CPU, which reads the adapters
-    // in place (an accelerator computed the base matmul into host memory
-    // all the same).
-    return adapter_runner_.apply(*route.cpu, adapter_items_);
+    return !adapter_items_.empty();
 }
 
-Status Transformer::set_adapter(const LoraAdapter* adapter, float scale) {
+Status Transformer::set_adapter(const LoraAdapter* adapter, float scale, ThreadPool* pool) {
     adapter_ = nullptr;
     adapter_targets_.clear();
+    adapter_pool_ = pool;
     if (adapter == nullptr) return Status::ok();
     if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "adapter scale must be finite");
     // The matrices the forward pass multiplies as a whole (an adapter's
@@ -1457,7 +1476,7 @@ Status Transformer::set_adapter(const LoraAdapter* adapter, float scale) {
         }
         const TensorView& w = *it->second;
         const int32_t experts = w.n_dims >= 3 ? static_cast<int32_t>(w.ne[2]) : 0;
-        if (t.experts != experts || t.a.ne[0] != w.ne[0] || t.b.ne[1] != w.ne[1] || w.ne[3] != 1) {
+        if (t.experts != experts || t.a.ne[0] != w.ne[0] || t.rows != w.ne[1] || w.ne[3] != 1) {
             return Status(ErrorCode::InvalidArgument, "the adapter's " + t.base + " does not fit the model's shape");
         }
         bound.emplace(t.base, BoundAdapter{&t, adapter->scale_of(t, scale)});
@@ -2621,10 +2640,10 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
     auto project = [&](FfnProjection p, const TensorView& m, const float* x, float* y) -> Status {
         if (hook != nullptr && hook->ffn_matmul(layer, p, x, y, n)) {
             // The hook replaced the base matmul only: an adapter's update still applies.
-            if (adapter_targets_.empty()) return Status::ok();
             const TensorView* ws[] = {&m};
             float* ys[] = {y};
-            return apply_adapter(route, ws, x, ys, n);
+            if (adapter_targets_.empty() || !collect_adapter_items(ws, x, ys, n)) return Status::ok();
+            return adapter_runner_.apply(*route.cpu, adapter_items_, adapter_pool_);
         }
         return matmul(route, route.ffn, m, x, y, n);
     };
@@ -2894,13 +2913,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             items.push_back({&views[i][0], in, eh_.data() + first_row[i] * ff, rows});
             items.push_back({&views[i][1], in, eh2_.data() + first_row[i] * ff, rows});
         }
-        if (Status st = route.cpu->matmul_batch(items); !st.is_ok()) {
-            release_wave();
-            return st;
-        }
+        // Per-expert adapters: expert e's slice for the tokens routed to it,
+        // A·x in the wave's own batch.
+        adapter_items_.clear();
         if (!adapter_targets_.empty()) {
-            // Per-expert adapters: expert e's slice for the tokens routed to it.
-            adapter_items_.clear();
             for (size_t i = 0; i < wave.size(); ++i) {
                 if (fused) {
                     add_expert_update(w[kUpExps], wave[i], items[i]);
@@ -2909,11 +2925,13 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
                     add_expert_update(w[kUpExps], wave[i], items[2 * i + 1]);
                 }
             }
-            if (Status st = adapter_runner_.apply(*route.cpu, adapter_items_); !st.is_ok()) {
-                release_wave();
-                return st;
-            }
+            adapter_runner_.add_a_matmuls(adapter_items_, items);
         }
+        if (Status st = route.cpu->matmul_batch(items); !st.is_ok()) {
+            release_wave();
+            return st;
+        }
+        adapter_runner_.add_updates(adapter_items_, adapter_pool_);
         if (fused) {  // the same rows as the split matrices give, so the same bits
             for (size_t r = 0; r < rows_total; ++r) {
                 const float* gate_up = eh2_.data() + r * 2 * ff;
@@ -2927,14 +2945,15 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             const auto rows = static_cast<int32_t>(assigned[static_cast<size_t>(wave[i])].size());
             items.push_back({&views[i][2], eh_.data() + first_row[i] * ff, eout_.data() + first_row[i] * d, rows});
         }
+        adapter_items_.clear();
+        if (!adapter_targets_.empty()) {
+            for (size_t i = 0; i < wave.size(); ++i) add_expert_update(w[kDownExps], wave[i], items[i]);
+            adapter_runner_.add_a_matmuls(adapter_items_, items);
+        }
         const Status down_status = route.cpu->matmul_batch(items);
         release_wave();  // the outputs are in eout_; the weights are no longer read
         LIYAB_RETURN_IF_ERROR(down_status);
-        if (!adapter_targets_.empty()) {
-            adapter_items_.clear();
-            for (size_t i = 0; i < wave.size(); ++i) add_expert_update(w[kDownExps], wave[i], items[i]);
-            LIYAB_RETURN_IF_ERROR(adapter_runner_.apply(*route.cpu, adapter_items_));
-        }
+        adapter_runner_.add_updates(adapter_items_, adapter_pool_);
         for (size_t i = 0; i < first_row.size(); ++i) {
             const auto& users = assigned[static_cast<size_t>(wave[i])];
             for (size_t u = 0; u < users.size(); ++u) {
