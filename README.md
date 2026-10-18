@@ -1058,6 +1058,35 @@ conversation. Every reply was identical to plain decoding's.
 * The Llama runs shared the host with other heavy work. Their speed-ups are the least disturbed run's; tokens per
   pass and acceptance do not depend on timing.
 
+### Host measurements: tree verification against the best branch
+
+The same tasks and host (CPU backend, 6 threads, greedy, replies of up to 256 tokens), each suffix-draft mode with
+its tree (`suffix`, the default) and with its best branch only (`suffix:linear`). Every reply of every mode was
+identical to plain decoding's, the hybrid model's included. Tokens per verification pass with every draft verified
+(`suffix:8:fixed` against `suffix:8:fixed:linear`; these do not depend on timing):
+
+| Model | Code edit | Summary | Tool output | Free chat | Tool chat again |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B Q8_0 | 7.11 / 7.11 | 1.82 / 1.82 | 2.53 / 2.50 | 1.12 / 1.11 | 8.53 / 8.53 |
+| Qwen3-0.6B BF16 | 6.74 / 6.74 | 1.36 / 1.37 | 1.77 / 1.77 | 1.02 / 1.02 | 8.67 / 8.67 |
+| Qwen3.5-0.8B BF16 (hybrid) | 4.20 / 4.20 | 1.34 / 1.34 | 1.46 / 1.45 | 1.02 / 1.02 | 8.56 / 8.56 |
+| Llama-3.2-1B BF16 | 7.11 / 7.11 | 1.19 / 1.18 | 1.21 / 1.20 | 1.03 / 1.03 | 8.42 / 8.42 |
+
+(tree / best branch.) With the learned draft count on Qwen2.5-0.5B Q8_0 (median of 3 runs), the tree and the best
+branch gave 3.52 / 3.57, 1.55 / 1.53, 1.64 / 1.75, 1.03 / 1.03 and 3.89 / 3.85 tokens per pass for 3 drafts per
+step, and speed-ups over plain decoding of 2.02× / 2.10×, 1.17× / 1.11×, 1.49× / 1.37×, 1.00× / 1.02× and
+2.28× / 2.06×: equal within the run-to-run spread of this shared host.
+
+* **On these tasks a tree verifies what the best branch does.** Where a draft is rejected, the target almost always
+  writes a token that no earlier occurrence of the matched text continued with, so no sibling could have been
+  right; where the occurrences part, the likeliest one is mostly the right one. A tree gains where earlier text
+  continues the same words several ways and the target takes a less frequent one: the tests build such text and
+  check that the sibling is kept.
+* **It costs what the branch costs.** A tree pass of *k* + 1 tokens runs the same matmuls as a linear one, its
+  tokens attend to fewer positions (their ancestors only), and building the tree takes microseconds (7 µs for 8
+  drafts on a 6000-token text against 3 µs for the branch). Plain decoding is unchanged (the decode step at a
+  4000-token context timed alternately against the previous build: equal within the host's noise).
+
 ---
 
 ## Embeddings and reranking
