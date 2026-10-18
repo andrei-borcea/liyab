@@ -22,6 +22,12 @@ constexpr float kBinHalfLife = 64.0f;
 
 }  // namespace
 
+// Candidates' max-heap order: the likelier first, then the one created
+// first (a parent always before its children, siblings best first).
+bool SuffixDrafter::heap_less(const Node& a, const Node& b) noexcept {
+    return a.probability != b.probability ? a.probability < b.probability : a.sequence > b.sequence;
+}
+
 SuffixDrafter::SuffixDrafter(Limits limits) : limits_(limits) {
     limits_.max_stored_tokens = std::max<int64_t>(0, limits_.max_stored_tokens);
     limits_.max_sequences = std::max(0, limits_.max_sequences);
@@ -212,9 +218,94 @@ float SuffixDrafter::acceptance(uint16_t bin, int32_t match, float share) const 
     return (b.accepted + kPriorWeight * coarse) / (b.verified + kPriorWeight);
 }
 
-const SuffixDrafter::Draft& SuffixDrafter::propose(int32_t max_tokens) {
+const SuffixDrafter::Draft& SuffixDrafter::propose(int32_t max_tokens) { return build(max_tokens, false); }
+
+const SuffixDrafter::Draft& SuffixDrafter::propose_tree(int32_t max_tokens) { return build(max_tokens, true); }
+
+void SuffixDrafter::expand(int32_t parent, int32_t depth, int32_t begin, int32_t end, float probability,
+                           bool branching) {
+    // The tokens the node's occurrences continue with at `depth` (in the
+    // occurrences' order: newest first).
+    tally_.clear();
+    int32_t active = 0;
+    for (int32_t i = begin; i < end; ++i) {
+        const Occurrence& o = occurrences_[static_cast<size_t>(order_[static_cast<size_t>(i)])];
+        if (o.pos + depth >= o.end) continue;
+        ++active;
+        const int32_t token = o.tokens[o.pos + depth];
+        auto it = std::find_if(tally_.begin(), tally_.end(), [&](const Tally& x) { return x.token == token; });
+        if (it == tally_.end()) {
+            tally_.push_back({token, 1, o.source < 0});
+        } else {
+            ++it->count;
+            it->live = it->live || o.source < 0;
+        }
+    }
+    if (active == 0) return;
+    // Best first: the most occurrences, then one the live sequence supports,
+    // then the newest (the tally's order).
+    children_.resize(tally_.size());
+    std::iota(children_.begin(), children_.end(), 0);
+    std::stable_sort(children_.begin(), children_.end(), [&](int32_t a, int32_t b) {
+        const Tally &x = tally_[static_cast<size_t>(a)], &y = tally_[static_cast<size_t>(b)];
+        return x.count != y.count ? x.count > y.count : x.live && !y.live;
+    });
+    if (!branching) children_.resize(1);
+    const int32_t match = match_ + depth;
+    // Each child's probability of acceptance once the node is accepted.
+    // Siblings are exclusive (the target picks one token): estimates that
+    // sum above 1 are scaled to sum to 1.
+    float total = 0.0f;
+    const size_t first = candidates_.size();
+    for (const int32_t c : children_) {
+        const Tally& x = tally_[static_cast<size_t>(c)];
+        const float share = static_cast<float>(x.count) / static_cast<float>(active);
+        const uint16_t bin = bin_of(match, share, x.count, x.live);
+        const float accept = acceptance(bin, match, share);
+        total += accept;
+        candidates_.push_back({x.token, depth, parent, 0, 0, accept, bin, sequence_++});
+    }
+    const float scale = branching && total > 1.0f ? 1.0f / total : 1.0f;
+    // Each child's occurrences become a run of order_[begin, end) (stable:
+    // newest first within it), the ended ones and those of children not
+    // taken last.
+    const auto none = static_cast<int32_t>(tally_.size());
+    for (int32_t i = begin; i < end; ++i) {
+        const auto at = static_cast<size_t>(order_[static_cast<size_t>(i)]);
+        const Occurrence& o = occurrences_[at];
+        int32_t rank = none;
+        if (o.pos + depth < o.end) {
+            const int32_t token = o.tokens[o.pos + depth];
+            for (size_t r = 0; r < children_.size(); ++r) {
+                if (tally_[static_cast<size_t>(children_[r])].token == token) {
+                    rank = static_cast<int32_t>(r);
+                    break;
+                }
+            }
+        }
+        rank_[at] = rank;
+    }
+    std::stable_sort(order_.begin() + begin, order_.begin() + end, [&](int32_t a, int32_t b) {
+        return rank_[static_cast<size_t>(a)] < rank_[static_cast<size_t>(b)];
+    });
+    int32_t at = begin;
+    for (size_t r = 0; r < children_.size(); ++r) {
+        Node& node = candidates_[first + r];
+        node.begin = at;
+        while (at < end && rank_[static_cast<size_t>(order_[static_cast<size_t>(at)])] == static_cast<int32_t>(r)) ++at;
+        node.end = at;
+        // Along propose()'s branch, the same product as before trees (one
+        // factor per token): bit-identical survival.
+        node.probability = probability * (scale == 1.0f ? node.probability : node.probability * scale);
+        std::push_heap(candidates_.begin(), candidates_.begin() + static_cast<std::ptrdiff_t>(first + r + 1),
+                       heap_less);
+    }
+}
+
+const SuffixDrafter::Draft& SuffixDrafter::build(int32_t max_tokens, bool branching) {
     Draft& out = draft_;
     out.tokens.clear();
+    out.parents.clear();
     out.survival.clear();
     out.bins.clear();
     out.match = 0;
@@ -272,59 +363,65 @@ const SuffixDrafter::Draft& SuffixDrafter::propose(int32_t max_tokens) {
         }
     }
 
-    // 4. The best branch of the continuation tree: at each depth the token
-    // most occurrences continue with (ties: one the live sequence supports,
-    // then the newest), keeping only the occurrences that agree.
-    float survival = 1.0f;
-    for (int32_t depth = 0; depth < max_tokens; ++depth) {
-        tally_.clear();
-        int32_t active = 0;
-        for (const Occurrence& o : occurrences_) {
-            if (o.pos + depth >= o.end) continue;
-            ++active;
-            const int32_t token = o.tokens[o.pos + depth];
-            auto it = std::find_if(tally_.begin(), tally_.end(), [&](const Tally& x) { return x.token == token; });
-            if (it == tally_.end()) {
-                tally_.push_back({token, 1, o.source < 0});
-            } else {
-                ++it->count;
-                it->live = it->live || o.source < 0;
+    // 4. The continuation tree of those occurrences, its likeliest nodes
+    // first: a node's children become candidates once it is taken, so each
+    // node taken is the likeliest of those whose parent was taken.
+    match_ = best;
+    order_.resize(occurrences_.size());
+    std::iota(order_.begin(), order_.end(), 0);
+    rank_.resize(occurrences_.size());
+    candidates_.clear();
+    sequence_ = 0;
+    expand(-1, 0, 0, static_cast<int32_t>(occurrences_.size()), 1.0f, branching);
+    bool touched = false;
+    while (static_cast<int32_t>(out.tokens.size()) < max_tokens && !candidates_.empty()) {
+        std::pop_heap(candidates_.begin(), candidates_.end(), heap_less);
+        const Node node = candidates_.back();
+        candidates_.pop_back();
+        const auto index = static_cast<int32_t>(out.tokens.size());
+        out.tokens.push_back(node.token);
+        out.parents.push_back(node.parent);
+        out.survival.push_back(node.probability);
+        out.bins.push_back(node.bin);
+        if (node.depth == 0) {  // its occurrences' sources were useful (LRU)
+            for (int32_t i = node.begin; i < node.end; ++i) {
+                const Occurrence& o = occurrences_[static_cast<size_t>(order_[static_cast<size_t>(i)])];
+                if (o.source >= 0) stored_[static_cast<size_t>(o.source)].used = tick_ + 1;
             }
+            touched = true;
         }
-        if (active == 0) break;
-        const Tally* choice = &tally_.front();
-        for (const Tally& x : tally_) {
-            if (x.count > choice->count || (x.count == choice->count && x.live && !choice->live)) choice = &x;
+        if (static_cast<int32_t>(out.tokens.size()) < max_tokens) {
+            expand(index, node.depth + 1, node.begin, node.end, node.probability, branching);
         }
-        const int32_t token = choice->token;
-        const float share = static_cast<float>(choice->count) / static_cast<float>(active);
-        const int32_t match = best + depth;
-        const uint16_t bin = bin_of(match, share, choice->count, choice->live);
-        survival *= acceptance(bin, match, share);
-        out.tokens.push_back(token);
-        out.survival.push_back(survival);
-        out.bins.push_back(bin);
-        // Keep the agreeing occurrences; their sources were useful (LRU).
-        size_t kept = 0;
-        for (const Occurrence& o : occurrences_) {
-            if (o.pos + depth >= o.end || o.tokens[o.pos + depth] != token) continue;
-            if (depth == 0 && o.source >= 0) stored_[static_cast<size_t>(o.source)].used = tick_ + 1;
-            occurrences_[kept++] = o;
-        }
-        occurrences_.resize(kept);
-        if (depth == 0) ++tick_;
     }
+    if (touched) ++tick_;
     return out;
 }
 
 void SuffixDrafter::feedback(const Draft& draft, int32_t verified, int32_t accepted) {
+    // Along a branch, the accepted tokens are its first `accepted`.
+    std::vector<int32_t>& path = positions_;
+    path.resize(static_cast<size_t>(std::max(0, std::min(accepted, verified))));
+    std::iota(path.begin(), path.end(), 0);
+    feedback(draft, verified, std::span<const int32_t>(path));
+}
+
+void SuffixDrafter::feedback(const Draft& draft, int32_t verified, std::span<const int32_t> path) {
     verified = std::min(verified, static_cast<int32_t>(draft.bins.size()));
-    // Draft i was tested only if every one before it was accepted.
-    for (int32_t i = 0; i < verified && i <= accepted; ++i) {
+    if (verified <= 0) return;
+    on_path_.assign(static_cast<size_t>(verified), 0);
+    for (const int32_t i : path) {
+        if (i >= 0 && i < verified) on_path_[static_cast<size_t>(i)] = 1;
+    }
+    // Draft i was tested only if its parent was accepted (or it continues
+    // the live sequence).
+    for (int32_t i = 0; i < verified; ++i) {
+        const int32_t parent = draft.parents[static_cast<size_t>(i)];
+        if (parent >= 0 && (parent >= verified || on_path_[static_cast<size_t>(parent)] == 0)) continue;
         const uint16_t bin = draft.bins[static_cast<size_t>(i)];
         for (Bin* b : {&bins_[bin], &coarse_[bin / kFinePerCoarse]}) {
             b->verified += 1.0f;
-            if (i < accepted) b->accepted += 1.0f;
+            if (on_path_[static_cast<size_t>(i)] != 0) b->accepted += 1.0f;
             if (b->verified >= kBinHalfLife) {
                 b->verified *= 0.5f;
                 b->accepted *= 0.5f;

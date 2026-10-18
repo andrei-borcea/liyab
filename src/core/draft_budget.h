@@ -19,7 +19,11 @@
 // and a doubtful one not at all, also on a model where drafting does not pay
 // on average. A count's step time is the median of its last kWindow steps,
 // never below a count with fewer drafts: a step slowed by other work on the
-// cores, or a lucky one, does not move it.
+// cores, or a lucky one, does not move it. The drafts may be the nodes of a
+// tree (alternative branches, verified in one pass): a pass of j drafts costs
+// about the same whether they form a branch or a tree (j + 1 rows of every
+// matmul; on a MoE whose experts stream from flash, the union of the rows'
+// experts either way), so the same measured costs size both.
 //
 // Not thread-safe: owned by one SpeculativeDecoder.
 #ifndef LIYAB_CORE_DRAFT_BUDGET_H
@@ -39,8 +43,11 @@ public:
     // Most drafts to verify in the next step that has drafts to offer.
     [[nodiscard]] int32_t choose();
     // Most drafts to verify of a draft whose survival[i] is the estimated
-    // probability that its drafts 0..i are all accepted (non-increasing):
-    // the count j <= survival.size() maximizing
+    // probability that draft i is accepted (non-increasing; along a branch,
+    // that drafts 0..i all are; for the nodes of a tree, the likeliest first,
+    // that its branch is), so the first j drafts are expected to give
+    // 1 + survival[0] + ... + survival[j - 1] tokens: the count j <=
+    // survival.size() maximizing
     // (1 + survival[0] + ... + survival[j - 1]) / cost(j). Plain decoding is
     // measured first. A step never costs less with more drafts, so a count
     // costs at least the dearest fewer-drafts count measured. Counts are

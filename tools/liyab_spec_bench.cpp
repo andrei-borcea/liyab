@@ -2,7 +2,7 @@
 // the texts a phone assistant writes: plain decoding against context lookup
 // and suffix drafts, greedy, on one model.
 //
-//   liyab-spec-bench -m model.gguf [--modes plain,lookup,suffix,suffix:8]
+//   liyab-spec-bench -m model.gguf [--modes plain,lookup,suffix,suffix:8,suffix:8:linear]
 //                    [--tasks code,summary,tool,chat,again] [-n 512] [--repeat R]
 //                    [--threads N] [--backend cpu|metal|auto]
 //
@@ -11,7 +11,9 @@
 // with its most drafts per step (":K", default EngineConfig::draft_tokens)
 // and ":fixed" to verify every draft on offer instead of a learned count
 // (acceptance and tokens per pass then do not depend on timing; self always
-// is). The first mode is the reference (plain). Every mode has an engine of
+// is). Suffix drafts verify the likeliest nodes of the drafter's
+// continuation tree (EngineConfig::draft_tree); ":linear" only its best
+// branch. The first mode is the reference (plain). Every mode has an engine of
 // its own, unpaced, and the tasks run in
 // this order, each on all modes back to back (so the modes share the load of
 // the host), each a new conversation formatted by the model's chat template
@@ -164,6 +166,7 @@ struct Mode {
     bool lookup = false, suffix = false, self = false;
     int32_t draft_tokens = 0;  // 0: the default
     bool fixed = false;        // always the most drafts on offer (EngineConfig::adaptive_drafts off)
+    bool linear = false;       // suffix drafts: the best branch only (EngineConfig::draft_tree off)
 };
 
 // Runs one conversation; returns the replies and the decode statistics of all its turns.
@@ -207,7 +210,7 @@ bool run(Engine& engine, const Task& task, int32_t max_tokens, Result& result) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: liyab-spec-bench -m MODEL.gguf [--modes plain,lookup,suffix,suffix:8] [-n 512]\n"
+                 "usage: liyab-spec-bench -m MODEL.gguf [--modes plain,lookup,suffix,suffix:8:linear] [-n 512]\n"
                  "                        [--tasks code,summary,tool,chat,again] [--repeat R] [--threads N]\n"
                  "                        [--backend cpu|metal|auto]\n");
 }
@@ -264,7 +267,8 @@ int main(int argc, char** argv) {
         m.lookup = kind == "lookup";
         m.suffix = kind == "suffix";
         m.self = kind == "self";
-        m.fixed = m.name.ends_with(":fixed") || m.self;
+        m.fixed = m.name.find(":fixed") != std::string::npos || m.self;
+        m.linear = m.name.find(":linear") != std::string::npos;
         if (!m.lookup && !m.suffix && !m.self && kind != "plain") {
             usage();
             return 2;
@@ -296,6 +300,7 @@ int main(int argc, char** argv) {
             config.suffix_drafts = mode.suffix;
             if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
             config.adaptive_drafts = !mode.fixed;
+            config.draft_tree = !mode.linear;
             if (mode.self) config.draft_model_path = base.model_path;
             auto engine = Engine::create(config);
             if (!engine) {

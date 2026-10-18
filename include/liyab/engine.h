@@ -255,6 +255,13 @@ struct EngineConfig {
     // their files when selected. 0: adapters off (load_adapter() is
     // Unsupported).
     int64_t adapter_memory_mb = 256;
+    // Suffix drafts (lookup_drafts with suffix_drafts): verify the likeliest
+    // nodes of the drafter's continuation tree, alternative branches
+    // included, in one pass (true, the default), or only its best branch.
+    // Either way the step verifies at most draft_tokens drafted tokens, chosen
+    // by the same cost model, and keeps the longest accepted branch; the
+    // output is the same tokens (plain decoding's). No effect on other drafts.
+    bool draft_tree = true;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated

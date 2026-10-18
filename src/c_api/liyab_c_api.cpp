@@ -236,6 +236,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->segment_reuse_max_kl = d.segment_reuse_max_kl;
     config->prefix_cache_lossy = d.prefix_cache_lossy ? 1 : 0;
     config->adapter_memory_mb = d.adapter_memory_mb;
+    config->draft_tree = d.draft_tree ? 1 : 0;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -300,6 +301,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.segment_reuse_max_kl = config->segment_reuse_max_kl;
         c.prefix_cache_lossy = config->prefix_cache_lossy != 0;
         c.adapter_memory_mb = config->adapter_memory_mb;
+        c.draft_tree = config->draft_tree != 0;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());

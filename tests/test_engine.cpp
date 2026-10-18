@@ -4621,10 +4621,11 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
         REQUIRE(!expected_sampled.empty());
 
         for (const bool adaptive : {false, true}) {
-            for (const int32_t k : {3, 6}) {
+            for (const int32_t k : {3, 6, -6}) {  // -6: 6 drafts, the best branch only (no tree)
                 EngineConfig suffix = plain;
                 suffix.lookup_drafts = true;  // suffix drafts: the default drafter
-                suffix.draft_tokens = k;
+                suffix.draft_tokens = std::abs(k);
+                suffix.draft_tree = k > 0;
                 suffix.adaptive_drafts = adaptive;
                 auto engine = Engine::create(suffix);
                 REQUIRE(engine.has_value());
@@ -4802,6 +4803,7 @@ TEST_CASE("C API: create, generate, describe, errors") {
     CHECK(config.backend == LIYAB_BACKEND_AUTO);
     CHECK(config.kv_cache_type == LIYAB_KV_Q8_0);
     CHECK(config.suffix_drafts == (EngineConfig{}.suffix_drafts ? 1 : 0));
+    CHECK(config.draft_tree == (EngineConfig{}.draft_tree ? 1 : 0));
 
     config.model_path = "/nonexistent/model.gguf";
     liyab_engine* engine = nullptr;
@@ -5288,6 +5290,179 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
             const std::vector<int32_t> bad = {-1, 0, 2};
             CHECK(!tree->forward_tree(std::span<const int32_t>(tokens.data(), 3), bad, route, pool).has_value());
             CHECK(!tree->tree_pending());
+        }
+    }
+}
+
+TEST_CASE("The suffix drafter's tree holds the alternative continuations, likeliest first") {
+    SuffixDrafter drafter;
+    // "5 6" occurs three times before the end, followed by 7 8 2, 7 9 3 and
+    // 7 8 4: the tree is 7, then 8 (two occurrences) and 9 (one), 8's
+    // children 4 (the newest) and 2.
+    drafter.sync(std::vector<int32_t>{1, 5, 6, 7, 8, 2, 5, 6, 7, 9, 3, 5, 6, 7, 8, 4, 5, 6});
+    const SuffixDrafter::Draft branch = drafter.propose(10);
+    CHECK((branch.parents == std::vector<int32_t>{-1, 0, 1, 2, 3}));
+    const SuffixDrafter::Draft& tree = drafter.propose_tree(16);
+    CHECK(tree.match == 2);
+    REQUIRE(tree.tokens.size() >= 5);
+    REQUIRE(tree.parents.size() == tree.tokens.size());
+    REQUIRE(tree.survival.size() == tree.tokens.size());
+    CHECK(tree.tokens[0] == 7);
+    CHECK(tree.parents[0] == -1);
+    CHECK(tree.tokens[1] == 8);  // the likelier child first
+    CHECK(tree.parents[1] == 0);
+    CHECK(tree.survival[0] == branch.survival[0]);
+    CHECK(tree.survival[1] <= branch.survival[1]);  // its siblings share the parent's acceptance
+    bool ordered = true, siblings_differ = true;
+    std::vector<size_t> nine;
+    for (size_t i = 0; i < tree.tokens.size(); ++i) {
+        ordered = ordered && tree.parents[i] < static_cast<int32_t>(i) && tree.survival[i] > 0.0f &&
+                  (i == 0 || tree.survival[i] <= tree.survival[i - 1]);
+        for (size_t j = 0; j < i; ++j) {
+            siblings_differ = siblings_differ && !(tree.parents[j] == tree.parents[i] && tree.tokens[j] == tree.tokens[i]);
+        }
+        if (tree.tokens[i] == 9 && tree.parents[i] == 0) nine.push_back(i);
+    }
+    CHECK(ordered);
+    CHECK(siblings_differ);
+    REQUIRE(nine.size() == 1);
+    // Up to max_tokens, a parent before its children: any first j form a tree.
+    CHECK(drafter.propose_tree(1).tokens == std::vector<int32_t>{7});
+    // Siblings' probabilities sum to at most their parent's.
+    float under_seven = 0.0f;
+    const SuffixDrafter::Draft& again = drafter.propose_tree(16);
+    for (size_t i = 0; i < again.tokens.size(); ++i) {
+        if (again.parents[i] == 0) under_seven += again.survival[i];
+    }
+    CHECK(under_seven <= again.survival[0] * 1.0001f);
+
+    // Calibration from tree outcomes: 9 always accepted after 7, 8 never.
+    const SuffixDrafter::Draft outcome = drafter.propose_tree(3);  // 7, 8, 9
+    REQUIRE((outcome.tokens == std::vector<int32_t>{7, 8, 9}));
+    for (int i = 0; i < 100; ++i) drafter.feedback(outcome, 3, std::vector<int32_t>{0, 2});
+    const SuffixDrafter::Draft& learned = drafter.propose_tree(16);
+    REQUIRE(learned.tokens.size() >= 3);
+    CHECK(learned.tokens[1] == 9);  // now the likelier child
+    CHECK(learned.parents[1] == 0);
+    CHECK(learned.survival[1] > 0.5f * learned.survival[0]);
+    for (size_t i = 2; i < learned.tokens.size(); ++i) {
+        if (learned.tokens[i] == 8 && learned.parents[i] == 0) CHECK(learned.survival[i] < 0.2f * learned.survival[0]);
+    }
+}
+
+TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and keep other branches than the likeliest") {
+    struct Case {
+        std::string name;
+        test::TinyModelSpec spec;
+    };
+    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)}};
+    {
+        test::TinyModelSpec s;
+        s.arch = "qwen35";
+        s.n_layers = 4;
+        s.delta_net_interval = 2;
+        cases.push_back({"hybrid", s});
+    }
+    {
+        test::TinyModelSpec s;
+        s.arch = "qwen3moe";
+        s.n_expert = 4;
+        s.n_expert_used = 2;
+        s.identical_experts = false;
+        cases.push_back({"tree_moe", s});
+    }
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    constexpr int32_t kTokens = 48;
+    for (const Case& c : cases) {
+        for (const float temperature : {0.0f, 0.9f}) {
+            TransformerOptions options;
+            options.context_length = 512;
+            options.max_batch = 16;
+            auto plain = load_transformer(model_path(c.name, c.spec), options);
+            auto target = load_transformer(model_path(c.name, c.spec), options);
+            REQUIRE(plain != nullptr);
+            REQUIRE(target != nullptr);
+            const int32_t vocab = plain->config().n_vocab;
+            // "x y" followed twice by w and once by alt, then once more at
+            // the end, each time after another token (so "x y" is the longest
+            // match): the drafter's likeliest branch is w, its sibling alt.
+            // alt is the model's own greedy token after the end (a fixed
+            // point: alt is part of the text it is predicted from), so greedy
+            // verification keeps the sibling.
+            const int32_t x = stream_token(1, vocab), y = stream_token(2, vocab), z = stream_token(3, vocab);
+            auto text = [&](int32_t w, int32_t alt) {
+                std::vector<int32_t> t = {1};
+                for (int32_t i = 0; i < 6; ++i) t.push_back(stream_token(20 + i, vocab));
+                t.insert(t.end(), {stream_token(40, vocab), x, y, w, z, stream_token(41, vocab), x, y, w, z,
+                                   stream_token(42, vocab), x, y, alt, z, stream_token(43, vocab), x, y});
+                return t;
+            };
+            std::vector<int32_t> prompt;
+            for (int32_t w = 60; w < 120 && prompt.empty(); ++w) {
+                int32_t alt = stream_token(80, vocab);
+                for (int32_t round = 0; round < 6; ++round) {
+                    plain->reset();
+                    const std::vector<int32_t> t = text(stream_token(w, vocab), alt);
+                    auto logits = plain->forward(t, Transformer::Logits::Last, route, pool);
+                    REQUIRE(logits.has_value());
+                    const int32_t g = Sampler::argmax(*logits);
+                    if (g == stream_token(w, vocab)) break;
+                    if (g == alt) {
+                        prompt = t;
+                        break;
+                    }
+                    alt = g;
+                }
+            }
+            REQUIRE(!prompt.empty());  // found for every model below
+            plain->reset();
+            SamplingParams params;
+            params.temperature = temperature;
+            params.seed = 77;
+            // Plain decoding, one token per pass.
+            std::vector<int32_t> expected;
+            {
+                Sampler sampler(params);
+                REQUIRE(plain->forward(std::span<const int32_t>(prompt.data(), prompt.size() - 1),
+                                       Transformer::Logits::None, route, pool)
+                            .has_value());
+                int32_t last = prompt.back();
+                std::vector<float> p;
+                while (static_cast<int32_t>(expected.size()) < kTokens) {
+                    auto logits = plain->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, pool);
+                    REQUIRE(logits.has_value());
+                    sampler.probabilities(*logits, p);
+                    last = sampler.greedy() ? Sampler::argmax(p) : sampler.sample(p);
+                    expected.push_back(last);
+                }
+            }
+            // Speculative: every step verifies the drafter's tree of 8 drafts.
+            target->set_rollback_window(9);
+            SpeculativeDecoder decoder(*target, 8, SpeculativeDecoder::TextDrafts::Suffix);
+            decoder.set_adaptive(false);
+            Sampler sampler(params);
+            std::vector<int32_t> context(prompt.begin(), prompt.end() - 1), out;
+            REQUIRE(target->forward(context, Transformer::Logits::None, route, pool).has_value());
+            int32_t last = prompt.back();
+            while (static_cast<int32_t>(out.size()) < kTokens) {
+                auto next = decoder.step(last, context, sampler, route, route, pool);
+                REQUIRE(next.has_value());
+                context.push_back(last);
+                context.insert(context.end(), next->begin(), next->end() - 1);
+                last = next->back();
+                out.insert(out.end(), next->begin(), next->end());
+                REQUIRE(target->n_past() == static_cast<int32_t>(context.size()));
+            }
+            out.resize(kTokens);
+            if (out != expected) std::printf("  %s, temperature %.1f: not plain decoding's tokens\n", c.name.c_str(), temperature);
+            CHECK(out == expected);
+            CHECK(decoder.tree_steps() > 0);
+            if (temperature == 0.0f) CHECK(decoder.side_branches() > 0);  // w drafted first, alt kept
+            std::printf("  %s, temperature %.1f: %d drafts, %d accepted, %d tree steps, %d kept another branch\n",
+                        c.name.c_str(), temperature, decoder.proposed(), decoder.accepted(), decoder.tree_steps(),
+                        decoder.side_branches());
         }
     }
 }

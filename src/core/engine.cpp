@@ -2141,7 +2141,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
             *impl->target, config.draft_tokens,
             config.suffix_drafts ? SpeculativeDecoder::TextDrafts::Suffix : SpeculativeDecoder::TextDrafts::Lookup);
     }
-    if (impl->speculative) impl->speculative->set_adaptive(config.adaptive_drafts);
+    if (impl->speculative) {
+        impl->speculative->set_adaptive(config.adaptive_drafts);
+        impl->speculative->set_tree(config.draft_tree);
+    }
 
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     const ExperimentalConfig& x = config.experimental;

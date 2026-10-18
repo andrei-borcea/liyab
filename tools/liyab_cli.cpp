@@ -252,6 +252,8 @@ void usage() {
                  "                     confidence-sized drafts)\n"
                  "  --suffix           the same, explicitly\n"
                  "  --context-lookup   ... by context lookup instead (the last 4..2 tokens' earlier occurrence)\n"
+                 "  --linear-drafts    suffix drafts: verify only the drafter's best branch instead of the\n"
+                 "                     likeliest nodes of its continuation tree (the default)\n"
                  "  --fixed-drafts     always verify --draft-tokens drafts (default: learned per device)\n"
                  "  --profile P        performance | balanced | low_power (default balanced)\n"
                  "  --tps R            override the paced token rate\n"
@@ -351,6 +353,7 @@ int main(int argc, char** argv) {
         else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
         else if (arg == "--lookup") config.lookup_drafts = true;
         else if (arg == "--suffix") config.lookup_drafts = config.suffix_drafts = 1;
+        else if (arg == "--linear-drafts") config.draft_tree = 0;
         else if (arg == "--context-lookup") {
             config.lookup_drafts = 1;
             config.suffix_drafts = 0;

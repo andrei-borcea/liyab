@@ -116,6 +116,7 @@ typedef struct liyab_engine_config {
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.03) */
     int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of stored losslessly (lossy; 0 default, see EngineConfig) */
     int64_t adapter_memory_mb;    /* LoRA adapters (liyab_engine_load_adapter): RAM at most for the loaded ones, in MiB, the least recently selected released first (mapped again when selected); default 256; 0: adapters off (a zero-filled config without liyab_engine_config_default) */
+    int32_t draft_tree;           /* suffix drafts: nonzero (the default) verifies the likeliest nodes of the drafter's continuation tree, alternative branches included, in one pass; 0 only its best branch (a zero-filled config without liyab_engine_config_default); the same output either way (see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

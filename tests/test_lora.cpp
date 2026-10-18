@@ -201,6 +201,48 @@ std::vector<float> logits_of(Model& m) {
     return out;
 }
 
+// Speculative tree verification under the model's adapter: a tree pass
+// gives every branch the bits of a linear pass over it, and keep_path()
+// leaves that pass's context (the next token's logits the same bits).
+bool tree_matches_linear(Model& m) {
+    Transformer& t = *m.model;
+    const std::span<const int32_t> all(kTokens);
+    const std::span<const int32_t> prefix = all.first(6), tree = all.subspan(6, 5);
+    const std::vector<int32_t> parents = {-1, 0, 1, 0, 3};
+    t.reset();
+    t.set_rollback_window(8);
+    bool same = t.forward(prefix, Transformer::Logits::None, m.route, *m.pool).has_value();
+    t.snapshot_state();  // hybrid models return to the prefix from here
+    auto rows = t.forward_tree(tree, parents, m.route, *m.pool);
+    if (!same || !rows) return false;
+    const std::vector<float> got(rows->begin(), rows->end());
+    if (!t.keep_path(std::vector<int32_t>{0, 3, 4}).is_ok()) return false;
+    const int32_t next = kTokens.back();
+    auto after = t.forward(std::span<const int32_t>(&next, 1), Transformer::Logits::Last, m.route, *m.pool);
+    if (!after) return false;
+    const std::vector<float> continued(after->begin(), after->end());
+    const auto vocab = static_cast<size_t>(t.config().n_vocab);
+    for (size_t i = 0; i < tree.size(); ++i) {
+        std::vector<int32_t> branch;
+        for (auto a = static_cast<int32_t>(i); a >= 0; a = parents[static_cast<size_t>(a)]) {
+            branch.insert(branch.begin(), tree[static_cast<size_t>(a)]);
+        }
+        if (!t.truncate(static_cast<int32_t>(prefix.size())).is_ok()) return false;
+        auto ref = t.forward(branch, Transformer::Logits::All, m.route, *m.pool);
+        if (!ref) return false;
+        same = same && std::memcmp(ref->data() + (branch.size() - 1) * vocab, got.data() + i * vocab,
+                                   vocab * sizeof(float)) == 0;
+        if (i == 4) {  // the kept branch 0 3 4: then the next token
+            auto ref_next = t.forward(std::span<const int32_t>(&next, 1), Transformer::Logits::Last, m.route, *m.pool);
+            if (!ref_next) return false;
+            same = same && std::memcmp(ref_next->data(), continued.data(), vocab * sizeof(float)) == 0;
+        }
+    }
+    t.set_rollback_window(0);
+    t.reset();
+    return same;
+}
+
 double max_diff(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) return 1e30;
     double worst = 0.0;
@@ -259,6 +301,7 @@ void check_merged(const char* name, const test::TinyModelSpec& spec, const std::
                 scale, error);
     CHECK(moved > 0.02 * scale);       // the adapter matters
     CHECK(error < 2e-3 * scale);       // and is the merged model's
+    CHECK(tree_matches_linear(*base));  // speculative trees verify with it
     // Off again: the base model's bits; on again: the same bits as before,
     // the updates spread over the pool's threads or not.
     REQUIRE(base->model->set_adapter(nullptr).is_ok());

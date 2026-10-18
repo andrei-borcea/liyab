@@ -108,6 +108,8 @@ final class LiyabEngineConfig extends Struct {
   external int prefixCacheLossy;
   @Int64()
   external int adapterMemoryMb; // LoRA adapters: RAM at most for the loaded ones (MiB); 0: off
+  @Int32()
+  external int draftTree; // suffix drafts verified as a tree (nonzero, the default) or as their best branch
 }
 
 /// liyab_adapter_info: one loaded LoRA adapter (liyab_engine_adapter_info).

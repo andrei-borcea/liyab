@@ -5,9 +5,12 @@
 // was asked to change, a text it summarizes, a tool's output it quotes, the
 // phrasing of earlier replies. The drafter finds the longest suffix of the
 // current token sequence (at most kMaxMatch tokens) that occurred before,
-// in the live sequence or in a store of earlier sequences, and proposes the
-// continuation most of those occurrences agree on: the best branch of the
-// continuation tree, by frequency. Every drafted token comes with a
+// in the live sequence or in a store of earlier sequences, and proposes how
+// those occurrences continue: their continuation tree, each node a token
+// some of them continue with. propose() gives its best branch (at each node
+// the token most occurrences agree on); propose_tree() the tree's likeliest
+// nodes, alternative branches included, which the decoder verifies in one
+// pass (Transformer::forward_tree). Every drafted token comes with a
 // calibrated probability of being accepted, so the speculative decoder can
 // verify just as many drafts as pay off (DraftBudget::choose(survival)).
 //
@@ -29,7 +32,9 @@
 //
 // Confidence: each drafted token falls in a bin by match length, the share
 // and number of occurrences that agree on it and whether the live sequence
-// supports it; per bin, the accepted / verified counts give the probability.
+// supports it; per bin, the accepted / verified counts give the probability
+// that it is accepted once its parent (the token before it on its branch)
+// is. A token's probability is the product along its branch.
 // Two levels, so a few verifications already tell: a coarse bin (match length
 // and share only, its prior from the two) is the prior of the fine bins in
 // it. Counts are halved now and then, so they follow the text and the
@@ -74,8 +79,14 @@ public:
 
     struct Draft {
         std::vector<int32_t> tokens;
-        // survival[i]: estimated probability that tokens[0..i] are all
-        // accepted (non-increasing).
+        // parents[i]: the drafted token that token i continues, an earlier
+        // one (i - 1 along propose()'s branch), or -1 when it continues the
+        // live sequence. Siblings (tokens of one parent) differ.
+        std::vector<int32_t> parents;
+        // survival[i]: estimated probability that token i is accepted, i.e.
+        // its branch up to it: for propose(), tokens[0..i] all accepted. Non-
+        // increasing, so the first j tokens are the likeliest j and (a
+        // parent before its children) form a tree themselves.
         std::vector<float> survival;
         std::vector<uint16_t> bins;  // calibration bin of each token (for feedback)
         int32_t match = 0;           // length of the matched suffix (0: no draft)
@@ -89,14 +100,29 @@ public:
     // stored first if at least kMinDropped of its tokens are dropped.
     // O(length) (a comparison of the common prefix).
     void sync(std::span<const int32_t> sequence);
-    // Up to `max_tokens` tokens continuing the live sequence (none when no
-    // suffix of at least kMinMatch tokens occurred before). The draft is
-    // valid until the next call.
+    // Up to `max_tokens` tokens continuing the live sequence, one branch
+    // (none when no suffix of at least kMinMatch tokens occurred before).
+    // The draft is valid until the next call to propose*().
     const Draft& propose(int32_t max_tokens);
+    // Up to `max_tokens` tokens of the continuation tree, the likeliest
+    // first (best-first: a node's children become candidates once it is
+    // taken), so any first j of them are the j likeliest and form a tree.
+    // The siblings' acceptance probabilities (exclusive events: the target
+    // picks one token) are scaled down when their estimates sum above 1.
+    // With one candidate per node this is propose()'s branch. Valid until the
+    // next call to propose*().
+    const Draft& propose_tree(int32_t max_tokens);
     // The decoder verified the first `verified` tokens of `draft` and the
     // first `accepted` of them were accepted (so token `accepted`, when
-    // verified, was rejected); later ones were never tested.
+    // verified, was rejected); later ones were never tested. For a branch
+    // (propose()).
     void feedback(const Draft& draft, int32_t verified, int32_t accepted);
+    // The same for any draft: of its first `verified` tokens, those on
+    // `path` (draft indices, ascending: the accepted branch) were accepted.
+    // A token was tested when its parent was accepted (or it continues the
+    // live sequence): at the parent's row the target picked one token, so
+    // its other children were rejected; the rest were never tested.
+    void feedback(const Draft& draft, int32_t verified, std::span<const int32_t> path);
 
     [[nodiscard]] std::span<const int32_t> live() const noexcept { return live_; }
     [[nodiscard]] size_t stored_sequences() const noexcept { return stored_.size(); }
@@ -138,6 +164,18 @@ private:
         int32_t count;
         bool live;
     };
+    // A node of the continuation tree being built: its token at `depth`
+    // (0: the first drafted token), the occurrences continuing with its
+    // branch (order_[begin, end)), its branch's probability.
+    struct Node {
+        int32_t token;
+        int32_t depth;
+        int32_t parent;  // draft index of its parent, -1: the live sequence
+        int32_t begin, end;
+        float probability;
+        uint16_t bin;
+        uint32_t sequence;  // creation order: the tie-break among equal probabilities
+    };
     struct Bin {
         float accepted = 0.0f;
         float verified = 0.0f;
@@ -146,6 +184,15 @@ private:
     static constexpr size_t kFinePerCoarse = 3 * 2;    // support x live
 
     void store(std::span<const int32_t> sequence);
+    // propose() and propose_tree(): the tree's likeliest nodes, best first,
+    // with every candidate child (`branching`) or only each node's best one.
+    const Draft& build(int32_t max_tokens, bool branching);
+    // The children of a node of depth `depth` - 1 (the live sequence for
+    // depth 0) whose occurrences are order_[begin, end), as candidates
+    // (candidates_), its probability `probability`; order_[begin, end) is
+    // reordered so each child's occurrences are a run of their own. Only the
+    // best child unless `branching`.
+    void expand(int32_t parent, int32_t depth, int32_t begin, int32_t end, float probability, bool branching);
     [[nodiscard]] bool shadowed(const Stored& s) const noexcept {
         return s.prefix_aligned && s.common == s.tokens.size();
     }
@@ -154,6 +201,7 @@ private:
     int32_t longest_match(const Stored& s, int32_t& lo, int32_t& hi) const;
     void range(const Stored& s, std::span<const int32_t> pattern, int32_t& lo, int32_t& hi) const;
     static uint16_t bin_of(int32_t match, float share, int32_t support, bool live);
+    static bool heap_less(const Node& a, const Node& b) noexcept;
     static float prior(int32_t match, float share);
 
     Limits limits_;
@@ -169,6 +217,13 @@ private:
     std::vector<std::pair<int32_t, int32_t>> live_found_;  // scratch: (continuation, match length)
     std::vector<StoredMatch> stored_found_;                // scratch
     std::vector<int32_t> positions_;                       // scratch
+    std::vector<int32_t> order_;                           // scratch: occurrences_ indices, grouped by node
+    std::vector<int32_t> rank_;                            // scratch: per occurrence, its child's rank
+    std::vector<int32_t> children_;                        // scratch: tally_ indices, best child first
+    int32_t match_ = 0;                                    // scratch: the matched suffix's length (build)
+    std::vector<Node> candidates_;                         // scratch: a max-heap by probability
+    uint32_t sequence_ = 0;                                // scratch: Node::sequence counter
+    std::vector<uint8_t> on_path_;                         // scratch: feedback()'s accepted tokens
 };
 
 }  // namespace liyab

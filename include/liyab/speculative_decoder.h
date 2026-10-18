@@ -11,8 +11,10 @@
 //  * suffix drafts (core/suffix_drafter.h): the longest suffix (2..32 tokens)
 //    of the conversation that occurred before, in it or in earlier
 //    conversations of the same engine (a bounded store, least recently used
-//    out first), and the continuation most of its occurrences agree on, each
-//    token with a calibrated probability of being accepted.
+//    out first), and how its occurrences continue: the likeliest nodes of
+//    their continuation tree (alternative branches where they part), or its
+//    best branch only (set_tree(false)), each token with a calibrated
+//    probability of being accepted.
 // Acceptance follows Leviathan et al. (2023): draft token d is kept with
 // probability min(1, p(d)/q(d)) (lookup drafts are deterministic: q(d) = 1);
 // on the first rejection a replacement is drawn from norm(max(0, p − q)). The
@@ -44,8 +46,19 @@
 // (hybrid) models need a rollback window of at least k + 1
 // (Transformer::set_rollback_window), which Engine sets.
 //
-// Verification is linear: the best branch of the suffix drafter's
-// continuation tree, not the tree (that needs tree attention masks).
+// Tree verification (suffix drafts): the drafts form a tree, `last` its
+// root, laid out depth first with the likeliest child first, and one
+// Transformer::forward_tree() pass scores every node as a linear pass over
+// its branch would (each node attends to the context and its ancestors;
+// hybrid models continue each branch from its parent's recurrent state).
+// From the root down, each row is sampled once and the child holding the
+// sampled token (siblings differ) is kept, so the tokens are plain
+// decoding's, as for a branch; Transformer::keep_path() then moves the kept
+// branch into place. The k drafts verified are the tree's likeliest nodes
+// (a node's probability: its branch's), so the expected tokens of a step
+// are 1 + the sum of their probabilities, which DraftBudget weighs against
+// the measured cost of a pass of k + 1 tokens, the same whether they form a
+// branch or a tree. A tree that is a single branch runs as a linear pass.
 //
 // This is an engine component: Engine wires it up when
 // EngineConfig::draft_model_path is set, or EngineConfig::lookup_drafts
@@ -84,6 +97,10 @@ public:
     // Learn how many drafts to verify per step (default) or always draft_tokens
     // (suffix drafts: all the drafter offers, up to draft_tokens).
     void set_adaptive(bool adaptive);
+    // Suffix drafts: verify the likeliest nodes of the drafter's
+    // continuation tree, alternative branches included (default), or only
+    // its best branch. No effect on other drafts.
+    void set_tree(bool tree) noexcept { tree_ = tree; }
 
     // Precondition: the models cached the same prefix and `last` (the most
     // recent token) is not yet cached. `context` is that cached prefix's
@@ -100,7 +117,11 @@ public:
 
     [[nodiscard]] int32_t proposed() const noexcept { return proposed_; }
     [[nodiscard]] int32_t accepted() const noexcept { return accepted_; }
-    void reset_stats() noexcept { proposed_ = accepted_ = 0; }
+    // Steps verified as a tree (more than one branch), and those of them
+    // that kept a branch other than the likeliest one.
+    [[nodiscard]] int32_t tree_steps() const noexcept { return tree_steps_; }
+    [[nodiscard]] int32_t side_branches() const noexcept { return side_branches_; }
+    void reset_stats() noexcept { proposed_ = accepted_ = tree_steps_ = side_branches_ = 0; }
     // The suffix drafter (nullptr unless TextDrafts::Suffix), for diagnostics.
     [[nodiscard]] const SuffixDrafter* suffix_drafter() const noexcept { return suffix_.get(); }
 
@@ -116,11 +137,21 @@ private:
     int32_t draft_tokens_;
     int32_t proposed_ = 0;
     int32_t accepted_ = 0;
+    int32_t tree_steps_ = 0;
+    int32_t side_branches_ = 0;
     std::vector<std::vector<float>> q_;  // draft distributions, reused
     std::vector<float> p_;
     std::vector<int32_t> history_, drafts_;  // lookup scratch
     std::unique_ptr<DraftBudget> budget_;    // null: fixed draft_tokens_
     std::unique_ptr<SuffixDrafter> suffix_;  // non-null: suffix drafts
+    bool tree_ = true;                       // suffix drafts verified as a tree (set_tree)
+    // suffix_step() scratch: per draft index + 1 its first child and next
+    // sibling and its batch index; per batch token its parent and draft
+    // index; the depth-first
+    // walk's pending siblings; the kept branch (batch indices) and its
+    // draft indices.
+    std::vector<int32_t> child_first_, child_next_, batch_of_, batch_parent_, batch_draft_, stack_, path_,
+        accepted_path_;
 };
 
 }  // namespace liyab
