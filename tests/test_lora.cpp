@@ -663,9 +663,22 @@ TEST_CASE("engine adapters: speculative decoding verifies with the adapter") {
     const std::vector<int32_t> again(prompt.begin() + 1, prompt.end());
     prompt.insert(prompt.end(), again.begin(), again.end());
     GenerationStats st;
+    const std::vector<int32_t> expected = run(**merged, prompt, 24);
     const std::vector<int32_t> out = run(**engine, prompt, 24, &st);
-    CHECK(out == run(**merged, prompt, 24));
-    std::printf("  drafts proposed %d, accepted %d\n", st.draft_tokens_proposed, st.draft_tokens_accepted);
+    CHECK(out == expected);
+    std::printf("  lookup drafts proposed %d, accepted %d\n", st.draft_tokens_proposed, st.draft_tokens_accepted);
+    // A draft model (the base model itself) drafts without the adapter.
+    EngineConfig with_draft = adapter_engine_config(f.base);
+    with_draft.draft_model_path = f.base;
+    with_draft.draft_tokens = 3;
+    with_draft.adaptive_drafts = false;
+    auto drafted = Engine::create(with_draft);
+    REQUIRE(drafted.has_value());
+    REQUIRE((*drafted)->load_adapter("a", f.adapter_a).is_ok());
+    REQUIRE((*drafted)->set_adapter("a").is_ok());
+    CHECK(run(**drafted, prompt, 24, &st) == expected);
+    CHECK(st.draft_tokens_proposed > 0);
+    std::printf("  draft model: drafts proposed %d, accepted %d\n", st.draft_tokens_proposed, st.draft_tokens_accepted);
 }
 
 TEST_CASE("engine adapters: the prefix cache and saved states keep contexts apart by adapter") {
