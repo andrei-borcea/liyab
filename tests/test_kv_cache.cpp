@@ -1346,6 +1346,7 @@ TEST_CASE("Per-block KV: windowed layers keep their window, the others every pos
     // Two groups (2 and 4 layers): pool pages of 2 layers each.
     CHECK(kv.unit_bytes() * 3 == kv.legacy_page_bytes());
     CHECK(kv.page_bytes() == kv.unit_bytes());  // the two layers keeping every position
+    CHECK(kv_row_layout(c).image_bytes(c.page_tokens) == kv.page_bytes());  // what the store's codec reads
     CHECK(kv.window_page_bytes() == 2 * kv.unit_bytes());
     CHECK(kv.window_page_bytes() == 2u * 4u * 16u * 2u * kv.head_row_bytes());  // K+V, 4 layers, 16 slots, 2 heads
     int32_t peak = 0;

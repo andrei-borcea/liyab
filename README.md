@@ -1788,6 +1788,12 @@ The replies are the same tokens. Models without windowed blocks are unchanged: Q
 of KV at 3,144 positions, its context (4,405) and its reply, at the same speed (prefill median 24.5 / 23.7 s,
 decoding 59.4 / 62.6 tok/s, before / after, alternated).
 
+On gemma-3-1b-it with a 2,094-token system prompt: a context saved by the build before (format 3, 29.9 MB) loads
+converted and gives the same reply as one never saved, as does one saved now (format 4, 11.5 MB); the build before
+refuses the new file. Through the prefix cache on storage, a 2,133-token context set aside at exit takes 12.8 MB (9
+chunks and 11 window pages; its rows of every block would have taken 28.7 MB), and the next run, whose prompt leaves
+it at token 2,094, restores 2,048 tokens and replies as a run without the cache.
+
 ### Storage and kernels
 
 | Direct reads from UFS 4 | Throughput |
@@ -2362,7 +2368,9 @@ Implemented features are described above. These are next, in order:
   taken as equal, as on every DeepSeek model so far.
 * **Windowed blocks (Gemma 2 and 3, Phi-3):** keeping only their window, a context rewinds only inside the
   64-position rollback margin and to its snapshots (the end of each prompt, the oldest one), as a hybrid model
-  does; a further rewind is processed again from the nearest of those (or the prefix cache). With `segment_reuse`
+  does; a further rewind is processed again from the nearest of those (or the prefix cache). From the prefix
+  cache, a prompt that leaves a stored context inside a page restores to that page's start or to a snapshot
+  (at most 63 tokens processed again that a model without windowed blocks would restore). With `segment_reuse`
   on they keep every position, at full attention's memory. The prefix cache is off for a model whose windowed
   blocks have several windows or sit next to recurrent blocks (no such model is supported yet). Window pages are
   stored raw on storage (the lossless chunk coding is not applied to them yet).

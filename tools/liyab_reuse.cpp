@@ -199,6 +199,9 @@ int main(int argc, char** argv) {
     options.context_length = 4096;
     options.max_batch = 64;
     options.kv_type = kv_type;
+    // As the engine with segment reuse on: windowed blocks keep every
+    // position (a reused segment needs every block's rows).
+    options.keep_windowed_rows = true;
     auto loaded = Transformer::load(std::move(file).value(), options);
     if (!loaded) {
         std::fprintf(stderr, "%s\n", loaded.status().to_string().c_str());
