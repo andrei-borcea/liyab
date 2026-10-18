@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <istream>
+#include <limits>
 #include <numbers>
 #include <ostream>
 #include <random>
@@ -422,16 +423,59 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // latent channels serving as the values (ModelConfig::mla).
     kv.values_in_keys = c.mla.kv_rank > 0;
     kv.value_offset = kv.values_in_keys ? c.rope_dim : 0;
+    model->max_batch_ = std::max(1, options.max_batch);
+    // Per-block layout: a windowed block (Gemma 2 / 3, Phi-3) keeps only the
+    // rows its window still shows, so it costs a bounded amount whatever the
+    // context, and a position costs only what the blocks seeing every
+    // position keep for it (KvCache::kept_bytes()). Without windowed blocks
+    // the automatic length is the plain per-token formula, as before.
+    std::vector<int32_t> windows(static_cast<size_t>(kv.n_layers), 0);
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        const Layer& L = model->layers_[static_cast<size_t>(l)];
+        const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
+        if (L.kv_slot >= 0 && plan.mixer == MixerKind::Attention && plan.windowed && c.sliding_window > 0 &&
+            !options.keep_windowed_rows) {
+            windows[static_cast<size_t>(L.kv_slot)] = c.sliding_window;
+        }
+    }
     const size_t kv_per_token = KvCache::bytes_per_token(kv);
-    const auto automatic = static_cast<int32_t>(std::clamp<size_t>(kKvBudgetBytes / std::max<size_t>(kv_per_token, 1),
-                                                                   4096, 32768));
+    auto automatic = static_cast<int32_t>(std::clamp<size_t>(kKvBudgetBytes / std::max<size_t>(kv_per_token, 1),
+                                                             4096, 32768));
+    if (std::any_of(windows.begin(), windows.end(), [](int32_t w) { return w > 0; })) {
+        // The windowed blocks' share is set aside once (their window plus the
+        // rollback margin, whatever the context); the rest of the budget goes
+        // to the blocks keeping every position, at their own cost per position.
+        KvCacheConfig windowed_only = kv;
+        int32_t every = 0;
+        for (const int32_t w : windows) {
+            if (w > 0) {
+                windowed_only.layer_windows.push_back(w);
+            } else {
+                ++every;
+            }
+        }
+        windowed_only.n_layers = static_cast<int32_t>(windowed_only.layer_windows.size());
+        const size_t fixed =
+            KvCache::kept_bytes(windowed_only, std::numeric_limits<int32_t>::max() / 2, model->max_batch_);
+        KvCacheConfig every_only = kv;
+        every_only.n_layers = every;
+        const size_t per_position = every > 0 ? KvCache::bytes_per_token(every_only) : 0;
+        const size_t room = kKvBudgetBytes > fixed ? kKvBudgetBytes - fixed : 0;
+        automatic = per_position == 0 ? 32768
+                                      : static_cast<int32_t>(std::clamp<size_t>(room / per_position, 4096, 32768));
+    }
     model->context_length_ = options.context_length > 0
                                  ? options.context_length
                                  : (c.n_ctx_train > 0 ? std::min(c.n_ctx_train, automatic) : automatic);
     if (c.n_ctx_train > 0 && model->context_length_ > c.n_ctx_train) {
         LIYAB_LOG_WARN("context %d exceeds the model's training context %d", model->context_length_, c.n_ctx_train);
     }
-    model->max_batch_ = std::max(1, options.max_batch);
+    // A window holding the whole context keeps every position anyway: such
+    // blocks stay with the others (a windowed group would only add bookkeeping).
+    for (int32_t& w : windows) {
+        if (w >= model->context_length_) w = 0;
+    }
+    if (std::any_of(windows.begin(), windows.end(), [](int32_t w) { return w > 0; })) kv.layer_windows = windows;
     kv.max_positions = model->context_length_;
     kv.window = options.sliding_window > 0 && options.sliding_window < model->context_length_ ? options.sliding_window : 0;
     kv.sink_tokens = std::clamp(options.sink_tokens, 0, kv.page_tokens);
@@ -526,6 +570,17 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                    model->context_length_, kv.window ? " (sliding)" : "",
                    std::string(dtype_traits(model->kv_->dtype()).name).c_str(),
                    static_cast<double>(KvCache::bytes_per_token(kv)) / 1024.0);
+    if (model->kv_->has_windowed_layers()) {
+        const KvCacheConfig& made = model->kv_->config();
+        int32_t every = 0;
+        for (const int32_t w : made.layer_windows) every += w == 0 ? 1 : 0;
+        const int32_t ctx = model->context_length_;
+        LIYAB_LOG_INFO("KV per block: %d of %d attention blocks keep every position (%.1f KiB/token), the others their "
+                       "window of %d; a full context holds %.1f MiB instead of %.1f MiB",
+                       every, made.n_layers, static_cast<double>(model->kv_->rows_bytes(1)) / 1024.0, c.sliding_window,
+                       static_cast<double>(KvCache::kept_bytes(made, ctx, model->max_batch_)) / (1024.0 * 1024.0),
+                       static_cast<double>(KvCache::bytes_per_token(made)) * ctx / (1024.0 * 1024.0));
+    }
     if (c.mla.kv_rank > 0) {
         LIYAB_LOG_INFO("latent attention: a %d-wide latent + %d RoPE channels cached per position, %d heads of %d + %d "
                        "-> %d%s",
@@ -807,8 +862,18 @@ void Transformer::reset() noexcept {
     n_past_ = 0;
 }
 
+bool Transformer::has_position_state() const noexcept { return !states_.empty() || kv_->has_windowed_layers(); }
+
+void Transformer::pin_snapshots() {
+    if (!kv_->has_windowed_layers()) return;
+    std::vector<int32_t> positions;
+    positions.reserve(snapshots_.size());
+    for (const StateSnapshot& snap : snapshots_) positions.push_back(snap.pos);
+    kv_->pin(positions);
+}
+
 void Transformer::snapshot_state(bool pin) {
-    if (states_.empty() || n_past_ == 0) return;
+    if (!has_position_state() || n_past_ == 0) return;
     if (!snapshots_.empty() && snapshots_.back().pos == n_past_) {  // already held
         if (pin) {
             for (StateSnapshot& s : snapshots_) s.pinned = false;
@@ -834,6 +899,9 @@ void Transformer::snapshot_state(bool pin) {
     }
     snap.pinned = pin;
     snap.pos = n_past_;
+    // The recurrent states are copied; the windowed blocks' window before
+    // this position stays in the cache's pages, which the pin keeps (no copy:
+    // it is usually the live window).
     snap.data.resize(recurrent_state_bytes() / sizeof(float));
     float* out = snap.data.data();
     for (const RecurrentState& st : states_) {
@@ -841,6 +909,7 @@ void Transformer::snapshot_state(bool pin) {
         out = std::copy(st.ssm.begin(), st.ssm.end(), out);
     }
     snapshots_.push_back(std::move(snap));
+    pin_snapshots();
 }
 
 namespace {
@@ -848,7 +917,14 @@ namespace {
 constexpr uint32_t kStateMagic = 0x5453594C;  // "LYST"
 // 2: the recurrent-state snapshots follow the states (1 had none).
 // 3: the key scales the pages were stored with follow the fingerprint.
-constexpr uint32_t kStateVersion = 3;
+// 4: per-block KV layout: the cache's layout fingerprint follows the
+//    fingerprint, pages are rows images (the blocks keeping every position),
+//    and the windowed blocks' pages (KvCache::window_pages_of() the end and
+//    the snapshots kept: a count, then each page's index and window page
+//    image) end the file. Older files hold every block's rows of every
+//    position in one table's pages: they load converted
+//    (KvCache::write_legacy_page()).
+constexpr uint32_t kStateVersion = 4;
 
 template <typename T>
 void put(std::ostream& out, const T& v) {
@@ -878,13 +954,16 @@ std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
 uint64_t Transformer::context_fingerprint() const noexcept {
     const std::array<int64_t, 9> fp = state_fingerprint();
     const uint64_t page = kv_->page_bytes();
-    const uint64_t seed = xxhash64(fp.data(), sizeof fp, xxhash64(&page, sizeof page));
+    uint64_t seed = xxhash64(fp.data(), sizeof fp, xxhash64(&page, sizeof page));
+    // Windowed blocks change what chunks hold and add their own images: the
+    // layout is part of the key (0, and so no change, without them).
+    if (const uint64_t layout = kv_->layout_fingerprint(); layout != 0) seed = xxhash64(&layout, sizeof layout, seed);
     return xxhash64(key_scale_.data(), key_scale_.size() * sizeof(float), seed);
 }
 
 std::vector<Transformer::KeptState> Transformer::kept_states() const {
     std::vector<KeptState> kept;
-    if (states_.empty() || n_past_ == 0) return kept;
+    if (!has_position_state() || n_past_ == 0) return kept;
     bool pinned_below = false;
     for (const StateSnapshot& snap : snapshots_) {
         if (snap.pos < n_past_ && (&snap == &snapshots_.front() || snap.pinned)) {
@@ -910,6 +989,12 @@ std::vector<std::span<const float>> Transformer::kept_state_parts(int32_t pos) c
         if (snap.pos == pos) parts.emplace_back(snap.data);
     }
     return parts;
+}
+
+std::vector<int32_t> Transformer::snapshot_positions() const {
+    std::vector<int32_t> out;
+    for (const StateSnapshot& snap : snapshots_) out.push_back(snap.pos);
+    return out;
 }
 
 void Transformer::begin_restore() {
@@ -950,15 +1035,23 @@ Status Transformer::write_state(std::ostream& out) const {
             kept.push_back({snap.pos, snap.pinned, snap.data});
         }
     }
-    return write_image(out, n_past_, [this](int32_t p) { return kv_->page_data(p); }, {}, kept, true);
+    // A page spread over several pool pages is copied out; otherwise written in place.
+    std::vector<uint8_t> scratch(kv_->page_bytes());
+    auto page = [this, &scratch](int32_t p) -> const uint8_t* {
+        if (const uint8_t* data = kv_->page_data(p)) return data;
+        if (!kv_->read_rows(p, kv_->config().page_tokens, scratch.data()).is_ok()) return nullptr;
+        return scratch.data();
+    };
+    return write_image(out, n_past_, page, nullptr, {}, kept, true);
 }
 
 Status Transformer::write_state(std::ostream& out, const ContextImage& image) const {
     if (kv_->window() > 0) return Status(ErrorCode::Unsupported, "a sliding-window context cannot be saved");
     const size_t floats = recurrent_state_bytes() / sizeof(float);
+    const bool windowed = kv_->has_windowed_layers();
     if (image.n < 0 || image.n > context_length_ || !image.page || image.state.size() != (states_.empty() ? 0 : floats) ||
         static_cast<int32_t>(image.snapshots.size()) >= kStateSnapshots ||
-        (states_.empty() && !image.snapshots.empty())) {
+        (states_.empty() && !image.snapshots.empty()) || (windowed && (!image.window_page || !image.snapshots.empty()))) {
         return Status(ErrorCode::InvalidArgument, "the context image does not fit this model");
     }
     int32_t below = 0;
@@ -968,17 +1061,22 @@ Status Transformer::write_state(std::ostream& out, const ContextImage& image) co
         }
         below = snap.pos;
     }
-    return write_image(out, image.n, image.page, image.state, image.snapshots, false);
+    return write_image(out, image.n, image.page, windowed ? &image.window_page : nullptr, image.state, image.snapshots,
+                       false);
 }
 
-// The body of both write_state()s: `state` holds the recurrent states at n
-// as one image, or `live` takes them from states_ (no copy of the live ones).
+// The body of both write_state()s: `state` holds the recurrent states at n as
+// one image, or `live` takes them from states_ (no copy of the live ones).
+// The windowed blocks' pages come from the live cache, or from `window_page`
+// (the windowed rows of a logical page, KvCache::read_window_rows()'s image).
 Status Transformer::write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
+                                const std::function<const uint8_t*(int32_t)>* window_page,
                                 std::span<const float> state, std::span<const SnapshotImage> snapshots,
                                 bool live) const {
     put(out, kStateMagic);
     put(out, kStateVersion);
     for (const int64_t v : state_fingerprint()) put(out, v);
+    put(out, kv_->layout_fingerprint());
     put(out, static_cast<uint64_t>(key_scale_.size()));
     out.write(reinterpret_cast<const char*>(key_scale_.data()),
               static_cast<std::streamsize>(key_scale_.size() * sizeof(float)));
@@ -986,7 +1084,7 @@ Status Transformer::write_image(std::ostream& out, int32_t n, const std::functio
     const int32_t pages = (n + kv_->config().page_tokens - 1) / kv_->config().page_tokens;
     put(out, static_cast<uint64_t>(kv_->page_bytes()));
     put(out, pages);
-    for (int32_t p = 0; p < pages; ++p) {
+    for (int32_t p = 0; p < pages && kv_->page_bytes() > 0; ++p) {
         const uint8_t* data = page(p);
         if (data == nullptr) return Status(ErrorCode::Internal, "a cached page is not mapped");
         out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(kv_->page_bytes()));
@@ -1010,6 +1108,26 @@ Status Transformer::write_image(std::ostream& out, int32_t n, const std::functio
         out.write(reinterpret_cast<const char*>(snap.data.data()),
                   static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
     }
+    // Windowed blocks: every page of the window before the end and before
+    // each snapshot kept, whole (out of the live pages, or the image's window
+    // pages), so a loaded context returns where the saved one would.
+    std::vector<int32_t> pins;
+    for (const SnapshotImage& snap : snapshots) pins.push_back(snap.pos);
+    const std::vector<int32_t> window = kv_->window_pages_of(n, pins);
+    put(out, static_cast<int32_t>(window.size()));
+    std::vector<uint8_t> scratch(live ? kv_->window_page_bytes() : 0);
+    const int32_t t = kv_->config().page_tokens;
+    for (const int32_t q : window) {
+        const uint8_t* image = nullptr;
+        if (live) {
+            LIYAB_RETURN_IF_ERROR(kv_->read_window_rows(q, std::min(t, n - q * t), scratch.data()));
+            image = scratch.data();
+        } else if (window_page == nullptr || (image = (*window_page)(q)) == nullptr) {
+            return Status(ErrorCode::InvalidArgument, "a window page of the context image is missing");
+        }
+        put(out, q);
+        out.write(reinterpret_cast<const char*>(image), static_cast<std::streamsize>(kv_->window_page_bytes()));
+    }
     return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
 }
 
@@ -1029,6 +1147,18 @@ Status Transformer::read_state(std::istream& in) {
             return fail(ErrorCode::InvalidArgument, "the state was saved for another model or other cache settings");
         }
     }
+    // Before version 4 every block kept every position in one table's pages:
+    // such a file converts to any layout. A version 4 file holds what its
+    // own layout keeps, so it must be this one.
+    const bool legacy = version < 4;
+    if (!legacy) {
+        uint64_t layout = 0;
+        if (!get(in, layout) || layout != kv_->layout_fingerprint()) {
+            return fail(ErrorCode::InvalidArgument,
+                        "the state was saved with other windowed attention blocks (another context length or "
+                        "segment reuse setting)");
+        }
+    }
     // Key scales the pages were stored with (none before version 3).
     std::vector<float> stored;
     if (version >= 3) {
@@ -1043,27 +1173,28 @@ Status Transformer::read_state(std::istream& in) {
     }
     int32_t n = 0, pages = 0;
     uint64_t page_bytes = 0;
+    const int32_t t = kv_->config().page_tokens;
     if (!get(in, n) || !get(in, page_bytes) || !get(in, pages) || n < 0 || n > context_length_ ||
-        page_bytes != kv_->page_bytes() || pages != (n + kv_->config().page_tokens - 1) / kv_->config().page_tokens) {
+        page_bytes != (legacy ? kv_->legacy_page_bytes() : kv_->page_bytes()) || pages != (n + t - 1) / t) {
         return fail(ErrorCode::InvalidArgument, "the state's cache layout does not match");
     }
-    if (Status s = kv_->reserve(n); !s.is_ok()) return fail(s.code(), "cannot map the state's cache pages");
-    for (int32_t p = 0; p < pages; ++p) {
-        uint8_t* data = kv_->mutable_page_data(p);
-        if (data == nullptr || !in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(page_bytes))) {
+    // Every page of the blocks keeping every position, the windowed blocks'
+    // pages of the window before n (a snapshot's are mapped when it is read).
+    if (Status s = kv_->reserve_context(n, {}); !s.is_ok()) return fail(s.code(), "cannot map the state's cache pages");
+    const bool convert = legacy && kv_->has_windowed_layers();
+    std::vector<uint8_t> buffer;
+    for (int32_t p = 0; p < pages && page_bytes > 0; ++p) {
+        uint8_t* data = convert ? nullptr : kv_->mutable_page_data(p);
+        if (data == nullptr) {
+            buffer.resize(static_cast<size_t>(page_bytes));
+            data = buffer.data();
+        }
+        if (!in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(page_bytes))) {
             return fail(ErrorCode::IoError, "the state's cache pages are truncated");
         }
-    }
-    // Keys stored with other scales (an older file: none, i.e. 1) are brought
-    // to the ones in use: k_now = k_stored * t_stored / t_now, requantized. The
-    // values and the rest of the context are unchanged.
-    if (stored != key_scale_) {
-        std::vector<float> ratio(key_scaling_shape().factors());
-        for (size_t i = 0; i < ratio.size(); ++i) {
-            ratio[i] = (stored.empty() ? 1.0f : stored[i]) / (key_scale_.empty() ? 1.0f : key_scale_[i]);
-        }
-        if (Status s = kv_->scale_keys(n, ratio); !s.is_ok()) return fail(s.code(), "cannot convert the state's keys");
-        LIYAB_LOG_INFO("state: keys of %d positions converted to this model's key scales", n);
+        if (data != buffer.data()) continue;  // read in place
+        const Status written = convert ? kv_->write_legacy_page(p, data) : kv_->write_rows(p, data, t, 0, t);
+        if (!written.is_ok()) return fail(ErrorCode::InvalidArgument, "the state's cache pages do not fit");
     }
     int32_t count = 0;
     if (!get(in, count) || count != static_cast<int32_t>(states_.size())) {
@@ -1082,6 +1213,7 @@ Status Transformer::read_state(std::istream& in) {
         return fail(ErrorCode::InvalidArgument, "the state's snapshots do not match");
     }
     const size_t floats = recurrent_state_bytes() / sizeof(float);
+    int32_t dropped = 0;
     for (int32_t i = 0; i < snapshots; ++i) {
         StateSnapshot snap;
         uint8_t pinned = 0;
@@ -1095,7 +1227,53 @@ Status Transformer::read_state(std::istream& in) {
         if (!in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
             return fail(ErrorCode::IoError, "the state's snapshots are truncated");
         }
+        if (convert) {
+            // An older file kept no window of its own for a snapshot below
+            // the end: its rows were in pages released here. The context
+            // loads without it (it rewinds less far).
+            ++dropped;
+            continue;
+        }
         snapshots_.push_back(std::move(snap));
+    }
+    // Windowed blocks (version 4): the pages of the window before n and
+    // before each snapshot, whole, exactly those (older files had those rows
+    // in their pages).
+    if (!legacy) {
+        std::vector<int32_t> pins;
+        for (const StateSnapshot& snap : snapshots_) pins.push_back(snap.pos);
+        if (Status s = kv_->reserve_context(n, pins); !s.is_ok()) return fail(s.code(), "cannot map the state's pages");
+        const std::vector<int32_t> expected = kv_->window_pages_of(n, pins);
+        int32_t count_pages = 0;
+        if (!get(in, count_pages) || count_pages != static_cast<int32_t>(expected.size())) {
+            return fail(ErrorCode::InvalidArgument, "the state's windowed blocks do not match");
+        }
+        buffer.resize(kv_->window_page_bytes());
+        for (const int32_t q : expected) {
+            int32_t at = 0;
+            if (!get(in, at) || at != q) return fail(ErrorCode::InvalidArgument, "the state's windowed blocks do not match");
+            if (!in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()))) {
+                return fail(ErrorCode::IoError, "the state's window pages are truncated");
+            }
+            if (!kv_->write_window_rows(q, buffer.data(), 0, std::min(t, n - q * t)).is_ok()) {
+                return fail(ErrorCode::InvalidArgument, "the state's window pages do not fit");
+            }
+        }
+    }
+    // Keys stored with other scales (an older file: none, i.e. 1) are brought
+    // to the ones in use: k_now = k_stored * t_stored / t_now, requantized. The
+    // values and the rest of the context are unchanged.
+    if (stored != key_scale_) {
+        std::vector<float> ratio(key_scaling_shape().factors());
+        for (size_t i = 0; i < ratio.size(); ++i) {
+            ratio[i] = (stored.empty() ? 1.0f : stored[i]) / (key_scale_.empty() ? 1.0f : key_scale_[i]);
+        }
+        if (Status s = kv_->scale_keys(n, ratio); !s.is_ok()) return fail(s.code(), "cannot convert the state's keys");
+        LIYAB_LOG_INFO("state: keys of %d positions converted to this model's key scales", n);
+    }
+    if (convert) {
+        LIYAB_LOG_INFO("state: a version %u file converted to per-block KV (windowed blocks keep their window)%s",
+                       version, dropped > 0 ? "; its snapshots below the end were dropped" : "");
     }
     n_past_ = n;
     // One at the end too, so a draft typed ahead can be dropped back to it. It
@@ -1108,13 +1286,18 @@ Status Transformer::read_state(std::istream& in) {
 
 int32_t Transformer::restorable_prefix(int32_t n) const noexcept {
     n = std::clamp(n, 0, n_past_);
-    if (!config_.hybrid() || n == n_past_) return n;
+    if (n == n_past_) return n;
+    // Windowed blocks: only where their window's rows are still kept (the
+    // rollback margin, the snapshots' pins).
+    const bool windowed = kv_->has_windowed_layers();
+    if (!config_.hybrid()) return windowed ? kv_->restorable(n) : n;
+    auto kept = [&](int32_t m) { return !windowed || kv_->restorable(m) == m; };
     int32_t best = 0;
     for (const int32_t p : checkpoint_pos_) {  // a checkpoint at position p restores n = p + 1
-        if (p >= 0 && p + 1 <= n) best = std::max(best, p + 1);
+        if (p >= 0 && p + 1 <= n && p + 1 > best && kept(p + 1)) best = p + 1;
     }
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos <= n) best = std::max(best, snap.pos);
+        if (snap.pos <= n && snap.pos > best && kept(snap.pos)) best = snap.pos;
     }
     return best;
 }
@@ -1179,10 +1362,14 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 // A windowed block (`window` > 0) sees, of what the cache keeps visible, only
 // the positions [pos - window + 1, pos]: the sinks drop out once the window
 // has passed them. Its spans follow its own visible count, so they too depend
-// only on the position. The KV pages still hold every block's rows, so a
-// windowed block saves compute, not memory.
+// only on the position. Its rows live in the cache's windowed group, which
+// keeps only those positions (KvCache's per-block layout), so a windowed block
+// saves memory as well as compute (with TransformerOptions::keep_windowed_rows,
+// compute only).
 void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
+    // The block's rows, their group and offsets resolved once for the pass.
+    const KvCache::RowView rows = kv_->row_view(kv_slot);
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
     // Values may be narrower than keys (latent attention: the latent part of
@@ -1260,13 +1447,13 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             for (size_t j = 0; j < ugroup; ++j) queries[j] = q8_queries_.data() + (first_row + j) * q8_per_head;
             for (size_t i = 0; i < len; ++i) {
                 const auto* k = reinterpret_cast<const quant::BlockQ8_0*>(
-                    kv_->k_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g));
+                    rows.k(position(i0 + static_cast<int32_t>(i)), g));
                 quant::dot_q8_0_q8_0_rows(k, queries.data(), group, hd, dots.data());
                 for (size_t j = 0; j < ugroup; ++j) scores[j * len + i] = dots[j] * scale;
             }
         } else {
             for (size_t i = 0; i < len; ++i) {
-                const uint8_t* k = kv_->k_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+                const uint8_t* k = rows.k(position(i0 + static_cast<int32_t>(i)), g);
                 for (int32_t j = 0; j < group; ++j) {
                     const size_t row = first_row + static_cast<size_t>(j);
                     scores[static_cast<size_t>(j) * len + i] =
@@ -1299,7 +1486,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         // the group (decoding it per head cost 8x the work).
         vrow.resize(uvd);
         for (size_t i = 0; i < len; ++i) {
-            const uint8_t* v = kv_->v_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+            const uint8_t* v = rows.v(position(i0 + static_cast<int32_t>(i)), g);
             if (kv_type == DType::F32) {
                 std::copy_n(reinterpret_cast<const float*>(v), uvd, vrow.data());
             } else {
@@ -3026,6 +3213,12 @@ Status Transformer::reuse_support() const {
     if (kv_->window() > 0) {
         return Status(ErrorCode::Unsupported, "a sliding-window cache releases the positions it no longer shows");
     }
+    if (kv_->has_windowed_layers()) {
+        return Status(ErrorCode::Unsupported,
+                      "windowed attention blocks keep only their window's rows, so a segment's rows of those blocks "
+                      "are gone once the context moves past them (and recomputing them alone would need every "
+                      "block before them over the whole segment)");
+    }
     if (c.spec->qk_norm == QkNormOrder::AfterRope) {
         for (const Layer& L : layers_) {
             for (size_t i = 0; i < L.k_norm.size() && i < static_cast<size_t>(c.rope_dim); ++i) {
@@ -3042,6 +3235,9 @@ Status Transformer::reuse_support() const {
 Status Transformer::swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past) {
     if (config_.hybrid() || !states_.empty()) {
         return Status(ErrorCode::Unsupported, "swap_context: recurrent states are part of the context");
+    }
+    if (kv_->has_windowed_layers()) {
+        return Status(ErrorCode::Unsupported, "swap_context: the windowed blocks' snapshots are part of the context");
     }
     if (!kv) return Status(ErrorCode::InvalidArgument, "swap_context: no cache");
     const KvCacheConfig& a = kv_->config();
@@ -3282,7 +3478,7 @@ Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshot
     };
     const size_t floats = recurrent_state_bytes() / sizeof(float);
     if (n < 0 || n > context_length_ || kv_->window() > 0) return fail("the context does not fit this cache");
-    if (static_cast<int32_t>(snapshots.size()) >= kStateSnapshots || (states_.empty() && !snapshots.empty())) {
+    if (static_cast<int32_t>(snapshots.size()) >= kStateSnapshots || (!has_position_state() && !snapshots.empty())) {
         return fail("the context's recurrent states do not fit this model");
     }
     int32_t below = 0;
@@ -3293,7 +3489,16 @@ Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshot
         below = snap.pos;
     }
     for (int32_t p = 0; p * kv_->config().page_tokens < n; ++p) {
-        if (kv_->page_data(p) == nullptr) return fail("the context's cache pages are not mapped");
+        if (!kv_->page_mapped(p)) return fail("the context's cache pages are not mapped");
+    }
+    // Windowed blocks: the caller wrote the rows of the window before n and
+    // before each snapshot (KvCache::write_window_rows()); a context missing
+    // them would attend over zeros.
+    if (kv_->has_windowed_layers()) {
+        if (n > 0 && kv_->restorable(n) != n) return fail("the context's window rows are not in the cache");
+        for (const OwnedSnapshot& snap : snapshots) {
+            if (kv_->restorable(snap.pos) != snap.pos) return fail("a snapshot's window rows are not in the cache");
+        }
     }
     if (n == 0) {
         reset();
@@ -3309,7 +3514,7 @@ Status Transformer::adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshot
         snapshots_.push_back(StateSnapshot{snap.pos, std::move(snap.data), snap.pinned});
     }
     n_past_ = n;
-    snapshot_state(pin_end);  // in a kept buffer when one is left
+    snapshot_state(pin_end);  // in a kept buffer when one is left; pins the snapshots' windows
     spare_buffers_.clear();   // the others: never more memory than before the restore
     return Status::ok();
 }
@@ -3366,10 +3571,17 @@ Status Transformer::truncate(int32_t n) {
             if (p >= n) p = -1;
         }
         std::erase_if(snapshots_, [n](const StateSnapshot& s) { return s.pos > n; });
+        pin_snapshots();
         n_past_ = n;
         return Status::ok();
     }
+    // Windowed blocks: refused when their rows of the window before n were
+    // released (KvCache::truncate()); their snapshots past n go.
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
+    if (!snapshots_.empty() && snapshots_.back().pos > n) {
+        std::erase_if(snapshots_, [n](const StateSnapshot& s) { return s.pos > n; });
+        pin_snapshots();
+    }
     n_past_ = n;
     return Status::ok();
 }

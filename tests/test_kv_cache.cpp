@@ -562,6 +562,62 @@ TEST_CASE("The KV store restores a hybrid model up to the deepest state its prom
     CHECK(store->plan(prompt, prompt.size()).positions == 20);
 }
 
+TEST_CASE("The KV store restores windowed blocks where a prompt's own prefix leads to the whole window's pages") {
+    std::mt19937 rng(17);
+    KvStore::Config config = store_config(size_t{1} << 20, {}, 0, /*hybrid=*/true);
+    config.window = 20;      // a window of 20 positions
+    config.page_tokens = 8;  // over pages of 8 (two per chunk)
+    auto store = KvStore::open(config);
+    REQUIRE(store != nullptr);
+    const std::vector<int32_t> x = random_tokens(rng, 100);
+    // The window pages a cache still held: the live window (pages 9-12, the
+    // end marked as a restore point) and a snapshot's at 37 (pages 2-4, each
+    // at its end, and at the snapshot).
+    KvStore::PutResult r = put(*store, x,
+                               {{24, false}, {32, false}, {37, true}, {40, false}, {80, false}, {88, false}, {96, false},
+                                {100, true}});
+    CHECK(r.whole);
+    KvStore::Plan p = store->plan(x, 100);
+    CHECK(p.positions == 100);
+    REQUIRE(p.snapshots.size() == 1);  // the snapshot, with its window
+    CHECK(p.snapshots[0].pos == 37);
+    CHECK(p.snapshots[0].pinned);
+    CHECK(!p.state_pinned);
+    std::vector<int32_t> pages;
+    for (const KvStore::RecordState& rs : p.window_pages) pages.push_back(rs.pos);
+    // 81..99 and 18..36, page by page, each page whole (37's last page by its end).
+    CHECK(pages == std::vector<int32_t>({24, 32, 40, 88, 96, 100}));
+    CHECK(rows_match(*store, p, x));
+    std::vector<float> image(kStateFloats);
+    REQUIRE(read_state(*store, p.window_pages[1].key, image).is_ok());
+    CHECK(image == state_image(x, 32));
+    // A prompt leaving x at 60: back to 40, the deepest position whose whole
+    // window is stored (the end of the snapshot's last page), the snapshot
+    // below it.
+    std::vector<int32_t> prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 60), {7, 7, 7});
+    p = store->plan(prompt, prompt.size());
+    CHECK(p.positions == 40);
+    REQUIRE(p.snapshots.size() == 1);
+    CHECK(p.snapshots[0].pos == 37);
+    // Leaving it at 39: the snapshot itself.
+    prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 39), {7, 7, 7});
+    p = store->plan(prompt, prompt.size());
+    CHECK(p.positions == 37);
+    CHECK(p.snapshots.empty());
+    CHECK(p.state_pinned);
+    // Leaving it at 30: page 24's window would need the pages ending at 8
+    // and 16, which no context kept: nothing to restore.
+    prompt = join(std::vector<int32_t>(x.begin(), x.begin() + 30), {7, 7, 7});
+    CHECK(store->plan(prompt, prompt.size()).positions == 0);
+    // A context of window pages that lost one (evicted, or never kept):
+    // restored only above the hole.
+    const std::vector<int32_t> y = random_tokens(rng, 60);
+    put(*store, y, {{8, false}, {16, false}, {24, false}, {40, false}, {48, false}, {56, false}, {60, true}});
+    CHECK(store->plan(y, 60).positions == 60);  // the window of 60: pages 5-7 (41..59)
+    prompt = join(std::vector<int32_t>(y.begin(), y.begin() + 30), {7, 7});
+    CHECK(store->plan(prompt, prompt.size()).positions == 24);  // 32 is missing: 24, whose window is 5..23
+}
+
 TEST_CASE("The KV store stays within its caps, least recently used out first, a chunk never before what continues it") {
     std::mt19937 rng(3);
     const std::vector<int32_t> system = random_tokens(rng, 2 * kChunk);
@@ -1210,5 +1266,333 @@ TEST_CASE("The KV store codes chunks only where it pays, measures that once, and
         }
         std::filesystem::remove_all(dir);
         std::filesystem::remove_all(calibration);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-block layout: windowed layers keep only their window.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Six layers: 1, 2, 4 and 5 see the last 40 positions, 0 and 3 every one.
+KvCacheConfig per_block_config(KvCacheType type = KvCacheType::Q8_0) {
+    KvCacheConfig c = small_config(type);
+    c.n_layers = 6;
+    c.layer_windows = {0, 40, 40, 0, 40, 40};
+    return c;
+}
+
+// Every layer's rows of positions [from, to), each a function of (layer, position).
+void store_rows(KvCache& kv, int32_t from, int32_t to) {
+    const KvCacheConfig& c = kv.config();
+    const auto width = static_cast<size_t>(c.head_dim) * static_cast<size_t>(c.n_head_kv);
+    for (int32_t pos = from; pos < to; ++pos) {
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const std::vector<float> k = row_for(pos * 7 + l * 131, width);
+            const std::vector<float> v = row_for(pos * 5 + l * 17 + 1000, width);
+            kv.store(l, pos, k.data(), v.data());
+        }
+    }
+}
+
+bool same_row(const KvCache& a, const KvCache& b, int32_t layer, int32_t pos) {
+    const size_t row = a.head_row_bytes();
+    for (int32_t h = 0; h < a.config().n_head_kv; ++h) {
+        if (std::memcmp(a.k_row(layer, pos, h), b.k_row(layer, pos, h), row) != 0) return false;
+        if (!a.config().values_in_keys && std::memcmp(a.v_row(layer, pos, h), b.v_row(layer, pos, h), row) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("Per-block KV: one group keeps the single-table layout, bytes and memory") {
+    KvCacheConfig single = small_config(KvCacheType::Q8_0);
+    KvCacheConfig zeros = single;
+    zeros.layer_windows.assign(static_cast<size_t>(single.n_layers), 0);
+    auto a = KvCache::create(single);
+    auto b = KvCache::create(zeros);
+    REQUIRE(a.has_value() && b.has_value());
+    CHECK(!b.value()->has_windowed_layers());
+    CHECK(b.value()->layout_fingerprint() == 0);
+    CHECK(b.value()->unit_bytes() == a.value()->page_bytes());
+    CHECK(b.value()->page_bytes() == a.value()->page_bytes());
+    CHECK(b.value()->legacy_page_bytes() == a.value()->page_bytes());
+    CHECK(b.value()->window_page_bytes() == 0 && b.value()->window_pages_of(40, {}).empty());
+    REQUIRE(a.value()->reserve(40).is_ok());
+    REQUIRE(b.value()->reserve(40).is_ok());
+    store_rows(*a.value(), 0, 40);
+    store_rows(*b.value(), 0, 40);
+    for (int32_t p = 0; p < 3; ++p) {
+        REQUIRE(b.value()->page_data(p) != nullptr);
+        CHECK(std::memcmp(a.value()->page_data(p), b.value()->page_data(p), a.value()->page_bytes()) == 0);
+    }
+    CHECK(a.value()->bytes_in_use() == b.value()->bytes_in_use());
+    CHECK(KvCache::kept_bytes(zeros, 1000, 64) == KvCache::kept_bytes(single, 1000, 64));
+    CHECK(KvCache::kept_bytes(single, 1000, 64) == 63 * a.value()->page_bytes());  // ceil(1000 / 16) pages
+}
+
+TEST_CASE("Per-block KV: windowed layers keep their window, the others every position, from one pool") {
+    const KvCacheConfig c = per_block_config();
+    auto made = KvCache::create(c);
+    REQUIRE(made.has_value());
+    KvCache& kv = *made.value();
+    CHECK(kv.has_windowed_layers());
+    CHECK(kv.layout_fingerprint() != 0);
+    CHECK(kv.window_of_windowed() == 40);
+    CHECK(kv.keeps_every_position(0) && kv.keeps_every_position(3) && !kv.keeps_every_position(1));
+    // Two groups (2 and 4 layers): pool pages of 2 layers each.
+    CHECK(kv.unit_bytes() * 3 == kv.legacy_page_bytes());
+    CHECK(kv.page_bytes() == kv.unit_bytes());  // the two layers keeping every position
+    CHECK(kv_row_layout(c).image_bytes(c.page_tokens) == kv.page_bytes());  // what the store's codec reads
+    CHECK(kv.window_page_bytes() == 2 * kv.unit_bytes());
+    CHECK(kv.window_page_bytes() == 2u * 4u * 16u * 2u * kv.head_row_bytes());  // K+V, 4 layers, 16 slots, 2 heads
+    int32_t peak = 0;
+    const int32_t keep_back = 4;
+    for (int32_t pos = 0; pos < 1000; ++pos) {
+        REQUIRE(kv.reserve(pos + 1).is_ok());
+        store_rows(kv, pos, pos + 1);
+        kv.release_unreachable(pos + 1, keep_back);
+        peak = std::max(peak, kv.pages_in_use());
+    }
+    // Every page of the 2 layers keeping every position (63 pool pages), and
+    // the window plus the rollback margin of the 4 windowed ones: at most
+    // 4 logical pages of 2 pool pages each.
+    CHECK(peak <= 63 + 8);
+    CHECK(kv.pages_allocated() == peak);  // freed pages were reused by both groups
+    KvCacheConfig flat = c;
+    flat.layer_windows.clear();
+    CHECK(kv.bytes_in_use() <= KvCache::kept_bytes(c, 1000, keep_back));
+    CHECK(KvCache::kept_bytes(c, 1000, keep_back) * 2 < KvCache::kept_bytes(flat, 1000, keep_back));
+    std::printf("  1000 positions, 4 of 6 layers windowed (40): %d pool pages (%zu KiB) instead of %d (%zu KiB)\n", peak,
+                kv.bytes_allocated() / 1024, 63 * 3, 63 * 3 * kv.unit_bytes() / 1024);
+    // Rows kept where queries may still look, with their bits.
+    auto all = KvCache::create(flat);
+    REQUIRE(all.has_value());
+    REQUIRE(all.value()->reserve(1000).is_ok());
+    store_rows(*all.value(), 0, 1000);
+    bool same = true;
+    for (int32_t pos = 0; pos < 1000; ++pos) {
+        same = same && same_row(kv, *all.value(), 0, pos) && same_row(kv, *all.value(), 3, pos);
+    }
+    for (int32_t pos = 1000 - 40 - keep_back; pos < 1000; ++pos) {
+        for (const int32_t l : {1, 2, 4, 5}) same = same && same_row(kv, *all.value(), l, pos);
+    }
+    CHECK(same);
+    // Rollback within the margin; beyond it the window's rows are gone.
+    // Kept: the pages from the one holding 957 (the window of 996, the
+    // oldest query after a rollback of 4), i.e. positions from 944 on.
+    CHECK(kv.restorable(1000) == 1000);
+    CHECK(kv.restorable(990) == 990);
+    CHECK(kv.restorable(983) == 983);  // its window starts at 944
+    CHECK(kv.restorable(982) == 0);
+    CHECK(kv.restorable(900) == 0);
+    CHECK(kv.truncate(997).is_ok());
+    CHECK(!kv.truncate(900).is_ok());
+}
+
+TEST_CASE("Per-block KV: a pinned position keeps its window, so the context returns to it") {
+    const KvCacheConfig c = per_block_config();
+    auto made = KvCache::create(c);
+    auto flat_made = [&] {
+        KvCacheConfig flat = c;
+        flat.layer_windows.clear();
+        return KvCache::create(flat);
+    }();
+    REQUIRE(made.has_value() && flat_made.has_value());
+    KvCache& kv = *made.value();
+    KvCache& all = *flat_made.value();
+    REQUIRE(all.reserve(600).is_ok());
+    store_rows(all, 0, 600);
+    for (int32_t pos = 0; pos < 600; ++pos) {
+        REQUIRE(kv.reserve(pos + 1).is_ok());
+        store_rows(kv, pos, pos + 1);
+        if (pos + 1 == 200) {
+            const int32_t at[] = {200};
+            kv.pin(at);
+        }
+        kv.release_unreachable(pos + 1, 4);
+    }
+    // The pin keeps whole pages: those of [161, 200), i.e. positions 160-207.
+    CHECK(kv.restorable(250) == 208);
+    CHECK(kv.restorable(199) == 199);
+    CHECK(kv.restorable(198) == 0);
+    const int32_t pin_at[] = {200};
+    // Pages of 16: the window of 600 (561-599) and the pin's (161-199).
+    CHECK(kv.window_pages_of(600, pin_at) == std::vector<int32_t>({10, 11, 12, 35, 36, 37}));
+    std::vector<uint8_t> page(kv.window_page_bytes());
+    CHECK(kv.read_window_rows(12, 16, page.data()).is_ok());  // positions 192-207 of the pinned page 12
+    CHECK(!kv.read_window_rows(13, 16, page.data()).is_ok());  // released
+    // Unpinned, the pages it held go once no query sees them.
+    const int32_t before = kv.pages_in_use();
+    kv.pin({});
+    CHECK(kv.pages_in_use() < before);
+    CHECK(kv.restorable(250) == 0);
+    // Pinned again (from a fresh run), then back to it: the rows after it are
+    // written again as the window moves on, the same bits as a cache keeping
+    // every position.
+    kv.clear();
+    for (int32_t pos = 0; pos < 600; ++pos) {
+        REQUIRE(kv.reserve(pos + 1).is_ok());
+        store_rows(kv, pos, pos + 1);
+        if (pos + 1 == 200) {
+            const int32_t at[] = {200};
+            kv.pin(at);
+        }
+        kv.release_unreachable(pos + 1, 4);
+    }
+    REQUIRE(kv.truncate(200).is_ok());
+    CHECK(kv.pins().size() == 1);
+    for (int32_t pos = 200; pos < 300; ++pos) {
+        REQUIRE(kv.reserve(pos + 1).is_ok());
+        store_rows(kv, pos, pos + 1);
+        kv.release_unreachable(pos + 1, 4);
+    }
+    bool same = true;
+    for (int32_t pos = 300 - 44; pos < 300; ++pos) {
+        for (int32_t l = 0; l < c.n_layers; ++l) same = same && same_row(kv, all, l, pos);
+    }
+    CHECK(same);
+    REQUIRE(kv.truncate(0).is_ok());
+    CHECK(kv.pins().empty());
+}
+
+TEST_CASE("Per-block KV: rows images, window pages and older pages, bit for bit") {
+    for (const bool values_in_keys : {false, true}) {
+        KvCacheConfig c = per_block_config();
+        if (values_in_keys) {
+            c.values_in_keys = true;
+            c.value_offset = 32;
+        }
+        KvCacheConfig flat = c;
+        flat.layer_windows.clear();
+        auto src_made = KvCache::create(flat);  // keeps every position: the truth
+        auto dst_made = KvCache::create(c);
+        REQUIRE(src_made.has_value() && dst_made.has_value());
+        KvCache& src = *src_made.value();
+        KvCache& dst = *dst_made.value();
+        const int32_t n = 150;  // 9 pages and a partial one
+        REQUIRE(src.reserve(n).is_ok());
+        store_rows(src, 0, n);
+        // Older saved contexts: the single-table pages convert, the windowed
+        // layers keeping the window before n.
+        REQUIRE(dst.reserve_context(n, {}).is_ok());
+        for (int32_t p = 0; p * c.page_tokens < n; ++p) REQUIRE(dst.write_legacy_page(p, src.page_data(p)).is_ok());
+        bool same = true;
+        for (int32_t pos = 0; pos < n; ++pos) same = same && same_row(src, dst, 0, pos) && same_row(src, dst, 3, pos);
+        for (int32_t pos = n - 39; pos < n; ++pos) {
+            for (const int32_t l : {1, 2, 4, 5}) same = same && same_row(src, dst, l, pos);
+        }
+        CHECK(same);
+        CHECK(dst.restorable(n) == n);
+        CHECK(dst.restorable(100) == 0);  // the window before 100 starts in a page never mapped
+        // Rows images: only the layers keeping every position, laid out
+        // [plane][layer][slot][head][row] whatever the pool pages.
+        CHECK(dst.page_bytes() * 3 == src.page_bytes());
+        std::vector<uint8_t> image(dst.rows_bytes(70));
+        REQUIRE(dst.read_rows_at(9, 61, image.data(), 70, 3).is_ok());
+        for (int32_t i = 0; i < 61; ++i) {
+            for (const int32_t l : {0, 3}) {
+                for (int32_t h = 0; h < c.n_head_kv; ++h) {
+                    same = same && std::memcmp(image.data() + dst.image_key_offset(70, l, 3 + i, h), src.k_row(l, 9 + i, h),
+                                               dst.head_row_bytes()) == 0;
+                }
+            }
+        }
+        CHECK(same);
+        // Window pages, as saved contexts and the KV store keep them: a page's
+        // image holds zeros past the position it ends at; the pages a context
+        // returning to n keeps, written whole into another cache, give the
+        // rows of every position in them.
+        const std::vector<int32_t> kept = dst.window_pages_of(n, {});
+        CHECK(kept == std::vector<int32_t>({6, 7, 8, 9}));  // 111..149 over pages of 16
+        std::vector<std::vector<uint8_t>> pages;
+        for (int32_t q = 0; q * c.page_tokens < n; ++q) {
+            pages.emplace_back(dst.window_page_bytes(), 0xEE);
+            const int32_t rows = std::min(c.page_tokens, n - q * c.page_tokens);
+            if (dst.window_page_mapped(q)) {
+                REQUIRE(dst.read_window_rows(q, rows, pages.back().data()).is_ok());
+                if (rows < c.page_tokens) CHECK(pages.back().back() == 0);
+            } else {
+                CHECK(!dst.read_window_rows(q, rows, pages.back().data()).is_ok());
+            }
+        }
+        auto restored = KvCache::create(c);
+        REQUIRE(restored.has_value());
+        REQUIRE(restored.value()->reserve_context(n, {}).is_ok());
+        for (const int32_t q : kept) {
+            REQUIRE(restored.value()->window_page_mapped(q));
+            REQUIRE(restored.value()->write_window_rows(q, pages[static_cast<size_t>(q)].data(), 0,
+                                                        std::min(c.page_tokens, n - q * c.page_tokens)).is_ok());
+        }
+        CHECK(!restored.value()->window_page_mapped(5));
+        for (int32_t pos = kept.front() * c.page_tokens; pos < n; ++pos) {
+            for (const int32_t l : {1, 2, 4, 5}) same = same && same_row(src, *restored.value(), l, pos);
+        }
+        CHECK(same);
+        // Pinned positions keep their windows too.
+        const int32_t pins[] = {40};
+        CHECK(dst.window_pages_of(n, pins) == std::vector<int32_t>({0, 1, 2, 6, 7, 8, 9}));
+        CHECK(!dst.reserve_context(n, std::vector<int32_t>{n + 1}).is_ok());
+    }
+}
+
+TEST_CASE("Per-block KV: key scaling converts the rows each layer keeps") {
+    const KvCacheConfig c = per_block_config();
+    auto made = KvCache::create(c);
+    REQUIRE(made.has_value());
+    KvCache& kv = *made.value();
+    for (int32_t pos = 0; pos < 200; ++pos) {
+        REQUIRE(kv.reserve(pos + 1).is_ok());
+        store_rows(kv, pos, pos + 1);
+        kv.release_unreachable(pos + 1, 4);
+    }
+    std::vector<float> factors(static_cast<size_t>(c.n_layers) * c.n_head_kv * c.head_dim, 2.0f);
+    std::vector<float> before = read_k(kv, 1, 190, 1);
+    REQUIRE(kv.scale_keys(200, factors).is_ok());  // windowed rows that were released are skipped
+    std::vector<float> after = read_k(kv, 1, 190, 1);
+    for (size_t i = 0; i < before.size(); ++i) CHECK_NEAR(after[i], 2.0f * before[i], 0.05f);
+    CHECK(!kv.scale_keys(200, std::vector<float>(3, 1.0f)).is_ok());
+}
+
+TEST_CASE("Per-block KV: the windows' share is bounded in the memory a context is sized with") {
+    // A Gemma 3 4B-like layout: 34 blocks, one in six global, 4 KV heads of
+    // 256, a window of 1024; a Gemma 2 2B-like one: 26 blocks, every other one
+    // windowed (4096).
+    struct Layout {
+        const char* name;
+        int32_t layers, period, window;
+    };
+    for (const Layout& l : {Layout{"gemma3-4b", 34, 6, 1024}, Layout{"gemma2-2b", 26, 2, 4096}}) {
+        KvCacheConfig c;
+        c.n_layers = l.layers;
+        c.n_head_kv = 4;
+        c.head_dim = 256;
+        c.type = KvCacheType::Q8_0;
+        c.max_positions = 32768;
+        c.page_tokens = 64;
+        for (int32_t i = 0; i < l.layers; ++i) c.layer_windows.push_back((i + 1) % l.period == 0 ? 0 : l.window);
+        KvCacheConfig flat = c;
+        flat.layer_windows.clear();
+        const size_t budget = size_t{256} << 20;
+        auto longest = [&](const KvCacheConfig& cfg) {
+            int32_t lo = 0, hi = 1 << 20;
+            while (lo < hi) {
+                const int32_t mid = lo + (hi - lo + 1) / 2;
+                if (KvCache::kept_bytes(cfg, mid, 64) <= budget) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return lo;
+        };
+        const int32_t before = longest(flat), after = longest(c);
+        CHECK(after > before);
+        std::printf("  %s: %.1f KiB/token kept for every position (was %.1f); %d -> %d positions in 256 MiB\n", l.name,
+                    static_cast<double>(KvCache::create(c).value()->rows_bytes(1)) / 1024.0,
+                    static_cast<double>(KvCache::bytes_per_token(flat)) / 1024.0, before, after);
     }
 }

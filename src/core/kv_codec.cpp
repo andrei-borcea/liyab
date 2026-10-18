@@ -752,7 +752,11 @@ KvRowLayout kv_row_layout(const KvCacheConfig& config) noexcept {
     KvRowLayout l;
     l.type = config.type;
     l.planes = config.values_in_keys ? 1 : 2;
-    l.layers = config.n_layers;
+    // The layers keeping every position: windowed ones are not in rows images
+    // (KvCache's per-block layout).
+    l.layers = config.layer_windows.empty()
+                   ? config.n_layers
+                   : static_cast<int32_t>(std::count(config.layer_windows.begin(), config.layer_windows.end(), 0));
     l.heads = config.n_head_kv;
     l.head_dim = config.head_dim;
     return l;

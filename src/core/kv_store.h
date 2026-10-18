@@ -32,6 +32,18 @@
 // that state come back as the model's snapshots, so a restored context
 // rewinds where the live one would have.
 //
+// Windowed attention blocks (Gemma 2 / 3, Phi-3: Config::window). Their
+// per-block cache keeps only their last window's rows, so chunks hold the
+// rows of the blocks keeping every position (KvCache's rows images), and the
+// windowed rows go page by page, as state images keyed like the others: the
+// windowed rows of one page depend on the tokens up to its end only, so a
+// window page is keyed by the prefix ending at its page's end (or at the
+// context's end, or a snapshot, inside a page) and shared by every context
+// with that prefix, as chunks are. A context set aside keeps the window pages
+// its cache still holds (the window before its end and before its snapshots);
+// a prompt is restored to the deepest position whose own window page is
+// stored with those of every page of the window before it.
+//
 // Stored contexts (records). Each context set aside also keeps a record: its
 // tokens, the text they encode (the engine matches a prompt's text against
 // it, since a reply's tokens need not be its text's encoding) and the states
@@ -192,8 +204,24 @@ public:
     struct Config {
         KvKey seed;                 // see kv_seed_key(); chunks of other seeds are never returned
         int32_t chunk_tokens = 64;  // positions per chunk: whole KV pages
-        size_t chunk_bytes = 0;     // bytes of a whole chunk's rows (KvCache::rows_bytes(chunk_tokens))
-        size_t state_floats = 0;    // values of one recurrent-state image; 0: attention-only model
+        // Bytes of a whole chunk's rows (KvCache::rows_bytes(chunk_tokens));
+        // 0 (chunks of tokens only) needs state images: a model whose every
+        // attention block is windowed.
+        size_t chunk_bytes = 0;
+        // Values of one state image: a recurrent-state image (hybrid models),
+        // or with `window` a window page; 0: attention only, every position a
+        // restore point.
+        size_t state_floats = 0;
+        // > 0: the window of the model's windowed attention blocks, whose
+        // rows chunks do not hold (KvCache's rows images). State images are
+        // then window pages (KvCache::read_window_rows(): the windowed rows of
+        // one page, page_tokens slots, zeros past the image's position), one
+        // per page a context set aside still kept, at the page's end or the
+        // context's end (and at its snapshots inside a page), and a prompt is
+        // restored only where its own prefix leads to the window pages of the
+        // whole window before it (see the header comment). Not with recurrent
+        // states.
+        int32_t window = 0;
         size_t ram_bytes = 0;       // RAM cap; 0: no RAM tier
         std::string dir;            // storage tier directory (created when missing); empty: none
         size_t disk_bytes = 0;      // storage cap; 0: no storage tier
@@ -290,6 +318,9 @@ public:
         KvKey state;                        // hybrid: the state image at `positions`
         bool state_pinned = false;          // its pinned flag (the snapshot taken there)
         std::vector<RecordState> snapshots;  // hybrid: images below `positions`, restored as snapshots
+        // Config::window: the window pages of the window before `positions`,
+        // ascending (each at its page's end, the last at `positions`).
+        std::vector<RecordState> window_pages;
         const Record* record = nullptr;     // a record whose tokens start with those positions (text_tokens > 0), or nullptr
     };
     // The longest restorable prefix of `tokens`, at most `limit` positions.

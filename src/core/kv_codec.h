@@ -103,7 +103,9 @@ struct KvRowLayout {
     [[nodiscard]] size_t image_bytes(int32_t slots) const noexcept;
 };
 
-// The layout of a cache's chunk images (KvCache::read_rows).
+// The layout of a cache's chunk images (KvCache::read_rows): the layers that
+// keep every position (KvCacheConfig::layer_windows 0); invalid when every
+// layer is windowed (chunks of tokens only, stored raw).
 KvRowLayout kv_row_layout(const KvCacheConfig& config) noexcept;
 
 // What reading and decoding cost on this device, for the lossless

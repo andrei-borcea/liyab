@@ -4848,4 +4848,332 @@ TEST_CASE("C API: create, generate, describe, errors") {
     liyab_engine_destroy(nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// Per-block KV: windowed attention blocks keep only their window.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Models with windowed blocks, a window of 16 so tiny contexts leave it.
+test::TinyModelSpec windowed_spec(const std::string& arch) {
+    test::TinyModelSpec s;
+    s.arch = arch;
+    s.sliding_window = 16;
+    if (arch == "gemma3") {  // one block in six global (block 5), its own RoPE table for the others
+        s.n_layers = 6;
+        s.qk_norm = true;
+        s.post_norms = true;
+        s.tied_output = true;
+    } else if (arch == "gemma2") {  // every other block windowed, soft caps
+        s.n_layers = 4;
+        s.post_norms = true;
+        s.attn_softcap = 50.0f;
+        s.final_softcap = 30.0f;
+    } else if (arch == "phi3") {  // every block windowed: chunks of tokens only
+        s.fused_qkv = true;
+        s.fused_gate_up = true;
+    }
+    return s;
+}
+
+const std::string& windowed_model(const std::string& arch) { return model_path("windowed_" + arch, windowed_spec(arch)); }
+
+struct WindowedPair {
+    std::unique_ptr<Transformer> per_block, every;  // the default layout, and windowed blocks keeping every position
+    std::unique_ptr<ThreadPool> pool;
+    std::unique_ptr<Backend> cpu;
+    Route route;
+};
+
+WindowedPair load_windowed(const std::string& arch, KvCacheType type = KvCacheType::Q8_0) {
+    WindowedPair p;
+    for (const bool keep : {false, true}) {
+        auto file = MmapLoader::open(windowed_model(arch));
+        if (!file) {
+            CHECK(file.has_value());
+            std::abort();  // the cases below cannot run without their models
+        }
+        TransformerOptions options;
+        options.context_length = 512;
+        options.max_batch = 8;
+        options.kv_type = type;
+        options.keep_windowed_rows = keep;
+        auto model = Transformer::load(std::move(file).value(), options);
+        if (!model) {
+            CHECK(model.has_value());
+            std::abort();
+        }
+        (keep ? p.every : p.per_block) = std::move(model).value();
+    }
+    p.pool = std::make_unique<ThreadPool>(3);
+    p.cpu = make_cpu_backend(*p.pool);
+    p.route = {p.cpu.get(), p.cpu.get(), p.cpu.get()};
+    return p;
+}
+
+// Token t of a deterministic stream.
+int32_t stream_token(int32_t t, int32_t vocab) { return 3 + (t * 37 + 11) % (vocab - 3); }
+
+// Feeds tokens [from, to) of the stream to both models in passes of `chunk`,
+// the last pass's logits compared bit for bit.
+bool feed_both(WindowedPair& p, int32_t from, int32_t to, int32_t chunk) {
+    const int32_t vocab = p.per_block->config().n_vocab;
+    bool same = true;
+    for (int32_t at = from; at < to; at += chunk) {
+        std::vector<int32_t> tokens;
+        for (int32_t t = at; t < std::min(to, at + chunk); ++t) tokens.push_back(stream_token(t, vocab));
+        auto a = p.per_block->forward(tokens, Transformer::Logits::Last, p.route, *p.pool);
+        if (!a) return false;
+        const std::vector<float> la(a->begin(), a->end());
+        auto b = p.every->forward(tokens, Transformer::Logits::Last, p.route, *p.pool);
+        if (!b) return false;
+        same = same && std::memcmp(la.data(), b->data(), la.size() * sizeof(float)) == 0;
+    }
+    return same;
+}
+
+}  // namespace
+
+TEST_CASE("Windowed blocks keep their window: the same logits as keeping every position, in less memory") {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
+        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16}) {
+            WindowedPair p = load_windowed(arch, type);
+            CHECK(p.per_block->kv_cache().has_windowed_layers());
+            CHECK(!p.every->kv_cache().has_windowed_layers());
+            CHECK(p.per_block->has_position_state());
+            // A long prompt in passes, then decoding steps: every logit the same.
+            CHECK(feed_both(p, 0, 300, 32));
+            CHECK(feed_both(p, 300, 340, 1));
+            const size_t kept = p.per_block->kv_cache().bytes_in_use(), all = p.every->kv_cache().bytes_in_use();
+            CHECK(kept < all);
+            std::printf("  %s %s: %zu KiB of KV at 340 positions instead of %zu KiB\n", arch.c_str(),
+                        type == KvCacheType::F16 ? "f16" : "q8_0", kept / 1024, all / 1024);
+            // A rollback inside the margin (speculative verification) is exact.
+            REQUIRE(p.per_block->truncate(337).is_ok());
+            REQUIRE(p.every->truncate(337).is_ok());
+            CHECK(feed_both(p, 337, 345, 4));
+            // Further back the windowed rows are gone: refused, and the
+            // context is left as it was.
+            CHECK(!p.per_block->truncate(200).is_ok());
+            CHECK(p.per_block->n_past() == 345);
+            CHECK(p.per_block->restorable_prefix(200) == 0);
+            // A snapshot's window stays: the context returns to it exactly.
+            p.per_block->snapshot_state(true);
+            p.every->snapshot_state(true);
+            CHECK(feed_both(p, 345, 420, 16));
+            CHECK(p.per_block->restorable_prefix(400) >= 345);
+            REQUIRE(p.per_block->truncate(345).is_ok());
+            REQUIRE(p.every->truncate(345).is_ok());
+            CHECK(feed_both(p, 345, 380, 8));
+        }
+    }
+}
+
+TEST_CASE("Windowed blocks: a saved context restores exactly, older files convert, other layouts are refused") {
+    for (const std::string arch : {"gemma3", "phi3"}) {
+        WindowedPair p = load_windowed(arch);
+        CHECK(feed_both(p, 0, 200, 32));
+        p.per_block->snapshot_state(true);
+        p.every->snapshot_state(true);
+        CHECK(feed_both(p, 200, 260, 16));
+        std::stringstream saved;
+        REQUIRE(p.per_block->write_state(saved).is_ok());
+        std::stringstream every;
+        REQUIRE(p.every->write_state(every).is_ok());
+        // A context's state is a fraction of the one keeping every position.
+        CHECK(saved.str().size() < every.str().size());
+
+        // Restored into another model of the same layout: it continues exactly,
+        // and returns to the saved snapshot (its window came with it).
+        WindowedPair q = load_windowed(arch);
+        REQUIRE(q.per_block->read_state(saved).is_ok());
+        CHECK(q.per_block->n_past() == 260);
+        q.every = std::move(p.every);
+        CHECK(feed_both(q, 260, 280, 4));
+        REQUIRE(q.per_block->truncate(200).is_ok());
+        REQUIRE(q.every->truncate(200).is_ok());
+        CHECK(feed_both(q, 200, 230, 8));
+
+        // Another layout (the same model keeping every position) is refused,
+        // and so is this layout's file there.
+        WindowedPair r = load_windowed(arch);
+        every.seekg(0);
+        CHECK(r.per_block->read_state(every).code() == ErrorCode::InvalidArgument);
+        CHECK(r.per_block->n_past() == 0);
+        saved.seekg(0);
+        CHECK(r.every->read_state(saved).code() == ErrorCode::InvalidArgument);
+
+        // A version 3 file (every block's rows of every position in one
+        // table's pages, no layout or window pages): the keeping model's v4
+        // file without those fields (its layout, 0, after the fingerprint, and
+        // its count of window pages, 0, at the end). It converts: the windowed
+        // blocks keep the window before its end.
+        const std::string v4 = every.str();
+        const size_t header = 4 + 4 + 9 * 8;  // magic, version, fingerprint
+        std::string v3 = v4.substr(0, header) + v4.substr(header + 8, v4.size() - header - 8 - 4);
+        const uint32_t three = 3;
+        std::memcpy(v3.data() + 4, &three, sizeof three);
+        std::stringstream old(v3);
+        REQUIRE(r.per_block->read_state(old).is_ok());
+        CHECK(r.per_block->n_past() == 260);
+        WindowedPair fresh = load_windowed(arch);
+        CHECK(feed_both(fresh, 0, 260, 64));
+        // The converted context continues as one never saved.
+        r.every = std::move(fresh.every);
+        CHECK(feed_both(r, 260, 290, 5));
+    }
+}
+
+TEST_CASE("A context saved without a window loads into a cache with the engine's own window") {
+    WindowedPair p = load_windowed("gemma3");
+    CHECK(feed_both(p, 0, 120, 32));
+    std::stringstream saved;
+    REQUIRE(p.every->write_state(saved).is_ok());
+    auto file = MmapLoader::open(windowed_model("gemma3"));
+    REQUIRE(file.has_value());
+    TransformerOptions options;
+    options.context_length = 512;
+    options.max_batch = 8;
+    options.keep_windowed_rows = true;
+    options.sliding_window = 64;  // the engine's window: every block keeps its last 64 and the sinks
+    auto sliding = Transformer::load(std::move(file).value(), options);
+    REQUIRE(sliding.has_value());
+    REQUIRE(sliding.value()->read_state(saved).is_ok());
+    CHECK(sliding.value()->n_past() == 120);
+    const std::vector<int32_t> next = {stream_token(120, sliding.value()->config().n_vocab)};
+    CHECK(sliding.value()->forward(next, Transformer::Logits::Last, p.route, *p.pool).has_value());
+}
+
+TEST_CASE("Windowed models: the prefix cache brings back a replaced conversation and a snapshot, exactly") {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
+        EngineConfig config = engine_config(windowed_model(arch));
+        config.backend = BackendKind::Cpu;
+        config.prefix_cache_mb = 64;
+        auto cached = Engine::create(config);
+        config.prefix_cache_mb = 0;
+        auto fresh = Engine::create(config);
+        REQUIRE(cached.has_value() && fresh.has_value());
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string a, b;
+        for (int i = 0; i < 200; ++i) {  // past kMinPrefixEntry (128) tokens, and far past the window
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        Engine& e = *cached.value();
+        const std::string reply_a = run(e, a);
+        run(e, b);  // another conversation: A's context goes to the prefix cache
+        const std::string next_a = a + reply_a + " hello";
+        GenerationStats st{};
+        const std::string out = run(e, next_a, &st);
+        const auto a_tokens = static_cast<int32_t>(e.tokenize(a, true)->size());
+        // Its window pages came back with it: nothing of A done again.
+        CHECK(st.cached_prefix_tokens == a_tokens + 5);
+        CHECK(out == run(*fresh.value(), next_a));
+        // An edited reply: back to A's prompt end, a snapshot whose window
+        // pages were kept (from the store when the context moved on).
+        run(e, b);
+        const std::string edited = a + " world world hello";
+        GenerationStats st2{};
+        const std::string after_edit = run(e, edited, &st2);
+        CHECK(st2.cached_prefix_tokens >= a_tokens - 1);
+        CHECK(after_edit == run(*fresh.value(), edited));
+        const Engine::PrefixCacheStats ps = e.prefix_cache_stats();
+        CHECK(ps.restores >= 2);
+    }
+}
+
+TEST_CASE("Windowed models: a context set aside is saved as kept, and a later engine restores it from storage") {
+    for (const std::string arch : {"gemma3", "phi3"}) {
+        EngineConfig config = engine_config(windowed_model(arch));
+        config.backend = BackendKind::Cpu;
+        auto fresh = Engine::create(config);
+        REQUIRE(fresh.has_value());
+        const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_windowed_" + arch;
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_dir = dir;
+        config.prefix_cache_disk_mb = 64;
+        auto run = [](Engine& e, const std::string& p, GenerationStats* out = nullptr) {
+            std::string text;
+            auto st = e.generate(p, greedy(6), [&](std::string_view piece, int32_t) {
+                text += piece;
+                return true;
+            });
+            if (st && out != nullptr) *out = *st;
+            return st ? text : std::string("<error>");
+        };
+        std::string a, b;
+        for (int i = 0; i < 200; ++i) {
+            a += i % 3 ? " hello" : " world";
+            b += i % 2 ? " world" : " hello world";
+        }
+        const std::string file = dir + "_set_aside.bin";
+        std::string next_a;
+        {
+            auto first = Engine::create(config);
+            REQUIRE(first.has_value());
+            Engine& e = *first.value();
+            next_a = a + run(e, a) + " hello";
+            run(e, b);  // A goes to the store (on storage)
+            // Saved as it is kept: its rows, and its window from the window pages.
+            REQUIRE(e.save_state(file, next_a).is_ok());
+            auto loader = Engine::create(engine_config(windowed_model(arch)));
+            REQUIRE(loader.has_value());
+            REQUIRE(loader.value()->load_state(file).has_value());
+            GenerationStats st{};
+            const std::string out = run(*loader.value(), next_a, &st);
+            CHECK(st.cached_prefix_tokens == static_cast<int32_t>(e.tokenize(a, true)->size()) + 5);
+            CHECK(out == run(*fresh.value(), next_a));
+        }  // destroyed: B goes to storage too
+        auto later = Engine::create(config);
+        REQUIRE(later.has_value());
+        GenerationStats st{};
+        const std::string out = run(*later.value(), next_a, &st);
+        CHECK(st.cached_prefix_tokens >= static_cast<int32_t>(later.value()->tokenize(a, true)->size()));
+        CHECK(out == run(*fresh.value(), next_a));
+        std::remove(file.c_str());
+        later.value().reset();
+        std::filesystem::remove_all(dir);
+    }
+}
+
+TEST_CASE("Windowed models reuse the live context up to a snapshot whose window is kept, exactly") {
+    EngineConfig config = engine_config(windowed_model("gemma3"));
+    config.backend = BackendKind::Cpu;
+    auto reused = Engine::create(config);
+    auto fresh = Engine::create(config);
+    REQUIRE(reused.has_value() && fresh.has_value());
+    auto run = [](Engine& e, const std::string& prompt, GenerationStats* out = nullptr) {
+        std::string text;
+        auto st = e.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        if (st && out != nullptr) *out = *st;
+        return st ? text : std::string("<error>");
+    };
+    std::string system = "system:";
+    for (int i = 0; i < 120; ++i) system += i % 3 ? " hello" : " world";
+    Engine& e = *reused.value();
+    REQUIRE(e.prefill(system, true).is_ok());
+    const auto system_tokens = static_cast<int32_t>(e.tokenize(system, true)->size());
+    std::string turn1 = system;
+    for (int i = 0; i < 100; ++i) turn1 += i % 2 ? " world" : " hello";
+    const std::string reply = run(e, turn1);
+    // A dropped turn: back to the system prompt's snapshot (its window pinned
+    // while the context went on past it), never to an empty context.
+    const std::string dropped = system + " hello";
+    GenerationStats st{};
+    const std::string after_drop = run(e, dropped, &st);
+    CHECK(st.cached_prefix_tokens == system_tokens);
+    CHECK(after_drop == run(*fresh.value(), dropped));
+    CHECK(e.describe().find("KV blocks:") != std::string::npos);
+}
+
 TEST_MAIN()
