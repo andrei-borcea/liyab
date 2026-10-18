@@ -49,7 +49,9 @@ struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
     std::string draft_model_path;     // optional: enables speculative decoding
     int32_t n_threads = 0;            // 0: performance cores, minus one when there is no efficiency cluster
-    int32_t context_length = 0;       // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the training context
+    // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the
+    // training context; windowed attention blocks count for their window only.
+    int32_t context_length = 0;
     int32_t sliding_window = 0;       // 0: full attention; else attend to the last N tokens
     int32_t kv_sink_tokens = 8;       // with a sliding window: first N tokens stay visible (attention sinks)
     // Paged KV cache format. Q8_0 (the default) halves F16's memory. For
@@ -236,7 +238,10 @@ struct EngineConfig {
     // prefix_cache_disk_mb), whose caps the stored segments share; refused,
     // with the reason in Engine::segment_reuse(), for hybrid models, with a
     // sliding window or a draft model, or when no share on the calibration's
-    // grid meets the target.
+    // grid meets the target. A segment is reused with every block's rows, so
+    // on models with windowed attention blocks (Gemma 2 / 3, Phi-3) it makes
+    // those blocks keep every position, as the others, instead of only their
+    // window: full attention's KV memory, a shorter automatic context.
     bool segment_reuse = false;
     // The target: the mean KL divergence of the next-token distributions,
     // KL(whole prompt processed || segments reused), over the answers to
@@ -520,7 +525,10 @@ public:
     void reset_context();
     // Saves the context (e.g. a prefilled system prompt) to `path`: KV pages,
     // recurrent states (with the oldest and the pinned state snapshots on
-    // hybrid models), and the tokens and text they encode. Written to a
+    // hybrid models), the rows windowed attention blocks keep (the window
+    // before the end and before those snapshots), and the tokens and text
+    // they encode. Files written before the per-block KV layout load
+    // converted. Written to a
     // temporary file then renamed, so `path` is either the old file or the new
     // one. Unsupported with a draft model or a sliding window. Busy while a
     // generation runs.

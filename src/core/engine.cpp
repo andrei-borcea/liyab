@@ -257,6 +257,10 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     if (!file) return file.status();
     TransformerOptions options;
     options.context_length = config.context_length;
+    // Segment reuse needs every block's rows of a segment: with it on,
+    // windowed attention blocks keep every position (their per-block layout
+    // keeps only their window otherwise).
+    options.keep_windowed_rows = config.segment_reuse;
     options.sliding_window = config.sliding_window;
     options.sink_tokens = config.kv_sink_tokens;
     // A pooling model holds one input at a time: its own KV format (EngineConfig::pooling_kv_cache_type).
@@ -685,13 +689,24 @@ struct Engine::Impl {
         // chunk is each conversation's own).
         constexpr size_t kChunkBytes = size_t{2} << 20;
         constexpr int32_t kMaxChunkPages = 4;
-        const auto chunk_pages =
-            static_cast<int32_t>(std::clamp<size_t>(kChunkBytes / kv.page_bytes(), 1, kMaxChunkPages));
+        // Windowed attention blocks keep only their window's rows: chunks
+        // hold the other blocks' rows, and the windowed rows go to the store
+        // page by page as window pages (KvStore::Config::window; a model whose
+        // every attention block is windowed has 0-byte chunks of tokens only).
+        const int32_t window = kv.window_of_windowed();
+        if (window < 0 || (window > 0 && (target->recurrent_state_bytes() > 0 || kv.window_page_bytes() % sizeof(float) != 0))) {
+            LIYAB_LOG_INFO("prefix cache: off with windowed attention blocks of several windows or next to recurrent "
+                           "blocks (their window pages are not kept apart)");
+            return;
+        }
+        const auto chunk_pages = static_cast<int32_t>(
+            std::clamp<size_t>(kChunkBytes / std::max<size_t>(kv.page_bytes(), 1), 1, kMaxChunkPages));
         KvStore::Config sc;
         sc.seed = store_seed(repacked, chunk_pages);
         sc.chunk_tokens = kv.config().page_tokens * chunk_pages;
         sc.chunk_bytes = kv.page_bytes() * static_cast<size_t>(chunk_pages);
-        sc.state_floats = target->recurrent_state_bytes() / sizeof(float);
+        sc.state_floats = (window > 0 ? kv.window_page_bytes() : target->recurrent_state_bytes()) / sizeof(float);
+        sc.window = window;
         sc.ram_bytes = ram;
         if (disk) {
             sc.dir = cfg.prefix_cache_dir;
@@ -774,8 +789,41 @@ struct Engine::Impl {
         };
         // (Segment reuse runs on attention-only models only: a hybrid
         // model's context is always exact, so its states are its end's.)
-        for (const Transformer::KeptState& k : target->kept_states()) source.states.push_back({k.pos, k.pinned});
-        source.state_parts = [this](int32_t pos) { return target->kept_state_parts(pos); };
+        std::deque<Transformer::StateBuffer> window_images;
+        if (kv.has_windowed_layers()) {
+            // Windowed blocks: every window page the cache still holds (the
+            // window before the end, the snapshots' windows), keyed at its
+            // page's end, or at the context's end or a snapshot inside a page
+            // (the slots after it zero). The restore points the model keeps
+            // (Transformer::kept_states(): the oldest and the pinned snapshot,
+            // the end) are marked pinned, so a restored context gets them
+            // back as its snapshots.
+            const auto n = static_cast<int32_t>(exact);
+            std::vector<KvStore::StateMark> at;
+            for (int32_t q = 0; q * page_tokens < n; ++q) {
+                if (kv.window_page_mapped(q)) at.push_back({std::min((q + 1) * page_tokens, n), false});
+            }
+            for (const Transformer::KeptState& k : target->kept_states()) {
+                if (k.pos > 0 && k.pos <= n && kv.window_page_mapped((k.pos - 1) / page_tokens)) at.push_back({k.pos, true});
+            }
+            std::sort(at.begin(), at.end(), [](const KvStore::StateMark& a, const KvStore::StateMark& b) {
+                return a.pos != b.pos ? a.pos < b.pos : a.pinned > b.pinned;  // a restore point first
+            });
+            at.erase(std::unique(at.begin(), at.end(),
+                                 [](const KvStore::StateMark& a, const KvStore::StateMark& b) { return a.pos == b.pos; }),
+                     at.end());
+            source.states = std::move(at);
+            source.state_parts = [&](int32_t pos) {
+                const int32_t q = (pos - 1) / page_tokens;
+                window_images.emplace_back(kv.window_page_bytes() / sizeof(float));
+                auto* bytes = reinterpret_cast<uint8_t*>(window_images.back().data());
+                if (!kv.read_window_rows(q, pos - q * page_tokens, bytes).is_ok()) return std::vector<std::span<const float>>();
+                return std::vector<std::span<const float>>{std::span<const float>(window_images.back())};
+            };
+        } else {
+            for (const Transformer::KeptState& k : target->kept_states()) source.states.push_back({k.pos, k.pinned});
+            source.state_parts = [this](int32_t pos) { return target->kept_state_parts(pos); };
+        }
         const KvStore::PutResult put = store->put(source, storage_only);
         const double ms = ms_since(watch);
         const double mib = 1.0 / (1024.0 * 1024.0);
@@ -804,7 +852,12 @@ struct Engine::Impl {
     Status restore_plan(const KvStore::Plan& plan, size_t rows_from) {
         KvCache& kv = target->mutable_kv_cache();
         const int32_t positions = plan.positions;
-        LIYAB_RETURN_IF_ERROR(kv.reserve(positions));
+        // Windowed attention blocks: only the pages of the window before the
+        // end (and before each snapshot), never the whole context's; their
+        // rows come from the plan's window pages.
+        std::vector<int32_t> pins;
+        for (const KvStore::RecordState& rs : plan.snapshots) pins.push_back(rs.pos);
+        LIYAB_RETURN_IF_ERROR(kv.reserve_context(positions, pins));
         const int32_t c = store->chunk_tokens();
         const int32_t page_tokens = kv.config().page_tokens;
         const int32_t chunk_pages = c / page_tokens;
@@ -850,6 +903,21 @@ struct Engine::Impl {
                 if (p.from < p.to) LIYAB_RETURN_IF_ERROR(kv.write_rows(p.page, scratch[p.slot].data(), p.rows, p.from, p.to));
             }
         }
+        // Windowed blocks: the window pages of the windows before the end and
+        // before each snapshot, each up to its own position (the snapshots
+        // are restore points of the windowed rows only: no recurrent states).
+        std::vector<Transformer::OwnedSnapshot> window_snapshots;
+        if (!plan.window_pages.empty()) {
+            for (const KvStore::RecordState& rs : plan.snapshots) window_snapshots.push_back({rs.pos, rs.pinned, {}});
+            Transformer::StateBuffer image(kv.window_page_bytes() / sizeof(float));
+            for (const KvStore::RecordState& rs : plan.window_pages) {
+                const std::span<float> into(image);
+                LIYAB_RETURN_IF_ERROR(store->read_state(rs.key, {&into, 1}));
+                const int32_t q = (rs.pos - 1) / page_tokens;
+                LIYAB_RETURN_IF_ERROR(
+                    kv.write_window_rows(q, reinterpret_cast<const uint8_t*>(image.data()), 0, rs.pos - q * page_tokens));
+            }
+        }
         // Recurrent states straight into the model and into the buffers of
         // the snapshots being replaced: no intermediate copy, no allocation
         // or zero-fill of 62.8 MiB images on a 35B.
@@ -864,6 +932,8 @@ struct Engine::Impl {
                 LIYAB_RETURN_IF_ERROR(store->read_state(rs.key, {&into, 1}));
                 snapshots.push_back(std::move(snap));
             }
+        } else {
+            snapshots = std::move(window_snapshots);
         }
         return target->adopt_context(positions, std::move(snapshots), plan.state_pinned);
     }
@@ -2133,6 +2203,19 @@ std::string Engine::describe() const {
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
     }
+    if (kv.has_windowed_layers()) {  // per-block KV: windowed blocks keep their window only
+        int32_t every = 0;
+        for (const int32_t w : kv.config().layer_windows) every += w == 0 ? 1 : 0;
+        const int32_t ctx = impl_->target->context_length();
+        char blocks[256];
+        std::snprintf(blocks, sizeof blocks,
+                      "KV blocks:  %d of %d keep every position (%.1f KiB/token), the others a window of %d; "
+                      "a full context %.1f MiB\n",
+                      every, kv.config().n_layers, static_cast<double>(kv.rows_bytes(1)) / 1024.0, c.sliding_window,
+                      static_cast<double>(KvCache::kept_bytes(kv.config(), ctx, impl_->target->max_batch())) /
+                          (1024.0 * 1024.0));
+        out += blocks;
+    }
     if (impl_->draft) {
         out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
                " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
@@ -2323,6 +2406,26 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                     kv.image_to_page(image.data() + kv.rows_bytes(first), rows, page.data());
                     return page.data();
                 };
+                // Windowed blocks: their window before the end from the
+                // record's window pages (the one at each page's end, the
+                // last one at n), each read once.
+                Transformer::StateBuffer window_image;
+                int32_t window_at = -1;
+                if (kv.has_windowed_layers()) {
+                    context.window_page = [&](int32_t p) -> const uint8_t* {
+                        const int32_t pos = std::min((p + 1) * page_tokens, n);
+                        if (pos == window_at) return reinterpret_cast<const uint8_t*>(window_image.data());
+                        const auto rs = std::find_if(record.states.begin(), record.states.end(),
+                                                     [pos](const KvStore::RecordState& r) { return r.pos == pos; });
+                        if (rs == record.states.end()) return nullptr;
+                        window_image.resize(kv.window_page_bytes() / sizeof(float));
+                        const std::span<float> into(window_image);
+                        read = s.store->read_state(rs->key, {&into, 1});
+                        if (!read.is_ok()) return nullptr;
+                        window_at = pos;
+                        return reinterpret_cast<const uint8_t*>(window_image.data());
+                    };
+                }
                 const size_t floats = s.target->recurrent_state_bytes() / sizeof(float);
                 Transformer::StateBuffer state;  // images are not zero-filled before they are read
                 std::vector<Transformer::StateBuffer> snapshots;

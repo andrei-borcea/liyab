@@ -123,7 +123,15 @@ private:
 };
 
 struct TransformerOptions {
-    int32_t context_length = 0;   // 0: automatic (kKvBudgetBytes of KV, 4096..32768, at most the training context)
+    // 0: automatic (kKvBudgetBytes of KV, 4096..32768, at most the training
+    // context; windowed attention blocks counted for their window only).
+    int32_t context_length = 0;
+    // Windowed attention blocks keep every position, as the others (the
+    // single-table layout): segment reuse needs every block's rows of a
+    // segment wherever it lies. Costs full attention's KV memory on those
+    // blocks; false (default): they keep their window (KvCacheConfig::
+    // layer_windows).
+    bool keep_windowed_rows = false;
     int32_t sliding_window = 0;   // 0: full attention
     int32_t sink_tokens = 8;      // attention-sink anchors kept with a sliding window
     KvCacheType kv_type = KvCacheType::Q8_0;
@@ -254,6 +262,14 @@ public:
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
+    // Whether the context carries a state bound to its position, beyond KV
+    // rows any prefix of it can be cut from: recurrent (DeltaNet) states, or
+    // the rows of the last window of windowed attention blocks, whose older
+    // rows the cache lets go (KvCache::layer_windows). Such a context returns
+    // only to where that state is kept (snapshots, the rollback margin).
+    [[nodiscard]] bool has_position_state() const noexcept;
+    // Positions of the state snapshots held (snapshot_state()), ascending.
+    [[nodiscard]] std::vector<int32_t> snapshot_positions() const;
     [[nodiscard]] int32_t max_batch() const noexcept { return max_batch_; }
 
     // Wall time spent in each phase of forward(), in ms, cumulative over every
@@ -311,10 +327,13 @@ public:
 
     // Discards cached positions >= n (speculative-decoding rollback, a chat
     // turn that rewrites the end of the context). KV caches simply drop
-    // positions. Recurrent (DeltaNet) states cannot be rewound, so hybrid
-    // models restore a copy instead: they accept n == 0, n == n_past(), any n
-    // whose position n - 1 is still inside the rollback window, or the
-    // position of a state snapshot (Unsupported otherwise).
+    // positions, as long as the windowed blocks still hold the rows of the
+    // window before n (the rollback margin kept behind the end, a snapshot's
+    // pinned window: InvalidArgument otherwise, see KvCache::truncate()).
+    // Recurrent (DeltaNet) states cannot be rewound, so hybrid models restore
+    // a copy instead: they accept n == 0, n == n_past(), any n whose position
+    // n - 1 is still inside the rollback window, or the position of a state
+    // snapshot (Unsupported otherwise). Snapshots past n are discarded.
     Status truncate(int32_t n);
     // After forward() returned Cancelled (ForwardHooks::cancel) partway
     // through its blocks: returns the context to n_past(), the position the
@@ -323,11 +342,14 @@ public:
     // model); without one, Unsupported and the context must be reset.
     Status abandon_pass();
     // The longest prefix of at most n positions truncate() accepts: n itself
-    // for models without recurrent blocks, else the nearest checkpoint or
-    // snapshot at or below n (0 if none).
+    // for models without a position state, else the longest whose windowed
+    // rows are still kept (KvCache::restorable()) and, on hybrid models, the
+    // nearest checkpoint or snapshot at or below n among those (0 if none).
     [[nodiscard]] int32_t restorable_prefix(int32_t n) const noexcept;
-    // Hybrid models: keeps a copy of the recurrent states at the current
-    // position, so truncate() can return exactly here later. The engine
+    // Models with a position state (has_position_state()): keeps the state
+    // at the current position, so truncate() can return exactly here later:
+    // a copy of the recurrent states, and a pin on the windowed blocks'
+    // window before it (KvCache::pin(): those pages stay, no copy). The engine
     // takes one at the end of every prompt (`pin`: the next chat turn
     // re-sends that prompt, and its end, the last reply or an edited turn,
     // may differ) and at the end of every prefill (a draft being typed ahead,
@@ -339,8 +361,8 @@ public:
     // (2838 tokens processed again, 151 s on a 35B MoE). Two others, because
     // a draft is prepared twice: its words, then the whole message as it
     // would be sent (time line and reply opening included); typing on goes
-    // back to the words, not to the last prompt. No-op without recurrent
-    // blocks or at position 0.
+    // back to the words, not to the last prompt. No-op without a position
+    // state or at position 0.
     void snapshot_state(bool pin = false);
     static constexpr int32_t kStateSnapshots = 4;
     // Quantized KV caches: per-channel key scaling (core/key_scaling.h).
@@ -356,18 +378,25 @@ public:
     // [1/kMaxKeyScale, kMaxKeyScale], a quantized-cache-only call on an F16
     // cache, or a non-empty context.
     Status set_key_scales(std::span<const float> scales);
-    // Writes what the context holds (n_past(), the KV pages of positions
-    // [0, n_past()), the key scales they were stored with, the recurrent
-    // states and, below n_past(), the oldest and the pinned state snapshots)
-    // with a fingerprint of the model and the cache settings, so read_state()
-    // accepts it only for the same model file loaded the same way.
+    // Writes what the context holds (n_past(), the KV rows of positions
+    // [0, n_past()) of the blocks keeping every position as rows image pages,
+    // the key scales they were stored with, the recurrent states at n_past(),
+    // below n_past() the oldest and the pinned state snapshots, and the
+    // windowed blocks' pages of the window before n_past() and before those
+    // snapshots, whole) with a fingerprint of the model, the cache
+    // settings and its per-block layout, so read_state() accepts it only for
+    // the same model file loaded the same way (format version 4).
     // Unsupported with a sliding window (released positions are gone).
     // IoError when the stream fails.
     Status write_state(std::ostream& out) const;
     // A context held outside the model, as the engine's KV store keeps it
-    // (core/kv_store.h): positions [0, n), the KV page `page(p)` returns for
-    // each p < ceil(n / page_tokens) (page_bytes() bytes, valid until the
-    // next call), the recurrent states at n and the snapshots below n.
+    // (core/kv_store.h): positions [0, n), the rows image page `page(p)`
+    // returns for each p < ceil(n / page_tokens) (page_bytes() bytes, valid
+    // until the next call), the recurrent states at n and the snapshots below
+    // n; with windowed blocks, the windowed rows of the pages of the window
+    // before n that `window_page(p)` returns (KvCache::read_window_rows()'s
+    // image of page_tokens positions, window_page_bytes(); valid until the
+    // next call), and no snapshots.
     struct SnapshotImage {
         int32_t pos = 0;
         bool pinned = false;
@@ -376,30 +405,40 @@ public:
     struct ContextImage {
         int32_t n = 0;
         std::function<const uint8_t*(int32_t page)> page;
+        std::function<const uint8_t*(int32_t page)> window_page;  // windowed blocks only
         std::span<const float> state;  // empty without recurrent blocks
         std::vector<SnapshotImage> snapshots;
     };
     // Writes `image` in write_state()'s format, as if it were the context
     // (the key scales in use, which the store's chunks were stored with).
     // Unsupported with a sliding window; InvalidArgument for an image that
-    // does not fit this model; IoError when the stream fails.
+    // does not fit this model, or when a window page of the window before n
+    // is missing (window_page() returned nullptr);
+    // IoError when the stream fails.
     Status write_state(std::ostream& out, const ContextImage& image) const;
     // Replaces the context with one write_state() saved, its snapshots
     // included (truncate() returns to them as in the context that was saved),
     // and takes a state snapshot at its end (pinned unless a saved one is).
     // Reads the formats without snapshots or key scales too. Keys stored with
     // other scales than the ones in use (an older file: none) are converted
-    // to them. InvalidArgument when the fingerprint differs; the context is
-    // empty after any failure.
+    // to them. Files older than version 4 (every block's rows in one table's
+    // pages) are converted to the per-block layout: windowed blocks keep the
+    // window before the end (a hybrid model's snapshots below it, whose
+    // windows those files did not keep apart, are dropped). InvalidArgument
+    // when the fingerprint differs or a version 4 file has another per-block
+    // layout (other windows); the context is empty after any failure.
     Status read_state(std::istream& in);
     // What the context's bytes depend on (the fingerprint read_state()
-    // checks, the page size and the key scales in use): the root of the KV
-    // store's keys, together with what the engine adds (kernels, route).
+    // checks, the page size, the per-block layout and the key scales in use):
+    // the root of the KV store's keys, together with what the engine adds
+    // (kernels, route). Unchanged for caches without windowed blocks.
     [[nodiscard]] uint64_t context_fingerprint() const noexcept;
-    // The recurrent-state images write_state() keeps, ascending: the oldest
-    // and the pinned snapshot below n_past(), then n_past() itself, with the
-    // pinned flags read_state() gives them back (the end pinned unless a
-    // snapshot below is). Empty without recurrent blocks or at position 0.
+    // The state images write_state() keeps, ascending: the oldest and the
+    // pinned snapshot below n_past(), then n_past() itself, with the pinned
+    // flags read_state() gives them back (the end pinned unless a snapshot
+    // below is). Empty without a position state or at position 0. (With
+    // windowed blocks these are the restore points whose windows the engine's
+    // store keeps, page by page: KvCache::read_window_rows().)
     struct KeptState {
         int32_t pos = 0;
         bool pinned = false;
@@ -452,15 +491,19 @@ public:
         StateBuffer data;  // recurrent_state_bytes() / sizeof(float) values
     };
     // Takes positions [0, n) as the context once the caller has written their
-    // KV rows (KvCache::reserve() and write_rows(); rows below n_past() may be
-    // left as they are where they hold the same tokens) and its recurrent
-    // states (recurrent_parts()): frees the pages past n, moves `snapshots`
-    // in as the snapshots below n (ascending, fewer than kStateSnapshots),
-    // discards the rollback checkpoints, then takes a snapshot at n, pinned
-    // when `pin_end`, in a buffer begin_restore() kept when one is left (the
-    // others are freed). InvalidArgument for an image that does not fit
-    // (sizes, positions, unmapped pages); the context is then empty.
+    // KV rows (KvCache::reserve_context() and write_rows(), and with windowed
+    // blocks write_window_rows() for the window before n and before each
+    // snapshot; rows below n_past() may be left as they are where they hold
+    // the same tokens) and its recurrent states (recurrent_parts()): frees the
+    // pages past n, moves `snapshots` in as the snapshots below n (ascending,
+    // fewer than kStateSnapshots), discards the rollback checkpoints, then
+    // takes a snapshot at n, pinned when `pin_end`, in a buffer begin_restore()
+    // kept when one is left (the others are freed); the snapshots' windows are
+    // pinned. InvalidArgument for an image that does not fit (sizes,
+    // positions, unmapped pages, windowed rows missing); the context is then
+    // empty.
     Status adopt_context(int32_t n, std::vector<OwnedSnapshot> snapshots, bool pin_end);
+
     // Keeps a copy of every recurrent state after each of the last
     // `positions` processed tokens, so truncate() can return to any of them
     // (speculative verification needs draft count + 1). Costs positions x
@@ -480,7 +523,8 @@ public:
     // Whether this model's KV rows can be moved to other positions and
     // partly recomputed there, and why not: Unsupported for hybrid models
     // (their recurrent blocks must run over the whole prompt, in order),
-    // with a sliding-window cache (released positions are gone), and when a
+    // with a sliding-window cache or windowed attention blocks (released
+    // positions are gone), and when a
     // Q/K norm after RoPE zeroes a rotated key channel (its rotation could
     // not be undone).
     [[nodiscard]] Status reuse_support() const;
@@ -488,8 +532,9 @@ public:
     // while the engine is idle): swaps the KV cache and the position count
     // with `kv` and `n_past`, so the work runs on another cache and the
     // conversation's comes back untouched by swapping again. `kv` comes from
-    // make_kv_cache(). Unsupported with recurrent blocks (their states are
-    // part of a context too); InvalidArgument for a cache of another layout.
+    // make_kv_cache(). Unsupported with recurrent blocks or windowed
+    // attention blocks (their states and snapshots are part of a context
+    // too); InvalidArgument for a cache of another layout.
     Status swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past);
     // An empty KV cache laid out like the context's (format, pages, rows)
     // for `positions` positions; its pages are mapped as they are used.
@@ -746,13 +791,16 @@ private:
     std::vector<int32_t> checkpoint_pos_;  // per ring slot: the position its checkpoints hold, -1 none
     [[nodiscard]] std::array<int64_t, 9> state_fingerprint() const noexcept;
     Status write_image(std::ostream& out, int32_t n, const std::function<const uint8_t*(int32_t)>& page,
-                       std::span<const float> state, std::span<const SnapshotImage> snapshots, bool live) const;
+                       const std::function<const uint8_t*(int32_t)>* window_page, std::span<const float> state,
+                       std::span<const SnapshotImage> snapshots, bool live) const;
     struct StateSnapshot {
         int32_t pos = 0;           // n_past() when taken
         StateBuffer data;          // [conv | ssm] of every recurrent block, in states_ order
         bool pinned = false;       // the end of the last prompt (see snapshot_state)
     };
-    std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_
+    std::vector<StateSnapshot> snapshots_;  // ascending pos, all <= n_past_; windowed rows pinned in the cache
+    // Pins the windowed blocks' window before each snapshot (KvCache::pin()).
+    void pin_snapshots();
     // Snapshot buffers begin_restore() kept for the context being restored
     // (at most kStateSnapshots with snapshots_): no allocation, first touch
     // or zero-fill per restore.

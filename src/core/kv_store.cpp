@@ -351,7 +351,9 @@ KvStore::KvStore(const Config& config) : config_(config) {
 KvStore::~KvStore() = default;  // the RAM tier is freed; files stay for later engines; the lock is released
 
 std::unique_ptr<KvStore> KvStore::open(const Config& config) {
-    if (config.chunk_tokens <= 0 || config.chunk_bytes == 0 ||
+    // Chunks of 0 bytes only carry tokens: a model whose every attention
+    // block is windowed keeps its rows in the state images (window tails).
+    if (config.chunk_tokens <= 0 || (config.chunk_bytes == 0 && config.state_floats == 0) ||
         config.chunk_bytes % static_cast<size_t>(config.chunk_tokens) != 0) {
         return nullptr;
     }
@@ -1072,6 +1074,105 @@ KvStore::Plan KvStore::plan(std::span<const int32_t> tokens, size_t limit) const
         } else {
             chunks_up_to(nullptr);
         }
+    } else if (config_.window > 0) {
+        // Windowed blocks: the window pages the prompt's own prefix leads to,
+        // by position; the deepest one whose window is whole (the page ends
+        // of every page before it in the window) is where it restores.
+        std::vector<KvKey> prompt_keys = path;
+        for (size_t at = prompt_keys.size() * c; at + c <= limit; at += c) {
+            prompt_keys.push_back(kv_chain_key(prompt_keys.empty() ? config_.seed : prompt_keys.back(), tokens.subspan(at, c)));
+        }
+        std::map<int32_t, const State*> matched;
+        for (const auto& [key, st] : states_) {
+            if (!ours(st) || st.pos <= 0 || static_cast<size_t>(st.pos) > limit) continue;
+            const auto j = static_cast<size_t>(st.pos - 1) / c;
+            const auto t = tokens.subspan(j * c, static_cast<size_t>(st.pos) - j * c);
+            if (st.parent != (j > 0 ? prompt_keys[j - 1] : config_.seed) || kv_chain_key(st.parent, t) != st.key ||
+                !std::equal(t.begin(), t.end(), st.tokens.begin(), st.tokens.end())) {
+                continue;
+            }
+            matched[st.pos] = &st;
+        }
+        const int32_t page = config_.page_tokens > 0 ? config_.page_tokens : config_.chunk_tokens;
+        // Whether position m's window is whole: its own page (the state at
+        // m) and the page end of every page before it in the window.
+        auto whole = [&](int32_t m) {
+            const int32_t first = std::max(0, m - config_.window + 1) / page, last = (m - 1) / page;
+            for (int32_t q = first; q < last; ++q) {
+                if (matched.count((q + 1) * page) == 0) return false;
+            }
+            return true;
+        };
+        // The window pages restoring position m's window. The engine writes
+        // every page it maps whole (a mapped windowed page holds every
+        // position of the context in it): m's own page up to m; a snapshot's
+        // last page is its page end's image (the positions after the snapshot
+        // in it belong to the context), or m's when they share it.
+        auto add_window = [&](int32_t m, int32_t end) {
+            const int32_t first = std::max(0, m - config_.window + 1) / page, last = (m - 1) / page;
+            for (int32_t q = first; q < last; ++q) {
+                const State* s = matched.at((q + 1) * page);
+                plan.window_pages.push_back({s->pos, false, s->key});
+            }
+            if (m == end) {
+                plan.window_pages.push_back({m, false, matched.at(m)->key});
+            } else if ((last + 1) * page <= end) {
+                const State* s = matched.at((last + 1) * page);
+                plan.window_pages.push_back({s->pos, false, s->key});
+            }
+        };
+        const State* best = nullptr;
+        for (auto it = matched.rbegin(); it != matched.rend() && best == nullptr; ++it) {
+            if (whole(it->first)) best = it->second;
+        }
+        if (best == nullptr) return plan;
+        plan.positions = best->pos;
+        add_window(best->pos, best->pos);
+        const auto j = static_cast<size_t>(best->pos - 1) / c;
+        path.assign(prompt_keys.begin(), prompt_keys.begin() + static_cast<std::ptrdiff_t>(j));
+        chunks_up_to(&chunks_.at(best->chunk));
+        // Its snapshots: the restore points below it (the states set aside
+        // marked, pinned = the live context's snapshots) of the most recently
+        // used record that holds it, with their windows. The highest is the
+        // pinned one (the last prompt's end), as a live context has them.
+        const RecordEntry* holder = nullptr;
+        uint64_t holder_clock = 0;
+        for (const auto& [leaf, e] : records_) {
+            if (e.seed != config_.seed) continue;
+            for (const RecordState& rs : e.record.states) {
+                if (rs.key != best->key) continue;
+                const uint64_t clock = chunks_.at(leaf).clock;
+                if (holder == nullptr || clock > holder_clock) {
+                    holder = &e;
+                    holder_clock = clock;
+                }
+            }
+        }
+        if (holder != nullptr) {
+            for (const RecordState& rs : holder->record.states) {
+                if (!rs.pinned || rs.pos >= best->pos || matched.count(rs.pos) == 0 ||
+                    matched.at(rs.pos)->key != rs.key || !whole(rs.pos)) {
+                    continue;
+                }
+                // Its last page whole: its page end's image, unless that page
+                // is the restored end's own.
+                const int32_t end_of_page = ((rs.pos - 1) / page + 1) * page;
+                if (end_of_page <= best->pos && matched.count(end_of_page) == 0) continue;
+                plan.snapshots.push_back({rs.pos, false, rs.key});
+            }
+        }
+        // At most three below it (the oldest and the two highest), as a
+        // model keeps them (Transformer::kStateSnapshots with the end).
+        if (plan.snapshots.size() > 3) plan.snapshots.erase(plan.snapshots.begin() + 1, plan.snapshots.end() - 2);
+        for (const RecordState& rs : plan.snapshots) add_window(rs.pos, best->pos);
+        if (!plan.snapshots.empty()) plan.snapshots.back().pinned = true;
+        plan.state_pinned = plan.snapshots.empty();
+        // Each page once, ascending (a page may hold several restore points).
+        std::sort(plan.window_pages.begin(), plan.window_pages.end(),
+                  [](const RecordState& a, const RecordState& b) { return a.pos < b.pos; });
+        plan.window_pages.erase(std::unique(plan.window_pages.begin(), plan.window_pages.end(),
+                                            [](const RecordState& a, const RecordState& b) { return a.key == b.key; }),
+                                plan.window_pages.end());
     } else {
         // Hybrid: the deepest stored state the prompt's own prefix leads to,
         // whichever chunk holding that prefix it is attached to. The keys of
@@ -1154,6 +1255,7 @@ void KvStore::used(const Plan& plan) {
     };
     if (plan.state != KvKey{}) follow(plan.state);
     for (const RecordState& rs : plan.snapshots) follow(rs.key);
+    for (const RecordState& rs : plan.window_pages) follow(rs.key);
     std::vector<std::pair<Kind, KvKey>> order;  // newest first
     for (const KvKey& key : plan.chunks) {
         order.emplace_back(Kind::Chunk, key);
@@ -1163,6 +1265,7 @@ void KvStore::used(const Plan& plan) {
         };
         if (plan.state != KvKey{}) add(plan.state);
         for (const RecordState& rs : plan.snapshots) add(rs.key);
+        for (const RecordState& rs : plan.window_pages) add(rs.key);
         std::sort(own.begin(), own.end(), [](const State* a, const State* b) { return a->pos > b->pos; });
         for (const State* s : own) order.emplace_back(Kind::State, s->key);
     }

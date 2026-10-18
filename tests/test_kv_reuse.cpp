@@ -57,6 +57,9 @@ std::unique_ptr<Loaded> load(const char* name, const test::TinyModelSpec& spec, 
     if (!file) return nullptr;
     if (options.context_length == 0) options.context_length = 512;
     options.max_batch = 32;
+    // Segment reuse moves every block's rows: windowed blocks keep every
+    // position, as the engine has them with segment_reuse on.
+    options.keep_windowed_rows = true;
     // Latent attention pinned to the absorbed form, the one run_block_at()
     // uses: LatentForm::Auto picks a form per pass shape, so a reference
     // prefill's bits would depend on how its passes were split.
@@ -323,6 +326,27 @@ TEST_CASE("Moved keys equal the keys computed at the new positions, for every Ro
     auto w = load("window", {}, window);
     REQUIRE(w != nullptr);
     CHECK(w->model->reuse_support().code() == ErrorCode::Unsupported);
+    // Windowed blocks keeping only their window (the per-block default):
+    // a segment's rows of those blocks would be gone.
+    test::TinyModelSpec windowed;
+    windowed.arch = "gemma3";
+    windowed.n_layers = 6;
+    windowed.sliding_window = 8;
+    windowed.qk_norm = true;
+    windowed.post_norms = true;
+    windowed.tied_output = true;
+    const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_reuse_perblock.gguf";
+    test::write_tiny_model(path, windowed);
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    TransformerOptions per_block;
+    per_block.context_length = 512;
+    auto pb = Transformer::load(std::move(file).value(), per_block);
+    REQUIRE(pb.has_value());
+    CHECK(pb.value()->kv_cache().has_windowed_layers());
+    CHECK(pb.value()->reuse_support().code() == ErrorCode::Unsupported);
+    pb.value().reset();
+    std::remove(path.c_str());
 }
 
 TEST_CASE("Blocks run at scattered positions give the rows and logits a whole pass gives, bit for bit") {
