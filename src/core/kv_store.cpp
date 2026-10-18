@@ -338,14 +338,123 @@ int32_t remove_kv_dedup_files(const std::string& dir) {
     return removed;
 }
 
-KvStore::KvStore(const Config& config) : config_(config) {
-    if (config_.page_tokens <= 0) config_.page_tokens = config_.chunk_tokens;
+KvKey KvStore::derive_seed(const KvKey& seed) const noexcept {
     // A lossy store keys its chunks apart: they are never returned to one that
     // did not opt in.
-    if (config_.lossy) {
-        static constexpr char kLossy[] = "kv-lossy4";
-        config_.seed = hash_after(config_.seed, kLossy, sizeof kLossy - 1);
+    if (!config_.lossy) return seed;
+    static constexpr char kLossy[] = "kv-lossy4";
+    return hash_after(seed, kLossy, sizeof kLossy - 1);
+}
+
+KvStore::KvStore(const Config& config) : config_(config) {
+    if (config_.page_tokens <= 0) config_.page_tokens = config_.chunk_tokens;
+    config_.seed = derive_seed(config_.seed);
+    checked_seeds_.push_back(config_.seed);  // scan() checks this seed's files in full
+}
+
+void KvStore::set_seed(const KvKey& requested) {
+    const KvKey seed = derive_seed(requested);
+    if (seed == config_.seed) return;
+    config_.seed = seed;
+    ahead_keys_.clear();
+    ahead_valid_ = false;
+    if (std::find(checked_seeds_.begin(), checked_seeds_.end(), seed) == checked_seeds_.end()) {
+        check_seed();
+        checked_seeds_.push_back(seed);
     }
+    // This seed's first chunks, oldest use first (a deterministic order).
+    roots_.clear();
+    for (const auto& [key, ch] : chunks_) {
+        if (ours(ch) && ch.start == 0) roots_.push_back(key);
+    }
+    std::sort(roots_.begin(), roots_.end(), [&](const KvKey& a, const KvKey& b) {
+        const Chunk& x = chunks_.at(a);
+        const Chunk& y = chunks_.at(b);
+        return x.clock != y.clock ? x.clock < y.clock : (x.key.hi != y.key.hi ? x.key.hi < y.key.hi : x.key.lo < y.key.lo);
+    });
+}
+
+void KvStore::check_seed() {
+    // What scan() checks for its own seed only, now that this seed is in use.
+    // Items put() stored in this process are valid by construction; those
+    // found in the directory had their headers and chains checked there.
+    const auto c = static_cast<size_t>(config_.chunk_tokens);
+    std::vector<KvKey> chunk_keys;
+    for (const auto& [key, ch] : chunks_) {
+        if (ours(ch)) chunk_keys.push_back(key);
+    }
+    std::sort(chunk_keys.begin(), chunk_keys.end(),
+              [&](const KvKey& a, const KvKey& b) { return chunks_.at(a).start < chunks_.at(b).start; });
+    for (const KvKey& key : chunk_keys) {
+        const auto it = chunks_.find(key);
+        if (it == chunks_.end()) continue;  // went with a parent
+        const Chunk& ch = it->second;
+        const size_t count = ch.tokens.size();
+        const bool ok = count > 0 && count <= c && ch.start % config_.chunk_tokens == 0 &&
+                        ch.payload_bytes == rows_bytes(static_cast<int32_t>(count)) &&
+                        (ch.encoding == KvEncoding::Raw || config_.layout.valid()) &&
+                        (ch.encoding != KvEncoding::Lossy4 || config_.lossy) &&
+                        kv_chain_key(ch.parent, ch.tokens) == ch.key && kv_content_key(ch.seed, ch.tokens) == ch.content &&
+                        (ch.start == 0 ? ch.parent == ch.seed
+                                       : chunks_.count(ch.parent) != 0 && chunks_.at(ch.parent).tokens.size() == c);
+        if (!ok) {
+            ++removed_files_;
+            drop_chunk(key);
+        }
+    }
+    std::vector<KvKey> state_keys;
+    for (const auto& [key, st] : states_) {
+        if (!ours(st)) continue;
+        const auto j = static_cast<size_t>(std::max(st.pos - 1, 0)) / c;
+        const bool ok = st.pos > 0 && st.tokens.size() == static_cast<size_t>(st.pos) - j * c &&
+                        st.payload_bytes == config_.state_floats * sizeof(float) &&
+                        kv_chain_key(st.parent, st.tokens) == st.key;
+        if (!ok) state_keys.push_back(key);
+    }
+    for (const KvKey& key : state_keys) {
+        ++removed_files_;
+        drop_state(key);
+    }
+    // Records: open() kept the tokens and text of its own seed's only.
+    std::vector<KvKey> broken;
+    for (auto& [leaf, e] : records_) {
+        if (e.seed != config_.seed || !e.record.tokens.empty()) continue;
+        Record full;
+        bool ok = e.on_disk && read_record_file(leaf, full);
+        if (ok) {
+            KvKey key = config_.seed;
+            for (size_t pos = 0; pos < full.tokens.size(); pos += c) {
+                key = kv_chain_key(key, std::span<const int32_t>(full.tokens).subspan(pos, std::min(c, full.tokens.size() - pos)));
+            }
+            ok = !full.tokens.empty() && key == leaf;
+        }
+        if (!ok) {
+            broken.push_back(leaf);
+            continue;
+        }
+        e.record.tokens = std::move(full.tokens);
+        e.record.text = std::move(full.text);
+        e.record.text_tokens = full.text_tokens;
+    }
+    for (const KvKey& leaf : broken) {
+        ++removed_files_;
+        drop_record(leaf, /*collect=*/true);
+    }
+}
+
+bool KvStore::read_record_file(const KvKey& leaf, Record& out) const {
+    std::FILE* file = os::open_file(path_of(leaf, ".ctx"), "rb");
+    if (file == nullptr) return false;
+    FileHeader h{};
+    std::vector<uint8_t> meta;
+    bool ok = std::fread(&h, sizeof h, 1, file) == 1 && std::memcmp(h.magic, kMagic, sizeof kMagic) == 0 &&
+              h.version == kFormat && h.kind == kFileRecord && get_key(h.key) == leaf && h.meta_bytes <= kMaxMeta;
+    if (ok) {
+        meta.resize(static_cast<size_t>(h.meta_bytes));
+        ok = meta.empty() || std::fread(meta.data(), 1, meta.size(), file) == meta.size();
+    }
+    std::fclose(file);
+    return ok && header_hash(h, meta.data(), meta.size()) == h.header_hash && parse_record_meta(meta, h.count, out);
 }
 
 KvStore::~KvStore() = default;  // the RAM tier is freed; files stay for later engines; the lock is released
@@ -643,6 +752,13 @@ const KvStore::Chunk* KvStore::holder_of(const State& state, const KvKey& except
         kids = &roots_;
     } else if (auto parent = chunks_.find(state.parent); parent != chunks_.end()) {
         kids = &parent->second.kids;
+    }
+    std::vector<KvKey> other_roots;  // another seed's first chunks (set_seed() indexes the one in use)
+    if (kids == nullptr && state.parent == state.seed) {
+        for (const auto& [key, ch] : chunks_) {
+            if (ch.seed == state.seed && ch.start == 0) other_roots.push_back(key);
+        }
+        kids = &other_roots;
     }
     const Chunk* best = nullptr;
     if (kids == nullptr) return best;
@@ -1650,7 +1766,9 @@ void KvStore::scan() {
         } else if (it->second.seed == config_.seed) {
             roots_.push_back(key);
         }
-        if (it->second.seed == config_.seed) by_content_.emplace(it->second.content, key);
+        // Every seed's: content keys are rooted in the seed, so lookups find
+        // the seed in use only, whichever it is (set_seed()).
+        by_content_.emplace(it->second.content, key);
     }
     // States: their prefix must be stored (a chunk continuing their parent
     // that starts with their tokens); attached to the most recent such chunk.

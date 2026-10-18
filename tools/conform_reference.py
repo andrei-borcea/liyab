@@ -33,6 +33,11 @@ metadata is compared with the model run with the same RoPE parameters, e.g.
 "factor": 4.0, "original_max_position_embeddings": 32768}}'.
 --attn-implementation picks transformers' attention kernel: Gemma 2 needs
 "eager", the default kernel leaves its attention soft cap out.
+
+--lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
+a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
+convert the same adapter to GGUF and pass it to liyab-kl --lora. Needs peft
+(pip install peft).
 """
 
 import argparse
@@ -58,6 +63,7 @@ def main():
                         help="run modeling code shipped with the model (only for repositories you trust)")
     parser.add_argument("--config", help="JSON object of configuration fields to set before the model is built")
     parser.add_argument("--attn-implementation", help='transformers attention kernel, e.g. "eager"')
+    parser.add_argument("--lora", help="PEFT LoRA adapter (directory or id) applied to the model")
     args = parser.parse_args()
 
     import torch
@@ -81,6 +87,10 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
                                                  dtype=getattr(torch, args.dtype),
                                                  trust_remote_code=args.trust_remote_code, **extra)
+    if args.lora:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, args.lora)
     model.eval()
     with torch.no_grad():
         logits = model(torch.tensor([ids])).logits[0, :-1].float()

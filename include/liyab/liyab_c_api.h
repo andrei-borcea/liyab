@@ -115,6 +115,7 @@ typedef struct liyab_engine_config {
     int32_t segment_reuse;        /* nonzero: segment reuse, KV reused away from its prefix (lossy, opt-in per request: liyab_engine_generate_segmented); needs the prefix cache; calibrated once per model in the background while the engine is idle, off until then (kept in cache_dir; see EngineConfig); 0 (default) off */
     float segment_reuse_max_kl;   /* the calibration's target: mean KL against processing the whole prompt (default 0.03) */
     int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of stored losslessly (lossy; 0 default, see EngineConfig) */
+    int64_t adapter_memory_mb;    /* LoRA adapters (liyab_engine_load_adapter): RAM at most for the loaded ones, in MiB, the least recently selected released first (mapped again when selected); default 256; 0: adapters off (a zero-filled config without liyab_engine_config_default) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -570,6 +571,50 @@ typedef struct liyab_segment_reuse_info {
  * which). `out` (may be NULL) receives the calibration either way.
  * Thread-safe. */
 LIYAB_C_API liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segment_reuse_info* out);
+
+/*
+ * LoRA adapters (Engine's AdapterInfo in liyab/engine.h has the whole
+ * contract): GGUF LoRA adapters loaded next to the model, several at once
+ * within adapter_memory_mb, the one later calls apply selected per
+ * generation. Each adapted matmul adds scale * alpha / rank * B(Ax) to the
+ * base product; nothing is merged into the weights, and calls without an
+ * adapter cost what they did. Contexts are kept apart by adapter: one
+ * computed with an adapter is never continued with another (the live
+ * context, the prefix cache's chunks, saved states).
+ */
+/* Loads the adapter at `path` under `name` (UTF-8, 1..127 bytes; not
+ * selected). LIYAB_ERR_INVALID_ARGUMENT for a taken or bad name, an adapter
+ * of another architecture or a matrix that does not fit the model;
+ * LIYAB_ERR_UNSUPPORTED for embedding or latent-attention per-head adapters,
+ * activated LoRA, or adapter_memory_mb 0; LIYAB_ERR_OUT_OF_MEMORY when it
+ * alone exceeds adapter_memory_mb; LIYAB_ERR_INVALID_MODEL / LIYAB_ERR_IO for
+ * a file that is not a LoRA adapter or cannot be read; LIYAB_ERR_BUSY while
+ * another call runs. */
+LIYAB_C_API liyab_status liyab_engine_load_adapter(liyab_engine* engine, const char* name, const char* path);
+/* Forgets an adapter (the selected one: back to the base model). */
+LIYAB_C_API liyab_status liyab_engine_unload_adapter(liyab_engine* engine, const char* name);
+/* Selects the adapter later calls apply, at `scale` (1: as trained); NULL or
+ * "" for none (the default). A context computed otherwise is set aside in
+ * the prefix cache and the next prompt starts from what it keeps for this
+ * adapter. LIYAB_ERR_INVALID_ARGUMENT for an unknown name or a scale that is
+ * not finite; LIYAB_ERR_BUSY while another call runs. */
+LIYAB_C_API liyab_status liyab_engine_set_adapter(liyab_engine* engine, const char* name, float scale);
+
+typedef struct liyab_adapter_info {
+    char name[128];     /* NUL-terminated */
+    float alpha;        /* adapter.lora.alpha (0: none) */
+    int32_t rank;       /* the largest rank of its matrices */
+    int32_t matrices;   /* adapted matrices (a per-expert stack counts once) */
+    uint64_t bytes;     /* its tensors, counted against adapter_memory_mb */
+    int32_t resident;   /* nonzero: mapped now (else mapped again when selected) */
+    int32_t active;     /* nonzero: the selected one */
+    float scale;        /* its scale, when selected */
+} liyab_adapter_info;
+/* How many adapters are loaded (0 for a NULL engine). Thread-safe. */
+LIYAB_C_API int32_t liyab_engine_adapter_count(const liyab_engine* engine);
+/* Adapter `index` (0..count-1, load order) into `out`.
+ * LIYAB_ERR_INVALID_ARGUMENT for an index out of range. Thread-safe. */
+LIYAB_C_API liyab_status liyab_engine_adapter_info(const liyab_engine* engine, int32_t index, liyab_adapter_info* out);
 
 #ifdef __cplusplus
 }

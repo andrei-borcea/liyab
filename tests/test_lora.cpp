@@ -427,4 +427,304 @@ TEST_CASE("lora: latent attention's whole matrices give the merged model's logit
     check_merged("mla", mla, per_block(2, {"attn_q_a", "attn_q_b", "attn_kv_a_mqa", "attn_output"}));
 }
 
+// ---- The engine's adapters --------------------------------------------------
+
+namespace {
+
+// A base model, two adapters (A on attention and FFN, B on the FFN only) and
+// the base model with A merged at scale 1, written once.
+struct EngineFiles {
+    std::string base, merged_a, adapter_a, adapter_b;
+    explicit EngineFiles(int32_t rank = 32) {
+        base = temp_path("engine_base.gguf");
+        merged_a = temp_path("engine_merged_a.gguf");
+        adapter_a = temp_path("engine_a.gguf");
+        adapter_b = temp_path("engine_b.gguf");
+        test::write_tiny_model(base, f32_spec("llama"));
+        const std::vector<Pair> a =
+            random_pairs(base, per_block(2, {"attn_q", "attn_v", "attn_output", "ffn_up", "ffn_down"}), rank, DType::F32, 11);
+        write_adapter(adapter_a, a, 2.0f * static_cast<float>(rank), DType::F32);  // s = 2
+        write_merged(base, merged_a, a, 2.0f);
+        write_adapter(adapter_b, random_pairs(base, per_block(2, {"ffn_gate", "ffn_up"}), 32, DType::F16, 12), 32.0f,
+                      DType::F16);
+    }
+    ~EngineFiles() {
+        for (const std::string& p : {base, merged_a, adapter_a, adapter_b}) std::remove(p.c_str());
+    }
+};
+
+EngineConfig adapter_engine_config(const std::string& path) {
+    EngineConfig c;
+    c.model_path = path;
+    c.n_threads = 3;
+    c.thermal_polling = false;
+    c.power.profile = PowerProfile::Performance;
+    c.backend = BackendKind::Cpu;
+    c.kv_cache_type = KvCacheType::F16;
+    return c;
+}
+
+SamplingParams greedy(int32_t max_tokens) {
+    SamplingParams p;
+    p.temperature = 0.0f;
+    p.max_tokens = max_tokens;
+    return p;
+}
+
+std::vector<int32_t> prompt_of(size_t n, int32_t salt) {
+    std::vector<int32_t> t = {1};
+    for (size_t i = 1; i < n; ++i) t.push_back(3 + static_cast<int32_t>((i * 31 + static_cast<size_t>(salt) * 7) % 250));
+    return t;
+}
+
+std::vector<int32_t> run(Engine& e, const std::vector<int32_t>& prompt, int32_t max_tokens = 12,
+                         GenerationStats* stats = nullptr) {
+    std::vector<int32_t> out;
+    auto st = e.generate_tokens(prompt, greedy(max_tokens), [&](std::string_view, int32_t t) {
+        out.push_back(t);
+        return true;
+    });
+    if (!st) std::printf("  generate failed: %s\n", st.status().to_string().c_str());
+    if (st && stats != nullptr) *stats = st.value();
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("engine adapters: selected per generation, the merged model's output, the base model's without") {
+    const EngineFiles f;
+    auto merged = Engine::create(adapter_engine_config(f.merged_a));
+    auto engine = Engine::create(adapter_engine_config(f.base));
+    REQUIRE(merged.has_value() && engine.has_value());
+    Engine& e = **engine;
+    const std::vector<int32_t> prompt = prompt_of(40, 1);
+    const std::vector<int32_t> base_out = run(e, prompt);
+    const std::vector<int32_t> merged_out = run(**merged, prompt);
+    std::printf("  replies of %zu and %zu tokens\n", base_out.size(), merged_out.size());
+    REQUIRE(!base_out.empty() && !merged_out.empty());
+    CHECK(base_out != merged_out);  // the adapter changes the reply
+
+    REQUIRE(e.load_adapter("a", f.adapter_a).is_ok());
+    REQUIRE(e.load_adapter("b", f.adapter_b).is_ok());
+    std::vector<AdapterInfo> info = e.adapters();
+    REQUIRE(info.size() == 2);
+    CHECK(info[0].name == "a" && info[0].rank == 32 && info[0].matrices == 10 && info[0].resident && !info[0].active);
+    CHECK_NEAR(info[0].alpha, 64.0, 0.0);
+    CHECK(info[1].name == "b" && info[1].matrices == 4);
+    CHECK(e.describe().find("Adapter:    a, LoRA rank 32") != std::string::npos);
+    // Loading selects nothing: still the base model, its context kept.
+    GenerationStats st;
+    CHECK(run(e, prompt, 12, &st) == base_out);
+    CHECK(st.cached_prefix_tokens > 0);
+
+    // Selected: the merged model's reply, the base context not continued.
+    REQUIRE(e.set_adapter("a").is_ok());
+    info = e.adapters();
+    CHECK(info[0].active && info[0].scale == 1.0f && !info[1].active);
+    CHECK(run(e, prompt, 12, &st) == merged_out);
+    CHECK(st.cached_prefix_tokens == 0);
+    // The same adapter again keeps its context; another scale does not.
+    REQUIRE(e.set_adapter("a").is_ok());
+    CHECK(run(e, prompt, 12, &st) == merged_out);
+    CHECK(st.cached_prefix_tokens > 0);
+    REQUIRE(e.set_adapter("a", 0.0f).is_ok());  // a zero scale: the base model's output, its own context
+    CHECK(run(e, prompt, 12, &st) == base_out);
+    CHECK(st.cached_prefix_tokens == 0);
+    REQUIRE(e.set_adapter("b", 1.0f).is_ok());
+    const std::vector<int32_t> b_out = run(e, prompt);
+    CHECK(b_out != base_out && b_out != merged_out);
+    // None again: the base model's reply.
+    REQUIRE(e.set_adapter("").is_ok());
+    CHECK(run(e, prompt) == base_out);
+    // Unloading the selected adapter goes back to the base model.
+    REQUIRE(e.set_adapter("b").is_ok());
+    REQUIRE(e.unload_adapter("b").is_ok());
+    CHECK(e.adapters().size() == 1);
+    CHECK(run(e, prompt) == base_out);
+
+    // Refused: unknown names, a taken name, a bad scale, a non-adapter, an
+    // adapter that does not fit the model.
+    CHECK(e.set_adapter("nope").code() == ErrorCode::InvalidArgument);
+    CHECK(e.set_adapter("a", std::nanf("")).code() == ErrorCode::InvalidArgument);
+    CHECK(e.unload_adapter("nope").code() == ErrorCode::InvalidArgument);
+    CHECK(e.load_adapter("a", f.adapter_b).code() == ErrorCode::InvalidArgument);
+    CHECK(e.load_adapter("", f.adapter_b).code() == ErrorCode::InvalidArgument);
+    CHECK(e.load_adapter("m", f.base).code() == ErrorCode::InvalidModel);
+    const std::string moe_path = temp_path("engine_moe.gguf");
+    test::TinyModelSpec moe = f32_spec("qwen3moe");
+    moe.n_expert = 4;
+    moe.n_expert_used = 2;
+    test::write_tiny_model(moe_path, moe);
+    const std::string moe_adapter = temp_path("engine_moe_adapter.gguf");
+    write_adapter(moe_adapter, random_pairs(moe_path, {"blk.0.ffn_up_exps.weight"}, 8, DType::F32, 3), 8.0f, DType::F32);
+    CHECK(e.load_adapter("moe", moe_adapter).code() == ErrorCode::InvalidArgument);
+    std::remove(moe_path.c_str());
+    std::remove(moe_adapter.c_str());
+    // Adapters off.
+    EngineConfig off = adapter_engine_config(f.base);
+    off.adapter_memory_mb = 0;
+    auto without = Engine::create(off);
+    REQUIRE(without.has_value());
+    CHECK((*without)->load_adapter("a", f.adapter_a).code() == ErrorCode::Unsupported);
+}
+
+TEST_CASE("engine adapters: speculative decoding verifies with the adapter") {
+    const EngineFiles f;
+    auto merged = Engine::create(adapter_engine_config(f.merged_a));
+    EngineConfig spec = adapter_engine_config(f.base);
+    spec.lookup_drafts = true;
+    spec.draft_tokens = 3;
+    spec.adaptive_drafts = false;
+    auto engine = Engine::create(spec);
+    REQUIRE(merged.has_value() && engine.has_value());
+    REQUIRE((*engine)->load_adapter("a", f.adapter_a).is_ok());
+    REQUIRE((*engine)->set_adapter("a").is_ok());
+    // A prompt that repeats itself, so drafts are proposed.
+    std::vector<int32_t> prompt = prompt_of(24, 3);
+    const std::vector<int32_t> again(prompt.begin() + 1, prompt.end());
+    prompt.insert(prompt.end(), again.begin(), again.end());
+    GenerationStats st;
+    const std::vector<int32_t> out = run(**engine, prompt, 24, &st);
+    CHECK(out == run(**merged, prompt, 24));
+    std::printf("  drafts proposed %d, accepted %d\n", st.draft_tokens_proposed, st.draft_tokens_accepted);
+}
+
+TEST_CASE("engine adapters: the prefix cache and saved states keep contexts apart by adapter") {
+    const EngineFiles f;
+    const std::string dir = temp_path("engine_store");
+    std::filesystem::remove_all(dir);
+    EngineConfig c = adapter_engine_config(f.base);
+    c.prefix_cache_mb = 0;  // storage only: every context set aside outlives the engine
+    c.prefix_cache_dir = dir;
+    c.prefix_cache_disk_mb = 64;
+    const std::vector<int32_t> prompt = prompt_of(200, 2), other = prompt_of(200, 5);
+    std::vector<int32_t> base_out, a_out;
+    {
+        auto engine = Engine::create(c);
+        REQUIRE(engine.has_value());
+        Engine& e = **engine;
+        REQUIRE(e.load_adapter("a", f.adapter_a).is_ok());
+        base_out = run(e, prompt);
+        // Selecting A sets the base context aside; A's prompt finds nothing of
+        // it (another seed): processed in full.
+        REQUIRE(e.set_adapter("a").is_ok());
+        const uint64_t restores = e.prefix_cache_stats().restores;
+        GenerationStats st;
+        a_out = run(e, prompt, 12, &st);
+        CHECK(a_out != base_out);
+        CHECK(st.cached_prefix_tokens == 0);
+        CHECK(e.prefix_cache_stats().restores == restores);
+        // Another conversation under A sets A's aside; returning restores it.
+        run(e, other);
+        CHECK(run(e, prompt, 12, &st) == a_out);
+        CHECK(st.cached_prefix_tokens >= 128);
+        CHECK(e.prefix_cache_stats().restores == restores + 1);
+        // Back to the base model: its own context restored, its reply.
+        REQUIRE(e.set_adapter("").is_ok());
+        CHECK(run(e, prompt, 12, &st) == base_out);
+        CHECK(st.cached_prefix_tokens >= 128);
+
+        // A saved state belongs to its adapter.
+        const std::string state = temp_path("engine_state.bin");
+        REQUIRE(e.save_state(state).is_ok());  // the base context
+        REQUIRE(e.set_adapter("a").is_ok());
+        CHECK(e.load_state(state).status().code() == ErrorCode::InvalidArgument);
+        REQUIRE(e.set_adapter("").is_ok());
+        CHECK(e.load_state(state).has_value());
+        REQUIRE(e.set_adapter("a").is_ok());
+        run(e, prompt);
+        REQUIRE(e.save_state(state).is_ok());  // A's context
+        REQUIRE(e.set_adapter("").is_ok());
+        CHECK(e.load_state(state).status().code() == ErrorCode::InvalidArgument);
+        REQUIRE(e.set_adapter("a", 0.5f).is_ok());
+        CHECK(e.load_state(state).status().code() == ErrorCode::InvalidArgument);
+        REQUIRE(e.set_adapter("a").is_ok());
+        auto restored = e.load_state(state);
+        CHECK(restored.has_value());
+        CHECK(run(e, prompt, 12, &st) == a_out);
+        CHECK(st.cached_prefix_tokens >= 128);
+        std::remove(state.c_str());
+    }  // destroyed with A selected: A's context goes to storage under A
+    {
+        // A later engine finds each adapter's contexts on storage under it.
+        auto engine = Engine::create(c);
+        REQUIRE(engine.has_value());
+        Engine& e = **engine;
+        GenerationStats st;
+        CHECK(run(e, prompt, 12, &st) == base_out);
+        CHECK(st.cached_prefix_tokens >= 128);
+        REQUIRE(e.load_adapter("a", f.adapter_a).is_ok());
+        REQUIRE(e.set_adapter("a").is_ok());
+        CHECK(run(e, prompt, 12, &st) == a_out);
+        CHECK(st.cached_prefix_tokens >= 128);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("engine adapters: the memory cap releases the least recently selected, mapped again when selected") {
+    const EngineFiles f(56);  // A: 0.63 MiB, B: 0.09 MiB
+    EngineConfig c = adapter_engine_config(f.base);
+    c.adapter_memory_mb = 1;  // two copies of A do not fit
+    auto engine = Engine::create(c);
+    REQUIRE(engine.has_value());
+    Engine& e = **engine;
+    auto merged = Engine::create(adapter_engine_config(f.merged_a));
+    REQUIRE(merged.has_value());
+    const std::vector<int32_t> prompt = prompt_of(30, 4);
+    REQUIRE(e.load_adapter("a", f.adapter_a).is_ok());
+    REQUIRE(e.set_adapter("a").is_ok());
+    REQUIRE(e.load_adapter("b", f.adapter_b).is_ok());  // A is selected: kept, over the cap with B
+    std::vector<AdapterInfo> info = e.adapters();
+    REQUIRE(info.size() == 2);
+    CHECK(info[0].resident && info[1].resident);
+    std::printf("  adapter sizes: %llu and %llu bytes\n", static_cast<unsigned long long>(info[0].bytes),
+                static_cast<unsigned long long>(info[1].bytes));
+    REQUIRE(e.set_adapter("b").is_ok());
+    REQUIRE(e.set_adapter("").is_ok());
+    REQUIRE(e.load_adapter("a2", f.adapter_a).is_ok());  // A is the least recently selected: released
+    info = e.adapters();
+    CHECK(!info[0].resident && info[1].resident && info[2].resident);
+    REQUIRE(e.set_adapter("a").is_ok());  // mapped again (B released)
+    info = e.adapters();
+    CHECK(info[0].resident && info[0].active);
+    CHECK(run(e, prompt) == run(**merged, prompt));
+    // Too large for the cap on its own.
+    const std::string big = temp_path("engine_big.gguf");
+    write_adapter(big, random_pairs(f.base, per_block(2, {"attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate",
+                                                          "ffn_up", "ffn_down"}),
+                                    128, DType::F32, 9),
+                  1.0f, DType::F32);
+    CHECK(e.load_adapter("big", big).code() == ErrorCode::OutOfMemory);
+    std::remove(big.c_str());
+}
+
+TEST_CASE("engine adapters through the C ABI") {
+    const EngineFiles f;
+    liyab_engine_config c;
+    liyab_engine_config_default(&c);
+    CHECK(c.adapter_memory_mb == 256);
+    c.model_path = f.base.c_str();
+    c.n_threads = 2;
+    c.thermal_polling = 0;
+    c.backend = LIYAB_BACKEND_CPU;
+    liyab_engine* engine = nullptr;
+    REQUIRE(liyab_engine_create(&c, &engine) == LIYAB_OK);
+    CHECK(liyab_engine_adapter_count(engine) == 0);
+    CHECK(liyab_engine_load_adapter(engine, "a", f.adapter_a.c_str()) == LIYAB_OK);
+    CHECK(liyab_engine_load_adapter(engine, std::string(128, 'x').c_str(), f.adapter_b.c_str()) ==
+          LIYAB_ERR_INVALID_ARGUMENT);
+    CHECK(liyab_engine_set_adapter(engine, "a", 0.5f) == LIYAB_OK);
+    CHECK(liyab_engine_adapter_count(engine) == 1);
+    liyab_adapter_info info{};
+    REQUIRE(liyab_engine_adapter_info(engine, 0, &info) == LIYAB_OK);
+    CHECK(std::string(info.name) == "a" && info.rank == 32 && info.matrices == 10 && info.active == 1 &&
+          info.resident == 1 && info.scale == 0.5f && info.bytes > 0);
+    CHECK(liyab_engine_adapter_info(engine, 1, &info) == LIYAB_ERR_INVALID_ARGUMENT);
+    CHECK(liyab_engine_set_adapter(engine, "missing", 1.0f) == LIYAB_ERR_INVALID_ARGUMENT);
+    CHECK(liyab_engine_set_adapter(engine, nullptr, 1.0f) == LIYAB_OK);
+    CHECK(liyab_engine_unload_adapter(engine, "a") == LIYAB_OK);
+    CHECK(liyab_engine_adapter_count(engine) == 0);
+    liyab_engine_destroy(engine);
+}
+
 TEST_MAIN()

@@ -235,6 +235,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->segment_reuse = d.segment_reuse ? 1 : 0;
     config->segment_reuse_max_kl = d.segment_reuse_max_kl;
     config->prefix_cache_lossy = d.prefix_cache_lossy ? 1 : 0;
+    config->adapter_memory_mb = d.adapter_memory_mb;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -298,6 +299,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.segment_reuse = config->segment_reuse != 0;
         c.segment_reuse_max_kl = config->segment_reuse_max_kl;
         c.prefix_cache_lossy = config->prefix_cache_lossy != 0;
+        c.adapter_memory_mb = config->adapter_memory_mb;
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());
@@ -788,6 +790,66 @@ liyab_status liyab_engine_segment_reuse(const liyab_engine* engine, liyab_segmen
                                         info.calibrating ? 1 : 0, info.progress, info.bound};
     }
     return info.status.is_ok() ? LIYAB_OK : fail(info.status);
+}
+
+liyab_status liyab_engine_load_adapter(liyab_engine* engine, const char* name, const char* path) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || name == nullptr || path == nullptr) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine, name and path are required");
+        }
+        // liyab_adapter_info holds the name whole.
+        if (std::strlen(name) >= sizeof(liyab_adapter_info::name)) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "an adapter name is at most 127 bytes");
+        }
+        const liyab::Status s = engine->engine->load_adapter(name, path);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+liyab_status liyab_engine_unload_adapter(liyab_engine* engine, const char* name) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || name == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and name are required");
+        const liyab::Status s = engine->engine->unload_adapter(name);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+liyab_status liyab_engine_set_adapter(liyab_engine* engine, const char* name, float scale) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine is required");
+        const liyab::Status s = engine->engine->set_adapter(name != nullptr ? name : "", scale);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+int32_t liyab_engine_adapter_count(const liyab_engine* engine) {
+    if (engine == nullptr) return 0;
+    try {
+        return static_cast<int32_t>(engine->engine->adapters().size());
+    } catch (...) {
+        return 0;
+    }
+}
+
+liyab_status liyab_engine_adapter_info(const liyab_engine* engine, int32_t index, liyab_adapter_info* out) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || out == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and out are required");
+        const std::vector<liyab::AdapterInfo> all = engine->engine->adapters();
+        if (index < 0 || static_cast<size_t>(index) >= all.size()) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "no adapter at this index");
+        }
+        const liyab::AdapterInfo& a = all[static_cast<size_t>(index)];
+        *out = liyab_adapter_info{};
+        copy_out(a.name, out->name, sizeof out->name);
+        out->alpha = a.alpha;
+        out->rank = a.rank;
+        out->matrices = a.matrices;
+        out->bytes = a.bytes;
+        out->resident = a.resident ? 1 : 0;
+        out->active = a.active ? 1 : 0;
+        out->scale = a.scale;
+        return LIYAB_OK;
+    });
 }
 
 }  // extern "C"

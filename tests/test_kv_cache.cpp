@@ -1212,3 +1212,79 @@ TEST_CASE("The KV store codes chunks only where it pays, measures that once, and
         std::filesystem::remove_all(calibration);
     }
 }
+
+TEST_CASE("The KV store switches seeds: each seed's contexts only under it, in RAM and on storage") {
+    std::mt19937 rng(17);
+    const std::string dir = store_dir("seeds");
+    const std::vector<int32_t> a = random_tokens(rng, 40), b = random_tokens(rng, 40);
+    const uint64_t one[] = {1}, two[] = {2};
+    const KvKey seed1 = kv_seed_key(one), seed2 = kv_seed_key(two);
+    for (const bool hybrid : {false, true}) {
+        std::filesystem::remove_all(dir);
+        const std::vector<KvStore::StateMark> marks = hybrid ? std::vector<KvStore::StateMark>{{40, true}}
+                                                             : std::vector<KvStore::StateMark>{};
+        std::vector<KvKey> chunks1;
+        {
+            auto store = KvStore::open(store_config(size_t{1} << 20, dir, size_t{1} << 20, hybrid, 1));
+            REQUIRE(store != nullptr);
+            CHECK(store->seed() == seed1);
+            CHECK(put(*store, a, marks).whole);
+            chunks1 = store->plan(a, a.size()).chunks;
+            // Another seed: nothing of the first is returned.
+            store->set_seed(seed2);
+            CHECK(store->seed() == seed2);
+            CHECK(store->plan(a, a.size()).positions == 0);
+            CHECK(store->records().empty());
+            // The same tokens under it are other chunks.
+            CHECK(put(*store, a, marks).whole);
+            CHECK(put(*store, b, marks).whole);
+            const KvStore::Plan p2 = store->plan(a, a.size());
+            CHECK(p2.positions == 40);
+            CHECK(p2.chunks != chunks1);
+            CHECK(rows_match(*store, p2, a));
+            CHECK(store->records().size() == 2);
+            // Back: the first seed's context again, its own chunks.
+            store->set_seed(seed1);
+            const KvStore::Plan p1 = store->plan(a, a.size());
+            CHECK(p1.positions == 40);
+            CHECK(p1.chunks == chunks1);
+            CHECK(store->plan(b, b.size()).positions == 0);
+            CHECK(store->records().size() == 1);
+            if (hybrid) {
+                std::vector<float> state(kStateFloats);
+                REQUIRE(read_state(*store, p1.state, state).is_ok());
+                CHECK(state == state_image(a, 40));
+            }
+            put(*store, a, marks, /*storage_only=*/true);  // as an engine being destroyed
+            store->set_seed(seed2);
+            put(*store, b, marks, /*storage_only=*/true);
+        }
+        {
+            // A later store opened under the first seed finds the second's
+            // files once it switches: chunks, states and records (tokens and
+            // text read back).
+            auto store = KvStore::open(store_config(0, dir, size_t{1} << 20, hybrid, 1));
+            REQUIRE(store != nullptr);
+            CHECK(store->records().size() == 1);
+            CHECK(store->plan(b, b.size()).positions == 0);
+            store->set_seed(seed2);
+            CHECK(store->stats().removed_files == 0);
+            CHECK(store->records().size() == 1);  // B's, set aside to storage (A's under this seed stayed in RAM)
+            const KvStore::Plan pb = store->plan(b, b.size());
+            CHECK(pb.positions == 40);
+            CHECK(rows_match(*store, pb, b));
+            bool found = false;
+            for (const KvStore::Record* r : store->records()) found = found || r->tokens == b;
+            CHECK(found);
+            if (hybrid) {
+                std::vector<float> state(kStateFloats);
+                REQUIRE(read_state(*store, pb.state, state).is_ok());
+                CHECK(state == state_image(b, 40));
+            }
+            store->set_seed(seed1);
+            CHECK(store->plan(a, a.size()).positions == 40);
+            CHECK(store->plan(b, b.size()).positions == 0);
+        }
+    }
+    std::filesystem::remove_all(dir);
+}

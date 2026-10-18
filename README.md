@@ -41,6 +41,7 @@ from the command line and **~12–16 tok/s in the app**.
 * [Heat and power](#heat-and-power)
 * [Speculative decoding](#speculative-decoding)
 * [Embeddings and reranking](#embeddings-and-reranking)
+* [LoRA adapters](#lora-adapters)
 * [Using the engine](#using-the-engine): C++, C ABI, Kotlin, Swift, command line
 * [The Liyab app](#the-liyab-app): assistant, agent tools, local OpenAI / Anthropic / gRPC API
 * [Look and feel](#look-and-feel): the living flame, colours, type
@@ -124,6 +125,7 @@ These rules decide what goes into the code:
 | Speculative decoding: draft model, n-gram lookup or suffix drafts from this and earlier conversations, adaptive draft count, hybrid models included | ✅ |
 | Structured output: grammar-constrained decoding (JSON Schema, grammar text; tool calls in the app and the local API) and forced continuations | ✅ |
 | Embeddings and reranking: decoder embedding models and rerankers as their GGUF declares them (last-token or mean pooling, ranking heads, or LM-head labels), shared prefixes computed once | ✅ cross-checked against Hugging Face transformers |
+| LoRA adapters: several GGUF adapters loaded next to one model within a memory cap, selected per generation, computed beside the base matmuls (never merged); dense, hybrid and MoE models (per-expert adapters); contexts kept apart by adapter | ✅ |
 | Heat and power: OS headroom forecast, adaptive pacing, ADPF performance hints, emergency guards, power profiles | ✅ |
 | SoC detection (Snapdragon, Dimensity, Tensor, Exynos, Apple) and backend ranking | ✅ |
 | Qualcomm QNN (Hexagon NPU), MediaTek NeuroPilot | 🟡 detected at runtime; compute falls back to GPU/CPU |
@@ -1093,6 +1095,54 @@ Sharing prefixes skipped 17% of the embedding tokens and 47% of the reranking on
 
 ---
 
+## LoRA adapters
+
+A LoRA adapter specializes a model (a task, a style, a tool format) with a low-rank update of some of its matrices:
+W' = W + s·B·A, where A has `rank` rows and B `rank` columns, rank 8 to 64 against matrices thousands wide. Liyab
+never merges it into the weights. Each adapted matmul adds the update to the base product:
+
+```
+y = W·x + s·B·(A·x)
+```
+
+so several adapters stay loaded next to one model, the one in use is chosen per generation, and a generation
+without one runs exactly as before.
+
+* **The file** is the GGUF LoRA format the common converters write from a PEFT adapter: `general.type` `adapter`,
+  `adapter.type` `lora`, `adapter.lora.alpha`, and for each adapted matrix `<name>.lora_a` (ne {cols, rank}) and
+  `<name>.lora_b` (ne {rank, rows}), a mixture of experts' expert stacks with a third dimension (one A and B per
+  expert). F32, F16 and BF16 tensors are read in place from the mapping; other types are converted to F32 once at
+  load.
+* **Scale**: s = scale · alpha / rank, with each matrix's own rank (alpha 0 or absent: s = scale); `scale` is chosen
+  when the adapter is selected, 1 meaning as trained.
+* **Where it applies**: every matrix the forward pass multiplies whole: attention, DeltaNet and FFN projections
+  (separate or fused), a mixture of experts' router, shared expert and routed experts (each expert its own slice, for
+  the tokens routed to it), latent attention's whole projections, and the LM head. Refused when loaded, naming the
+  tensor: adapters of the token embeddings (they change a lookup, not a matmul), of latent attention's per-head
+  `attn_k_b` / `attn_v_b`, activated LoRA (`adapter.alora.*`), and any matrix whose name or shape the model does not
+  have.
+* **How it is computed**: per group of matmuls sharing an input (Q/K/V, gate/up, one wave of experts), two batched
+  passes of the CPU backend's own kernels, every A·x first (`rank` rows each), then every B·t (`rank` columns), then
+  the adds. Each output value is one dot product computed by one thread, so the result is the same bits for any
+  thread count. With an accelerator, the base product comes from the GPU and the update from the CPU, which reads the
+  adapter in place. Without an adapter selected, a matmul pays one branch.
+* **Several at once**: `Engine::load_adapter(name, path)` maps an adapter, checked against the model (architecture,
+  every matrix's name, shape and expert count), within `EngineConfig::adapter_memory_mb` (256 MiB by default, 0 turns
+  adapters off). Past the cap the least recently selected adapters are released and mapped again from their files
+  when selected. `Engine::set_adapter(name, scale)` selects the one later calls apply (generate, prefill, embed,
+  rerank); `set_adapter("")` goes back to the base model; `Engine::adapters()` lists them.
+* **Contexts never cross adapters.** The live context is continued only while the same adapter and scale stay
+  selected. Selecting another sets it aside in the prefix cache under the adapter it was computed with, and the next
+  prompt starts from what the cache keeps for the new one. The prefix cache's key seed covers the adapter (a hash of
+  its file) and the scale, so its chunks, in RAM and on storage across runs, are only restored under the adapter that
+  computed them. `save_state()` records the adapter; `load_state()` refuses a context saved under another one.
+* **Speculative decoding** verifies every draft with the adapter applied, so the output is the adapter's. A draft
+  model drafts without it, which may lower acceptance, not change the output.
+* **Segment reuse** is off while an adapter is selected (its share was calibrated on the base model): marked prompts
+  are processed as usual, exactly.
+
+---
+
 ## Using the engine
 
 ### C++
@@ -1205,6 +1255,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_render_chat` / `_chat_format` | The model's chat template applied to a conversation (JSON); its layout of turns and whether it is prefix-stable |
 | `liyab_engine_embed` / `_rerank` | Pooling models: one vector per text; one relevance score per document of a query |
 | `liyab_engine_pooling` / `_embedding_size` | What the model pools (none, mean, last token, rank); the values per vector |
+| `liyab_engine_load_adapter` / `_unload_adapter` / `_set_adapter` / `_adapter_count` / `_adapter_info` | [LoRA adapters](#lora-adapters): load several next to the model, select the one later calls apply (and its scale), list them |
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
@@ -1223,6 +1274,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 * `cache_dir`, where what is measured once per model is kept (the KV cache's key scales, latent attention's
   form ratio, segment reuse's calibration);
 * segment reuse (`segment_reuse`, its target `segment_reuse_max_kl`);
+* the memory cap of loaded LoRA adapters (`adapter_memory_mb`);
 * KV type, sliding window and sinks, and the KV type of pooling models (`pooling_kv_cache_type`, F16 by default);
 * speculative decoding (draft model, lookup or suffix drafts);
 * the MoE trade-offs;
@@ -2014,8 +2066,9 @@ interpreter: `describe_model_registry`.
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier, each in the absorbed and the expanded form, the expanded one also with a sliding window and sinks) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
 | `test_pooling` | Embeddings and reranking: the pooling metadata (type, EOS, ranking head and labels, prompt; unusable heads reported, the model still loading), prompt templates, normalization and `dimensions`, scores of one or several labels; a last-token vector is the state the LM head reads, a mean the mean of every token's state across passes, a score the head's softmax (with and without bias) or the LM head's over `labels`; the same bits alone, in any batch and order with shared prefixes, on hybrid models and through a sliding window; which pooling applies and what is refused, inputs past the context, truncation; the context left empty and a conversation restored from the prefix cache; the F16 KV of pooling models; cancellation; the C API |
-| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; segments kept as contexts no prompt's chain reaches, found by their tokens whatever position they were computed at, the most recently used copy first, a segment that starts another kept apart, on storage for a later store; chunk encodings: lossless bit for bit for F16, Q8_0, Q4_0 and Q4_1, two planes and one, whole and partial chunks, on one thread and on a pool, malformed payloads failing cleanly, the 4-bit encoding within one step of what it quantizes over; compressed chunks on storage counted by their files, read by a later store, older raw files still read, a lossy store's chunks kept apart from a lossless one's, a damaged compressed payload removed when read, chunks of two pages read into parts cut off the page boundary; coding only where the given costs say it pays (raw files otherwise), measured costs kept and found again, reads ahead in order, with a chunk skipped and out of order |
+| `test_kv_cache` | Paging and reuse, sinks over 5,000 positions, quantization accuracy, values read from the key rows (latent attention) bit for bit in half the memory; pages out as chunk images and back bit for bit (whole, partial, values in keys); the KV store on synthetic chunks: a shared prefix kept once, a prompt restored to where it diverges, hybrid restores to the deepest state reached with the snapshots below and an image shared by two chunks, both caps never exceeded with LRU eviction leaf first and a context used again outliving newer ones, RAM spilling to storage and back, a context too large for both, files persisting in LRU order, one store per directory, other seeds' files kept and never returned, interrupted writes, foreign and damaged files and broken chains removed; segments kept as contexts no prompt's chain reaches, found by their tokens whatever position they were computed at, the most recently used copy first, a segment that starts another kept apart, on storage for a later store; chunk encodings: lossless bit for bit for F16, Q8_0, Q4_0 and Q4_1, two planes and one, whole and partial chunks, on one thread and on a pool, malformed payloads failing cleanly, the 4-bit encoding within one step of what it quantizes over; compressed chunks on storage counted by their files, read by a later store, older raw files still read, a lossy store's chunks kept apart from a lossless one's, a damaged compressed payload removed when read, chunks of two pages read into parts cut off the page boundary; coding only where the given costs say it pays (raw files otherwise), measured costs kept and found again, reads ahead in order, with a chunk skipped and out of order; the store's seed switched while open (each seed's contexts returned only under it, in RAM and on storage, chunks, states and records found by a later store and its records read back) |
 | `test_kv_reuse` | KV reused away from its prefix: rows copied out of and into any positions bit for bit (values in keys too); keys moved to other positions equal to the keys computed there, within two rounding steps, for every RoPE variant (adjacent and half pairs, partial rotation, `rope_freqs` with linear scaling, YaRN, LongRoPE, Q/K norms after RoPE, windowed and global RoPE tables, latent attention's RoPE key) and every cache format, key scales included, with values, unrotated latents and moves by 0 keeping their bits; blocks run at scattered positions giving the rows and logits of a whole pass bit for bit (dense, windowed, latent attention, MoE); hybrid models and sliding-window caches refused; segments reused with every token recomputed giving a full prefill's rows and logits bit for bit for every criterion (dense, key-scaled, windowed, latent attention), stored in chunks of one, two and four pages and starting inside a page, a copy reused where it was computed needing none, a damaged copy processed instead; a segment's tokens the same wherever it appears, BOS outside it, malformed ranges refused; through the engine: segments kept and reused elsewhere, one longer than two of the store's chunks reused whole, a request that marks none getting a fresh context's reply (the reused rows processed again, set aside and saved only up to the first one, restored state included), refusals with their reasons (off, no prefix cache, a hybrid model, a target never met, read back from `cache_dir`) leaving marked prompts exact; the calibration in stages, stopped and resumed, keeping the smallest share whose bound, and every larger share's, is within its target (a question-guided criterion with a pass per question); in the background: the engine created at once, marked prompts processed as usual until the calibration ends, a call stopping it without `Busy` and finding its context as it left it, the result read back from `cache_dir`, an engine closed while it runs; the C API (`Busy` while calibrating) |
+| `test_lora` | LoRA adapters: base model + adapter giving the logits of the model with the adapter merged into its weights (prefill and decoding), for dense blocks and the LM head, F32 / F16 / BF16 / Q8_0 adapter tensors, QKV bias, a mixture of experts' routed experts (split and fused gate/up), shared expert and router, hybrid DeltaNet blocks and latent attention's whole projections; no adapter giving the base bits back; malformed files and unsupported targets refused (half pairs, stray tensors, mismatched ranks, missing or misshapen matrices, token embeddings, activated LoRA, latent attention's per-head matrices); through the engine: adapters loaded, listed and selected per generation (the merged model's replies, the base model's without, a context continued only under the same adapter and scale), speculative decoding verifying with the adapter, the prefix cache and saved states keeping contexts apart by adapter (in RAM, on storage across engines), the memory cap releasing the least recently selected and mapping it again, refusals; the C API |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item, the final logit soft-cap giving the same bits on 1 and N threads (and its cost on a 256k vocabulary); the engine's own tanh within 1.32 ulp of the true one, odd, monotone and saturating, its results hashed to the same pinned value on every platform |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |

@@ -38,6 +38,11 @@
 // same bytes back (exit status 1 otherwise), so its comparison against a
 // reference saved without the option shows KL 0.
 // The two runs are separate processes: a 35B MoE does not fit twice in RAM.
+//
+// --lora ADAPTER.gguf [--lora-scale S] runs the model with a LoRA adapter
+// (core/lora.h) applied at scale S (default 1), as the engine applies a
+// selected one: a reference written by tools/conform_reference.py --lora
+// (transformers + PEFT with the same adapter) measures its conformance.
 // The text goes through in passes of --batch tokens (64 by default);
 // --latent-form pins how a latent-attention model attends (auto, absorbed or
 // expanded), to measure what one form's rounding moves against the other;
@@ -87,6 +92,7 @@ int usage() {
                  "                [--kv f16|q8_0|q4_0|q4_1 (default q8_0)] [--no-key-scaling] [--ref-tokens]\n"
                  "                [--max-kl KL] [--min-top1 PERCENT] [--batch N (default 64)]\n"
                  "                [--latent-form auto|absorbed|expanded] [--store-codec lossless|lossy4]\n"
+                 "                [--lora ADAPTER.gguf [--lora-scale S (default 1)]]\n"
                  "  --no-key-scaling   quantized caches: store keys as computed, not per-channel scaled\n"
                  "  --ref-tokens       compare on the reference's token ids, not this build's encoding\n"
                  "  --max-kl KL        fail (exit 1) when the mean KL divergence exceeds KL\n"
@@ -95,7 +101,8 @@ int usage() {
                  "  --latent-form F    latent attention: auto (default), absorbed or expanded\n"
                  "  --store-codec C    encode and decode every KV page the text fills as the prefix cache\n"
                  "                     stores chunks (lossless | lossy4), later positions attending to the\n"
-                 "                     decoded rows; prints the ratio and the time per MiB\n");
+                 "                     decoded rows; prints the ratio and the time per MiB\n"
+                 "  --lora A           apply the LoRA adapter A (scale S: s = S * alpha / rank per matrix)\n");
     return 2;
 }
 
@@ -153,6 +160,8 @@ int main(int argc, char** argv) {
     double max_kl = -1.0, min_top1 = -1.0;  // < 0: no gate
     int32_t chunk = kChunk;
     liyab::LatentForm latent_form = liyab::LatentForm::Auto;
+    std::string lora_path;
+    float lora_scale = 1.0f;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -186,6 +195,8 @@ int main(int argc, char** argv) {
         else if (arg == "--max-kl") max_kl = std::atof(next());
         else if (arg == "--min-top1") min_top1 = std::atof(next());
         else if (arg == "--batch") chunk = std::max(1, std::atoi(next()));
+        else if (arg == "--lora") lora_path = next();
+        else if (arg == "--lora-scale") lora_scale = static_cast<float>(std::atof(next()));
         else if (arg == "--latent-form") {
             const std::string v = next();
             if (v == "auto") latent_form = liyab::LatentForm::Auto;
@@ -305,6 +316,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "latent form calibration: %s\n", ratio.status().to_string().c_str());
             return 1;
         }
+    }
+    // After the calibrations, which the engine measures on the base model.
+    std::unique_ptr<liyab::LoraAdapter> adapter;
+    if (!lora_path.empty()) {
+        auto loaded_adapter = liyab::LoraAdapter::load(lora_path);
+        const liyab::Status s = loaded_adapter ? model->set_adapter(loaded_adapter->get(), lora_scale)
+                                               : loaded_adapter.status();
+        if (!s.is_ok()) {
+            std::fprintf(stderr, "adapter: %s\n", s.to_string().c_str());
+            return 1;
+        }
+        adapter = std::move(loaded_adapter).value();
+        std::printf("adapter: %zu matrices, rank %d, alpha %g, scale %g\n", adapter->targets().size(),
+                    adapter->max_rank(), static_cast<double>(adapter->alpha()), static_cast<double>(lora_scale));
     }
     const auto vocab = static_cast<size_t>(model->config().n_vocab);
 
