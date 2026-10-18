@@ -176,10 +176,21 @@ struct TransformerOptions {
     // Latent attention (DeepSeek-V2/V3 and models converted alike): the
     // form passes attend in. Ignored by other models.
     LatentForm latent_form = LatentForm::Auto;
+    // Contexts the embedder will make besides the live one (make_context():
+    // the engine's sequences), and the rollback window it will give them.
+    // Only for the memory plan of a MoE whose experts stream: each one's
+    // recurrent states, kStateSnapshots snapshots and rollback checkpoints
+    // (hybrid models) come out of the expert cache, as the live context's
+    // snapshots do. 0: none (the plan of a single context).
+    int32_t extra_contexts = 0;
+    int32_t extra_rollback_window = 0;
 };
 
 class Transformer {
 public:
+    // One sequence's state; see "Several sequences" below.
+    class Context;
+
     static Result<std::unique_ptr<Transformer>> load(std::unique_ptr<MmapLoader> file, const TransformerOptions& options);
 
     [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
@@ -662,6 +673,58 @@ public:
     Status set_adapter(const LoraAdapter* adapter, float scale = 1.0f, ThreadPool* pool = nullptr);
     [[nodiscard]] const LoraAdapter* adapter() const noexcept { return adapter_; }
 
+    // ---- Several sequences (the engine's sequences) ----
+    // Everything above works on the live context: the KV cache, the
+    // positions it holds, the recurrent states with their rollback
+    // checkpoints and snapshots, a pending tree pass and the adapter bound
+    // with set_adapter(). Other sequences' contexts are parked in Context
+    // objects, sharing the weights, the scratch and the expert cache.
+    //
+    // A new, empty context laid out as the live one (KV cache settings,
+    // recurrent states, rollback window); no adapter. Its KV pages are
+    // mapped as it is used, its recurrent states are allocated now
+    // (recurrent_state_bytes(), zero).
+    [[nodiscard]] Result<std::unique_ptr<Context>> make_context() const;
+    // Makes the context parked in `other` the live one and parks the live
+    // one in `other`: O(1), no copy. An empty Context() (made with its
+    // default constructor) may take the live one, leaving no live context:
+    // swap again before any other call. Not during a pass.
+    void swap_context(Context& other) noexcept;
+    // One sequence's part of a forward_batch() pass: `tokens` appended to
+    // `context` (nullptr: the live context), its logits (None: none, Last:
+    // its last token's, All: every token's) and whether its recurrent states
+    // are checkpointed for a rollback (set_checkpointing(), per item).
+    struct BatchItem {
+        Context* context = nullptr;
+        std::span<const int32_t> tokens;
+        Logits logits = Logits::Last;
+        bool checkpoint = false;
+    };
+    // One pass over several sequences: every item's tokens go through each
+    // block together, so the matmuls run over all of their rows at once (a
+    // mixture of experts reads the union of the experts they choose), while
+    // each item attends to its own KV cache at its own positions, continues
+    // its own recurrent states, applies its own context's adapter and, with
+    // latent attention, attends in the form its own pass would take. Each
+    // item's rows are the bits forward() over its tokens alone gives on the
+    // CPU backend (a row's matmul does not depend on the batch around it,
+    // and attention depends on the token's position only), and its context
+    // ends where that forward() leaves it. `out[i]` receives item i's
+    // logits (n_vocab floats per row; empty for None), valid until the
+    // next pass. Hooks: head masking, FFN matmul overrides and `cancel`
+    // apply to every item; early exit and FFN skipping are single-token
+    // decoding steps' and are refused (InvalidArgument), as are items
+    // sharing a context, an empty item, a context awaiting keep_path() and
+    // a token outside the vocabulary. ContextFull as forward(). Cancelled
+    // between blocks: every item's context goes back to where the pass
+    // started (abandon_pass(); a hybrid context without a snapshot there
+    // is reset, which the caller sees as n_past() 0). On any other failure
+    // the contexts keep their positions as before the pass.
+    Status forward_batch(std::span<const BatchItem> items, const Route& route, ThreadPool& pool,
+                         std::vector<std::span<const float>>& out, const ForwardHooks* hooks = nullptr);
+    // Positions a parked context holds (n_past() of the live one).
+    [[nodiscard]] static int32_t positions_of(const Context& context) noexcept;
+
 private:
     // Matrices of one block, by role; unused roles stay nullptr.
     enum WeightRole : size_t {
@@ -722,20 +785,48 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
-    // Position of token t of the current batch: n_past_ + t, n_past_ + its
-    // depth in a tree pass (forward_tree), or positions_[t] while
-    // run_block_at() runs a batch at scattered positions. Its RoPE angle and
-    // what it may see follow from it.
-    [[nodiscard]] int32_t pos_of(int32_t t) const noexcept {
-        if (!positions_.empty()) return positions_[static_cast<size_t>(t)];
-        return n_past_ + (tree_depth_.empty() ? t : tree_depth_[static_cast<size_t>(t)]);
+    // One sequence's part of the current pass (segs_): its tokens are rows
+    // [first, first + n) of the batch, and the state they read and write is
+    // its context's, the live one's (forward(), and every pass of a single
+    // sequence) or a parked one's (forward_batch()). Resolved once per pass,
+    // so the blocks never look a context up.
+    struct BoundAdapter;
+    using AdapterMap = std::unordered_map<std::string_view, BoundAdapter>;
+    struct Segment {
+        int32_t first = 0;
+        int32_t n = 0;
+        KvCache* kv = nullptr;
+        int32_t n_past = 0;  // positions held before the pass
+        std::vector<RecurrentState>* states = nullptr;
+        int32_t rollback = 0;     // its rollback window (ring slots)
+        bool checkpoint = false;  // record checkpoints of its last `rollback` tokens
+        const AdapterMap* adapter = nullptr;  // nullptr: none
+        bool expanded = false;    // latent attention in the expanded form
+        Logits logits = Logits::None;
+        Context* context = nullptr;  // nullptr: the live context
+    };
+    // Position of batch row t of segment s: s.n_past + its index in s,
+    // s.n_past + its depth in a tree pass (forward_tree), or positions_[t]
+    // while run_block_at() runs a batch at scattered positions. Its RoPE
+    // angle and what it may see follow from it.
+    [[nodiscard]] int32_t pos_of(const Segment& s, int32_t t) const noexcept {
+        if (!positions_.empty()) return positions_[static_cast<size_t>(t - s.first)];
+        return s.n_past + (tree_depth_.empty() ? t - s.first : tree_depth_[static_cast<size_t>(t - s.first)]);
     }
-    // Cache slot holding token t's KV rows: its position, except in a tree
+    // Cache slot holding row t's KV rows: its position, except in a tree
     // pass, where tokens at one depth are alternatives and each has the slot
-    // n_past_ + t until keep_path().
-    [[nodiscard]] int32_t row_of(int32_t t) const noexcept {
-        return positions_.empty() ? n_past_ + t : positions_[static_cast<size_t>(t)];
+    // n_past + its index until keep_path().
+    [[nodiscard]] int32_t row_of(const Segment& s, int32_t t) const noexcept {
+        return positions_.empty() ? s.n_past + (t - s.first) : positions_[static_cast<size_t>(t - s.first)];
     }
+    // The segment of batch row t (the only one outside forward_batch()).
+    [[nodiscard]] size_t segment_of(int32_t t) const noexcept {
+        return segs_.size() == 1 ? 0 : static_cast<size_t>(seg_of_[static_cast<size_t>(t)]);
+    }
+    // The live context as a segment of the pass: rows [first, first + n).
+    [[nodiscard]] Segment live_segment(int32_t first, int32_t n, Logits logits) noexcept;
+    // A pass of the live context alone over n rows (segs_, adapters).
+    void begin_live_pass(int32_t n, Logits logits) noexcept;
     // Sizes the per-token scratch for a batch of n tokens.
     void size_batch(int32_t n);
     // One block over the batch in x_ (n rows, token t at pos_of(t)): the
@@ -764,18 +855,19 @@ private:
     // Absorbed form: each head's query from mla_q_ as [q_pe | W_kb,h^T
     // q_nope,h] into q_ (unrotated). The per-head matrices run on the CPU.
     Status latent_absorb(const BlockWeights& w, int32_t n, const Route& route);
-    // Expanded form, once the batch's key rows are stored and its queries in
-    // mla_q_ rotated: attends each head over the positions the batch sees,
+    // Expanded form, once segment s's key rows are stored and its queries in
+    // mla_q_ rotated: attends each head over the positions its tokens see,
     // their keys [W_kb,h c | k_pe] and values W_vb,h c expanded from the
-    // cached rows tile by tile, and leaves each token's heads (v_dim
-    // channels each) in att_. See the definition for the layout and why the
-    // result does not depend on the batch.
-    Status latent_expanded(int32_t layer, const BlockWeights& w, int32_t n, ThreadPool& pool,
+    // cached rows tile by tile, and leaves each of its tokens' heads (v_dim
+    // channels each) in att_ (rows of other segments untouched). See the
+    // definition for the layout and why the result does not depend on the
+    // batch.
+    Status latent_expanded(int32_t layer, const BlockWeights& w, const Segment& s, ThreadPool& pool,
                            const uint8_t* head_mask);
-    // The positions the n tokens of the pass see in a block with `window`,
+    // The positions the tokens of segment s see in a block with `window`,
     // merged into ascending disjoint ranges [first, end) (mla_union_), and
     // the number of (token, visible position) pairs.
-    int64_t latent_visible(int32_t n, int32_t window);
+    int64_t latent_visible(const Segment& s, int32_t window);
     // Expanded form: positions per tile of expanded keys and values, from
     // the model's shape only (so tile bounds, which set the order a token's
     // softmax is merged in, never depend on the pass).
@@ -806,9 +898,11 @@ private:
     Status attach_expert_store(int64_t budget_option, uint64_t memory_budget, size_t reserve, int32_t requant_bits,
                                bool repack);
     // Softmax attention of the batch's queries (q_) over the cached keys and
-    // values of attention block `kv_slot`; `window` > 0 limits each query to
-    // its last `window` positions (within what the KV cache keeps visible).
-    // Leaves each token's heads in att_, value_dim channels per head.
+    // values of attention block `kv_slot`, each segment's tokens over its own
+    // cache (segments in the expanded latent form are left out: see
+    // latent_expanded); `window` > 0 limits each query to its last `window`
+    // positions (within what the KV cache keeps visible). Leaves each
+    // token's heads in att_, value_dim channels per head.
     void attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
@@ -825,13 +919,19 @@ private:
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
                         std::span<float* const> ys, int32_t n);
-    // The active adapter's items for matmuls ys[i] = x · ws[i]ᵀ (matrices it
-    // does not adapt are skipped) into adapter_items_; false when none.
+    // The active adapters' items for matmuls ys[i] = x · ws[i]ᵀ of n rows
+    // (matrices an adapter does not adapt are skipped) into adapter_items_:
+    // with one segment, its adapter over all n rows; in a pass of several,
+    // each segment's adapter over its own rows (adapter_rows_ while the
+    // logits of forward_batch() are computed). False when none.
     bool collect_adapter_items(std::span<const TensorView* const> ws, const float* x, std::span<float* const> ys,
                                int32_t n);
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of
     // x_, then the final soft-cap (if any) on `pool`.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
+    // The same over the hidden rows `rows` of x_ (any order), into logits_
+    // rows 0, 1, ... (forward_batch()).
+    Status compute_logits_rows(const Route& route, std::span<const int32_t> rows, ThreadPool& pool);
     // Early exit: writes K/V for blocks [from, n_layers) of the single token
     // at `pos` from the current hidden state, so later tokens stay coherent.
     Status propagate_kv(const Route& route, int32_t from, int32_t pos);
@@ -842,6 +942,22 @@ private:
     int32_t max_batch_ = 0;
     int32_t n_past_ = 0;
     std::span<const int32_t> positions_;  // run_block_at(): the batch's positions (see pos_of)
+    // The current pass's segments (one but in forward_batch()), each row's
+    // segment when there are several, and forward_batch()'s tokens one
+    // segment after another.
+    std::vector<Segment> segs_;
+    std::vector<int32_t> seg_of_;
+    std::vector<int32_t> batch_tokens_;
+    // forward_batch()'s logits pass: per segment with an adapter, its rows
+    // among the logits rows ({first, count, adapter}); empty otherwise.
+    struct AdapterRows {
+        int32_t first = 0;
+        int32_t n = 0;
+        const AdapterMap* adapter = nullptr;
+    };
+    std::vector<AdapterRows> adapter_rows_;
+    bool logits_rows_ = false;  // forward_batch()'s logits pass: adapters by adapter_rows_
+    bool adapters_in_pass_ = false;
     // Tree pass (forward_tree): per token its depth, its parent (-1: the
     // root) and the batch index of its ancestor at each depth up to its own
     // (tree_ancestors_[t * tree_stride_ + d]), which attention reads the rows
@@ -911,6 +1027,8 @@ private:
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
     std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
+    std::vector<KvCache::RowView> row_views_;           // attention: each segment's rows of the block
+    std::vector<int32_t> attn_rows_;                    // attention: the rows attending, when not every row
     std::vector<quant::BlockQ8_0> q8_queries_;          // attention: Q8_0 queries for quantized caches
     std::vector<float> qg_, gate_;                     // gated attention: raw [q | gate] rows, gates
     std::vector<float> qkv_;                           // fused attention projection: raw [q | k | v] rows
@@ -942,11 +1060,43 @@ private:
         float scale = 0.0f;
     };
     const LoraAdapter* adapter_ = nullptr;
-    std::unordered_map<std::string_view, BoundAdapter> adapter_targets_;
+    AdapterMap adapter_targets_;
     LoraRunner adapter_runner_;
     ThreadPool* adapter_pool_ = nullptr;
     std::vector<LoraRunner::Item> adapter_items_;
     std::vector<Backend::MatmulItem> adapter_batch_;  // base and A·x matmuls of one group
+};
+
+// A parked sequence's state (Transformer::make_context(), swap_context(),
+// forward_batch()): what the live context holds in the transformer's own
+// members. Default-constructed it is empty (no KV cache): only a place for
+// swap_context() to park the live context in. Not thread-safe; used under
+// the embedder's lock on the transformer.
+class Transformer::Context {
+public:
+    Context() = default;
+    ~Context() = default;
+    Context(const Context&) = delete;
+    Context& operator=(const Context&) = delete;
+    // Whether it holds a context (else it is an empty place to park one).
+    [[nodiscard]] bool holds() const noexcept { return kv_ != nullptr; }
+    // KV cache bytes it maps now.
+    [[nodiscard]] size_t kv_bytes() const noexcept { return kv_ ? kv_->bytes_in_use() : 0; }
+
+private:
+    friend class Transformer;
+    std::unique_ptr<KvCache> kv_;
+    int32_t n_past_ = 0;
+    std::vector<RecurrentState> states_;
+    std::vector<int32_t> checkpoint_pos_;
+    int32_t rollback_window_ = 0;
+    bool checkpointing_ = true;
+    std::vector<StateSnapshot> snapshots_;
+    std::vector<StateBuffer> spare_buffers_;
+    int32_t tree_base_ = -1;
+    std::vector<int32_t> tree_parent_;
+    const LoraAdapter* adapter_ = nullptr;
+    AdapterMap adapter_targets_;
 };
 
 }  // namespace liyab

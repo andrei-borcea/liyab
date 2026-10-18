@@ -1370,8 +1370,29 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 // compute only).
 void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
-    // The block's rows, their group and offsets resolved once for the pass.
-    const KvCache::RowView rows = kv_->row_view(kv_slot);
+    // Each segment's rows of the block, their group and offsets resolved
+    // once for the pass (a pass of several sequences reads several caches).
+    row_views_.clear();
+    bool all_rows = true;  // every segment attends here (not latent attention's expanded ones)
+    for (const Segment& s : segs_) {
+        row_views_.push_back(s.kv->row_view(kv_slot));
+        all_rows = all_rows && !s.expanded;
+    }
+    // The rows attending: every row of the batch, or the absorbed segments'
+    // rows of a latent pass that also has expanded ones (attn_rows_). Tasks
+    // and partial results are indexed by a row's place among them.
+    int32_t m = n;
+    if (!all_rows) {
+        attn_rows_.clear();
+        for (const Segment& s : segs_) {
+            if (s.expanded) continue;
+            for (int32_t t = s.first; t < s.first + s.n; ++t) attn_rows_.push_back(t);
+        }
+        m = static_cast<int32_t>(attn_rows_.size());
+        if (m == 0) return;
+    }
+    const int32_t* row_list = all_rows ? nullptr : attn_rows_.data();
+    auto row_at = [row_list](int64_t i) { return row_list == nullptr ? static_cast<int32_t>(i) : row_list[i]; };
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
     // Values may be narrower than keys (latent attention: the latent part of
@@ -1381,7 +1402,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const size_t out_dim = static_cast<size_t>(c.n_head) * uvd;  // att_ row: every head's output
     const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
     const float softcap = c.attn_softcap;
-    const DType kv_type = kv_->dtype();
+    const DType kv_type = segs_.front().kv->dtype();  // every context's cache has the same format
     const bool quantized_kv = quant::is_block_quantized(kv_type);
     const auto uhd = static_cast<size_t>(hd);
     const auto ugroup = static_cast<size_t>(group);
@@ -1392,11 +1413,12 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     // copy of each query (same kernels as the weight matmuls), made once per
     // (token, head) rather than in every span.
     if (quantized_kv) {
-        const auto rows = static_cast<int64_t>(n) * c.n_head;
-        q8_queries_.resize(static_cast<size_t>(rows) * q8_per_head);
+        const auto rows = static_cast<int64_t>(m) * c.n_head;
+        q8_queries_.resize(static_cast<size_t>(n) * n_head * q8_per_head);
         auto quantize = [&](int64_t begin, int64_t end) {
             for (int64_t r = begin; r < end; ++r) {
-                const auto row = static_cast<size_t>(r);
+                const size_t row =
+                    static_cast<size_t>(row_at(r / c.n_head)) * n_head + static_cast<size_t>(r % c.n_head);
                 quant::quantize_row_q8_0(q_.data() + row * uhd, q8_queries_.data() + row * q8_per_head, hd);
             }
         };
@@ -1409,12 +1431,13 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     auto spans_for = [](int32_t n_visible) {
         return std::clamp(n_visible / kAttentionMinSpan, 1, kAttentionMaxSpans);
     };
-    // Positions a query at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
-    auto seen = [&](int32_t pos) { return seen_by(*kv_, pos, window); };
+    // Positions a query of segment s at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
+    auto seen = [&](const Segment& s, int32_t pos) { return seen_by(*s.kv, pos, window); };
     auto spans_of = [&](int32_t t) {
-        const int32_t pos = pos_of(t);
-        const Seen s = seen(pos);
-        return spans_for(s.sink_end - s.sink_begin + (pos - s.first + 1));
+        const Segment& s = segs_[segment_of(t)];
+        const int32_t pos = pos_of(s, t);
+        const Seen v = seen(s, pos);
+        return spans_for(v.sink_end - v.sink_begin + (pos - v.first + 1));
     };
 
     // Span sp of token t for the query heads of KV head g. For head j of the
@@ -1426,18 +1449,21 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         thread_local std::vector<float> vrow;    // one V row, decoded (vd values)
         thread_local std::vector<float> dots;    // one K row against the group's queries
         thread_local std::vector<const quant::BlockQ8_0*> queries;  // the group's Q8_0 queries
-        const int32_t pos = pos_of(t);
+        const size_t si = segment_of(t);
+        const Segment& s = segs_[si];
+        const KvCache::RowView& rows = row_views_[si];
+        const int32_t pos = pos_of(s, t);
         // Visible positions: attention sinks [sink_begin, sink_end) + [first, pos].
-        const Seen vis = seen(pos);
+        const Seen vis = seen(s, pos);
         const int32_t n_sinks = vis.sink_end - vis.sink_begin;
         const int32_t n_visible = n_sinks + (pos - vis.first + 1);
-        // A tree pass reads the rows of positions n_past_ + d (the batch's
+        // A tree pass reads the rows of positions n_past + d (the batch's
         // own) from the slot of the token's ancestor at depth d: its branch.
         const int32_t* ancestors =
-            tree_depth_.empty() ? nullptr : tree_ancestors_.data() + static_cast<size_t>(t) * tree_stride_;
+            tree_depth_.empty() ? nullptr : tree_ancestors_.data() + static_cast<size_t>(t - s.first) * tree_stride_;
         auto position = [&](int32_t i) {
             const int32_t p = i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks);
-            return ancestors == nullptr || p < n_past_ ? p : n_past_ + ancestors[p - n_past_];
+            return ancestors == nullptr || p < s.n_past ? p : s.n_past + ancestors[p - s.n_past];
         };
         const int32_t spans = spans_for(n_visible);
         const auto i0 = static_cast<int32_t>(int64_t{n_visible} * sp / spans);
@@ -1530,15 +1556,19 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         for (size_t d = 0; d < uvd; ++d) dst[d] *= inv;
     };
 
-    // The last token sees the most positions; in a tree pass, the deepest.
-    int32_t max_spans = spans_of(n - 1);
+    // A segment's last token sees the most of its positions; in a tree
+    // pass, the deepest.
+    int32_t max_spans = 1;
+    for (const Segment& s : segs_) {
+        if (!s.expanded) max_spans = std::max(max_spans, spans_of(s.first + s.n - 1));
+    }
     for (int32_t t = 0; !tree_depth_.empty() && t + 1 < n; ++t) max_spans = std::max(max_spans, spans_of(t));
-    const int64_t pairs = int64_t{n} * c.n_head_kv;
+    const int64_t pairs = int64_t{m} * c.n_head_kv;
     if (max_spans == 1 || pairs >= int64_t{pool.max_threads()} * ThreadPool::kChunksPerThread) {
         pool.parallel_for(pairs, [&](int64_t begin, int64_t end) {
             thread_local std::vector<float> mx, sm, out;  // [head of the group][span]
             for (int64_t task = begin; task < end; ++task) {
-                const auto t = static_cast<int32_t>(task / c.n_head_kv);
+                const int32_t t = row_at(task / c.n_head_kv);
                 const auto g = static_cast<int32_t>(task % c.n_head_kv);
                 const int32_t spans = spans_of(t);
                 const auto uspans = static_cast<size_t>(spans);
@@ -1557,19 +1587,20 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         });
         return;
     }
-    // Partial results per (token, query head, span slot).
+    // Partial results per (attending row, query head, span slot).
     const auto slots = static_cast<size_t>(max_spans);
-    part_max_.resize(static_cast<size_t>(n) * n_head * slots);
+    part_max_.resize(static_cast<size_t>(m) * n_head * slots);
     part_sum_.resize(part_max_.size());
     part_out_.resize(part_max_.size() * uvd);
-    auto base = [&](int32_t t, int32_t h) { return (static_cast<size_t>(t) * n_head + static_cast<size_t>(h)) * slots; };
+    auto base = [&](int64_t i, int32_t h) { return (static_cast<size_t>(i) * n_head + static_cast<size_t>(h)) * slots; };
     pool.parallel_for(pairs * max_spans, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const auto sp = static_cast<int32_t>(task % max_spans);
-            const auto t = static_cast<int32_t>(task / max_spans / c.n_head_kv);
+            const int64_t i = task / max_spans / c.n_head_kv;
+            const int32_t t = row_at(i);
             const auto g = static_cast<int32_t>(task / max_spans % c.n_head_kv);
             if (sp >= spans_of(t)) continue;  // an earlier token of the batch sees fewer positions
-            const size_t at = base(t, g * group) + static_cast<size_t>(sp);
+            const size_t at = base(i, g * group) + static_cast<size_t>(sp);
             score_span(t, g, sp, part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd, slots);
         }
     });
@@ -1578,22 +1609,23 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     constexpr int32_t kParallelMergeSpans = 32;
     auto merge_range = [&](int64_t begin, int64_t end) {
         for (int64_t th = begin; th < end; ++th) {
-            const auto t = static_cast<int32_t>(th / c.n_head);
+            const int64_t i = th / c.n_head;
+            const int32_t t = row_at(i);
             const auto h = static_cast<int32_t>(th % c.n_head);
-            const size_t at = base(t, h);
+            const size_t at = base(i, h);
             merge(t, h, spans_of(t), part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd);
         }
     };
     if (max_spans >= kParallelMergeSpans) {
-        pool.parallel_for(int64_t{n} * c.n_head, merge_range);
+        pool.parallel_for(int64_t{m} * c.n_head, merge_range);
     } else {
-        merge_range(0, int64_t{n} * c.n_head);
+        merge_range(0, int64_t{m} * c.n_head);
     }
 }
 
 Status Transformer::matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y,
                            int32_t n) {
-    if (!adapter_targets_.empty()) {
+    if (adapters_in_pass_) {
         const TensorView* ws[] = {&w};
         float* ys[] = {y};
         return matmul_group(route, backend, ws, x, ys, n);
@@ -1605,7 +1637,7 @@ Status Transformer::matmul(const Route& route, Backend* backend, const TensorVie
 
 Status Transformer::matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws,
                                  const float* x, std::span<float* const> ys, int32_t n) {
-    if (!adapter_targets_.empty() && collect_adapter_items(ws, x, ys, n)) {
+    if (adapters_in_pass_ && collect_adapter_items(ws, x, ys, n)) {
         // The A·x matmuls go with the base ones on the CPU backend (one
         // parallel pass); an accelerator's base products land in host memory
         // like the CPU's, and its A·x run on the CPU after them.
@@ -1635,10 +1667,24 @@ Status Transformer::matmul_group(const Route& route, Backend* backend, std::span
 bool Transformer::collect_adapter_items(std::span<const TensorView* const> ws, const float* x,
                                         std::span<float* const> ys, int32_t n) {
     adapter_items_.clear();
-    for (size_t i = 0; i < ws.size(); ++i) {
-        const auto it = adapter_targets_.find(ws[i]->name);
-        if (it == adapter_targets_.end() || it->second.target->experts > 0) continue;
-        adapter_items_.push_back({it->second.target, 0, it->second.scale, x, ys[i], n});
+    // Rows [first, first + count) of x and of every y, with `adapter`.
+    auto add = [&](const AdapterMap& adapter, int32_t first, int32_t count) {
+        for (size_t i = 0; i < ws.size(); ++i) {
+            const auto it = adapter.find(ws[i]->name);
+            if (it == adapter.end() || it->second.target->experts > 0) continue;
+            const LoraTarget* t = it->second.target;
+            adapter_items_.push_back({t, 0, it->second.scale, x + static_cast<size_t>(first) * static_cast<size_t>(t->a.ne[0]),
+                                      ys[i] + static_cast<size_t>(first) * static_cast<size_t>(t->rows), count});
+        }
+    };
+    if (segs_.size() == 1) {  // one sequence: its adapter over every row of this matmul
+        if (segs_.front().adapter != nullptr) add(*segs_.front().adapter, 0, n);
+    } else if (logits_rows_) {  // forward_batch()'s logits: the rows each segment has among them
+        for (const AdapterRows& r : adapter_rows_) add(*r.adapter, r.first, r.n);
+    } else {
+        for (const Segment& s : segs_) {
+            if (s.adapter != nullptr) add(*s.adapter, s.first, s.n);
+        }
     }
     return !adapter_items_.empty();
 }
@@ -1963,7 +2009,7 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
     std::vector<float> input(un * d);
     for (float& v : input) v = normal(rng);
     for (size_t t = 0; t < un; ++t) rmsnorm(input.data() + t * d, L.attn_norm.data(), input.data() + t * d, c.n_embd, c.rms_eps);
-    const int64_t pairs = latent_visible(n, L.window);
+    const int64_t pairs = latent_visible(live_segment(0, n, Logits::None), L.window);
     int64_t positions = 0;
     for (const auto& [a, b] : mla_union_) positions += b - a;
     const LatentFormChooser::Work work = LatentFormChooser::work(c, n, pairs, positions);
@@ -1977,6 +2023,7 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
             for (const bool expanded : {false, true}) {
                 std::copy(input.begin(), input.end(), xb_.begin());
                 latent_expanded_ = expanded;
+                begin_live_pass(n, Logits::None);
                 latent_ms_ = 0.0;
                 status = latent_attention_mixer(layer, w, n, route, pool, nullptr);
                 if (!status.is_ok()) break;
@@ -2028,21 +2075,23 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             }
         }
     }
-    for (size_t t = 0; t < un; ++t) {
-        float* q = q_.data() + t * q_dim;
-        float* k = k_.data() + t * kv_dim;
-        float* v = v_.data() + t * kv_dim;
-        for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
-        for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
-        for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
-        if (!norm_after_rope) qk_norm(L, q, k);
-        const int32_t pos = pos_of(static_cast<int32_t>(t));
-        if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-        rope(q, c.n_head, pos, rope_table);
-        rope(k, c.n_head_kv, pos, rope_table);
-        if (norm_after_rope) qk_norm(L, q, k);
-        scale_keys(L.kv_slot, q, k);
-        kv_->store(L.kv_slot, row_of(static_cast<int32_t>(t)), k, v);
+    for (const Segment& s : segs_) {
+        for (auto t = static_cast<size_t>(s.first); t < static_cast<size_t>(s.first + s.n); ++t) {
+            float* q = q_.data() + t * q_dim;
+            float* k = k_.data() + t * kv_dim;
+            float* v = v_.data() + t * kv_dim;
+            for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
+            for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
+            for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
+            if (!norm_after_rope) qk_norm(L, q, k);
+            const int32_t pos = pos_of(s, static_cast<int32_t>(t));
+            if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
+            rope(q, c.n_head, pos, rope_table);
+            rope(k, c.n_head_kv, pos, rope_table);
+            if (norm_after_rope) qk_norm(L, q, k);
+            scale_keys(L.kv_slot, q, k);
+            s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, v);
+        }
     }
     attention(L.kv_slot, L.window, n, pool, head_mask);
     if (gated) {
@@ -2144,12 +2193,12 @@ Status Transformer::latent_absorb(const BlockWeights& w, int32_t n, const Route&
     return Status::ok();
 }
 
-int64_t Transformer::latent_visible(int32_t n, int32_t window) {
+int64_t Transformer::latent_visible(const Segment& seg, int32_t window) {
     mla_union_.clear();
     int64_t pairs = 0;
-    for (int32_t t = 0; t < n; ++t) {
-        const int32_t pos = n_past_ + t;
-        const Seen s = seen_by(*kv_, pos, window);
+    for (int32_t t = 0; t < seg.n; ++t) {
+        const int32_t pos = seg.n_past + t;
+        const Seen s = seen_by(*seg.kv, pos, window);
         pairs += (s.sink_end - s.sink_begin) + (pos - s.first + 1);
         if (s.sink_end > s.sink_begin) mla_union_.emplace_back(s.sink_begin, s.sink_end);
         mla_union_.emplace_back(s.first, pos + 1);
@@ -2196,12 +2245,14 @@ int32_t Transformer::latent_tile() const noexcept {
 // position, its query and the cached rows: the same bits however a prompt is
 // split into passes and however many threads run (within this form; the
 // absorbed form rounds differently).
-Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_t n, ThreadPool& pool,
+Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, const Segment& seg, ThreadPool& pool,
                                     const uint8_t* head_mask) {
     const ModelConfig& c = config_;
     const LatentAttention& m = c.mla;
     const Layer& L = layers_[static_cast<size_t>(layer)];
-    const auto un = static_cast<size_t>(n);
+    // The segment's tokens, 0..un-1 here; batch row first + i in q_, mla_q_ and att_.
+    const auto un = static_cast<size_t>(seg.n);
+    const auto first = static_cast<size_t>(seg.first);
     const auto heads = static_cast<size_t>(c.n_head);
     const auto rd = static_cast<size_t>(c.rope_dim);
     const auto rank = static_cast<size_t>(m.kv_rank);
@@ -2254,13 +2305,14 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
     // att_ in the [token][head][v] order attn_output reads.
     mla_max_.assign(un * heads, -INFINITY);
     mla_sum_.assign(un * heads, 0.0f);
-    std::fill(att_.begin(), att_.begin() + static_cast<std::ptrdiff_t>(un * heads * vd), 0.0f);
+    float* const att = att_.data() + first * heads * vd;  // this segment's rows (others' are left as they are)
+    std::fill(att, att + un * heads * vd, 0.0f);
     const float scale = c.attn_scale;
     const float softcap = c.attn_softcap;
-    const DType kv_type = kv_->dtype();
+    const DType kv_type = seg.kv->dtype();
     const float* key_scales = key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd;
     const int32_t tile = latent_tile();
-    latent_visible(n, L.window);
+    latent_visible(seg, L.window);
     const int32_t lo = mla_union_.front().first;
     const int32_t hi = mla_union_.back().second;
     for (int32_t t0 = lo / tile * tile; t0 < hi; t0 += tile) {
@@ -2282,7 +2334,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
             key.resize(kd);
             for (int64_t j = j0; j < j1; ++j) {
                 const auto uj = static_cast<size_t>(j);
-                const uint8_t* src = kv_->k_row(L.kv_slot, mla_rows_[uj], 0);
+                const uint8_t* src = seg.kv->k_row(L.kv_slot, mla_rows_[uj], 0);
                 quant::dequantize_row(kv_type, src, key.data(), static_cast<int64_t>(kd));
                 if (key_scales != nullptr) {
                     for (size_t i = 0; i < kd; ++i) key[i] *= key_scales[i];
@@ -2340,8 +2392,8 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                 // Each token's visible rows, as index ranges into the ascending mla_rows_.
                 size_t lo = urows, hi = 0;
                 for (size_t j = 0; j < count; ++j) {
-                    const int32_t pos = n_past_ + static_cast<int32_t>(g0 + j);
-                    const Seen s = seen_by(*kv_, pos, L.window);
+                    const int32_t pos = seg.n_past + static_cast<int32_t>(g0 + j);
+                    const Seen s = seen_by(*seg.kv, pos, L.window);
                     ranges[j][0] = {index(s.sink_begin), index(s.sink_end)};
                     ranges[j][1] = {index(std::max(s.first, s.sink_end)), index(pos + 1)};
                     for (const auto& [i0, i1] : ranges[j]) {
@@ -2357,7 +2409,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                     const size_t c1 = std::min(hi, c0 + kAttendRows);
                     for (size_t j0 = 0; j0 < count; j0 += block) {
                         const float* q[kScoreQueries];
-                        for (size_t j = 0; j < block; ++j) q[j] = mla_q_.data() + ((g0 + token(j0, j)) * heads + h) * qk;
+                        for (size_t j = 0; j < block; ++j) q[j] = mla_q_.data() + ((first + g0 + token(j0, j)) * heads + h) * qk;
                         for (size_t i = c0; i < c1; i += kScoreKeys) {
                             const float* k[kScoreKeys];
                             for (size_t r = 0; r < static_cast<size_t>(kScoreKeys); ++r) {
@@ -2379,7 +2431,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                 // weights exp(score - maximum) in place of the scores, their sum.
                 for (size_t j = 0; j < count; ++j) {
                     const size_t ut = (g0 + j) * heads + h;
-                    float* o = att_.data() + ut * vd;
+                    float* o = att + ut * vd;
                     float* sc = scores.data() + j * urows;
                     float tile_max = -INFINITY;
                     for (const auto& [i0, i1] : ranges[j]) {
@@ -2415,7 +2467,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
                         size_t common0 = 0, common1 = 0;  // rows every token of the block sees, if no sinks
                         bool together = in_block == block;
                         for (size_t j = 0; j < in_block; ++j) {
-                            o[j] = att_.data() + ((g0 + j0 + j) * heads + h) * vd;
+                            o[j] = att + ((g0 + j0 + j) * heads + h) * vd;
                             w[j] = scores.data() + (j0 + j) * urows;
                             const auto& rg = ranges[j0 + j];
                             together = together && rg[0].first >= rg[0].second;
@@ -2449,7 +2501,7 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, int32_
     for (size_t i = 0; i < un * heads; ++i) {
         if (mla_sum_[i] == 0.0f) continue;  // a pruned head stays zero
         const float inv = 1.0f / mla_sum_[i];
-        float* o = att_.data() + i * vd;
+        float* o = att + i * vd;
         for (size_t d = 0; d < vd; ++d) o[d] *= inv;
     }
     return Status::ok();
@@ -2470,62 +2522,78 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     const auto kd = static_cast<size_t>(c.head_dim);
     const size_t qk = nope + rd;
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
-    const bool expanded = latent_expanded_;
+    // Each segment attends in its own form (the one its pass alone would
+    // take); a pass of a single sequence has one form.
+    bool any_absorbed = false, any_expanded = false;
+    for (const Segment& s : segs_) (s.expanded ? any_expanded : any_absorbed) = true;
 
     LIYAB_RETURN_IF_ERROR(latent_project(layer, w, n, route, route.attention, true));
     auto start = Clock::now();
-    if (!expanded) LIYAB_RETURN_IF_ERROR(latent_absorb(w, n, route));
+    if (any_absorbed) LIYAB_RETURN_IF_ERROR(latent_absorb(w, n, route));  // every row: the same bits for each
     double form_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-    for (size_t t = 0; t < un; ++t) {
-        float* k = k_.data() + t * kd;
-        const int32_t pos = pos_of(static_cast<int32_t>(t));
-        if (expanded) {
-            // Queries stay [q_nope | q_pe] per head; only q_pe turns. Keys are
-            // stored scaled as in the absorbed form (the cache is shared).
-            rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
-            rope(k, 1, pos, rope_table);
-            scale_keys(L.kv_slot, nullptr, k);
-        } else {
-            float* q = q_.data() + t * heads * kd;
-            if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-            rope(q, c.n_head, pos, rope_table);
-            rope(k, 1, pos, rope_table);
-            scale_keys(L.kv_slot, q, k);
+    for (const Segment& s : segs_) {
+        for (auto t = static_cast<size_t>(s.first); t < static_cast<size_t>(s.first + s.n); ++t) {
+            float* k = k_.data() + t * kd;
+            const int32_t pos = pos_of(s, static_cast<int32_t>(t));
+            if (s.expanded) {
+                // Queries stay [q_nope | q_pe] per head; only q_pe turns. Keys are
+                // stored scaled as in the absorbed form (the cache is shared).
+                rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
+                rope(k, 1, pos, rope_table);
+                scale_keys(L.kv_slot, nullptr, k);
+            } else {
+                float* q = q_.data() + t * heads * kd;
+                if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
+                rope(q, c.n_head, pos, rope_table);
+                rope(k, 1, pos, rope_table);
+                scale_keys(L.kv_slot, q, k);
+            }
+            s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
         }
-        kv_->store(L.kv_slot, row_of(static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
     }
     start = Clock::now();
-    if (expanded) {
-        LIYAB_RETURN_IF_ERROR(latent_expanded(layer, w, n, pool, head_mask));
-    } else {
-        // att_: per token and head, the softmax-weighted latent (value_dim = rank).
+    if (any_absorbed) {
+        // att_: per absorbed token and head, the softmax-weighted latent
+        // (value_dim = rank), rows `rank` wide per head.
         attention(L.kv_slot, L.window, n, pool, head_mask);
 
         // Per head, the weighted latent becomes the head's value: W_vb,h c. Keys
         // stored with per-channel scales carried their latent divided by them,
         // so the latent is multiplied back first (exact for each channel).
+        // Every absorbed row is read before any is written in the [token]
+        // [head][value] layout (narrower: v_dim <= rank), and expanded
+        // segments write theirs after this (latent_expanded()).
         const float* scales =
             key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd + rd;
-        mla_heads_in_.resize(heads * un * rank);
-        for (size_t t = 0; t < un; ++t) {
+        const int32_t* listed = any_expanded ? attn_rows_.data() : nullptr;  // the rows attention() attended
+        const size_t m = any_expanded ? attn_rows_.size() : un;
+        auto row_at = [listed](size_t i) { return listed == nullptr ? i : static_cast<size_t>(listed[i]); };
+        mla_heads_in_.resize(heads * m * rank);
+        for (size_t i = 0; i < m; ++i) {
+            const size_t t = row_at(i);
             for (size_t h = 0; h < heads; ++h) {
                 const float* src = att_.data() + (t * heads + h) * rank;
-                float* dst = mla_heads_in_.data() + (h * un + t) * rank;
+                float* dst = mla_heads_in_.data() + (h * m + i) * rank;
                 if (scales == nullptr) {
                     std::copy(src, src + rank, dst);
                 } else {
-                    for (size_t i = 0; i < rank; ++i) dst[i] = src[i] * scales[i];
+                    for (size_t j = 0; j < rank; ++j) dst[j] = src[j] * scales[j];
                 }
             }
         }
-        mla_heads_out_.resize(heads * un * vd);
-        LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kVb], mla_heads_in_.data(), mla_heads_out_.data(), n));
-        for (size_t t = 0; t < un; ++t) {  // [token][head][value], the order attn_output reads
+        mla_heads_out_.resize(heads * m * vd);
+        LIYAB_RETURN_IF_ERROR(per_head_matmul(route, w[kVb], mla_heads_in_.data(), mla_heads_out_.data(),
+                                              static_cast<int32_t>(m)));
+        for (size_t i = 0; i < m; ++i) {  // [token][head][value], the order attn_output reads
+            const size_t t = row_at(i);
             for (size_t h = 0; h < heads; ++h) {
-                const float* src = mla_heads_out_.data() + (h * un + t) * vd;
+                const float* src = mla_heads_out_.data() + (h * m + i) * vd;
                 std::copy(src, src + vd, att_.data() + (t * heads + h) * vd);
             }
         }
+    }
+    for (const Segment& s : segs_) {
+        if (s.expanded) LIYAB_RETURN_IF_ERROR(latent_expanded(layer, w, s, pool, head_mask));
     }
     form_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     latent_ms_ += form_ms;
@@ -2547,7 +2615,6 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                                     ThreadPool& pool) {
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
-    RecurrentState& st = states_[static_cast<size_t>(L.state_slot)];
     const auto un = static_cast<size_t>(n);
     const auto hd = static_cast<size_t>(c.ssm_head_dim);
     const auto hk = static_cast<size_t>(c.ssm_k_heads);
@@ -2569,64 +2636,82 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
     }
 
-    // Checkpoints: the state after each of the last rollback_window_ tokens of
-    // the batch, for truncate(); slot = position % window, layout [conv | ssm].
-    const size_t per_state = st.conv.size() + st.ssm.size();
-    const bool checkpoint = rollback_window_ > 0 && checkpointing_;
-    auto slot_of = [&](size_t t) -> float* {
-        if (!checkpoint || t + static_cast<size_t>(rollback_window_) < un) return nullptr;
-        return st.checkpoints.data() +
-               static_cast<size_t>((n_past_ + static_cast<int32_t>(t)) % rollback_window_) * per_state;
+    // Each segment continues its own states (segments_ in order: tasks below
+    // are (segment, head) pairs; a segment's token i is batch row first + i).
+    // Checkpoints: the state after each of the last `rollback` tokens of the
+    // segment, for truncate(); slot = position % rollback, layout [conv | ssm].
+    auto state_of = [&](const Segment& s) -> RecurrentState& { return (*s.states)[static_cast<size_t>(L.state_slot)]; };
+    auto slot_of = [&](const Segment& s, RecurrentState& st, size_t i) -> float* {
+        if (!s.checkpoint || i + static_cast<size_t>(s.rollback) < static_cast<size_t>(s.n)) return nullptr;
+        return st.checkpoints.data() + static_cast<size_t>((s.n_past + static_cast<int32_t>(i)) % s.rollback) *
+                                           (st.conv.size() + st.ssm.size());
     };
 
-    // Tree pass: a token whose parent is not the token before it (a branch
-    // other than the first) continues from its parent's state, which the
-    // parent's checkpoint holds (forward_tree() keeps one for every token).
+    // Tree pass (one segment): a token whose parent is not the token before
+    // it (a branch other than the first) continues from its parent's state,
+    // which the parent's checkpoint holds (forward_tree() keeps one for every
+    // token).
     const int32_t* parent = tree_depth_.empty() ? nullptr : tree_parent_.data();
-    auto branches = [&](size_t t) { return parent != nullptr && t > 0 && parent[t] != static_cast<int32_t>(t) - 1; };
+    auto branches = [&](size_t i) { return parent != nullptr && i > 0 && parent[i] != static_cast<int32_t>(i) - 1; };
+    const auto segments = static_cast<int64_t>(segs_.size());
 
     // 1. Causal depthwise convolution over [history, current] and SiLU, every
-    //    channel through all n tokens (channels are independent, tokens are
-    //    not), then the L2 norm of each query / key head. One task per head of
-    //    channels: 2 hk query/key heads, then hv value heads.
+    //    channel through all of a segment's tokens (channels are independent,
+    //    tokens are not), then the L2 norm of each query / key head. One task
+    //    per segment and head of channels: 2 hk query/key heads, then hv value
+    //    heads.
     const auto conv_tasks = static_cast<int64_t>(2 * hk + hv);
-    pool.parallel_for(conv_tasks, [&](int64_t begin, int64_t end) {
-        for (auto task = static_cast<size_t>(begin); task < static_cast<size_t>(end); ++task) {
+    pool.parallel_for(conv_tasks * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / conv_tasks)];
+            RecurrentState& st = state_of(s);
+            const auto task = static_cast<size_t>(job % conv_tasks);
+            const auto first = static_cast<size_t>(s.first);
+            const auto count = static_cast<size_t>(s.n);
             const size_t ch0 = task * hd;  // query heads, key heads and value heads are hd channels each
             for (size_t ch = ch0; ch < ch0 + hd; ++ch) {
                 float* hist = st.conv.data() + ch * history;
                 const float* tap = L.conv1d.data() + ch * taps;
-                for (size_t t = 0; t < un; ++t) {
-                    if (branches(t)) {
-                        const float* from = slot_of(static_cast<size_t>(parent[t])) + ch * history;
+                for (size_t i = 0; i < count; ++i) {
+                    if (branches(i)) {
+                        const float* from = slot_of(s, st, static_cast<size_t>(parent[i])) + ch * history;
                         std::copy(from, from + history, hist);
                     }
-                    float* m = mix_.data() + t * conv_dim;
+                    float* m = mix_.data() + (first + i) * conv_dim;
                     float acc = m[ch] * tap[history];
                     for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
                     for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
                     hist[history - 1] = m[ch];
                     m[ch] = silu(acc);
-                    if (float* slot = slot_of(t)) std::copy(hist, hist + history, slot + ch * history);
+                    if (float* slot = slot_of(s, st, i)) std::copy(hist, hist + history, slot + ch * history);
                 }
             }
             if (task < 2 * hk) {
-                for (size_t t = 0; t < un; ++t) l2norm(mix_.data() + t * conv_dim + ch0, static_cast<int32_t>(hd), c.rms_eps);
+                for (size_t i = 0; i < count; ++i) {
+                    l2norm(mix_.data() + (first + i) * conv_dim + ch0, static_cast<int32_t>(hd), c.rms_eps);
+                }
             }
         }
     });
 
-    // 2. The recurrence, one task per value head through all n tokens (heads
-    //    are independent), then the head's gated RMSNorm.
+    // 2. The recurrence, one task per segment and value head through all of
+    //    the segment's tokens (heads are independent), then the head's gated
+    //    RMSNorm.
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    pool.parallel_for(static_cast<int64_t>(hv), [&](int64_t begin, int64_t end) {
-        for (auto h = static_cast<size_t>(begin); h < static_cast<size_t>(end); ++h) {
+    const auto heads = static_cast<int64_t>(hv);
+    pool.parallel_for(heads * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / heads)];
+            RecurrentState& st = state_of(s);
+            const auto h = static_cast<size_t>(job % heads);
+            const auto first = static_cast<size_t>(s.first);
             float* S = st.ssm.data() + h * hd * hd;
-            for (size_t t = 0; t < un; ++t) {
-                if (branches(t)) {
-                    const float* from = slot_of(static_cast<size_t>(parent[t])) + st.conv.size() + h * hd * hd;
+            for (size_t i = 0; i < static_cast<size_t>(s.n); ++i) {
+                if (branches(i)) {
+                    const float* from = slot_of(s, st, static_cast<size_t>(parent[i])) + st.conv.size() + h * hd * hd;
                     std::copy(from, from + hd * hd, S);
                 }
+                const size_t t = first + i;
                 const float* m = mix_.data() + t * conv_dim;
                 const float* q = m + (h % hk) * hd;
                 const float* k = m + key_dim + (h % hk) * hd;
@@ -2638,7 +2723,7 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                 const float* z = z_.data() + t * value_dim + h * hd;
                 rmsnorm(o, L.ssm_norm.data(), o, static_cast<int32_t>(hd), c.rms_eps);
                 for (size_t j = 0; j < hd; ++j) o[j] *= silu(z[j]);
-                if (float* slot = slot_of(t)) std::copy(S, S + hd * hd, slot + st.conv.size() + h * hd * hd);
+                if (float* slot = slot_of(s, st, i)) std::copy(S, S + hd * hd, slot + st.conv.size() + h * hd * hd);
             }
         }
     });
@@ -2854,7 +2939,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
             // The hook replaced the base matmul only: an adapter's update still applies.
             const TensorView* ws[] = {&m};
             float* ys[] = {y};
-            if (adapter_targets_.empty() || !collect_adapter_items(ws, x, ys, n)) return Status::ok();
+            if (!adapters_in_pass_ || !collect_adapter_items(ws, x, ys, n)) return Status::ok();
             return adapter_runner_.apply(*route.cpu, adapter_items_, adapter_pool_);
         }
         return matmul(route, route.ffn, m, x, y, n);
@@ -3048,12 +3133,27 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             for (const int32_t ex : wave) expert_store_->release(layer, ex);
         }
     };
-    // Queues the active adapter's update of one expert's matmul `item` when
-    // it adapts the stack `stack` (see set_adapter()).
-    auto add_expert_update = [&](const TensorView& stack, int32_t expert, const Backend::MatmulItem& item) {
-        const auto it = adapter_targets_.find(stack.name);
-        if (it == adapter_targets_.end() || it->second.target->experts == 0) return;
-        adapter_items_.push_back({it->second.target, expert, it->second.scale, item.x, item.y, item.n});
+    // Queues the active adapters' updates of one expert's matmul `item` over
+    // its users' rows (in token order), when they adapt the stack `stack`
+    // (see set_adapter()): each segment's users with its own adapter (one
+    // run for a single sequence).
+    auto add_expert_update = [&](const TensorView& stack, int32_t expert, const Backend::MatmulItem& item,
+                                 const std::vector<Use>& users) {
+        for (size_t u0 = 0; u0 < users.size();) {
+            const Segment& s = segs_[segment_of(users[u0].token)];
+            size_t u1 = u0 + 1;
+            while (u1 < users.size() && users[u1].token < s.first + s.n) ++u1;
+            if (s.adapter != nullptr) {
+                const auto it = s.adapter->find(stack.name);
+                if (it != s.adapter->end() && it->second.target->experts > 0) {
+                    const LoraTarget* t = it->second.target;
+                    adapter_items_.push_back({t, expert, it->second.scale,
+                                              item.x + u0 * static_cast<size_t>(t->a.ne[0]),
+                                              item.y + u0 * static_cast<size_t>(t->rows), static_cast<int32_t>(u1 - u0)});
+                }
+            }
+            u0 = u1;
+        }
     };
     for (size_t next = 0; next < chosen.size();) {
         wave.clear();
@@ -3128,13 +3228,14 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         // Per-expert adapters: expert e's slice for the tokens routed to it,
         // A·x in the wave's own batch.
         adapter_items_.clear();
-        if (!adapter_targets_.empty()) {
+        if (adapters_in_pass_) {
             for (size_t i = 0; i < wave.size(); ++i) {
+                const auto& users = assigned[static_cast<size_t>(wave[i])];
                 if (fused) {
-                    add_expert_update(w[kUpExps], wave[i], items[i]);
+                    add_expert_update(w[kUpExps], wave[i], items[i], users);
                 } else {
-                    add_expert_update(w[kGateExps], wave[i], items[2 * i]);
-                    add_expert_update(w[kUpExps], wave[i], items[2 * i + 1]);
+                    add_expert_update(w[kGateExps], wave[i], items[2 * i], users);
+                    add_expert_update(w[kUpExps], wave[i], items[2 * i + 1], users);
                 }
             }
             adapter_runner_.add_a_matmuls(adapter_items_, items);
@@ -3158,8 +3259,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             items.push_back({&views[i][2], eh_.data() + first_row[i] * ff, eout_.data() + first_row[i] * d, rows});
         }
         adapter_items_.clear();
-        if (!adapter_targets_.empty()) {
-            for (size_t i = 0; i < wave.size(); ++i) add_expert_update(w[kDownExps], wave[i], items[i]);
+        if (adapters_in_pass_) {
+            for (size_t i = 0; i < wave.size(); ++i) {
+                add_expert_update(w[kDownExps], wave[i], items[i], assigned[static_cast<size_t>(wave[i])]);
+            }
             adapter_runner_.add_a_matmuls(adapter_items_, items);
         }
         const Status down_status = route.cpu->matmul_batch(items);
@@ -3333,6 +3436,7 @@ Status Transformer::run_block_at(int32_t layer, std::span<const int32_t> positio
         size_batch(static_cast<int32_t>(m));
         std::copy_n(x.data() + i * d, m * d, x_.data());
         positions_ = positions.subspan(i, m);
+        begin_live_pass(static_cast<int32_t>(m), Logits::None);
         status = run_block(layer, w, static_cast<int32_t>(m), route, pool, nullptr, nullptr, nullptr);
         positions_ = {};
         if (status.is_ok()) std::copy_n(x_.data(), m * d, x.data() + i * d);
@@ -3559,7 +3663,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
                 break;
             }
         }
-        const int64_t pairs = latent_visible(n, window);
+        const int64_t pairs = latent_visible(live_segment(0, n, logits), window);
         int64_t positions = 0;
         for (const auto& [a, b] : mla_union_) positions += b - a;
         latent_work = LatentFormChooser::work(c, n, pairs, positions);
@@ -3571,6 +3675,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     const auto un = static_cast<size_t>(n);
     size_batch(n);
     LIYAB_RETURN_IF_ERROR(embed(tokens, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
+    begin_live_pass(n, logits);
 
     for (int32_t l = 0; l < c.n_layers; ++l) {
         if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
@@ -3818,6 +3923,261 @@ Status Transformer::truncate(int32_t n) {
         pin_snapshots();
     }
     n_past_ = n;
+    return Status::ok();
+}
+
+// ---------------------------------------------------------------------------
+// Several sequences
+// ---------------------------------------------------------------------------
+Transformer::Segment Transformer::live_segment(int32_t first, int32_t n, Logits logits) noexcept {
+    Segment s;
+    s.first = first;
+    s.n = n;
+    s.kv = kv_.get();
+    s.n_past = n_past_;
+    s.states = &states_;
+    s.rollback = rollback_window_;
+    s.checkpoint = rollback_window_ > 0 && checkpointing_;
+    s.adapter = adapter_targets_.empty() ? nullptr : &adapter_targets_;
+    s.expanded = latent_expanded_;
+    s.logits = logits;
+    return s;
+}
+
+void Transformer::begin_live_pass(int32_t n, Logits logits) noexcept {
+    segs_.assign(1, live_segment(0, n, logits));  // reuses the vector's storage: no allocation per pass
+    seg_of_.clear();
+    adapter_rows_.clear();
+    adapters_in_pass_ = segs_.front().adapter != nullptr;
+}
+
+Result<std::unique_ptr<Transformer::Context>> Transformer::make_context() const {
+    if (!kv_) return Status(ErrorCode::InvalidArgument, "make_context: no live context to lay a new one out like");
+    auto kv = KvCache::create(kv_->config());
+    if (!kv) return kv.status();
+    auto context = std::make_unique<Context>();
+    context->kv_ = std::move(kv).value();
+    context->states_.resize(states_.size());
+    for (size_t i = 0; i < states_.size(); ++i) {
+        RecurrentState& st = context->states_[i];
+        st.conv.assign(states_[i].conv.size(), 0.0f);
+        st.ssm.assign(states_[i].ssm.size(), 0.0f);
+        st.checkpoints.assign(static_cast<size_t>(rollback_window_) * (st.conv.size() + st.ssm.size()), 0.0f);
+    }
+    context->rollback_window_ = rollback_window_;
+    context->checkpoint_pos_.assign(static_cast<size_t>(rollback_window_), -1);
+    return context;
+}
+
+void Transformer::swap_context(Context& other) noexcept {
+    std::swap(kv_, other.kv_);
+    std::swap(n_past_, other.n_past_);
+    states_.swap(other.states_);
+    checkpoint_pos_.swap(other.checkpoint_pos_);
+    std::swap(rollback_window_, other.rollback_window_);
+    std::swap(checkpointing_, other.checkpointing_);
+    snapshots_.swap(other.snapshots_);
+    spare_buffers_.swap(other.spare_buffers_);
+    std::swap(tree_base_, other.tree_base_);
+    tree_parent_.swap(other.tree_parent_);
+    std::swap(adapter_, other.adapter_);
+    adapter_targets_.swap(other.adapter_targets_);
+}
+
+int32_t Transformer::positions_of(const Context& context) noexcept { return context.n_past_; }
+
+Status Transformer::compute_logits_rows(const Route& route, std::span<const int32_t> rows, ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const size_t d = static_cast<size_t>(c.n_embd);
+    const PhaseTimer timer(phases_.lm_head);
+    file_->begin_layer(c.n_layers);  // output head slot of the prefetch window
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rmsnorm(x_.data() + static_cast<size_t>(rows[i]) * d, output_norm_.data(), xb_.data() + i * d, c.n_embd,
+                c.rms_eps);
+    }
+    logits_.resize(rows.size() * static_cast<size_t>(c.n_vocab));
+    LIYAB_RETURN_IF_ERROR(
+        matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), static_cast<int32_t>(rows.size())));
+    if (c.final_softcap > 0.0f) apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
+    return Status::ok();
+}
+
+// One pass over several sequences. Everything a sequence's own state decides
+// (its positions, what each token sees, its recurrent states and their
+// checkpoints, its adapter, latent attention's form) is taken per segment,
+// exactly as forward() takes it for that sequence alone; everything else
+// runs over the rows of every segment at once, which is where the pass saves:
+// each weight is read once for all of them (dense models in RAM are bound by
+// that read when decoding), and a mixture of experts reads each chosen expert
+// once for every token that chose it.
+Status Transformer::forward_batch(std::span<const BatchItem> items, const Route& route, ThreadPool& pool,
+                                  std::vector<std::span<const float>>& out, const ForwardHooks* hooks) {
+    const ModelConfig& c = config_;
+    out.clear();
+    last_exit_layer_ = -1;
+    last_ffn_skips_ = 0;
+    predicted_layer_ = -1;
+    if (items.empty()) return Status(ErrorCode::InvalidArgument, "forward_batch() needs at least one sequence");
+    if (route.attention == nullptr || route.ffn == nullptr || route.cpu == nullptr) {
+        return Status(ErrorCode::InvalidArgument, "incomplete backend route");
+    }
+    if (hooks != nullptr && (hooks->early_exit != nullptr || hooks->ffn_skip != nullptr)) {
+        return Status(ErrorCode::InvalidArgument,
+                      "forward_batch(): early exit and FFN skipping apply to single-token decoding steps only");
+    }
+    if (!kv_) return Status(ErrorCode::InvalidArgument, "forward_batch(): no live context");
+    segs_.clear();
+    int32_t total = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const BatchItem& item = items[i];
+        Context* ctx = item.context;
+        if (item.tokens.empty()) return Status(ErrorCode::InvalidArgument, "forward_batch(): a sequence without tokens");
+        for (const int32_t id : item.tokens) {
+            if (id < 0 || id >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "token id out of range");
+        }
+        if (ctx != nullptr && !ctx->holds()) {
+            return Status(ErrorCode::InvalidArgument, "forward_batch(): an empty context");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (items[j].context == ctx) {
+                return Status(ErrorCode::InvalidArgument, "forward_batch(): two items of one context");
+            }
+        }
+        if ((ctx != nullptr ? ctx->tree_base_ : tree_base_) >= 0) {
+            return Status(ErrorCode::InvalidArgument, "a tree pass awaits keep_path()");
+        }
+        const auto n = static_cast<int32_t>(item.tokens.size());
+        Segment s;
+        if (ctx == nullptr) {
+            s = live_segment(total, n, item.logits);
+        } else {
+            s.first = total;
+            s.n = n;
+            s.kv = ctx->kv_.get();
+            s.n_past = ctx->n_past_;
+            s.states = &ctx->states_;
+            s.rollback = ctx->rollback_window_;
+            s.adapter = ctx->adapter_targets_.empty() ? nullptr : &ctx->adapter_targets_;
+            s.logits = item.logits;
+            s.context = ctx;
+        }
+        s.checkpoint = s.rollback > 0 && item.checkpoint;
+        s.expanded = false;
+        segs_.push_back(s);
+        total += n;
+    }
+    auto n_past_of = [&](const Segment& s) -> int32_t& { return s.context != nullptr ? s.context->n_past_ : n_past_; };
+    auto ring_of = [&](const Segment& s) -> std::vector<int32_t>& {
+        return s.context != nullptr ? s.context->checkpoint_pos_ : checkpoint_pos_;
+    };
+    for (const Segment& s : segs_) {
+        LIYAB_RETURN_IF_ERROR(s.kv->reserve(s.n_past + s.n));  // maps KV pages; ContextFull past the limit
+    }
+    // The DeltaNet mixers overwrite these rollback slots; they become valid
+    // only once every block has run (as in forward()).
+    for (const Segment& s : segs_) {
+        const int32_t recorded = s.checkpoint ? std::min(s.n, s.rollback) : 0;
+        for (int32_t i = 0; i < recorded; ++i) {
+            ring_of(s)[static_cast<size_t>((s.n_past + s.n - 1 - i) % s.rollback)] = -1;
+        }
+    }
+    // Latent attention: each segment in the form forward() would choose for
+    // it alone (its own batch size and context), so its rows round as they
+    // would there.
+    latent_ms_ = 0.0;
+    if (c.mla.kv_rank > 0) {
+        int32_t window = 0;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            if (c.blocks[static_cast<size_t>(l)].latent) {
+                window = layers_[static_cast<size_t>(l)].window;
+                break;
+            }
+        }
+        for (Segment& s : segs_) {
+            if (s.n < 2 || key_ranges_ != nullptr) continue;
+            const int64_t pairs = latent_visible(s, window);
+            int64_t positions = 0;
+            for (const auto& [a, b] : mla_union_) positions += b - a;
+            const LatentFormChooser::Work work = LatentFormChooser::work(c, s.n, pairs, positions);
+            s.expanded = latent_form_ == LatentForm::Expanded ||
+                         (latent_form_ == LatentForm::Auto && latent_chooser_.expand(work));
+        }
+    }
+    batch_tokens_.clear();
+    seg_of_.clear();
+    adapter_rows_.clear();
+    adapters_in_pass_ = false;
+    for (size_t i = 0; i < items.size(); ++i) {
+        batch_tokens_.insert(batch_tokens_.end(), items[i].tokens.begin(), items[i].tokens.end());
+        seg_of_.insert(seg_of_.end(), items[i].tokens.size(), static_cast<int32_t>(i));
+        adapters_in_pass_ = adapters_in_pass_ || segs_[i].adapter != nullptr;
+    }
+    const auto un = static_cast<size_t>(total);
+    size_batch(total);
+    LIYAB_RETURN_IF_ERROR(embed(batch_tokens_, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
+    const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
+    const std::atomic<bool>* cancel = hooks != nullptr ? hooks->cancel : nullptr;
+    FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
+
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
+            // Every context back to where the pass started (forward()'s
+            // abandon_pass(), each one made live for it in turn).
+            const std::vector<Segment> segments = segs_;
+            for (const Segment& s : segments) {
+                if (s.context != nullptr) swap_context(*s.context);
+                if (!abandon_pass().is_ok()) reset();  // a hybrid context without a snapshot here
+                if (s.context != nullptr) swap_context(*s.context);
+            }
+            return Status(ErrorCode::Cancelled, "forward pass cancelled");
+        }
+        const BlockWeights w(*this, l);
+        LIYAB_RETURN_IF_ERROR(w.status());
+        LIYAB_RETURN_IF_ERROR(run_block(l, w, total, route, pool, head_mask, nullptr, ffn_hook));
+    }
+
+    for (const Segment& s : segs_) {
+        const int32_t recorded = s.checkpoint ? std::min(s.n, s.rollback) : 0;
+        for (int32_t i = 0; i < recorded; ++i) {
+            const int32_t pos = s.n_past + s.n - 1 - i;
+            ring_of(s)[static_cast<size_t>(pos % s.rollback)] = pos;
+        }
+        if (c.mla.kv_rank > 0) ++(s.expanded ? latent_stats_.expanded_passes : latent_stats_.absorbed_passes);
+        n_past_of(s) = s.n_past + s.n;
+        s.kv->release_unreachable(s.n_past + s.n, max_batch_);  // recycle pages that left the window
+    }
+    if (expert_store_ != nullptr && ++decode_steps_ % 16 == 0) expert_store_->age();
+
+    // --- output head: the rows each segment asked for, segment after segment ---
+    std::vector<int32_t> rows;
+    std::vector<std::pair<size_t, size_t>> spans(segs_.size());  // per segment: its first logits row, its count
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        const Segment& s = segs_[i];
+        const size_t at = rows.size();
+        if (s.logits == Logits::Last) rows.push_back(s.first + s.n - 1);
+        if (s.logits == Logits::All) {
+            for (int32_t t = s.first; t < s.first + s.n; ++t) rows.push_back(t);
+        }
+        spans[i] = {at, rows.size() - at};
+        if (s.adapter != nullptr && rows.size() > at) {
+            adapter_rows_.push_back({static_cast<int32_t>(at), static_cast<int32_t>(rows.size() - at), s.adapter});
+        }
+    }
+    if (!rows.empty()) {
+        logits_rows_ = true;
+        const Status status = compute_logits_rows(route, rows, pool);
+        logits_rows_ = false;
+        adapter_rows_.clear();
+        if (!status.is_ok()) {
+            for (const Segment& s : segs_) n_past_of(s) = s.n_past;
+            return status;
+        }
+    }
+    const auto vocab = static_cast<size_t>(c.n_vocab);
+    for (const auto& [at, count] : spans) {
+        out.emplace_back(count == 0 ? std::span<const float>()
+                                    : std::span<const float>(logits_.data() + at * vocab, count * vocab));
+    }
     return Status::ok();
 }
 
