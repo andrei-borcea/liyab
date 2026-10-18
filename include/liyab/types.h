@@ -240,8 +240,8 @@ struct GenerationStats {
     int32_t cached_prefix_tokens = 0;  // prompt tokens not recomputed: kept from the previous context or a KV snapshot
     double decode_ms = 0.0;
     double tokens_per_second = 0.0;
-    int32_t draft_tokens_proposed = 0;
-    int32_t draft_tokens_accepted = 0;
+    int32_t draft_tokens_proposed = 0;  // drafted tokens verified (every node of a tree of suffix drafts)
+    int32_t draft_tokens_accepted = 0;  // of them, those kept (one branch per step)
     int32_t thermal_reroutes = 0;   // decode steps executed on the throttled route
     double paced_idle_ms = 0.0;     // time spent idling for duty-cycle pacing
     int32_t early_exits = 0;        // experimental: decode steps that exited early

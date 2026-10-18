@@ -31,8 +31,9 @@
 //    live sequence contains it, so text never counts twice.
 //
 // Confidence: each drafted token falls in a bin by match length, the share
-// and number of occurrences that agree on it and whether the live sequence
-// supports it; per bin, the accepted / verified counts give the probability
+// and number of occurrences that agree on it, whether the live sequence
+// supports it and whether it is its parent's likeliest child or an
+// alternative (a tree's sibling); per bin, the accepted / verified counts give the probability
 // that it is accepted once its parent (the token before it on its branch)
 // is. A token's probability is the product along its branch.
 // Two levels, so a few verifications already tell: a coarse bin (match length
@@ -180,7 +181,12 @@ private:
         float accepted = 0.0f;
         float verified = 0.0f;
     };
-    static constexpr size_t kBins = 5 * 4 * 3 * 2;  // match x share x support x live
+    // rank x match x share x support x live. Rank: the node's likeliest
+    // child or an alternative one (a tree's sibling): an alternative is
+    // rejected more often than the likeliest child of the same share (a tie
+    // at 50% among them), so it is calibrated apart, and the branch's bins
+    // are those they were before trees.
+    static constexpr size_t kBins = 2 * 5 * 4 * 3 * 2;
     static constexpr size_t kFinePerCoarse = 3 * 2;    // support x live
 
     void store(std::span<const int32_t> sequence);
@@ -200,7 +206,7 @@ private:
     // `s` with at least one token after it; [lo, hi) its suffix array range.
     int32_t longest_match(const Stored& s, int32_t& lo, int32_t& hi) const;
     void range(const Stored& s, std::span<const int32_t> pattern, int32_t& lo, int32_t& hi) const;
-    static uint16_t bin_of(int32_t match, float share, int32_t support, bool live);
+    static uint16_t bin_of(int32_t match, float share, int32_t support, bool live, bool alternative = false);
     static bool heap_less(const Node& a, const Node& b) noexcept;
     static float prior(int32_t match, float share);
 
@@ -210,7 +216,7 @@ private:
     int64_t stored_tokens_ = 0;
     uint64_t tick_ = 0;
     std::array<Bin, kBins> bins_{};
-    std::array<Bin, kBins / kFinePerCoarse> coarse_{};  // by match and share only
+    std::array<Bin, kBins / kFinePerCoarse> coarse_{};  // by rank, match and share only
     Draft draft_;
     std::vector<Occurrence> occurrences_;  // scratch
     std::vector<Tally> tally_;             // scratch

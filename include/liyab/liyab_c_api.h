@@ -134,8 +134,8 @@ typedef struct liyab_generation_stats {
     double prefill_ms;
     double decode_ms;
     double tokens_per_second;
-    int32_t draft_tokens_proposed;
-    int32_t draft_tokens_accepted;
+    int32_t draft_tokens_proposed; /* drafted tokens verified (every node of a tree of suffix drafts) */
+    int32_t draft_tokens_accepted; /* of them, those kept (one branch per step) */
     int32_t thermal_reroutes;
     double paced_idle_ms;
     int32_t cancelled;

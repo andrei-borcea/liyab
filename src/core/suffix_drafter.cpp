@@ -198,11 +198,11 @@ int32_t SuffixDrafter::longest_match(const Stored& s, int32_t& lo, int32_t& hi) 
     return good;
 }
 
-uint16_t SuffixDrafter::bin_of(int32_t match, float share, int32_t support, bool live) {
+uint16_t SuffixDrafter::bin_of(int32_t match, float share, int32_t support, bool live, bool alternative) {
     const int32_t m = match <= 2 ? 0 : match <= 4 ? 1 : match <= 8 ? 2 : match <= 16 ? 3 : 4;
     const int32_t f = share >= 1.0f ? 3 : share >= 0.8f ? 2 : share >= 0.5f ? 1 : 0;
     const int32_t c = support <= 1 ? 0 : support <= 3 ? 1 : 2;
-    return static_cast<uint16_t>(((m * 4 + f) * 3 + c) * 2 + (live ? 1 : 0));
+    return static_cast<uint16_t>((((alternative ? 1 : 0) * 5 + m) * 4 + f) * 3 * 2 + c * 2 + (live ? 1 : 0));
 }
 
 float SuffixDrafter::prior(int32_t match, float share) {
@@ -260,7 +260,7 @@ void SuffixDrafter::expand(int32_t parent, int32_t depth, int32_t begin, int32_t
     for (const int32_t c : children_) {
         const Tally& x = tally_[static_cast<size_t>(c)];
         const float share = static_cast<float>(x.count) / static_cast<float>(active);
-        const uint16_t bin = bin_of(match, share, x.count, x.live);
+        const uint16_t bin = bin_of(match, share, x.count, x.live, c != children_.front());
         const float accept = acceptance(bin, match, share);
         total += accept;
         candidates_.push_back({x.token, depth, parent, 0, 0, accept, bin, sequence_++});
