@@ -1362,10 +1362,14 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 // A windowed block (`window` > 0) sees, of what the cache keeps visible, only
 // the positions [pos - window + 1, pos]: the sinks drop out once the window
 // has passed them. Its spans follow its own visible count, so they too depend
-// only on the position. The KV pages still hold every block's rows, so a
-// windowed block saves compute, not memory.
+// only on the position. Its rows live in the cache's windowed group, which
+// keeps only those positions (KvCache's per-block layout), so a windowed block
+// saves memory as well as compute (with TransformerOptions::keep_windowed_rows,
+// compute only).
 void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
+    // The block's rows, their group and offsets resolved once for the pass.
+    const KvCache::RowView rows = kv_->row_view(kv_slot);
     const int32_t hd = c.head_dim;
     const int32_t group = c.n_head / c.n_head_kv;
     // Values may be narrower than keys (latent attention: the latent part of
@@ -1443,13 +1447,13 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             for (size_t j = 0; j < ugroup; ++j) queries[j] = q8_queries_.data() + (first_row + j) * q8_per_head;
             for (size_t i = 0; i < len; ++i) {
                 const auto* k = reinterpret_cast<const quant::BlockQ8_0*>(
-                    kv_->k_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g));
+                    rows.k(position(i0 + static_cast<int32_t>(i)), g));
                 quant::dot_q8_0_q8_0_rows(k, queries.data(), group, hd, dots.data());
                 for (size_t j = 0; j < ugroup; ++j) scores[j * len + i] = dots[j] * scale;
             }
         } else {
             for (size_t i = 0; i < len; ++i) {
-                const uint8_t* k = kv_->k_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+                const uint8_t* k = rows.k(position(i0 + static_cast<int32_t>(i)), g);
                 for (int32_t j = 0; j < group; ++j) {
                     const size_t row = first_row + static_cast<size_t>(j);
                     scores[static_cast<size_t>(j) * len + i] =
@@ -1482,7 +1486,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         // the group (decoding it per head cost 8x the work).
         vrow.resize(uvd);
         for (size_t i = 0; i < len; ++i) {
-            const uint8_t* v = kv_->v_row(kv_slot, position(i0 + static_cast<int32_t>(i)), g);
+            const uint8_t* v = rows.v(position(i0 + static_cast<int32_t>(i)), g);
             if (kv_type == DType::F32) {
                 std::copy_n(reinterpret_cast<const float*>(v), uvd, vrow.data());
             } else {

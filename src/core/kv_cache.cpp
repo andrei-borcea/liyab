@@ -316,6 +316,24 @@ void KvCache::store(int32_t layer, int32_t pos, const float* k, const float* v) 
     }
 }
 
+KvCache::RowView KvCache::row_view(int32_t layer) const noexcept {
+    const Place& place = places_[static_cast<size_t>(layer)];
+    const Group& g = groups_[static_cast<size_t>(place.group)];
+    RowView v;
+    v.pages_ = pool_.data();
+    v.table_ = g.table.data();
+    v.units_ = static_cast<size_t>(g.units);
+    v.unit_ = static_cast<size_t>(place.unit);
+    v.page_tokens_ = config_.page_tokens;
+    v.heads_ = static_cast<size_t>(config_.n_head_kv);
+    v.row_bytes_ = row_bytes_;
+    // As row(): the layer's run of slots in its pool page, values after the
+    // K plane (or inside the key row with values_in_keys).
+    v.layer_offset_ = static_cast<size_t>(place.layer) * static_cast<size_t>(config_.page_tokens) * slot_bytes_;
+    v.value_offset_ = config_.values_in_keys ? value_skip_ : unit_bytes_ / 2;
+    return v;
+}
+
 const uint8_t* KvCache::k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept {
     return row(layer, pos, kv_head, false);
 }

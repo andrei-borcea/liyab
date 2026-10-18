@@ -165,6 +165,34 @@ public:
     void store(int32_t layer, int32_t pos, const float* k, const float* v);
     [[nodiscard]] const uint8_t* k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     [[nodiscard]] const uint8_t* v_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
+    // One layer's rows with where they live resolved once: attention reads a
+    // row per visible position and KV head, so the layer's group, pool page
+    // and offsets are looked up once per pass instead of per row (inline: no
+    // call per row either). The same pointers as k_row() / v_row(). Valid
+    // until pages are mapped or freed (reserve(), truncate(), release_*(),
+    // pin(), clear()); positions must be mapped.
+    class RowView {
+    public:
+        [[nodiscard]] const uint8_t* k(int32_t pos, int32_t kv_head) const noexcept { return at(pos, kv_head); }
+        [[nodiscard]] const uint8_t* v(int32_t pos, int32_t kv_head) const noexcept {
+            return at(pos, kv_head) + value_offset_;
+        }
+
+    private:
+        friend class KvCache;
+        [[nodiscard]] const uint8_t* at(int32_t pos, int32_t kv_head) const noexcept {
+            const auto logical = static_cast<size_t>(pos / page_tokens_);
+            const auto slot = static_cast<size_t>(pos % page_tokens_);
+            const uint8_t* page = pages_[static_cast<size_t>(table_[logical * units_ + unit_])].get();
+            return page + layer_offset_ + (slot * heads_ + static_cast<size_t>(kv_head)) * row_bytes_;
+        }
+        const std::unique_ptr<uint8_t[]>* pages_ = nullptr;
+        const int32_t* table_ = nullptr;
+        size_t units_ = 1, unit_ = 0;
+        int32_t page_tokens_ = 1;
+        size_t heads_ = 0, row_bytes_ = 0, layer_offset_ = 0, value_offset_ = 0;
+    };
+    [[nodiscard]] RowView row_view(int32_t layer) const noexcept;
 
     // Multiplies channel c of the keys of positions [0, end) of layer l, KV
     // head h by factors[(l * n_head_kv + h) * head_dim + c], requantizing each

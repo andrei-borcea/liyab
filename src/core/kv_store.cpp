@@ -352,7 +352,7 @@ KvStore::~KvStore() = default;  // the RAM tier is freed; files stay for later e
 
 std::unique_ptr<KvStore> KvStore::open(const Config& config) {
     // Chunks of 0 bytes only carry tokens: a model whose every attention
-    // block is windowed keeps its rows in the state images (window tails).
+    // block is windowed keeps its rows in the state images (window pages).
     if (config.chunk_tokens <= 0 || (config.chunk_bytes == 0 && config.state_floats == 0) ||
         config.chunk_bytes % static_cast<size_t>(config.chunk_tokens) != 0) {
         return nullptr;
@@ -1267,6 +1267,7 @@ void KvStore::used(const Plan& plan) {
         for (const RecordState& rs : plan.snapshots) add(rs.key);
         for (const RecordState& rs : plan.window_pages) add(rs.key);
         std::sort(own.begin(), own.end(), [](const State* a, const State* b) { return a->pos > b->pos; });
+        own.erase(std::unique(own.begin(), own.end()), own.end());  // a window page may be a snapshot too
         for (const State* s : own) order.emplace_back(Kind::State, s->key);
     }
     const uint64_t base = clock_;
