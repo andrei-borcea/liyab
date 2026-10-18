@@ -114,6 +114,16 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
     const auto rows = static_cast<int64_t>(values.size()) / row;
     const size_t row_bytes = dtype_row_bytes(type, row);
     t.data.resize(row_bytes * static_cast<size_t>(rows));
+    if (type == DType::BF16) {  // quant::quantize_row has no BF16: the upper half, rounded to nearest even
+        for (size_t i = 0; i < values.size(); ++i) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &values[i], sizeof bits);
+            const auto half = static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+            std::memcpy(t.data.data() + 2 * i, &half, sizeof half);
+        }
+        tensors_.push_back(std::move(t));
+        return;
+    }
     for (int64_t r = 0; r < rows; ++r) {
         quant::quantize_row(type, values.data() + r * row, t.data.data() + static_cast<size_t>(r) * row_bytes, row);
     }

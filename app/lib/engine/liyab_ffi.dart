@@ -4,6 +4,7 @@
 // below must match the header field for field (same order, same C types, so
 // Dart's natural alignment reproduces the C layout). Keep them in sync when
 // the header changes; new fields are only ever appended there.
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 
@@ -105,6 +106,36 @@ final class LiyabEngineConfig extends Struct {
   external double segmentReuseMaxKl;
   @Int32()
   external int prefixCacheLossy;
+  @Int64()
+  external int adapterMemoryMb; // LoRA adapters: RAM at most for the loaded ones (MiB); 0: off
+}
+
+/// liyab_adapter_info: one loaded LoRA adapter (liyab_engine_adapter_info).
+final class LiyabAdapterInfo extends Struct {
+  @Array(128)
+  external Array<Uint8> name; // NUL-terminated UTF-8
+  @Float()
+  external double alpha;
+  @Int32()
+  external int rank;
+  @Int32()
+  external int matrices;
+  @Uint64()
+  external int bytes;
+  @Int32()
+  external int resident;
+  @Int32()
+  external int active;
+  @Float()
+  external double scale;
+
+  String get nameText {
+    final bytes = <int>[];
+    for (var i = 0; i < 128 && name[i] != 0; ++i) {
+      bytes.add(name[i]);
+    }
+    return utf8.decode(bytes, allowMalformed: true);
+  }
 }
 
 /// liyab_pooling: what a model does with its final hidden states (liyab_engine_pooling).
@@ -408,7 +439,17 @@ final class LiyabLib {
             Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, Size,
                 Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>),
             int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, int,
-                Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>)>('liyab_engine_rerank');
+                Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>)>('liyab_engine_rerank'),
+        loadAdapter = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)>('liyab_engine_load_adapter'),
+        unloadAdapter = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+            int Function(Pointer<Void>, Pointer<Utf8>)>('liyab_engine_unload_adapter'),
+        setAdapter = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Float),
+            int Function(Pointer<Void>, Pointer<Utf8>, double)>('liyab_engine_set_adapter'),
+        adapterCount = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
+            'liyab_engine_adapter_count'),
+        adapterInfo = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32, Pointer<LiyabAdapterInfo>),
+            int Function(Pointer<Void>, int, Pointer<LiyabAdapterInfo>)>('liyab_engine_adapter_info');
 
   /// libliyab.so from the APK on Android; linked into the app on iOS.
   static final LiyabLib instance =
@@ -484,6 +525,14 @@ final class LiyabLib {
       Pointer<Float>, int, Pointer<LiyabPoolingStats>) embed;
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Pointer<Utf8>>, Pointer<Size>, int,
       Pointer<LiyabRerankParams>, Pointer<Float>, Pointer<LiyabPoolingStats>) rerank;
+
+  /// LoRA adapters (liyab_engine_load_adapter and the rest): load one under a name, forget it, select the one
+  /// later calls apply (name null or '' for none, at a scale), and list them (count, then each by index).
+  final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>) loadAdapter;
+  final int Function(Pointer<Void>, Pointer<Utf8>) unloadAdapter;
+  final int Function(Pointer<Void>, Pointer<Utf8>, double) setAdapter;
+  final int Function(Pointer<Void>) adapterCount;
+  final int Function(Pointer<Void>, int, Pointer<LiyabAdapterInfo>) adapterInfo;
 
   /// Why grammar text does not compile (null when it does).
   String? grammarError(String text) => using((arena) {

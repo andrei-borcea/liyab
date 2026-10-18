@@ -13,7 +13,10 @@
 // key scales the keys were stored with, the kernel set and the backends that
 // computed them. So identical prefixes (a system prompt, a tool block, the
 // start of a conversation) are stored once whatever context they came from,
-// and a chunk is never read back for another model or other settings.
+// and a chunk is never read back for another model or other settings. The
+// seed can change while the store is open (set_seed(): the engine's LoRA
+// adapter, which changes every hidden state): each seed's items stay stored
+// side by side, and only the seed in use is ever returned.
 //
 // What a prompt gets back (plan()). The chunks of the prompt's tokens are
 // looked up in order while they are stored; at the first one that is not,
@@ -255,6 +258,22 @@ public:
     [[nodiscard]] int32_t chunk_tokens() const noexcept { return config_.chunk_tokens; }
     [[nodiscard]] bool has_storage() const noexcept { return disk_on_; }
 
+    // Switches the seed the store's keys are rooted in (Config::seed, derived
+    // the same way for a lossy store), for when what the stored bytes depend
+    // on changes while the store is open: the engine selecting a LoRA adapter
+    // (core/lora.h), whose contexts are never another adapter's. Everything
+    // stored under other seeds stays, in the same tiers, caps and LRU order
+    // (it may be evicted to make room as before), but is never returned
+    // while another seed is in use; switching back finds it again, and so
+    // does a later store opened under that seed. Items found in the directory
+    // under a seed not used before in this store are checked the first time
+    // it is used, as open() checks its own seed's (inconsistent ones are
+    // removed), and the tokens and text of its records, which open() keeps for
+    // its own seed only, are read back from their files. Forgets read_ahead().
+    void set_seed(const KvKey& seed);
+    // The seed in use (after the lossy derivation).
+    [[nodiscard]] const KvKey& seed() const noexcept { return config_.seed; }
+
     // A recurrent-state image of a context: its position and pinned flag
     // (Transformer::KeptState), with its key once stored.
     struct StateMark {
@@ -400,6 +419,11 @@ public:
 private:
     explicit KvStore(const Config& config);
     enum class Kind : uint8_t { Chunk, State };
+    [[nodiscard]] KvKey derive_seed(const KvKey& seed) const noexcept;  // a lossy store's own seeds
+    // set_seed(): the checks scan() makes for its own seed only, for the
+    // seed now in use, and its records' tokens and text read back.
+    void check_seed();
+    [[nodiscard]] bool read_record_file(const KvKey& leaf, Record& out) const;
     // A chunk or a state: what the LRU orders.
     struct Item {
         KvKey key;
@@ -502,6 +526,7 @@ private:
     size_t ram_used_ = 0;
     size_t disk_used_ = 0;
     int32_t removed_files_ = 0;
+    std::vector<KvKey> checked_seeds_;  // seeds whose stored items are checked in full (see set_seed())
     std::unordered_map<KvKey, Chunk, KvKeyHash> chunks_;
     std::unordered_map<KvKey, State, KvKeyHash> states_;
     std::unordered_map<KvKey, RecordEntry, KvKeyHash> records_;  // by leaf key

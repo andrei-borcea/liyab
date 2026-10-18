@@ -117,7 +117,8 @@ struct EngineConfig {
     // then edited after the last reply does not. Contexts are kept in a
     // content-addressed store of KV chunks (whole KV pages, about 2 MiB, at
     // most 256 tokens), each keyed by every token before it plus the model,
-    // cache layout, key scales and kernels, so a prefix conversations share
+    // cache layout, key scales, kernels and the LoRA adapter selected (see
+    // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
     // restores it; recurrent (DeltaNet) states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model
@@ -248,6 +249,12 @@ struct EngineConfig {
     // RAG-shaped prompts in the model's chat template (core/kv_reuse.h), with
     // a margin for what those prompts cannot tell apart.
     float segment_reuse_max_kl = 0.03f;
+    // LoRA adapters (Engine::load_adapter): RAM at most for the loaded
+    // adapters' tensors, in MiB. Several can be loaded at once; past the cap
+    // the least recently selected ones are released and mapped again from
+    // their files when selected. 0: adapters off (load_adapter() is
+    // Unsupported).
+    int64_t adapter_memory_mb = 256;
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
@@ -363,6 +370,47 @@ using ContinuationCallback = std::function<Continuation(std::string_view generat
 struct PromptSegment {
     size_t begin = 0;
     size_t end = 0;
+};
+
+// ---- LoRA adapters -----------------------------------------------------------
+// A LoRA adapter (a GGUF the common converters write from a PEFT adapter:
+// lora_a / lora_b per adapted matrix, adapter.lora.alpha) changes some of the
+// model's matrices by a low-rank update W + s·B·A. Liyab never merges it: each
+// adapted matmul adds s·B·(A·x) to the base product, computed by the
+// engine's own CPU kernels (A·x batched with the base matmuls, the update over
+// a transposed B; see README "LoRA adapters"), so several adapters
+// stay loaded next to one model and the one in use is chosen per generation
+// (Engine::set_adapter), and a pass without one costs what it did.
+//  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each
+//    matrix's own rank; alpha 0 or absent: s = scale), as PEFT computes it.
+//  * Dense matrices of every block (attention, DeltaNet, FFN, the shared
+//    expert, the router, latent attention's whole projections) and the LM
+//    head; a mixture of experts' per-expert stacks (each expert its slice).
+//    Refused: adapters of the token embeddings, of latent attention's
+//    per-head attn_k_b / attn_v_b, activated LoRA, other adapter types.
+//  * Contexts are kept apart by adapter (and scale): one computed with
+//    adapter X is never continued with Y or without it. Selecting another
+//    adapter sets the live context aside in the prefix cache under X (when
+//    there is one) and starts from what the cache keeps under Y; the cache's
+//    chunks are keyed by the adapter too (its file's hash), on storage
+//    across runs as well; save_state() records the adapter, and
+//    load_state() refuses a context saved under another one.
+//  * Speculative decoding verifies with the adapter (the target model's
+//    passes apply it); a draft model drafts without it, which may lower the
+//    acceptance rate but not change the output's distribution.
+//  * Segment reuse is off while an adapter is selected (its calibration is
+//    the base model's): marked prompts are processed as usual, exactly.
+//  * Embeddings and reranking apply the selected adapter as well.
+struct AdapterInfo {
+    std::string name;
+    std::string path;
+    float alpha = 0.0f;        // adapter.lora.alpha (0: none; s = scale)
+    int32_t rank = 0;          // the largest rank of its matrices
+    int32_t matrices = 0;      // adapted matrices (a per-expert stack counts once)
+    uint64_t bytes = 0;        // its tensors, counted against adapter_memory_mb
+    bool resident = false;     // mapped now (else mapped again when selected)
+    bool active = false;       // the one passes apply
+    float scale = 0.0f;        // set_adapter()'s scale, when active
 };
 
 // Options of Engine::generate. At most one of the two is set (both:
@@ -751,6 +799,35 @@ public:
         double bound = 0.0;        // the calibration's upper bound on the KL at that share (what met the target)
     };
     [[nodiscard]] SegmentReuseInfo segment_reuse() const;
+
+    // ---- LoRA adapters (see AdapterInfo) -------------------------------------
+    // Loads the adapter at `path` under `name` (not selected). Checks it
+    // against the model: its architecture, every adapted matrix's name and
+    // shape. InvalidArgument for an empty or taken name, another
+    // architecture or a matrix that does not fit; Unsupported for what
+    // AdapterInfo lists as refused, or with adapter_memory_mb 0; OutOfMemory
+    // when it alone exceeds adapter_memory_mb; InvalidModel / IoError for a
+    // file that is not a LoRA adapter or cannot be read. Busy while another
+    // call runs. Other adapters may be released to fit the cap (not the
+    // selected one).
+    Status load_adapter(std::string_view name, const std::string& path);
+    // Forgets an adapter (selected: the engine goes back to the base model,
+    // as set_adapter("")). InvalidArgument for an unknown name; Busy.
+    Status unload_adapter(std::string_view name);
+    // Selects the adapter later calls apply (generate, prefill, embed,
+    // rerank): `name` at `scale` (see AdapterInfo), "" for none (the base
+    // model, the default). A context computed otherwise is set aside in the
+    // prefix cache (when there is one) and the next prompt starts from what
+    // the cache keeps for this adapter, or from scratch; selecting the
+    // adapter in use at the same scale keeps the context. An adapter
+    // released under the cap is mapped again from its file (IoError /
+    // InvalidModel when it changed into something that is not an adapter, or
+    // InvalidArgument when it no longer fits the model; the engine is then
+    // without an adapter). InvalidArgument for an unknown name or a scale
+    // that is not finite; Busy while another call runs.
+    Status set_adapter(std::string_view name, float scale = 1.0f);
+    // The loaded adapters, in load order. Thread-safe.
+    [[nodiscard]] std::vector<AdapterInfo> adapters() const;
 
 private:
     struct Impl;

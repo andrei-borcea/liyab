@@ -156,6 +156,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
   @override
   String get servedModel =>
       modelName.isNotEmpty ? modelName : (_released == null ? '' : File(_released!).uri.pathSegments.last);
+
+  /// The LoRA adapters loaded next to the model: the GGUFs in the models folder's `adapters` directory, each
+  /// under its file name without `.gguf`, loaded with every model (the engine refuses those of another
+  /// architecture). Other apps select one by naming it as the request's `model` or `adapter`; the app's own
+  /// chat runs on the model itself.
+  @override
+  List<String> adapters = const [];
   bool _parkPending = false; // hidden, and the park not done yet
 
   static const _work = MethodChannel('liyab/work');
@@ -417,9 +424,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   @override
   Generation generate(String prompt, SamplingOptions sampling,
-      {String? grammar, Continuation Function(String generated)? structure}) {
+      {String? grammar, Continuation Function(String generated)? structure, String adapter = ''}) {
     _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
-    final generation = engine.generate(prompt, sampling, grammar: grammar, structure: structure);
+    final generation = engine.generate(prompt, sampling, grammar: grammar, structure: structure, adapter: adapter);
     ++_apiGenerations;
     _updateWork();
     var ended = false;
@@ -498,6 +505,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     modelPath = null;
     modelName = '';
     description = '';
+    adapters = const [];
     pooling = LiyabPooling.none;
     messages.clear();
     status = 'No model loaded';
@@ -548,7 +556,13 @@ class AppState extends ChangeNotifier implements ApiBackend {
         // Measured once per model (0.3 s on a 4B, 1.4 s on the 35B MoE), then read back at every load.
         cacheDir: '${(await getApplicationSupportDirectory()).path}/engine-cache',
         experimental: experimental.toJson(),
+        adapters: await _adapterFiles(),
       ));
+      adapters = model.adapters;
+      for (final MapEntry(key: name, value: why) in model.adapterErrors.entries) {
+        _log('Adapter $name not loaded: $why');
+      }
+      if (adapters.isNotEmpty) _log('LoRA adapters: ${adapters.join(', ')}');
       // The model's own chat template when it keeps each turn's prompt a prefix of the next one's (context
       // reuse needs it), else the built-in format its vocabulary implies.
       final source = model.metadata['tokenizer.chat_template'] ?? '';
@@ -649,6 +663,22 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// The snapshots of KV dedup, the experimental persistent prefix cache the engine's prefix cache replaced: they
   /// had no bound, and nothing reads them any more.
+  /// The LoRA adapters to load with a model (see adapters): the GGUFs in `adapters` under the models folder and
+  /// under the shared app folder (where adb pushes files), by file name without `.gguf`; the first found keeps a
+  /// name.
+  Future<Map<String, String>> _adapterFiles() async {
+    final found = <String, String>{};
+    for (final base in [await ModelsStore.modelsDir(), await ModelsStore.sharedDir()]) {
+      final dir = base == null ? null : Directory('${base.path}/adapters');
+      if (dir == null || !dir.existsSync()) continue;
+      for (final file in dir.listSync().whereType<File>().where((f) => f.path.endsWith('.gguf'))) {
+        final name = file.uri.pathSegments.last;
+        found.putIfAbsent(name.substring(0, name.length - '.gguf'.length), () => file.path);
+      }
+    }
+    return found;
+  }
+
   Future<void> _removeRetiredKvDedup() async {
     try {
       final dir = Directory('${(await getApplicationSupportDirectory()).path}/kv-dedup');

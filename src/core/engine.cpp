@@ -29,6 +29,7 @@
 #include "core/key_scaling.h"
 #include "core/kv_reuse.h"
 #include "core/kv_store.h"
+#include "core/lora.h"
 #include "core/os.h"
 #include "core/pooling.h"
 #include "core/transformer.h"
@@ -358,7 +359,8 @@ struct Engine::Impl {
             s.request_marks = marks;
             s.request_marks_tokens = tokens;
             s.request_segments.clear();
-            s.request_reuse = !marks.empty() && s.reuse_info.status.is_ok() && s.store != nullptr;
+            // Not while an adapter is selected: the share was calibrated on the base model.
+            s.request_reuse = !marks.empty() && s.reuse_info.status.is_ok() && s.store != nullptr && s.context_key == 0;
         }
         ~Request() {
             s.request_marks = {};
@@ -592,6 +594,134 @@ struct Engine::Impl {
 
     [[nodiscard]] bool prefix_cache_on() const { return store != nullptr; }
 
+    // ---- LoRA adapters (Engine::load_adapter / set_adapter, core/lora.h) ----
+    // The loaded adapters, each mapped while resident: at most
+    // config.adapter_memory_mb of them, the least recently selected
+    // released first and mapped again from its file when selected. `active`
+    // is the one passes apply (nullptr: none) at `active_scale`;
+    // `context_key` names what the live context was computed with (0: the
+    // base model), and the store's seed always follows it (seed_for), so a
+    // context is never continued, set aside or restored under another
+    // adapter or scale. Changed under a Call, and under adapters_mutex where
+    // adapters() reads.
+    struct AdapterEntry {
+        std::string name;
+        std::string path;
+        std::unique_ptr<LoraAdapter> adapter;  // nullptr: released under the cap
+        size_t bytes = 0;
+        int32_t rank = 0;
+        int32_t matrices = 0;
+        float alpha = 0.0f;
+        uint64_t last_used = 0;
+    };
+    std::vector<std::unique_ptr<AdapterEntry>> adapters;
+    AdapterEntry* active = nullptr;
+    float active_scale = 1.0f;
+    uint64_t context_key = 0;
+    uint64_t adapter_clock = 0;
+    KvKey base_seed;  // the store's seed without an adapter (store_seed())
+    mutable std::mutex adapters_mutex;
+
+    AdapterEntry* find_adapter(std::string_view name) {
+        for (auto& e : adapters) {
+            if (e->name == name) return e.get();
+        }
+        return nullptr;
+    }
+    // What contexts computed with `adapter` at `scale` are keyed by: its
+    // file's hash and the scale; 0 for none.
+    static uint64_t adapter_key(const LoraAdapter* adapter, float scale) {
+        if (adapter == nullptr) return 0;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &scale, sizeof bits);
+        const uint64_t parts[] = {adapter->id(), bits};
+        const uint64_t key = xxhash64(parts, sizeof parts);
+        return key != 0 ? key : 1;
+    }
+    [[nodiscard]] KvKey seed_for(uint64_t key) const {
+        if (key == 0) return base_seed;
+        const uint64_t parts[] = {base_seed.hi, base_seed.lo, key};
+        return kv_seed_key(parts);
+    }
+    // Releases the least recently selected adapters but `keep` until
+    // `bytes` more fit under the cap.
+    void fit_adapters(size_t bytes, const AdapterEntry* keep) {
+        const size_t cap = static_cast<size_t>(std::max<int64_t>(config.adapter_memory_mb, 0)) << 20;
+        for (;;) {
+            size_t used = 0;
+            AdapterEntry* oldest = nullptr;
+            for (auto& e : adapters) {
+                if (!e->adapter) continue;
+                used += e->bytes;
+                if (e.get() != keep && e.get() != active && (oldest == nullptr || e->last_used < oldest->last_used)) {
+                    oldest = e.get();
+                }
+            }
+            if (used + bytes <= cap || oldest == nullptr) return;
+            LIYAB_LOG_INFO("adapters: %s released (%.1f MiB) to stay within %lld MiB", oldest->name.c_str(),
+                           static_cast<double>(oldest->bytes) / (1024.0 * 1024.0),
+                           static_cast<long long>(config.adapter_memory_mb));
+            std::lock_guard<std::mutex> lock(adapters_mutex);
+            oldest->adapter.reset();
+        }
+    }
+    // Checks an adapter against the model: its architecture, and every
+    // target bound once (then the selected adapter is bound again).
+    Status check_adapter(const LoraAdapter& adapter) {
+        const auto arch = target->file().get_string("general.architecture");
+        if (!adapter.architecture().empty() && arch && *arch != adapter.architecture()) {
+            return Status(ErrorCode::InvalidArgument, "the adapter is for " + adapter.architecture() +
+                                                          " models; this model is " + std::string(*arch));
+        }
+        const Status fits = target->set_adapter(&adapter, 1.0f);
+        const Status back =
+            target->set_adapter(active != nullptr ? active->adapter.get() : nullptr, active_scale, pool.get());
+        LIYAB_RETURN_IF_ERROR(fits);
+        return back;
+    }
+    // Makes `e` (nullptr: none) the adapter passes apply at `scale`. A live
+    // context computed otherwise is set aside under its own adapter (the
+    // store's seed is still its) and cleared; then the store's seed follows.
+    Status select_adapter(AdapterEntry* e, float scale) {
+        if (e != nullptr && !e->adapter) {  // released under the cap: mapped again
+            auto loaded = LoraAdapter::load(e->path);
+            Status fits = loaded ? check_adapter(**loaded) : loaded.status();
+            if (fits.is_ok()) {
+                fit_adapters((*loaded)->bytes(), e);
+                std::lock_guard<std::mutex> lock(adapters_mutex);
+                e->bytes = (*loaded)->bytes();
+                e->adapter = std::move(loaded).value();
+            } else {
+                LIYAB_LOG_WARN("adapters: %s could not be mapped again: %s", e->name.c_str(), fits.to_string().c_str());
+                (void)select_adapter(nullptr, 1.0f);
+                return fits;
+            }
+        }
+        const LoraAdapter* adapter = e != nullptr ? e->adapter.get() : nullptr;
+        const uint64_t key = adapter_key(adapter, scale);
+        if (key != context_key) {
+            stash_context();  // under the adapter it was computed with (no-op without a store)
+            clear_context();
+        }
+        if (Status s = target->set_adapter(adapter, scale, pool.get()); !s.is_ok()) {
+            (void)target->set_adapter(nullptr);
+            clear_context();
+            if (store) store->set_seed(base_seed);
+            context_key = 0;
+            std::lock_guard<std::mutex> lock(adapters_mutex);
+            active = nullptr;
+            return s;
+        }
+        if (store) store->set_seed(seed_for(key));
+        if (key != context_key && prefix_cache_on()) note_store();
+        context_key = key;
+        std::lock_guard<std::mutex> lock(adapters_mutex);
+        active = e;
+        active_scale = scale;
+        if (e != nullptr) e->last_used = ++adapter_clock;
+        return Status::ok();
+    }
+
     ~Impl() {
         stop_calibration();
         // The context left goes to storage, so a later engine or process
@@ -703,6 +833,7 @@ struct Engine::Impl {
             std::clamp<size_t>(kChunkBytes / std::max<size_t>(kv.page_bytes(), 1), 1, kMaxChunkPages));
         KvStore::Config sc;
         sc.seed = store_seed(repacked, chunk_pages);
+        base_seed = sc.seed;  // an adapter's contexts are keyed under seed_for() (select_adapter)
         sc.chunk_tokens = kv.config().page_tokens * chunk_pages;
         sc.chunk_bytes = kv.page_bytes() * static_cast<size_t>(chunk_pages);
         sc.state_floats = (window > 0 ? kv.window_page_bytes() : target->recurrent_state_bytes()) / sizeof(float);
@@ -1240,7 +1371,11 @@ struct Engine::Impl {
         Result<bool> r = false;
         {
             const PowerManager::Work thermal(*power);  // thermal sampling while this runs
+            // The base model's measurement: no adapter, whichever is selected.
+            const LoraAdapter* adapter = target->adapter();
+            if (adapter != nullptr) (void)target->set_adapter(nullptr);
             r = calibrator->step(*target, draft_route(), *pool, target->max_batch(), &calibration_stop);
+            if (adapter != nullptr) (void)target->set_adapter(adapter, active_scale, pool.get());  // bound before
         }
         // The conversation's context back (the same caches: cannot fail).
         (void)target->swap_context(calibration_kv, calibration_n_past);
@@ -2216,6 +2351,16 @@ std::string Engine::describe() const {
                           (1024.0 * 1024.0));
         out += blocks;
     }
+    {
+        std::lock_guard<std::mutex> lock(impl_->adapters_mutex);
+        for (const auto& e : impl_->adapters) {
+            char line[256];
+            std::snprintf(line, sizeof line, "Adapter:    %s, LoRA rank %d, %d matrices, %.1f MiB%s%s\n", e->name.c_str(),
+                          e->rank, e->matrices, static_cast<double>(e->bytes) / (1024.0 * 1024.0),
+                          e->adapter ? "" : " (released)", e.get() == impl_->active ? ", selected" : "");
+            out += line;
+        }
+    }
     if (impl_->draft) {
         out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
                " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
@@ -2241,6 +2386,86 @@ Engine::PrefixCacheStats Engine::prefix_cache_stats() const {
 Engine::SegmentReuseInfo Engine::segment_reuse() const {
     std::lock_guard<std::mutex> lock(impl_->reuse_info_mutex);
     return impl_->reuse_info;
+}
+
+Status Engine::load_adapter(std::string_view name, const std::string& path) {
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.config.adapter_memory_mb <= 0) {
+        return Status(ErrorCode::Unsupported, "adapters are off (EngineConfig::adapter_memory_mb is 0)");
+    }
+    if (name.empty()) return Status(ErrorCode::InvalidArgument, "an adapter needs a name");
+    if (s.find_adapter(name) != nullptr) {
+        return Status(ErrorCode::InvalidArgument, "an adapter named " + std::string(name) + " is loaded already");
+    }
+    auto loaded = LoraAdapter::load(path);
+    if (!loaded) return loaded.status();
+    LIYAB_RETURN_IF_ERROR(s.check_adapter(**loaded));
+    const size_t bytes = (*loaded)->bytes();
+    const size_t cap = static_cast<size_t>(s.config.adapter_memory_mb) << 20;
+    if (bytes > cap) {
+        return Status(ErrorCode::OutOfMemory, "the adapter's " + std::to_string(bytes >> 20) +
+                                                  " MiB exceed EngineConfig::adapter_memory_mb");
+    }
+    s.fit_adapters(bytes, nullptr);
+    auto entry = std::make_unique<Impl::AdapterEntry>();
+    entry->name = std::string(name);
+    entry->path = path;
+    entry->bytes = bytes;
+    entry->rank = (*loaded)->max_rank();
+    entry->matrices = static_cast<int32_t>((*loaded)->targets().size());
+    entry->alpha = (*loaded)->alpha();
+    entry->last_used = ++s.adapter_clock;
+    entry->adapter = std::move(loaded).value();
+    LIYAB_LOG_INFO("adapters: %s loaded from %s: LoRA rank %d, alpha %g, %d matrices, %.1f MiB", entry->name.c_str(),
+                   path.c_str(), entry->rank, static_cast<double>(entry->alpha), entry->matrices,
+                   static_cast<double>(bytes) / (1024.0 * 1024.0));
+    std::lock_guard<std::mutex> lock(s.adapters_mutex);
+    s.adapters.push_back(std::move(entry));
+    return Status::ok();
+}
+
+Status Engine::unload_adapter(std::string_view name) {
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    Impl::AdapterEntry* e = s.find_adapter(name);
+    if (e == nullptr) return Status(ErrorCode::InvalidArgument, "no adapter named " + std::string(name));
+    if (e == s.active) LIYAB_RETURN_IF_ERROR(s.select_adapter(nullptr, 1.0f));
+    std::lock_guard<std::mutex> lock(s.adapters_mutex);
+    std::erase_if(s.adapters, [e](const std::unique_ptr<Impl::AdapterEntry>& x) { return x.get() == e; });
+    return Status::ok();
+}
+
+Status Engine::set_adapter(std::string_view name, float scale) {
+    const Impl::Call call(*impl_);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (name.empty()) return s.select_adapter(nullptr, 1.0f);
+    Impl::AdapterEntry* e = s.find_adapter(name);
+    if (e == nullptr) return Status(ErrorCode::InvalidArgument, "no adapter named " + std::string(name));
+    if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "the adapter scale must be finite");
+    return s.select_adapter(e, scale);
+}
+
+std::vector<AdapterInfo> Engine::adapters() const {
+    std::lock_guard<std::mutex> lock(impl_->adapters_mutex);
+    std::vector<AdapterInfo> out;
+    for (const auto& e : impl_->adapters) {
+        AdapterInfo info;
+        info.name = e->name;
+        info.path = e->path;
+        info.alpha = e->alpha;
+        info.rank = e->rank;
+        info.matrices = e->matrices;
+        info.bytes = e->bytes;
+        info.resident = e->adapter != nullptr;
+        info.active = e.get() == impl_->active;
+        info.scale = info.active ? impl_->active_scale : 0.0f;
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 Status Engine::prefill(std::string_view text, bool add_bos) { return prefill(text, {}, add_bos); }
@@ -2306,8 +2531,12 @@ namespace {
 // (`exact`), so a later request that does not reuse segments never continues
 // them; other contexts end as before, so their files are unchanged.
 constexpr uint32_t kReusedMagic = 0x5355524C;  // "LRUS"
+// A context computed with a LoRA adapter then has kAdapterMagic and its key
+// (Impl::adapter_key: the adapter file's hash and the scale), last, so
+// load_state() never continues it under another adapter or without one.
+constexpr uint32_t kAdapterMagic = 0x5044414C;  // "LADP"
 void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, const std::string& text,
-                        size_t text_tokens, size_t exact = SIZE_MAX) {
+                        size_t text_tokens, size_t exact = SIZE_MAX, uint64_t adapter = 0) {
     const auto n = static_cast<uint64_t>(tokens.size());
     const bool known = text_tokens > 0;
     const uint64_t length = known ? text.size() : UINT64_MAX;
@@ -2324,6 +2553,10 @@ void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, c
         const auto first = static_cast<uint64_t>(exact);
         out.write(reinterpret_cast<const char*>(&kReusedMagic), sizeof kReusedMagic);
         out.write(reinterpret_cast<const char*>(&first), sizeof first);
+    }
+    if (adapter != 0) {
+        out.write(reinterpret_cast<const char*>(&kAdapterMagic), sizeof kAdapterMagic);
+        out.write(reinterpret_cast<const char*>(&adapter), sizeof adapter);
     }
 }
 
@@ -2357,7 +2590,7 @@ Status Engine::save_state(const std::string& path) {
     if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
     return write_replacing(path, [&s](std::ostream& out) {
         LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
-        write_context_tail(out, s.context, s.context_text, s.context_text_tokens, s.exact_end);
+        write_context_tail(out, s.context, s.context_text, s.context_text_tokens, s.exact_end, s.context_key);
         return Status::ok();
     });
 }
@@ -2451,7 +2684,7 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                 const Status written = s.target->write_state(out, context);
                 LIYAB_RETURN_IF_ERROR(read);
                 LIYAB_RETURN_IF_ERROR(written);
-                write_context_tail(out, record.tokens, record.text, record.text_tokens);
+                write_context_tail(out, record.tokens, record.text, record.text_tokens, SIZE_MAX, s.context_key);
                 return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
             });
         }
@@ -2497,11 +2730,21 @@ Result<int32_t> Engine::load_state(const std::string& path) {
     }
     // Where rows reused away from their prefix start (segment reuse), when
     // the context held some.
-    uint32_t reused = 0;
-    uint64_t exact = 0;
-    if (in.read(reinterpret_cast<char*>(&reused), sizeof reused) && reused == kReusedMagic) {
+    uint32_t tag = 0;
+    uint64_t exact = 0, adapter = 0;
+    bool tagged = static_cast<bool>(in.read(reinterpret_cast<char*>(&tag), sizeof tag));
+    if (tagged && tag == kReusedMagic) {
         if (!in.read(reinterpret_cast<char*>(&exact), sizeof exact) || exact >= n) return damaged();
         s.exact_end = static_cast<size_t>(exact);
+        tagged = static_cast<bool>(in.read(reinterpret_cast<char*>(&tag), sizeof tag));
+    }
+    // The adapter it was computed with (none when untagged) must be the selected one.
+    if (tagged && tag == kAdapterMagic && !in.read(reinterpret_cast<char*>(&adapter), sizeof adapter)) return damaged();
+    if (adapter != s.context_key) {
+        s.clear_context();
+        return Status(ErrorCode::InvalidArgument,
+                      adapter == 0 ? "the saved context was computed without an adapter: select none first"
+                                   : "the saved context was computed with another adapter (or scale) than the selected one");
     }
     s.last_prompt_end = static_cast<size_t>(n);
     return static_cast<int32_t>(n);

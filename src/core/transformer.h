@@ -30,12 +30,14 @@
 #include <new>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "core/architecture.h"
 #include "core/expert_store.h"
 #include "core/key_scaling.h"
+#include "core/lora.h"
 #include "core/quant.h"
 #include "liyab/backend.h"
 #include "liyab/experimental/forward_hooks.h"
@@ -603,6 +605,27 @@ public:
         layer_shared_ = shared;
     }
 
+    // ---- LoRA adapters (core/lora.h) ----
+    // Applies `adapter` at `scale` (s = scale · alpha / rank per matrix) to
+    // every later pass until changed: each adapted matrix's matmul output
+    // gets s · B·(A·x), computed on route.cpu (A·x in the base matmuls'
+    // batch when they run there too; LoraRunner) after the base matmul (dense
+    // matrices, the LM head, and per-expert stacks of a mixture of experts,
+    // expert e's slice for the tokens routed to it). nullptr: none, and
+    // passes cost what they did without adapters (one branch per matmul).
+    // Checks every target first: InvalidArgument for a tensor the model does
+    // not have or of another shape, Unsupported for one the forward pass does
+    // not multiply as a whole (latent attention's per-head attn_k_b /
+    // attn_v_b); the adapter in use is then none. The context is left as it
+    // is: the caller decides whether rows computed with another adapter may
+    // be kept (the engine never keeps them). `adapter` must outlive its use.
+    // Not applied by the router's expert prediction, which only prefetches.
+    // `pool` (optional) spreads the updates of large matmuls over its
+    // threads (the same bits on any number); it must be the pool the CPU
+    // backend runs on, or one not in use during passes.
+    Status set_adapter(const LoraAdapter* adapter, float scale = 1.0f, ThreadPool* pool = nullptr);
+    [[nodiscard]] const LoraAdapter* adapter() const noexcept { return adapter_; }
+
 private:
     // Matrices of one block, by role; unused roles stay nullptr.
     enum WeightRole : size_t {
@@ -757,6 +780,10 @@ private:
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
                         std::span<float* const> ys, int32_t n);
+    // The active adapter's items for matmuls ys[i] = x · ws[i]ᵀ (matrices it
+    // does not adapt are skipped) into adapter_items_; false when none.
+    bool collect_adapter_items(std::span<const TensorView* const> ws, const float* x, std::span<float* const> ys,
+                               int32_t n);
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of
     // x_, then the final soft-cap (if any) on `pool`.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
@@ -854,6 +881,18 @@ private:
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
+    // The active adapter (set_adapter): its targets by base tensor name, with
+    // their scales; empty when none (the only check a pass pays then).
+    struct BoundAdapter {
+        const LoraTarget* target = nullptr;
+        float scale = 0.0f;
+    };
+    const LoraAdapter* adapter_ = nullptr;
+    std::unordered_map<std::string_view, BoundAdapter> adapter_targets_;
+    LoraRunner adapter_runner_;
+    ThreadPool* adapter_pool_ = nullptr;
+    std::vector<LoraRunner::Item> adapter_items_;
+    std::vector<Backend::MatmulItem> adapter_batch_;  // base and A·x matmuls of one group
 };
 
 }  // namespace liyab

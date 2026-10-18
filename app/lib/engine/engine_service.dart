@@ -28,6 +28,7 @@ class LoadOptions {
     this.prefixCacheDiskMb = 0,
     this.cacheDir,
     this.experimental = const {},
+    this.adapters = const {},
   });
 
   final String modelPath;
@@ -51,6 +52,22 @@ class LoadOptions {
   /// Experimental and advanced engine options, keyed as ExperimentalSettings.toJson; absent keys keep the
   /// engine's defaults.
   final Map<String, Object?> experimental;
+
+  /// LoRA adapters loaded next to the model (liyab_engine_load_adapter), by name: GGUF paths. An adapter the
+  /// engine refuses (another architecture, a matrix the model does not have) is reported in
+  /// LoadedModel.adapterErrors; the model loads all the same. A generation selects one by name (generate).
+  final Map<String, String> adapters;
+}
+
+/// A LoRA adapter loaded next to the model (liyab_adapter_info).
+class AdapterInfo {
+  const AdapterInfo(this.name, this.rank, this.matrices, this.bytes, {this.resident = true, this.active = false});
+  final String name;
+  final int rank; // the largest rank of its matrices
+  final int matrices; // adapted matrices
+  final int bytes; // counted against the engine's adapter memory cap
+  final bool resident; // mapped now (else mapped again when selected)
+  final bool active; // the one the engine applies now
 }
 
 class SamplingOptions {
@@ -84,7 +101,9 @@ class LoadedModel {
       required this.memory,
       required this.contextLength,
       this.pooling = LiyabPooling.none,
-      this.embeddingSize = 0});
+      this.embeddingSize = 0,
+      this.adapters = const [],
+      this.adapterErrors = const {}});
 
   final String description;
   final double loadSeconds;
@@ -100,6 +119,10 @@ class LoadedModel {
   /// for a reranker; and the values per embedding vector (its hidden size).
   final int pooling;
   final int embeddingSize;
+
+  /// The LoRA adapters of LoadOptions.adapters the engine loaded, and why it refused the others (by name).
+  final List<String> adapters;
+  final Map<String, String> adapterErrors;
 }
 
 /// The vectors of an embed call, in input order (unit length), and the tokens it processed.
@@ -378,7 +401,7 @@ class EngineService {
     _engine = 0;
     final r = await _call<List<Object?>>(
         ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile,
-          o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir]);
+          o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir, o.adapters]);
     _engine = r[0] as int;
     final plan = r[4] as List<Object?>;
     return LoadedModel(
@@ -388,8 +411,35 @@ class EngineService {
         memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int),
         contextLength: r[5] as int,
         pooling: r[6] as int,
-        embeddingSize: r[7] as int);
+        embeddingSize: r[7] as int,
+        adapters: List<String>.from(r[8] as List),
+        adapterErrors: Map<String, String>.from(r[9] as Map));
   }
+
+  /// The LoRA adapters loaded next to the model, in load order (read directly: thread-safe in the C API).
+  List<AdapterInfo> adapters() {
+    if (_engine == 0) return const [];
+    final lib = LiyabLib.instance;
+    final engine = Pointer<Void>.fromAddress(_engine);
+    final out = calloc<LiyabAdapterInfo>();
+    try {
+      return [
+        for (var i = 0; i < lib.adapterCount(engine); ++i)
+          if (lib.adapterInfo(engine, i, out) == LiyabStatus.ok)
+            AdapterInfo(out.ref.nameText, out.ref.rank, out.ref.matrices, out.ref.bytes,
+                resident: out.ref.resident != 0, active: out.ref.active != 0),
+      ];
+    } finally {
+      calloc.free(out);
+    }
+  }
+
+  /// Loads a LoRA adapter next to the model under `name` (liyab_engine_load_adapter); an EngineException when
+  /// the engine refuses it.
+  Future<void> loadAdapter(String name, String path) => _call<Object?>(['loadAdapter', name, path]);
+
+  /// Forgets a LoRA adapter.
+  Future<void> unloadAdapter(String name) => _call<Object?>(['unloadAdapter', name]);
 
   Future<void> unload() async {
     _engine = 0;
@@ -472,8 +522,16 @@ class EngineService {
   /// text and the grammar of the span that follows (Continuation). Grammar
   /// text that does not compile fails the generation (check it first with
   /// grammarError). `structure` runs on the engine's isolate, as `force`.
+  ///
+  /// `adapter` names a LoRA adapter loaded with the model (LoadOptions.adapters, loadAdapter) that this generation
+  /// applies, at `adapterScale` ('' : the base model). Every other command runs on the base model. The engine
+  /// never continues a context under another adapter: switching sets it aside in its prefix cache.
   Generation generate(String prompt, SamplingOptions s,
-      {String Function(String generated)? force, String? grammar, Continuation Function(String generated)? structure}) {
+      {String Function(String generated)? force,
+      String? grammar,
+      Continuation Function(String generated)? structure,
+      String adapter = '',
+      double adapterScale = 1.0}) {
     final id = _nextId++;
     void stop() {
       if (_running?.id == id) {
@@ -486,7 +544,8 @@ class EngineService {
 
     final controller = StreamController<GenerationEvent>(onCancel: stop);
     _streams[id] = controller;
-    _enqueue(_Job(id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force, grammar, structure],
+    _enqueue(_Job(
+        id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force, grammar, structure, adapter, adapterScale],
         background: false));
     return Generation(controller.stream, stop);
   }
@@ -531,10 +590,25 @@ void _worker(SendPort replies) {
   replies.send(commands.sendPort);
   final lib = LiyabLib.instance;
   var engine = Pointer<Void>.fromAddress(0);
+  // The LoRA adapter the engine applies now ('': none). A generation selects its own; every other command
+  // (the app's prefills, saved states, embeddings) runs on the base model.
+  var adapter = '';
+  var adapterScale = 1.0;
 
   void destroy() {
     if (engine.address != 0) lib.destroy(engine);
     engine = Pointer<Void>.fromAddress(0);
+    adapter = '';
+    adapterScale = 1.0;
+  }
+
+  bool select(String name, double scale) {
+    if (name == adapter && (name.isEmpty || scale == adapterScale)) return true;
+    final ok = using((arena) => lib.setAdapter(engine, name.toNativeUtf8(allocator: arena), scale)) == LiyabStatus.ok;
+    // After a failure the engine's selection is not known here: the next command selects again.
+    adapter = ok ? name : '\u0000unknown';
+    adapterScale = scale;
+    return ok;
   }
 
   commands.listen((message) {
@@ -572,6 +646,14 @@ void _worker(SendPort replies) {
               final value = LiyabLib.readText((b, s) => lib.metadata(engine, k, b, s));
               if (value.isNotEmpty) metadata[key] = value;
             }
+            final loadedAdapters = <String>[];
+            final adapterErrors = <String, String>{};
+            for (final MapEntry(key: name, value: path) in Map<String, String>.from(m[12] as Map).entries) {
+              lib.loadAdapter(engine, name.toNativeUtf8(allocator: arena), path.toNativeUtf8(allocator: arena)) ==
+                      LiyabStatus.ok
+                  ? loadedAdapters.add(name)
+                  : adapterErrors[name] = lib.errorMessage();
+            }
             final plan = arena<LiyabMemoryPlan>();
             lib.memoryPlan(engine, plan);
             replies.send([
@@ -586,12 +668,25 @@ void _worker(SendPort replies) {
                 lib.contextLength(engine),
                 lib.pooling(engine),
                 lib.embeddingSize(engine),
+                loadedAdapters,
+                adapterErrors,
               ]
             ]);
           });
         case 'unload':
           destroy();
           replies.send(['ok', id]);
+        case 'loadAdapter':
+        case 'unloadAdapter':
+          if (engine.address == 0) return fail('no model loaded');
+          using((arena) {
+            final name = (m[2] as String).toNativeUtf8(allocator: arena);
+            final status = kind == 'loadAdapter'
+                ? lib.loadAdapter(engine, name, (m[3] as String).toNativeUtf8(allocator: arena))
+                : lib.unloadAdapter(engine, name);
+            if (kind == 'unloadAdapter' && m[2] == adapter) adapter = ''; // the engine went back to the base model
+            status == LiyabStatus.ok ? replies.send(['ok', id]) : fail();
+          });
         case 'tokenize':
           if (engine.address == 0) return fail('no model loaded');
           using((arena) {
@@ -633,6 +728,7 @@ void _worker(SendPort replies) {
           });
         case 'prefill':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select('', 1.0)) return fail();
           using((arena) {
             lib.prefill(engine, (m[2] as String).toNativeUtf8(allocator: arena), 1) == LiyabStatus.ok
                 ? replies.send(['ok', id])
@@ -640,6 +736,7 @@ void _worker(SendPort replies) {
           });
         case 'saveState':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select('', 1.0)) return fail();
           using((arena) {
             final path = (m[2] as String).toNativeUtf8(allocator: arena);
             final continuing = m[3] as String?;
@@ -656,6 +753,7 @@ void _worker(SendPort replies) {
           });
         case 'loadState':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select('', 1.0)) return fail();
           using((arena) {
             final n = arena<Int32>();
             lib.loadState(engine, (m[2] as String).toNativeUtf8(allocator: arena), n) == LiyabStatus.ok
@@ -670,9 +768,11 @@ void _worker(SendPort replies) {
           });
         case 'generate':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select(m[10] as String, m[11] as double)) return fail();
           _generate(lib, engine, m, replies);
         case 'embed':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select('', 1.0)) return fail();
           using((arena) {
             final texts = List<String>.from(m[2] as List);
             final params = arena<LiyabEmbedParams>();
@@ -699,6 +799,7 @@ void _worker(SendPort replies) {
           });
         case 'rerank':
           if (engine.address == 0) return fail('no model loaded');
+          if (!select('', 1.0)) return fail();
           using((arena) {
             final documents = List<String>.from(m[3] as List);
             final params = arena<LiyabRerankParams>();

@@ -32,14 +32,17 @@ class AnthropicApi {
         },
       };
 
-  static Map<String, Object?> models(String model) => {
+  /// The model, then the LoRA adapters loaded next to it (a request names one as its `model` to use it).
+  static Map<String, Object?> models(String model, [List<String> adapters = const []]) => {
         'data': [
           if (model.isNotEmpty)
             {'type': 'model', 'id': model, 'display_name': model, 'created_at': '1970-01-01T00:00:00Z'},
+          for (final a in adapters)
+            {'type': 'model', 'id': a, 'display_name': a, 'created_at': '1970-01-01T00:00:00Z'},
         ],
         'has_more': false,
-        'first_id': model.isEmpty ? null : model,
-        'last_id': model.isEmpty ? null : model,
+        'first_id': model.isEmpty ? (adapters.isEmpty ? null : adapters.first) : model,
+        'last_id': adapters.isNotEmpty ? adapters.last : (model.isEmpty ? null : model),
       };
 
   static List<ToolSpec> _tools(Object? raw) {
@@ -125,6 +128,8 @@ class AnthropicApi {
       maxTokens: maxTokens,
       stop: stopList(body['stop_sequences']),
       thinking: thinking is Map && thinking['type'] != 'disabled',
+      model: body['model'] as String?,
+      adapter: body['adapter'] as String?,
     );
   }
 
