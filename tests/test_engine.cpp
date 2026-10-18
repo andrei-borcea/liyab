@@ -5023,6 +5023,26 @@ TEST_CASE("Windowed blocks: a saved context restores exactly, older files conver
     }
 }
 
+TEST_CASE("A context saved without a window loads into a cache with the engine's own window") {
+    WindowedPair p = load_windowed("gemma3");
+    CHECK(feed_both(p, 0, 120, 32));
+    std::stringstream saved;
+    REQUIRE(p.every->write_state(saved).is_ok());
+    auto file = MmapLoader::open(windowed_model("gemma3"));
+    REQUIRE(file.has_value());
+    TransformerOptions options;
+    options.context_length = 512;
+    options.max_batch = 8;
+    options.keep_windowed_rows = true;
+    options.sliding_window = 64;  // the engine's window: every block keeps its last 64 and the sinks
+    auto sliding = Transformer::load(std::move(file).value(), options);
+    REQUIRE(sliding.has_value());
+    REQUIRE(sliding.value()->read_state(saved).is_ok());
+    CHECK(sliding.value()->n_past() == 120);
+    const std::vector<int32_t> next = {stream_token(120, sliding.value()->config().n_vocab)};
+    CHECK(sliding.value()->forward(next, Transformer::Logits::Last, p.route, *p.pool).has_value());
+}
+
 TEST_CASE("Windowed models: the prefix cache brings back a replaced conversation and a snapshot, exactly") {
     for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
         EngineConfig config = engine_config(windowed_model(arch));

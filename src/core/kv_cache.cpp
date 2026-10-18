@@ -267,18 +267,21 @@ Status KvCache::reserve_context(int32_t n, std::span<const int32_t> pins) {
     const int32_t sink_pages = sink_page_count();
     for (Group& g : groups_) {
         set_pinned_ranges(g);
-        const bool release = releases(g);
-        const int32_t first = release && n > 0 ? first_seen(g, n) / config_.page_tokens : 0;
+        // Only windowed groups keep less than [0, n): a group bounded by the
+        // engine's window alone maps every page, as reserve() after clear()
+        // does, and lets go of them once the context moves on.
+        const bool windowed = g.window > 0;
+        const int32_t first = windowed && n > 0 ? first_seen(g, n) / config_.page_tokens : 0;
         const auto table_pages = static_cast<int32_t>(g.table.size() / static_cast<size_t>(g.units));
         for (int32_t p = 0; p < std::max(pages, table_pages); ++p) {
-            const bool needed = p < pages && (!release || p < sink_pages || p >= first || is_pinned(g, p));
+            const bool needed = p < pages && (!windowed || p < sink_pages || p >= first || is_pinned(g, p));
             if (needed) {
                 if (!mapped(g, static_cast<size_t>(p))) LIYAB_RETURN_IF_ERROR(map_page(g, static_cast<size_t>(p)));
             } else {
                 free_page(g, static_cast<size_t>(p));
             }
         }
-        g.released_below = release ? first : 0;
+        g.released_below = first;
     }
     return Status::ok();
 }
