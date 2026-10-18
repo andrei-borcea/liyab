@@ -34,10 +34,12 @@ class OpenAiApi {
         },
       };
 
-  static Map<String, Object?> models(String model) => {
+  /// The model, then the LoRA adapters loaded next to it (a request names one as its `model` to use it).
+  static Map<String, Object?> models(String model, [List<String> adapters = const []]) => {
         'object': 'list',
         'data': [
           if (model.isNotEmpty) {'id': model, 'object': 'model', 'created': 0, 'owned_by': 'liyab'},
+          for (final a in adapters) {'id': a, 'object': 'model', 'created': 0, 'owned_by': 'liyab', 'parent': model},
         ],
       };
 
@@ -156,6 +158,8 @@ class OpenAiApi {
       toolName: toolName,
       parallelToolCalls: body['parallel_tool_calls'] != false,
       responseSchema: _responseSchema(body['response_format']),
+      model: body['model'] as String?,
+      adapter: body['adapter'] as String?,
     );
   }
 
@@ -175,6 +179,8 @@ class OpenAiApi {
       topK: intField(body, 'top_k'),
       maxTokens: intField(body, 'max_tokens') ?? 16, // the OpenAI default for completions
       stop: stopList(body['stop']),
+      model: body['model'] as String?,
+      adapter: body['adapter'] as String?,
     );
   }
 

@@ -64,6 +64,8 @@ class ApiRequest {
     this.toolName,
     this.parallelToolCalls = true,
     this.responseSchema,
+    this.model,
+    this.adapter,
   });
 
   /// A conversation, formatted with the model's chat template. A last
@@ -95,6 +97,14 @@ class ApiRequest {
 
   /// The answer is a JSON value valid against this JSON Schema (response_format).
   final Map<String, Object?>? responseSchema;
+
+  /// The `model` the client asked for. The loaded model answers whatever it names, unless it names a LoRA adapter
+  /// loaded next to it (ApiBackend.adapters): then that adapter answers.
+  final String? model;
+
+  /// A LoRA adapter asked for by name (an `adapter` field): it must be loaded (else 400). Takes precedence over
+  /// `model`.
+  final String? adapter;
 }
 
 /// A request the API refuses, with the HTTP status that says why.
@@ -165,6 +175,10 @@ abstract class ApiBackend {
   /// process Android started without a window); '' when none is chosen.
   /// Listed by /v1/models, so a client that checks the list first finds it.
   String get servedModel;
+
+  /// The LoRA adapters loaded next to the model, by name (listed by /v1/models after it). A request selects one
+  /// by naming it as its `model` or `adapter`; valid once ensureLoaded() returned.
+  List<String> get adapters;
   ChatTemplate get template;
   bool get thinkingSupported;
 
@@ -180,9 +194,10 @@ abstract class ApiBackend {
   /// Loads the model again if it was released while idle; throws ApiError when no model is chosen.
   Future<void> ensureLoaded();
   Future<int> countTokens(String text);
-  /// See EngineService.generate for `grammar` and `structure` (constrained decoding).
+  /// See EngineService.generate for `grammar` and `structure` (constrained decoding) and `adapter` (a LoRA
+  /// adapter of `adapters` that answers; '' for the model itself).
   Generation generate(String prompt, SamplingOptions sampling,
-      {String? grammar, Continuation Function(String generated)? structure});
+      {String? grammar, Continuation Function(String generated)? structure, String adapter = ''});
 
   /// What the loaded model pools (LiyabPooling): none for a generative model, last or mean for an embedding
   /// model, rank for a reranker. Valid once ensureLoaded() returned.
@@ -360,11 +375,28 @@ class ApiCore {
     }
   }
 
+  /// The LoRA adapter that answers `r` ('' for the model itself): its `adapter`, which must be loaded, else its
+  /// `model` when that names a loaded adapter.
+  String adapterFor(ApiRequest r) {
+    final loaded = backend.adapters;
+    final asked = r.adapter;
+    if (asked != null && asked.isNotEmpty) {
+      if (!loaded.contains(asked)) {
+        throw ApiError(400, 'no LoRA adapter named $asked is loaded'
+            '${loaded.isEmpty ? '' : ' (loaded: ${loaded.join(', ')})'}');
+      }
+      return asked;
+    }
+    final model = r.model;
+    return model != null && loaded.contains(model) ? model : '';
+  }
+
   /// Runs `r`: ApiStart, then reasoning and answer pieces, then ApiDone.
   /// Cancelling the subscription stops the generation.
   Stream<ApiEvent> run(ApiRequest r) async* {
     await backend.ensureLoaded();
     _refusePooling();
+    final adapter = adapterFor(r);
     final (text, reasoning) = prompt(r);
     final (grammar, structure) = constraints(r, reasoning: reasoning);
     yield ApiStart(await backend.countTokens(text));
@@ -389,7 +421,7 @@ class ApiCore {
       }
     }
 
-    final generation = backend.generate(text, sampling, grammar: grammar, structure: structure);
+    final generation = backend.generate(text, sampling, grammar: grammar, structure: structure, adapter: adapter);
     var stopping = false;
     try {
       // Leaving this loop early (the client went away) cancels the subscription, which stops the generation.

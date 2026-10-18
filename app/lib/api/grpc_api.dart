@@ -24,7 +24,8 @@ class LiyabGrpcService extends Service {
   @override
   String get $name => 'liyab.v1.Liyab';
 
-  List<String> _models() => [if (core.backend.servedModel.isNotEmpty) core.backend.servedModel];
+  List<String> _models() =>
+      [if (core.backend.servedModel.isNotEmpty) core.backend.servedModel, ...core.backend.adapters];
 
   Stream<ApiEvent> _generate(ServiceCall call, Future<ApiRequest> request) async* {
     try {
@@ -53,7 +54,7 @@ class LiyabGrpcService extends Service {
   static ApiRequest decodeRequest(List<int> bytes) {
     final r = CodedBufferReader(bytes);
     final messages = <ApiMessage>[], stop = <String>[];
-    String? prompt;
+    String? prompt, adapter;
     double? temperature, topP;
     int? topK, maxTokens;
     var thinking = false;
@@ -76,6 +77,8 @@ class LiyabGrpcService extends Service {
           stop.add(r.readString());
         case 8:
           thinking = r.readBool();
+        case 9:
+          adapter = r.readString();
         default:
           r.skipField(tag);
       }
@@ -89,6 +92,7 @@ class LiyabGrpcService extends Service {
       maxTokens: maxTokens,
       stop: stop,
       thinking: thinking,
+      adapter: adapter,
     );
   }
 

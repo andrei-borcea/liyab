@@ -108,7 +108,9 @@ class LocalApi {
       final route = '${request.method} $path';
       if (route == 'GET /v1/models') {
         final model = core.backend.servedModel;
-        return await conn.json(200, anthropic ? AnthropicApi.models(model) : OpenAiApi.models(model));
+        final adapters = core.backend.adapters;
+        return await conn.json(
+            200, anthropic ? AnthropicApi.models(model, adapters) : OpenAiApi.models(model, adapters));
       }
       switch (route) {
         case 'POST /v1/chat/completions':

@@ -29,6 +29,9 @@ class FakeBackend implements ApiBackend {
   var stops = 0;
   ToolDialect dialect = ToolDialect.hermesJson;
   final grammars = <String?>[]; // the whole-output grammar of each generation
+  final adapterCalls = <String>[]; // the LoRA adapter of each generation ('': the model itself)
+  @override
+  List<String> adapters = const [];
   final spans = <String>[]; // grammars the structure callbacks opened
   final forced = <String>[]; // text they forced
 
@@ -102,9 +105,10 @@ class FakeBackend implements ApiBackend {
 
   @override
   Generation generate(String prompt, SamplingOptions sampling,
-      {String? grammar, Continuation Function(String generated)? structure}) {
+      {String? grammar, Continuation Function(String generated)? structure, String adapter = ''}) {
     prompts.add(prompt);
     grammars.add(grammar);
+    adapterCalls.add(adapter);
     var stopped = false;
     void stop() {
       if (!stopped) ++stops; // like EngineService's, stopping twice is stopping once
@@ -350,6 +354,37 @@ t1 ::= "now>\n" ""''');
       final (_, anthropic) =
           await call('GET', '/v1/models', headers: const {'x-api-key': token, 'anthropic-version': '2023-06-01'});
       expect(jsonDecode(anthropic)['data'][0]['id'], 'test-model.gguf');
+    });
+
+    test('LoRA adapters: listed after the model, selected by model or adapter, unknown ones refused', () async {
+      backend.adapters = ['support', 'legal'];
+      final (_, openai) = await call('GET', '/v1/models');
+      expect([for (final m in jsonDecode(openai)['data'] as List) m['id']], ['test-model.gguf', 'support', 'legal']);
+      final (_, anthropic) =
+          await call('GET', '/v1/models', headers: const {'x-api-key': token, 'anthropic-version': '2023-06-01'});
+      expect([for (final m in jsonDecode(anthropic)['data'] as List) m['id']], ['test-model.gguf', 'support', 'legal']);
+
+      Map<String, Object?> chat(Map<String, Object?> extra) => {
+            'messages': [
+              {'role': 'user', 'content': 'Hi'},
+            ],
+            ...extra,
+          };
+      // `model` naming an adapter selects it; any other model name is the model itself.
+      expect((await call('POST', '/v1/chat/completions', body: chat({'model': 'support'}))).$1, 200);
+      expect((await call('POST', '/v1/chat/completions', body: chat({'model': 'gpt-4o'}))).$1, 200);
+      expect((await call('POST', '/v1/completions', body: {'prompt': 'Hi', 'model': 'legal'})).$1, 200);
+      // `adapter` wins over `model`, and must name a loaded adapter.
+      expect((await call('POST', '/v1/chat/completions', body: chat({'model': 'support', 'adapter': 'legal'}))).$1, 200);
+      final (refused, error) = await call('POST', '/v1/chat/completions', body: chat({'adapter': 'missing'}));
+      expect(refused, 400);
+      expect(jsonDecode(error)['error']['message'], contains('no LoRA adapter named missing'));
+      // Anthropic clients name it the same way.
+      final (status, _) = await call('POST', '/v1/messages',
+          body: chat({'model': 'legal', 'max_tokens': 10}),
+          headers: const {'x-api-key': token, 'anthropic-version': '2023-06-01'});
+      expect(status, 200);
+      expect(backend.adapterCalls, ['support', '', 'legal', 'legal', 'legal']);
     });
 
     test('OpenAI: models, chat completion, reasoning, usage, streaming', () async {
@@ -957,6 +992,28 @@ t1 ::= "now>\n" ""''');
       }
       expect(text.toString(), 'Hello there');
       expect(completion, 2);
+
+      // A LoRA adapter named by field 9, listed by ListModels after the model.
+      backend.adapters = ['support'];
+      final adapted = (CodedBufferWriter()
+            ..writeField(1, PbFieldType.OY, message)
+            ..writeField(9, PbFieldType.OS, 'support'))
+          .toBuffer();
+      await client
+          .$createStreamingCall(generate, Stream.value(adapted),
+              options: grpc.CallOptions(metadata: {'authorization': 'Bearer $token'}))
+          .toList();
+      expect(backend.adapterCalls.last, 'support');
+      final listModels = grpc.ClientMethod<List<int>, List<int>>('/liyab.v1.Liyab/ListModels', (b) => b, (b) => b);
+      final listed = await client
+          .$createUnaryCall(listModels, <int>[], options: grpc.CallOptions(metadata: {'authorization': 'Bearer $token'}));
+      final models = <String>[];
+      final reader = CodedBufferReader(listed);
+      while (!reader.isAtEnd()) {
+        reader.readTag();
+        models.add(reader.readString());
+      }
+      expect(models, ['test-model.gguf', 'support']);
 
       await expectLater(
         client.$createStreamingCall(generate, Stream.value(request)).toList(),

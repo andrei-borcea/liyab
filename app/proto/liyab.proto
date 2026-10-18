@@ -7,7 +7,7 @@ syntax = "proto3";
 package liyab.v1;
 
 service Liyab {
-  // The loaded model (none when no model is loaded).
+  // The loaded model (none when no model is loaded), then the LoRA adapters loaded next to it.
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   // Streams the reply: reasoning pieces (thinking mode), text pieces, then Done.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
@@ -29,6 +29,7 @@ message GenerateRequest {
   optional int32 max_tokens = 6;
   repeated string stop = 7;       // stop sequences (not included in the reply)
   bool thinking = 8;              // reason first, on models with a thinking mode
+  optional string adapter = 9;    // a LoRA adapter of ListModels that answers instead of the model itself
 }
 
 message GenerateResponse {
