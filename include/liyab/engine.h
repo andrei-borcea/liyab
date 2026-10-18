@@ -115,7 +115,8 @@ struct EngineConfig {
     // then edited after the last reply does not. Contexts are kept in a
     // content-addressed store of KV chunks (whole KV pages, about 2 MiB, at
     // most 256 tokens), each keyed by every token before it plus the model,
-    // cache layout, key scales and kernels, so a prefix conversations share
+    // cache layout, key scales, kernels and the LoRA adapter selected (see
+    // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
     // restores it; recurrent (DeltaNet) states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model

@@ -594,7 +594,8 @@ each of those as a scheduling problem.
   it than the context keeps. A chunk is a whole number of pages of the paged KV cache, about 2 MiB and at most
   256 tokens (each is a file on storage, and creating one costs about as much as writing a megabyte), keyed by a
   hash chained over every token before it and rooted in what its bytes depend on (the model file, cache layout and
-  type, key scales, kernels and backends, and a latent-attention model's prefill form). A prefix that several
+  type, key scales, kernels and backends, a latent-attention model's prefill form, and the
+  [LoRA adapter](#lora-adapters) selected with its scale, if any). A prefix that several
   conversations share (the system prompt, the tool block, the start of a conversation) is therefore stored once,
   and setting a conversation aside again writes only its new chunks. A later prompt is restored up to the longest
   prefix the store holds, chunk by chunk, then cut to where the two diverge, even when its earlier replies would
@@ -2344,7 +2345,10 @@ Implemented features are described above. These are next, in order:
 3. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need. Then verification of the suffix drafts' whole tree in one pass, with tree attention masks.
-5. **Multi-LoRA.** Adapters for dense and MoE layers, switched per request.
+5. **LoRA adapters, next.** [Adapters](#lora-adapters) for dense and MoE layers switched per request are in place.
+   Next: the update computed on the GPU next to the base product (today the CPU adds it after an accelerator's
+   matmul), adapters of the token embeddings and of latent attention's per-head matrices, and a lower fixed cost per
+   adapted matmul at low rank.
 6. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
    pass (a mask per input), which the GPU path needs most: a pass costs it ~35 ms of fixed work, against ~3 ms on
@@ -2436,6 +2440,10 @@ Implemented features are described above. These are next, in order:
   Q8_0, against ~33 ms of work for a 37-token text) and ~35 ms on Metal (29 per second). F16 and BF16 weights
   multiply row by row on the CPU (no tiled float kernel yet), which makes their files several times slower to embed
   with than Q8_0 ones.
+* **LoRA adapters:** the update runs on the CPU, also when the base matmuls run on a GPU. Refused: adapters of the
+  token embeddings, of latent attention's per-head `attn_k_b` / `attn_v_b`, and activated LoRA. Segment reuse is off
+  while an adapter is selected. A draft model drafts without the adapter. On small models the update's fixed cost
+  per matmul shows at low rank (+6% per token at rank 8 on a 0.5B model, see [LoRA adapters](#lora-adapters)).
 * **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as
   `anyOf` (overlapping branches are not told apart); speculative decoding pauses while a grammar is active.
 * **Split GGUF:** dense split models use the older `mmap` streaming window. A split model opened through the system
@@ -2468,7 +2476,8 @@ src/core/               engine, architecture registry and model description, tra
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
                         sampler, speculative decoding (draft budget, suffix drafter), the prefix cache's KV
-                        store (kv_store.h), segment reuse (kv_reuse.h), power manager, device detection, thread pool, OS services (os.h:
+                        store (kv_store.h), segment reuse (kv_reuse.h), LoRA adapters (lora.h), power manager,
+                        device detection, thread pool, OS services (os.h:
                         memory, UTF-8 paths, file replacement, file locks; POSIX and Windows)
 src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*), metal/, vulkan/ (+ shaders/),
                         qnn/ and neuropilot/ (runtime probes)

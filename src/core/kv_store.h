@@ -13,7 +13,10 @@
 // key scales the keys were stored with, the kernel set and the backends that
 // computed them. So identical prefixes (a system prompt, a tool block, the
 // start of a conversation) are stored once whatever context they came from,
-// and a chunk is never read back for another model or other settings.
+// and a chunk is never read back for another model or other settings. The
+// seed can change while the store is open (set_seed(): the engine's LoRA
+// adapter, which changes every hidden state): each seed's items stay stored
+// side by side, and only the seed in use is ever returned.
 //
 // What a prompt gets back (plan()). The chunks of the prompt's tokens are
 // looked up in order while they are stored; at the first one that is not,
