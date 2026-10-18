@@ -127,6 +127,7 @@ add_library(liyab_core OBJECT
   src/core/kv_store.cpp
   src/core/kv_codec.cpp
   src/core/kv_reuse.cpp
+  src/core/lora.cpp
   src/core/triple_buffer_loader.cpp
   src/core/unicode.cpp
   src/core/regex.cpp
@@ -352,6 +353,7 @@ if(LIYAB_BUILD_TESTS)
   set(_liyab_tests test_mmap test_device_detect test_engine test_text test_kv_cache test_backends test_golden test_grammar)
   list(APPEND _liyab_tests test_pooling)
   list(APPEND _liyab_tests test_kv_reuse)
+  list(APPEND _liyab_tests test_lora)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()

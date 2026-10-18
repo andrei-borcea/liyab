@@ -1397,6 +1397,11 @@ Status Transformer::matmul(const Route& route, Backend* backend, const TensorVie
                            int32_t n) {
     Status s = backend->matmul(w, x, y, n);
     if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul(w, x, y, n);
+    if (!adapter_targets_.empty() && s.is_ok()) {
+        const TensorView* ws[] = {&w};
+        float* ys[] = {y};
+        s = apply_adapter(route, ws, x, ys, n);
+    }
     return s;
 }
 
@@ -1404,7 +1409,62 @@ Status Transformer::matmul_group(const Route& route, Backend* backend, std::span
                                  const float* x, std::span<float* const> ys, int32_t n) {
     Status s = backend->matmul_group(ws, x, ys, n);
     if (s.code() == ErrorCode::Unsupported && backend != route.cpu) s = route.cpu->matmul_group(ws, x, ys, n);
+    if (!adapter_targets_.empty() && s.is_ok()) s = apply_adapter(route, ws, x, ys, n);
     return s;
+}
+
+Status Transformer::apply_adapter(const Route& route, std::span<const TensorView* const> ws, const float* x,
+                                  std::span<float* const> ys, int32_t n) {
+    adapter_items_.clear();
+    for (size_t i = 0; i < ws.size(); ++i) {
+        const auto it = adapter_targets_.find(ws[i]->name);
+        if (it == adapter_targets_.end() || it->second.target->experts > 0) continue;
+        adapter_items_.push_back({it->second.target, 0, it->second.scale, x, ys[i], n});
+    }
+    // A group's updates in two passes on the CPU, which reads the adapters
+    // in place (an accelerator computed the base matmul into host memory
+    // all the same).
+    return adapter_runner_.apply(*route.cpu, adapter_items_);
+}
+
+Status Transformer::set_adapter(const LoraAdapter* adapter, float scale) {
+    adapter_ = nullptr;
+    adapter_targets_.clear();
+    if (adapter == nullptr) return Status::ok();
+    if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "adapter scale must be finite");
+    // The matrices the forward pass multiplies as a whole (an adapter's
+    // update is added to such a product), by name: every block role but
+    // latent attention's per-head attn_k_b / attn_v_b, and the LM head unless
+    // it is the token embeddings (tied).
+    std::unordered_map<std::string_view, const TensorView*> applied;
+    for (const Layer& L : layers_) {
+        for (size_t role = 0; role < kWeightRoles; ++role) {
+            if (role == kKb || role == kVb || L.w[role] == nullptr) continue;
+            applied.emplace(L.w[role]->name, L.w[role]);
+        }
+    }
+    if (output_ != nullptr && output_ != token_embd_) applied.emplace(output_->name, output_);
+    std::unordered_map<std::string_view, BoundAdapter> bound;
+    for (const LoraTarget& t : adapter->targets()) {
+        const auto it = applied.find(t.base);
+        if (it == applied.end()) {
+            if (file_->tensor(t.base) == nullptr) {
+                return Status(ErrorCode::InvalidArgument,
+                              "the adapter changes " + t.base + ", which the model does not have");
+            }
+            return Status(ErrorCode::Unsupported,
+                          "the adapter changes " + t.base + ", which the forward pass does not multiply as a whole");
+        }
+        const TensorView& w = *it->second;
+        const int32_t experts = w.n_dims >= 3 ? static_cast<int32_t>(w.ne[2]) : 0;
+        if (t.experts != experts || t.a.ne[0] != w.ne[0] || t.b.ne[1] != w.ne[1] || w.ne[3] != 1) {
+            return Status(ErrorCode::InvalidArgument, "the adapter's " + t.base + " does not fit the model's shape");
+        }
+        bound.emplace(t.base, BoundAdapter{&t, adapter->scale_of(t, scale)});
+    }
+    adapter_targets_ = std::move(bound);
+    adapter_ = adapter;
+    return Status::ok();
 }
 
 void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool) {
@@ -2559,7 +2619,13 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
     hb2_.resize(rows);
     // FFN projections: an experimental override first, else the routed backend.
     auto project = [&](FfnProjection p, const TensorView& m, const float* x, float* y) -> Status {
-        if (hook != nullptr && hook->ffn_matmul(layer, p, x, y, n)) return Status::ok();
+        if (hook != nullptr && hook->ffn_matmul(layer, p, x, y, n)) {
+            // The hook replaced the base matmul only: an adapter's update still applies.
+            if (adapter_targets_.empty()) return Status::ok();
+            const TensorView* ws[] = {&m};
+            float* ys[] = {y};
+            return apply_adapter(route, ws, x, ys, n);
+        }
         return matmul(route, route.ffn, m, x, y, n);
     };
     if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
@@ -2751,6 +2817,13 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             for (const int32_t ex : wave) expert_store_->release(layer, ex);
         }
     };
+    // Queues the active adapter's update of one expert's matmul `item` when
+    // it adapts the stack `stack` (see set_adapter()).
+    auto add_expert_update = [&](const TensorView& stack, int32_t expert, const Backend::MatmulItem& item) {
+        const auto it = adapter_targets_.find(stack.name);
+        if (it == adapter_targets_.end() || it->second.target->experts == 0) return;
+        adapter_items_.push_back({it->second.target, expert, it->second.scale, item.x, item.y, item.n});
+    };
     for (size_t next = 0; next < chosen.size();) {
         wave.clear();
         views.clear();
@@ -2825,6 +2898,22 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             release_wave();
             return st;
         }
+        if (!adapter_targets_.empty()) {
+            // Per-expert adapters: expert e's slice for the tokens routed to it.
+            adapter_items_.clear();
+            for (size_t i = 0; i < wave.size(); ++i) {
+                if (fused) {
+                    add_expert_update(w[kUpExps], wave[i], items[i]);
+                } else {
+                    add_expert_update(w[kGateExps], wave[i], items[2 * i]);
+                    add_expert_update(w[kUpExps], wave[i], items[2 * i + 1]);
+                }
+            }
+            if (Status st = adapter_runner_.apply(*route.cpu, adapter_items_); !st.is_ok()) {
+                release_wave();
+                return st;
+            }
+        }
         if (fused) {  // the same rows as the split matrices give, so the same bits
             for (size_t r = 0; r < rows_total; ++r) {
                 const float* gate_up = eh2_.data() + r * 2 * ff;
@@ -2841,6 +2930,11 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         const Status down_status = route.cpu->matmul_batch(items);
         release_wave();  // the outputs are in eout_; the weights are no longer read
         LIYAB_RETURN_IF_ERROR(down_status);
+        if (!adapter_targets_.empty()) {
+            adapter_items_.clear();
+            for (size_t i = 0; i < wave.size(); ++i) add_expert_update(w[kDownExps], wave[i], items[i]);
+            LIYAB_RETURN_IF_ERROR(adapter_runner_.apply(*route.cpu, adapter_items_));
+        }
         for (size_t i = 0; i < first_row.size(); ++i) {
             const auto& users = assigned[static_cast<size_t>(wave[i])];
             for (size_t u = 0; u < users.size(); ++u) {
