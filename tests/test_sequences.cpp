@@ -602,4 +602,494 @@ TEST_CASE("forward_batch refuses what it cannot run together") {
     CHECK(out.size() == 2 && out[0].size() == static_cast<size_t>(model->config().n_vocab));
 }
 
+// ---------------------------------------------------------------------------
+// The engine's sequences
+// ---------------------------------------------------------------------------
+namespace {
+
+EngineConfig engine_config(const std::string& path, int32_t sequences) {
+    EngineConfig c;
+    c.model_path = path;
+    c.n_threads = 4;
+    c.thermal_polling = false;
+    c.power.profile = PowerProfile::Performance;  // unpaced: keep tests fast
+    c.backend = BackendKind::Cpu;                 // the same bits in any batch: the CPU backend's contract
+    c.max_sequences = sequences;
+    return c;
+}
+
+SamplingParams greedy(int32_t max_tokens) {
+    SamplingParams p;
+    p.temperature = 0.0f;
+    p.max_tokens = max_tokens;
+    return p;
+}
+
+SamplingParams sampled(int32_t max_tokens, uint64_t seed) {
+    SamplingParams p;
+    p.temperature = 0.9f;
+    p.top_k = 20;
+    p.top_p = 0.95f;
+    p.seed = seed;
+    p.max_tokens = max_tokens;
+    return p;
+}
+
+// One generation of a test: on `seq` (nullptr: the engine's default sequence).
+struct Job {
+    Engine::Sequence* seq = nullptr;
+    std::string prompt;
+    SamplingParams params;
+    std::string out;
+    std::vector<int32_t> tokens;
+    Status status;
+    GenerationStats stats;
+    std::function<bool(int32_t)> stop_after;  // optional: called with the tokens so far; true stops
+};
+
+void run_job(Engine& engine, Job& job) {
+    auto on_token = [&](std::string_view piece, int32_t token) {
+        job.out += piece;
+        job.tokens.push_back(token);
+        return !job.stop_after || !job.stop_after(static_cast<int32_t>(job.tokens.size()));
+    };
+    auto r = job.seq != nullptr ? job.seq->generate(job.prompt, job.params, on_token)
+                                : engine.generate(job.prompt, job.params, on_token);
+    job.status = r.status();
+    if (r) job.stats = *r;
+}
+
+// Every job at once, each on a thread of its own, released together.
+void run_together(Engine& engine, std::vector<Job>& jobs) {
+    std::atomic<int32_t> ready{0};
+    std::vector<std::thread> threads;
+    for (Job& job : jobs) {
+        threads.emplace_back([&] {
+            ready.fetch_add(1);
+            while (ready.load() < static_cast<int32_t>(jobs.size())) std::this_thread::yield();
+            run_job(engine, job);
+        });
+    }
+    for (std::thread& t : threads) t.join();
+}
+
+// Each job alone, on an engine of one sequence with a fresh context.
+std::vector<std::string> run_alone(const EngineConfig& config, std::vector<Job> jobs) {
+    EngineConfig one = config;
+    one.max_sequences = 1;
+    auto engine = Engine::create(one);
+    std::vector<std::string> out;
+    if (!engine) return out;
+    for (Job& job : jobs) {
+        engine.value()->reset_context();
+        job.seq = nullptr;
+        job.out.clear();
+        job.tokens.clear();
+        run_job(*engine.value(), job);
+        out.push_back(job.status.is_ok() ? job.out : "<" + job.status.to_string() + ">");
+    }
+    return out;
+}
+
+std::vector<Job> four_jobs() {
+    std::vector<Job> jobs(4);
+    jobs[0].prompt = "hello world";
+    jobs[0].params = greedy(24);
+    jobs[1].prompt = "world hello world hello, how is the world";
+    jobs[1].params = greedy(20);
+    jobs[2].prompt = "hello";
+    jobs[2].params = sampled(28, 1234);
+    jobs[3].prompt = "a quick brown fox jumps over the lazy dog, hello world";
+    jobs[3].params = greedy(16);
+    return jobs;
+}
+
+// The jobs together on `config`'s engine (job 0 on the default sequence,
+// the others on sequences of their own) against each alone.
+bool check_together(const std::string& name, const EngineConfig& config, std::vector<Job> jobs,
+                    Engine::SchedulerStats* stats_out = nullptr) {
+    const std::vector<std::string> alone = run_alone(config, jobs);
+    if (alone.size() != jobs.size()) {
+        std::printf("  %s: the reference engine failed\n", name.c_str());
+        return false;
+    }
+    auto engine = Engine::create(config);
+    if (!engine) {
+        std::printf("  %s: %s\n", name.c_str(), engine.status().to_string().c_str());
+        return false;
+    }
+    std::vector<std::unique_ptr<Engine::Sequence>> sequences;
+    for (size_t i = 1; i < jobs.size(); ++i) {
+        auto seq = engine.value()->open_sequence();
+        if (!seq) {
+            std::printf("  %s: open_sequence: %s\n", name.c_str(), seq.status().to_string().c_str());
+            return false;
+        }
+        jobs[i].seq = seq->get();
+        sequences.push_back(std::move(seq).value());
+    }
+    run_together(*engine.value(), jobs);
+    bool ok = true;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        if (!jobs[i].status.is_ok()) {
+            std::printf("  %s: job %zu: %s\n", name.c_str(), i, jobs[i].status.to_string().c_str());
+            ok = false;
+        } else if (jobs[i].out != alone[i]) {
+            std::printf("  %s: job %zu together \"%s\", alone \"%s\"\n", name.c_str(), i, jobs[i].out.c_str(),
+                        alone[i].c_str());
+            ok = false;
+        }
+    }
+    const Engine::SchedulerStats st = engine.value()->scheduler_stats();
+    std::printf("  %s: %llu passes, %llu shared (%llu rows), %llu stopped\n", name.c_str(),
+                static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.shared_passes),
+                static_cast<unsigned long long>(st.shared_rows), static_cast<unsigned long long>(st.preempted));
+    if (stats_out != nullptr) *stats_out = st;
+    return ok;
+}
+
+test::TinyModelSpec hybrid_spec() {
+    test::TinyModelSpec s;
+    s.arch = "qwen35";
+    s.n_layers = 4;
+    s.delta_net_interval = 2;
+    return s;
+}
+
+test::TinyModelSpec moe_spec() {
+    test::TinyModelSpec s;
+    s.arch = "qwen3moe";
+    s.n_layers = 3;
+    s.n_expert = 16;
+    s.n_expert_used = 4;
+    s.identical_experts = false;
+    return s;
+}
+
+test::TinyModelSpec latent_spec() {
+    test::TinyModelSpec s;
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("Engine sequences generate together, each one's output what it gives alone") {
+    struct Model {
+        const char* name;
+        test::TinyModelSpec spec;
+        int64_t expert_cache_mb = -1;
+    };
+    test::TinyModelSpec windowed;
+    windowed.arch = "gemma2";
+    windowed.n_layers = 4;
+    windowed.sliding_window = 16;
+    windowed.post_norms = true;
+    for (const Model& m : {Model{"llama", {}}, Model{"hybrid", hybrid_spec()}, Model{"moe streamed", moe_spec(), 1},
+                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed}}) {
+        EngineConfig config = engine_config(model_path(std::string("engine_") + m.name, m.spec), 4);
+        config.expert_cache_mb = m.expert_cache_mb;
+        Engine::SchedulerStats st;
+        CHECK(check_together(m.name, config, four_jobs(), &st));
+        CHECK(st.shared_passes > 0);
+    }
+}
+
+TEST_CASE("Engine sequences: speculative drafts run alone, shared steps keep every output") {
+    for (const bool hybrid : {false, true}) {
+        EngineConfig config =
+            engine_config(hybrid ? model_path("engine_hybrid", hybrid_spec()) : model_path("engine_llama", {}), 3);
+        config.lookup_drafts = true;  // suffix drafts, tree verification
+        std::vector<Job> jobs = four_jobs();
+        jobs.resize(3);
+        CHECK(check_together(hybrid ? "drafts hybrid" : "drafts", config, jobs));
+    }
+}
+
+TEST_CASE("Engine sequences: one is cancelled, the others go on as alone") {
+    const EngineConfig config = engine_config(model_path("engine_llama", {}), 3);
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    auto a = engine.value()->open_sequence();
+    auto b = engine.value()->open_sequence();
+    REQUIRE(a.has_value() && b.has_value());
+    std::vector<Job> jobs = four_jobs();
+    jobs.resize(3);
+    jobs[0].params.max_tokens = 64;
+    jobs[1].seq = a->get();
+    jobs[2].seq = b->get();
+    jobs[2].params = greedy(64);
+    Engine::Sequence* cancelled = b->get();
+    jobs[2].stop_after = [cancelled](int32_t n) {
+        if (n == 5) cancelled->cancel();
+        return false;
+    };
+    const std::vector<std::string> alone = run_alone(config, jobs);
+    run_together(*engine.value(), jobs);
+    REQUIRE(jobs[2].status.is_ok());
+    CHECK(jobs[2].stats.cancelled);
+    CHECK(jobs[2].stats.generated_tokens <= 6);
+    CHECK(jobs[0].out == alone[0]);
+    CHECK(jobs[1].out == alone[1]);
+    CHECK(!jobs[0].stats.cancelled && !jobs[1].stats.cancelled);
+    // The cancelled sequence continues its conversation as a fresh one would.
+    Job again;
+    again.seq = b->get();
+    again.prompt = "hello world";
+    again.params = greedy(12);
+    run_job(*engine.value(), again);
+    std::vector<Job> ref(1);
+    ref[0].prompt = again.prompt;
+    ref[0].params = again.params;
+    CHECK(again.out == run_alone(config, ref)[0]);
+}
+
+TEST_CASE("Engine sequences: limits, Busy, and engines that refuse them") {
+    {
+        auto engine = Engine::create(engine_config(model_path("engine_llama", {}), 1));
+        REQUIRE(engine.has_value());
+        CHECK(engine.value()->open_sequence().status().code() == ErrorCode::Unsupported);
+    }
+    auto engine = Engine::create(engine_config(model_path("engine_llama", {}), 2));
+    REQUIRE(engine.has_value());
+    auto a = engine.value()->open_sequence(SequencePriority::Background);
+    REQUIRE(a.has_value());
+    CHECK(a.value()->priority() == SequencePriority::Background);
+    CHECK(a.value()->id() > 0);
+    CHECK(engine.value()->open_sequence().status().code() == ErrorCode::Busy);
+    CHECK(engine.value()->scheduler_stats().open_sequences == 2);
+    // A second call on a sequence while one runs: Busy (a callback calls it).
+    Status inner;
+    Engine::Sequence* seq = a->get();
+    auto r = seq->generate("hello", greedy(4), [&](std::string_view, int32_t) {
+        inner = seq->prefill("world").code() == ErrorCode::Busy ? Status::ok() : Status(ErrorCode::Internal, "not busy");
+        return true;
+    });
+    REQUIRE(r.has_value());
+    CHECK(inner.is_ok());
+    a.value().reset();  // closed: its slot can be taken again
+    CHECK(engine.value()->scheduler_stats().open_sequences == 1);
+    auto b = engine.value()->open_sequence();
+    CHECK(b.has_value());
+    // With a draft model: no sequences (its cache follows one).
+    EngineConfig drafted = engine_config(model_path("engine_llama", {}), 2);
+    drafted.draft_model_path = drafted.model_path;
+    auto with_draft = Engine::create(drafted);
+    REQUIRE(with_draft.has_value());
+    CHECK(with_draft.value()->open_sequence().status().code() == ErrorCode::Unsupported);
+}
+
+TEST_CASE("Engine sequences: a background sequence yields, and both outputs stay their own") {
+    test::TinyModelSpec bigger;
+    bigger.n_layers = 8;
+    bigger.n_embd = 512;
+    bigger.n_head = 8;
+    bigger.n_head_kv = 4;
+    bigger.n_ff = 2048;
+    bigger.context_length = 8192;
+    for (const bool hybrid : {false, true}) {
+        test::TinyModelSpec spec = bigger;
+        if (hybrid) {
+            spec.arch = "qwen35";
+            spec.delta_net_interval = 2;
+        }
+        const EngineConfig config =
+            engine_config(model_path(hybrid ? "engine_bigger_hybrid" : "engine_bigger", spec), 2);
+        // A background sequence processes a long prompt; the user's chat
+        // starts meanwhile. The background pass running is stopped between
+        // two blocks (its work so far kept), the user's tokens come first,
+        // and each output is its own all the same.
+        std::string long_prompt;
+        for (int32_t i = 0; i < 1500; ++i) long_prompt += i % 3 == 0 ? "hello world " : "world hello ";
+        std::vector<Job> jobs(2);
+        jobs[0].prompt = "hello world";
+        jobs[0].params = greedy(24);
+        jobs[1].prompt = long_prompt;
+        jobs[1].params = greedy(8);
+        const std::vector<std::string> alone = run_alone(config, jobs);
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        auto background = engine.value()->open_sequence(SequencePriority::Background);
+        REQUIRE(background.has_value());
+        jobs[1].seq = background->get();
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point user_first{}, background_done{};
+        jobs[0].stop_after = [&](int32_t n) {
+            if (n == 1) user_first = Clock::now();
+            return false;
+        };
+        std::thread bg([&] {
+            run_job(*engine.value(), jobs[1]);
+            background_done = Clock::now();
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        run_job(*engine.value(), jobs[0]);
+        bg.join();
+        REQUIRE(jobs[0].status.is_ok() && jobs[1].status.is_ok());
+        CHECK(jobs[0].out == alone[0]);
+        CHECK(jobs[1].out == alone[1]);
+        CHECK(user_first < background_done);  // the user's first token before the background prompt ended
+        const Engine::SchedulerStats st = engine.value()->scheduler_stats();
+        std::printf("  %s: background prompt %d tokens in %.0f ms, %llu passes, %llu shared, %llu stopped for the user's\n",
+                    hybrid ? "hybrid" : "dense", jobs[1].stats.prompt_tokens, jobs[1].stats.prefill_ms,
+                    static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.shared_passes),
+                    static_cast<unsigned long long>(st.preempted));
+        CHECK(st.preempted >= 1);
+    }
+}
+
+TEST_CASE("Engine sequences: each applies its own LoRA adapter") {
+    const std::string& path = model_path("engine_llama", {});
+    const std::string pa = write_adapter("engine_a", path, {"blk.0.attn_q.weight", "blk.1.ffn_down.weight", "output.weight"},
+                                         8, 21);
+    const std::string pb = write_adapter("engine_b", path, {"blk.1.attn_v.weight", "blk.0.ffn_up.weight"}, 4, 22);
+    REQUIRE(!pa.empty() && !pb.empty());
+    EngineConfig config = engine_config(path, 3);
+    // Alone: each job with its adapter on a one-sequence engine.
+    std::vector<Job> jobs = four_jobs();
+    jobs.resize(3);
+    const char* chosen[] = {"", "a", "b"};
+    std::vector<std::string> alone;
+    {
+        EngineConfig one = config;
+        one.max_sequences = 1;
+        auto engine = Engine::create(one);
+        REQUIRE(engine.has_value());
+        REQUIRE(engine.value()->load_adapter("a", pa).is_ok());
+        REQUIRE(engine.value()->load_adapter("b", pb).is_ok());
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            REQUIRE(engine.value()->set_adapter(chosen[i]).is_ok());
+            engine.value()->reset_context();
+            Job job = jobs[i];
+            run_job(*engine.value(), job);
+            alone.push_back(job.out);
+        }
+        CHECK(alone[1] != alone[0] || alone[2] != alone[0]);  // the adapters change something
+    }
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    REQUIRE(engine.value()->load_adapter("a", pa).is_ok());
+    REQUIRE(engine.value()->load_adapter("b", pb).is_ok());
+    auto s1 = engine.value()->open_sequence();
+    auto s2 = engine.value()->open_sequence();
+    REQUIRE(s1.has_value() && s2.has_value());
+    REQUIRE(s1.value()->set_adapter("a").is_ok());
+    REQUIRE(s2.value()->set_adapter("b").is_ok());
+    CHECK(s1.value()->set_adapter("missing").code() == ErrorCode::InvalidArgument);
+    jobs[1].seq = s1->get();
+    jobs[2].seq = s2->get();
+    run_together(*engine.value(), jobs);
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        CHECK(jobs[i].status.is_ok());
+        CHECK(jobs[i].out == alone[i]);
+    }
+    // The default sequence still applies none; unloading an adapter another
+    // sequence selected takes it back to the base model.
+    for (const AdapterInfo& info : engine.value()->adapters()) CHECK(!info.active);
+    REQUIRE(engine.value()->unload_adapter("a").is_ok());
+    Job base;
+    base.seq = s1->get();
+    base.prompt = jobs[1].prompt;
+    base.params = jobs[1].params;
+    run_job(*engine.value(), base);
+    std::vector<Job> ref(1);
+    ref[0].prompt = base.prompt;
+    ref[0].params = base.params;
+    CHECK(base.out == run_alone(config, ref)[0]);
+    std::remove(pa.c_str());
+    std::remove(pb.c_str());
+}
+
+TEST_CASE("Engine sequences share the prefix cache: a context one set aside, another restores") {
+    EngineConfig config = engine_config(model_path("engine_llama", {}), 2);
+    config.prefix_cache_mb = 64;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    std::string prompt;
+    for (int32_t i = 0; i < 60; ++i) prompt += "hello world ";
+    std::string reply;
+    {
+        auto seq = engine.value()->open_sequence();
+        REQUIRE(seq.has_value());
+        auto r = seq.value()->generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+            reply += piece;
+            return true;
+        });
+        REQUIRE(r.has_value());
+    }  // closed: its context set aside
+    CHECK(engine.value()->prefix_cache_stats().set_asides >= 1);
+    const std::string turn = prompt + reply + " hello";
+    Job job;
+    job.prompt = turn;
+    job.params = greedy(10);
+    run_job(*engine.value(), job);
+    REQUIRE(job.status.is_ok());
+    CHECK(job.stats.cached_prefix_tokens >= 128);
+    CHECK(engine.value()->prefix_cache_stats().restores >= 1);
+    std::vector<Job> ref(1);
+    ref[0].prompt = turn;
+    ref[0].params = job.params;
+    EngineConfig plain = config;
+    plain.prefix_cache_mb = 0;
+    CHECK(job.out == run_alone(plain, ref)[0]);
+}
+
+TEST_CASE("Engine sequences under one grammar at once: each output valid and its own") {
+    const EngineConfig config = engine_config(model_path("engine_llama", {}), 3);
+    auto grammar = Grammar::parse(R"(root ::= "hello" (" world" | " hello") (" world" | " hello") "!")");
+    REQUIRE(grammar.has_value());
+    std::vector<std::string> alone;
+    {
+        EngineConfig one = config;
+        one.max_sequences = 1;
+        auto engine = Engine::create(one);
+        REQUIRE(engine.has_value());
+        for (const char* prompt : {"hello", "world hello", "hello world hello"}) {
+            engine.value()->reset_context();
+            std::string out;
+            GenerateOptions options;
+            options.grammar = *grammar;
+            auto r = engine.value()->generate(prompt, greedy(24), [&](std::string_view p, int32_t) {
+                out += p;
+                return true;
+            }, options);
+            REQUIRE(r.has_value());
+            alone.push_back(out);
+        }
+    }
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    auto s1 = engine.value()->open_sequence();
+    auto s2 = engine.value()->open_sequence();
+    REQUIRE(s1.has_value() && s2.has_value());
+    Engine::Sequence* seqs[] = {nullptr, s1->get(), s2->get()};
+    const char* prompts[] = {"hello", "world hello", "hello world hello"};
+    std::string outs[3];
+    std::atomic<int32_t> ready{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 3; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1);
+            while (ready.load() < 3) std::this_thread::yield();
+            GenerateOptions options;
+            options.grammar = *grammar;
+            auto cb = [&](std::string_view p, int32_t) {
+                outs[i] += p;
+                return true;
+            };
+            auto r = seqs[i] != nullptr ? seqs[i]->generate(prompts[i], greedy(24), cb, options)
+                                        : engine.value()->generate(prompts[i], greedy(24), cb, options);
+            CHECK(r.has_value());
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    for (int i = 0; i < 3; ++i) {
+        CHECK(outs[i] == alone[static_cast<size_t>(i)]);
+        CHECK(grammar->matches(outs[i]));
+    }
+}
+
 TEST_MAIN()

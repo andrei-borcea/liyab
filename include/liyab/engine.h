@@ -262,6 +262,28 @@ struct EngineConfig {
     // by the same cost model, and keeps the longest accepted branch; the
     // output is the same tokens (plain decoding's). No effect on other drafts.
     bool draft_tree = true;
+    // Sequences the engine keeps at once, its default one included (see
+    // Engine::open_sequence): 1 (the default) keeps one conversation, as
+    // before, and open_sequence() is Unsupported. Each one past the first
+    // keeps a context of its own (KV pages as it uses them, up to
+    // context_length() positions; on hybrid models its recurrent states and
+    // up to 4 state snapshots, 62.8 MiB each on Qwen3.6-35B-A3B, set aside at
+    // load from the expert cache's budget as the default context's are).
+    // Unsupported with a draft model (its cache follows one sequence).
+    int32_t max_sequences = 1;
+};
+
+// How the engine schedules a sequence's passes against the others'
+// (Engine::Sequence::set_priority). The user's turn is Foreground; work the
+// user does not wait for (an agent running in the background, prefetching)
+// is Background, which yields: its passes run when no foreground one is
+// waiting, its decoding steps join a foreground pass only where that costs
+// the foreground step little (measured: see Engine::Sequence), and a
+// background prompt being processed is stopped between two blocks (its
+// work so far kept) when a foreground sequence needs the model.
+enum class SequencePriority : int32_t {
+    Foreground = 0,
+    Background = 1,
 };
 
 // GGUF `general.architecture` values this build can run, comma-separated
@@ -416,7 +438,7 @@ struct AdapterInfo {
     int32_t matrices = 0;      // adapted matrices (a per-expert stack counts once)
     uint64_t bytes = 0;        // its tensors, counted against adapter_memory_mb
     bool resident = false;     // mapped now (else mapped again when selected)
-    bool active = false;       // the one passes apply
+    bool active = false;       // the one the default sequence's passes apply (Sequence::set_adapter for others)
     float scale = 0.0f;        // set_adapter()'s scale, when active
 };
 
@@ -554,8 +576,9 @@ public:
     // keeps the tokenization it was generated with. On the CPU backend it is
     // also the same bits however the prompt was split into passes, however
     // many threads ran and whatever the expert cache held or I/O timing did,
-    // so greedy decoding is reproducible (moe_skip_slow aside). Not
-    // reentrant: a concurrent call returns ErrorCode::Busy.
+    // so greedy decoding is reproducible (moe_skip_slow aside). Runs on the
+    // engine's default sequence: a concurrent call on it returns
+    // ErrorCode::Busy; calls on other sequences run alongside (open_sequence).
     Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
                                      const TokenCallback& on_token);
     // Same, with forced continuations (see ForceCallback), with or without
@@ -638,7 +661,9 @@ public:
     Status save_expert_profile(const std::string& path) const;
     Status load_expert_profile(const std::string& path);
 
-    // Thread-safe: stops an in-flight generate() at the next token boundary.
+    // Thread-safe: stops an in-flight generate() (or embed() / rerank()) on
+    // the default sequence at the next token boundary; never another
+    // sequence's (Sequence::cancel()).
     void cancel() noexcept;
     // Thread-safe: stops an in-flight prefill() between two blocks of the
     // model (within a fraction of a second, also inside a long pass); it
@@ -836,16 +861,117 @@ public:
     // The loaded adapters, in load order. Thread-safe.
     [[nodiscard]] std::vector<AdapterInfo> adapters() const;
 
+    // ---- Several sequences decoded together ----------------------------------
+    // The engine's own calls (generate, prefill, save_state...) work on its
+    // default sequence. open_sequence() opens another one, up to
+    // EngineConfig::max_sequences in all: a conversation with a context of
+    // its own (KV cache, recurrent states and snapshots, prompt text, LoRA
+    // adapter selection, speculative drafts), sharing the weights, the
+    // thread pool, the expert cache and the prefix cache. Calls on different
+    // sequences run at once, each on its caller's thread (callbacks
+    // included), and their forward passes run together: one pass over every
+    // waiting sequence's tokens, the matmuls over all of their rows (each
+    // weight read once for all of them; a mixture of experts reads the
+    // union of the experts they choose), each sequence attending to its own
+    // cache. Contract:
+    //  * Each sequence's output is what it gives alone: on the CPU backend
+    //    the same bits (a row's matmul does not depend on the rows around it,
+    //    attention on its own position only), so greedy decoding gives the
+    //    same tokens and sampling the same draws from the same seed. With the
+    //    experimental lossy hooks (early exit, EGLS, TDSS, head pruning)
+    //    sequences take turns instead of sharing passes, so that holds too.
+    //  * A call that runs alone (no call on another sequence) runs exactly as
+    //    a single conversation always has: the same passes, speculative
+    //    drafts (draft model aside: see max_sequences), pacing per token.
+    //    While several run, steps are plain (one token, no drafts): the pass
+    //    shared with the others is the batch drafts would otherwise fill
+    //    (README measures both). Pacing then holds each shared pass to the
+    //    token rate, so every sequence in it gets a token per slot.
+    //  * A prompt is processed in passes of at most max_batch tokens while
+    //    other sequences decode (a pass's time is what their next token
+    //    waits for), except with latent attention, whose passes keep their
+    //    size so each takes the form it takes alone.
+    //  * Priorities (SequencePriority) and per-sequence cancellation; see
+    //    Sequence. Busy when another call runs on the same sequence.
+    //  * The prefix cache is shared: a context any sequence set aside (or
+    //    one the store kept from earlier runs) is restored by whichever
+    //    sequence's prompt continues it, under the same adapter.
+    //  * GenerationStats counts each call's own tokens and passes; its expert
+    //    and phase figures are the engine's over the call's time, other
+    //    sequences' passes included.
+    //  * embed(), rerank(), save_state(), load_state() and segment reuse
+    //    work on the default sequence; while one runs, the others' passes
+    //    wait for it.
+    // Unsupported with max_sequences 1 or a draft model; Busy when
+    // max_sequences are open.
+    class Sequence;
+    Result<std::unique_ptr<Sequence>> open_sequence(SequencePriority priority = SequencePriority::Foreground);
+    // How sequences shared passes since the engine was created. Thread-safe.
+    struct SchedulerStats {
+        uint64_t passes = 0;         // passes run for sequences while several were in a call
+        uint64_t shared_passes = 0;  // of them, passes of two sequences or more
+        uint64_t shared_rows = 0;    // tokens of those shared passes
+        uint64_t preempted = 0;      // background passes stopped for foreground work (run again later)
+        int32_t open_sequences = 0;  // open now, the default one included
+        int32_t active_sequences = 0;  // in a call now
+    };
+    [[nodiscard]] SchedulerStats scheduler_stats() const;
+
 private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);
-    // generate_tokens() with the busy lock held; `text`, when given, is the
-    // text `prompt` encodes, remembered for the next call's reuse.
-    Result<GenerationStats> generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
-                                            const TokenCallback& on_token, const std::string_view* text,
-                                            const ForceCallback* force = nullptr,
-                                            const GenerateOptions* options = nullptr);
     std::unique_ptr<Impl> impl_;
+};
+
+// A sequence of an Engine (Engine::open_sequence): the calls the engine has
+// for its default sequence, on this one's context. Destroying it sets its
+// context aside in the prefix cache (when there is one), frees it, and
+// waits for a call running on it, which it cancels first; destroy every
+// Sequence before its Engine. Thread-safe as the engine's calls are: one
+// call at a time on it (Busy otherwise), any number on other sequences;
+// cancel() and cancel_prefill() from any thread.
+class LIYAB_API Engine::Sequence {
+public:
+    ~Sequence();
+    Sequence(const Sequence&) = delete;
+    Sequence& operator=(const Sequence&) = delete;
+
+    // An id unique among the engine's sequences (the default one is 0).
+    [[nodiscard]] int32_t id() const noexcept { return id_; }
+    // Engine::generate on this sequence's context. `options` may carry a
+    // grammar, a continuation and segments as there.
+    Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
+                                     const TokenCallback& on_token, const GenerateOptions& options = {});
+    // With forced continuations (ForceCallback), as Engine::generate.
+    Result<GenerationStats> generate(std::string_view prompt, const SamplingParams& params,
+                                     const TokenCallback& on_token, const ForceCallback& force);
+    // Engine::generate_tokens on this sequence.
+    Result<GenerationStats> generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                            const TokenCallback& on_token);
+    // Engine::prefill on this sequence (cancel_prefill() stops it).
+    Status prefill(std::string_view text, bool add_bos = true);
+    // Forgets its context (waits for a call running on it).
+    void reset_context();
+    // Engine::set_adapter for this sequence only: its generations and
+    // prefills apply `name` at `scale` ("" none), whatever the others apply
+    // (passes shared with them apply each one's own adapter to its rows).
+    // Busy while a call runs on it.
+    Status set_adapter(std::string_view name, float scale = 1.0f);
+    // Its priority (see SequencePriority), taken into account from its next
+    // pass on. Thread-safe.
+    void set_priority(SequencePriority priority) noexcept;
+    [[nodiscard]] SequencePriority priority() const noexcept;
+    // Thread-safe: stops its generate() at the next token boundary; its
+    // prefill() between two passes (between two blocks when its pass runs
+    // alone or with background work only). Never another sequence's call.
+    void cancel() noexcept;
+    void cancel_prefill() noexcept;
+
+private:
+    friend class Engine;
+    Sequence(Engine& engine, int32_t id) : engine_(engine), id_(id) {}
+    Engine& engine_;
+    int32_t id_;
 };
 
 }  // namespace liyab

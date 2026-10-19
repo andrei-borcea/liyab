@@ -119,6 +119,7 @@ These rules decide what goes into the code:
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) laid out per block (windowed blocks keep only their window), with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
+| Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU backend |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
 | Segment reuse: marked parts of a prompt (documents, tool results) reused wherever they appear, keys turned to their new positions, a share calibrated per model processed again; attention-only models | ✅ opt-in, lossy |
@@ -848,6 +849,43 @@ each of those as a scheduling problem.
 * **Cancellable, resumable prefill.** `cancel_prefill()` stops a background prefill between blocks, within a fraction
   of a second even inside a 1,024-token pass, and keeps the work done. The next prompt continues from there. A user
   request therefore never waits behind background work.
+* **Several sequences decoded together** (`max_sequences`, `Engine::open_sequence()`). The chat, a request from
+  another app through the local API and a background agent no longer queue behind each other: each one runs on a
+  sequence of its own, with its own context (KV pages as it uses them, recurrent states and snapshots, the text its
+  tokens encode, its LoRA adapter), sharing the weights, the threads, the expert cache and the prefix cache. Calls on
+  different sequences run at once, each on its caller's thread, and their forward passes run together: whichever
+  waiting thread leads takes every sequence's next tokens into one pass
+  (`Transformer::forward_batch()`), whose matmuls go over all of their rows, so each weight is read once for all
+  of them (a mixture of experts reads the union of the experts they choose), while each sequence attends to its own
+  cache at its own positions, continues its own DeltaNet states, applies its own adapter and, with latent attention,
+  attends in the form its pass alone would take. The rest stays on each caller's thread: sampling, grammars,
+  callbacks, stopping.
+  * **Each sequence's output is its own.** A row's matmul gives the same bits whatever rows share its batch, and
+    attention depends on a token's own position only, so on the CPU backend every sequence's logits are the bits
+    it gets alone: greedy output is token for token, sampling draws the same tokens from the same seed. Tested on
+    dense, gated, windowed (Gemma 2/3, Phi-3), hybrid, MoE (in place and streamed), latent (both forms, mixed in one
+    pass) and LoRA models (`tests/test_sequences.cpp`). With the experimental lossy hooks on, sequences take turns
+    instead of sharing passes, so that holds there too.
+  * **Alone, nothing changes.** A call that runs while no other sequence has one runs exactly as a single
+    conversation always has: the same passes, speculative drafts, pacing per token. While several run, their steps
+    are plain (one token each, no drafts): the shared pass is the batch drafts would otherwise fill. Passes of a
+    prompt are cut to `max_batch` tokens while others decode, since a pass's time is what their next token waits
+    for (latent attention keeps its own pass sizes: each pass's form follows from its size).
+  * **The user first** (`SequencePriority`). Foreground sequences are the user's turn; background ones yield: their
+    passes run when no foreground request waits, a pass of a background prompt is stopped between two blocks when
+    foreground work arrives (its work kept, the pass run again later), and a background decoding step joins a
+    foreground pass only while a pass of one more sequence measured at most 1.25 times as long: on a model in RAM
+    a row more costs little, while a MoE whose experts stream from storage would make the user's step wait for the
+    background step's expert reads. A leader waits for the sequences about to submit (sampling, calling back) for
+    at most half a pass, so a slow callback costs the others little.
+  * **Per sequence.** Cancellation (`Sequence::cancel()`, `cancel_prefill()`), adapters (`set_adapter()`), the
+    prefix cache's restores and set-asides (a context one sequence set aside, any other restores), and the Busy
+    rule: one call at a time per sequence. `embed()`, `rerank()`, `save_state()`, `load_state()` and segment reuse
+    stay on the default sequence; the others' passes wait while they run.
+  * **Memory.** Each sequence keeps its own KV pages, up to `context_length()` positions, and on hybrid models its
+    recurrent states and up to four snapshots, set aside at load from the expert cache's budget for every sequence
+    `max_sequences` allows (62.8 MiB each on the 35B). `max_sequences` is 1 by default: one conversation, the
+    memory plan of before. Not with a draft model, whose cache follows one sequence.
 * **Automatic context length.** With `context_length = 0`, the context is what 256 MiB of KV holds: 4,096 to 32,768
   positions, at most the training context. That is ~24k on Qwen3.6-35B-A3B (only 10 of 40 blocks have a KV cache)
   and 4,096 on a dense 4B. Windowed blocks count for what they keep: their window plus the rollback margin is set

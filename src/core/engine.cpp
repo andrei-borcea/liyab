@@ -278,6 +278,12 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.latent_form = config.latent_form == LatentAttentionForm::Absorbed   ? LatentForm::Absorbed
                           : config.latent_form == LatentAttentionForm::Expanded ? LatentForm::Expanded
                                                                                 : LatentForm::Auto;
+    // The engine's other sequences (EngineConfig::max_sequences; none with a
+    // draft model), with the rollback window lookup drafts give them.
+    if (config.draft_model_path.empty()) {
+        options.extra_contexts = std::max(config.max_sequences, 1) - 1;
+        options.extra_rollback_window = config.lookup_drafts && config.draft_tokens > 0 ? config.draft_tokens + 1 : 0;
+    }
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -294,39 +300,82 @@ struct Engine::Impl {
     std::unique_ptr<Transformer> draft;
     std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
     std::atomic<uint64_t> tokens_generated{0};  // Engine::counters()
-    // Tokens whose KV / recurrent state the target holds, in order
-    // (target->n_past() == context.size()); context lookup drafts from it. Not
-    // used with a draft model, whose cache moves in step with the target's
-    // during speculation.
-    std::vector<int32_t> context;
-    // The text the first `context_text_tokens` tokens of `context` encode (0:
-    // not known): a prompt given as text, followed by the pieces of the reply
-    // tokens generated after it. Those tokens need not be the text's own
-    // encoding (a model may write a word in pieces the tokenizer would
-    // merge), so a prompt is matched against this text, not re-encoded
-    // (encode_continuation). The text outlives work that was cancelled or cut
-    // short, which leaves its tokens in place, and follows rewinds
-    // (cut_text): losing it made the next turn re-encode the conversation,
-    // diverge at the first such reply and, on a hybrid model, start over.
-    std::string context_text;
-    size_t context_text_tokens = 0;
-    // Where the last prompt generate() processed ends in `context` (or the
-    // end of what a restore or load_state() brought back): a prompt that
-    // leaves the context before it belongs to another conversation, or
-    // branches this one (an edited message), and the prefix cache sets the
-    // context aside; one that leaves it after edits a draft typed ahead.
-    size_t last_prompt_end = 0;
+    static constexpr size_t kExact = SIZE_MAX;
+    struct AdapterEntry;
+
+    // ---- Sequences (Engine::open_sequence) ----------------------------------
+    // One conversation the engine keeps: the default one (id 0, the Engine's
+    // own calls) or one opened with open_sequence(). The transformer holds
+    // one context live (`bound`'s); every other sequence's is parked in its
+    // `parked` Context (bind() swaps them in O(1)).
+    struct Seq {
+        int32_t id = 0;
+        std::atomic<int32_t> priority{static_cast<int32_t>(SequencePriority::Foreground)};
+        // Its transformer state while another sequence's is live; an empty
+        // Context while its own is.
+        std::unique_ptr<Transformer::Context> parked;
+        // Tokens whose KV / recurrent state its context holds, in order
+        // (n_past() == context.size()); context lookup drafts from it. Not
+        // used with a draft model, whose cache moves in step with the target's
+        // during speculation.
+        std::vector<int32_t> context;
+        // The text the first `context_text_tokens` tokens of `context` encode (0:
+        // not known): a prompt given as text, followed by the pieces of the reply
+        // tokens generated after it. Those tokens need not be the text's own
+        // encoding (a model may write a word in pieces the tokenizer would
+        // merge), so a prompt is matched against this text, not re-encoded
+        // (encode_continuation). The text outlives work that was cancelled or cut
+        // short, which leaves its tokens in place, and follows rewinds
+        // (cut_text): losing it made the next turn re-encode the conversation,
+        // diverge at the first such reply and, on a hybrid model, start over.
+        std::string context_text;
+        size_t context_text_tokens = 0;
+        // Where the last prompt generate() processed ends in `context` (or the
+        // end of what a restore or load_state() brought back): a prompt that
+        // leaves the context before it belongs to another conversation, or
+        // branches this one (an edited message), and the prefix cache sets the
+        // context aside; one that leaves it after edits a draft typed ahead.
+        size_t last_prompt_end = 0;
+        // Segment reuse: the first position of `context` whose rows were
+        // reused away from their prefix (kExact: none): a request that did not
+        // opt in never continues them, and the prefix cache never keeps them,
+        // so its restores stay exact. The request being served: its segments
+        // as given (`request_marks`, byte offsets, or token indices with
+        // `request_marks_tokens`), as token ranges (`request_segments`), and
+        // whether it opted in (`request_reuse`).
+        size_t exact_end = kExact;
+        std::span<const PromptSegment> request_marks;
+        bool request_marks_tokens = false;
+        std::vector<TokenSegment> request_segments;
+        bool request_reuse = false;
+        // Its LoRA adapter: `active` at `active_scale` (nullptr: none), and
+        // what its context was computed with (context_key, 0: the base
+        // model; the store's seed follows it whenever the sequence is bound).
+        AdapterEntry* active = nullptr;
+        float active_scale = 1.0f;
+        uint64_t context_key = 0;
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> cancel_prefill{false};
+        std::mutex call;  // one call at a time on a sequence
+        // Scheduler state, under Impl::sched: where its call is, and the
+        // OS thread running it (performance hints).
+        enum class Phase { Idle, Away, Working, Waiting } phase = Phase::Idle;
+        int32_t thread_id = 0;
+        [[nodiscard]] bool foreground() const noexcept {
+            return priority.load(std::memory_order_relaxed) == static_cast<int32_t>(SequencePriority::Foreground);
+        }
+    };
+    // Sequences by id order; seqs[0] is the default one. Elements keep their
+    // address (unique_ptr); the vector changes under `sched` and `model`.
+    std::vector<std::unique_ptr<Seq>> seqs;
+    Seq* main = nullptr;   // seqs[0], set at creation (read without a lock)
+    Seq* bound = nullptr;  // whose context is the transformer's live one
+    int32_t next_sequence_id = 1;
+
     // Segment reuse (EngineConfig::segment_reuse, core/kv_reuse.h). `reuse`
     // holds the calibrated settings and `reuse_info` whether it is on (set at
-    // creation, or when the background calibration ends: under `busy`, and
-    // under reuse_info_mutex for segment_reuse()). `exact_end` is the first position of
-    // `context` whose rows were reused away from their prefix (kExact:
-    // none): a request that did not opt in never continues them, and the
-    // prefix cache never keeps them, so its restores stay exact. The request
-    // being served: its segments as given (`request_marks`, byte offsets, or
-    // token indices with `request_marks_tokens`), as token ranges
-    // (`request_segments`), and whether it opted in (`request_reuse`).
-    static constexpr size_t kExact = SIZE_MAX;
+    // creation, or when the background calibration ends: under `model`, and
+    // under reuse_info_mutex for segment_reuse()).
     ReuseSettings reuse;
     SegmentReuseInfo reuse_info;
     mutable std::mutex reuse_info_mutex;
@@ -345,40 +394,40 @@ struct Engine::Impl {
     bool calibration_closing = false;
     Clock::time_point last_call = Clock::now();  // when the last call ended (or the engine was made)
     std::atomic<int32_t> calls_in_flight{0};
-    std::atomic<bool> calibration_holds{false};  // the calibration has `busy`
     std::atomic<bool> calibration_stop{false};
-    size_t exact_end = kExact;
-    std::span<const PromptSegment> request_marks;
-    bool request_marks_tokens = false;
-    std::vector<TokenSegment> request_segments;
-    bool request_reuse = false;
-    // Sets the request's segments for the scope of one call.
+    // Sets a sequence's request segments for the scope of one call.
     struct Request {
         Impl& s;
-        Request(Impl& impl, std::span<const PromptSegment> marks, bool tokens) : s(impl) {
-            s.request_marks = marks;
-            s.request_marks_tokens = tokens;
-            s.request_segments.clear();
+        Seq& q;
+        Request(Impl& impl, Seq& seq, std::span<const PromptSegment> marks, bool tokens) : s(impl), q(seq) {
+            q.request_marks = marks;
+            q.request_marks_tokens = tokens;
+            q.request_segments.clear();
             // Not while an adapter is selected: the share was calibrated on the base model.
-            s.request_reuse = !marks.empty() && s.reuse_info.status.is_ok() && s.store != nullptr && s.context_key == 0;
+            q.request_reuse = !marks.empty() && s.reuse_ready() && s.store != nullptr && q.context_key == 0;
         }
         ~Request() {
-            s.request_marks = {};
-            s.request_segments.clear();
-            s.request_reuse = false;
+            q.request_marks = {};
+            q.request_segments.clear();
+            q.request_reuse = false;
         }
         Request(const Request&) = delete;
         Request& operator=(const Request&) = delete;
     };
+    [[nodiscard]] bool reuse_ready() const {
+        std::lock_guard<std::mutex> lock(reuse_info_mutex);
+        return reuse_info.status.is_ok();
+    }
 
-    void clear_context() {
+    // Forgets sequence q's context. The model must be held with q bound.
+    void clear_context(Seq& q) {
         target->reset();
         if (draft) draft->reset();
-        context.clear();
-        context_text.clear();
-        context_text_tokens = 0;
-        last_prompt_end = 0;
-        exact_end = kExact;
+        q.context.clear();
+        q.context_text.clear();
+        q.context_text_tokens = 0;
+        q.last_prompt_end = 0;
+        q.exact_end = kExact;
     }
 
     // Moves `end` back over the text that tokens[i] stands for at the end of
@@ -398,69 +447,68 @@ struct Engine::Impl {
         return false;
     }
 
-    // Before `context` is cut to its first `n` tokens: the text of those
+    // Before q's `context` is cut to its first `n` tokens: the text of those
     // tokens, by stepping back over the others from the end of the text (not
     // known when it does not end with them).
-    void cut_text(size_t n) {
-        if (n >= context_text_tokens) return;
-        size_t end = context_text.size();
+    void cut_text(Seq& q, size_t n) {
+        if (n >= q.context_text_tokens) return;
+        size_t end = q.context_text.size();
         bool known = n > 0;
-        for (size_t i = context_text_tokens; known && i-- > n;) known = step_back(context, context_text, end, i);
+        for (size_t i = q.context_text_tokens; known && i-- > n;) known = step_back(q.context, q.context_text, end, i);
         if (known) {
-            context_text.resize(end);
-            context_text_tokens = n;
+            q.context_text.resize(end);
+            q.context_text_tokens = n;
         } else {
-            context_text.clear();
-            context_text_tokens = 0;
+            q.context_text.clear();
+            q.context_text_tokens = 0;
         }
     }
 
-    // The text of `context`'s first n tokens and how many of them it covers,
+    // The text of q's first n context tokens and how many of them it covers,
     // as cut_text(n) would leave them (empty and 0: not known).
-    std::pair<std::string_view, size_t> text_of(size_t n) const {
-        if (n >= context_text_tokens) return {context_text, context_text_tokens};
-        size_t end = context_text.size();
-        for (size_t i = context_text_tokens; i-- > n;) {
-            if (!step_back(context, context_text, end, i)) return {{}, 0};
+    std::pair<std::string_view, size_t> text_of(const Seq& q, size_t n) const {
+        if (n >= q.context_text_tokens) return {q.context_text, q.context_text_tokens};
+        size_t end = q.context_text.size();
+        for (size_t i = q.context_text_tokens; i-- > n;) {
+            if (!step_back(q.context, q.context_text, end, i)) return {{}, 0};
         }
-        return n > 0 ? std::pair<std::string_view, size_t>(std::string_view(context_text).substr(0, end), n)
+        return n > 0 ? std::pair<std::string_view, size_t>(std::string_view(q.context_text).substr(0, end), n)
                      : std::pair<std::string_view, size_t>({}, 0);
     }
 
     // Segment reuse: a request that did not opt in never continues rows
     // reused away from their prefix: the context goes back to the first of
     // them, and what follows is processed again (any position restores on
-    // the attention-only models segment reuse runs on).
-    void drop_approximate() {
-        const size_t keep = exact_end;
+    // the attention-only models segment reuse runs on). Model held, q bound.
+    void drop_approximate(Seq& q) {
+        const size_t keep = q.exact_end;
         LIYAB_LOG_INFO("segment reuse: the context's reused rows (from token %zu of %zu) are processed again for a "
                        "request that does not reuse segments",
-                       keep, context.size());
+                       keep, q.context.size());
         if (keep == 0 || !target->truncate(static_cast<int32_t>(keep)).is_ok()) {
-            clear_context();
+            clear_context(q);
             return;
         }
-        cut_text(keep);
-        context.resize(keep);
-        last_prompt_end = std::min(last_prompt_end, keep);
-        exact_end = kExact;
+        cut_text(q, keep);
+        q.context.resize(keep);
+        q.last_prompt_end = std::min(q.last_prompt_end, keep);
+        q.exact_end = kExact;
     }
 
-    // Tokens for `text`. When it continues a text the engine knows (this
-    // context's, or a context set aside in the prefix cache, which running
-    // the prompt then restores), that text's own tokens followed by the
-    // encoding of the rest: re-encoding an earlier reply need not give back
-    // the tokens that were generated, and on a hybrid model any difference
-    // would recompute from a state snapshot before it.
-    Result<std::vector<int32_t>> encode_continuation(std::string_view text, bool add_bos) const {
+    // Tokens for `text` on sequence q. When it continues a text the engine
+    // knows (q's context's, or a context set aside in the prefix cache, which
+    // running the prompt then restores), that text's own tokens followed by
+    // the encoding of the rest: re-encoding an earlier reply need not give
+    // back the tokens that were generated, and on a hybrid model any
+    // difference would recompute from a state snapshot before it.
+    Result<std::vector<int32_t>> encode_continuation(Seq& q, std::string_view text, bool add_bos) {
         const bool bos = add_bos && tokenizer->add_bos_default();
-        const KnownText k = known_text(text);
-        if (k.tokens != nullptr) {
-            auto rest = tokenizer->encode_continuation(text.substr(k.bytes), (*k.tokens)[k.count - 1]);
+        KnownText k = known_text(q, text);
+        if (!k.tokens.empty()) {
+            auto rest = tokenizer->encode_continuation(text.substr(k.bytes), k.tokens.back());
             if (!rest) return rest.status();
-            std::vector<int32_t> tokens(k.tokens->begin(), k.tokens->begin() + static_cast<std::ptrdiff_t>(k.count));
-            tokens.insert(tokens.end(), rest->begin(), rest->end());
-            return tokens;
+            k.tokens.insert(k.tokens.end(), rest->begin(), rest->end());
+            return std::move(k.tokens);
         }
         return tokenizer->encode(text, bos);
     }
@@ -468,29 +516,26 @@ struct Engine::Impl {
     // Segment reuse: tokens for a request's text with marked segments, as
     // encode_continuation() finds the text it continues; the rest is split
     // at the segments' boundaries (encode_segmented), whose token ranges go
-    // to request_segments. A segment inside the known text needs no reuse
+    // to q.request_segments. A segment inside the known text needs no reuse
     // (the context or the prefix cache restores it exactly).
-    Result<std::vector<int32_t>> encode_segments(std::string_view text, bool add_bos) {
-        const KnownText k = known_text(text);
-        std::vector<int32_t> tokens;
-        if (k.tokens != nullptr) {
-            tokens.assign(k.tokens->begin(), k.tokens->begin() + static_cast<std::ptrdiff_t>(k.count));
-        }
-        request_segments.clear();
-        LIYAB_RETURN_IF_ERROR(encode_segmented(*tokenizer, text, k.tokens != nullptr ? k.bytes : 0, request_marks,
-                                               add_bos && tokenizer->add_bos_default(), tokens, request_segments));
+    Result<std::vector<int32_t>> encode_segments(Seq& q, std::string_view text, bool add_bos) {
+        KnownText k = known_text(q, text);
+        std::vector<int32_t> tokens = std::move(k.tokens);
+        q.request_segments.clear();
+        LIYAB_RETURN_IF_ERROR(encode_segmented(*tokenizer, text, !tokens.empty() ? k.bytes : 0, q.request_marks,
+                                               add_bos && tokenizer->add_bos_default(), tokens, q.request_segments));
         return tokens;
     }
 
     // The tokens a text a request sends starts with, when it continues a
-    // text the engine knows (see encode_continuation): those tokens (count
-    // of them, spelling its first `bytes` bytes), or none.
+    // text the engine knows (see encode_continuation): a copy of those
+    // tokens (spelling its first `bytes` bytes), or none. The prefix cache's
+    // records are read with the model held (other sequences change them).
     struct KnownText {
-        const std::vector<int32_t>* tokens = nullptr;
-        size_t count = 0;
+        std::vector<int32_t> tokens;
         size_t bytes = 0;
     };
-    KnownText known_text(std::string_view text) const {
+    KnownText known_text(Seq& q, std::string_view text) {
         const std::vector<int32_t>* known = nullptr;
         size_t known_tokens = 0, known_bytes = 0;
         // The rest of the prompt is encoded from a character's first byte:
@@ -519,52 +564,58 @@ struct Engine::Impl {
                 known_bytes = end;
             }
         };
-        if (!draft) {
-            if (store) {
-                for (const KvStore::Record* r : store->records()) consider(r->tokens, r->text, r->text_tokens);
+        KnownText out;
+        if (draft) return out;
+        std::unique_ptr<Hold> held;
+        if (store) {
+            held = std::make_unique<Hold>(*this, q, /*bind=*/false);
+            for (const KvStore::Record* r : store->records()) consider(r->tokens, r->text, r->text_tokens);
+        }
+        consider(q.context, q.context_text, q.context_text_tokens);  // preferred on a tie: nothing to restore
+        // A prompt that leaves this context's text partway (a draft edited,
+        // a message prepared ahead then typed over): the context's tokens
+        // up to the last one whose text the prompt still starts with,
+        // found by stepping back from the end of the text as cut_text()
+        // does. Re-encoding the whole prompt instead could diverge in an
+        // earlier reply and, on a hybrid model, go back past the draft's
+        // snapshots.
+        size_t same = 0;
+        const size_t most = std::min(text.size(), q.context_text.size());
+        while (same < most && text[same] == q.context_text[same]) ++same;
+        if (q.context_text_tokens > 0 && same < q.context_text.size() && same > known_bytes) {
+            size_t n = q.context_text_tokens, end = q.context_text.size();
+            while (n > 0 && end > same) {
+                if (!step_back(q.context, q.context_text, end, n - 1)) {
+                    n = 0;  // the tokens do not spell the text: unknown
+                    break;
+                }
+                --n;
             }
-            consider(context, context_text, context_text_tokens);  // preferred on a tie: nothing to restore
-            // A prompt that leaves this context's text partway (a draft edited,
-            // a message prepared ahead then typed over): the context's tokens
-            // up to the last one whose text the prompt still starts with,
-            // found by stepping back from the end of the text as cut_text()
-            // does. Re-encoding the whole prompt instead could diverge in an
-            // earlier reply and, on a hybrid model, go back past the draft's
-            // snapshots.
-            size_t same = 0;
-            const size_t most = std::min(text.size(), context_text.size());
-            while (same < most && text[same] == context_text[same]) ++same;
-            if (context_text_tokens > 0 && same < context_text.size() && same > known_bytes) {
-                size_t n = context_text_tokens, end = context_text.size();
-                while (n > 0 && end > same) {
-                    if (!step_back(context, context_text, end, n - 1)) {
-                        n = 0;  // the tokens do not spell the text: unknown
-                        break;
-                    }
-                    --n;
-                }
-                to_boundary(context, context_text, n, end);
-                if (n > 0 && end > known_bytes) {
-                    known = &context;
-                    known_tokens = n;
-                    known_bytes = end;
-                }
+            to_boundary(q.context, q.context_text, n, end);
+            if (n > 0 && end > known_bytes) {
+                known = &q.context;
+                known_tokens = n;
+                known_bytes = end;
             }
         }
-        return {known, known_tokens, known_bytes};
+        if (known != nullptr) {
+            out.tokens.assign(known->begin(), known->begin() + static_cast<std::ptrdiff_t>(known_tokens));
+            out.bytes = known_bytes;
+        }
+        return out;
     }
 
-    // After a run over `prompt` (the encoding of `text`): records the text the
-    // context now holds, if the context still starts with the whole prompt.
-    void remember_text(std::span<const int32_t> prompt, std::string_view text) {
-        if (context.size() < prompt.size() || !std::equal(prompt.begin(), prompt.end(), context.begin())) {
-            context_text.clear();
-            context_text_tokens = 0;
+    // After a run over `prompt` (the encoding of `text`): records the text
+    // q's context now holds, if the context still starts with the whole prompt.
+    void remember_text(Seq& q, std::span<const int32_t> prompt, std::string_view text) {
+        if (q.context.size() < prompt.size() || !std::equal(prompt.begin(), prompt.end(), q.context.begin())) {
+            q.context_text.clear();
+            q.context_text_tokens = 0;
             return;
         }
-        context_text.assign(text);
-        for (size_t i = prompt.size(); i < context.size(); ++i) context_text += tokenizer->piece(context[i]);
-        context_text_tokens = context.size();
+        q.context_text.assign(text);
+        for (size_t i = prompt.size(); i < q.context.size(); ++i) q.context_text += tokenizer->piece(q.context[i]);
+        q.context_text_tokens = q.context.size();
     }
 
     // Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir,
@@ -597,12 +648,13 @@ struct Engine::Impl {
     // ---- LoRA adapters (Engine::load_adapter / set_adapter, core/lora.h) ----
     // The loaded adapters, each mapped while resident: at most
     // config.adapter_memory_mb of them, the least recently selected
-    // released first and mapped again from its file when selected. `active`
-    // is the one passes apply (nullptr: none) at `active_scale`;
-    // `context_key` names what the live context was computed with (0: the
-    // base model), and the store's seed always follows it (seed_for), so a
-    // context is never continued, set aside or restored under another
-    // adapter or scale. Changed under a Call, and under adapters_mutex where
+    // released first and mapped again from its file when selected. Each
+    // sequence selects its own (Seq::active, at Seq::active_scale, nullptr:
+    // none), bound to its transformer context; Seq::context_key names what
+    // its context was computed with (0: the base model), and the store's
+    // seed follows the bound sequence's (bind(), seed_for()), so a context is
+    // never continued, set aside or restored under another adapter or
+    // scale. Changed with the model held, and under adapters_mutex where
     // adapters() reads.
     struct AdapterEntry {
         std::string name;
@@ -615,9 +667,6 @@ struct Engine::Impl {
         uint64_t last_used = 0;
     };
     std::vector<std::unique_ptr<AdapterEntry>> adapters;
-    AdapterEntry* active = nullptr;
-    float active_scale = 1.0f;
-    uint64_t context_key = 0;
     uint64_t adapter_clock = 0;
     KvKey base_seed;  // the store's seed without an adapter (store_seed())
     mutable std::mutex adapters_mutex;
@@ -627,6 +676,10 @@ struct Engine::Impl {
             if (e->name == name) return e.get();
         }
         return nullptr;
+    }
+    // Whether some sequence has `e` selected.
+    [[nodiscard]] bool selected(const AdapterEntry* e) const {
+        return std::any_of(seqs.begin(), seqs.end(), [e](const std::unique_ptr<Seq>& q) { return q->active == e; });
     }
     // What contexts computed with `adapter` at `scale` are keyed by: its
     // file's hash and the scale; 0 for none.
@@ -643,8 +696,8 @@ struct Engine::Impl {
         const uint64_t parts[] = {base_seed.hi, base_seed.lo, key};
         return kv_seed_key(parts);
     }
-    // Releases the least recently selected adapters but `keep` until
-    // `bytes` more fit under the cap.
+    // Releases the least recently selected adapters but `keep` and those a
+    // sequence has selected until `bytes` more fit under the cap. Model held.
     void fit_adapters(size_t bytes, const AdapterEntry* keep) {
         const size_t cap = static_cast<size_t>(std::max<int64_t>(config.adapter_memory_mb, 0)) << 20;
         for (;;) {
@@ -653,7 +706,7 @@ struct Engine::Impl {
             for (auto& e : adapters) {
                 if (!e->adapter) continue;
                 used += e->bytes;
-                if (e.get() != keep && e.get() != active && (oldest == nullptr || e->last_used < oldest->last_used)) {
+                if (e.get() != keep && !selected(e.get()) && (oldest == nullptr || e->last_used < oldest->last_used)) {
                     oldest = e.get();
                 }
             }
@@ -666,7 +719,8 @@ struct Engine::Impl {
         }
     }
     // Checks an adapter against the model: its architecture, and every
-    // target bound once (then the selected adapter is bound again).
+    // target bound once to the live context (then the bound sequence's own
+    // adapter is bound again). Model held.
     Status check_adapter(const LoraAdapter& adapter) {
         const auto arch = target->file().get_string("general.architecture");
         if (!adapter.architecture().empty() && arch && *arch != adapter.architecture()) {
@@ -674,15 +728,17 @@ struct Engine::Impl {
                                                           " models; this model is " + std::string(*arch));
         }
         const Status fits = target->set_adapter(&adapter, 1.0f);
-        const Status back =
-            target->set_adapter(active != nullptr ? active->adapter.get() : nullptr, active_scale, pool.get());
+        const AdapterEntry* own = bound != nullptr ? bound->active : nullptr;
+        const Status back = target->set_adapter(own != nullptr ? own->adapter.get() : nullptr,
+                                                bound != nullptr ? bound->active_scale : 1.0f, pool.get());
         LIYAB_RETURN_IF_ERROR(fits);
         return back;
     }
-    // Makes `e` (nullptr: none) the adapter passes apply at `scale`. A live
+    // Makes `e` (nullptr: none) the adapter q's passes apply at `scale`. A
     // context computed otherwise is set aside under its own adapter (the
     // store's seed is still its) and cleared; then the store's seed follows.
-    Status select_adapter(AdapterEntry* e, float scale) {
+    // Model held, q bound.
+    Status select_adapter(Seq& q, AdapterEntry* e, float scale) {
         if (e != nullptr && !e->adapter) {  // released under the cap: mapped again
             auto loaded = LoraAdapter::load(e->path);
             Status fits = loaded ? check_adapter(**loaded) : loaded.status();
@@ -693,43 +749,47 @@ struct Engine::Impl {
                 e->adapter = std::move(loaded).value();
             } else {
                 LIYAB_LOG_WARN("adapters: %s could not be mapped again: %s", e->name.c_str(), fits.to_string().c_str());
-                (void)select_adapter(nullptr, 1.0f);
+                (void)select_adapter(q, nullptr, 1.0f);
                 return fits;
             }
         }
         const LoraAdapter* adapter = e != nullptr ? e->adapter.get() : nullptr;
         const uint64_t key = adapter_key(adapter, scale);
-        if (key != context_key) {
-            stash_context();  // under the adapter it was computed with (no-op without a store)
-            clear_context();
+        if (key != q.context_key) {
+            stash_context(q);  // under the adapter it was computed with (no-op without a store)
+            clear_context(q);
         }
         if (Status s = target->set_adapter(adapter, scale, pool.get()); !s.is_ok()) {
             (void)target->set_adapter(nullptr);
-            clear_context();
+            clear_context(q);
             if (store) store->set_seed(base_seed);
-            context_key = 0;
+            q.context_key = 0;
             std::lock_guard<std::mutex> lock(adapters_mutex);
-            active = nullptr;
+            q.active = nullptr;
             return s;
         }
         if (store) store->set_seed(seed_for(key));
-        if (key != context_key && prefix_cache_on()) note_store();
-        context_key = key;
+        if (key != q.context_key && prefix_cache_on()) note_store();
+        q.context_key = key;
         std::lock_guard<std::mutex> lock(adapters_mutex);
-        active = e;
-        active_scale = scale;
+        q.active = e;
+        q.active_scale = scale;
         if (e != nullptr) e->last_used = ++adapter_clock;
         return Status::ok();
     }
 
     ~Impl() {
         stop_calibration();
-        // The context left goes to storage, so a later engine or process
-        // continues it instead of processing it again. Best effort: a
+        // The contexts left go to storage, so a later engine or process
+        // continues them instead of processing them again. Best effort: a
         // destructor cannot report a failure.
         if (!store || !store->has_storage() || !target || draft) return;
         try {
-            stash_context(/*storage_only=*/true);
+            std::lock_guard<std::mutex> lock(model);
+            for (auto& q : seqs) {
+                bind(*q);
+                stash_context(*q, /*storage_only=*/true);
+            }
         } catch (...) {
             LIYAB_LOG_WARN("prefix cache: the context could not be set aside");
         }
@@ -879,12 +939,12 @@ struct Engine::Impl {
 
     // Sets the context aside in the store (see above); `storage_only` when
     // the engine is being destroyed.
-    void stash_context(bool storage_only = false) {
+    void stash_context(Seq& q, bool storage_only = false) {
         // Rows reused away from their prefix (segment reuse) are never kept:
         // a context holding them is set aside up to the first one, so what
         // the store restores is always exact.
-        const size_t exact = std::min(context.size(), exact_end);
-        if (!store || exact < kMinPrefixEntry || context.size() != static_cast<size_t>(target->n_past())) return;
+        const size_t exact = std::min(q.context.size(), q.exact_end);
+        if (!store || exact < kMinPrefixEntry || q.context.size() != static_cast<size_t>(target->n_past())) return;
         // The whole context, the last reply included: that conversation's next
         // prompt re-sends it, and on a hybrid model a reply that encodes
         // differently goes back to the pinned snapshot kept with it (the last
@@ -893,8 +953,8 @@ struct Engine::Impl {
         const auto watch = Clock::now();
         const KvCache& kv = target->kv_cache();
         KvStore::ContextSource source;
-        source.tokens = std::span<const int32_t>(context).first(exact);
-        std::tie(source.text, source.text_tokens) = text_of(exact);
+        source.tokens = std::span<const int32_t>(q.context).first(exact);
+        std::tie(source.text, source.text_tokens) = text_of(q, exact);
         // Storage is written straight from the cache's pages and the model's
         // states: a chunk's image is its pages' images one after the other,
         // a whole page's being the page itself; only a partial last page is
@@ -931,8 +991,8 @@ struct Engine::Impl {
             // back as its snapshots.
             const auto n = static_cast<int32_t>(exact);
             std::vector<KvStore::StateMark> at;
-            for (int32_t q = 0; q * page_tokens < n; ++q) {
-                if (kv.window_page_mapped(q)) at.push_back({std::min((q + 1) * page_tokens, n), false});
+            for (int32_t pg = 0; pg * page_tokens < n; ++pg) {
+                if (kv.window_page_mapped(pg)) at.push_back({std::min((pg + 1) * page_tokens, n), false});
             }
             for (const Transformer::KeptState& k : target->kept_states()) {
                 if (k.pos > 0 && k.pos <= n && kv.window_page_mapped((k.pos - 1) / page_tokens)) at.push_back({k.pos, true});
@@ -945,10 +1005,10 @@ struct Engine::Impl {
                      at.end());
             source.states = std::move(at);
             source.state_parts = [&](int32_t pos) {
-                const int32_t q = (pos - 1) / page_tokens;
+                const int32_t pg = (pos - 1) / page_tokens;
                 window_images.emplace_back(kv.window_page_bytes() / sizeof(float));
                 auto* bytes = reinterpret_cast<uint8_t*>(window_images.back().data());
-                if (!kv.read_window_rows(q, pos - q * page_tokens, bytes).is_ok()) return std::vector<std::span<const float>>();
+                if (!kv.read_window_rows(pg, pos - pg * page_tokens, bytes).is_ok()) return std::vector<std::span<const float>>();
                 return std::vector<std::span<const float>>{std::span<const float>(window_images.back())};
             };
         } else {
@@ -1075,34 +1135,34 @@ struct Engine::Impl {
     // reply sent back as text may encode differently from the tokens
     // generated; on hybrid models, to a stored state image); the tokens kept,
     // or 0.
-    size_t restore_cached(std::span<const int32_t> tokens, size_t limit, size_t have) {
+    size_t restore_cached(Seq& q, std::span<const int32_t> tokens, size_t limit, size_t have) {
         const KvStore::Plan plan = store->plan(tokens, limit);
         const auto positions = static_cast<size_t>(plan.positions);
-        const size_t live = context.empty() ? 0 : static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(have)));
+        const size_t live = q.context.empty() ? 0 : static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(have)));
         if (positions <= live || positions < kMinPrefixEntry) return 0;
         const auto watch = Clock::now();
-        const size_t rows_from = context.empty() ? 0 : std::min(have, positions);
+        const size_t rows_from = q.context.empty() ? 0 : std::min(have, positions);
         if (Status st = restore_plan(plan, rows_from); !st.is_ok()) {
             LIYAB_LOG_WARN("prefix cache: %s", st.to_string().c_str());
-            clear_context();
+            clear_context(q);
             note_store();
             return 0;
         }
         if (plan.record != nullptr) {
-            context = plan.record->tokens;
-            context_text = plan.record->text;
-            context_text_tokens = plan.record->text_tokens;
-            cut_text(positions);
-            context.resize(positions);
+            q.context = plan.record->tokens;
+            q.context_text = plan.record->text;
+            q.context_text_tokens = plan.record->text_tokens;
+            cut_text(q, positions);
+            q.context.resize(positions);
         } else {
-            context.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(positions));
-            context_text.clear();
-            context_text_tokens = 0;
+            q.context.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(positions));
+            q.context_text.clear();
+            q.context_text_tokens = 0;
         }
-        last_prompt_end = positions;
+        q.last_prompt_end = positions;
         // The rows kept in place may be reused ones (a request that opted in
         // to segment reuse); the restored ones are exact.
-        if (exact_end >= rows_from) exact_end = kExact;
+        if (q.exact_end >= rows_from) q.exact_end = kExact;
         store->used(plan);
         const double ms = ms_since(watch);
         LIYAB_LOG_INFO("prefix cache: restored %zu tokens (%zu kept in place) from %zu chunk(s) in %.0f ms", positions,
@@ -1119,20 +1179,20 @@ struct Engine::Impl {
 
     // `approximate_ok`: the request opted in to segment reuse, so it may
     // continue rows reused away from their prefix (else they go first).
-    size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit, bool approximate_ok = false) {
-        if (draft || context.size() != static_cast<size_t>(target->n_past())) {
-            clear_context();
+    size_t reuse_prefix(Seq& q, std::span<const int32_t> tokens, size_t limit, bool approximate_ok = false) {
+        if (draft || q.context.size() != static_cast<size_t>(target->n_past())) {
+            clear_context(q);
             return 0;
         }
-        if (!approximate_ok && exact_end < context.size()) drop_approximate();
+        if (!approximate_ok && q.exact_end < q.context.size()) drop_approximate(q);
         // An empty context (reset_context(), or embed() / rerank(), which use
         // the context and leave it empty): a prompt that continues a context
         // the prefix cache set aside gets it back.
-        if (context.empty()) return prefix_cache_on() ? restore_cached(tokens, limit, 0) : 0;
+        if (q.context.empty()) return prefix_cache_on() ? restore_cached(q, tokens, limit, 0) : 0;
         size_t common = 0;
-        const size_t n = std::min({context.size(), tokens.size(), limit});
-        while (common < n && context[common] == tokens[common]) ++common;
-        if (common == context.size()) return common;  // pure continuation: nothing to drop
+        const size_t n = std::min({q.context.size(), tokens.size(), limit});
+        while (common < n && q.context[common] == tokens[common]) ++common;
+        if (common == q.context.size()) return common;  // pure continuation: nothing to drop
         // Attention-only models rewind to any position; hybrid ones to the
         // nearest recurrent-state checkpoint or snapshot below it.
         const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
@@ -1144,26 +1204,26 @@ struct Engine::Impl {
             // model, back to its nearest snapshot, possibly the start). A
             // draft edited after the last reply is not: it would write state
             // images at every keystroke.
-            const bool replaced = common < context.size() / 2 ||
-                                  (common < last_prompt_end && context.size() - keep >= kMinPrefixEntry);
-            if (replaced) stash_context();
+            const bool replaced = common < q.context.size() / 2 ||
+                                  (common < q.last_prompt_end && q.context.size() - keep >= kMinPrefixEntry);
+            if (replaced) stash_context(q);
             // The store may hold more of this prompt than the context keeps
             // (the conversation it continues, set aside earlier).
-            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
-            if (context.empty()) return 0;  // a cached context failed to restore
+            if (const size_t restored = restore_cached(q, tokens, limit, common); restored > 0) return restored;
+            if (q.context.empty()) return 0;  // a cached context failed to restore
         }
         // Diverging from the context costs a recomputation from `keep`: say
         // where, so a slow turn can be traced to its cause.
-        LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, context.size(),
+        LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, q.context.size(),
                        keep);
         if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
-            cut_text(keep);
-            context.resize(keep);
-            last_prompt_end = std::min(last_prompt_end, keep);
-            if (keep <= exact_end) exact_end = kExact;  // cut before any reused row: exact again
+            cut_text(q, keep);
+            q.context.resize(keep);
+            q.last_prompt_end = std::min(q.last_prompt_end, keep);
+            if (keep <= q.exact_end) q.exact_end = kExact;  // cut before any reused row: exact again
             return keep;
         }
-        clear_context();
+        clear_context(q);
         return 0;
     }
     // Segment reuse for the request being served: the stored segments of
@@ -1171,23 +1231,23 @@ struct Engine::Impl {
     // and before `limit`, reused (core/kv_reuse.h). Returns where processing
     // resumes: past the last reused segment, or `exact` when nothing was
     // reused or reuse failed (the context then still holds the exact prefix).
-    size_t reuse_request_segments(std::span<const int32_t> tokens, size_t exact, size_t limit, const Route& route,
+    size_t reuse_request_segments(Seq& q, std::span<const int32_t> tokens, size_t exact, size_t limit, const Route& route,
                                   int32_t chunk, const std::atomic<bool>* stop, GenerationStats* stats) {
-        if (!request_reuse || request_segments.empty() || exact >= limit) return exact;
+        if (!q.request_reuse || q.request_segments.empty() || exact >= limit) return exact;
         const auto t0 = Clock::now();
-        auto r = reuse_segments(*target, *store, tokens, request_segments, static_cast<int32_t>(exact),
+        auto r = reuse_segments(*target, *store, tokens, q.request_segments, static_cast<int32_t>(exact),
                                 static_cast<int32_t>(limit), reuse, route, *pool, chunk, stop);
         if (!r) {
             if (r.status().code() != ErrorCode::Cancelled) {
                 LIYAB_LOG_WARN("segment reuse: %s; the prompt is processed", r.status().to_string().c_str());
             }
-            if (static_cast<size_t>(target->n_past()) != exact) clear_context();
+            if (static_cast<size_t>(target->n_past()) != exact) clear_context(q);
             note_store();
-            return context.size();
+            return q.context.size();
         }
         if (r->end <= static_cast<int32_t>(exact)) return exact;
-        context.assign(tokens.begin(), tokens.begin() + r->end);
-        if (r->first_reused >= 0) exact_end = std::min(exact_end, static_cast<size_t>(r->first_reused));
+        q.context.assign(tokens.begin(), tokens.begin() + r->end);
+        if (r->first_reused >= 0) q.exact_end = std::min(q.exact_end, static_cast<size_t>(r->first_reused));
         const double ms = ms_since(t0);
         LIYAB_LOG_INFO("segment reuse: %d tokens of %d segment(s) reused (%d of them processed again), %d processed "
                        "between them, in %.0f ms (rows %.0f ms)",
@@ -1209,11 +1269,11 @@ struct Engine::Impl {
 
     // Keeps the request's segments the context now holds and the store has
     // no copy of (core/kv_reuse.h, keep_segments).
-    void keep_request_segments() {
-        if (!request_reuse || request_segments.empty() || !store) return;
+    void keep_request_segments(Seq& q) {
+        if (!q.request_reuse || q.request_segments.empty() || !store) return;
         // The context starts with the prompt the segments index (else
         // nothing of them is kept: the context was replaced or cut).
-        const int32_t kept = keep_segments(*target, *store, context, request_segments, reuse.min_tokens);
+        const int32_t kept = keep_segments(*target, *store, q.context, q.request_segments, reuse.min_tokens);
         if (kept > 0) {
             std::lock_guard<std::mutex> lock(prefix_stats_mutex);
             prefix_stats.segments_kept += static_cast<uint64_t>(kept);
@@ -1339,11 +1399,8 @@ struct Engine::Impl {
                     calibration_wake.wait_until(wait, std::max(ready, now + std::chrono::milliseconds(100)));
                 }
             }
-            // Before the lock, so a call that finds `busy` taken knows to wait.
-            calibration_holds.store(true);
-            std::unique_lock<std::mutex> lock(busy, std::try_to_lock);
+            std::unique_lock<std::mutex> lock(model, std::try_to_lock);
             if (!lock.owns_lock()) {
-                calibration_holds.store(false);
                 std::unique_lock<std::mutex> wait(calibration_mutex);
                 calibration_wake.wait_for(wait, std::chrono::milliseconds(100));
                 continue;
@@ -1354,12 +1411,12 @@ struct Engine::Impl {
             bool over = false;
             if (calls_in_flight.load() == 0) over = calibration_stage();
             lock.unlock();
-            calibration_holds.store(false);
             if (over) return;
         }
     }
-    // One stage, `busy` held: true when the calibration is over (segment
-    // reuse then on or off).
+    // One stage, the model held: true when the calibration is over (segment
+    // reuse then on or off). It runs on the live context's cache, swapped
+    // out for its own and back (whichever sequence is bound).
     bool calibration_stage() {
         if (!calibration_kv) {
             auto kv = target->make_kv_cache(calibrator->positions());
@@ -1375,7 +1432,7 @@ struct Engine::Impl {
             const LoraAdapter* adapter = target->adapter();
             if (adapter != nullptr) (void)target->set_adapter(nullptr);
             r = calibrator->step(*target, draft_route(), *pool, target->max_batch(), &calibration_stop);
-            if (adapter != nullptr) (void)target->set_adapter(adapter, active_scale, pool.get());  // bound before
+            if (adapter != nullptr) (void)target->set_adapter(adapter, bound->active_scale, pool.get());  // bound before
         }
         // The conversation's context back (the same caches: cannot fail).
         (void)target->swap_context(calibration_kv, calibration_n_past);
@@ -1420,20 +1477,86 @@ struct Engine::Impl {
         return true;
     }
 
-    // One call's hold on the engine: false (Busy) while another call runs.
-    // The background calibration is not a call: one arriving while it runs
-    // stops it between two blocks and waits for that, a fraction of a
-    // second. `wait`: wait for another call too (reset_context()).
+    // ---- Scheduler: sequences decoded together --------------------------------
+    // `model` serializes everything that uses the transformer, the prefix
+    // cache's store and the thread pool: a forward pass, an exclusive
+    // operation of one sequence (Hold: a prefix-cache restore or set-aside,
+    // a speculative step, a saved state, embeddings), the background
+    // calibration. A sequence whose call is the only one running runs exactly
+    // as the engine always ran a single conversation (alone()); while others
+    // run, each forward pass it needs is a request (submit()) that one of
+    // the waiting threads, the leader, runs together with the other
+    // sequences' requests in one forward_batch() pass, each sequence keeping
+    // its own sampling, callbacks and stopping on its own thread.
+    std::mutex model;
+    std::mutex sched;  // what follows, and Seq::phase / thread_id
+    std::condition_variable sched_cv;
+    std::mutex pace_mutex;  // PowerManager pacing and hint threads (not thread-safe)
+    int32_t in_call = 0;     // sequences in a call
+    int32_t waiting_fg = 0;  // foreground sequences waiting for the model (Hold)
+    bool leading = false;    // a thread runs the pending requests
+    bool preemptible = false;  // the pass running may be stopped for foreground work
+    std::vector<const Seq*> running;  // the sequences of the pass running
+    std::atomic<bool> preempt{false};  // that pass's cancel flag
+    // What a pass is for: a prompt's chunk (generate), a prefill() chunk, a
+    // forced continuation, a decoding step. The last two are small (a few
+    // tokens): they share passes freely and are paced.
+    enum class PassKind { Prompt, Prefill, Forced, Decode };
+    struct PassRequest {
+        Seq* seq = nullptr;
+        std::span<const int32_t> tokens;
+        Transformer::Logits logits = Transformer::Logits::None;
+        PassKind kind = PassKind::Prompt;
+        // Filled by the pass:
+        bool done = false;
+        Status status;
+        std::vector<float> rows;  // its logits, copied out of the pass (the next one reuses the transformer's)
+        bool throttled = false, head_pruned = false, sparse_ffn = false;
+        int32_t ffn_skips = 0, exit_layer = -1;
+        double paced_ms = 0.0;
+        int32_t sequences = 0;  // in its pass
+        [[nodiscard]] bool small() const noexcept { return kind == PassKind::Forced || kind == PassKind::Decode; }
+    };
+    std::vector<PassRequest*> pending;
+    // Passes timed by the scheduler: every pass (how long to wait for a
+    // sequence about to submit), and passes of small requests by how many
+    // sequences they served (whether a background step may join the user's).
+    static constexpr int32_t kMaxShared = 16;
+    double pass_ms = 0.0;
+    std::array<double, kMaxShared + 2> small_pass_ms{};
+    SchedulerStats sched_stats;
+    // A background step joins a pass of foreground ones only while passes of
+    // one more sequence measured at most this many times as long: on a model
+    // in RAM a row more costs little, while a mixture of experts streamed
+    // from storage reads every chosen expert of the batch, and the user's
+    // step would wait for the reads of the background one's.
+    static constexpr double kRideAlong = 1.25;
+
+    // A call's hold on one sequence: false (Busy) while another call runs on
+    // it. Calls on different sequences run at once. The background
+    // calibration is not a call: one arriving while it runs stops it between
+    // two blocks and waits for that, a fraction of a second, when it needs
+    // the model. `wait`: wait for another call on the sequence too
+    // (reset_context()).
     class Call {
     public:
-        explicit Call(Impl& s, bool wait = false) : s_(s), lock_(s.busy, std::defer_lock) {
+        Call(Impl& s, Seq& q, bool wait = false) : s_(s), q_(q), lock_(q.call, std::defer_lock) {
             s.calls_in_flight.fetch_add(1);
             s.calibration_stop.store(true);
-            if (wait || (!lock_.try_lock() && s.calibration_holds.load())) lock_.lock();
-            if (!lock_.owns_lock()) s.calls_in_flight.fetch_sub(1);
+            if (wait) {
+                lock_.lock();
+            } else {
+                (void)lock_.try_lock();
+            }
+            if (!lock_.owns_lock()) {
+                s.calls_in_flight.fetch_sub(1);
+                return;
+            }
+            s.enter(q);
         }
         ~Call() {
             if (!lock_.owns_lock()) return;
+            s_.leave(q_);
             lock_.unlock();
             {
                 std::lock_guard<std::mutex> lock(s_.calibration_mutex);
@@ -1448,8 +1571,416 @@ struct Engine::Impl {
 
     private:
         Impl& s_;
+        Seq& q_;
         std::unique_lock<std::mutex> lock_;
     };
+
+    // The model for sequence q, its context live (unless `bind` is false) and
+    // the store keyed for it. A foreground sequence goes before passes that
+    // have not started yet, and stops a background prefill pass running.
+    class Hold {
+    public:
+        Hold(Impl& s, Seq& q, bool bind = true) : s_(s), q_(q) {
+            {
+                std::lock_guard<std::mutex> g(s.sched);
+                before_ = q.phase;
+                if (q.phase != Seq::Phase::Idle) q.phase = Seq::Phase::Away;
+                foreground_ = q.foreground();
+                if (foreground_) {
+                    ++s.waiting_fg;
+                    if (s.preemptible) s.preempt.store(true);
+                }
+            }
+            lock_ = std::unique_lock<std::mutex>(s.model);
+            if (foreground_) {
+                std::lock_guard<std::mutex> g(s.sched);
+                --s.waiting_fg;
+                s.sched_cv.notify_all();
+            }
+            if (bind) s.bind(q);
+        }
+        ~Hold() {
+            lock_.unlock();
+            std::lock_guard<std::mutex> g(s_.sched);
+            if (q_.phase == Seq::Phase::Away) q_.phase = before_;  // Working again: about to submit
+            s_.sched_cv.notify_all();
+        }
+        Hold(const Hold&) = delete;
+        Hold& operator=(const Hold&) = delete;
+
+    private:
+        Impl& s_;
+        Seq& q_;
+        Seq::Phase before_ = Seq::Phase::Idle;
+        bool foreground_ = false;
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    // While it lives (the model held), the pass q runs alone may be stopped
+    // for foreground work as a shared background pass may: `preempt` is its
+    // cancel flag, set by a foreground Hold or submit() and by q's
+    // cancel_prefill(). `on`: q is a background sequence.
+    class Stoppable {
+    public:
+        Stoppable(Impl& s, Seq& q, bool on) : s_(s), on_(on) {
+            if (on_) s.begin_stoppable({&q});
+        }
+        ~Stoppable() {
+            if (on_) s_.end_stoppable();
+        }
+        Stoppable(const Stoppable&) = delete;
+        Stoppable& operator=(const Stoppable&) = delete;
+
+    private:
+        Impl& s_;
+        bool on_;
+    };
+    // A stoppable pass of `seqs` starts / ends, the model held. One whose
+    // stop was already asked (foreground work waits) is stopped at once.
+    void begin_stoppable(std::vector<const Seq*> seqs_in_pass) {
+        std::lock_guard<std::mutex> g(sched);
+        preemptible = true;
+        running = std::move(seqs_in_pass);
+        const bool asked = waiting_fg > 0 || std::any_of(pending.begin(), pending.end(), [](const PassRequest* r) {
+                               return r->seq->foreground();
+                           }) || std::any_of(running.begin(), running.end(), [](const Seq* q) {
+                               return q->cancel_prefill.load(std::memory_order_relaxed);
+                           });
+        preempt.store(asked);
+    }
+    void count_stop() {
+        std::lock_guard<std::mutex> g(sched);
+        ++sched_stats.preempted;
+    }
+    void end_stoppable() {
+        std::lock_guard<std::mutex> g(sched);
+        preemptible = false;
+        running.clear();
+    }
+    // Tokens per prompt pass while other sequences decode: what their next
+    // token waits for, so at most max_batch (the passes a streamed MoE or
+    // latent attention would make longer read more per token, see
+    // prefill_chunk()). Latent attention keeps its own passes: each pass's
+    // form follows from its size, and a sequence's passes must take the
+    // forms they take alone.
+    [[nodiscard]] int32_t shared_chunk() const {
+        if (target->config().mla.kv_rank > 0) return prefill_chunk();
+        return std::min(prefill_chunk(), target->max_batch());
+    }
+
+    // Generation and prefill on a sequence, its call held (defined below).
+    Result<GenerationStats> generate(Seq& q, std::span<const int32_t> prompt, const SamplingParams& params,
+                                     const TokenCallback& on_token, const std::string_view* text,
+                                     const ForceCallback* force = nullptr, const GenerateOptions* options = nullptr);
+    Result<GenerationStats> generate_text(Seq& q, std::string_view prompt, const SamplingParams& params,
+                                          const TokenCallback& on_token, const ForceCallback* force,
+                                          const GenerateOptions* options);
+    Result<GenerationStats> generate_tokens_on(Seq& q, std::span<const int32_t> prompt, const SamplingParams& params,
+                                               const TokenCallback& on_token, const GenerateOptions& options);
+    Status prefill_on(Seq& q, std::string_view text, std::span<const PromptSegment> segments, bool add_bos);
+
+    // Makes q's context the transformer's live one (O(1): the contexts are
+    // swapped, not copied) and keys the store for its adapter. Model held.
+    void bind(Seq& q) {
+        if (bound != &q) {
+            target->swap_context(*bound->parked);  // bound's state back into its Context, an empty one live
+            target->swap_context(*q.parked);       // q's live, its Context empty
+            bound = &q;
+        }
+        if (store) store->set_seed(seed_for(q.context_key));
+    }
+
+    Seq* find_sequence(int32_t id) {
+        std::lock_guard<std::mutex> g(sched);
+        for (auto& q : seqs) {
+            if (q->id == id) return q.get();
+        }
+        return nullptr;
+    }
+
+    // A call starts / ends on q (Call).
+    void enter(Seq& q) {
+        std::lock_guard<std::mutex> g(sched);
+        ++in_call;
+        q.phase = Seq::Phase::Away;
+        q.thread_id = ThreadPool::current_thread_id();
+        hint_threads();
+    }
+    void leave(Seq& q) {
+        std::lock_guard<std::mutex> g(sched);
+        --in_call;
+        q.phase = Seq::Phase::Idle;
+        q.thread_id = 0;
+        hint_threads();
+        sched_cv.notify_all();
+    }
+    // The threads that decode, for the power manager's performance hints:
+    // the pool's workers and every call's thread (a Dart isolate may move
+    // between OS threads from one call to the next). Under `sched`.
+    void hint_threads() {
+        if (!power) return;
+        std::vector<int32_t> threads = pool->worker_thread_ids();
+        for (const auto& q : seqs) {
+            if (q->thread_id != 0) threads.push_back(q->thread_id);
+        }
+        std::lock_guard<std::mutex> p(pace_mutex);
+        power->set_hint_threads(std::move(threads));
+    }
+    // Whether q's call is the only one: then it runs as a single sequence
+    // always did (exact same passes, speculative drafts, pacing per token).
+    bool alone() {
+        std::lock_guard<std::mutex> g(sched);
+        return in_call <= 1 && pending.empty();
+    }
+    // Whether requests may share a pass: not with the experimental lossy
+    // hooks, which act on single passes (early exit, FFN skipping) or would
+    // apply to every sequence in it; each sequence then has passes of its
+    // own, so its output is what it gives alone.
+    [[nodiscard]] bool share_passes() const noexcept {
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+        return !early_exit && !egls && !tdss && !head_pruner;
+#else
+        return true;
+#endif
+    }
+    // How long a leader waits for the sequences about to submit (they
+    // sample and call back between passes, well under a millisecond): half
+    // a pass, so a late one costs the others little, and joins the next.
+    [[nodiscard]] Clock::duration straggler_wait() const {
+        const double ms = std::clamp(0.5 * pass_ms, 0.5, 50.0);
+        return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(ms));
+    }
+    [[nodiscard]] bool any_working() const {
+        return std::any_of(seqs.begin(), seqs.end(),
+                           [](const std::unique_ptr<Seq>& q) { return q->phase == Seq::Phase::Working; });
+    }
+    // Whether a background step may join a pass of `k` sequences' steps.
+    [[nodiscard]] bool ride_along(size_t k) const {
+        if (k + 1 >= small_pass_ms.size()) return false;
+        const double now = small_pass_ms[k], more = small_pass_ms[k + 1];
+        return now == 0.0 || more == 0.0 || more <= kRideAlong * now;
+    }
+
+    // Engine::Sequence's destructor: q's call cancelled and waited for, its
+    // context set aside in the prefix cache (when there is one) and freed.
+    void close_sequence(int32_t id) {
+        Seq* q = find_sequence(id);
+        if (q == nullptr || q == main) return;
+        q->cancel.store(true, std::memory_order_relaxed);
+        cancel_prefill(*q);
+        std::unique_lock<std::mutex> call(q->call);  // its call, if any, ends (cancelled)
+        std::unique_ptr<Seq> gone;
+        {
+            const std::lock_guard<std::mutex> lock(model);
+            bind(*q);
+            if (!draft) stash_context(*q);
+            bind(*main);
+            const std::lock_guard<std::mutex> g(sched);
+            for (auto it = seqs.begin(); it != seqs.end(); ++it) {
+                if (it->get() != q) continue;
+                gone = std::move(*it);
+                seqs.erase(it);
+                break;
+            }
+            LIYAB_LOG_INFO("sequences: %d closed (%zu open)", id, seqs.size());
+        }
+        call.unlock();
+        gone.reset();  // its KV pages and recurrent states
+    }
+
+    // Engine::set_adapter / Sequence::set_adapter, the call held on q.
+    Status set_sequence_adapter(Seq& q, std::string_view name, float scale) {
+        const Hold hold(*this, q);
+        if (name.empty()) return select_adapter(q, nullptr, 1.0f);
+        AdapterEntry* e = find_adapter(name);
+        if (e == nullptr) return Status(ErrorCode::InvalidArgument, "no adapter named " + std::string(name));
+        if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "the adapter scale must be finite");
+        return select_adapter(q, e, scale);
+    }
+
+    // Engine::cancel_prefill / Sequence::cancel_prefill: q's prefill() stops
+    // between passes, or now when its pass may be stopped.
+    void cancel_prefill(Seq& q) noexcept {
+        q.cancel_prefill.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(sched);
+        if (preemptible && std::find(running.begin(), running.end(), &q) != running.end()) preempt.store(true);
+    }
+
+    // Runs q's request with the other sequences' (see above) and returns its
+    // status once its pass ran. Its logits are in r.rows.
+    Status submit(Seq& q, PassRequest& r) {
+        std::unique_lock<std::mutex> lock(sched);
+        r.seq = &q;
+        r.done = false;
+        q.phase = Seq::Phase::Waiting;
+        pending.push_back(&r);
+        if (q.foreground() && preemptible) preempt.store(true);
+        sched_cv.notify_all();
+        while (!r.done) {
+            if (!leading) {
+                leading = true;
+                lead(lock, r);
+                leading = false;
+                sched_cv.notify_all();
+            } else {
+                sched_cv.wait(lock);
+            }
+        }
+        return r.status;
+    }
+
+    // The leader's loop, `sched` held: passes until its own request ran.
+    void lead(std::unique_lock<std::mutex>& lock, const PassRequest& mine) {
+        while (!mine.done) {
+            // A foreground sequence's exclusive work first (it waits for the model).
+            sched_cv.wait(lock, [&] { return waiting_fg == 0; });
+            // The sequences about to submit join this pass, for a while.
+            sched_cv.wait_until(lock, Clock::now() + straggler_wait(), [&] { return !any_working(); });
+            std::vector<PassRequest*> chosen = choose();
+            if (chosen.empty()) {
+                sched_cv.wait_for(lock, std::chrono::milliseconds(1));
+                continue;
+            }
+            for (PassRequest* r : chosen) std::erase(pending, r);
+            // Background work alone in the pass, a prompt among it: it may be
+            // stopped when foreground work comes (run_pass()).
+            const bool can_stop = std::all_of(chosen.begin(), chosen.end(), [](const PassRequest* r) {
+                                      return !r->seq->foreground();
+                                  }) && std::any_of(chosen.begin(), chosen.end(), [](const PassRequest* r) {
+                                      return !r->small();
+                                  });
+            lock.unlock();
+            const auto t0 = Clock::now();
+            const bool stopped = run_pass(chosen, can_stop);
+            const double ms = ms_since(t0);
+            lock.lock();
+            if (!stopped) {
+                pass_ms = pass_ms == 0.0 ? ms : 0.8 * pass_ms + 0.2 * ms;
+                const bool small = std::all_of(chosen.begin(), chosen.end(), [](const PassRequest* r) { return r->small(); });
+                if (small && chosen.size() < small_pass_ms.size()) {
+                    double& e = small_pass_ms[chosen.size()];
+                    e = e == 0.0 ? ms : 0.8 * e + 0.2 * ms;
+                }
+                ++sched_stats.passes;
+                if (chosen.size() > 1) {
+                    ++sched_stats.shared_passes;
+                    for (const PassRequest* r : chosen) sched_stats.shared_rows += r->tokens.size();
+                }
+            } else {
+                ++sched_stats.preempted;
+            }
+            for (PassRequest* r : chosen) {
+                if (stopped && r->status.code() == ErrorCode::Cancelled) {
+                    // Stopped for foreground work (its context is back where
+                    // the pass started): it runs again later, unless its own
+                    // prefill() was cancelled.
+                    const bool own = r->kind == PassKind::Prefill && r->seq->cancel_prefill.load();
+                    if (!own) {
+                        r->status = Status::ok();
+                        pending.push_back(r);
+                        continue;
+                    }
+                }
+                r->done = true;
+                r->seq->phase = Seq::Phase::Working;
+            }
+            sched_cv.notify_all();
+        }
+    }
+
+    // The requests of the next pass, `sched` held: every foreground one, and
+    // background steps when riding along is cheap (see kRideAlong); else
+    // every background one. One at a time when passes are not shared.
+    std::vector<PassRequest*> choose() {
+        std::vector<PassRequest*> fg, bg;
+        for (PassRequest* r : pending) (r->seq->foreground() ? fg : bg).push_back(r);
+        if (!share_passes()) return {fg.empty() ? bg.front() : fg.front()};
+        if (fg.empty()) return bg;
+        for (PassRequest* r : bg) {
+            if (r->small() && ride_along(fg.size())) fg.push_back(r);
+        }
+        return fg;
+    }
+
+    // One pass over `chosen` (the model taken here): a single request as its
+    // sequence alone would run it (its hooks, its checkpointing), several in
+    // one forward_batch(). Returns true when a preemptible pass was stopped
+    // (the contexts are then back where it started).
+    bool run_pass(const std::vector<PassRequest*>& chosen, bool can_stop) {
+        std::unique_lock<std::mutex> lock(model);
+        struct Stop {
+            Impl& s;
+            bool on;
+            ~Stop() {
+                if (on) s.end_stoppable();
+            }
+        } stop{*this, can_stop};
+        if (can_stop) {
+            std::vector<const Seq*> in_pass;
+            for (const PassRequest* r : chosen) in_pass.push_back(r->seq);
+            begin_stoppable(std::move(in_pass));
+        }
+        const PowerPolicy policy = power->policy();
+        apply_policy(policy);
+        const Route route = policy.throttled ? throttled_route() : normal_route();
+        double slept = 0.0;
+        if (std::any_of(chosen.begin(), chosen.end(), [](const PassRequest* r) { return r->small(); })) {
+            // Duty cycling per pass: each sequence in it gets a token per slot.
+            std::lock_guard<std::mutex> p(pace_mutex);
+            slept = static_cast<double>(power->pace_token().count()) / 1000.0;
+        }
+        Status status;
+        if (chosen.size() == 1) {
+            PassRequest& r = *chosen.front();
+            bind(*r.seq);
+            ForwardHooks hooks = r.kind == PassKind::Prompt || r.kind == PassKind::Prefill || !speculative
+                                     ? this->hooks(policy, r.kind == PassKind::Decode)
+                                     : ForwardHooks{};
+            if (r.kind == PassKind::Prefill) hooks.cancel = &r.seq->cancel_prefill;
+            if (can_stop) hooks.cancel = &preempt;  // cancel_prefill() sets it too (Engine::cancel_prefill)
+            if (r.small() && speculative) target->set_checkpointing(false);  // never rolled back
+            auto out = target->forward(r.tokens, r.logits, route, *pool, &hooks);
+            r.sequences = 1;
+            r.throttled = policy.throttled;
+            r.head_pruned = hooks.head_mask != nullptr;
+            r.sparse_ffn = hooks.ffn_matmul != nullptr;
+            r.ffn_skips = target->last_ffn_skips();
+            r.exit_layer = target->last_exit_layer();
+            r.paced_ms = slept;
+            if (out) {
+                r.rows.assign(out->begin(), out->end());
+                r.status = Status::ok();
+            } else {
+                status = out.status();
+                if (status.code() == ErrorCode::Cancelled && !target->abandon_pass().is_ok()) target->reset();
+                r.status = status;
+            }
+            return status.code() == ErrorCode::Cancelled && can_stop;
+        }
+        std::vector<Transformer::BatchItem> items;
+        items.reserve(chosen.size());
+        for (const PassRequest* r : chosen) {
+            Transformer::BatchItem item;
+            item.context = r->seq == bound ? nullptr : r->seq->parked.get();
+            item.tokens = r->tokens;
+            item.logits = r->logits;
+            item.checkpoint = !r->small();  // steps are never rolled back here (no drafts in shared passes)
+            items.push_back(item);
+        }
+        ForwardHooks hooks;
+        if (can_stop) hooks.cancel = &preempt;
+        std::vector<std::span<const float>> out;
+        status = target->forward_batch(items, route, *pool, out, &hooks);
+        for (size_t i = 0; i < chosen.size(); ++i) {
+            PassRequest& r = *chosen[i];
+            r.sequences = static_cast<int32_t>(chosen.size());
+            r.throttled = policy.throttled;
+            r.paced_ms = slept;
+            r.status = status;
+            if (status.is_ok()) r.rows.assign(out[i].begin(), out[i].end());
+        }
+        return status.code() == ErrorCode::Cancelled && can_stop;
+    }
 
     // What a calibration depends on: the model, the cache and its key
     // scales (context_fingerprint), the kernels, the procedure's version,
@@ -1561,26 +2092,33 @@ struct Engine::Impl {
     // on first use, and the state tables of the grammars used most recently
     // (most recent first), so a grammar used again keeps its transitions and
     // masks. At most 16 tables and 64 MiB together; the newest always stays.
-    std::unique_ptr<grammar::VocabTrie> vocab_trie;
-    std::list<std::unique_ptr<grammar::StateTable>> grammar_tables;
-    const grammar::VocabTrie& trie() {
+    // Shared: a generation keeps the trie and its tables alive while it uses
+    // them (trim_memory() drops the caches' references only), and every use
+    // of either, which fills a table's caches as it goes, holds
+    // grammar_mutex (sequences may use one grammar at once).
+    std::shared_ptr<const grammar::VocabTrie> vocab_trie;
+    std::list<std::shared_ptr<grammar::StateTable>> grammar_tables;
+    std::mutex grammar_mutex;
+    // grammar_mutex held.
+    std::shared_ptr<const grammar::VocabTrie> trie() {
         if (!vocab_trie) {
             const auto t0 = Clock::now();
             vocab_trie = grammar::VocabTrie::build(*tokenizer);
             LIYAB_LOG_INFO("grammar: vocabulary trie of %zu nodes built in %.1f ms", vocab_trie->nodes.size(),
                            ms_since(t0));
         }
-        return *vocab_trie;
+        return vocab_trie;
     }
-    grammar::StateTable& grammar_table(const Grammar& g) {
+    // grammar_mutex held.
+    std::shared_ptr<grammar::StateTable> grammar_table(const Grammar& g) {
         for (auto it = grammar_tables.begin(); it != grammar_tables.end(); ++it) {
             const auto& p = (*it)->program();
             if (p == g.program() || p->same(*g.program())) {
                 grammar_tables.splice(grammar_tables.begin(), grammar_tables, it);
-                return *grammar_tables.front();
+                return grammar_tables.front();
             }
         }
-        grammar_tables.push_front(std::make_unique<grammar::StateTable>(g.program()));
+        grammar_tables.push_front(std::make_shared<grammar::StateTable>(g.program()));
         size_t total = 0;
         for (const auto& t : grammar_tables) total += t->memory_bytes();
         constexpr size_t kMaxTables = 16, kMaxBytes = size_t{64} << 20;
@@ -1588,7 +2126,7 @@ struct Engine::Impl {
             total -= grammar_tables.back()->memory_bytes();
             grammar_tables.pop_back();
         }
-        return *grammar_tables.front();
+        return grammar_tables.front();
     }
     void load_chat_template() {
         const auto source = target->file().get_string("tokenizer.chat_template");
@@ -1629,9 +2167,6 @@ struct Engine::Impl {
         }
     }
     std::unique_ptr<PowerManager> power;
-    std::atomic<bool> cancel{false};
-    std::atomic<bool> cancel_prefill{false};  // Engine::cancel_prefill: prefill() only
-    std::mutex busy;
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     std::unique_ptr<experimental::EarlyExit> early_exit;
     std::optional<experimental::HeadPruner> head_pruner;
@@ -2042,18 +2577,21 @@ struct Engine::Impl {
     // replaces it would set it aside (prefix cache), and the context is left
     // empty. Lossy experimental hooks are not applied: vectors and scores are
     // the model's own.
+    // On the default sequence, holding the model for the whole call.
     Result<PooledRun> run_pooling(std::span<const std::vector<int32_t>> sequences, const PoolTarget& pool_target) {
-        cancel.store(false, std::memory_order_relaxed);
-        if (!draft && prefix_cache_on() && context.size() == static_cast<size_t>(target->n_past())) stash_context();
-        clear_context();
+        Seq& q = *main;
+        q.cancel.store(false, std::memory_order_relaxed);
+        const Hold hold(*this, q);
+        if (!draft && prefix_cache_on() && q.context.size() == static_cast<size_t>(target->n_past())) stash_context(q);
+        clear_context(q);
         const PowerManager::Work thermal(*power);
         const PowerPolicy policy = power->policy();
         apply_policy(policy);
         const Route route = policy.throttled ? throttled_route() : normal_route();
         ForwardHooks forward_hooks;
-        forward_hooks.cancel = &cancel;
+        forward_hooks.cancel = &q.cancel;
         auto run = run_pooled(*target, sequences, pool_target, route, *this->pool, prefill_chunk(), &forward_hooks);
-        clear_context();
+        clear_context(q);
         if (!run && run.status().code() == ErrorCode::Cancelled) {
             return Status(ErrorCode::Cancelled, "the embedding or reranking call was cancelled");
         }
@@ -2094,6 +2632,15 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     auto target = load_model(config.model_path, config, max_batch, repack_cpu);
     if (!target) return target.status();
     impl->target = std::move(target).value();
+    {
+        // The default sequence: its context is the transformer's live one.
+        auto q = std::make_unique<Impl::Seq>();
+        q->id = 0;
+        q->parked = std::make_unique<Transformer::Context>();
+        impl->bound = q.get();
+        impl->main = q.get();
+        impl->seqs.push_back(std::move(q));
+    }
 
     LIYAB_RETURN_IF_ERROR(impl->attach_layer_streaming(config.triple_buffer_loading));
     LIYAB_RETURN_IF_ERROR(impl->share_resident_weights());
@@ -2193,9 +2740,9 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
 }
 
-void Engine::cancel() noexcept { impl_->cancel.store(true, std::memory_order_relaxed); }
+void Engine::cancel() noexcept { impl_->main->cancel.store(true, std::memory_order_relaxed); }
 
-void Engine::cancel_prefill() noexcept { impl_->cancel_prefill.store(true, std::memory_order_relaxed); }
+void Engine::cancel_prefill() noexcept { impl_->cancel_prefill(*impl_->main); }
 
 const DeviceInfo& Engine::device() const noexcept { return impl_->device; }
 
@@ -2270,6 +2817,7 @@ Engine::MemoryPlan Engine::memory_plan() const {
 }
 
 size_t Engine::trim_memory() {
+    const std::lock_guard<std::mutex> model(impl_->model);  // not during another sequence's pass
     size_t released = 0;
     if (ExpertStore* store = impl_->target->expert_store()) released += store->trim();
     if (impl_->draft) {
@@ -2278,8 +2826,11 @@ size_t Engine::trim_memory() {
     if (released > 0) LIYAB_LOG_INFO("trimmed %.2f GiB of cached experts", released / (1024.0 * 1024.0 * 1024.0));
     // Constrained decoding's caches are rebuilt on the next constrained
     // generation (the trie in tens of ms): not worth keeping while idle.
-    impl_->grammar_tables.clear();
-    impl_->vocab_trie.reset();
+    {
+        std::lock_guard<std::mutex> lock(impl_->grammar_mutex);
+        impl_->grammar_tables.clear();
+        impl_->vocab_trie.reset();
+    }
     return released;
 }
 
@@ -2307,6 +2858,7 @@ std::optional<std::string> Engine::model_metadata(std::string_view key) const {
 }
 
 std::string Engine::describe() const {
+    const std::lock_guard<std::mutex> model(impl_->model);  // the live context changes while sequences run
     const ModelConfig& c = impl_->target->config();
     const KvCache& kv = impl_->target->kv_cache();
     char buf[768];
@@ -2360,7 +2912,7 @@ std::string Engine::describe() const {
             char line[256];
             std::snprintf(line, sizeof line, "Adapter:    %s, LoRA rank %d, %d matrices, %.1f MiB%s%s\n", e->name.c_str(),
                           e->rank, e->matrices, static_cast<double>(e->bytes) / (1024.0 * 1024.0),
-                          e->adapter ? "" : " (released)", e.get() == impl_->active ? ", selected" : "");
+                          e->adapter ? "" : " (released)", e.get() == impl_->main->active ? ", selected" : "");
             out += line;
         }
     }
@@ -2392,13 +2944,14 @@ Engine::SegmentReuseInfo Engine::segment_reuse() const {
 }
 
 Status Engine::load_adapter(std::string_view name, const std::string& path) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     if (s.config.adapter_memory_mb <= 0) {
         return Status(ErrorCode::Unsupported, "adapters are off (EngineConfig::adapter_memory_mb is 0)");
     }
     if (name.empty()) return Status(ErrorCode::InvalidArgument, "an adapter needs a name");
+    const Impl::Hold hold(s, *s.main);
     if (s.find_adapter(name) != nullptr) {
         return Status(ErrorCode::InvalidArgument, "an adapter named " + std::string(name) + " is loaded already");
     }
@@ -2430,31 +2983,54 @@ Status Engine::load_adapter(std::string_view name, const std::string& path) {
 }
 
 Status Engine::unload_adapter(std::string_view name) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
-    Impl::AdapterEntry* e = s.find_adapter(name);
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl::AdapterEntry* e = nullptr;
+    {
+        const std::lock_guard<std::mutex> model(s.model);
+        e = s.find_adapter(name);
+    }
     if (e == nullptr) return Status(ErrorCode::InvalidArgument, "no adapter named " + std::string(name));
-    if (e == s.active) LIYAB_RETURN_IF_ERROR(s.select_adapter(nullptr, 1.0f));
+    // Every sequence that selected it goes back to the base model; one in a
+    // call keeps using it, so the adapter stays (Busy).
+    std::vector<Impl::Seq*> users;
+    std::vector<std::unique_lock<std::mutex>> calls;
+    {
+        std::lock_guard<std::mutex> g(s.sched);
+        for (auto& q : s.seqs) {
+            if (q->active != e) continue;
+            if (q.get() != s.main) {
+                std::unique_lock<std::mutex> other(q->call, std::try_to_lock);
+                if (!other.owns_lock()) {
+                    return Status(ErrorCode::Busy, "a generation on another sequence applies this adapter");
+                }
+                calls.push_back(std::move(other));
+            }
+            users.push_back(q.get());
+        }
+    }
+    for (Impl::Seq* q : users) {
+        const Impl::Hold hold(s, *q);
+        LIYAB_RETURN_IF_ERROR(s.select_adapter(*q, nullptr, 1.0f));
+    }
+    const Impl::Hold hold(s, *s.main);
     std::lock_guard<std::mutex> lock(s.adapters_mutex);
     std::erase_if(s.adapters, [e](const std::unique_ptr<Impl::AdapterEntry>& x) { return x.get() == e; });
     return Status::ok();
 }
 
 Status Engine::set_adapter(std::string_view name, float scale) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
-    if (name.empty()) return s.select_adapter(nullptr, 1.0f);
-    Impl::AdapterEntry* e = s.find_adapter(name);
-    if (e == nullptr) return Status(ErrorCode::InvalidArgument, "no adapter named " + std::string(name));
-    if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "the adapter scale must be finite");
-    return s.select_adapter(e, scale);
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    return s.set_sequence_adapter(*s.main, name, scale);
 }
 
 std::vector<AdapterInfo> Engine::adapters() const {
     std::lock_guard<std::mutex> lock(impl_->adapters_mutex);
     std::vector<AdapterInfo> out;
+    const Impl::Seq& q = *impl_->main;
     for (const auto& e : impl_->adapters) {
         AdapterInfo info;
         info.name = e->name;
@@ -2464,60 +3040,136 @@ std::vector<AdapterInfo> Engine::adapters() const {
         info.matrices = e->matrices;
         info.bytes = e->bytes;
         info.resident = e->adapter != nullptr;
-        info.active = e.get() == impl_->active;
-        info.scale = info.active ? impl_->active_scale : 0.0f;
+        info.active = e.get() == q.active;
+        info.scale = info.active ? q.active_scale : 0.0f;
         out.push_back(std::move(info));
     }
     return out;
 }
 
+Result<std::unique_ptr<Engine::Sequence>> Engine::open_sequence(SequencePriority priority) {
+    Impl& s = *impl_;
+    if (s.draft) {
+        return Status(ErrorCode::Unsupported, "sequences are not available with a draft model (its cache follows one)");
+    }
+    const auto most = static_cast<size_t>(std::max(s.config.max_sequences, 1));
+    if (most == 1) return Status(ErrorCode::Unsupported, "EngineConfig::max_sequences is 1: the engine keeps one sequence");
+    const std::lock_guard<std::mutex> model(s.model);
+    {
+        const std::lock_guard<std::mutex> g(s.sched);
+        if (s.seqs.size() >= most) return Status(ErrorCode::Busy, "every sequence is open (EngineConfig::max_sequences)");
+    }
+    auto context = s.target->make_context();
+    if (!context) return context.status();
+    auto q = std::make_unique<Impl::Seq>();
+    q->priority.store(static_cast<int32_t>(priority), std::memory_order_relaxed);
+    q->parked = std::move(context).value();
+    const std::lock_guard<std::mutex> g(s.sched);
+    q->id = s.next_sequence_id++;
+    const int32_t id = q->id;
+    s.seqs.push_back(std::move(q));
+    LIYAB_LOG_INFO("sequences: %d opened (%zu of %zu), %s", id, s.seqs.size(), most,
+                   priority == SequencePriority::Foreground ? "foreground" : "background");
+    return std::unique_ptr<Sequence>(new Sequence(*this, id));
+}
+
+Engine::SchedulerStats Engine::scheduler_stats() const {
+    const std::lock_guard<std::mutex> g(impl_->sched);
+    SchedulerStats out = impl_->sched_stats;
+    out.open_sequences = static_cast<int32_t>(impl_->seqs.size());
+    out.active_sequences = impl_->in_call;
+    return out;
+}
+
+Engine::Sequence::~Sequence() { engine_.impl_->close_sequence(id_); }
+
+Result<GenerationStats> Engine::Sequence::generate(std::string_view prompt, const SamplingParams& params,
+                                                   const TokenCallback& on_token, const GenerateOptions& options) {
+    if (options.grammar && options.continuation) {
+        return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
+    }
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return Status(ErrorCode::InvalidArgument, "the sequence is closed");
+    const Impl::Call call(s, *q);
+    if (!call) return Status(ErrorCode::Busy, "a call is already running on this sequence");
+    return s.generate_text(*q, prompt, params, on_token, nullptr, &options);
+}
+
+Result<GenerationStats> Engine::Sequence::generate(std::string_view prompt, const SamplingParams& params,
+                                                   const TokenCallback& on_token, const ForceCallback& force) {
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return Status(ErrorCode::InvalidArgument, "the sequence is closed");
+    const Impl::Call call(s, *q);
+    if (!call) return Status(ErrorCode::Busy, "a call is already running on this sequence");
+    return s.generate_text(*q, prompt, params, on_token, force ? &force : nullptr, nullptr);
+}
+
+Result<GenerationStats> Engine::Sequence::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                                          const TokenCallback& on_token) {
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return Status(ErrorCode::InvalidArgument, "the sequence is closed");
+    const Impl::Call call(s, *q);
+    if (!call) return Status(ErrorCode::Busy, "a call is already running on this sequence");
+    return s.generate(*q, prompt, params, on_token, nullptr);
+}
+
+Status Engine::Sequence::prefill(std::string_view text, bool add_bos) {
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return Status(ErrorCode::InvalidArgument, "the sequence is closed");
+    const Impl::Call call(s, *q);
+    if (!call) return Status(ErrorCode::Busy, "a call is already running on this sequence");
+    return s.prefill_on(*q, text, {}, add_bos);
+}
+
+void Engine::Sequence::reset_context() {
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return;
+    const Impl::Call call(s, *q, /*wait=*/true);
+    const Impl::Hold hold(s, *q);
+    s.clear_context(*q);
+}
+
+Status Engine::Sequence::set_adapter(std::string_view name, float scale) {
+    Impl& s = *engine_.impl_;
+    Impl::Seq* q = s.find_sequence(id_);
+    if (q == nullptr) return Status(ErrorCode::InvalidArgument, "the sequence is closed");
+    const Impl::Call call(s, *q);
+    if (!call) return Status(ErrorCode::Busy, "a call is already running on this sequence");
+    return s.set_sequence_adapter(*q, name, scale);
+}
+
+void Engine::Sequence::set_priority(SequencePriority priority) noexcept {
+    if (Impl::Seq* q = engine_.impl_->find_sequence(id_)) {
+        q->priority.store(static_cast<int32_t>(priority), std::memory_order_relaxed);
+    }
+}
+
+SequencePriority Engine::Sequence::priority() const noexcept {
+    const Impl::Seq* q = engine_.impl_->find_sequence(id_);
+    return q != nullptr ? static_cast<SequencePriority>(q->priority.load(std::memory_order_relaxed))
+                        : SequencePriority::Foreground;
+}
+
+void Engine::Sequence::cancel() noexcept {
+    if (Impl::Seq* q = engine_.impl_->find_sequence(id_)) q->cancel.store(true, std::memory_order_relaxed);
+}
+
+void Engine::Sequence::cancel_prefill() noexcept {
+    if (Impl::Seq* q = engine_.impl_->find_sequence(id_)) engine_.impl_->cancel_prefill(*q);
+}
+
 Status Engine::prefill(std::string_view text, bool add_bos) { return prefill(text, {}, add_bos); }
 
 Status Engine::prefill(std::string_view text, std::span<const PromptSegment> segments, bool add_bos) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
-    if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
-    LIYAB_RETURN_IF_ERROR(check_segments(segments, text.size(), text));
-    const Impl::Request request(s, segments, /*tokens=*/false);
-    auto tokens = s.request_reuse ? s.encode_segments(text, add_bos) : s.encode_continuation(text, add_bos);
-    if (!tokens) return tokens.status();
-    s.cancel_prefill.store(false, std::memory_order_relaxed);
-    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
-    const std::vector<int32_t>& t = tokens.value();
-    size_t reused = s.reuse_prefix(t, t.size(), s.request_reuse);
-    const PowerPolicy policy = s.power->policy();
-    s.apply_policy(policy);
-    const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
-    ForwardHooks hooks = s.hooks(policy, false);
-    // Interruptible within a pass (cancel_prefill() is checked between
-    // blocks): a pass of 1024 tokens of a streamed MoE runs for tens of
-    // seconds. The work done so far stays: a hybrid model's state is
-    // snapshotted before each pass, and an abandoned pass returns to it, so
-    // the next prompt continuing this text resumes there.
-    hooks.cancel = &s.cancel_prefill;
-    const auto chunk = static_cast<size_t>(s.prefill_chunk());
-    // Segment reuse (marked segments): stored ones after the exact prefix;
-    // cancel_prefill() stops it between blocks, keeping that prefix.
-    reused = s.reuse_request_segments(t, reused, t.size(), route, static_cast<int32_t>(chunk), &s.cancel_prefill,
-                                      nullptr);
-    if (s.cancel_prefill.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
-    for (size_t i = reused; i < t.size(); i += chunk) {
-        if (s.target->config().hybrid()) s.target->snapshot_state();
-        const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
-        if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
-            if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {
-                return Status(ErrorCode::Cancelled, "prefill cancelled");
-            }
-            s.clear_context();
-            return r.status();
-        }
-        s.context.insert(s.context.end(), part.begin(), part.end());
-    }
-    s.target->snapshot_state();  // the next prompt starts with this text
-    s.keep_request_segments();
-    s.remember_text(t, text);
-    return Status::ok();
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    return s.prefill_on(*s.main, text, segments, add_bos);
 }
 
 namespace {
@@ -2587,25 +3239,28 @@ Status write_replacing(const std::string& path, const std::function<Status(std::
 }  // namespace
 
 Status Engine::save_state(const std::string& path) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
-    return write_replacing(path, [&s](std::ostream& out) {
+    Impl::Seq& q = *s.main;
+    const Impl::Hold hold(s, q);
+    return write_replacing(path, [&s, &q](std::ostream& out) {
         LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
-        write_context_tail(out, s.context, s.context_text, s.context_text_tokens, s.exact_end, s.context_key);
+        write_context_tail(out, q.context, q.context_text, q.context_text_tokens, q.exact_end, q.context_key);
         return Status::ok();
     });
 }
 
 Status Engine::save_state(const std::string& path, std::string_view text) {
     {
-        const Impl::Call call(*impl_);
-        if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
         Impl& s = *impl_;
+        const Impl::Call call(s, *s.main);
+        if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
         if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
-        const bool live = s.context_text_tokens > 0 && text.starts_with(s.context_text);
+        const bool live = s.main->context_text_tokens > 0 && text.starts_with(s.main->context_text);
         if (!live) {
+            const Impl::Hold hold(s, *s.main);
             // The longest context set aside for this text, written as it is
             // kept: nothing is restored or processed.
             const KvStore::Record* best = s.store ? s.store->record_for_text(text) : nullptr;
@@ -2687,7 +3342,7 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
                 const Status written = s.target->write_state(out, context);
                 LIYAB_RETURN_IF_ERROR(read);
                 LIYAB_RETURN_IF_ERROR(written);
-                write_context_tail(out, record.tokens, record.text, record.text_tokens, SIZE_MAX, s.context_key);
+                write_context_tail(out, record.tokens, record.text, record.text_tokens, SIZE_MAX, s.main->context_key);
                 return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
             });
         }
@@ -2696,40 +3351,42 @@ Status Engine::save_state(const std::string& path, std::string_view text) {
 }
 
 Result<int32_t> Engine::load_state(const std::string& path) {
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
-    s.clear_context();
+    Impl::Seq& q = *s.main;
+    const Impl::Hold hold(s, q);
+    s.clear_context(q);
     std::ifstream in(os::utf8_path(path), std::ios::binary);
     if (!in) return Status(ErrorCode::IoError, "cannot read " + path);
     LIYAB_RETURN_IF_ERROR(s.target->read_state(in));
     uint32_t magic = 0;
     uint64_t n = 0, text = 0;
-    const auto damaged = [&s] {
-        s.clear_context();
+    const auto damaged = [&s, &q] {
+        s.clear_context(q);
         return Status(ErrorCode::IoError, "the saved context is damaged");
     };
     if (!in.read(reinterpret_cast<char*>(&magic), sizeof magic) || magic != kContextMagic ||
         !in.read(reinterpret_cast<char*>(&n), sizeof n) || n != static_cast<uint64_t>(s.target->n_past())) {
         return damaged();
     }
-    s.context.resize(n);
-    if (!in.read(reinterpret_cast<char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t))) ||
+    q.context.resize(n);
+    if (!in.read(reinterpret_cast<char*>(q.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t))) ||
         !in.read(reinterpret_cast<char*>(&text), sizeof text)) {
         return damaged();
     }
     if (text != UINT64_MAX) {
         if (text > (uint64_t{1} << 30)) return damaged();
-        s.context_text.resize(text);
-        if (!in.read(s.context_text.data(), static_cast<std::streamsize>(text))) return damaged();
+        q.context_text.resize(text);
+        if (!in.read(q.context_text.data(), static_cast<std::streamsize>(text))) return damaged();
         uint64_t covered = 0;
         if (!in.read(reinterpret_cast<char*>(&covered), sizeof covered)) {
             covered = n;  // written before the count was saved: the text covers every token
         } else if (covered == 0 || covered > n) {
             return damaged();
         }
-        s.context_text_tokens = static_cast<size_t>(covered);
+        q.context_text_tokens = static_cast<size_t>(covered);
     }
     // Where rows reused away from their prefix start (segment reuse), when
     // the context held some.
@@ -2738,42 +3395,42 @@ Result<int32_t> Engine::load_state(const std::string& path) {
     bool tagged = static_cast<bool>(in.read(reinterpret_cast<char*>(&tag), sizeof tag));
     if (tagged && tag == kReusedMagic) {
         if (!in.read(reinterpret_cast<char*>(&exact), sizeof exact) || exact >= n) return damaged();
-        s.exact_end = static_cast<size_t>(exact);
+        q.exact_end = static_cast<size_t>(exact);
         tagged = static_cast<bool>(in.read(reinterpret_cast<char*>(&tag), sizeof tag));
     }
     // The adapter it was computed with (none when untagged) must be the selected one.
     if (tagged && tag == kAdapterMagic && !in.read(reinterpret_cast<char*>(&adapter), sizeof adapter)) return damaged();
-    if (adapter != s.context_key) {
-        s.clear_context();
+    if (adapter != q.context_key) {
+        s.clear_context(q);
         return Status(ErrorCode::InvalidArgument,
                       adapter == 0 ? "the saved context was computed without an adapter: select none first"
                                    : "the saved context was computed with another adapter (or scale) than the selected one");
     }
-    s.last_prompt_end = static_cast<size_t>(n);
+    q.last_prompt_end = static_cast<size_t>(n);
     return static_cast<int32_t>(n);
 }
 
 void Engine::reset_context() {
-    const Impl::Call call(*impl_, /*wait=*/true);
-    impl_->clear_context();
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main, /*wait=*/true);
+    const Impl::Hold hold(s, *s.main);
+    s.clear_context(*s.main);
 }
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token) {
-    const Impl::Call call(*impl_);
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
     if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
-    if (!tokens) return tokens.status();
-    return generate_locked(*tokens, params, on_token, &prompt);
+    return s.generate_text(*s.main, prompt, params, on_token, nullptr, nullptr);
 }
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
                                          const TokenCallback& on_token, const ForceCallback& force) {
-    const Impl::Call call(*impl_);
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
     if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
-    if (!tokens) return tokens.status();
-    return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
+    return s.generate_text(*s.main, prompt, params, on_token, force ? &force : nullptr, nullptr);
 }
 
 Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
@@ -2781,22 +3438,18 @@ Result<GenerationStats> Engine::generate(std::string_view prompt, const Sampling
     if (options.grammar && options.continuation) {
         return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
     }
-    const Impl::Call call(*impl_);
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
     if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size(), prompt));
-    const Impl::Request request(*impl_, options.segments, /*tokens=*/false);
-    auto tokens = impl_->request_reuse ? impl_->encode_segments(prompt, params.add_bos)
-                                       : impl_->encode_continuation(prompt, params.add_bos);
-    if (!tokens) return tokens.status();
-    const bool structured = options.grammar.has_value() || static_cast<bool>(options.continuation);
-    return generate_locked(*tokens, params, on_token, &prompt, nullptr, structured ? &options : nullptr);
+    return s.generate_text(*s.main, prompt, params, on_token, nullptr, &options);
 }
 
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
                                                 const TokenCallback& on_token) {
-    const Impl::Call call(*impl_);
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
     if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
-    return generate_locked(prompt, params, on_token, nullptr);
+    return s.generate(*s.main, prompt, params, on_token, nullptr);
 }
 
 Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
@@ -2804,39 +3457,78 @@ Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt,
     if (options.grammar && options.continuation) {
         return Status(ErrorCode::InvalidArgument, "GenerateOptions: set a grammar or a continuation callback, not both");
     }
-    const Impl::Call call(*impl_);
+    Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
     if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    return s.generate_tokens_on(*s.main, prompt, params, on_token, options);
+}
+
+// generate() from text on sequence q, its call held: the prompt encoded as
+// it continues q's context or one the prefix cache keeps (with marked
+// segments when the request opts in to segment reuse).
+Result<GenerationStats> Engine::Impl::generate_text(Seq& q, std::string_view prompt, const SamplingParams& params,
+                                                    const TokenCallback& on_token, const ForceCallback* force,
+                                                    const GenerateOptions* options) {
+    const std::span<const PromptSegment> marks =
+        options != nullptr ? std::span<const PromptSegment>(options->segments) : std::span<const PromptSegment>();
+    LIYAB_RETURN_IF_ERROR(check_segments(marks, prompt.size(), prompt));
+    const Request request(*this, q, marks, /*tokens=*/false);
+    auto tokens = q.request_reuse ? encode_segments(q, prompt, params.add_bos)
+                                  : encode_continuation(q, prompt, params.add_bos);
+    if (!tokens) return tokens.status();
+    const bool structured = options != nullptr && (options->grammar.has_value() || static_cast<bool>(options->continuation));
+    return generate(q, *tokens, params, on_token, &prompt, force, structured ? options : nullptr);
+}
+
+// generate_tokens() with options on sequence q, its call held.
+Result<GenerationStats> Engine::Impl::generate_tokens_on(Seq& q, std::span<const int32_t> prompt,
+                                                         const SamplingParams& params, const TokenCallback& on_token,
+                                                         const GenerateOptions& options) {
     LIYAB_RETURN_IF_ERROR(check_segments(options.segments, prompt.size()));
-    const Impl::Request request(*impl_, options.segments, /*tokens=*/true);
-    if (impl_->request_reuse) {
+    const Request request(*this, q, options.segments, /*tokens=*/true);
+    if (q.request_reuse) {
         for (const PromptSegment& m : options.segments) {
-            impl_->request_segments.push_back({static_cast<int32_t>(m.begin), static_cast<int32_t>(m.end)});
+            q.request_segments.push_back({static_cast<int32_t>(m.begin), static_cast<int32_t>(m.end)});
         }
     }
     const bool structured = options.grammar.has_value() || static_cast<bool>(options.continuation);
-    return generate_locked(prompt, params, on_token, nullptr, nullptr, structured ? &options : nullptr);
+    return generate(q, prompt, params, on_token, nullptr, nullptr, structured ? &options : nullptr);
 }
 
-Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
-                                                const TokenCallback& on_token, const std::string_view* text,
-                                                const ForceCallback* force, const GenerateOptions* options) {
+// A generation on sequence q, its call held. Alone (no call on another
+// sequence), each pass runs as a single conversation's always did, under a
+// Hold of the model: the same passes, speculative steps, pacing per token.
+// With other sequences in a call, each pass is a request the scheduler runs
+// together with theirs (Impl::submit), one token per step, no drafts; the
+// sampling, the grammar, the callbacks and the bookkeeping stay here, on
+// the caller's thread. A run may switch between the two at any pass: either
+// way a pass gives each of its tokens the same bits, so the output does not
+// depend on when it switched.
+Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> prompt, const SamplingParams& params,
+                                               const TokenCallback& on_token, const std::string_view* text,
+                                               const ForceCallback* force, const GenerateOptions* options) {
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
     const auto t_start = Clock::now();
-    Impl& s = *impl_;
-    s.cancel.store(false, std::memory_order_relaxed);
+    Impl& s = *this;
+    q.cancel.store(false, std::memory_order_relaxed);
     const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
+    // Forgets q's context after a failed pass (its states may be partly advanced).
+    auto fail = [&](Status status) {
+        const Hold hold(s, q);
+        s.clear_context(q);
+        return status;
+    };
     // The last prompt token seeds the decode loop, so it is never reused.
-    const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1, s.request_reuse);
-    if (s.speculative) s.speculative->reset_stats();
-    s.power->reset_pacing();
+    size_t reused = 0;
     {
-        // The caller decodes too, and may be a different OS thread each run
-        // (a Dart isolate moves between threads).
-        std::vector<int32_t> decode_threads = s.pool->worker_thread_ids();
-        decode_threads.push_back(ThreadPool::current_thread_id());
-        s.power->set_hint_threads(std::move(decode_threads));
+        const Hold hold(s, q);
+        reused = s.reuse_prefix(q, prompt, prompt.size() - 1, q.request_reuse);
+    }
+    if (s.alone()) {  // a new run starts its pacing (another sequence's run keeps it going otherwise)
+        const std::lock_guard<std::mutex> pace(s.pace_mutex);
+        s.power->reset_pacing();
     }
     Sampler sampler(params);
     GenerationStats stats;
@@ -2857,36 +3549,68 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     s.apply_policy(prefill_policy);
     const Route prefill_route = prefill_policy.throttled ? s.throttled_route() : s.normal_route();
     const ForwardHooks prefill_hooks = s.hooks(prefill_policy, false);
-    const auto chunk = static_cast<size_t>(s.prefill_chunk());
-    // Segment reuse (a request that marked segments): stored segments after
-    // the exact prefix, processing resumes after the last one reused.
-    first_uncached = s.reuse_request_segments(prompt, first_uncached, prompt.size() - 1, prefill_route,
-                                              static_cast<int32_t>(chunk), &s.cancel, &stats);
+    {
+        // Segment reuse (a request that marked segments): stored segments
+        // after the exact prefix, processing resumes after the last one reused.
+        const Hold hold(s, q);
+        first_uncached = s.reuse_request_segments(q, prompt, first_uncached, prompt.size() - 1, prefill_route,
+                                                  s.prefill_chunk(), &q.cancel, &stats);
+    }
     const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1).subspan(first_uncached);
-    for (size_t i = 0; i < prefix.size(); i += chunk) {
-        if (s.cancel.load(std::memory_order_relaxed)) {
+    const bool hybrid = s.target->config().hybrid();
+    for (size_t i = 0; i < prefix.size();) {
+        if (q.cancel.load(std::memory_order_relaxed)) {
             stats.cancelled = true;
             return stats;
         }
+        const bool alone = s.alone();
+        const size_t chunk = static_cast<size_t>(alone ? s.prefill_chunk() : s.shared_chunk());
         const auto part = prefix.subspan(i, std::min(chunk, prefix.size() - i));
-        if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &prefill_hooks); !r) {
-            s.clear_context();
-            return r.status();
-        }
-        if (s.draft) {
-            if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
-                s.clear_context();
+        if (alone) {
+            const Hold hold(s, q);
+            // A background sequence's pass may be stopped for foreground
+            // work (between blocks): a hybrid one returns to a snapshot.
+            const bool stoppable = !q.foreground();
+            if (stoppable && hybrid) s.target->snapshot_state();
+            const Stoppable stop(s, q, stoppable);
+            ForwardHooks hooks = prefill_hooks;
+            if (stoppable) hooks.cancel = &s.preempt;
+            if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &hooks); !r) {
+                if (r.status().code() == ErrorCode::Cancelled && stoppable && s.target->abandon_pass().is_ok()) {
+                    s.count_stop();
+                    continue;  // stopped: the same tokens again, now with the others
+                }
+                s.clear_context(q);
                 return r.status();
             }
+            if (s.draft) {
+                if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
+                    s.clear_context(q);
+                    return r.status();
+                }
+            } else {
+                q.context.insert(q.context.end(), part.begin(), part.end());
+            }
         } else {
-            s.context.insert(s.context.end(), part.begin(), part.end());
+            if (!q.foreground() && hybrid) {  // its pass may be stopped: the state to return to
+                const Hold hold(s, q);
+                s.target->snapshot_state();
+            }
+            PassRequest r;
+            r.tokens = part;
+            r.logits = Transformer::Logits::None;
+            r.kind = PassKind::Prompt;
+            if (Status st = s.submit(q, r); !st.is_ok()) return fail(st);
+            q.context.insert(q.context.end(), part.begin(), part.end());
         }
+        i += part.size();
     }
     stats.prefill_ms = ms_since(t_prefill);
     // The next chat turn re-sends this prompt: keep its recurrent state.
     if (!s.draft) {
+        const Hold hold(s, q);
         s.target->snapshot_state(/*pin=*/true);
-        s.last_prompt_end = s.context.size();
+        q.last_prompt_end = q.context.size();
     }
 
     const auto t_decode = Clock::now();
@@ -2898,12 +3622,18 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     // The next token when a forced pass already sampled it from its last row:
     // the next step emits it instead of running a pass of its own.
     std::optional<int32_t> presampled;
+    // Whether the tokens about to be emitted came from a shared pass, which
+    // the scheduler paced already (once per pass), and for how long.
+    bool paced_by_pass = false;
+    double pass_paced_ms = 0.0;
     bool stop = false;
     std::chrono::microseconds idle{0};
 
     // Constrained decoding (GenerateOptions). `span` follows the output from
     // where its grammar started (`whole`: the start of the output); its state
-    // set is the table's state id.
+    // set is the table's state id. Tables and the trie are the engine's
+    // shared caches: this run keeps the ones it uses alive (trim_memory()
+    // may drop the caches meanwhile), and uses them under grammar_mutex.
     const ContinuationCallback* continuation =
         options != nullptr && options->continuation ? &options->continuation : nullptr;
     struct Span {
@@ -2911,6 +3641,12 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         int32_t state;
     };
     std::optional<Span> span;
+    std::vector<std::shared_ptr<grammar::StateTable>> tables_held;
+    std::shared_ptr<const grammar::VocabTrie> trie_held;
+    auto trie = [&]() -> const grammar::VocabTrie& {  // grammar_mutex held
+        if (!trie_held) trie_held = s.trie();
+        return *trie_held;
+    };
     const bool whole = options != nullptr && options->grammar.has_value();
     bool span_started = false;  // set by structure() when it opened a span
     bool output_done = false;   // the whole output's grammar matched completely
@@ -2922,13 +3658,17 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     };
     std::optional<Heal> heal;
     std::vector<float> masked;
-    auto start_span = [&](const Grammar& g) {
+    auto start_span = [&](const Grammar& g) {  // grammar_mutex held
         span.reset();
-        grammar::StateTable& table = s.grammar_table(g);
-        span = Span{&table, table.initial()};
+        std::shared_ptr<grammar::StateTable> table = s.grammar_table(g);
+        if (std::find(tables_held.begin(), tables_held.end(), table) == tables_held.end()) tables_held.push_back(table);
+        span = Span{table.get(), table->initial()};
         span_started = true;
     };
-    if (whole) start_span(*options->grammar);
+    if (whole) {
+        const std::lock_guard<std::mutex> g(s.grammar_mutex);
+        start_span(*options->grammar);
+    }
     // What the output must continue with here: the active span's forced text
     // and, each time a span completes, the callback's next continuation. The
     // guard bounds a callback that keeps opening spans that complete at once.
@@ -2939,6 +3679,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         heal.reset();
         for (int guard = 0; guard < 64; ++guard) {
             if (span) {
+                const std::lock_guard<std::mutex> g(s.grammar_mutex);
                 const grammar::StateTable& t = *span->table;
                 if (t.accepting(span->state) && !t.extendable(span->state)) {
                     span.reset();
@@ -2962,6 +3703,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             Continuation c = (*continuation)(text_so_far);
             out += c.text;
             if (!c.grammar) break;
+            const std::lock_guard<std::mutex> g(s.grammar_mutex);
             start_span(*c.grammar);
         }
         stats.grammar_ms += ms_since(t0);
@@ -2980,8 +3722,11 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         // when they are not there or every allowed token counts (top_k 0).
         const size_t k = sampler.greedy() ? 1 : params.top_k > 0 ? static_cast<size_t>(params.top_k) : 0;
         size_t allowed = k;
-        if (k == 0 || !span->table->keep_top_allowed(span->state, *s.tokenizer, s.trie(), masked, k)) {
-            allowed = span->table->apply_mask(span->state, s.trie(), masked);
+        {
+            const std::lock_guard<std::mutex> g(s.grammar_mutex);
+            if (k == 0 || !span->table->keep_top_allowed(span->state, *s.tokenizer, trie(), masked, k)) {
+                allowed = span->table->apply_mask(span->state, trie(), masked);
+            }
         }
         stats.grammar_ms += ms_since(t0);
         if (allowed == 0) {
@@ -3030,9 +3775,10 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             // span's states cover (text a callback forced before it has none).
             if (!tail.empty() && heal->offset <= forced.size() && tail.size() <= forced.size() - heal->offset) {
                 const size_t keep = forced.size() - tail.size();
+                const std::lock_guard<std::mutex> g(s.grammar_mutex);
                 const int32_t before = span->table->advance(
                     heal->state, std::string_view(forced).substr(heal->offset, keep - heal->offset));
-                if (before >= 0 && span->table->extends(before, tail, s.trie())) {
+                if (before >= 0 && span->table->extends(before, tail, trie())) {
                     forced_tokens->pop_back();
                     forced.resize(keep);
                     span->state = before;
@@ -3044,38 +3790,60 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         const bool sample_next = (s.speculative != nullptr || !s.decode_only_hooks()) && !output_done;
         std::vector<int32_t> batch{last};
         batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - (sample_next ? 0 : 1));
-        // Speculative steps run without hooks; the experimental ones
-        // apply to plain decoding only.
-        const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, false);
-        // Forced tokens are never rolled back: no recurrent-state
-        // checkpoints (the next speculative step turns them back on).
-        if (s.speculative) s.target->set_checkpointing(false);
         const auto t_forced = Clock::now();
-        auto logits = s.target->forward(batch, sample_next ? Transformer::Logits::Last : Transformer::Logits::None,
-                                        route, *s.pool, &hooks);
-        if (!logits) {
-            s.clear_context();
-            return logits.status();
-        }
-        ++stats.decode_passes;
-        if (sample_next) {
-            if (policy.throttled) ++stats.thermal_reroutes;
-            if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
-            if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
-            auto token = sample_next_token(*logits);
-            if (!token) {
-                s.clear_context();
-                return token.status();
+        if (s.alone()) {
+            const Hold hold(s, q);
+            // Speculative steps run without hooks; the experimental ones
+            // apply to plain decoding only.
+            const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, false);
+            // Forced tokens are never rolled back: no recurrent-state
+            // checkpoints (the next speculative step turns them back on).
+            if (s.speculative) s.target->set_checkpointing(false);
+            auto logits = s.target->forward(batch, sample_next ? Transformer::Logits::Last : Transformer::Logits::None,
+                                            route, *s.pool, &hooks);
+            if (!logits) {
+                s.clear_context(q);
+                return logits.status();
             }
-            presampled = *token;
-        }
-        if (s.draft) {  // the draft model reads the same tokens, so both caches stay aligned
-            if (auto r = s.draft->forward(batch, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
-                s.clear_context();
-                return r.status();
+            ++stats.decode_passes;
+            if (sample_next) {
+                if (policy.throttled) ++stats.thermal_reroutes;
+                if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+                if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
+                auto token = sample_next_token(*logits);
+                if (!token) {
+                    s.clear_context(q);
+                    return token.status();
+                }
+                presampled = *token;
             }
+            if (s.draft) {  // the draft model reads the same tokens, so both caches stay aligned
+                if (auto r = s.draft->forward(batch, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
+                    s.clear_context(q);
+                    return r.status();
+                }
+            } else {
+                q.context.insert(q.context.end(), batch.begin(), batch.end());
+            }
+            paced_by_pass = false;
         } else {
-            s.context.insert(s.context.end(), batch.begin(), batch.end());
+            PassRequest r;
+            r.tokens = batch;
+            r.logits = sample_next ? Transformer::Logits::Last : Transformer::Logits::None;
+            r.kind = PassKind::Forced;
+            if (Status st = s.submit(q, r); !st.is_ok()) return fail(st);
+            ++stats.decode_passes;
+            q.context.insert(q.context.end(), batch.begin(), batch.end());
+            if (sample_next) {
+                if (r.throttled) ++stats.thermal_reroutes;
+                if (r.head_pruned) ++stats.head_pruned_steps;
+                if (r.sparse_ffn) ++stats.sparse_ffn_steps;
+                auto token = sample_next_token(r.rows);
+                if (!token) return fail(token.status());
+                presampled = *token;
+            }
+            paced_by_pass = true;
+            pass_paced_ms = r.paced_ms;
         }
         stats.forced_ms += ms_since(t_forced);
         last = forced_tokens->back();
@@ -3104,7 +3872,7 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
     }
 
     while (!stop) {
-        if (s.cancel.load(std::memory_order_relaxed)) {
+        if (q.cancel.load(std::memory_order_relaxed)) {
             stats.cancelled = true;
             break;
         }
@@ -3116,61 +3884,85 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         if (presampled) {
             next.push_back(*presampled);
             presampled.reset();
-        } else if (s.speculative && !span) {
-            if (policy.throttled) ++stats.thermal_reroutes;
-            auto r = s.speculative->step(last, s.context, sampler, route, s.draft_route(), *s.pool);
-            if (!r) {
-                s.clear_context();
-                return r.status();
-            }
-            ++stats.decode_passes;
-            next = std::move(r).value();
-            if (!s.draft) {  // the target now caches `last` and every returned token but the final one
-                s.context.push_back(last);
-                s.context.insert(s.context.end(), next.begin(), next.end() - 1);
-            }
-        } else {
-            // A plain step; also with speculative decoding while a grammar
-            // constrains the output (one token at a time, no hooks, no
-            // rollback checkpoints, the draft model fed the same token).
-            if (policy.throttled) ++stats.thermal_reroutes;
-            const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, true);
-            if (s.speculative) s.target->set_checkpointing(false);
-            auto logits =
-                s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
-            if (!logits) {
-                s.clear_context();
-                return logits.status();
-            }
-            ++stats.decode_passes;
-            if (s.draft) {
-                if (auto r = s.draft->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::None,
-                                              s.draft_route(), *s.pool);
-                    !r) {
-                    s.clear_context();
+        } else if (s.alone()) {
+            paced_by_pass = false;
+            const Hold hold(s, q);
+            if (s.speculative && !span) {
+                if (policy.throttled) ++stats.thermal_reroutes;
+                const int32_t proposed = s.speculative->proposed(), accepted = s.speculative->accepted();
+                auto r = s.speculative->step(last, q.context, sampler, route, s.draft_route(), *s.pool);
+                stats.draft_tokens_proposed += s.speculative->proposed() - proposed;
+                stats.draft_tokens_accepted += s.speculative->accepted() - accepted;
+                if (!r) {
+                    s.clear_context(q);
                     return r.status();
                 }
+                ++stats.decode_passes;
+                next = std::move(r).value();
+                if (!s.draft) {  // the target now caches `last` and every returned token but the final one
+                    q.context.push_back(last);
+                    q.context.insert(q.context.end(), next.begin(), next.end() - 1);
+                }
             } else {
-                s.context.push_back(last);
-            }
-            if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
-            stats.ffn_blocks_skipped += s.target->last_ffn_skips();
-            if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
-            if (const int32_t exit_layer = s.target->last_exit_layer(); exit_layer >= 0) {
-                ++stats.early_exits;
-                stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - exit_layer;
-            }
-            if (span) {
+                // A plain step; also with speculative decoding while a grammar
+                // constrains the output (one token at a time, no hooks, no
+                // rollback checkpoints, the draft model fed the same token).
+                if (policy.throttled) ++stats.thermal_reroutes;
+                const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, true);
+                if (s.speculative) s.target->set_checkpointing(false);
+                auto logits = s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route,
+                                                *s.pool, &hooks);
+                if (!logits) {
+                    s.clear_context(q);
+                    return logits.status();
+                }
+                ++stats.decode_passes;
+                if (s.draft) {
+                    if (auto r = s.draft->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::None,
+                                                  s.draft_route(), *s.pool);
+                        !r) {
+                        s.clear_context(q);
+                        return r.status();
+                    }
+                } else {
+                    q.context.push_back(last);
+                }
+                if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+                stats.ffn_blocks_skipped += s.target->last_ffn_skips();
+                if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
+                if (const int32_t exit_layer = s.target->last_exit_layer(); exit_layer >= 0) {
+                    ++stats.early_exits;
+                    stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - exit_layer;
+                }
                 auto token = sample_next_token(*logits);
                 if (!token) {
-                    s.clear_context();
+                    s.clear_context(q);
                     return token.status();
                 }
                 next.push_back(*token);
-            } else {
-                sampler.probabilities(*logits, probs);
-                next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
             }
+        } else {
+            // With other sequences: a plain step in a pass shared with theirs.
+            PassRequest r;
+            r.tokens = std::span<const int32_t>(&last, 1);
+            r.logits = Transformer::Logits::Last;
+            r.kind = PassKind::Decode;
+            if (Status st = s.submit(q, r); !st.is_ok()) return fail(st);
+            ++stats.decode_passes;
+            q.context.push_back(last);
+            if (r.throttled) ++stats.thermal_reroutes;
+            if (r.head_pruned) ++stats.head_pruned_steps;
+            if (r.sparse_ffn) ++stats.sparse_ffn_steps;
+            stats.ffn_blocks_skipped += r.ffn_skips;
+            if (r.exit_layer >= 0) {
+                ++stats.early_exits;
+                stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - r.exit_layer;
+            }
+            auto token = sample_next_token(r.rows);
+            if (!token) return fail(token.status());
+            next.push_back(*token);
+            paced_by_pass = true;
+            pass_paced_ms = r.paced_ms;
         }
 
         if (stats.ttft_ms == 0.0) {
@@ -3193,18 +3985,23 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                 break;
             }
             // Duty cycling: hold this token until its slot at the target
-            // rate; the SoC idles in between instead of racing ahead.
-            idle += s.power->pace_token();
+            // rate; the SoC idles in between instead of racing ahead. A
+            // token of a shared pass waited for its pass's slot already.
+            if (paced_by_pass) {
+                idle += std::chrono::microseconds(static_cast<int64_t>(pass_paced_ms * 1000.0));
+                paced_by_pass = false;
+            } else {
+                const std::lock_guard<std::mutex> pace(s.pace_mutex);
+                idle += s.power->pace_token();
+            }
             ++stats.generated_tokens;
             s.tokens_generated.fetch_add(1, std::memory_order_relaxed);
             pending_utf8 += s.tokenizer->piece(token);
             if (span) {  // the mask allowed only tokens the grammar accepts here
                 const auto t0 = Clock::now();
+                const std::lock_guard<std::mutex> g(s.grammar_mutex);
                 span->state = span->table->advance(span->state, s.tokenizer->piece(token));
-                if (span->state < 0) {
-                    s.clear_context();
-                    return Status(ErrorCode::Internal, "grammar: a sampled token left the grammar");
-                }
+                if (span->state < 0) return fail(Status(ErrorCode::Internal, "grammar: a sampled token left the grammar"));
                 span->state = span->table->compact(span->state);
                 stats.grammar_ms += ms_since(t0);
             }
@@ -3219,8 +4016,8 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                     break;
                 }
             }
-            if (stats.generated_tokens >= params.max_tokens || s.cancel.load(std::memory_order_relaxed)) {
-                stats.cancelled = s.cancel.load(std::memory_order_relaxed);
+            if (stats.generated_tokens >= params.max_tokens || q.cancel.load(std::memory_order_relaxed)) {
+                stats.cancelled = q.cancel.load(std::memory_order_relaxed);
                 stop = true;
                 kept = i + 1;
                 break;
@@ -3256,14 +4053,15 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
             // stayed in it, and their text in the text it remembers, so the
             // next turn's prompt matched an end token twice and diverged.
             const auto dropped = static_cast<int32_t>(next.size() - kept);
+            const Hold hold(s, q);
             const int32_t keep = s.target->n_past() - dropped;
             Status rolled_back = s.target->truncate(keep);
             if (rolled_back.is_ok() && s.draft) rolled_back = s.draft->truncate(keep);
             if (!rolled_back.is_ok()) {
-                s.clear_context();
+                s.clear_context(q);
                 return rolled_back;
             }
-            if (!s.draft) s.context.resize(s.context.size() - static_cast<size_t>(dropped));
+            if (!s.draft) q.context.resize(q.context.size() - static_cast<size_t>(dropped));
             next.resize(kept);
         }
         last = next.back();
@@ -3272,6 +4070,10 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         if (output_done) stop = true;
     }
     if (!pending_utf8.empty() && on_token) on_token(pending_utf8, last);
+    {
+        const std::lock_guard<std::mutex> g(s.sched);
+        q.phase = Seq::Phase::Away;  // no more passes: a leader need not wait for this sequence
+    }
 
     stats.decode_ms = ms_since(t_decode);
     stats.tokens_per_second = stats.decode_ms > 0.0 ? stats.generated_tokens * 1000.0 / stats.decode_ms : 0.0;
@@ -3281,7 +4083,6 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
         stats.weight_stalls = static_cast<int32_t>(after.stalls - loader_before.stalls);
         stats.weight_wait_ms = after.consumer_wait_ms - loader_before.consumer_wait_ms;
     }
-    stats.kv_cache_bytes = s.target->kv_cache().bytes_in_use();
     if (const ExpertStore* store = s.target->expert_store()) {
         const ExpertStore::Stats after = store->stats();
         stats.expert_hits = static_cast<int32_t>(after.hits - experts_before.hits);
@@ -3304,13 +4105,101 @@ Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt,
                            phases.shared_expert - phases_before.shared_expert,
                            phases.dense_ffn - phases_before.dense_ffn,
                            phases.lm_head - phases_before.lm_head};
-    if (s.speculative) {
-        stats.draft_tokens_proposed = s.speculative->proposed();
-        stats.draft_tokens_accepted = s.speculative->accepted();
+    {
+        const Hold hold(s, q);
+        stats.kv_cache_bytes = s.target->kv_cache().bytes_in_use();
+        s.keep_request_segments(q);
     }
-    s.keep_request_segments();
-    if (text != nullptr && !s.draft) s.remember_text(prompt, *text);
+    if (text != nullptr && !s.draft) s.remember_text(q, prompt, *text);
     return stats;
+}
+
+// Engine::prefill on sequence q, its call held. Alone, each pass runs as a
+// single conversation's always did; with other sequences, as requests the
+// scheduler runs with theirs (passes of at most max_batch tokens but with
+// latent attention, see shared_chunk()).
+Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const PromptSegment> segments,
+                                bool add_bos) {
+    Impl& s = *this;
+    if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
+    LIYAB_RETURN_IF_ERROR(check_segments(segments, text.size(), text));
+    const Request request(s, q, segments, /*tokens=*/false);
+    auto tokens = q.request_reuse ? s.encode_segments(q, text, add_bos) : s.encode_continuation(q, text, add_bos);
+    if (!tokens) return tokens.status();
+    q.cancel_prefill.store(false, std::memory_order_relaxed);
+    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
+    const std::vector<int32_t>& t = tokens.value();
+    const PowerPolicy policy = s.power->policy();
+    s.apply_policy(policy);
+    const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
+    ForwardHooks hooks = s.hooks(policy, false);
+    // Interruptible within a pass (cancel_prefill() is checked between
+    // blocks): a pass of 1024 tokens of a streamed MoE runs for tens of
+    // seconds. The work done so far stays: a hybrid model's state is
+    // snapshotted before each pass, and an abandoned pass returns to it, so
+    // the next prompt continuing this text resumes there.
+    hooks.cancel = &q.cancel_prefill;
+    size_t reused = 0;
+    {
+        const Hold hold(s, q);
+        reused = s.reuse_prefix(q, t, t.size(), q.request_reuse);
+        // Segment reuse (marked segments): stored ones after the exact prefix;
+        // cancel_prefill() stops it between blocks, keeping that prefix.
+        reused = s.reuse_request_segments(q, t, reused, t.size(), route, s.prefill_chunk(), &q.cancel_prefill, nullptr);
+    }
+    if (q.cancel_prefill.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
+    const bool hybrid = s.target->config().hybrid();
+    for (size_t i = reused; i < t.size();) {
+        const bool alone = s.alone();
+        const size_t chunk = static_cast<size_t>(alone ? s.prefill_chunk() : s.shared_chunk());
+        const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
+        if (alone) {
+            const Hold hold(s, q);
+            if (hybrid) s.target->snapshot_state();
+            // A background sequence's pass may be stopped for foreground work
+            // too (Stoppable: cancel_prefill() sets the same flag then).
+            const bool stoppable = !q.foreground();
+            const Stoppable stop(s, q, stoppable);
+            ForwardHooks pass_hooks = hooks;
+            if (stoppable) pass_hooks.cancel = &s.preempt;
+            if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &pass_hooks); !r) {
+                if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {
+                    if (q.cancel_prefill.load(std::memory_order_relaxed)) {
+                        return Status(ErrorCode::Cancelled, "prefill cancelled");
+                    }
+                    s.count_stop();
+                    continue;  // stopped for foreground work: the same tokens again, now with the others
+                }
+                s.clear_context(q);
+                return r.status();
+            }
+        } else {
+            if (q.cancel_prefill.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
+            if (hybrid) {  // the state an abandoned pass returns to
+                const Hold hold(s, q);
+                s.target->snapshot_state();
+            }
+            PassRequest r;
+            r.tokens = part;
+            r.logits = Transformer::Logits::None;
+            r.kind = PassKind::Prefill;
+            if (Status st = s.submit(q, r); !st.is_ok()) {
+                if (st.code() == ErrorCode::Cancelled) return Status(ErrorCode::Cancelled, "prefill cancelled");
+                const Hold hold(s, q);
+                s.clear_context(q);
+                return st;
+            }
+        }
+        q.context.insert(q.context.end(), part.begin(), part.end());
+        i += part.size();
+    }
+    {
+        const Hold hold(s, q);
+        s.target->snapshot_state();  // the next prompt starts with this text
+        s.keep_request_segments(q);
+    }
+    s.remember_text(q, t, text);
+    return Status::ok();
 }
 
 bool Engine::has_chat_template() const noexcept { return impl_->chat_template.has_value(); }
@@ -3328,9 +4217,9 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
                                                       const EmbedOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     Pooling pooling = options.pooling;
     if (pooling == Pooling::Auto) {
@@ -3382,9 +4271,9 @@ Result<std::vector<float>> Engine::rerank(std::string_view query, std::span<cons
                                           const RerankOptions& options, PoolingStats* stats) {
     const auto t_start = Clock::now();
     if (stats != nullptr) *stats = PoolingStats{};
-    const Impl::Call call(*impl_);
-    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     Impl& s = *impl_;
+    const Impl::Call call(s, *s.main);
+    if (!call) return Status(ErrorCode::Busy, "a generation is already running on this engine");
     if (!s.pooling_error.is_ok()) return s.pooling_error;
     const std::string& tmpl = options.prompt_template.empty() ? s.pooling.rerank_template : options.prompt_template;
     if (tmpl.empty()) {

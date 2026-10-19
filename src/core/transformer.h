@@ -981,6 +981,7 @@ private:
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
     MemoryPlan memory_plan_;
+    size_t extra_context_bytes_ = 0;  // TransformerOptions::extra_contexts' recurrent states, set aside at load
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
     int32_t rollback_window_ = 0;
