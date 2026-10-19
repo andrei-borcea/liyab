@@ -254,7 +254,8 @@ LIYAB_C_API liyab_status liyab_engine_generate_tokens(liyab_engine* engine, cons
 LIYAB_C_API int32_t liyab_engine_tokenize(const liyab_engine* engine, const char* text, int32_t add_bos, int32_t* out,
                                           int32_t capacity);
 
-/* Thread-safe; stops an in-flight generation at the next token boundary. */
+/* Thread-safe; stops an in-flight generation at the next token boundary (on
+ * the engine's default sequence: liyab_sequence_cancel for another one). */
 LIYAB_C_API void liyab_engine_cancel(liyab_engine* engine);
 
 LIYAB_C_API liyab_status liyab_engine_set_power_profile(liyab_engine* engine, liyab_power_profile profile);

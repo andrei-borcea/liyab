@@ -1363,6 +1363,19 @@ auto stats = engine.value()->generate(prompt, params, on_piece, options);
 // stats->segment_reused_tokens, segment_recomputed_tokens; engine.value()->segment_reuse() says why it is off
 ```
 
+Several conversations at once (`max_sequences`): each on a sequence of its own, called from a thread of its own;
+the engine decodes them together, and each reply is what it would be alone.
+
+```cpp
+config.max_sequences = 2;  // the default sequence (the engine's own calls) and one more
+auto engine = liyab::Engine::create(config);
+auto agent = engine.value()->open_sequence(liyab::SequencePriority::Background);  // yields to the user's turn
+std::thread background([&] { agent.value()->generate(agent_prompt, params, on_agent_piece); });
+engine.value()->generate(chat_prompt, params, on_chat_piece);  // the user's, foreground
+background.join();
+agent.value().reset();  // closed: its context set aside in the prefix cache, its memory freed
+```
+
 `Engine::cancel()` is thread-safe and stops at the next token. `prefill(text)` processes a prefix ahead of time,
 such as a system prompt right after loading. `reset_context()` forgets everything. The public headers in
 `include/liyab/` document each function's contract: preconditions, ownership, thread safety and error cases.
@@ -2502,33 +2515,37 @@ Implemented features are described above. These are next, in order:
 3. **CPU and GPU in parallel.** A per-operation split calibrated on the device, so both work on every token.
 4. **Speculative decoding with draft-guided expert prefetch.** The draft's routing tells the store which experts the
    target will need. Then verification of the suffix drafts' whole tree in one pass, with tree attention masks.
-5. **LoRA adapters, next.** [Adapters](#lora-adapters) for dense and MoE layers switched per request are in place.
+5. **Several sequences, next.** [Shared passes](#context-memory-and-serving) are in place. Next: multi-row kernels
+   for F16 / BF16 weights, which today compute each row's dot product on its own (a shared pass gains little
+   there); speculative drafts inside shared passes (each sequence's tree as a segment of the pass); one page pool
+   for every sequence's KV cache, so a sequence's pages go back to the others when its context shrinks.
+6. **LoRA adapters, next.** [Adapters](#lora-adapters) for dense and MoE layers switched per request are in place.
    Next: the update computed on the GPU next to the base product (today the CPU adds it after an accelerator's
    matmul), adapters of the token embeddings and of latent attention's per-head matrices, and a lower fixed cost per
    adapted matmul at low rank.
-6. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
+7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
    pass (a mask per input), which the GPU path needs most: a pass costs it ~35 ms of fixed work, against ~3 ms on
    the CPU.
-7. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
+8. **Two tiers.** A small model always loaded for the assistant sheet and tools, and the large one in a separate
    process with its own memory limit, called when the small one escalates.
-8. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
+9. **Smaller experts.** A [measured study](docs/research/cold-experts.md) chose an importance-weighted Q3_K tier
    (a format the engine already decodes): with half of each block's least used experts in it, `liyab-kl` measured
    KL 0.016 and 94.7% top-1 agreement; with all experts, 0.040 and 91.2%, 29% fewer bytes per expert. Next: Q3_K's
    decode cost on the phone, then the tier (a mixed file written once on the device). Binary factorization
    (LittleBit-style) and a non-uniform 3-bit codebook were measured and not chosen.
-9. **The agent.** Planned in this order:
+10. **The agent.** Planned in this order:
     * voice input (on-device speech recognition);
     * actions confirmed by the user (alarms, events, replies);
     * reliable message reading (persisted notification history, RCS);
     * local memory over your own data;
     * the screen content through a voice-interaction service.
-10. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
+11. **Platforms.** The iOS app, which finishes work in the background through a continued-processing task and shows
     it as a Live Activity (Dynamic Island, lock screen); the app on Linux and Windows (the same Flutter app and
     command bar as on macOS), which first needs the engine's [Windows port](#windows-x64) built and tested on
     Windows and the x86-64 kernels validated on native x86 machines, then AVX-VNNI / AVX-512 paths; NPU compute (QNN HTP,
     NeuroPilot); app localization.
-11. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
+12. **Energy.** Joules per token measured on battery, as a first-class benchmark next to tokens per second.
 
 ## Known limitations
 

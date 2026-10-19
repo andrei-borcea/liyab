@@ -719,7 +719,9 @@ public:
     // between blocks: every item's context goes back to where the pass
     // started (abandon_pass(); a hybrid context without a snapshot there
     // is reset, which the caller sees as n_past() 0). On any other failure
-    // the contexts keep their positions as before the pass.
+    // the contexts keep their positions as before the pass, but, as after a
+    // failed forward(), recurrent states may be partly advanced: callers
+    // reset the contexts (the engine forgets each sequence's).
     Status forward_batch(std::span<const BatchItem> items, const Route& route, ThreadPool& pool,
                          std::vector<std::span<const float>>& out, const ForwardHooks* hooks = nullptr);
     // Positions a parked context holds (n_past() of the live one).
