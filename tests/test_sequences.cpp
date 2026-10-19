@@ -1263,6 +1263,7 @@ TEST_CASE("C API: sequences open, generate together as alone, cancel and close")
     REQUIRE(liyab_engine_scheduler_stats(engine, &sched) == LIYAB_OK);
     CHECK(sched.open_sequences == 3 && sched.active_sequences == 0);
     CHECK(sched.shared_passes > 0);
+    CHECK(sched.pass_ms > 0.0 && sched.gather_ms >= 0.0);
     CHECK(liyab_sequence_prefill(a, "hello world", 1) == LIYAB_OK);
     CHECK(liyab_sequence_reset_context(a) == LIYAB_OK);
     CHECK(liyab_sequence_set_adapter(a, "missing", 1.0f) == LIYAB_ERR_INVALID_ARGUMENT);

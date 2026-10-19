@@ -10,19 +10,25 @@
 // Each sequence gets a task of its own (a long text to write, through the
 // model's chat template, thinking off where the template has the switch).
 // Its prompt is processed first (prefill() up to its last token, not
-// timed); then:
+// timed); then two runs:
 //   together  every sequence's generation starts at once, one thread each:
-//             the engine decodes them in shared passes; per-sequence tok/s is
-//             each one's decode rate, the total is every token over the wall
-//             time from the start to the last one's end;
-//   turns     the same generations one after another (each alone: the engine
+//             the engine decodes them in shared passes; "seq tok/s" is the
+//             median sequence's decode rate, "slowest" the slowest one's, and
+//             "together" every token over the wall time from the start to the
+//             last one's end;
+//   in turns  the same generations one after another (each alone: the engine
 //             runs them as a single conversation, drafts included with
-//             --lookup); the total is every token over the sum of their times.
-// Every together reply is checked against its turns reply (they must be the
-// same: greedy decoding, CPU backend). --repeat R prints the median of R runs.
-// Every run on a fresh engine of max(sequences) sequences (suffix drafts
-// keep earlier conversations: a run never drafts from an earlier one's
-// replies), unpaced (Performance profile), warmed up on an unrelated text.
+//             --lookup): every token over the sum of their times.
+// "gain" is together / in turns. A repeat runs both back to back, in
+// alternating order (on a busy host the speed drifts; the gain compares runs
+// that saw the same conditions); --repeat R prints the median of R repeats.
+// Every together reply is checked against its reply alone ("same": greedy
+// decoding, CPU backend). The last together run's scheduler counters follow:
+// passes shared, time in a pass, time a leader waited for sequences about to
+// submit. Every run on a fresh engine of max(sequences) sequences (suffix
+// drafts keep earlier conversations: a run never drafts from an earlier
+// one's replies), unpaced (Performance profile), warmed up on an unrelated
+// text.
 //
 // Uses only the public C++ API; built with the tests (LIYAB_BUILD_TESTS).
 #include <algorithm>
@@ -53,8 +59,8 @@ constexpr const char* kTasks[] = {
     "the evaporator, and why each one matters. Write at least ten paragraphs.",
     "Describe a full week of meals for a family of four: breakfast, lunch and dinner for each day, with the "
     "ingredients and how to cook each dish.",
-    "Write the history of a small mountain village over five centuries, generation by generation, with names, trades "
-    "and the events that changed it.",
+    "Write a long travel guide to a coastal town of your choice: its neighbourhoods, food, museums, walks and day "
+    "trips, in many paragraphs.",
 };
 constexpr const char* kWarmUp = "Hello! Say something short.";
 
@@ -208,60 +214,75 @@ int main(int argc, char** argv) {
     params.temperature = 0.0f;
     params.max_tokens = tokens;
     bool header = false;
-    double one = 0.0;
+    // The same generations one after another, each alone; returns every
+    // token over the sum of their times.
+    auto run_turns = [&](int k, std::vector<Run>& turns) -> double {
+        auto bench = make(k);
+        if (!bench) return -1.0;
+        if (!header) {
+            std::printf("%s\n%-4s %10s %10s %12s %12s %8s %6s   %s\n", description.c_str(), "seqs", "seq tok/s",
+                        "slowest", "together", "in turns", "gain", "same", "scheduler");
+            header = true;
+        }
+        Engine& engine = *bench->engine;
+        double ms = 0.0;
+        int64_t generated = 0;
+        for (int i = 0; i < k; ++i) {
+            engine.reset_context();
+            prepare(engine, nullptr, prompts[static_cast<size_t>(i)]);
+            const auto t0 = Clock::now();
+            turns[static_cast<size_t>(i)] = generate(engine, nullptr, prompts[static_cast<size_t>(i)], params);
+            ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            generated += turns[static_cast<size_t>(i)].stats.generated_tokens;
+        }
+        return generated * 1000.0 / ms;
+    };
+    // Every sequence at once, one thread each; returns every token over the
+    // wall time, and each sequence's run.
+    auto run_together = [&](int k, std::vector<Run>& runs, Engine::SchedulerStats& stats) -> double {
+        auto bench = make(k);
+        if (!bench) return -1.0;
+        Engine& shared = *bench->engine;
+        for (int i = 0; i < k; ++i) prepare(shared, bench->sequence(i), prompts[static_cast<size_t>(i)]);
+        std::atomic<int> ready{0};
+        std::vector<std::thread> threads;
+        const auto t0 = Clock::now();
+        for (int i = 0; i < k; ++i) {
+            threads.emplace_back([&, i] {
+                ready.fetch_add(1);
+                while (ready.load() < k) std::this_thread::yield();
+                runs[static_cast<size_t>(i)] = generate(shared, bench->sequence(i), prompts[static_cast<size_t>(i)], params);
+            });
+        }
+        for (std::thread& t : threads) t.join();
+        const double wall = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        int64_t generated = 0;
+        for (const Run& run : runs) generated += run.stats.generated_tokens;
+        stats = shared.scheduler_stats();
+        return generated * 1000.0 / wall;
+    };
     for (const int k : counts) {
-        std::vector<double> together_total, together_seq, together_min, turns_total;
+        std::vector<double> together_total, together_seq, together_min, turns_total, gains;
         bool same = true;
         Engine::SchedulerStats last{};
         for (int r = 0; r < repeat; ++r) {
-            // Turns: each alone, one after another (drafts when configured).
-            std::vector<Run> turns(static_cast<size_t>(k));
-            {
-                auto bench = make(k);
-                if (!bench) return 1;
-                if (!header) {
-                    std::printf("%s\n%-4s %-9s %10s %10s %12s %10s %8s\n", description.c_str(), "seqs", "mode",
-                                "seq tok/s", "slowest", "total tok/s", "x one", "same");
-                    header = true;
+            // A repeat's two runs back to back, in alternating order: on a busy
+            // host the speed drifts, and the gain compares runs that saw the
+            // same conditions.
+            std::vector<Run> turns(static_cast<size_t>(k)), runs(static_cast<size_t>(k));
+            double in_turns = 0.0, together = 0.0;
+            for (int half = 0; half < 2; ++half) {
+                if ((half == 0) == (r % 2 == 0)) {
+                    in_turns = run_turns(k, turns);
+                } else {
+                    together = run_together(k, runs, last);
                 }
-                Engine& engine = *bench->engine;
-                double turn_ms = 0.0;
-                int64_t turn_tokens = 0;
-                for (int i = 0; i < k; ++i) {
-                    engine.reset_context();
-                    prepare(engine, nullptr, prompts[static_cast<size_t>(i)]);
-                    const auto t0 = Clock::now();
-                    turns[static_cast<size_t>(i)] = generate(engine, nullptr, prompts[static_cast<size_t>(i)], params);
-                    turn_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                    turn_tokens += turns[static_cast<size_t>(i)].stats.generated_tokens;
-                }
-                turns_total.push_back(turn_tokens * 1000.0 / turn_ms);
             }
-            // Together: every sequence at once.
-            auto bench = make(k);
-            if (!bench) return 1;
-            Engine& shared = *bench->engine;
-            for (int i = 0; i < k; ++i) prepare(shared, bench->sequence(i), prompts[static_cast<size_t>(i)]);
-            std::vector<Run> runs(static_cast<size_t>(k));
-            std::atomic<int> ready{0};
-            std::vector<std::thread> threads;
-            const auto t0 = Clock::now();
-            for (int i = 0; i < k; ++i) {
-                threads.emplace_back([&, i] {
-                    ready.fetch_add(1);
-                    while (ready.load() < k) std::this_thread::yield();
-                    runs[static_cast<size_t>(i)] =
-                        generate(shared, bench->sequence(i), prompts[static_cast<size_t>(i)], params);
-                });
-            }
-            for (std::thread& t : threads) t.join();
-            const double wall = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            int64_t all = 0;
+            if (in_turns < 0.0 || together < 0.0) return 1;
             double slowest = 1e30;
             std::vector<double> rates;
             for (int i = 0; i < k; ++i) {
                 const Run& run = runs[static_cast<size_t>(i)];
-                all += run.stats.generated_tokens;
                 rates.push_back(run.stats.tokens_per_second);
                 slowest = std::min(slowest, run.stats.tokens_per_second);
                 if (!run.ok || run.reply != turns[static_cast<size_t>(i)].reply) {
@@ -269,19 +290,18 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "sequence %d: the reply together differs from its reply alone\n", i);
                 }
             }
-            together_total.push_back(all * 1000.0 / wall);
+            together_total.push_back(together);
+            turns_total.push_back(in_turns);
+            gains.push_back(together / in_turns);
             together_seq.push_back(median(rates));
             together_min.push_back(slowest);
-            last = shared.scheduler_stats();
         }
-        const double total = median(together_total);
-        if (k == 1) one = total;
-        std::printf("%-4d %-9s %10.1f %10.1f %12.1f %10.2f %8s   (%llu of %llu passes shared)\n", k, "together",
-                    median(together_seq), median(together_min), total, one > 0.0 ? total / one : 0.0,
-                    same ? "yes" : "NO", static_cast<unsigned long long>(last.shared_passes),
-                    static_cast<unsigned long long>(last.passes));
-        std::printf("%-4d %-9s %10s %10s %12.1f %10.2f\n", k, "turns", "-", "-", median(turns_total),
-                    one > 0.0 ? median(turns_total) / one : 0.0);
+        const double passes = static_cast<double>(std::max<uint64_t>(last.passes, 1));
+        std::printf("%-4d %10.1f %10.1f %12.1f %12.1f %8.2f %6s   %llu of %llu passes shared, %.2f ms a pass, %.2f ms "
+                    "gathering\n",
+                    k, median(together_seq), median(together_min), median(together_total), median(turns_total),
+                    median(gains), same ? "yes" : "NO", static_cast<unsigned long long>(last.shared_passes),
+                    static_cast<unsigned long long>(last.passes), last.pass_ms / passes, last.gather_ms / passes);
     }
     return 0;
 }

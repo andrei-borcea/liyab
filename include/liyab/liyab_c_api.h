@@ -681,6 +681,8 @@ typedef struct liyab_scheduler_stats {
     uint64_t preempted;        /* background passes stopped for foreground work (run again later) */
     int32_t open_sequences;    /* open now, the default one included */
     int32_t active_sequences;  /* in a call now */
+    double pass_ms;            /* time in those passes */
+    double gather_ms;          /* time leaders waited for sequences about to submit */
 } liyab_scheduler_stats;
 LIYAB_C_API liyab_status liyab_engine_scheduler_stats(const liyab_engine* engine, liyab_scheduler_stats* out);
 

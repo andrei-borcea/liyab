@@ -974,8 +974,8 @@ liyab_status liyab_engine_scheduler_stats(const liyab_engine* engine, liyab_sche
     return guarded([&]() -> liyab_status {
         if (engine == nullptr || out == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and out are required");
         const liyab::Engine::SchedulerStats s = engine->engine->scheduler_stats();
-        *out = liyab_scheduler_stats{s.passes, s.shared_passes, s.shared_rows, s.preempted, s.open_sequences,
-                                     s.active_sequences};
+        *out = liyab_scheduler_stats{s.passes,         s.shared_passes,    s.shared_rows, s.preempted,
+                                     s.open_sequences, s.active_sequences, s.pass_ms,     s.gather_ms};
         return LIYAB_OK;
     });
 }

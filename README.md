@@ -1423,7 +1423,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_embed` / `_rerank` | Pooling models: one vector per text; one relevance score per document of a query |
 | `liyab_engine_pooling` / `_embedding_size` | What the model pools (none, mean, last token, rank); the values per vector |
 | `liyab_engine_load_adapter` / `_unload_adapter` / `_set_adapter` / `_adapter_count` / `_adapter_info` | [LoRA adapters](#lora-adapters): load several next to the model, select the one later calls apply (and its scale), list them |
-| `liyab_sequence_open` / `_close` / `_generate` / `_prefill` / `_cancel` / `_cancel_prefill` / `_set_priority` / `_set_adapter` / `_reset_context` / `_id`; `liyab_engine_scheduler_stats` | [Several sequences](#context-memory-and-serving) (`max_sequences`): conversations of their own whose calls run at once from different threads, decoded together, each output what it gives alone; foreground or background priority; per-sequence cancellation and adapter; how passes were shared |
+| `liyab_sequence_open` / `_close` / `_generate` / `_prefill` / `_cancel` / `_cancel_prefill` / `_set_priority` / `_set_adapter` / `_reset_context` / `_id`; `liyab_engine_scheduler_stats` | [Several sequences](#context-memory-and-serving) (`max_sequences`): conversations of their own whose calls run at once from different threads, decoded together, each output what it gives alone; foreground or background priority; per-sequence cancellation and adapter; how passes were shared and the time in them |
 | `liyab_set_log_callback` / `liyab_log_buffer_enable` / `_take` | Logs to a callback, or to a buffer for polling UIs |
 
 `liyab_generation_stats` reports where time went:
@@ -2350,6 +2350,17 @@ Benchmarks and tools built with the tests:
   ```bash
   build/liyab-spec-bench -m Qwen3-0.6B-BF16.gguf --modes plain,lookup,suffix,suffix:8
   ```
+* `liyab-seq-bench`: [several sequences decoded together](#context-memory-and-serving). For 1 to 4 sequences, each
+  with a writing task of its own (prompt processed first, not timed), it runs their generations at once and the
+  same generations one after another, greedy and unpaced, on fresh engines, the two back to back in alternating
+  order so they share the host's load. It reports each sequence's tok/s together, the total together and in
+  turns, the gain (their ratio), whether every reply together equals its reply alone, and the scheduler's
+  counters (passes shared, time in a pass, time a leader waited for the others). `--lookup` turns on drafts from the text
+  itself (`lookup_drafts`), which a sequence uses while it runs alone, to compare sharing passes with drafting; `--repeat R` prints medians of R runs.
+
+  ```bash
+  build/liyab-seq-bench -m qwen2.5-0.5b-instruct-q8_0.gguf --sequences 1,2,3,4 --repeat 3 --threads 8
+  ```
 * `liyab-tok`: a model's tokenizer on its own, from the full GGUF or a vocabulary-only one. It prints the ids of a
   text, compares them with reference ids (first difference shown with the pieces around it, exit status 1), or
   measures encoding speed (`--bench N`). `tools/tokenizer_reference.py` writes the reference from the model's
@@ -2664,7 +2675,7 @@ src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*),
                         qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench,
+tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench, liyab-seq-bench,
                         liyab-embed, liyab-reuse, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
                         and pooling_reference.py (Hugging Face references), describe_model.py and
                         reference_trace.py (registry rows established from the Hugging Face implementation and

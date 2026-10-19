@@ -914,6 +914,8 @@ public:
         uint64_t preempted = 0;      // background passes stopped for foreground work (run again later)
         int32_t open_sequences = 0;  // open now, the default one included
         int32_t active_sequences = 0;  // in a call now
+        double pass_ms = 0.0;        // time in those passes
+        double gather_ms = 0.0;      // time leaders waited for sequences about to submit (see open_sequence)
     };
     [[nodiscard]] SchedulerStats scheduler_stats() const;
 

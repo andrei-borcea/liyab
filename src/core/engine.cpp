@@ -1845,7 +1845,9 @@ struct Engine::Impl {
             // A foreground sequence's exclusive work first (it waits for the model).
             sched_cv.wait(lock, [&] { return waiting_fg == 0; });
             // The sequences about to submit join this pass, for a while.
-            sched_cv.wait_until(lock, Clock::now() + straggler_wait(), [&] { return !any_working(); });
+            const auto gather = Clock::now();
+            sched_cv.wait_until(lock, gather + straggler_wait(), [&] { return !any_working(); });
+            sched_stats.gather_ms += ms_since(gather);
             std::vector<PassRequest*> chosen = choose();
             if (chosen.empty()) {
                 sched_cv.wait_for(lock, std::chrono::milliseconds(1));
@@ -1869,6 +1871,7 @@ struct Engine::Impl {
             }
             const double ms = ms_since(t0);
             lock.lock();
+            sched_stats.pass_ms += ms;
             if (!stopped) {
                 pass_ms = pass_ms == 0.0 ? ms : 0.8 * pass_ms + 0.2 * ms;
                 const bool small = std::all_of(chosen.begin(), chosen.end(), [](const PassRequest* r) { return r->small(); });
