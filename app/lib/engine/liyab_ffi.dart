@@ -32,6 +32,12 @@ abstract final class LiyabPowerProfile {
   static const lowPower = 2;
 }
 
+/// liyab_sequence_priority: the user's turn first; background work yields.
+abstract final class LiyabSequencePriority {
+  static const foreground = 0;
+  static const background = 1;
+}
+
 final class LiyabEngineConfig extends Struct {
   external Pointer<Utf8> modelPath;
   external Pointer<Utf8> draftModelPath;
@@ -110,6 +116,8 @@ final class LiyabEngineConfig extends Struct {
   external int adapterMemoryMb; // LoRA adapters: RAM at most for the loaded ones (MiB); 0: off
   @Int32()
   external int draftTree; // suffix drafts verified as a tree (nonzero, the default) or as their best branch
+  @Int32()
+  external int maxSequences; // sequences kept at once, the default one included (liyab_sequence_open); 1: one
 }
 
 /// liyab_adapter_info: one loaded LoRA adapter (liyab_engine_adapter_info).
@@ -451,11 +459,48 @@ final class LiyabLib {
         adapterCount = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
             'liyab_engine_adapter_count'),
         adapterInfo = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32, Pointer<LiyabAdapterInfo>),
-            int Function(Pointer<Void>, int, Pointer<LiyabAdapterInfo>)>('liyab_engine_adapter_info');
+            int Function(Pointer<Void>, int, Pointer<LiyabAdapterInfo>)>('liyab_engine_adapter_info'),
+        sequenceOpen = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32, Pointer<Pointer<Void>>),
+            int Function(Pointer<Void>, int, Pointer<Pointer<Void>>)>('liyab_sequence_open'),
+        sequenceClose =
+            lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('liyab_sequence_close'),
+        sequenceCancel =
+            lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('liyab_sequence_cancel'),
+        sequenceSetPriority = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32), int Function(Pointer<Void>, int)>(
+            'liyab_sequence_set_priority'),
+        sequenceSetAdapter = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>, Float),
+            int Function(Pointer<Void>, Pointer<Utf8>, double)>('liyab_sequence_set_adapter'),
+        sequenceGenerate = lib.lookupFunction<
+            Int32 Function(
+                Pointer<Void>,
+                Pointer<Utf8>,
+                Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+                Pointer<NativeFunction<LiyabForceCallbackNative>>,
+                Pointer<Void>,
+                Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+                Pointer<Void>,
+                Pointer<LiyabGenerationStats>,
+                Pointer<LiyabGrammarStats>),
+            int Function(
+                Pointer<Void>,
+                Pointer<Utf8>,
+                Pointer<LiyabSamplingParams>,
+                Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+                Pointer<NativeFunction<LiyabForceCallbackNative>>,
+                Pointer<Void>,
+                Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+                Pointer<Void>,
+                Pointer<LiyabGenerationStats>,
+                Pointer<LiyabGrammarStats>)>('liyab_sequence_generate');
 
-  /// libliyab.so from the APK on Android; linked into the app on iOS.
-  static final LiyabLib instance =
-      LiyabLib._(Platform.isAndroid ? DynamicLibrary.open('libliyab.so') : DynamicLibrary.process());
+  /// libliyab.so from the APK on Android; linked into the app on iOS and macOS; the library LIYAB_LIBRARY names
+  /// when set (tests on the host: build/libliyab.dylib).
+  static final LiyabLib instance = LiyabLib._(Platform.environment['LIYAB_LIBRARY'] != null
+      ? DynamicLibrary.open(Platform.environment['LIYAB_LIBRARY']!)
+      : Platform.isAndroid
+          ? DynamicLibrary.open('libliyab.so')
+          : DynamicLibrary.process());
 
   final Pointer<Utf8> Function() version;
   final Pointer<Utf8> Function() lastError;
@@ -535,6 +580,28 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>, double) setAdapter;
   final int Function(Pointer<Void>) adapterCount;
   final int Function(Pointer<Void>, int, Pointer<LiyabAdapterInfo>) adapterInfo;
+
+  /// Sequences (liyab_sequence_open and the rest): another conversation of the engine, with a context of its own,
+  /// whose generations run alongside the default sequence's (the engine decodes them together). Open (an opaque
+  /// liyab_sequence*, closed with sequenceClose before the engine is destroyed), cancel its generation (thread-safe),
+  /// its priority (LiyabSequencePriority) and adapter, and a generation on it: at most one of the force callback,
+  /// the grammar and the continuation callback.
+  final int Function(Pointer<Void>, int, Pointer<Pointer<Void>>) sequenceOpen;
+  final void Function(Pointer<Void>) sequenceClose;
+  final void Function(Pointer<Void>) sequenceCancel;
+  final int Function(Pointer<Void>, int) sequenceSetPriority;
+  final int Function(Pointer<Void>, Pointer<Utf8>, double) sequenceSetAdapter;
+  final int Function(
+      Pointer<Void>,
+      Pointer<Utf8>,
+      Pointer<LiyabSamplingParams>,
+      Pointer<NativeFunction<LiyabTokenCallbackNative>>,
+      Pointer<NativeFunction<LiyabForceCallbackNative>>,
+      Pointer<Void>,
+      Pointer<NativeFunction<LiyabContinuationCallbackNative>>,
+      Pointer<Void>,
+      Pointer<LiyabGenerationStats>,
+      Pointer<LiyabGrammarStats>) sequenceGenerate;
 
   /// Why grammar text does not compile (null when it does).
   String? grammarError(String text) => using((arena) {

@@ -24,6 +24,10 @@ struct liyab_grammar {
     liyab::Grammar grammar;
 };
 
+struct liyab_sequence {
+    std::unique_ptr<liyab::Engine::Sequence> sequence;
+};
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -237,6 +241,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->prefix_cache_lossy = d.prefix_cache_lossy ? 1 : 0;
     config->adapter_memory_mb = d.adapter_memory_mb;
     config->draft_tree = d.draft_tree ? 1 : 0;
+    config->max_sequences = d.max_sequences;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -302,6 +307,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.prefix_cache_lossy = config->prefix_cache_lossy != 0;
         c.adapter_memory_mb = config->adapter_memory_mb;
         c.draft_tree = config->draft_tree != 0;
+        c.max_sequences = std::max(config->max_sequences, 1);  // a zero-filled config: one sequence
 
         auto engine = liyab::Engine::create(c);
         if (!engine) return fail(engine.status());
@@ -850,6 +856,126 @@ liyab_status liyab_engine_adapter_info(const liyab_engine* engine, int32_t index
         out->resident = a.resident ? 1 : 0;
         out->active = a.active ? 1 : 0;
         out->scale = a.scale;
+        return LIYAB_OK;
+    });
+}
+
+liyab_status liyab_sequence_open(liyab_engine* engine, liyab_sequence_priority priority, liyab_sequence** out_sequence) {
+    return guarded([&]() -> liyab_status {
+        if (out_sequence == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "out_sequence is required");
+        *out_sequence = nullptr;
+        if (engine == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine is required");
+        if (priority != LIYAB_SEQUENCE_FOREGROUND && priority != LIYAB_SEQUENCE_BACKGROUND) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "priority out of range");
+        }
+        auto seq = engine->engine->open_sequence(static_cast<liyab::SequencePriority>(priority));
+        if (!seq) return fail(seq.status());
+        *out_sequence = new liyab_sequence{std::move(seq).value()};
+        return LIYAB_OK;
+    });
+}
+
+void liyab_sequence_close(liyab_sequence* sequence) {
+    // Closing waits for a call on it and sets its context aside; it does not throw out.
+    (void)guarded([&] {
+        delete sequence;
+        return LIYAB_OK;
+    });
+}
+
+int32_t liyab_sequence_id(const liyab_sequence* sequence) { return sequence != nullptr ? sequence->sequence->id() : -1; }
+
+liyab_status liyab_sequence_set_priority(liyab_sequence* sequence, liyab_sequence_priority priority) {
+    if (sequence == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "sequence is required");
+    if (priority != LIYAB_SEQUENCE_FOREGROUND && priority != LIYAB_SEQUENCE_BACKGROUND) {
+        return fail(LIYAB_ERR_INVALID_ARGUMENT, "priority out of range");
+    }
+    sequence->sequence->set_priority(static_cast<liyab::SequencePriority>(priority));
+    return LIYAB_OK;
+}
+
+void liyab_sequence_cancel(liyab_sequence* sequence) {
+    if (sequence != nullptr) sequence->sequence->cancel();
+}
+
+void liyab_sequence_cancel_prefill(liyab_sequence* sequence) {
+    if (sequence != nullptr) sequence->sequence->cancel_prefill();
+}
+
+liyab_status liyab_sequence_generate(liyab_sequence* sequence, const char* prompt, const liyab_sampling_params* params,
+                                     liyab_token_callback callback, liyab_force_callback force,
+                                     const liyab_grammar* grammar, liyab_continuation_callback continuation,
+                                     void* user_data, liyab_generation_stats* stats,
+                                     liyab_grammar_stats* grammar_stats) {
+    return guarded([&]() -> liyab_status {
+        if (sequence == nullptr || prompt == nullptr) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "sequence and prompt are required");
+        }
+        if ((force != nullptr) + (grammar != nullptr) + (continuation != nullptr) > 1) {
+            return fail(LIYAB_ERR_INVALID_ARGUMENT, "set at most one of force, grammar and continuation");
+        }
+        liyab::Engine::Sequence& seq = *sequence->sequence;
+        liyab::Result<liyab::GenerationStats> result = liyab::GenerationStats{};
+        if (force != nullptr) {
+            const liyab::ForceCallback forced = [force, user_data](std::string_view generated) {
+                char out[512];
+                const size_t n = force(generated.data(), generated.size(), out, sizeof out, user_data);
+                return std::string(out, std::min(n, sizeof out));
+            };
+            result = seq.generate(prompt, to_cpp(params), wrap(callback, user_data), forced);
+        } else {
+            liyab::GenerateOptions options;
+            if (grammar != nullptr) options.grammar = grammar->grammar;
+            if (continuation != nullptr) {
+                options.continuation = [continuation, user_data](std::string_view generated) {
+                    char out[4096];  // as liyab_engine_generate_structured
+                    const liyab_grammar* next = nullptr;
+                    const size_t n = continuation(generated.data(), generated.size(), out, sizeof out, &next, user_data);
+                    liyab::Continuation c;
+                    c.text.assign(out, std::min(n, sizeof out));
+                    if (next != nullptr) c.grammar = next->grammar;
+                    return c;
+                };
+            }
+            result = seq.generate(prompt, to_cpp(params), wrap(callback, user_data), options);
+        }
+        if (result && grammar_stats != nullptr) {
+            *grammar_stats = liyab_grammar_stats{result->constrained_tokens, result->grammar_ms};
+        }
+        return finish_generation(result, stats);
+    });
+}
+
+liyab_status liyab_sequence_prefill(liyab_sequence* sequence, const char* text, int32_t add_bos) {
+    return guarded([&]() -> liyab_status {
+        if (sequence == nullptr || text == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "sequence and text are required");
+        const liyab::Status s = sequence->sequence->prefill(text, add_bos != 0);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+liyab_status liyab_sequence_reset_context(liyab_sequence* sequence) {
+    return guarded([&]() -> liyab_status {
+        if (sequence == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "sequence is required");
+        sequence->sequence->reset_context();
+        return LIYAB_OK;
+    });
+}
+
+liyab_status liyab_sequence_set_adapter(liyab_sequence* sequence, const char* name, float scale) {
+    return guarded([&]() -> liyab_status {
+        if (sequence == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "sequence is required");
+        const liyab::Status s = sequence->sequence->set_adapter(name == nullptr ? "" : name, scale);
+        return s.is_ok() ? LIYAB_OK : fail(s);
+    });
+}
+
+liyab_status liyab_engine_scheduler_stats(const liyab_engine* engine, liyab_scheduler_stats* out) {
+    return guarded([&]() -> liyab_status {
+        if (engine == nullptr || out == nullptr) return fail(LIYAB_ERR_INVALID_ARGUMENT, "engine and out are required");
+        const liyab::Engine::SchedulerStats s = engine->engine->scheduler_stats();
+        *out = liyab_scheduler_stats{s.passes, s.shared_passes, s.shared_rows, s.preempted, s.open_sequences,
+                                     s.active_sequences};
         return LIYAB_OK;
     });
 }

@@ -1092,4 +1092,96 @@ TEST_CASE("Engine sequences under one grammar at once: each output valid and its
     }
 }
 
+namespace {
+
+int32_t collect(const char* piece, size_t len, int32_t, void* user) {
+    static_cast<std::string*>(user)->append(piece, len);
+    return 1;
+}
+
+}  // namespace
+
+TEST_CASE("C API: sequences open, generate together as alone, cancel and close") {
+    const std::string& path = model_path("engine_llama", {});
+    liyab_engine_config config;
+    liyab_engine_config_default(&config);
+    CHECK(config.max_sequences == 1);
+    config.model_path = path.c_str();
+    config.backend = LIYAB_BACKEND_CPU;
+    config.power_profile = LIYAB_POWER_PERFORMANCE;
+    config.thermal_polling = 0;
+    config.n_threads = 4;
+    liyab_sampling_params params;
+    liyab_sampling_params_default(&params);
+    params.temperature = 0.0f;
+    params.max_tokens = 20;
+    const char* prompts[] = {"hello world", "world hello world", "hello"};
+    // Alone: one sequence, a fresh context each.
+    std::string alone[3];
+    {
+        liyab_engine* engine = nullptr;
+        REQUIRE(liyab_engine_create(&config, &engine) == LIYAB_OK);
+        liyab_sequence* seq = nullptr;
+        CHECK(liyab_sequence_open(engine, LIYAB_SEQUENCE_FOREGROUND, &seq) == LIYAB_ERR_UNSUPPORTED);
+        CHECK(seq == nullptr);
+        for (int i = 0; i < 3; ++i) {
+            REQUIRE(liyab_engine_reset_context(engine) == LIYAB_OK);
+            REQUIRE(liyab_engine_generate(engine, prompts[i], &params, collect, &alone[i], nullptr) == LIYAB_OK);
+        }
+        liyab_engine_destroy(engine);
+    }
+    config.max_sequences = 3;
+    liyab_engine* engine = nullptr;
+    REQUIRE(liyab_engine_create(&config, &engine) == LIYAB_OK);
+    liyab_sequence* a = nullptr;
+    liyab_sequence* b = nullptr;
+    REQUIRE(liyab_sequence_open(engine, LIYAB_SEQUENCE_FOREGROUND, &a) == LIYAB_OK);
+    REQUIRE(liyab_sequence_open(engine, LIYAB_SEQUENCE_BACKGROUND, &b) == LIYAB_OK);
+    liyab_sequence* c = nullptr;
+    CHECK(liyab_sequence_open(engine, LIYAB_SEQUENCE_FOREGROUND, &c) == LIYAB_ERR_BUSY);
+    CHECK(liyab_sequence_id(a) > 0 && liyab_sequence_id(b) > 0 && liyab_sequence_id(a) != liyab_sequence_id(b));
+    CHECK(liyab_sequence_set_priority(b, LIYAB_SEQUENCE_FOREGROUND) == LIYAB_OK);
+    liyab_grammar* grammar = nullptr;
+    REQUIRE(liyab_grammar_parse(R"(root ::= "x")", &grammar) == LIYAB_OK);
+    CHECK(liyab_sequence_generate(a, "hello", &params, collect, nullptr, grammar,
+                                  [](const char*, size_t, char*, size_t, const liyab_grammar**, void*) -> size_t { return 0; },
+                                  nullptr, nullptr, nullptr) == LIYAB_ERR_INVALID_ARGUMENT);
+    std::string out[3];
+    liyab_generation_stats stats[3] = {};
+    std::atomic<int32_t> ready{0};
+    std::vector<std::thread> threads;
+    liyab_sequence* seqs[3] = {nullptr, a, b};
+    for (int i = 0; i < 3; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1);
+            while (ready.load() < 3) std::this_thread::yield();
+            const liyab_status st =
+                seqs[i] == nullptr
+                    ? liyab_engine_generate(engine, prompts[i], &params, collect, &out[i], &stats[i])
+                    : liyab_sequence_generate(seqs[i], prompts[i], &params, collect, nullptr, nullptr, nullptr, &out[i],
+                                              &stats[i], nullptr);
+            CHECK(st == LIYAB_OK);
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    for (int i = 0; i < 3; ++i) CHECK(out[i] == alone[i]);
+    liyab_scheduler_stats sched;
+    REQUIRE(liyab_engine_scheduler_stats(engine, &sched) == LIYAB_OK);
+    CHECK(sched.open_sequences == 3 && sched.active_sequences == 0);
+    CHECK(sched.shared_passes > 0);
+    CHECK(liyab_sequence_prefill(a, "hello world", 1) == LIYAB_OK);
+    CHECK(liyab_sequence_reset_context(a) == LIYAB_OK);
+    CHECK(liyab_sequence_set_adapter(a, "missing", 1.0f) == LIYAB_ERR_INVALID_ARGUMENT);
+    CHECK(liyab_sequence_set_adapter(a, nullptr, 1.0f) == LIYAB_OK);
+    liyab_sequence_cancel(a);
+    liyab_sequence_cancel_prefill(a);
+    liyab_sequence_close(a);
+    liyab_sequence_close(b);
+    liyab_sequence_close(nullptr);
+    REQUIRE(liyab_engine_scheduler_stats(engine, &sched) == LIYAB_OK);
+    CHECK(sched.open_sequences == 1);
+    liyab_grammar_destroy(grammar);
+    liyab_engine_destroy(engine);
+}
+
 TEST_MAIN()

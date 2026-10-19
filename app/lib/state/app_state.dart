@@ -361,6 +361,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // The local API (lib/api/local_api.dart): this state is its backend.
   LocalApi? _api;
 
+  // The engine lane other apps' generations run on (LoadOptions.lanes), opened at load while the API is on.
+  static const _apiLane = 'api';
+
   /// Whether the local API is listening, and why not when it should be.
   bool get apiRunning => _api != null;
   String apiError = '';
@@ -425,8 +428,12 @@ class AppState extends ChangeNotifier implements ApiBackend {
   @override
   Generation generate(String prompt, SamplingOptions sampling,
       {String? grammar, Continuation Function(String generated)? structure, String adapter = ''}) {
-    _chatContext = false; // queued after anything the chat queued: the engine's context is this request's once it ran
-    final generation = engine.generate(prompt, sampling, grammar: grammar, structure: structure, adapter: adapter);
+    // On the API's lane, the chat's context stays the chat's. Without one (the API switched on after the model
+    // loaded), queued after anything the chat queued: the engine's context is this request's once it ran.
+    final lane = engine.hasLane(_apiLane);
+    if (!lane) _chatContext = false;
+    final generation =
+        engine.generate(prompt, sampling, grammar: grammar, structure: structure, adapter: adapter, lane: _apiLane);
     ++_apiGenerations;
     _updateWork();
     var ended = false;
@@ -557,6 +564,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
         cacheDir: '${(await getApplicationSupportDirectory()).path}/engine-cache',
         experimental: experimental.toJson(),
         adapters: await _adapterFiles(),
+        // With the local API on, other apps' requests get a sequence of their own: they run alongside the chat
+        // (the engine decodes both together) instead of replacing its context, and yield to it (background
+        // priority: the chat's steps go first). Its memory is set aside at load, so the switch counts from the
+        // next load.
+        lanes: device.apiEnabled ? const {_apiLane: LiyabSequencePriority.background} : const {},
       ));
       adapters = model.adapters;
       for (final MapEntry(key: name, value: why) in model.adapterErrors.entries) {

@@ -29,6 +29,7 @@ class LoadOptions {
     this.cacheDir,
     this.experimental = const {},
     this.adapters = const {},
+    this.lanes = const {},
   });
 
   final String modelPath;
@@ -57,6 +58,13 @@ class LoadOptions {
   /// engine refuses (another architecture, a matrix the model does not have) is reported in
   /// LoadedModel.adapterErrors; the model loads all the same. A generation selects one by name (generate).
   final Map<String, String> adapters;
+
+  /// Lanes besides the main one, by name: their priority (LiyabSequencePriority). Each is a sequence of the
+  /// engine (liyab_sequence_open: a context of its own) with a worker isolate of its own, so its generations run
+  /// alongside the main lane's, which the engine decodes together (generate's `lane`). Each costs what a sequence
+  /// does (EngineConfig::max_sequences): KV pages as it uses them, and on hybrid models its recurrent states and
+  /// snapshots, set aside from the expert cache at load. Empty: one sequence, as before.
+  final Map<String, int> lanes;
 }
 
 /// A LoRA adapter loaded next to the model (liyab_adapter_info).
@@ -258,6 +266,19 @@ class _Job {
   final bool background;
 }
 
+/// A lane (LoadOptions.lanes): a sequence of the engine and the worker isolate that runs its generations, one at a
+/// time, alongside the main worker's commands.
+class _Lane {
+  _Lane(this.name, this.commands, this.replies, this.isolate);
+  final String name;
+  final SendPort commands;
+  final ReceivePort replies;
+  final Isolate isolate;
+  int sequence = 0; // address of its liyab_sequence once open
+  final List<_Job> queue = [];
+  _Job? running;
+}
+
 class EngineService {
   EngineService._(this._commands, this._replies);
 
@@ -279,6 +300,10 @@ class EngineService {
   // waited for all of it.
   final List<_Job> _queue = [];
   _Job? _running;
+
+  // Lanes (LoadOptions.lanes): generations on a sequence of their own, queued per lane, running alongside the main
+  // worker's commands.
+  final Map<String, _Lane> _lanes = {};
 
   void _enqueue(_Job job) {
     _queue.add(job);
@@ -305,9 +330,85 @@ class EngineService {
 
   /// A reply that ends command `id` (its result, its error, or a generation's last event).
   void _finished(int id) {
-    if (_running?.id != id) return;
-    _running = null;
-    _pump();
+    if (_running?.id == id) {
+      _running = null;
+      _pump();
+      return;
+    }
+    for (final lane in _lanes.values) {
+      if (lane.running?.id != id) continue;
+      lane.running = null;
+      _pumpLane(lane);
+      return;
+    }
+  }
+
+  void _pumpLane(_Lane lane) {
+    if (lane.running != null || lane.queue.isEmpty) return;
+    final next = lane.queue.removeAt(0);
+    lane.running = next;
+    lane.commands.send(next.message);
+  }
+
+  /// Whether lane `name` is open: generate's `lane` runs there, else on the main lane.
+  bool hasLane(String name) => (_lanes[name]?.sequence ?? 0) != 0;
+
+  /// Opens the lanes of a loaded engine: a worker isolate each, which opens the engine's sequence.
+  Future<void> _openLanes(Map<String, int> lanes) async {
+    for (final MapEntry(key: name, value: priority) in lanes.entries) {
+      final replies = ReceivePort();
+      final ready = Completer<SendPort>();
+      final isolate = await Isolate.spawn(_laneWorker, replies.sendPort, debugName: 'liyab-lane-$name');
+      late final _Lane lane;
+      replies.listen((message) {
+        if (!ready.isCompleted) {
+          ready.complete(message as SendPort);
+          return;
+        }
+        _onReply(message as List<Object?>);
+      });
+      lane = _Lane(name, await ready.future, replies, isolate);
+      _lanes[name] = lane;
+      final id = _nextId++;
+      final opened = Completer<Object?>();
+      _pending[id] = opened.complete;
+      lane.running = _Job(id, const [], background: false);
+      lane.commands.send(['open', id, _engine, priority]);
+      final result = await opened.future;
+      if (result is EngineException || result is! int) {
+        await _closeLane(lane);
+        throw result is EngineException ? result : EngineException('lane $name not opened');
+      }
+      lane.sequence = result;
+    }
+  }
+
+  /// Closes every lane: its generation cancelled, its queued ones failed, its sequence closed, its isolate gone.
+  Future<void> _closeLanes() async {
+    for (final lane in _lanes.values.toList()) {
+      await _closeLane(lane);
+    }
+  }
+
+  Future<void> _closeLane(_Lane lane) async {
+    _lanes.remove(lane.name);
+    for (final job in lane.queue) {
+      _streams.remove(job.id)
+        ?..addError(EngineException('the model was unloaded'))
+        ..close();
+    }
+    lane.queue.clear();
+    if (lane.sequence != 0) {
+      LiyabLib.instance.sequenceCancel(Pointer<Void>.fromAddress(lane.sequence));
+      final id = _nextId++;
+      final closed = Completer<Object?>();
+      _pending[id] = closed.complete;
+      lane.commands.send(['close', id]); // after the generation running there, cancelled
+      await closed.future;
+      lane.sequence = 0;
+    }
+    lane.isolate.kill();
+    lane.replies.close();
   }
 
   bool get loaded => _engine != 0;
@@ -398,11 +499,13 @@ class EngineService {
 
   /// Loads a model, replacing the current one.
   Future<LoadedModel> load(LoadOptions o) async {
+    await _closeLanes(); // their sequences before the engine they belong to
     _engine = 0;
     final r = await _call<List<Object?>>(
         ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile,
-          o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir, o.adapters]);
+          o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir, o.adapters, 1 + o.lanes.length]);
     _engine = r[0] as int;
+    await _openLanes(o.lanes);
     final plan = r[4] as List<Object?>;
     return LoadedModel(
         description: r[1] as String,
@@ -442,6 +545,7 @@ class EngineService {
   Future<void> unloadAdapter(String name) => _call<Object?>(['unloadAdapter', name]);
 
   Future<void> unload() async {
+    await _closeLanes();
     _engine = 0;
     await _call<Object?>(['unload']);
   }
@@ -526,15 +630,28 @@ class EngineService {
   /// `adapter` names a LoRA adapter loaded with the model (LoadOptions.adapters, loadAdapter) that this generation
   /// applies, at `adapterScale` ('' : the base model). Every other command runs on the base model. The engine
   /// never continues a context under another adapter: switching sets it aside in its prefix cache.
+  ///
+  /// `lane` (LoadOptions.lanes) runs it on that lane's sequence, alongside the main lane's commands (the engine
+  /// decodes the two together); queued behind that lane's earlier generations only. An unknown or closed lane: the
+  /// main lane.
   Generation generate(String prompt, SamplingOptions s,
       {String Function(String generated)? force,
       String? grammar,
       Continuation Function(String generated)? structure,
       String adapter = '',
-      double adapterScale = 1.0}) {
+      double adapterScale = 1.0,
+      String? lane}) {
     final id = _nextId++;
+    final on = lane != null && hasLane(lane) ? _lanes[lane] : null;
     void stop() {
-      if (_running?.id == id) {
+      if (on != null) {
+        if (on.running?.id == id && on.sequence != 0) {
+          LiyabLib.instance.sequenceCancel(Pointer<Void>.fromAddress(on.sequence)); // this generation only
+        } else if (on.queue.any((j) => j.id == id)) {
+          on.queue.removeWhere((j) => j.id == id);
+          _streams.remove(id)?.close();
+        }
+      } else if (_running?.id == id) {
         cancel();
       } else if (_queue.any((j) => j.id == id)) {
         _queue.removeWhere((j) => j.id == id);
@@ -544,9 +661,15 @@ class EngineService {
 
     final controller = StreamController<GenerationEvent>(onCancel: stop);
     _streams[id] = controller;
-    _enqueue(_Job(
+    final job = _Job(
         id, ['generate', id, prompt, s.temperature, s.topP, s.topK, s.maxTokens, force, grammar, structure, adapter, adapterScale],
-        background: false));
+        background: false);
+    if (on != null) {
+      on.queue.add(job);
+      _pumpLane(on);
+    } else {
+      _enqueue(job);
+    }
     return Generation(controller.stream, stop);
   }
 
@@ -629,7 +752,8 @@ void _worker(SendPort replies) {
               ..powerProfile = m[8] as int
               ..skinThresholdC = m[5] as double
               ..memoryBudgetMb = m[6] as int // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
-              ..prefixCacheDiskMb = m[10] as int;
+              ..prefixCacheDiskMb = m[10] as int
+              ..maxSequences = m[13] as int; // the main lane's sequence and one per other lane
             final prefixDir = m[9] as String?;
             if (prefixDir != null) config.ref.prefixCacheDir = prefixDir.toNativeUtf8(allocator: arena);
             final cacheDir = m[11] as String?;
@@ -865,7 +989,54 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   c.nThreads = i('threads') ?? c.nThreads;
 }
 
-void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort replies) {
+// A lane's worker isolate (EngineService._openLanes): opens a sequence of the engine, runs its generations one at
+// a time (on that sequence, with its own adapter selection), and closes it.
+void _laneWorker(SendPort replies) {
+  final commands = ReceivePort();
+  replies.send(commands.sendPort);
+  final lib = LiyabLib.instance;
+  var sequence = Pointer<Void>.fromAddress(0);
+  var adapter = '';
+  var adapterScale = 1.0;
+  commands.listen((message) {
+    final m = message as List<Object?>;
+    final kind = m[0] as String, id = m[1] as int;
+    void fail([String? text]) => replies.send(['error', id, text ?? lib.errorMessage()]);
+    try {
+      switch (kind) {
+        case 'open':
+          using((arena) {
+            final out = arena<Pointer<Void>>();
+            if (lib.sequenceOpen(Pointer<Void>.fromAddress(m[2] as int), m[3] as int, out) != LiyabStatus.ok) {
+              return fail();
+            }
+            sequence = out.value;
+            replies.send(['ok', id, sequence.address]);
+          });
+        case 'close':
+          if (sequence.address != 0) lib.sequenceClose(sequence);
+          sequence = Pointer<Void>.fromAddress(0);
+          replies.send(['ok', id]);
+        case 'generate':
+          if (sequence.address == 0) return fail('the lane is closed');
+          final name = m[10] as String, scale = m[11] as double;
+          if (name != adapter || (name.isNotEmpty && scale != adapterScale)) {
+            final ok = using((arena) => lib.sequenceSetAdapter(sequence, name.toNativeUtf8(allocator: arena), scale)) ==
+                LiyabStatus.ok;
+            adapter = ok ? name : '\u0000unknown'; // after a failure, select again next time
+            adapterScale = scale;
+            if (!ok) return fail();
+          }
+          _generate(lib, Pointer<Void>.fromAddress(0), m, replies, sequence: sequence);
+      }
+    } catch (e) {
+      fail('$e');
+    }
+  });
+}
+
+/// One generation (the 'generate' command): on the engine's default sequence, or on `sequence` (a lane's).
+void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort replies, {Pointer<Void>? sequence}) {
   final id = m[1] as int;
   // Called synchronously on this isolate's thread during liyab_engine_generate;
   // each piece is complete UTF-8.
@@ -940,12 +1111,15 @@ void _generate(LiyabLib lib, Pointer<Void> engine, List<Object?> m, SendPort rep
         replies.send(['error', id, 'grammar: $grammarFailure']);
         return;
       }
-      final status = whole != null || continuation != null
-          ? lib.generateStructured(engine, prompt, params, callback.nativeFunction, whole ?? nullptr,
-              continuation?.nativeFunction ?? nullptr, nullptr, stats, grammarStats)
-          : force == null
-              ? lib.generate(engine, prompt, params, callback.nativeFunction, nullptr, stats)
-              : lib.generateForced(engine, prompt, params, callback.nativeFunction, force.nativeFunction, nullptr, stats);
+      final status = sequence != null
+          ? lib.sequenceGenerate(sequence, prompt, params, callback.nativeFunction, force?.nativeFunction ?? nullptr,
+              whole ?? nullptr, continuation?.nativeFunction ?? nullptr, nullptr, stats, grammarStats)
+          : whole != null || continuation != null
+              ? lib.generateStructured(engine, prompt, params, callback.nativeFunction, whole ?? nullptr,
+                  continuation?.nativeFunction ?? nullptr, nullptr, stats, grammarStats)
+              : force == null
+                  ? lib.generate(engine, prompt, params, callback.nativeFunction, nullptr, stats)
+                  : lib.generateForced(engine, prompt, params, callback.nativeFunction, force.nativeFunction, nullptr, stats);
       if (status != LiyabStatus.ok || grammarFailure != null) {
         replies.send(['error', id, grammarFailure != null ? 'grammar: $grammarFailure' : lib.errorMessage()]);
         return;

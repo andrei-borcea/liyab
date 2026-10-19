@@ -117,6 +117,7 @@ typedef struct liyab_engine_config {
     int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of stored losslessly (lossy; 0 default, see EngineConfig) */
     int64_t adapter_memory_mb;    /* LoRA adapters (liyab_engine_load_adapter): RAM at most for the loaded ones, in MiB, the least recently selected released first (mapped again when selected); default 256; 0: adapters off (a zero-filled config without liyab_engine_config_default) */
     int32_t draft_tree;           /* suffix drafts: nonzero (the default) verifies the likeliest nodes of the drafter's continuation tree, alternative branches included, in one pass; 0 only its best branch (a zero-filled config without liyab_engine_config_default); the same output either way (see EngineConfig) */
+    int32_t max_sequences;        /* sequences kept at once, the default one included (liyab_sequence_open); 1 (the default; 0 counts as 1): one conversation, as before; each more keeps a context of its own (see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -616,6 +617,71 @@ LIYAB_C_API int32_t liyab_engine_adapter_count(const liyab_engine* engine);
 /* Adapter `index` (0..count-1, load order) into `out`.
  * LIYAB_ERR_INVALID_ARGUMENT for an index out of range. Thread-safe. */
 LIYAB_C_API liyab_status liyab_engine_adapter_info(const liyab_engine* engine, int32_t index, liyab_adapter_info* out);
+
+/*
+ * Several sequences decoded together (Engine::open_sequence and
+ * Engine::Sequence in liyab/engine.h have the whole contract). The engine's
+ * own calls (liyab_engine_generate...) run on its default sequence; a
+ * liyab_sequence is another conversation with a context of its own (KV
+ * cache, recurrent states, prompt text, LoRA adapter, priority), up to
+ * max_sequences in all. Calls on different sequences may run at once from
+ * different threads: their forward passes run together, one pass over every
+ * waiting sequence's tokens, and each sequence's output is what it gives
+ * alone (on the CPU backend, the same bits). A call that runs while no other
+ * sequence has one runs exactly as a single conversation always has. One
+ * call at a time per sequence (LIYAB_ERR_BUSY otherwise). Callbacks run on
+ * the thread that called.
+ */
+typedef struct liyab_sequence liyab_sequence;
+
+typedef enum liyab_sequence_priority {
+    LIYAB_SEQUENCE_FOREGROUND = 0, /* the user's turn: its passes first */
+    LIYAB_SEQUENCE_BACKGROUND = 1  /* yields: runs when no foreground pass waits; its prompt passes stop for foreground work */
+} liyab_sequence_priority;
+
+/* Opens a sequence. LIYAB_ERR_UNSUPPORTED with max_sequences 1 or a draft
+ * model; LIYAB_ERR_BUSY when max_sequences are open. Close every sequence
+ * before destroying its engine. */
+LIYAB_C_API liyab_status liyab_sequence_open(liyab_engine* engine, liyab_sequence_priority priority,
+                                             liyab_sequence** out_sequence);
+/* Cancels a call running on it and waits for it, sets its context aside in
+ * the prefix cache (when there is one) and frees it. NULL is a no-op. */
+LIYAB_C_API void liyab_sequence_close(liyab_sequence* sequence);
+/* Its id among the engine's sequences (the default one is 0); -1 for NULL. */
+LIYAB_C_API int32_t liyab_sequence_id(const liyab_sequence* sequence);
+/* Thread-safe; taken into account from its next pass. */
+LIYAB_C_API liyab_status liyab_sequence_set_priority(liyab_sequence* sequence, liyab_sequence_priority priority);
+/* Thread-safe: stop its generation at the next token boundary / its prefill
+ * between two passes; never another sequence's. */
+LIYAB_C_API void liyab_sequence_cancel(liyab_sequence* sequence);
+LIYAB_C_API void liyab_sequence_cancel_prefill(liyab_sequence* sequence);
+/* A generation on the sequence: liyab_engine_generate with, optionally, ONE
+ * of `force` (liyab_engine_generate_forced), `grammar` or `continuation`
+ * (liyab_engine_generate_structured); more than one:
+ * LIYAB_ERR_INVALID_ARGUMENT. `stats` and `grammar_stats` may be NULL. */
+LIYAB_C_API liyab_status liyab_sequence_generate(liyab_sequence* sequence, const char* prompt,
+                                                 const liyab_sampling_params* params, liyab_token_callback callback,
+                                                 liyab_force_callback force, const liyab_grammar* grammar,
+                                                 liyab_continuation_callback continuation, void* user_data,
+                                                 liyab_generation_stats* stats, liyab_grammar_stats* grammar_stats);
+/* liyab_engine_prefill on the sequence (liyab_sequence_cancel_prefill stops it). */
+LIYAB_C_API liyab_status liyab_sequence_prefill(liyab_sequence* sequence, const char* text, int32_t add_bos);
+/* Forgets its context (waits for a call running on it). */
+LIYAB_C_API liyab_status liyab_sequence_reset_context(liyab_sequence* sequence);
+/* liyab_engine_set_adapter for this sequence only (NULL or "": none). */
+LIYAB_C_API liyab_status liyab_sequence_set_adapter(liyab_sequence* sequence, const char* name, float scale);
+
+/* How sequences shared passes since the engine was created
+ * (Engine::SchedulerStats). Thread-safe. */
+typedef struct liyab_scheduler_stats {
+    uint64_t passes;           /* passes run for sequences while several were in a call */
+    uint64_t shared_passes;    /* of them, passes of two sequences or more */
+    uint64_t shared_rows;      /* tokens of those shared passes */
+    uint64_t preempted;        /* background passes stopped for foreground work (run again later) */
+    int32_t open_sequences;    /* open now, the default one included */
+    int32_t active_sequences;  /* in a call now */
+} liyab_scheduler_stats;
+LIYAB_C_API liyab_status liyab_engine_scheduler_stats(const liyab_engine* engine, liyab_scheduler_stats* out);
 
 #ifdef __cplusplus
 }
