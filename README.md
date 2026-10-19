@@ -876,7 +876,8 @@ each of those as a scheduling problem.
     foreground work arrives (its work kept, the pass run again later), and a background decoding step joins a
     foreground pass only while a pass of one more sequence measured at most 1.25 times as long: on a model in RAM
     a row more costs little, while a MoE whose experts stream from storage would make the user's step wait for the
-    background step's expert reads. A leader waits for the sequences about to submit (sampling, calling back) for
+    background step's expert reads. One step in 64 that would be kept out joins anyway, so the estimate follows
+    the expert cache warming up and the device's load (at most 1/64 of the difference on the user's steps). A leader waits for the sequences about to submit (sampling, calling back) for
     at most half a pass, so a slow callback costs the others little.
   * **Per sequence.** Cancellation (`Sequence::cancel()`, `cancel_prefill()`), adapters (`set_adapter()`), the
     prefix cache's restores and set-asides (a context one sequence set aside, any other restores), and the Busy

@@ -278,9 +278,11 @@ struct EngineConfig {
 // user does not wait for (an agent running in the background, prefetching)
 // is Background, which yields: its passes run when no foreground one is
 // waiting, its decoding steps join a foreground pass only where that costs
-// the foreground step little (measured: see Engine::Sequence), and a
-// background prompt being processed is stopped between two blocks (its
-// work so far kept) when a foreground sequence needs the model.
+// the foreground step little (passes of one more sequence measured at most
+// 1.25 times as long; one step in 64 that would be kept out joins anyway,
+// to re-measure), and a background prompt being processed is stopped
+// between two blocks (its work so far kept) when a foreground sequence
+// needs the model.
 enum class SequencePriority : int32_t {
     Foreground = 0,
     Background = 1,

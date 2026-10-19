@@ -1533,6 +1533,8 @@ struct Engine::Impl {
     // from storage reads every chosen expert of the batch, and the user's
     // step would wait for the reads of the background one's.
     static constexpr double kRideAlong = 1.25;
+    static constexpr int32_t kReprobe = 64;
+    int32_t ride_refused = 0;  // background steps kept out since the last re-measure (ride_along())
 
     // A call's hold on one sequence: false (Busy) while another call runs on
     // it. Calls on different sequences run at once. The background
@@ -1765,10 +1767,17 @@ struct Engine::Impl {
                            [](const std::unique_ptr<Seq>& q) { return q->phase == Seq::Phase::Working; });
     }
     // Whether a background step may join a pass of `k` sequences' steps.
-    [[nodiscard]] bool ride_along(size_t k) const {
+    // A refusal rests on an estimate only passes of k + 1 refresh, so one
+    // step in kReprobe that would be refused joins anyway and re-measures
+    // (an expert cache warming up, the host's load changing): that costs the
+    // user's steps at most 1/kReprobe of the difference.
+    [[nodiscard]] bool ride_along(size_t k) {
         if (k + 1 >= small_pass_ms.size()) return false;
         const double now = small_pass_ms[k], more = small_pass_ms[k + 1];
-        return now == 0.0 || more == 0.0 || more <= kRideAlong * now;
+        if (now == 0.0 || more == 0.0 || more <= kRideAlong * now) return true;
+        if (++ride_refused < kReprobe) return false;
+        ride_refused = 0;
+        return true;
     }
 
     // Engine::Sequence's destructor: q's call cancelled and waited for, its
