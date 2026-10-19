@@ -937,7 +937,101 @@ TEST_CASE("Engine sequences: a background sequence yields, and both outputs stay
                     hybrid ? "hybrid" : "dense", jobs[1].stats.prompt_tokens, jobs[1].stats.prefill_ms,
                     static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.shared_passes),
                     static_cast<unsigned long long>(st.preempted));
-        CHECK(st.preempted >= 1);
+        // (A stop happens when the user's call arrives during a background
+        // pass; arriving between two, it simply goes first: timing decides,
+        // so the count is printed, not checked.)
+    }
+}
+
+TEST_CASE("Engine sequences: a shared pass of background prompts stops for the user's, every output its own") {
+    test::TinyModelSpec spec;
+    spec.n_layers = 8;
+    spec.n_embd = 512;
+    spec.n_head = 8;
+    spec.n_head_kv = 4;
+    spec.n_ff = 2048;
+    spec.context_length = 8192;
+    for (const bool hybrid : {false, true}) {
+        test::TinyModelSpec s = spec;
+        if (hybrid) {
+            s.arch = "qwen35";
+            s.delta_net_interval = 2;
+        }
+        const EngineConfig config = engine_config(model_path(hybrid ? "engine_bigger_hybrid" : "engine_bigger", s), 3);
+        std::string a, b;
+        for (int32_t i = 0; i < 1200; ++i) {
+            a += i % 3 == 0 ? "hello world " : "world hello ";
+            b += i % 4 == 0 ? "world world " : "hello hello ";
+        }
+        std::vector<Job> jobs(3);
+        jobs[0].prompt = "hello world";
+        jobs[0].params = greedy(20);
+        jobs[1].prompt = a;
+        jobs[1].params = greedy(6);
+        jobs[2].prompt = b;
+        jobs[2].params = greedy(6);
+        const std::vector<std::string> alone = run_alone(config, jobs);
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        auto s1 = engine.value()->open_sequence(SequencePriority::Background);
+        auto s2 = engine.value()->open_sequence(SequencePriority::Background);
+        REQUIRE(s1.has_value() && s2.has_value());
+        jobs[1].seq = s1->get();
+        jobs[2].seq = s2->get();
+        // The two background prompts share passes; the user's chat arrives
+        // meanwhile and goes first: a background pass running then is stopped
+        // (when the chat arrives between two passes, nothing needs stopping).
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point user_first{}, background_done[2]{};
+        jobs[0].stop_after = [&](int32_t n) {
+            if (n == 1) user_first = Clock::now();
+            return false;
+        };
+        std::atomic<int32_t> ready{0};
+        std::vector<std::thread> background;
+        for (size_t i = 1; i < 3; ++i) {
+            background.emplace_back([&, i] {
+                ready.fetch_add(1);
+                while (ready.load() < 2) std::this_thread::yield();
+                run_job(*engine.value(), jobs[i]);
+                background_done[i - 1] = Clock::now();
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        run_job(*engine.value(), jobs[0]);
+        for (std::thread& t : background) t.join();
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            REQUIRE(jobs[i].status.is_ok());
+            CHECK(jobs[i].out == alone[i]);
+        }
+        CHECK(user_first < background_done[0]);
+        CHECK(user_first < background_done[1]);
+        const Engine::SchedulerStats st = engine.value()->scheduler_stats();
+        std::printf("  %s: %llu passes, %llu shared, %llu stopped for the user's\n", hybrid ? "hybrid" : "dense",
+                    static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.shared_passes),
+                    static_cast<unsigned long long>(st.preempted));
+        CHECK(st.shared_passes > 0);
+
+        // One of two background prefills sharing passes cancelled: it stops
+        // (its pass, when running, at the next block), the other goes on, and
+        // both conversations continue exactly.
+        s1.value()->reset_context();
+        s2.value()->reset_context();
+        Status cancelled, finished;
+        std::thread p1([&] { cancelled = s1.value()->prefill(a); });
+        std::thread p2([&] { finished = s2.value()->prefill(b); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        s1.value()->cancel_prefill();
+        p1.join();
+        p2.join();
+        CHECK(finished.is_ok());
+        CHECK(cancelled.is_ok() || cancelled.code() == ErrorCode::Cancelled);  // it may have ended first
+        for (size_t i = 1; i < 3; ++i) {
+            jobs[i].out.clear();
+            run_job(*engine.value(), jobs[i]);
+            CHECK(jobs[i].status.is_ok());
+            CHECK(jobs[i].out == alone[i]);
+        }
     }
 }
 

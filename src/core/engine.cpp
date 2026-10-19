@@ -1496,7 +1496,9 @@ struct Engine::Impl {
     int32_t waiting_fg = 0;  // foreground sequences waiting for the model (Hold)
     bool leading = false;    // a thread runs the pending requests
     bool preemptible = false;  // the pass running may be stopped for foreground work
-    std::vector<const Seq*> running;  // the sequences of the pass running
+    // The sequences of the stoppable pass running whose request is a
+    // prefill() call: their cancel_prefill() stops it too.
+    std::vector<const Seq*> running;
     std::atomic<bool> preempt{false};  // that pass's cancel flag
     // What a pass is for: a prompt's chunk (generate), a prefill() chunk, a
     // forced continuation, a decoding step. The last two are small (a few
@@ -1618,12 +1620,13 @@ struct Engine::Impl {
 
     // While it lives (the model held), the pass q runs alone may be stopped
     // for foreground work as a shared background pass may: `preempt` is its
-    // cancel flag, set by a foreground Hold or submit() and by q's
-    // cancel_prefill(). `on`: q is a background sequence.
+    // cancel flag, set by a foreground Hold or submit() and, for a prefill()
+    // call's pass (`prefill_call`), by q's cancel_prefill(). `on`: q is a
+    // background sequence.
     class Stoppable {
     public:
-        Stoppable(Impl& s, Seq& q, bool on) : s_(s), on_(on) {
-            if (on_) s.begin_stoppable({&q});
+        Stoppable(Impl& s, Seq& q, bool on, bool prefill_call) : s_(s), on_(on) {
+            if (on_) s.begin_stoppable(prefill_call ? std::vector<const Seq*>{&q} : std::vector<const Seq*>{});
         }
         ~Stoppable() {
             if (on_) s_.end_stoppable();
@@ -1635,12 +1638,16 @@ struct Engine::Impl {
         Impl& s_;
         bool on_;
     };
-    // A stoppable pass of `seqs` starts / ends, the model held. One whose
-    // stop was already asked (foreground work waits) is stopped at once.
-    void begin_stoppable(std::vector<const Seq*> seqs_in_pass) {
+    // A stoppable pass starts / ends, the model held; `prefill_calls`: its
+    // sequences whose request is a prefill() call. One whose stop was
+    // already asked (foreground work waits, such a call was cancelled) is
+    // stopped at once. Only prefill() calls heed cancel_prefill(): the flag
+    // stays set after one, and a generation's pass stopped by it would run
+    // again and be stopped again.
+    void begin_stoppable(std::vector<const Seq*> prefill_calls) {
         std::lock_guard<std::mutex> g(sched);
         preemptible = true;
-        running = std::move(seqs_in_pass);
+        running = std::move(prefill_calls);
         const bool asked = waiting_fg > 0 || std::any_of(pending.begin(), pending.end(), [](const PassRequest* r) {
                                return r->seq->foreground();
                            }) || std::any_of(running.begin(), running.end(), [](const Seq* q) {
@@ -1651,6 +1658,8 @@ struct Engine::Impl {
     void count_stop() {
         std::lock_guard<std::mutex> g(sched);
         ++sched_stats.preempted;
+        LIYAB_LOG_INFO("scheduler: a background prompt pass stopped for foreground work (%llu so far); it runs again",
+                       static_cast<unsigned long long>(sched_stats.preempted));
     }
     void end_stoppable() {
         std::lock_guard<std::mutex> g(sched);
@@ -1700,31 +1709,32 @@ struct Engine::Impl {
 
     // A call starts / ends on q (Call).
     void enter(Seq& q) {
-        std::lock_guard<std::mutex> g(sched);
-        ++in_call;
-        q.phase = Seq::Phase::Away;
-        q.thread_id = ThreadPool::current_thread_id();
-        hint_threads();
+        std::vector<int32_t> threads = pool->worker_thread_ids();
+        {
+            std::lock_guard<std::mutex> g(sched);
+            ++in_call;
+            q.phase = Seq::Phase::Away;
+            q.thread_id = ThreadPool::current_thread_id();
+            for (const auto& other : seqs) {
+                if (other->thread_id != 0) threads.push_back(other->thread_id);
+            }
+        }
+        // The threads that decode, for the power manager's performance hints:
+        // the pool's workers and every call's thread (a Dart isolate may move
+        // between OS threads from one call to the next). Set outside `sched`:
+        // pacing sleeps holding pace_mutex. Not changed when a call ends, so
+        // one conversation's calls keep the hint session open, as before.
+        if (power) {
+            std::lock_guard<std::mutex> p(pace_mutex);
+            power->set_hint_threads(std::move(threads));
+        }
     }
     void leave(Seq& q) {
         std::lock_guard<std::mutex> g(sched);
         --in_call;
         q.phase = Seq::Phase::Idle;
         q.thread_id = 0;
-        hint_threads();
         sched_cv.notify_all();
-    }
-    // The threads that decode, for the power manager's performance hints:
-    // the pool's workers and every call's thread (a Dart isolate may move
-    // between OS threads from one call to the next). Under `sched`.
-    void hint_threads() {
-        if (!power) return;
-        std::vector<int32_t> threads = pool->worker_thread_ids();
-        for (const auto& q : seqs) {
-            if (q->thread_id != 0) threads.push_back(q->thread_id);
-        }
-        std::lock_guard<std::mutex> p(pace_mutex);
-        power->set_hint_threads(std::move(threads));
     }
     // Whether q's call is the only one: then it runs as a single sequence
     // always did (exact same passes, speculative drafts, pacing per token).
@@ -1851,7 +1861,12 @@ struct Engine::Impl {
                                   });
             lock.unlock();
             const auto t0 = Clock::now();
-            const bool stopped = run_pass(chosen, can_stop);
+            bool stopped = false;
+            try {
+                stopped = run_pass(chosen, can_stop);
+            } catch (const std::exception& e) {  // e.g. out of memory: each sequence sees it as its pass's failure
+                for (PassRequest* r : chosen) r->status = Status(ErrorCode::Internal, std::string("pass failed: ") + e.what());
+            }
             const double ms = ms_since(t0);
             lock.lock();
             if (!stopped) {
@@ -1868,6 +1883,9 @@ struct Engine::Impl {
                 }
             } else {
                 ++sched_stats.preempted;
+                LIYAB_LOG_INFO("scheduler: a background pass of %zu sequence(s) stopped for foreground work (%llu so "
+                               "far); it runs again",
+                               chosen.size(), static_cast<unsigned long long>(sched_stats.preempted));
             }
             for (PassRequest* r : chosen) {
                 if (stopped && r->status.code() == ErrorCode::Cancelled) {
@@ -1916,9 +1934,19 @@ struct Engine::Impl {
             }
         } stop{*this, can_stop};
         if (can_stop) {
-            std::vector<const Seq*> in_pass;
-            for (const PassRequest* r : chosen) in_pass.push_back(r->seq);
-            begin_stoppable(std::move(in_pass));
+            // A hybrid context returns to a snapshot when its pass is
+            // stopped (abandon_pass()): one where the pass starts.
+            if (target->config().hybrid()) {
+                for (const PassRequest* r : chosen) {
+                    bind(*r->seq);
+                    target->snapshot_state();
+                }
+            }
+            std::vector<const Seq*> prefill_calls;
+            for (const PassRequest* r : chosen) {
+                if (r->kind == PassKind::Prefill) prefill_calls.push_back(r->seq);
+            }
+            begin_stoppable(std::move(prefill_calls));
         }
         const PowerPolicy policy = power->policy();
         apply_policy(policy);
@@ -3572,7 +3600,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             // work (between blocks): a hybrid one returns to a snapshot.
             const bool stoppable = !q.foreground();
             if (stoppable && hybrid) s.target->snapshot_state();
-            const Stoppable stop(s, q, stoppable);
+            const Stoppable stop(s, q, stoppable, /*prefill_call=*/false);
             ForwardHooks hooks = prefill_hooks;
             if (stoppable) hooks.cancel = &s.preempt;
             if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &hooks); !r) {
@@ -3592,11 +3620,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
                 q.context.insert(q.context.end(), part.begin(), part.end());
             }
         } else {
-            if (!q.foreground() && hybrid) {  // its pass may be stopped: the state to return to
-                const Hold hold(s, q);
-                s.target->snapshot_state();
-            }
-            PassRequest r;
+            PassRequest r;  // a stoppable pass takes the snapshot it may return to (run_pass())
             r.tokens = part;
             r.logits = Transformer::Logits::None;
             r.kind = PassKind::Prompt;
@@ -3626,6 +3650,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
     // the scheduler paced already (once per pass), and for how long.
     bool paced_by_pass = false;
     double pass_paced_ms = 0.0;
+    int32_t shared_passes = 0;  // passes this run shared with other sequences (logged)
     bool stop = false;
     std::chrono::microseconds idle{0};
 
@@ -3833,6 +3858,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             r.kind = PassKind::Forced;
             if (Status st = s.submit(q, r); !st.is_ok()) return fail(st);
             ++stats.decode_passes;
+            if (r.sequences > 1) ++shared_passes;
             q.context.insert(q.context.end(), batch.begin(), batch.end());
             if (sample_next) {
                 if (r.throttled) ++stats.thermal_reroutes;
@@ -3949,6 +3975,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             r.kind = PassKind::Decode;
             if (Status st = s.submit(q, r); !st.is_ok()) return fail(st);
             ++stats.decode_passes;
+            if (r.sequences > 1) ++shared_passes;
             q.context.push_back(last);
             if (r.throttled) ++stats.thermal_reroutes;
             if (r.head_pruned) ++stats.head_pruned_steps;
@@ -4111,6 +4138,10 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
         s.keep_request_segments(q);
     }
     if (text != nullptr && !s.draft) s.remember_text(q, prompt, *text);
+    if (shared_passes > 0) {
+        LIYAB_LOG_INFO("sequence %d: %d tokens at %.1f tok/s, %d of %d decoding passes shared with other sequences", q.id,
+                       stats.generated_tokens, stats.tokens_per_second, shared_passes, stats.decode_passes);
+    }
     return stats;
 }
 
@@ -4159,7 +4190,7 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
             // A background sequence's pass may be stopped for foreground work
             // too (Stoppable: cancel_prefill() sets the same flag then).
             const bool stoppable = !q.foreground();
-            const Stoppable stop(s, q, stoppable);
+            const Stoppable stop(s, q, stoppable, /*prefill_call=*/true);
             ForwardHooks pass_hooks = hooks;
             if (stoppable) pass_hooks.cancel = &s.preempt;
             if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &pass_hooks); !r) {

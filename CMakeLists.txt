@@ -395,6 +395,9 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-embed tools/liyab_embed.cpp)
   target_link_libraries(liyab-embed PRIVATE liyab_core)
   target_include_directories(liyab-embed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Several sequences decoded together: tok/s per sequence and in total for 1..4, against taking turns.
+  add_executable(liyab-seq-bench tools/liyab_seq_bench.cpp)
+  target_link_libraries(liyab-seq-bench PRIVATE liyab_core)
   # tools/describe_model.py reads the registry and prints rows the way architecture.cpp writes them: every
   # row must round-trip. Standard-library Python only; registered when a Python 3 interpreter is found.
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -415,7 +418,7 @@ endif()
 # rely on its host's manifest), and liyab-cli reads its UTF-16 command line.
 if(WIN32)
   foreach(exe liyab-cli ${_liyab_tests} liyab-bench liyab-kl liyab-experts liyab-spec-bench liyab-tok liyab-embed
-              liyab-reuse)
+              liyab-reuse liyab-seq-bench)
     if(TARGET ${exe})
       if(MSVC)
         target_sources(${exe} PRIVATE ${PROJECT_SOURCE_DIR}/cmake/windows/utf8.manifest)  # merged by mt.exe
