@@ -23,7 +23,8 @@
 // alternating order (on a busy host the speed drifts; the gain compares runs
 // that saw the same conditions); --repeat R prints the median of R repeats.
 // Every together reply is checked against its reply alone ("same": greedy
-// decoding, CPU backend). The last together run's scheduler counters follow:
+// decoding, and the CPU and Metal kernels compute a row the same whatever
+// rows share its pass). The last together run's scheduler counters follow:
 // passes shared, time in a pass, time a leader waited for sequences about to
 // submit. Every run on a fresh engine of max(sequences) sequences (suffix
 // drafts keep earlier conversations: a run never drafts from an earlier

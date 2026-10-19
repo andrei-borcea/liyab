@@ -119,7 +119,7 @@ These rules decide what goes into the code:
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) laid out per block (windowed blocks keep only their window), with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
-| Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU backend |
+| Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU and Metal backends |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
 | Segment reuse: marked parts of a prompt (documents, tool results) reused wherever they appear, keys turned to their new positions, a share calibrated per model processed again; attention-only models | ✅ opt-in, lossy |
@@ -864,13 +864,37 @@ each of those as a scheduling problem.
     attention depends on a token's own position only, so on the CPU backend every sequence's logits are the bits
     it gets alone: greedy output is token for token, sampling draws the same tokens from the same seed. Tested on
     dense, gated, windowed (Gemma 2/3, Phi-3), hybrid, MoE (in place and streamed), latent (both forms, mixed in one
-    pass) and LoRA models (`tests/test_sequences.cpp`). With the experimental lossy hooks on, sequences take turns
-    instead of sharing passes, so that holds there too.
+    pass) and LoRA models (`tests/test_sequences.cpp`). The GPU kernels compute each row on its own too: on Metal,
+    replies together equal replies alone (`liyab-seq-bench --backend metal`). With the experimental lossy hooks on,
+    sequences take turns instead of sharing passes, so that holds there too.
   * **Alone, nothing changes.** A call that runs while no other sequence has one runs exactly as a single
-    conversation always has: the same passes, speculative drafts, pacing per token. While several run, their steps
-    are plain (one token each, no drafts): the shared pass is the batch drafts would otherwise fill. Passes of a
-    prompt are cut to `max_batch` tokens while others decode, since a pass's time is what their next token waits
-    for (latent attention keeps its own pass sizes: each pass's form follows from its size).
+    conversation always has: the same passes, speculative drafts, pacing per token. Alternating runs on the Mac
+    against the engine before sequences (CPU, 8 threads, 128 tokens, medians) decoded at 57.6 and 57.0 tok/s on
+    Qwen3-0.6B BF16 (63.7 and 64.2 with drafts), 26.8 and 26.3 on Llama 3.2 1B, 48.3 and 48.1 on Qwen3.5-0.8B,
+    238.6 and 235.5 on Qwen2.5-0.5B Q8_0 (11 runs each, prefill 180 ms both), the same replies. While several
+    run, their steps are plain (one token each, no drafts): the shared pass is the batch drafts would otherwise
+    fill. Passes of a prompt are cut to `max_batch` tokens while others decode, since a pass's time is what their
+    next token waits for (latent attention keeps its own pass sizes: each pass's form follows from its size).
+  * **What it gains.** `liyab-seq-bench` on the Mac (M4 Pro, 8 threads, 128 tokens per sequence, greedy, medians of
+    3 paired runs): every token generated together over the wall time, against the same generations one after
+    another. Every reply together was its reply alone.
+
+    | Model | 2 sequences | 3 | 4 | Each of 2, alone |
+    |---|---|---|---|---|
+    | Qwen2.5-0.5B Q8_0, CPU | 1.37x | 1.75x | 2.28x | 144 tok/s, 287 |
+    | Qwen2.5-0.5B Q8_0, Metal | 1.90x | | 3.26x | 44.3 tok/s, 46.5 |
+    | Qwen3.5-0.8B BF16 (hybrid), CPU | 1.23x | 1.29x | 1.27x | 23.1 tok/s, 39.2 |
+    | Qwen2.5-0.5B F16, CPU | 1.14x | 1.20x | 1.24x | 38.1 tok/s, 69.9 |
+    | Qwen3-0.6B BF16, CPU | 1.10x | 1.21x | 1.29x | 30.3 tok/s, 55.3 |
+    | Llama 3.2 1B BF16, CPU | 1.11x | 1.18x | 1.18x | 14.3 tok/s, 25.6 |
+
+    Quantized weights gain most: their kernels decode a block of weights once for four rows. F16 and BF16 weights
+    are dotted row by row, so a row more costs almost a row's time ([next](#roadmap)). On the GPU a pass's fixed
+    cost dominates and is paid once for all. Each sequence decodes slower than alone, since a pass of more rows
+    takes longer: the reason background steps join the user's passes only when that costs little. Drafts or a
+    shared pass: with `lookup_drafts` on new text, the same generations in turns went no faster (Qwen2.5 Q8_0:
+    222 tok/s with drafts, 223 without), and two sequences together gave 1.42x over the turns with drafts; drafts pay on repeated text
+    (`liyab-spec-bench`), so a sequence alone keeps them, and sequences together share plain steps.
   * **The user first** (`SequencePriority`). Foreground sequences are the user's turn; background ones yield: their
     passes run when no foreground request waits, a pass of a background prompt is stopped between two blocks when
     foreground work arrives (its work kept, the pass run again later), and a background decoding step joins a
