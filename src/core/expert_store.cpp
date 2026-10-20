@@ -1,11 +1,8 @@
 #include "core/expert_store.h"
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
-
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -86,8 +83,9 @@ Result<std::unique_ptr<ExpertStore>> ExpertStore::create(const MmapLoader& file,
         const double share = static_cast<double>(budget_bytes) * static_cast<double>(class_blocks[c]) /
                              static_cast<double>(moe_blocks);
         sc.first_slot = n_slots;
-        sc.n_slots = std::clamp(static_cast<size_t>(share / static_cast<double>(sc.bytes)), std::min(min_slots, entries),
-                                entries);
+        sc.min_slots = std::min(min_slots, entries);
+        sc.n_slots = std::clamp(static_cast<size_t>(share / static_cast<double>(sc.bytes)), sc.min_slots, entries);
+        sc.active = sc.n_slots;
         n_slots += sc.n_slots;
         s->arena_bytes_ += sc.n_slots * sc.bytes;
     }
@@ -254,7 +252,7 @@ int32_t ExpertStore::take_slot_locked(std::unique_lock<std::mutex>& lock, int32_
             const Entry& v = entries_[static_cast<size_t>(slots_[static_cast<size_t>(current)].entry)];
             return e.uses < v.uses || (e.uses == v.uses && e.last_use < v.last_use);
         };
-        for (size_t i = sc.first_slot; i < sc.first_slot + sc.n_slots; ++i) {
+        for (size_t i = sc.first_slot; i < sc.first_slot + sc.active; ++i) {  // lent slots stay out (lend())
             const int32_t key = slots_[i].entry;
             if (key < 0) return static_cast<int32_t>(i);
             const Entry& e = entries_[static_cast<size_t>(key)];
@@ -468,8 +466,10 @@ size_t ExpertStore::warm() {
     size_t queued = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        size_t slots = 0;
+        for (const SizeClass& sc : classes_) slots += sc.active;
         for (const int32_t key : hot_) {
-            if (queued >= slots_.size()) break;  // beyond the cache's size the list would evict itself
+            if (queued >= slots) break;  // beyond the cache's size the list would evict itself
             Entry& e = entries_[static_cast<size_t>(key)];
             if (e.state != State::Empty) continue;
             e.state = State::Queued;
@@ -516,12 +516,146 @@ size_t ExpertStore::trim() {
         os::unlock_memory(arena_, arena_bytes_);
         locked_ = false;
     }
-#if defined(__linux__)
-    // Private anonymous pages: freed at once, and read back as zeros (then
+    // Heap pages of the arena: freed (read back as zeros on Linux, then
     // overwritten by the next expert read) when touched again.
-    madvise(arena_, arena_bytes_, MADV_DONTNEED);
-#endif
+    os::release_pages(arena_, arena_bytes_);
     return released;
+}
+
+namespace {
+
+// The whole pages inside [p, p + bytes): mlock / munlock of a range that
+// shares an edge page with slots still in use would change that page too.
+std::pair<uint8_t*, size_t> inner_pages(uint8_t* p, size_t bytes) {
+    const size_t page = os::page_size();
+    const auto begin = (reinterpret_cast<uintptr_t>(p) + page - 1) / page * page;
+    const auto end = (reinterpret_cast<uintptr_t>(p) + bytes) / page * page;
+    if (end <= begin) return {nullptr, 0};
+    return {reinterpret_cast<uint8_t*>(begin), end - begin};
+}
+
+}  // namespace
+
+Result<ExpertStore::Loan> ExpertStore::lend(size_t bytes) {
+    Loan loan;
+    loan.slots.assign(classes_.size(), 0);
+    if (bytes == 0) return loan;
+    const std::lock_guard<std::mutex> loans(loan_mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Each class gives its share of `bytes` (its share of the arena), in
+    // whole slots rounded up: every block keeps the same fraction of its
+    // experts cached, as create() planned them.
+    for (size_t c = 0; c < classes_.size(); ++c) {
+        const SizeClass& sc = classes_[c];
+        const double share = static_cast<double>(bytes) * static_cast<double>(sc.n_slots * sc.bytes) /
+                             static_cast<double>(arena_bytes_);
+        const auto take = static_cast<size_t>(std::ceil(share / static_cast<double>(sc.bytes)));
+        if (sc.active < sc.min_slots + take) {
+            char message[160];
+            std::snprintf(message, sizeof message,
+                          "the expert cache cannot spare %.1f MiB (%.1f MiB of it in use, %.1f MiB lent out)",
+                          static_cast<double>(bytes) / (1024.0 * 1024.0),
+                          static_cast<double>(arena_bytes_ - lent_bytes_) / (1024.0 * 1024.0),
+                          static_cast<double>(lent_bytes_) / (1024.0 * 1024.0));
+            return Status(ErrorCode::OutOfMemory, message);
+        }
+        loan.slots[c] = take;
+        loan.bytes += take * sc.bytes;
+    }
+    // Out of use first (take_slot_locked() no longer picks them), then
+    // emptied: an unpinned expert goes at once (an acquire() waiting for it
+    // reads it again into a slot still in use, as after any eviction), a
+    // pinned or loading one when its user releases it or its read lands.
+    for (size_t c = 0; c < classes_.size(); ++c) classes_[c].active -= loan.slots[c];
+    for (;;) {
+        bool busy = false;
+        for (size_t c = 0; c < classes_.size(); ++c) {
+            const SizeClass& sc = classes_[c];
+            for (size_t i = sc.first_slot + sc.active; i < sc.first_slot + sc.active + loan.slots[c]; ++i) {
+                const int32_t key = slots_[i].entry;
+                if (key < 0) continue;
+                Entry& e = entries_[static_cast<size_t>(key)];
+                if (e.state != State::Ready || e.pins > 0) {
+                    busy = true;
+                    continue;
+                }
+                if (e.untouched) ++stats_.unused;
+                e.untouched = false;
+                e.state = State::Empty;
+                e.slot = -1;
+                slots_[i].entry = -1;
+            }
+        }
+        if (!busy || stop_) break;
+        ready_cv_.wait(lock);
+    }
+    lent_bytes_ += loan.bytes;
+    const bool locked = locked_;
+    // The pages go back to the OS without mutex_: nothing reads or writes
+    // these slots now, and loan_mutex_ keeps a repay() from re-enabling them
+    // meanwhile. (A concurrent trim() releasing the whole arena is harmless.)
+    lock.unlock();
+    for (size_t c = 0; c < classes_.size(); ++c) {
+        if (loan.slots[c] == 0) continue;
+        const SizeClass& sc = classes_[c];
+        uint8_t* first = arena_ + slots_[sc.first_slot + sc.active].offset;
+        const auto [pages, length] = inner_pages(first, loan.slots[c] * sc.bytes);
+        if (length == 0) continue;
+        if (locked) os::unlock_memory(pages, length);
+        os::release_pages(pages, length);
+    }
+    return loan;
+}
+
+void ExpertStore::repay(const Loan& loan) {
+    if (loan.bytes == 0) return;
+    const std::lock_guard<std::mutex> loans(loan_mutex_);
+    bool locked = false;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        locked = locked_;
+    }
+    // Locked again (faulting the pages in) before the slots serve experts,
+    // without mutex_: decoding goes on meanwhile on the slots in use. Each
+    // class's loan slots are the first ones past its active slots.
+    std::vector<std::pair<uint8_t*, size_t>> relocked;
+    if (locked) {
+        for (size_t c = 0; c < classes_.size() && c < loan.slots.size(); ++c) {
+            if (loan.slots[c] == 0) continue;
+            const SizeClass& sc = classes_[c];
+            const auto range = inner_pages(arena_ + slots_[sc.first_slot + sc.active].offset, loan.slots[c] * sc.bytes);
+            if (range.second > 0 && os::lock_memory(range.first, range.second)) relocked.push_back(range);
+        }
+    }
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        // trim() unlocked the arena meanwhile: these pages stay pageable too.
+        if (!locked_) {
+            for (const auto& [p, n] : relocked) os::unlock_memory(p, n);
+        }
+        for (size_t c = 0; c < classes_.size() && c < loan.slots.size(); ++c) {
+            classes_[c].active = std::min(classes_[c].active + loan.slots[c], classes_[c].n_slots);
+        }
+        lent_bytes_ -= std::min(lent_bytes_, loan.bytes);
+    }
+    ready_cv_.notify_all();  // a load waiting for a slot may take one now
+}
+
+size_t ExpertStore::lent_bytes() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return lent_bytes_;
+}
+
+size_t ExpertStore::capacity_bytes() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return arena_bytes_ - lent_bytes_;
+}
+
+size_t ExpertStore::entries() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    size_t n = 0;
+    for (const SizeClass& sc : classes_) n += sc.active;
+    return n;
 }
 
 ExpertStore::Stats ExpertStore::stats() const {

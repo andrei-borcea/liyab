@@ -56,6 +56,13 @@ void unmap_anonymous(void* p, size_t bytes) noexcept;
 bool lock_memory(void* p, size_t bytes) noexcept;
 // Undoes lock_memory() (munlock); nothing to undo on Windows.
 void unlock_memory(void* p, size_t bytes) noexcept;
+// Hands the RAM behind the whole pages inside [p, p + bytes) back to the OS
+// while the range stays mapped and usable: its contents are undefined
+// afterwards (zeros on Linux), and a page takes RAM again when written. For
+// private anonymous or heap memory that is not locked (unlock_memory()
+// first). Linux/Android: madvise(MADV_DONTNEED), freed at once; Apple:
+// madvise(MADV_FREE), taken back when the system needs it; Windows: a no-op.
+void release_pages(void* p, size_t bytes) noexcept;
 
 // --- Processes ----------------------------------------------------------------------
 

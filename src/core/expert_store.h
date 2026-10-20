@@ -22,8 +22,8 @@
 //    router to the current hidden state ahead of time); acquire() blocks only
 //    for experts that are neither cached nor already loaded in time.
 //
-// Thread-safety: prefetch/acquire/release/stats may be called from any
-// thread; the I/O threads are internal.
+// Thread-safety: prefetch/acquire/release/stats/lend/repay may be called
+// from any thread; the I/O threads are internal.
 #ifndef LIYAB_CORE_EXPERT_STORE_H
 #define LIYAB_CORE_EXPERT_STORE_H
 
@@ -116,9 +116,37 @@ public:
     void set_hot(std::vector<int32_t> keys);
     size_t warm();
 
+    // Lending part of the cache to other memory (the engine's extra
+    // sequences, whose recurrent states would otherwise have to be set aside
+    // at load, shrinking the cache, and possibly forcing a lossy
+    // requantization, while no such sequence exists). lend() disables slots
+    // at the end of each size class, in proportion to the class's share of
+    // the arena (each class keeps serving its blocks), until at least
+    // `bytes` are out of use: their experts are evicted (reads in flight and
+    // pinned experts are waited for, as trim() does; other threads keep
+    // acquiring meanwhile, from the slots that stay), their pages unlocked
+    // and returned to the OS (os::release_pages). OutOfMemory, and nothing
+    // changes, when a class would keep fewer slots than its minimum (a
+    // block's top-k plus the reads in flight: what create() keeps whatever
+    // the budget). Never reloads or converts anything. repay() gives a loan's
+    // slots back (in any order; they come back empty and are locked again
+    // when the arena still is); a loan of 0 bytes is empty and needs no
+    // repay. Thread-safe. Do not call lend() from a thread holding pins:
+    // it may wait for them.
+    struct Loan {
+        std::vector<size_t> slots;  // per size class: slots taken out of use
+        size_t bytes = 0;           // their bytes (at least what was asked)
+    };
+    Result<Loan> lend(size_t bytes);
+    void repay(const Loan& loan);
+    // Bytes of arena lent out now (lend(), not repaid yet).
+    [[nodiscard]] size_t lent_bytes() const;
+
     [[nodiscard]] Stats stats() const;
-    [[nodiscard]] size_t capacity_bytes() const noexcept { return arena_bytes_; }
-    [[nodiscard]] size_t entries() const noexcept { return slots_.size(); }
+    // The cache in use: the arena minus what is lent out.
+    [[nodiscard]] size_t capacity_bytes() const;
+    // Slots in use (the arena's, minus the ones lent out).
+    [[nodiscard]] size_t entries() const;
     [[nodiscard]] uint64_t expert_bytes_total() const noexcept { return expert_bytes_total_; }
 
 private:
@@ -149,6 +177,11 @@ private:
         std::array<size_t, 3> offsets{};  // gate, up, down inside a slot
         size_t first_slot = 0;
         size_t n_slots = 0;
+        // Slots [first_slot, first_slot + active) serve experts; the rest of
+        // the class's slots are lent out (lend()). The tail goes first so a
+        // loan's pages are one contiguous range per class.
+        size_t active = 0;
+        size_t min_slots = 0;  // lend() never goes below this
     };
     struct Segment {      // one matrix of one expert in storage
         uint32_t shard = 0;
@@ -180,6 +213,7 @@ private:
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;
     bool locked_ = false;  // mlock succeeded (until trim() unlocks it)
+    size_t lent_bytes_ = 0;  // under mutex_
     std::vector<Slot> slots_;
     std::vector<Entry> entries_;
     std::vector<int32_t> hot_;  // see hot_keys()
@@ -187,6 +221,10 @@ private:
     std::atomic<bool> batch_{false};
 
     mutable std::mutex mutex_;
+    // Held through a whole lend() or repay() (taken before mutex_): which
+    // slots are lent out is positional (each class's tail), so a repay()
+    // must not re-enable slots a lend() is still draining.
+    std::mutex loan_mutex_;
     std::condition_variable work_cv_;   // I/O threads: queue or parts not empty / stop
     std::condition_variable ready_cv_;  // consumers: an entry became Ready or a slot freed
     std::deque<int32_t> queue_;                   // entries to load, by priority

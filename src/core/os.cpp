@@ -1,6 +1,7 @@
 #include "core/os.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <utility>
 
@@ -87,6 +88,25 @@ void unlock_memory(void* p, size_t bytes) noexcept {
     (void)bytes;
 #else
     munlock(p, bytes);
+#endif
+}
+
+void release_pages(void* p, size_t bytes) noexcept {
+#if defined(__linux__) || defined(__APPLE__)
+    // madvise wants a page-aligned start: only the pages wholly inside the
+    // range are released, so neighbouring data sharing an edge page is kept.
+    const size_t page = page_size();
+    const auto begin = (reinterpret_cast<uintptr_t>(p) + page - 1) / page * page;
+    const auto end = (reinterpret_cast<uintptr_t>(p) + bytes) / page * page;
+    if (end <= begin) return;
+#if defined(__linux__)
+    madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
+#else
+    madvise(reinterpret_cast<void*>(begin), end - begin, MADV_FREE);
+#endif
+#else
+    (void)p;
+    (void)bytes;
 #endif
 }
 
