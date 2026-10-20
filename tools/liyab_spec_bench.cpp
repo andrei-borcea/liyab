@@ -14,10 +14,13 @@
 // is). Suffix drafts verify the likeliest nodes of the drafter's
 // continuation tree (EngineConfig::draft_tree); ":linear" only its best
 // branch. The first mode is the reference (plain). Every mode has an engine of
-// its own, unpaced, and the tasks run in
-// this order, each on all modes back to back (so the modes share the load of
-// the host), each a new conversation formatted by the model's chat template
-// (thinking off where the template has the switch):
+// its own, unpaced, and only one engine is alive at a time: each plans its
+// memory (a MoE model's expert cache, locked in RAM) as if it were alone, so
+// several at once overcommit the device. A mode runs every task on its engine
+// in this order, then frees it; the modes take turns in the other order on
+// every second repetition, so drift of the host's load (heat) evens out. Each
+// task is a new conversation formatted by the model's chat template (thinking
+// off where the template has the switch):
 //   code     the model rewrites a code block with one change;
 //   summary  a summary of a pasted text;
 //   tool     two turns, each with the same tool output, the second asking
@@ -287,14 +290,15 @@ int main(int argc, char** argv) {
     if (!tasks_arg.empty()) {
         std::erase_if(tasks, [&](const Task& t) { return ("," + tasks_arg + ",").find("," + t.name + ",") == std::string::npos; });
     }
-    // results[rep][mode][task]. Every mode has its engine for the whole
-    // repetition (each keeps what its conversations left), and each task runs
-    // on all modes back to back, so the modes see the same load on the host.
+    // results[rep][mode][task]. One engine at a time (see the top of this
+    // file): a mode's engine keeps what its conversations left for the whole
+    // repetition, then is freed before the next mode's is made.
     std::vector<std::vector<std::vector<Result>>> results(
         static_cast<size_t>(repeats), std::vector<std::vector<Result>>(modes.size(), std::vector<Result>(tasks.size())));
     for (int32_t rep = 0; rep < repeats; ++rep) {
-        std::vector<std::unique_ptr<Engine>> engines;
-        for (const Mode& mode : modes) {
+        for (size_t i = 0; i < modes.size(); ++i) {
+            const size_t m = rep % 2 == 0 ? i : modes.size() - 1 - i;
+            const Mode& mode = modes[m];
             EngineConfig config = base;
             config.lookup_drafts = mode.lookup || mode.suffix;
             config.suffix_drafts = mode.suffix;
@@ -302,19 +306,17 @@ int main(int argc, char** argv) {
             config.adaptive_drafts = !mode.fixed;
             config.draft_tree = !mode.linear;
             if (mode.self) config.draft_model_path = base.model_path;
-            auto engine = Engine::create(config);
-            if (!engine) {
-                std::fprintf(stderr, "%s\n", engine.status().to_string().c_str());
+            auto created = Engine::create(config);
+            if (!created) {
+                std::fprintf(stderr, "%s\n", created.status().to_string().c_str());
                 return 1;
             }
-            engines.push_back(std::move(engine).value());
-        }
-        for (size_t t = 0; t < tasks.size(); ++t) {
-            for (size_t m = 0; m < modes.size(); ++m) {
+            const std::unique_ptr<Engine> engine = std::move(created).value();
+            for (size_t t = 0; t < tasks.size(); ++t) {
                 Result& r = results[static_cast<size_t>(rep)][m][t];
-                if (!run(*engines[m], tasks[t], max_tokens, r)) return 1;
+                if (!run(*engine, tasks[t], max_tokens, r)) return 1;
                 std::fprintf(stderr, "run %d, %s / %s: %d tokens, %.1f tok/s\n", rep + 1, tasks[t].name.c_str(),
-                             modes[m].name.c_str(), r.tokens, r.tokens * 1000.0 / r.decode_ms);
+                             mode.name.c_str(), r.tokens, r.tokens * 1000.0 / r.decode_ms);
             }
         }
     }
