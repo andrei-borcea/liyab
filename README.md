@@ -560,7 +560,9 @@ available memory or of `memory_budget_mb`.
   * **Batch-aware.** For a multi-token pass (prefill), experts are rearranged into the i8mm layouts on the I/O
     thread as they arrive. Prefill runs in passes of 1,024 tokens, each reading the union of its tokens' experts
     once. Such passes give the experts no LFU credit, so a long prompt does not evict the experts a conversation
-    keeps using.
+    keeps using. A pass of [several sequences](#context-memory-and-serving)' decoding steps, one token each, is
+    decoding: their experts are read in the file's layout and credited as a single sequence's are (served as a
+    prefill, two sequences on Qwen3-30B-A3B decoded at 0.60x the speed of taking turns; as decoding, 0.96x).
   * **Deterministic.** Each token's expert outputs are added in router order, whatever order they arrived in, and a
     repacked expert rounds like one in the file's layout. Results therefore depend neither on I/O timing nor on what
     the cache held: streamed and in-place experts give bit-identical logits (tested).
@@ -887,11 +889,14 @@ each of those as a scheduling problem.
     | Qwen2.5-0.5B F16, CPU | 1.14x | 1.20x | 1.24x | 38.1 tok/s, 69.9 |
     | Qwen3-0.6B BF16, CPU | 1.10x | 1.21x | 1.29x | 30.3 tok/s, 55.3 |
     | Llama 3.2 1B BF16, CPU | 1.11x | 1.18x | 1.18x | 14.3 tok/s, 25.6 |
+    | Qwen3-30B-A3B Q4_K_M, experts streamed (2 GiB cache), CPU | 0.96x | | 1.01x | 7.7 tok/s, 17.9 |
 
     Quantized weights gain most: their kernels decode a block of weights once for four rows. F16 and BF16 weights
     are dotted row by row, so a row more costs almost a row's time ([next](#roadmap)). On the GPU a pass's fixed
-    cost dominates and is paid once for all. Each sequence decodes slower than alone, since a pass of more rows
-    takes longer: the reason background steps join the user's passes only when that costs little. Drafts or a
+    cost dominates and is paid once for all. A MoE whose experts stream from storage reads the union of the
+    experts its sequences choose, and with 8 of 128 per token they have few in common: a shared pass (64 tokens
+    per sequence there) costs about as much as the passes it replaces, a draw. Each sequence decodes slower than alone, since a pass of more
+    rows takes longer: the reason background steps join the user's passes only when that costs little. Drafts or a
     shared pass: with `lookup_drafts` on new text, the same generations in turns went no faster (Qwen2.5 Q8_0:
     222 tok/s with drafts, 223 without), and two sequences together gave 1.42x over the turns with drafts; drafts pay on repeated text
     (`liyab-spec-bench`), so a sequence alone keeps them, and sequences together share plain steps.

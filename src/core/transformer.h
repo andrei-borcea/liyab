@@ -960,6 +960,9 @@ private:
     std::vector<AdapterRows> adapter_rows_;
     bool logits_rows_ = false;  // forward_batch()'s logits pass: adapters by adapter_rows_
     bool adapters_in_pass_ = false;
+    // forward_batch() of one token per sequence: decoding steps, which the
+    // expert store serves as decoding (moe_ffn), however many rows the pass has.
+    bool steps_only_ = false;
     // Tree pass (forward_tree): per token its depth, its parent (-1: the
     // root) and the batch index of its ancestor at each depth up to its own
     // (tree_ancestors_[t * tree_stride_ + d]), which attention reads the rows

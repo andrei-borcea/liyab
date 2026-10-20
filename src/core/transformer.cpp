@@ -3003,7 +3003,13 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     const bool fused = c.blocks[static_cast<size_t>(layer)].fused_gate_up;  // experts as [gate | up] and down
 
     PhaseTimer router_timer(phases_.router);
-    if (expert_store_ != nullptr) expert_store_->set_batch(n > 1);  // its reads are repacked for batched kernels
+    // A pass of several tokens of one sequence (a prompt, a speculative step)
+    // runs each expert over many of them: the store repacks its reads for the
+    // batched kernels and does not count those uses. Decoding steps of several
+    // sequences (steps_only_) are decoding: they choose few experts in common,
+    // so an expert runs over a token or two, a repack would only delay the
+    // read a miss waits for, and their uses are what the cache should keep.
+    if (expert_store_ != nullptr) expert_store_->set_batch(n > 1 && !steps_only_);
     router_.resize(un * E);
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
 
@@ -4121,6 +4127,11 @@ Status Transformer::forward_batch(std::span<const BatchItem> items, const Route&
     const auto un = static_cast<size_t>(total);
     size_batch(total);
     LIYAB_RETURN_IF_ERROR(embed(batch_tokens_, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
+    struct StepsOnly {
+        bool& flag;
+        ~StepsOnly() { flag = false; }
+    } steps_only{steps_only_};
+    steps_only_ = std::all_of(segs_.begin(), segs_.end(), [](const Segment& s) { return s.n == 1; });
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
     const std::atomic<bool>* cancel = hooks != nullptr ? hooks->cancel : nullptr;
     FfnMatmulHook* ffn_hook = hooks != nullptr ? hooks->ffn_matmul : nullptr;
