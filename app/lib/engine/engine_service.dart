@@ -30,6 +30,7 @@ class LoadOptions {
     this.experimental = const {},
     this.adapters = const {},
     this.lanes = const {},
+    this.laneIdleClose = const Duration(seconds: 5),
   });
 
   final String modelPath;
@@ -59,12 +60,20 @@ class LoadOptions {
   /// LoadedModel.adapterErrors; the model loads all the same. A generation selects one by name (generate).
   final Map<String, String> adapters;
 
-  /// Lanes besides the main one, by name: their priority (LiyabSequencePriority). Each is a sequence of the
-  /// engine (liyab_sequence_open: a context of its own) with a worker isolate of its own, so its generations run
-  /// alongside the main lane's, which the engine decodes together (generate's `lane`). Each costs what a sequence
-  /// does (EngineConfig::max_sequences): KV pages as it uses them, and on hybrid models its recurrent states and
-  /// snapshots, set aside from the expert cache at load. Empty: one sequence, as before.
+  /// Lanes besides the main one, by name: their priority (LiyabSequencePriority). Each has a worker isolate of
+  /// its own and, while it has work, a sequence of the engine (liyab_sequence_open: a context of its own), so its
+  /// generations run alongside the main lane's, which the engine decodes together (generate's `lane`). The engine
+  /// is created with room for them (EngineConfig::max_sequences: a ceiling, nothing is set aside at load), and a
+  /// lane's sequence is opened only when a generation arrives there and closed once the lane has been idle for
+  /// laneIdleClose: an idle lane holds no memory, and the model loads and runs exactly as with no lanes. A
+  /// sequence costs KV pages as it uses them and, on hybrid models, its recurrent states and snapshots, which the
+  /// engine borrows from the expert cache while it is open. Empty: one sequence, as before.
   final Map<String, int> lanes;
+
+  /// How long a lane stays open with nothing running or queued before its sequence closes (its context set aside
+  /// in the prefix cache, its memory back to the expert cache). A short grace keeps a client's back-to-back
+  /// requests (an agent's tool loop) from opening and closing it at every turn.
+  final Duration laneIdleClose;
 }
 
 /// A LoRA adapter loaded next to the model (liyab_adapter_info).
@@ -260,23 +269,27 @@ const _metadataKeys = [
 
 /// A command waiting for the worker isolate.
 class _Job {
-  _Job(this.id, this.message, {required this.background});
+  _Job(this.id, this.message, {required this.background, this.control = false});
   final int id;
   final List<Object?> message;
   final bool background;
+  final bool control; // a lane's 'open' or 'close': its reply is handled by its _pending callback
 }
 
-/// A lane (LoadOptions.lanes): a sequence of the engine and the worker isolate that runs its generations, one at a
-/// time, alongside the main worker's commands.
+/// A lane (LoadOptions.lanes): the worker isolate that runs its generations, one at a time, alongside the main
+/// worker's commands, on a sequence of the engine it opens when work arrives and closes once idle.
 class _Lane {
-  _Lane(this.name, this.commands, this.replies, this.isolate);
+  _Lane(this.name, this.priority, this.idleClose, this.commands, this.replies, this.isolate);
   final String name;
+  final int priority; // LiyabSequencePriority
+  final Duration idleClose;
   final SendPort commands;
   final ReceivePort replies;
   final Isolate isolate;
-  int sequence = 0; // address of its liyab_sequence once open
+  int sequence = 0; // address of its liyab_sequence while open
   final List<_Job> queue = [];
   _Job? running;
+  Timer? idle; // closes the sequence when it fires
 }
 
 class EngineService {
@@ -337,24 +350,79 @@ class EngineService {
     }
     for (final lane in _lanes.values) {
       if (lane.running?.id != id) continue;
+      if (lane.running!.control) return; // its _pending callback goes on
       lane.running = null;
       _pumpLane(lane);
       return;
     }
   }
 
+  /// Runs a lane's next step: its sequence opened before its first generation, its generations one at a time,
+  /// and, once nothing runs or waits there for laneIdleClose, its sequence closed. The API is stateless across
+  /// requests (each carries its whole history, and the prefix cache keeps what a closed sequence set aside), so
+  /// closing loses nothing, and an idle lane holds no engine memory.
   void _pumpLane(_Lane lane) {
-    if (lane.running != null || lane.queue.isEmpty) return;
+    if (lane.running != null) return;
+    if (lane.queue.isEmpty) {
+      if (lane.sequence != 0 && lane.idle == null) {
+        lane.idle = Timer(lane.idleClose, () {
+          lane.idle = null;
+          if (_lanes[lane.name] != lane || lane.running != null || lane.queue.isNotEmpty || lane.sequence == 0) return;
+          _laneControl(lane, (id) => ['close', id], (_) => lane.sequence = 0);
+        });
+      }
+      return;
+    }
+    lane.idle?.cancel();
+    lane.idle = null;
+    if (lane.sequence == 0) {
+      _laneControl(lane, (id) => ['open', id, _engine, lane.priority], (result) {
+        if (result is int && result != 0) {
+          lane.sequence = result;
+          return;
+        }
+        // The engine could not open it (the expert cache cannot spare its memory: OutOfMemory): its generations
+        // run on the main lane instead, after what is queued there, and replace the main lane's context.
+        if (_lanes[lane.name] != lane) return; // unloading: _closeLane fails what is queued
+        final why = result is EngineException ? result.message : 'lane ${lane.name} not opened';
+        final moved = List<_Job>.of(lane.queue);
+        lane.queue.clear();
+        onLaneFallback?.call(lane.name, why);
+        moved.forEach(_enqueue);
+      });
+      return;
+    }
     final next = lane.queue.removeAt(0);
     lane.running = next;
     lane.commands.send(next.message);
   }
 
-  /// Whether lane `name` is open: generate's `lane` runs there, else on the main lane.
-  bool hasLane(String name) => (_lanes[name]?.sequence ?? 0) != 0;
+  /// Sends a lane's 'open' or 'close' (built with its id), runs `done` with the reply, then the lane's next step.
+  void _laneControl(_Lane lane, List<Object?> Function(int id) message, void Function(Object? result) done) {
+    final id = _nextId++;
+    final m = message(id);
+    lane.running = _Job(id, m, background: false, control: true);
+    _pending[id] = (result) {
+      lane.running = null;
+      done(result);
+      if (_lanes[lane.name] == lane) _pumpLane(lane);
+    };
+    lane.commands.send(m);
+  }
 
-  /// Opens the lanes of a loaded engine: a worker isolate each, which opens the engine's sequence.
-  Future<void> _openLanes(Map<String, int> lanes) async {
+  /// Called when a lane's sequence could not be opened and its generations moved to the main lane (`why`: the
+  /// engine's message): they replace the main lane's context from then on.
+  void Function(String lane, String why)? onLaneFallback;
+
+  /// Whether lane `name` exists (LoadOptions.lanes): generate's `lane` runs there, else on the main lane.
+  bool hasLane(String name) => _lanes.containsKey(name);
+
+  /// Whether lane `name` holds a sequence of the engine now (it has work, or had some less than laneIdleClose ago).
+  bool laneOpen(String name) => (_lanes[name]?.sequence ?? 0) != 0;
+
+  /// Starts the lanes of a loaded engine: a worker isolate each. Their sequences open when work arrives
+  /// (_pumpLane).
+  Future<void> _openLanes(Map<String, int> lanes, Duration idleClose) async {
     for (final MapEntry(key: name, value: priority) in lanes.entries) {
       final replies = ReceivePort();
       final ready = Completer<SendPort>();
@@ -367,19 +435,8 @@ class EngineService {
         }
         _onReply(message as List<Object?>);
       });
-      lane = _Lane(name, await ready.future, replies, isolate);
+      lane = _Lane(name, priority, idleClose, await ready.future, replies, isolate);
       _lanes[name] = lane;
-      final id = _nextId++;
-      final opened = Completer<Object?>();
-      _pending[id] = opened.complete;
-      lane.running = _Job(id, const [], background: false);
-      lane.commands.send(['open', id, _engine, priority]);
-      final result = await opened.future;
-      if (result is EngineException || result is! int) {
-        await _closeLane(lane);
-        throw result is EngineException ? result : EngineException('lane $name not opened');
-      }
-      lane.sequence = result;
     }
   }
 
@@ -392,6 +449,21 @@ class EngineService {
 
   Future<void> _closeLane(_Lane lane) async {
     _lanes.remove(lane.name);
+    lane.idle?.cancel();
+    lane.idle = null;
+    // An 'open' or 'close' in flight: its reply first (a sequence it opened is closed below).
+    final control = lane.running;
+    if (control != null && control.control) {
+      final previous = _pending[control.id];
+      if (previous != null) {
+        final replied = Completer<void>();
+        _pending[control.id] = (result) {
+          previous(result);
+          replied.complete();
+        };
+        await replied.future;
+      }
+    }
     for (final job in lane.queue) {
       _streams.remove(job.id)
         ?..addError(EngineException('the model was unloaded'))
@@ -505,7 +577,7 @@ class EngineService {
         ['load', o.modelPath, o.backend, o.contextLength, o.skinThresholdC, o.memoryBudgetMb, o.experimental, o.powerProfile,
           o.prefixCacheDir, o.prefixCacheDiskMb, o.cacheDir, o.adapters, 1 + o.lanes.length]);
     _engine = r[0] as int;
-    await _openLanes(o.lanes);
+    await _openLanes(o.lanes, o.laneIdleClose);
     final plan = r[4] as List<Object?>;
     return LoadedModel(
         description: r[1] as String,
@@ -644,13 +716,12 @@ class EngineService {
     final id = _nextId++;
     final on = lane != null && hasLane(lane) ? _lanes[lane] : null;
     void stop() {
-      if (on != null) {
-        if (on.running?.id == id && on.sequence != 0) {
-          LiyabLib.instance.sequenceCancel(Pointer<Void>.fromAddress(on.sequence)); // this generation only
-        } else if (on.queue.any((j) => j.id == id)) {
-          on.queue.removeWhere((j) => j.id == id);
-          _streams.remove(id)?.close();
-        }
+      // On its lane, or on the main lane (never queued on a lane, or moved there: onLaneFallback).
+      if (on != null && on.running?.id == id && on.sequence != 0) {
+        LiyabLib.instance.sequenceCancel(Pointer<Void>.fromAddress(on.sequence)); // this generation only
+      } else if (on != null && on.queue.any((j) => j.id == id)) {
+        on.queue.removeWhere((j) => j.id == id);
+        _streams.remove(id)?.close();
       } else if (_running?.id == id) {
         cancel();
       } else if (_queue.any((j) => j.id == id)) {
@@ -753,7 +824,8 @@ void _worker(SendPort replies) {
               ..skinThresholdC = m[5] as double
               ..memoryBudgetMb = m[6] as int // per-app OS caps (HyperOS: 6 GiB PSS) are invisible to the engine
               ..prefixCacheDiskMb = m[10] as int
-              ..maxSequences = m[13] as int; // the main lane's sequence and one per other lane
+              // The main lane's sequence and one per other lane: a ceiling (a lane's opens only while it works).
+              ..maxSequences = m[13] as int;
             final prefixDir = m[9] as String?;
             if (prefixDir != null) config.ref.prefixCacheDir = prefixDir.toNativeUtf8(allocator: arena);
             final cacheDir = m[11] as String?;

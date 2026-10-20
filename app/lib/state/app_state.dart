@@ -344,6 +344,12 @@ class AppState extends ChangeNotifier implements ApiBackend {
       ..logBufferEnable(256 * 1024);
     final state = AppState._(
         await EngineService.start(), await SharedPreferences.getInstance(), await Downloads.start());
+    // An API request whose lane could not get a sequence (the expert cache could not spare its memory) runs on the
+    // main lane: the engine's context is then not the chat's.
+    state.engine.onLaneFallback = (lane, why) {
+      state._chatContext = false;
+      state._log('API request on the main lane: no sequence of its own ($why)');
+    };
     final last = state.device.lastModel;
     final usable = last != null && File(last).existsSync();
     if (hidden) {
@@ -361,7 +367,8 @@ class AppState extends ChangeNotifier implements ApiBackend {
   // The local API (lib/api/local_api.dart): this state is its backend.
   LocalApi? _api;
 
-  // The engine lane other apps' generations run on (LoadOptions.lanes), opened at load while the API is on.
+  // The engine lane other apps' generations run on (LoadOptions.lanes), set up at load while the API is on. Its
+  // sequence (and the memory it holds) exists only while requests run there, and a few seconds after.
   static const _apiLane = 'api';
 
   /// Whether the local API is listening, and why not when it should be.
@@ -428,8 +435,9 @@ class AppState extends ChangeNotifier implements ApiBackend {
   @override
   Generation generate(String prompt, SamplingOptions sampling,
       {String? grammar, Continuation Function(String generated)? structure, String adapter = ''}) {
-    // On the API's lane, the chat's context stays the chat's. Without one (the API switched on after the model
-    // loaded), queued after anything the chat queued: the engine's context is this request's once it ran.
+    // On the API's lane, the chat's context stays the chat's (should the lane's sequence not open, the request
+    // moves to the main lane: onLaneFallback). Without one (the API switched on after the model loaded), queued
+    // after anything the chat queued: the engine's context is this request's once it ran.
     final lane = engine.hasLane(_apiLane);
     if (!lane) _chatContext = false;
     final generation =
@@ -566,8 +574,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
         adapters: await _adapterFiles(),
         // With the local API on, other apps' requests get a sequence of their own: they run alongside the chat
         // (the engine decodes both together) instead of replacing its context, and yield to it (background
-        // priority: the chat's steps go first). Its memory is set aside at load, so the switch counts from the
-        // next load.
+        // priority: the chat's steps go first). The lane is set up at load (so the switch counts from the next
+        // load), but its sequence opens only when a request arrives and closes once the lane is idle: the model
+        // loads and the chat runs exactly as with the API off (same expert cache, no requantization), and a
+        // request's state memory is borrowed from the expert cache only while it runs.
         lanes: device.apiEnabled ? const {_apiLane: LiyabSequencePriority.background} : const {},
       ));
       adapters = model.adapters;
