@@ -559,10 +559,6 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         if (c.rope_base_swa > 0.0f) L.rope_table = 1;
     }
 
-    model->extra_context_bytes_ =
-        static_cast<size_t>(std::max(options.extra_contexts, 0)) *
-        static_cast<size_t>(1 + kStateSnapshots + std::max(options.extra_rollback_window, 0)) *
-        model->recurrent_state_bytes();
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(
             model->attach_expert_store(options.expert_cache_bytes, options.memory_budget_bytes, options.reserve_bytes,
@@ -794,6 +790,10 @@ Status Transformer::bind_weights() {
                       0.0f);
     }
     return Status::ok();
+}
+
+size_t Transformer::context_state_bytes() const noexcept {
+    return static_cast<size_t>(1 + kStateSnapshots + std::max(rollback_window_, 0)) * recurrent_state_bytes();
 }
 
 size_t Transformer::recurrent_state_bytes() const noexcept {
@@ -2763,11 +2763,13 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     // the KV cache, activations and the rest of the app: 1 GiB of free RAM,
     // or 512 MiB inside an explicit budget (the embedder already left its own
     // headroom below the platform's cap). Recurrent-state snapshots
-    // (snapshot_state) come out of the cache too.
-    // Contexts besides the live one (TransformerOptions::extra_contexts)
-    // each hold their recurrent states, snapshots and checkpoints too.
+    // (snapshot_state) come out of the cache too. Only the live context's:
+    // contexts made later (make_context(), the engine's other sequences)
+    // borrow theirs from the cache while they exist (ExpertStore::lend(),
+    // context_state_bytes()), so the plan, and with it the requantization
+    // decision, never depends on how many might be made.
     const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
-                          static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes() + extra_context_bytes_;
+                          static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
     // The budget came without the reserve (TransformerOptions::reserve_bytes),
     // which the loader set aside when it decided to stream; the cache plans
     // with it and hands back only what it can spare.

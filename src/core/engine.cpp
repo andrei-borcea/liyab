@@ -278,12 +278,9 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.latent_form = config.latent_form == LatentAttentionForm::Absorbed   ? LatentForm::Absorbed
                           : config.latent_form == LatentAttentionForm::Expanded ? LatentForm::Expanded
                                                                                 : LatentForm::Auto;
-    // The engine's other sequences (EngineConfig::max_sequences; none with a
-    // draft model), with the rollback window lookup drafts give them.
-    if (config.draft_model_path.empty()) {
-        options.extra_contexts = std::max(config.max_sequences, 1) - 1;
-        options.extra_rollback_window = config.lookup_drafts && config.draft_tokens > 0 ? config.draft_tokens + 1 : 0;
-    }
+    // EngineConfig::max_sequences plays no part here: the plan is the one of
+    // a single conversation, and each sequence opened later borrows its
+    // memory from the expert cache (Engine::open_sequence).
     return Transformer::load(std::move(file).value(), options);
 }
 
@@ -314,6 +311,11 @@ struct Engine::Impl {
         // Its transformer state while another sequence's is live; an empty
         // Context while its own is.
         std::unique_ptr<Transformer::Context> parked;
+        // What it borrowed from the expert cache for its recurrent states,
+        // snapshots and checkpoints (open_sequence(); empty for the default
+        // sequence, planned at load, and for models without streamed
+        // experts), repaid when it closes.
+        ExpertStore::Loan loan;
         // Tokens whose KV / recurrent state its context holds, in order
         // (n_past() == context.size()); context lookup drafts from it. Not
         // used with a draft model, whose cache moves in step with the target's
@@ -1804,7 +1806,16 @@ struct Engine::Impl {
             LIYAB_LOG_INFO("sequences: %d closed (%zu open)", id, seqs.size());
         }
         call.unlock();
+        const ExpertStore::Loan loan = gone != nullptr ? std::move(gone->loan) : ExpertStore::Loan{};
         gone.reset();  // its KV pages and recurrent states
+        // Their memory back to the expert cache, once freed (never both held
+        // at once). Without the model lock: other sequences decode meanwhile.
+        if (ExpertStore* store = target->expert_store(); store != nullptr && loan.bytes > 0) {
+            store->repay(loan);
+            LIYAB_LOG_INFO("sequences: %.1f MiB back to the expert cache (%.2f GiB)",
+                           static_cast<double>(loan.bytes) / (1024.0 * 1024.0),
+                           static_cast<double>(store->capacity_bytes()) / (1024.0 * 1024.0 * 1024.0));
+        }
     }
 
     // Engine::set_adapter / Sequence::set_adapter, the call held on q.
@@ -2853,7 +2864,10 @@ int32_t Engine::context_length() const noexcept { return impl_->target->context_
 
 Engine::MemoryPlan Engine::memory_plan() const {
     const Transformer::MemoryPlan& p = impl_->target->memory_plan();
-    return {p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};
+    // The cache as it is now: the plan's, minus what open sequences borrowed.
+    const ExpertStore* store = impl_->target->expert_store();
+    return {p.resident_bytes, p.expert_bytes, store != nullptr ? store->capacity_bytes() : p.expert_cache_bytes,
+            p.recommended_bytes, p.requant_bits};
 }
 
 size_t Engine::trim_memory() {
@@ -3099,10 +3113,32 @@ Result<std::unique_ptr<Engine::Sequence>> Engine::open_sequence(SequencePriority
         const std::lock_guard<std::mutex> g(s.sched);
         if (s.seqs.size() >= most) return Status(ErrorCode::Busy, "every sequence is open (EngineConfig::max_sequences)");
     }
+    // The memory its context will hold beyond KV pages (which it maps as it
+    // uses them) comes out of the expert cache now, before it is allocated,
+    // and goes back when it closes: an engine with no sequence open keeps the
+    // plan of a single conversation, whatever max_sequences allows. Under the
+    // model lock no pass runs, so the store waits only for reads in flight.
+    // A cache that cannot spare it refuses (OutOfMemory) rather than
+    // overcommit; nothing is ever requantized here (that is a load-time
+    // decision).
+    ExpertStore::Loan loan;
+    ExpertStore* store = s.target->expert_store();
+    if (const size_t bytes = s.target->context_state_bytes(); store != nullptr && bytes > 0) {
+        auto lent = store->lend(bytes);
+        if (!lent) return lent.status();
+        loan = std::move(lent).value();
+        LIYAB_LOG_INFO("sequences: %.1f MiB of the expert cache for a sequence's states (%.2f GiB left)",
+                       static_cast<double>(loan.bytes) / (1024.0 * 1024.0),
+                       static_cast<double>(store->capacity_bytes()) / (1024.0 * 1024.0 * 1024.0));
+    }
     auto context = s.target->make_context();
-    if (!context) return context.status();
+    if (!context) {
+        if (store != nullptr) store->repay(loan);
+        return context.status();
+    }
     auto q = std::make_unique<Impl::Seq>();
     q->priority.store(static_cast<int32_t>(priority), std::memory_order_relaxed);
+    q->loan = std::move(loan);
     q->parked = std::move(context).value();
     const std::lock_guard<std::mutex> g(s.sched);
     q->id = s.next_sequence_id++;

@@ -264,12 +264,16 @@ struct EngineConfig {
     bool draft_tree = true;
     // Sequences the engine keeps at once, its default one included (see
     // Engine::open_sequence): 1 (the default) keeps one conversation, as
-    // before, and open_sequence() is Unsupported. Each one past the first
-    // keeps a context of its own (KV pages as it uses them, up to
-    // context_length() positions; on hybrid models its recurrent states and
-    // up to 4 state snapshots, 62.8 MiB each on Qwen3.6-35B-A3B, set aside at
-    // load from the expert cache's budget as the default context's are).
-    // Unsupported with a draft model (its cache follows one sequence).
+    // before, and open_sequence() is Unsupported. A ceiling only: nothing is
+    // reserved at load, so while no sequence besides the default one is
+    // open the engine is exactly the engine of max_sequences 1 (the same
+    // memory plan, expert cache, requantization decision and output). Each
+    // sequence opened keeps a context of its own while it is open: KV pages
+    // as it uses them (up to context_length() positions) and, on hybrid
+    // models, its recurrent states, rollback checkpoints and up to 4 state
+    // snapshots (62.8 MiB each on Qwen3.6-35B-A3B), which open_sequence()
+    // takes out of the expert cache (see there). Unsupported with a draft
+    // model (its cache follows one sequence).
     int32_t max_sequences = 1;
 };
 
@@ -641,10 +645,12 @@ public:
     size_t trim_memory();
 
     // How a MoE model with streamed experts uses memory; all zero otherwise.
+    // Planned at load for one conversation, whatever max_sequences allows.
+    // Thread-safe.
     struct MemoryPlan {
         uint64_t resident_bytes = 0;      // weights kept in RAM (after any requantization)
         uint64_t expert_bytes = 0;        // routed experts read from storage
-        uint64_t expert_cache_bytes = 0;  // RAM caching experts
+        uint64_t expert_cache_bytes = 0;  // RAM caching experts now: the load's plan minus what open sequences borrowed
         uint64_t recommended_bytes = 0;   // memory budget at which most expert uses would come from RAM
         int32_t requant_bits = 0;         // resident Q8_0 matrices converted at load (4 / 5); 0: none
     };
@@ -904,8 +910,24 @@ public:
     //  * embed(), rerank(), save_state(), load_state() and segment reuse
     //    work on the default sequence; while one runs, the others' passes
     //    wait for it.
+    //  * Memory: an open sequence's context exists only while it is open.
+    //    Its KV pages are mapped as it uses them. On a hybrid model with
+    //    streamed experts, open_sequence() first takes its recurrent states,
+    //    rollback checkpoints and snapshots (their most) out of the expert
+    //    cache, in whole cache slots: the experts there are evicted (waiting
+    //    for reads in flight; other sequences keep decoding on the rest of
+    //    the cache) and their pages returned to the OS, so the engine's
+    //    footprint does not grow; closing the sequence frees its context and
+    //    gives those slots back (MemoryPlan::expert_cache_bytes shows the
+    //    cache in use). Nothing is ever requantized after load. Without
+    //    streamed experts, or on models without recurrent state, the
+    //    context is simply allocated on open and freed on close.
     // Unsupported with max_sequences 1 or a draft model; Busy when
-    // max_sequences are open.
+    // max_sequences are open; OutOfMemory when the expert cache cannot spare
+    // the sequence's states without going below its minimum (a block's
+    // top-k plus the reads in flight per slot size class), in which case
+    // nothing changes. Thread-safe; it waits for a pass running on other
+    // sequences to end.
     class Sequence;
     Result<std::unique_ptr<Sequence>> open_sequence(SequencePriority priority = SequencePriority::Foreground);
     // How sequences shared passes since the engine was created. Thread-safe.

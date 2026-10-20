@@ -176,14 +176,6 @@ struct TransformerOptions {
     // Latent attention (DeepSeek-V2/V3 and models converted alike): the
     // form passes attend in. Ignored by other models.
     LatentForm latent_form = LatentForm::Auto;
-    // Contexts the embedder will make besides the live one (make_context():
-    // the engine's sequences), and the rollback window it will give them.
-    // Only for the memory plan of a MoE whose experts stream: each one's
-    // recurrent states, kStateSnapshots snapshots and rollback checkpoints
-    // (hybrid models) come out of the expert cache, as the live context's
-    // snapshots do. 0: none (the plan of a single context).
-    int32_t extra_contexts = 0;
-    int32_t extra_rollback_window = 0;
 };
 
 class Transformer {
@@ -311,6 +303,15 @@ public:
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
     // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
+    // The most a context made now (make_context()) holds besides its KV
+    // pages, which it maps as it uses them: its recurrent states, its
+    // rollback checkpoints (the rollback window set now) and up to
+    // kStateSnapshots snapshots. 0 for plain transformers. The load-time
+    // memory plan counts only the live context's; an embedder that keeps
+    // more contexts takes this much out of the expert cache for each while
+    // it exists (ExpertStore::lend()), so a model with one context plans
+    // exactly as it always has.
+    [[nodiscard]] size_t context_state_bytes() const noexcept;
     // Whether the context carries a state bound to its position, beyond KV
     // rows any prefix of it can be cut from: recurrent (DeltaNet) states, or
     // the rows of the last window of windowed attention blocks, whose older
@@ -405,7 +406,8 @@ public:
     // which changes as the user edits). At most kStateSnapshots are kept: the
     // oldest (usually the system prompt), the last pinned one, and the two
     // newest others; their memory is set aside from the expert cache budget
-    // at load. Without a pinned slot, drafts typed ahead replaced the end of
+    // at load (a context made later borrows its own, context_state_bytes()).
+    // Without a pinned slot, drafts typed ahead replaced the end of
     // the conversation, and an edit before it fell back to the system prompt
     // (2838 tokens processed again, 151 s on a 35B MoE). Two others, because
     // a draft is prepared twice: its words, then the whole message as it
@@ -986,7 +988,6 @@ private:
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
     MemoryPlan memory_plan_;
-    size_t extra_context_bytes_ = 0;  // TransformerOptions::extra_contexts' recurrent states, set aside at load
     int64_t decode_steps_ = 0;  // expert cache aging clock
     PhaseTimes phases_;
     int32_t rollback_window_ = 0;

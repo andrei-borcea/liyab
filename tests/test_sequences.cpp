@@ -1186,6 +1186,323 @@ TEST_CASE("Engine sequences under one grammar at once: each output valid and its
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sequence memory: borrowed from the expert cache while a sequence is open
+// ---------------------------------------------------------------------------
+namespace {
+
+// A hybrid (DeltaNet) mixture of experts, as Qwen3.6-35B-A3B: recurrent
+// states per sequence and streamed experts.
+test::TinyModelSpec hybrid_moe_spec() {
+    test::TinyModelSpec s;
+    s.arch = "qwen35moe";
+    s.n_layers = 4;
+    s.delta_net_interval = 2;
+    s.n_expert = 64;
+    s.n_expert_used = 4;
+    s.identical_experts = false;
+    return s;
+}
+
+// The expert cache in use now, from the engine's public plan.
+uint64_t cache_bytes(const Engine& engine) { return engine.memory_plan().expert_cache_bytes; }
+
+// One acquired expert holds the file's bytes (its slot was not released or
+// reused under its user).
+bool expert_intact(const Transformer& model, ExpertStore& store, int32_t layer, int32_t expert) {
+    auto views = store.acquire(layer, expert);
+    if (!views) return false;
+    bool ok = true;
+    int32_t compared = 0;
+    const char* names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    for (size_t m = 0; m < 3; ++m) {
+        const TensorView& v = (*views)[m];
+        if (v.data == nullptr) continue;
+        const TensorView* t = model.file().tensor("blk." + std::to_string(layer) + "." + names[m] + ".weight");
+        if (t == nullptr || t->data == nullptr) return false;
+        const uint8_t* want = t->data + static_cast<size_t>(expert) * v.nbytes;
+        if (std::memcmp(v.data, want, v.nbytes) != 0) ok = false;
+        ++compared;
+    }
+    store.release(layer, expert);
+    return ok && compared > 0;
+}
+
+}  // namespace
+
+TEST_CASE("Sequence memory: with no sequence open, max_sequences changes nothing (plan, cache, requant, output)") {
+    struct Model {
+        const char* name;
+        test::TinyModelSpec spec;
+        int64_t expert_cache_mb;
+    };
+    test::TinyModelSpec moe_q8 = hybrid_moe_spec();
+    moe_q8.n_embd = 256;  // Q8_0 matrices of 256 columns: requant_bits -1 converts them under a tight cache
+    for (const Model& m : {Model{"dense", {}, -1}, Model{"hybrid", hybrid_spec(), -1},
+                           Model{"hybrid moe streamed", hybrid_moe_spec(), 8},
+                           Model{"hybrid moe streamed tight", moe_q8, 1}}) {
+        const std::string path = model_path(std::string("mem_") + m.name, m.spec);
+        std::string out[2];
+        Engine::MemoryPlan plans[2];
+        int i = 0;
+        for (const int32_t sequences : {1, 4}) {
+            EngineConfig config = engine_config(path, sequences);
+            config.expert_cache_mb = m.expert_cache_mb;
+            config.requant_bits = -1;  // automatic: the decision a reservation at load used to flip
+            config.lookup_drafts = true;
+            auto engine = Engine::create(config);
+            REQUIRE(engine.has_value());
+            plans[i] = engine.value()->memory_plan();
+            Job job;
+            job.prompt = "hello world, a quick brown fox";
+            job.params = greedy(24);
+            run_job(*engine.value(), job);
+            CHECK(job.status.is_ok());
+            out[i] = job.out;
+            // Still the same after a sequence came and went.
+            if (sequences > 1 && m.expert_cache_mb != 1) {
+                auto seq = engine.value()->open_sequence();
+                REQUIRE(seq.has_value());
+                seq.value().reset();
+                const Engine::MemoryPlan after = engine.value()->memory_plan();
+                CHECK(after.expert_cache_bytes == plans[i].expert_cache_bytes);
+                CHECK(after.requant_bits == plans[i].requant_bits);
+            }
+            ++i;
+        }
+        std::printf("  %s: cache %.2f MiB, requant %d\n", m.name,
+                    static_cast<double>(plans[0].expert_cache_bytes) / (1024.0 * 1024.0), plans[0].requant_bits);
+        CHECK(plans[0].resident_bytes == plans[1].resident_bytes);
+        CHECK(plans[0].expert_bytes == plans[1].expert_bytes);
+        CHECK(plans[0].expert_cache_bytes == plans[1].expert_cache_bytes);
+        CHECK(plans[0].recommended_bytes == plans[1].recommended_bytes);
+        CHECK(plans[0].requant_bits == plans[1].requant_bits);
+        CHECK(!out[0].empty());
+        CHECK(out[0] == out[1]);
+    }
+}
+
+TEST_CASE("Sequence memory: an open sequence borrows its states from the expert cache, closing gives them back") {
+    EngineConfig config = engine_config(model_path("mem_hybrid moe streamed", hybrid_moe_spec()), 4);
+    config.expert_cache_mb = 8;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    const uint64_t full = cache_bytes(e);
+    REQUIRE(full > 0);
+    std::vector<std::unique_ptr<Engine::Sequence>> open;
+    std::vector<uint64_t> after;
+    for (int32_t i = 0; i < 3; ++i) {
+        auto seq = e.open_sequence();
+        REQUIRE(seq.has_value());
+        open.push_back(std::move(seq).value());
+        after.push_back(cache_bytes(e));
+    }
+    // Each one takes the same share (whole slots: at least its states).
+    CHECK(after[0] < full);
+    const uint64_t each = full - after[0];
+    CHECK(after[1] == full - 2 * each);
+    CHECK(after[2] == full - 3 * each);
+    // They work, and each output stays its own.
+    std::vector<Job> jobs = four_jobs();
+    for (size_t i = 1; i < jobs.size(); ++i) jobs[i].seq = open[i - 1].get();
+    const std::vector<std::string> alone = run_alone(config, jobs);
+    run_together(e, jobs);
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        CHECK(jobs[i].status.is_ok());
+        CHECK(jobs[i].out == alone[i]);
+    }
+    open[1].reset();  // closed out of order: its share comes back all the same
+    CHECK(cache_bytes(e) == full - 2 * each);
+    open.clear();
+    CHECK(cache_bytes(e) == full);
+    // Plain transformers (no recurrent state) and in-place experts borrow nothing.
+    auto dense = Engine::create(engine_config(model_path("engine_llama", {}), 2));
+    REQUIRE(dense.has_value());
+    CHECK(cache_bytes(*dense.value()) == 0);
+    auto plain = dense.value()->open_sequence();
+    CHECK(plain.has_value());
+    EngineConfig moe = engine_config(model_path("engine_moe streamed", moe_spec()), 2);
+    moe.expert_cache_mb = 1;
+    auto plain_moe = Engine::create(moe);
+    REQUIRE(plain_moe.has_value());
+    const uint64_t moe_full = cache_bytes(*plain_moe.value());
+    CHECK(moe_full > 0);
+    auto seq = plain_moe.value()->open_sequence();
+    CHECK(seq.has_value());
+    CHECK(cache_bytes(*plain_moe.value()) == moe_full);
+}
+
+TEST_CASE("Sequence memory: a cache at its minimum refuses the sequence (OutOfMemory), nothing changes") {
+    EngineConfig config = engine_config(model_path("mem_hybrid moe streamed", hybrid_moe_spec()), 3);
+    config.expert_cache_mb = 1;  // every class at its minimum of slots
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    const uint64_t full = cache_bytes(e);
+    auto seq = e.open_sequence();
+    REQUIRE(!seq.has_value());
+    CHECK(seq.status().code() == ErrorCode::OutOfMemory);
+    std::printf("  refused: %s\n", seq.status().to_string().c_str());
+    CHECK(cache_bytes(e) == full);
+    CHECK(e.scheduler_stats().open_sequences == 1);
+    Job job;
+    job.prompt = "hello world";
+    job.params = greedy(12);
+    run_job(e, job);
+    CHECK(job.status.is_ok());
+    // The C ABI says the same.
+    liyab_engine_config c;
+    liyab_engine_config_default(&c);
+    c.model_path = config.model_path.c_str();
+    c.backend = LIYAB_BACKEND_CPU;
+    c.power_profile = LIYAB_POWER_PERFORMANCE;
+    c.thermal_polling = 0;
+    c.n_threads = 4;
+    c.max_sequences = 2;
+    c.expert_cache_mb = 1;
+    liyab_engine* engine_c = nullptr;
+    REQUIRE(liyab_engine_create(&c, &engine_c) == LIYAB_OK);
+    liyab_sequence* s = nullptr;
+    CHECK(liyab_sequence_open(engine_c, LIYAB_SEQUENCE_FOREGROUND, &s) == LIYAB_ERR_OUT_OF_MEMORY);
+    CHECK(s == nullptr);
+    liyab_engine_destroy(engine_c);
+}
+
+TEST_CASE("Sequence memory: ExpertStore lends and repays slots while other threads acquire experts") {
+    TransformerOptions options;
+    options.expert_cache_bytes = int64_t{8} << 20;
+    auto model = load_transformer(model_path("mem_hybrid moe streamed", hybrid_moe_spec()), options);
+    REQUIRE(model != nullptr);
+    ExpertStore* store = model->expert_store();
+    REQUIRE(store != nullptr);
+    const size_t full = store->capacity_bytes();
+    const size_t slots = store->entries();
+    const size_t states = model->context_state_bytes();
+    REQUIRE(states > 0);
+    // A loan covers what was asked in whole slots: at most one slot more
+    // (this model has one size class).
+    auto loan = store->lend(states);
+    REQUIRE(loan.has_value());
+    CHECK(loan->bytes >= states);
+    CHECK(store->capacity_bytes() == full - loan->bytes);
+    CHECK(store->lent_bytes() == loan->bytes);
+    const size_t slot = full / slots;
+    CHECK(loan->bytes < states + slot);
+    store->repay(*loan);
+    CHECK(store->capacity_bytes() == full);
+    CHECK(store->entries() == slots);
+    CHECK(store->lent_bytes() == 0);
+    // More than the cache can spare: refused, nothing taken.
+    auto too_much = store->lend(full);
+    CHECK(!too_much.has_value());
+    CHECK(too_much.status().code() == ErrorCode::OutOfMemory);
+    CHECK(store->capacity_bytes() == full);
+    CHECK(store->lend(0).has_value());
+
+    // Readers acquire experts (pinned while they check the bytes) while a
+    // thread lends and repays: a slot is never taken away from under a pin,
+    // and every expert keeps the file's bytes.
+    const int32_t n_expert = model->config().n_expert;
+    std::atomic<bool> stop{false};
+    std::atomic<int32_t> bad{0};
+    std::atomic<int64_t> checked{0};
+    std::vector<std::thread> readers;
+    for (int32_t r = 0; r < 3; ++r) {
+        readers.emplace_back([&, r] {
+            std::mt19937 rng(static_cast<uint32_t>(r + 1));
+            while (!stop.load()) {
+                const auto layer = static_cast<int32_t>(rng() % 4);
+                const auto expert = static_cast<int32_t>(rng() % static_cast<uint32_t>(n_expert));
+                if (!expert_intact(*model, *store, layer, expert)) bad.fetch_add(1);
+                checked.fetch_add(1);
+            }
+        });
+    }
+    std::vector<ExpertStore::Loan> loans;
+    for (int32_t round = 0; round < 60 || checked.load() < 3000; ++round) {
+        if (round % 3 != 2) {
+            auto l = store->lend(states * static_cast<size_t>(1 + round % 4));
+            if (l) loans.push_back(std::move(l).value());
+        } else if (!loans.empty()) {
+            store->repay(loans.front());
+            loans.erase(loans.begin());
+        }
+    }
+    for (const ExpertStore::Loan& l : loans) store->repay(l);
+    stop.store(true);
+    for (std::thread& t : readers) t.join();
+    std::printf("  %lld experts checked while lending\n", static_cast<long long>(checked.load()));
+    CHECK(bad.load() == 0);
+    CHECK(checked.load() > 0);
+    CHECK(store->capacity_bytes() == full);
+    CHECK(store->lent_bytes() == 0);
+}
+
+TEST_CASE("Sequence memory: sequences open and close while another decodes, its output unchanged") {
+    EngineConfig config = engine_config(model_path("mem_hybrid moe streamed", hybrid_moe_spec()), 3);
+    config.expert_cache_mb = 8;
+    auto engine = Engine::create(config);
+    REQUIRE(engine.has_value());
+    Engine& e = *engine.value();
+    const uint64_t full = cache_bytes(e);
+    std::vector<Job> jobs(1);
+    jobs[0].prompt = "a quick brown fox jumps over the lazy dog, hello world";
+    jobs[0].params = greedy(400);
+    const std::vector<std::string> alone = run_alone(config, jobs);
+    std::atomic<bool> done{false};
+    // The default sequence decodes the same reply several times over (a
+    // fresh context each), while sequences open and close.
+    std::vector<std::string> replies;
+    std::thread decoder([&] {
+        for (int32_t run = 0; run < 8; ++run) {
+            e.reset_context();
+            jobs[0].out.clear();
+            jobs[0].tokens.clear();
+            run_job(e, jobs[0]);
+            replies.push_back(jobs[0].status.is_ok() ? jobs[0].out : jobs[0].status.to_string());
+        }
+        done.store(true);
+    });
+    int32_t opened = 0;
+    int32_t with_work = 0;
+    double open_ms = 0.0, close_ms = 0.0;
+    auto since = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    const auto start = std::chrono::steady_clock::now();
+    while (!done.load()) {
+        auto t0 = std::chrono::steady_clock::now();
+        // Some do a little work of their own before closing: foreground ones
+        // (a background sequence's passes wait while the default one decodes).
+        const bool work = opened % 3 == 2;
+        auto seq = e.open_sequence(work || opened % 2 == 0 ? SequencePriority::Foreground : SequencePriority::Background);
+        open_ms += since(t0);
+        REQUIRE(seq.has_value());
+        ++opened;
+        if (work) {
+            Job other;
+            other.seq = seq->get();
+            other.prompt = "hello";
+            other.params = greedy(3);
+            run_job(e, other);
+            CHECK(other.status.is_ok());
+            ++with_work;
+        }
+        t0 = std::chrono::steady_clock::now();
+        seq.value().reset();
+        close_ms += since(t0);
+    }
+    decoder.join();
+    std::printf("  %d sequences opened and closed during 8 generations of %zu tokens in %.0f ms (%d generated; "
+                "%.1f ms opening, %.1f ms closing)\n",
+                opened, jobs[0].tokens.size(), since(start), with_work, open_ms, close_ms);
+    CHECK(opened > 8);
+    REQUIRE(replies.size() == 8);
+    for (const std::string& reply : replies) CHECK(reply == alone[0]);
+    CHECK(cache_bytes(e) == full);
+}
+
 namespace {
 
 int32_t collect(const char* piece, size_t len, int32_t, void* user) {

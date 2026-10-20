@@ -117,7 +117,7 @@ typedef struct liyab_engine_config {
     int32_t prefix_cache_lossy;   /* nonzero: prefix-cache chunks on storage re-quantized to 4 bits instead of stored losslessly (lossy; 0 default, see EngineConfig) */
     int64_t adapter_memory_mb;    /* LoRA adapters (liyab_engine_load_adapter): RAM at most for the loaded ones, in MiB, the least recently selected released first (mapped again when selected); default 256; 0: adapters off (a zero-filled config without liyab_engine_config_default) */
     int32_t draft_tree;           /* suffix drafts: nonzero (the default) verifies the likeliest nodes of the drafter's continuation tree, alternative branches included, in one pass; 0 only its best branch (a zero-filled config without liyab_engine_config_default); the same output either way (see EngineConfig) */
-    int32_t max_sequences;        /* sequences kept at once, the default one included (liyab_sequence_open); 1 (the default; 0 counts as 1): one conversation, as before; each more keeps a context of its own (see EngineConfig) */
+    int32_t max_sequences;        /* sequences kept at once, the default one included (liyab_sequence_open); 1 (the default; 0 counts as 1): one conversation, as before. A ceiling: nothing is reserved at load, and a sequence takes its memory only while open (see liyab_sequence_open and EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -314,7 +314,7 @@ LIYAB_C_API liyab_status liyab_engine_trim_memory(liyab_engine* engine, uint64_t
 typedef struct liyab_memory_plan {
     uint64_t resident_bytes;     /* weights kept in RAM (after any requantization) */
     uint64_t expert_bytes;       /* routed experts read from storage */
-    uint64_t expert_cache_bytes; /* RAM caching experts */
+    uint64_t expert_cache_bytes; /* RAM caching experts now: the plan's, minus what open sequences borrowed (liyab_sequence_open) */
     uint64_t recommended_bytes;  /* memory budget at which most expert uses would come from RAM */
     int32_t requant_bits;        /* resident Q8_0 matrices converted at load (4 / 5); 0: none */
 } liyab_memory_plan;
@@ -640,13 +640,20 @@ typedef enum liyab_sequence_priority {
     LIYAB_SEQUENCE_BACKGROUND = 1  /* yields: runs when no foreground pass waits; its prompt passes stop for foreground work */
 } liyab_sequence_priority;
 
-/* Opens a sequence. LIYAB_ERR_UNSUPPORTED with max_sequences 1 or a draft
- * model; LIYAB_ERR_BUSY when max_sequences are open. Close every sequence
- * before destroying its engine. */
+/* Opens a sequence. Its memory is taken now and given back by
+ * liyab_sequence_close: KV pages as it uses them, and on hybrid models its
+ * recurrent states, checkpoints and snapshots, which with streamed experts
+ * come out of the expert cache (slots evicted, their pages returned to the
+ * OS; never a requantization). LIYAB_ERR_UNSUPPORTED with max_sequences 1 or
+ * a draft model; LIYAB_ERR_BUSY when max_sequences are open;
+ * LIYAB_ERR_OUT_OF_MEMORY when the expert cache cannot spare those states
+ * without going below its minimum (nothing changes then). Close every
+ * sequence before destroying its engine. */
 LIYAB_C_API liyab_status liyab_sequence_open(liyab_engine* engine, liyab_sequence_priority priority,
                                              liyab_sequence** out_sequence);
 /* Cancels a call running on it and waits for it, sets its context aside in
- * the prefix cache (when there is one) and frees it. NULL is a no-op. */
+ * the prefix cache (when there is one) and frees it, giving the memory it
+ * borrowed back to the expert cache. NULL is a no-op. */
 LIYAB_C_API void liyab_sequence_close(liyab_sequence* sequence);
 /* Its id among the engine's sequences (the default one is 0); -1 for NULL. */
 LIYAB_C_API int32_t liyab_sequence_id(const liyab_sequence* sequence);
