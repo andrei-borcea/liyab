@@ -2383,8 +2383,8 @@ Benchmarks and tools built with the tests:
   LFU cache.
 * `liyab-spec-bench`: speculative decoding without a draft model on assistant tasks (a code edit, a summary, a
   repeated tool output over two turns, free chat, and that tool conversation again as a new one). It compares
-  plain decoding with lookup and suffix drafts, greedy and unpaced, each task on every mode back to back so they
-  share the host's load, and reports tok/s, accepted drafts, tokens per pass and whether each reply equals the
+  plain decoding with lookup and suffix drafts, greedy and unpaced, one mode's engine at a time (each plans its
+  memory as if alone; the order flips every second repetition so heat evens out), and reports tok/s, accepted drafts, tokens per pass and whether each reply equals the
   plain one (`--repeat R`: medians of R runs, and the best run, the least disturbed on a shared host). A mode
   `lookup:K:fixed` or `suffix:K:fixed` verifies every draft on offer, so its acceptance and tokens per pass do not
   depend on timing; `suffix:K:linear` verifies only the suffix drafter's best branch instead of its tree;
@@ -2506,6 +2506,11 @@ through the app's local API:
 * **Correctness:** the greedy replies must equal the stored reference, the CLI's three runs must agree, and the
   app's replies must equal the CLI's.
 * **Memory:** the peak resident memory of the CLI and of the app.
+
+Programs started through `adb shell` inherit adbd's `oom_score_adj` of -1000, so Android can never stop them: one
+that takes more memory than the phone has makes the kernel kill everything else and stall until the phone
+reboots. The script raises its commands' `oom_score_adj` to 1000, so a measurement is the first to go; do the same
+when running engine binaries by hand (`adb shell 'echo 1000 > /proc/self/oom_score_adj; ./liyab-cli ...'`).
 
 ```bash
 scripts/phone_regression.py --note "what changed"           # CLI part; models in /data/local/tmp/liyab (default moe.gguf)

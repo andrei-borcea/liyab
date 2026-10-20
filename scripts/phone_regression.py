@@ -107,11 +107,21 @@ ADB_GONE = ("no devices/emulators found", "device offline", "device unauthorized
             "adb: device '")
 
 
+# Commands from `adb shell` inherit adbd's oom_score_adj of -1000: neither the low-memory killer nor the kernel's
+# OOM killer may stop them. An engine binary that overcommits the phone (several engines, each planning its locked
+# expert cache as if alone) then makes the kernel kill every other process and stall in reclaim until the vendor's
+# hang detector panics and reboots the phone (seen on 2026-10-20). Every command here first makes its shell the
+# first to go instead: under real memory pressure a measurement fails, loudly, before any of the owner's apps.
+KILLABLE = "echo 1000 > /proc/self/oom_score_adj; "
+
+
 class Phone:
     def __init__(self, serial):
         self.serial = serial
 
     def _cmd(self, *args):
+        if len(args) == 2 and args[0] == "shell":
+            args = ("shell", KILLABLE + args[1])
         return ["adb"] + (["-s", self.serial] if self.serial else []) + list(args)
 
     def connected(self):
