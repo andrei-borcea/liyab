@@ -106,6 +106,29 @@ The row is accepted only if every step passes. When only the encoding fails, the
 the file's tokenizer settings are not. The GGUF must be a local file for the gate, BF16 or F16 (lower bit widths add
 their own error), and of the weights the reference loads.
 
+### Without the weights
+
+An architecture can be checked before, or instead of, downloading a model of it: the largest ones (hundreds of GB)
+never fit a development machine, and a small checkpoint isolates the forward pass from the weights.
+`tools/tiny_checkpoint.py` builds the model from its configuration with random weights: the shortest prefix of
+blocks that holds every kind of block, 4 attention heads of the model's own head size, FFNs and experts 128 wide, 16
+routed experts; every scalar of the configuration and the model's own tokenizer files are kept, so the text is
+encoded as the model encodes it. `--config` sets what the generic reduction cannot know (a latent rank, a state
+size, an index top-k small enough to select within the text). The checkpoint is converted to GGUF with the converter
+that writes the published files (llama.cpp's `convert_hf_to_gguf.py`), then checked like a real model:
+
+```bash
+tools/tiny_checkpoint.py --model Qwen/Qwen3-0.6B --out tiny-qwen3       # 2 of 28 blocks, 80M parameters
+python3 convert_hf_to_gguf.py tiny-qwen3 --outtype f32 --outfile tiny-qwen3.gguf
+tools/conform_reference.py --model tiny-qwen3 --text tests/data/conform_text.txt --out tiny-qwen3.ref
+build/liyab-kl -m tiny-qwen3.gguf -f tests/data/conform_text.txt --compare tiny-qwen3.ref --ref-tokens --kv f16
+```
+
+Qwen3 this way: the same 512 token ids as the reference, mean KL 0.00000 (max 0.00000) and top-1 agreement 100.00%
+over 511 positions. With F32 weights on both sides, only the order of float32 operations separates the two passes,
+so a structural error (a norm, a pairing, a scale, a routing rule) shows as a large divergence rather than a small
+one.
+
 ## Validation
 
 ### Every row in the registry, regenerated

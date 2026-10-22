@@ -2476,6 +2476,15 @@ Benchmarks and tools built with the tests:
       --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf     # a few MB of the file
   tools/describe_model.py --model baidu/ERNIE-4.5-0.3B-PT --gguf ERNIE-4.5-0.3B-PT-F16.gguf --gate
   ```
+* `tools/tiny_checkpoint.py`: a small checkpoint of a model with random weights, built from its configuration (few
+  blocks covering every kind, 4 heads of the model's own head size, narrow FFNs, 16 experts) and saved with the
+  model's own tokenizer files, so an architecture is checked against transformers without downloading its weights:
+  convert it to GGUF, then `conform_reference.py` and `liyab-kl` as for a real model
+  ([docs/model-descriptions.md](docs/model-descriptions.md#without-the-weights)).
+
+  ```bash
+  tools/tiny_checkpoint.py --model Qwen/Qwen3-0.6B --out tiny-qwen3
+  ```
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
