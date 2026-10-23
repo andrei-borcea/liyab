@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "liyab/engine.h"
 
@@ -68,6 +69,116 @@ constexpr ArchSpec kArchitectures[] = {
     // (planned from the tensors), LongRoPE factors; every block uses the
     // sliding window when the file sets one (Phi-3-mini-4k: 2047).
     {.name = "phi3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .swa_period = 1},
+    // The classic families: LayerNorm (weight and bias where present),
+    // biases on every projection where present, ungated FFNs, parallel
+    // blocks, learned absolute positions or ALiBi. Architectures without
+    // rotary embeddings keep the RopeLayout enum's first value (unused).
+    // GPT-2: learned positions, fused QKV, GELU (tanh), tied output.
+    {.name = "gpt2",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .norm = NormKind::Layer,
+     .rotary = false},
+    // GPT-NeoX (Pythia): parallel attention and FFN with a norm each
+    // (use_parallel_residual), partial RoPE, exact GELU.
+    {.name = "gptneox",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::Gelu,
+     .norm = NormKind::Layer,
+     .parallel_residual = true},
+    // Falcon: parallel blocks, one shared norm (7B) or ln_mlp as attn_norm_2
+    // (40B and later), multi-query attention, exact GELU.
+    {.name = "falcon",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "attn_norm_2",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::Gelu,
+     .norm = NormKind::Layer,
+     .parallel_residual = true},
+    // BLOOM: ALiBi (maximum bias 8), a LayerNorm on the embeddings, GELU (tanh).
+    {.name = "bloom",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .norm = NormKind::Layer,
+     .rotary = false,
+     .alibi_bias = 8.0f},
+    // MPT: ALiBi (the file's alibi_bias_max), LayerNorms without biases,
+    // optional Q/K/V clamping, exact GELU.
+    {.name = "mpt",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::Gelu,
+     .norm = NormKind::Layer,
+     .rotary = false,
+     .alibi_bias = 8.0f},
+    // StarCoder (GPTBigCode): GPT-2's block with multi-query attention.
+    {.name = "starcoder",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .norm = NormKind::Layer,
+     .rotary = false},
+    // StarCoder2: LayerNorm, biased projections, RoPE, GELU (tanh).
+    {.name = "starcoder2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .norm = NormKind::Layer},
+    // Phi-2: parallel blocks with one shared norm, partial RoPE, a biased LM head.
+    {.name = "phi2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .norm = NormKind::Layer,
+     .parallel_residual = true},
+    // StableLM (2): LayerNorm, partial RoPE, SwiGLU; parallel blocks and
+    // per-head Q/K LayerNorms where the file has them (12B).
+    {.name = "stablelm", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
+    // Orion: a Llama block with LayerNorms.
+    {.name = "orion", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
+    // OLMo (1): non-parametric LayerNorms (no norm tensors), optional clip_qkv.
+    {.name = "olmo", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
+    // Command-R: parallel blocks with one shared LayerNorm (no bias),
+    // adjacent RoPE pairs, logits multiplied by the file's logit_scale;
+    // per-head Q/K LayerNorms where the file has them (Command-R+).
+    {.name = "command-r",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .norm = NormKind::Layer,
+     .parallel_residual = true},
+    // Nemotron: LayerNorm1P (the converter stores 1 + w), partial RoPE, ReLU^2.
+    {.name = "nemotron",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::ReluSquared,
+     .norm = NormKind::Layer},
+    // Apertus: Q/K RMSNorms, xIELU with per-block scalars.
+    {.name = "apertus",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::XIelu},
+    // AFM (Arcee): a Llama block with an ungated ReLU^2 FFN.
+    {.name = "arcee",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::ReluSquared},
+    // DBRX: LayerNorms without biases (the FFN's is attn_output_norm), fused
+    // QKV clamped, a softmax top-k MoE renormalized.
+    {.name = "dbrx", .rope = RopeLayout::Halves, .ffn_norm = "attn_output_norm", .moe_norm_weights = true, .norm = NormKind::Layer},
 };
 
 }  // namespace
@@ -178,6 +289,15 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
+    if (c.spec->norm == NormKind::Layer) {  // LayerNorm architectures state their epsilon under its own key
+        c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_epsilon")).value_or(c.rms_eps));
+    }
+    if (!(c.rms_eps >= 0.0f) || !std::isfinite(c.rms_eps)) {
+        return Status(ErrorCode::InvalidModel, "invalid norm epsilon (" + key("attention.layer_norm_*epsilon") + ")");
+    }
+    // Architectures without rotary embeddings rotate nothing, whatever the
+    // file says of RoPE: their positions come from learned embeddings or ALiBi.
+    if (!c.spec->rotary) c.rope_dim = 0;
     c.rope_base = static_cast<float>(f.get_float(key("rope.freq_base")).value_or(10000.0));
     // LongRoPE: frequency factors for short and long contexts (Phi-3), and the
     // attention factor that comes with them.
@@ -270,7 +390,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (c.n_head_kv <= 0 || c.n_head % c.n_head_kv != 0) {
         return Status(ErrorCode::InvalidModel, "head_count must be a multiple of head_count_kv");
     }
-    if (c.head_dim <= 0 || c.rope_dim <= 0 || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
+    if (c.head_dim <= 0 || (c.rope_dim <= 0 && c.spec->rotary) || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
     }
     // The q·k scale: the file's, else 1/sqrt(head_dim) (computed as the
@@ -300,11 +420,74 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         return Status(ErrorCode::InvalidModel, "missing or malformed token_embd.weight");
     }
     c.n_vocab = static_cast<int32_t>(embd->rows());
+    // Command-R: the logits are multiplied by the file's scale.
+    c.logit_scale = static_cast<float>(f.get_float(key("logit_scale")).value_or(1.0));
+    // MPT, DBRX, OLMo: queries, keys and values clamped after their projections.
+    c.clamp_kqv = static_cast<float>(f.get_float(key("attention.clamp_kqv")).value_or(0.0));
+    // ALiBi, for architectures whose row has it: the file's maximum bias, else the row's.
+    if (c.spec->alibi_bias > 0.0f) {
+        c.alibi_bias = static_cast<float>(f.get_float(key("attention.max_alibi_bias")).value_or(c.spec->alibi_bias));
+    }
+    if (!(c.logit_scale > 0.0f) || !std::isfinite(c.logit_scale) || !(c.clamp_kqv >= 0.0f) ||
+        !std::isfinite(c.clamp_kqv) || !(c.alibi_bias >= 0.0f) || !std::isfinite(c.alibi_bias)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("logit_scale / attention.clamp_kqv / max_alibi_bias"));
+    }
+    // Learned absolute positions (GPT-2, GPTBigCode): one embedding row per
+    // position, added to the token embeddings.
+    if (const TensorView* pos = f.tensor("position_embd.weight")) {
+        if (pos->cols() != c.n_embd || pos->rows() <= 0 || pos->rows() > (int64_t{1} << 24)) {
+            return Status(ErrorCode::InvalidModel, "malformed position_embd.weight");
+        }
+        if (f.tensor("token_embd_norm.weight") != nullptr) {
+            // The embedding norm would have to follow the position embeddings,
+            // which the engine adds after it (no supported model has both).
+            return Status(ErrorCode::Unsupported, "an embedding norm with learned position embeddings is not supported");
+        }
+        c.n_positions = static_cast<int32_t>(pos->rows());
+    }
+    if (c.mla.kv_rank > 0 && (c.alibi_bias > 0.0f || c.rope_dim == 0)) {
+        return Status(ErrorCode::Unsupported, "latent attention without its RoPE key is not supported");
+    }
+    // xIELU (Apertus): four scalars per block, as global arrays of the
+    // reference's parameters; the effective ones are computed here once.
+    if (c.spec->ffn_activation == FfnActivation::XIelu) {
+        const char* names[] = {"xielu.alpha_p", "xielu.alpha_n", "xielu.beta", "xielu.eps"};
+        std::vector<double> values[4];
+        for (int i = 0; i < 4; ++i) {
+            const GgufValue* v = f.metadata(names[i]);
+            if (v == nullptr || v->type != GgufValue::Type::Array || v->array_type != GgufValue::Type::F32 ||
+                v->array_size < static_cast<uint64_t>(c.n_layers)) {
+                return Status(ErrorCode::InvalidModel, std::string("missing or invalid ") + names[i] + " (one float per block)");
+            }
+            for (int32_t l = 0; l < c.n_layers; ++l) {
+                float x = 0.0f;
+                std::memcpy(&x, v->array_data + static_cast<size_t>(l) * sizeof(float), sizeof x);
+                values[i].push_back(x);
+            }
+        }
+        auto softplus = [](double x) { return x > 20.0 ? x : std::log1p(std::exp(x)); };
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const auto ul = static_cast<size_t>(l);
+            XIeluScalars x;
+            x.alpha_p = static_cast<float>(softplus(values[0][ul]));
+            x.beta = static_cast<float>(values[2][ul]);
+            x.alpha_n = static_cast<float>(values[2][ul] + softplus(values[1][ul]));
+            x.eps = static_cast<float>(values[3][ul]);
+            if (!std::isfinite(x.alpha_p) || !std::isfinite(x.alpha_n) || !std::isfinite(x.beta) || !std::isfinite(x.eps)) {
+                return Status(ErrorCode::InvalidModel, "invalid xIELU scalars");
+            }
+            c.xielu.push_back(x);
+        }
+    }
 
     // Block plans, from the tensors present: a block with a DeltaNet
     // convolution is recurrent, every other block is attention; a router
     // makes the FFN a mixture of experts.
     const int64_t q_dim = int64_t{c.n_head} * c.head_dim;
+    // Parallel blocks: the file's flag (GPT-NeoX, StableLM), else the architecture's.
+    const GgufValue* parallel_key = f.metadata(key("use_parallel_residual"));
+    const bool parallel = parallel_key != nullptr && parallel_key->as_bool() ? *parallel_key->as_bool()
+                                                                             : c.spec->parallel_residual;
     c.blocks.resize(static_cast<size_t>(c.n_layers));
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
@@ -323,9 +506,12 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
         }
+        b.parallel = parallel;
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
-            b.fused_gate_up =
-                f.tensor(block_tensor(l, "ffn_gate.weight")) == nullptr && up->rows() == 2 * int64_t{c.n_ff};
+            const bool gate = f.tensor(block_tensor(l, "ffn_gate.weight")) != nullptr;
+            b.fused_gate_up = !gate && up->rows() == 2 * int64_t{c.n_ff};
+            // No gate and up as tall as the FFN: down(act(up)).
+            if (!gate && up->rows() == int64_t{c.n_ff}) b.ffn = FfnKind::Ungated;
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");

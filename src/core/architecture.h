@@ -48,10 +48,24 @@ enum class QkNormOrder : uint8_t {
     AfterRope,   // rotate, then normalize: Hunyuan
 };
 
-// Activation of a gated FFN's gate projection: down(act(gate) * up).
+// Activation of a gated FFN's gate projection, down(act(gate) * up), or of
+// an ungated FFN's up projection, down(act(up)) (FfnKind::Ungated).
 enum class FfnActivation : uint8_t {
-    SiLU,      // SwiGLU: Llama, Qwen, Phi, Hunyuan
-    GeluTanh,  // GeGLU, with the tanh approximation of GELU: Gemma
+    SiLU,         // SwiGLU: Llama, Qwen, Phi, Hunyuan
+    GeluTanh,     // GeGLU, with the tanh approximation of GELU: Gemma; GPT-2, BLOOM, Phi-2 (ungated)
+    Gelu,         // exact GELU, x Phi(x) with erf: GPT-NeoX, Falcon, MPT (ungated)
+    Relu,         // max(x, 0)
+    ReluSquared,  // max(x, 0)^2: Nemotron, AFM (ungated)
+    XIelu,        // xIELU with per-block scalars (ModelConfig::xielu): Apertus (ungated)
+};
+
+// How every norm of a model normalizes its input: the norms before each
+// block's mixer and FFN, the final norm, per-head Q/K norms and the
+// embedding norm. Each multiplies by its weight and adds its bias where the
+// tensor is present.
+enum class NormKind : uint8_t {
+    Rms,    // x / sqrt(mean(x^2) + eps) * w
+    Layer,  // (x - mean(x)) / sqrt(var(x) + eps) * w + b; w and b optional (OLMo: neither)
 };
 
 // The facts about one architecture that its tensors cannot tell. The fields
@@ -88,6 +102,25 @@ struct ArchSpec {
     // windowed blocks, 1M, linearly scaled on the larger models, in global
     // ones). 0: windowed blocks rotate like the others.
     float rope_base_swa = 0.0f;
+    // The norms' formula. LayerNorm architectures read their epsilon from
+    // <arch>.attention.layer_norm_epsilon. With LayerNorm, a file without
+    // output_norm.weight has no norm weights at all (OLMo's non-parametric
+    // norms); otherwise every norm's weight is required and biases are bound
+    // where present.
+    NormKind norm = NormKind::Rms;
+    // Every block is parallel (BlockPlan::parallel) when the file has no
+    // <arch>.use_parallel_residual: the FFN reads the block input normed
+    // (by the block's ffn_norm when the file has it, else the mixer's own
+    // normed input) and the residual adds the mixer's and the FFN's outputs.
+    bool parallel_residual = false;
+    // Queries and keys are rotated (RoPE). false: no block rotates
+    // (ModelConfig::rope_dim 0); positions come from learned absolute
+    // embeddings (position_embd.weight, added to the token embeddings) or
+    // ALiBi (alibi_bias).
+    bool rotary = true;
+    // > 0: ALiBi with this maximum bias when the file has no
+    // <arch>.attention.max_alibi_bias (the file's value wins; 0 there: none).
+    float alibi_bias = 0.0f;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -109,8 +142,9 @@ enum class MixerKind : uint8_t {
 
 // Feed-forward network of one block.
 enum class FfnKind : uint8_t {
-    Dense,  // gated: down(act(gate) * up), act = ArchSpec::ffn_activation
-    Moe,    // router + top-k routed gated experts
+    Dense,    // gated: down(act(gate) * up), act = ArchSpec::ffn_activation
+    Moe,      // router + top-k routed gated experts
+    Ungated,  // down(act(up x + b)) + b: ffn_up and ffn_down only (GPT-2, Falcon, Nemotron)
 };
 
 // The structure of one block, from the tensors present.
@@ -137,6 +171,23 @@ struct BlockPlan {
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+    // The mixer and the FFN both read the block input (ArchSpec::
+    // parallel_residual, <arch>.use_parallel_residual): the FFN through the
+    // block's own FFN norm when bound (GPT-NeoX's post_attention_layernorm,
+    // Falcon-40B's ln_mlp), else through the mixer's normed input (Phi-2,
+    // Falcon-7B, Command-R); the residual adds both outputs.
+    bool parallel = false;
+};
+
+// xIELU's scalars of one block (Apertus), as the reference computes them
+// from its parameters: x > 0: alpha_p x^2 + beta x; else
+// (expm1(min(x, eps)) - x) alpha_n + beta x, with alpha_p = softplus(p) and
+// alpha_n = beta + softplus(n) of the file's xielu.alpha_p / xielu.alpha_n.
+struct XIeluScalars {
+    float alpha_p = 0.0f;
+    float alpha_n = 0.0f;
+    float beta = 0.0f;
+    float eps = 0.0f;
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
@@ -189,9 +240,11 @@ struct ModelConfig {
     int32_t n_head_kv = 0;
     int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
     int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
-    int32_t rope_dim = 0;
+    int32_t rope_dim = 0;  // rotated channels per head; 0: no rotation (ArchSpec::rotary false)
     int32_t n_vocab = 0;
     int32_t n_ctx_train = 0;
+    // Epsilon of every norm: attention.layer_norm_rms_epsilon, or
+    // attention.layer_norm_epsilon with ArchSpec::norm Layer.
     float rms_eps = 1e-5f;
     float rope_base = 10000.0f;
     float rope_scale = 1.0f;  // linear position scaling
@@ -240,6 +293,25 @@ struct ModelConfig {
     MoeGating moe_gating = MoeGating::Softmax;
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
     float moe_weights_scale = 1.0f;
+
+    // Multiplies the output logits (<arch>.logit_scale: Command-R), before
+    // any final soft-cap; 1 when absent.
+    float logit_scale = 1.0f;
+    // > 0: queries, keys and values are clamped to [-clamp_kqv, clamp_kqv]
+    // after their projections and biases (<arch>.attention.clamp_kqv: MPT,
+    // DBRX, OLMo's clip_qkv).
+    float clamp_kqv = 0.0f;
+    // > 0: ALiBi's maximum bias (ArchSpec::alibi_bias, <arch>.attention.
+    // max_alibi_bias): head h adds slope_h x (key position - query position)
+    // to its scores, slopes 2^(-bias (h + 1) / n) for the n = 2^floor(log2
+    // heads) first heads and 2^(-bias (2 (h - n) + 1) / 2n) for the others.
+    float alibi_bias = 0.0f;
+    // > 0: rows of position_embd.weight, the learned absolute position
+    // embeddings added to the token embeddings (GPT-2, GPTBigCode): the
+    // longest context the model can address.
+    int32_t n_positions = 0;
+    // FfnActivation::XIelu: one entry per executed block.
+    std::vector<XIeluScalars> xielu;
 
     // True when some block keeps a recurrent state: such models cannot roll
     // back to an arbitrary earlier position (only to 0 or the current one).
