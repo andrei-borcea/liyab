@@ -35,6 +35,16 @@ void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
     for (int32_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
 }
 
+// The norm a block applies before its mixer or FFN, or the row as it is when
+// the block has none (post-only norms: BlockPlan::norm_before_mixer / _ffn).
+void pre_norm(const float* x, const std::vector<float>& w, float* out, int32_t n, float eps) {
+    if (w.empty()) {
+        std::copy(x, x + n, out);
+        return;
+    }
+    rmsnorm(x, w.data(), out, n, eps);
+}
+
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 // GELU with the tanh approximation (PyTorch's gelu(approximate="tanh")):
@@ -664,7 +674,7 @@ Status Transformer::bind_weights() {
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, plan.norm_before_mixer, L.attn_norm));
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -719,8 +729,11 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
+            // One head's weights shared by every head, or (BlockPlan::qk_norm_whole) the whole projection's.
+            LIYAB_RETURN_IF_ERROR(
+                vec(block_tensor(l, "attn_q_norm.weight"), plan.qk_norm_whole ? q_dim : c.head_dim, false, L.q_norm));
+            LIYAB_RETURN_IF_ERROR(
+                vec(block_tensor(l, "attn_k_norm.weight"), plan.qk_norm_whole ? kv_dim : c.head_dim, false, L.k_norm));
         } else {
             L.state_slot = state_slots++;
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
@@ -733,7 +746,8 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt.bias"), c.ssm_v_heads, true, L.ssm_dt));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
         }
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd, true, L.ffn_norm));
+        LIYAB_RETURN_IF_ERROR(
+            vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd, plan.norm_before_ffn, L.ffn_norm));
         if (!c.spec->post_mixer_norm.empty()) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
                                       false, L.post_mixer_norm));
@@ -1762,6 +1776,9 @@ Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t
     }
     logits_.resize(static_cast<size_t>(rows) * static_cast<size_t>(c.n_vocab));
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows));
+    if (c.logit_scale != 1.0f) {  // μP logit scale (Granite, MiniCPM)
+        for (float& v : logits_) v *= c.logit_scale;
+    }
     if (c.final_softcap > 0.0f) {  // Gemma 2: logits squashed into (-cap, cap)
         apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
     }
@@ -1809,7 +1826,7 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
         Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
-        rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
+        pre_norm(x_.data(), L.attn_norm, xb_.data(), c.n_embd, c.rms_eps);
         if (c.blocks[static_cast<size_t>(l)].latent) {
             // The key row only: its latent channels are the values.
             LIYAB_RETURN_IF_ERROR(latent_project(l, w, 1, route, backend, false));
@@ -1823,7 +1840,9 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
         if (!norm_after_rope) qk_norm(L, nullptr, k_.data());
-        rope(k_.data(), c.n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
+        if (c.blocks[static_cast<size_t>(l)].rope) {
+            rope(k_.data(), c.n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
+        }
         if (norm_after_rope) qk_norm(L, nullptr, k_.data());
         scale_keys(L.kv_slot, nullptr, k_.data());
         kv_->store(L.kv_slot, pos, k_.data(), v_.data());
@@ -1840,11 +1859,13 @@ KeyScalingShape Transformer::key_scaling_shape() const {
                           c.spec->rope, {}, {}, positions};
     // Transformer::rope: pair i of an attention block turns by
     // inv_freq[i] / scale of the block's table per position.
-    for (const Layer& L : layers_) {
+    for (size_t l = 0; l < layers_.size(); ++l) {
+        const Layer& L = layers_[l];
         if (L.kv_slot < 0) continue;  // attention blocks only, in KV slot order
         const RopeTable& t = rope_tables_[static_cast<size_t>(L.rope_table)];
-        for (const float f : t.inv_freq) shape.pair_speed.push_back(f / t.scale);
-        shape.rope_magnitude.push_back(t.magnitude);
+        const bool rotated = c.blocks[l].rope;  // a NoPE block's pairs never turn
+        for (const float f : t.inv_freq) shape.pair_speed.push_back(rotated ? f / t.scale : 0.0f);
+        shape.rope_magnitude.push_back(rotated ? t.magnitude : 1.0f);
     }
     return shape;
 }
@@ -1852,14 +1873,24 @@ KeyScalingShape Transformer::key_scaling_shape() const {
 void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
     const ModelConfig& c = config_;
     const auto hd = static_cast<size_t>(c.head_dim);
+    // A weight longer than one head spans the whole projection (BlockPlan::
+    // qk_norm_whole): one RMS over every head's channels together.
     if (q != nullptr && !L.q_norm.empty()) {
-        for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
-            rmsnorm(q + h * hd, L.q_norm.data(), q + h * hd, c.head_dim, c.rms_eps);
+        if (L.q_norm.size() > hd) {
+            rmsnorm(q, L.q_norm.data(), q, static_cast<int32_t>(L.q_norm.size()), c.rms_eps);
+        } else {
+            for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
+                rmsnorm(q + h * hd, L.q_norm.data(), q + h * hd, c.head_dim, c.rms_eps);
+            }
         }
     }
     if (!L.k_norm.empty()) {
-        for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
-            rmsnorm(k + h * hd, L.k_norm.data(), k + h * hd, c.head_dim, c.rms_eps);
+        if (L.k_norm.size() > hd) {
+            rmsnorm(k, L.k_norm.data(), k, static_cast<int32_t>(L.k_norm.size()), c.rms_eps);
+        } else {
+            for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
+                rmsnorm(k + h * hd, L.k_norm.data(), k + h * hd, c.head_dim, c.rms_eps);
+            }
         }
     }
 }
@@ -1877,7 +1908,9 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
     // after the rotation (KeyRanges::add).
     const auto hd = static_cast<size_t>(c.head_dim);
     // RoPE's magnitude (LongRoPE) scales the rotated channels before the norm.
-    const float magnitude = rope_tables_[static_cast<size_t>(L.rope_table)].magnitude;
+    const float magnitude = c.blocks[static_cast<size_t>(&L - layers_.data())].rope
+                                ? rope_tables_[static_cast<size_t>(L.rope_table)].magnitude
+                                : 1.0f;
     std::vector<float> rotated(hd);
     auto scaled = [&](const float* x, int32_t heads, bool normed, std::vector<float>& out) {
         out.assign(x, x + static_cast<size_t>(heads) * hd);
@@ -2058,6 +2091,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const size_t hd = static_cast<size_t>(c.head_dim);
     const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
+    const bool rotated = c.blocks[static_cast<size_t>(layer)].rope;  // false: a NoPE block
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (gated) qg_.resize(un * 2 * q_dim);
@@ -2090,9 +2124,17 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             if (!norm_after_rope) qk_norm(L, q, k);
             const int32_t pos = pos_of(s, static_cast<int32_t>(t));
             if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-            rope(q, c.n_head, pos, rope_table);
-            rope(k, c.n_head_kv, pos, rope_table);
+            if (rotated) {
+                rope(q, c.n_head, pos, rope_table);
+                rope(k, c.n_head_kv, pos, rope_table);
+            }
             if (norm_after_rope) qk_norm(L, q, k);
+            if (c.attn_temp_scale != 0.0f && pos >= c.attn_temp_length) {
+                // Attention temperature (llama_4_scaling): 1 below the length, so those rows keep their bits.
+                const auto temp = static_cast<float>(
+                    1.0 + c.attn_temp_scale * std::log1p(std::floor(static_cast<double>(pos) / c.attn_temp_length)));
+                for (size_t i = 0; i < q_dim; ++i) q[i] *= temp;
+            }
             scale_keys(L.kv_slot, q, k);
             s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, v);
         }
@@ -2882,7 +2924,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     pred_in_.resize(un * d);
     pred_logits_.resize(un * E);
     for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), pred_in_.data() + t * d, c.n_embd, c.rms_eps);
+        pre_norm(x_.data() + t * d, L.ffn_norm, pred_in_.data() + t * d, c.n_embd, c.rms_eps);
     }
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
@@ -3365,6 +3407,15 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     const bool moe = plan.ffn == FfnKind::Moe;
     const Route cpu_route{route.cpu, route.cpu, route.cpu};
     const Route& block_route = w.streamed() ? cpu_route : route;
+    // The residual add: x += xb, the branch scaled first by the μP residual
+    // multiplier (ModelConfig::residual_scale) when it is not 1.
+    auto add_residual = [&](size_t count) {
+        if (c.residual_scale != 1.0f) {
+            for (size_t i = 0; i < count; ++i) x_[i] += c.residual_scale * xb_[i];
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) x_[i] += xb_[i];
+    };
     // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
     auto post_norm = [&](const std::vector<float>& weight) {
         if (weight.empty()) return;
@@ -3381,7 +3432,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     // --- token mixer (attention or DeltaNet) ---
     if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
     for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+        pre_norm(x_.data() + t * d, L.attn_norm, xb_.data() + t * d, c.n_embd, c.rms_eps);
     }
     if (plan.mixer == MixerKind::DeltaNet) {
         const PhaseTimer timer(phases_.delta_net);
@@ -3396,7 +3447,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
             attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
     }
     post_norm(L.post_mixer_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    add_residual(un * d);
     // A MoE block predicts the next one once its own experts are queued (moe_ffn).
     if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
 
@@ -3407,7 +3458,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         return Status::ok();
     }
     for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+        pre_norm(x_.data() + t * d, L.ffn_norm, xb_.data() + t * d, c.n_embd, c.rms_eps);
     }
     if (moe) {
         LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
@@ -3416,7 +3467,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
     }
     post_norm(L.post_ffn_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    add_residual(un * d);
     return Status::ok();
 }
 
@@ -3574,6 +3625,8 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
     for (const Layer& L : layers_) {
         if (L.kv_slot < 0) continue;
         if (static_cast<size_t>(L.kv_slot) >= blocks.size()) blocks.resize(static_cast<size_t>(L.kv_slot) + 1);
+        // A NoPE block's keys do not depend on their position: they stay as stored (no turns).
+        if (!c.blocks[static_cast<size_t>(&L - layers_.data())].rope) continue;
         Slot& s = blocks[static_cast<size_t>(L.kv_slot)];
         s.turns = &turns_of(static_cast<size_t>(L.rope_table));
         s.unscale.assign(static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(touched), 1.0f);
@@ -4012,6 +4065,9 @@ Status Transformer::compute_logits_rows(const Route& route, std::span<const int3
     logits_.resize(rows.size() * static_cast<size_t>(c.n_vocab));
     LIYAB_RETURN_IF_ERROR(
         matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), static_cast<int32_t>(rows.size())));
+    if (c.logit_scale != 1.0f) {
+        for (float& v : logits_) v *= c.logit_scale;
+    }
     if (c.final_softcap > 0.0f) apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
     return Status::ok();
 }

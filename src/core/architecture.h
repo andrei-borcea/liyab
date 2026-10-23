@@ -88,6 +88,28 @@ struct ArchSpec {
     // windowed blocks, 1M, linearly scaled on the larger models, in global
     // ones). 0: windowed blocks rotate like the others.
     float rope_base_swa = 0.0f;
+    // Blocks without positional rotation (NoPE: their queries and keys are
+    // not rotated), for files that do not list them in
+    // <arch>.attention.rope_pattern (one bool per block, true = rotated, which
+    // overrides both rules). nope_period N > 0: blocks N-1, 2N-1, ... (SmolLM3:
+    // every 4th). nope_global: when some blocks attend through a window, the
+    // blocks attending globally (EXAONE 4: the windowed ones carry the
+    // positions, the global ones see every position unrotated).
+    int32_t nope_period = 0;
+    bool nope_global = false;
+    // Windowed blocks rotate with rope.freq_base but unscaled: no YaRN, linear
+    // scaling or frequency factors, which only the global blocks take (OLMo 3,
+    // whose converter writes the global blocks' YaRN).
+    bool swa_rope_unscaled = false;
+    // <arch>.logit_scale divides the output logits (Granite's logits_scaling,
+    // MiniCPM's n_embd / dim_model_base) instead of multiplying them.
+    bool logit_scale_divides = false;
+    // <arch>.rope.scaling.yarn_log_multiplier holds the reference's
+    // mscale_all_dim, as the converter writes it for every architecture but
+    // DeepSeek's (0.1 x mscale_all_dim, scaling q·k): YaRN's attention factor
+    // is then mscale(1) / mscale(mscale_all_dim), mscale(m) = 0.1 m ln(factor)
+    // + 1, on the rotation's magnitude (Ministral 3).
+    bool yarn_mscale_all_dim = false;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -137,6 +159,20 @@ struct BlockPlan {
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+    // Attention: queries and keys are rotated by RoPE; false: the block has no
+    // positional encoding of its own (NoPE, ArchSpec::nope_period /
+    // nope_global or the file's attention.rope_pattern).
+    bool rope = true;
+    // A norm before the mixer (attn_norm) and before the FFN (the
+    // architecture's ffn_norm), from the tensors present. false: the mixer or
+    // FFN reads the residual stream as it is, and the block must then have
+    // the norm after it (post-only norms: OLMo 2, EXAONE 4).
+    bool norm_before_mixer = true;
+    bool norm_before_ffn = true;
+    // Attention: attn_q_norm / attn_k_norm are one RMSNorm over the whole
+    // projection (n_head x head_dim, n_head_kv x head_dim: OLMo 2) instead of
+    // one per head (head_dim, shared by every head: Qwen3).
+    bool qk_norm_whole = false;
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
@@ -222,8 +258,25 @@ struct ModelConfig {
     // RoPE table of their own (ArchSpec::rope_base_swa).
     int32_t sliding_window = 0;
     float rope_base_swa = 0.0f;
-    // Multiplies the token embeddings: sqrt(n_embd) with ArchSpec::scale_embeddings, else 1.
+    // Multiplies the token embeddings: <arch>.embedding_scale when the file
+    // has it (μP: Granite's embedding_multiplier, MiniCPM's scale_emb), else
+    // sqrt(n_embd) with ArchSpec::scale_embeddings, else 1.
     float embd_scale = 1.0f;
+    // Multiplies the mixer's and the FFN's outputs before each residual add
+    // (<arch>.residual_scale: Granite's residual_multiplier, MiniCPM's
+    // scale_depth / sqrt(n_layers)); 1: none.
+    float residual_scale = 1.0f;
+    // Multiplies the output logits (after the output projection, before any
+    // soft cap): <arch>.logit_scale, or its inverse with
+    // ArchSpec::logit_scale_divides; 1: none.
+    float logit_scale = 1.0f;
+    // Attention temperature by position (Ministral 3's llama_4_scaling): each
+    // query is multiplied by 1 + attn_temp_scale ln(1 + floor(pos /
+    // attn_temp_length)) after RoPE (<arch>.attention.temperature_scale, the
+    // length <arch>.attention.temperature_length or YaRN's original context).
+    // 0: none; the factor is exactly 1 below attn_temp_length.
+    float attn_temp_scale = 0.0f;
+    int32_t attn_temp_length = 0;
     std::vector<BlockPlan> blocks;  // per executed block
 
     // Gated DeltaNet geometry (zero when every block is attention).

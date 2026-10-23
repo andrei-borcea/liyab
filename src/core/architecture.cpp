@@ -1,5 +1,6 @@
 #include "core/architecture.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -68,6 +69,77 @@ constexpr ArchSpec kArchitectures[] = {
     // (planned from the tensors), LongRoPE factors; every block uses the
     // sliding window when the file sets one (Phi-3-mini-4k: 2047).
     {.name = "phi3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .swa_period = 1},
+    // SmolLM3: Llama's block (the converter interleaves the Q/K rows), every
+    // fourth block without RoPE. The converter writes no per-block list
+    // (attention.rope_pattern), so the period is the row's.
+    {.name = "smollm3", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .nope_period = 4},
+    // OLMo 2 and OLMo 3: post-only norms (after the attention and after the
+    // FFN, none before: planned from the tensors) and RMSNorms of Q and K
+    // over the whole projections (from their size), before RoPE. OLMo 3
+    // attends through a window in the blocks its file lists (all but every
+    // fourth by default); those rotate with the base unscaled, the YaRN the
+    // converter writes being the global blocks'.
+    {.name = "olmo2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .swa_period = 4,
+     .swa_rope_unscaled = true},
+    // EXAONE 4: post-only norms as OLMo 2's, per-head Q/K norms before RoPE.
+    // With a window (EXAONE 4.0 32B: three windowed blocks, then a global
+    // one), only the windowed blocks rotate: the global ones are NoPE.
+    {.name = "exaone4",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .swa_period = 4,
+     .nope_global = true},
+    // EXAONE 3 / 3.5: a pre-norm block with SwiGLU, rotating halves (the
+    // converter keeps the rows), Llama 3 frequency factors in rope_freqs.
+    {"exaone", RopeLayout::Halves, "ffn_norm", false},
+    // Granite 3.x dense: Llama's block with μP scalars from the file
+    // (embedding_scale, residual_scale, attention.scale) and logits divided
+    // by its logit_scale (logits_scaling).
+    {.name = "granite", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .logit_scale_divides = true},
+    // MiniCPM (1, 2, 4 dense): Llama's block with μP scalars from the file:
+    // scale_emb, scale_depth / sqrt(n_layers) and logits divided by n_embd /
+    // dim_model_base; LongRoPE factors when the model has them.
+    {.name = "minicpm", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .logit_scale_divides = true},
+    // InternLM 2 / 2.5: Llama's block once the converter has split and
+    // interleaved the fused wqkv. (InternLM 3 converts as llama.)
+    {"internlm2", RopeLayout::Adjacent, "ffn_norm", false},
+    // Seed-OSS: QKV biases, halves; the norm before the FFN is stored as
+    // post_attention_norm (as Qwen3.5's).
+    {"seed_oss", RopeLayout::Halves, "post_attention_norm", false},
+    // ChatGLM 2 / 3 and GLM-4 (2024, GlmForCausalLM): fused attn_qkv with a
+    // bias, fused [gate | up], RoPE on adjacent pairs of the first half of
+    // each head (rope.dimension_count).
+    {"chatglm", RopeLayout::Adjacent, "ffn_norm", false},
+    // GLM-4-0414: ChatGLM's rotation (adjacent pairs, half of each head), QKV
+    // biases, fused [gate | up], and norms after the attention and the FFN
+    // besides the ones before them.
+    {.name = "glm4",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm"},
+    // Gemma (1): embeddings scaled by sqrt(d), GeGLU; the converter stores
+    // the RMSNorm weights as 1 + w.
+    {.name = "gemma",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .scale_embeddings = true},
+    // Ministral 3 (mistral3): Llama's block with YaRN whose
+    // yarn_log_multiplier is the reference's mscale_all_dim, and the
+    // queries' temperature by position (attention.temperature_scale).
+    {.name = "mistral3", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .yarn_mscale_all_dim = true},
 };
 
 }  // namespace
@@ -224,8 +296,16 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             const double ln_factor = y.factor > 1.0f ? std::log(static_cast<double>(y.factor)) : 0.0;
             const auto log_mul = f.get_float(key("rope.scaling.yarn_log_multiplier"));
             const auto attn_factor = f.get_float(key("rope.scaling.yarn_attn_factor"));
-            const double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
-            if (log_mul) qk_mscale = 1.0 + *log_mul * ln_factor;
+            // With ArchSpec::yarn_mscale_all_dim the multiplier is the
+            // reference's mscale_all_dim m instead: the rotation's magnitude
+            // is (0.1 ln(factor) + 1) / (0.1 m ln(factor) + 1) and q·k keeps
+            // its scale (Ministral 3: m = 1, a magnitude of 1).
+            double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            if (log_mul && c.spec->yarn_mscale_all_dim) {
+                if (!attn_factor) magnitude = (0.1 * ln_factor + 1.0) / (0.1 * *log_mul * ln_factor + 1.0);
+            } else if (log_mul) {
+                qk_mscale = 1.0 + *log_mul * ln_factor;
+            }
             if (!(magnitude > 0.0) || !(qk_mscale > 0.0)) {
                 return Status(ErrorCode::InvalidModel, "invalid YaRN attention factor (" + key("rope.scaling.*") + ")");
             }
@@ -239,6 +319,33 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     // As the reference scales them: sqrt(d) rounded once to float.
     if (c.spec->scale_embeddings) c.embd_scale = static_cast<float>(std::sqrt(static_cast<double>(c.n_embd)));
+    // μP scalars, wherever the file states them: the embeddings' multiplier,
+    // the residual branches' multiplier and the logits' scale (a divisor in
+    // the architectures whose converter writes one, ArchSpec::logit_scale_divides).
+    const auto finite_positive = [](double v) { return v > 0.0 && std::isfinite(v); };
+    if (const auto scale = f.get_float(key("embedding_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("embedding_scale"));
+        c.embd_scale = static_cast<float>(*scale);
+    }
+    if (const auto scale = f.get_float(key("residual_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("residual_scale"));
+        c.residual_scale = static_cast<float>(*scale);
+    }
+    if (const auto scale = f.get_float(key("logit_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("logit_scale"));
+        c.logit_scale = static_cast<float>(c.spec->logit_scale_divides ? 1.0 / *scale : *scale);
+    }
+    // Attention temperature by position (llama_4_scaling): its length is the
+    // file's, else YaRN's original context.
+    if (const auto beta = f.get_float(key("attention.temperature_scale")); beta && *beta != 0.0) {
+        c.attn_temp_scale = static_cast<float>(*beta);
+        c.attn_temp_length = static_cast<int32_t>(
+            f.get_int(key("attention.temperature_length")).value_or(c.yarn.factor > 0.0f ? c.yarn.ctx_orig : 0));
+        if (!std::isfinite(c.attn_temp_scale) || c.attn_temp_length <= 0) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.temperature_scale") + " / " +
+                                                       key("attention.temperature_length"));
+        }
+    }
 
     // Sliding-window attention blocks: the architecture's period, or the
     // file's own pattern (a period, or one flag per block).
@@ -250,6 +357,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (window > 0) {
         c.sliding_window = static_cast<int32_t>(window);
         c.rope_base_swa = static_cast<float>(f.get_float(key("rope.freq_base_swa")).value_or(c.spec->rope_base_swa));
+        if (c.rope_base_swa == 0.0f && c.spec->swa_rope_unscaled) c.rope_base_swa = c.rope_base;
         int64_t period = c.spec->swa_period;
         const GgufValue* pattern = f.metadata(key("attention.sliding_window_pattern"));
         if (pattern != nullptr && pattern->type == GgufValue::Type::Array) {
@@ -264,6 +372,25 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
         for (int64_t l = 0; period > 0 && l < c.n_layers; ++l) {
             windowed[static_cast<size_t>(l)] = period == 1 || (l + 1) % period != 0;
+        }
+    }
+
+    // Blocks without positional rotation (NoPE): the file's own list (true =
+    // rotated), else the architecture's rules: a period, and the global
+    // blocks of a model that has windowed ones.
+    std::vector<bool> rotated(static_cast<size_t>(c.n_layers), true);
+    if (const GgufValue* rp = f.metadata(key("attention.rope_pattern"))) {
+        if (rp->type != GgufValue::Type::Array || rp->array_type != GgufValue::Type::Bool ||
+            rp->array_size < static_cast<uint64_t>(c.n_layers)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.rope_pattern"));
+        }
+        for (size_t l = 0; l < rotated.size(); ++l) rotated[l] = rp->array_data[l] != 0;
+    } else {
+        const bool some_windowed = std::find(windowed.begin(), windowed.end(), true) != windowed.end();
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const auto i = static_cast<size_t>(l);
+            if (c.spec->nope_period > 0 && (l + 1) % c.spec->nope_period == 0) rotated[i] = false;
+            if (c.spec->nope_global && some_windowed && !windowed[i]) rotated[i] = false;
         }
     }
 
@@ -322,6 +449,30 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
+            b.rope = rotated[static_cast<size_t>(l)];
+            if (!b.rope && b.latent) {
+                return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                                                          ": latent attention without RoPE is not supported");
+            }
+            // Q/K norms over the whole projection (one weight per channel of
+            // every head) rather than one head's weights shared by all heads.
+            const TensorView* qn = f.tensor(block_tensor(l, "attn_q_norm.weight"));
+            const TensorView* kn = f.tensor(block_tensor(l, "attn_k_norm.weight"));
+            if (qn != nullptr || kn != nullptr) {
+                const int64_t kv_dim = int64_t{c.n_head_kv} * c.head_dim;
+                const bool q_whole = qn != nullptr && qn->elements() == q_dim && q_dim != c.head_dim;
+                const bool k_whole = kn != nullptr && kn->elements() == kv_dim && kv_dim != c.head_dim;
+                b.qk_norm_whole = q_whole || k_whole;
+                if ((qn != nullptr && qn->elements() != (b.qk_norm_whole ? q_dim : c.head_dim)) ||
+                    (kn != nullptr && kn->elements() != (b.qk_norm_whole ? kv_dim : c.head_dim))) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                                               ": attn_q_norm / attn_k_norm span neither one head "
+                                                               "nor the whole projection");
+                }
+                if (b.qk_norm_whole && c.spec->qk_norm == QkNormOrder::AfterRope) {
+                    return Status(ErrorCode::Unsupported, "Q/K norms over the whole projection after RoPE");
+                }
+            }
         }
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             b.fused_gate_up =
@@ -335,6 +486,21 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
                               f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
+        }
+        // Post-only norms: a block without the norm before its mixer (or FFN)
+        // feeds it the residual stream as it is, and normalizes its output
+        // instead. A block with neither norm is a damaged file, not a variant.
+        auto has = [&](std::string_view suffix) {
+            return !suffix.empty() && f.tensor(block_tensor(l, std::string(suffix) + ".weight")) != nullptr;
+        };
+        b.norm_before_mixer = has("attn_norm");
+        b.norm_before_ffn = has(c.spec->ffn_norm);
+        if (!b.norm_before_mixer && !has(c.spec->post_mixer_norm)) {
+            return Status(ErrorCode::InvalidModel, "missing tensor '" + block_tensor(l, "attn_norm.weight") + "'");
+        }
+        if (!b.norm_before_ffn && !has(c.spec->post_ffn_norm)) {
+            return Status(ErrorCode::InvalidModel,
+                          "missing tensor '" + block_tensor(l, std::string(c.spec->ffn_norm) + ".weight") + "'");
         }
     }
     if (c.n_attn_layers < c.n_layers) {
