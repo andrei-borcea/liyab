@@ -273,6 +273,11 @@ exactly the registered row, all three tokenizer texts match, and the 512-token f
 mean KL 0.00000, maximum 0.00001 and top-1 100.00%. Gemma 4's heterogeneous geometry remains pending in the
 generic per-block geometry work. The separate K-equals-V/no-per-layer-input Gemma 4 tiny case gives mean KL
 0.00000, maximum 0.00002, top-1 99.02%, and 512 identical IDs.
+The additional Gemma 3n BF16-reference comparison gives mean KL 0.00168, maximum 0.02824 and top-1 98.24%.
+CPU and Metal routes both greedily answer the checked chat prompt with "The capital of France is Paris."
+The deeper ten-block random diagnostic is retained as a failure: mean KL 0.00001, maximum 0.00064 and top-1
+91.78%. Rounding its reference keys and values to F16 improves top-1 to 98.83% (maximum KL 0.00006), which
+accounts for most, but not all, of its precision sensitivity. It is not counted as passing conformance.
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions

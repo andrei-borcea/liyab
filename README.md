@@ -455,6 +455,13 @@ What the port does differently from the POSIX platforms:
     before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
     and so is group-limited expert routing
     (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
+  * `gemma3n` (Gemma 3n text): AltUp residual streams, Laurel, per-layer token embeddings, Gaussian gate
+    sparsity, normalized values and shared KV. The per-layer table is mapped and read by token row; only its
+    current batch is materialized. The loader may warm the mapping, and the memory plan conservatively counts
+    the whole file. Projections use the existing CPU kernels and GPU operation routing; AltUp's small router
+    and corrections run on CPU.
+  * `gemma-embedding` (EmbeddingGemma 300M): bidirectional attention, mean pooling and chained dense projections
+    before L2 normalization. Each complete input runs alone through attention, including in a batch of inputs.
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -1190,7 +1197,7 @@ step, and speed-ups over plain decoding of 2.02× / 2.10×, 1.17× / 1.11×, 1.4
 ## Embeddings and reranking
 
 EmbeddingGemma (`gemma-embedding`, 300M) adds bidirectional attention and mean pooling with the model's two
-bias-free dense projections (768 → 3072 → 768). On the CPU, a BF16 conversion of `unsloth/embeddinggemma-300m`
+bias-free dense projections (768 → 3072 → 768). On CPU and Metal routes, a BF16 conversion of `unsloth/embeddinggemma-300m`
 matched all tokenizer IDs in the 39 pooling cases and reached cosine ≥ 0.99992651 against the float32 reference;
 all 39 vectors were bit-identical alone and in the batch. The independent reference agreed with
 sentence-transformers at cosine ≥ 0.9999998. Include the model card's task prefix in the input text.
@@ -2159,6 +2166,14 @@ cache the forward passes agree:
 | Youtu-LLM-2B, latent attention in the expanded form (passes of 512 tokens) | 512 | 0.00000 | 99.80% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
+| Gemma-3n-E2B-it (`gemma3n`; unsloth checkpoint converted to BF16) | 512 | 0.00000 | 100.00% |
+
+Gemma 3n also passes against a BF16 transformers reference (mean KL 0.00168, top-1 98.24%); CPU and Metal routes
+give the same greedy reply to the checked chat prompt, "The capital of France is Paris." BF16 matmuls retain the
+existing per-operation CPU fallback. Its four-block F32 tiny checkpoint, including every new part and windows
+within the text, gives mean KL 0.00000 and top-1 99.41%. A deeper ten-block random diagnostic gives mean KL
+0.00001 but fails the 99% top-1 threshold (91.78%); adding F16 KV rounding to that reference improves it to
+98.83%, so precision accounts for most of that difference. That diagnostic is not a passing conformance case.
 
 Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
 mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds
