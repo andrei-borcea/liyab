@@ -176,6 +176,8 @@ InternLM2 and Ministral 3 each have 14 template fixtures. An explicit template f
 transformers' Jinja renderer, including for tokenizers whose own chat formatter does not use Jinja.
 Reference tracing shortens a uniform configured attention window so its boundary occurs within the probe,
 verifies the actual mask there and reports the original configured size. Full conformance uses the original size.
+GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
+in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the

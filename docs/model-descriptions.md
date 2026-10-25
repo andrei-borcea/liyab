@@ -173,6 +173,11 @@ back to the original configured size. This keeps local/global blocks distinguish
 is thousands of tokens. It changes only the tracing configuration; the teacher-forced reference and engine gate
 run the checkpoint's original window. An OLMo 3 regression verifies three local blocks and a global block; the
 real PLaMo 3 description now derives its exact local-base/period row instead of conflating short causal masks.
+GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
+allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
+registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
+(zero means NoPE); the converter writes a RoPE mask from its older `no_rope_layers` field. The exact checkpoint's
+metadata must therefore be checked at that integration. No GraniteSWA conformance result is claimed here.
 
 ## The conformance gate
 
