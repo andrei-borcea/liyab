@@ -243,7 +243,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
     }
     if (a == "deepseek4") {
-        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.shared_head_dim > 0 ? s.shared_head_dim : s.n_embd / s.n_head));
         w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
         w.add_u32(a + ".attention.output_group_count", static_cast<uint32_t>(s.shared_output_groups));
         w.add_u32(a + ".attention.output_lora_rank", static_cast<uint32_t>(s.shared_output_rank));
@@ -331,7 +331,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     };
 
     const int64_t d = s.n_embd;
-    const int64_t hd = d / s.n_head;
+    const int64_t hd = a == "deepseek4" && s.shared_head_dim > 0 ? s.shared_head_dim : d / s.n_head;
     const int64_t kv = hd * s.n_head_kv;
     const std::vector<float> embd = random(d * n_vocab, 0.5f);
     w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, embd);

@@ -410,7 +410,8 @@ against that trace. The component runner below supplies those dimensions directl
 does not substitute for that full-model description gate.
 
 `test_compression` independently recomputes whole windows and dense attention (including F16 main-cache
-rounding), exercises eight writable weight formats, and checks decode splits, rollback and saved images in
+rounding), exercises eight writable weight formats with attention and residual widths independent, and checks
+decode splits, rollback and saved images in
 all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
 `tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
 
@@ -424,3 +425,20 @@ The isolated selection test excludes changes to the source hidden state caused b
 cache. The complete component fixture retains sliding, CSA and HCA blocks; none is removed to claim a model
 gate. Three synthetic golden cases pin compression with and without mHC and with YaRN on NEON, AVX2 and
 scalar. Every previously pinned case remains unchanged.
+
+### GLM-4.7-Flash export facts
+
+The official `glm4_moe_lite` configuration has dense and sparse blocks, sigmoid routing, block RMS epsilon
+1e-5 and separately constructed query/KV latent RMS epsilon 1e-6. The b11819 `Glm4MoeLiteModel` converter
+writes `deepseek2` and the block epsilon, but omits `expert_gating_func`; the engine's documented file default
+is softmax. The description tool reports that routing mismatch and proposes a latent-epsilon row different
+from the existing `deepseek2` row. The file cannot select both latent normalization contracts unambiguously
+from its architecture label and existing normalization metadata.
+
+An official-configuration random F32 tiny with one dense and one sparse block (trained query/KV/head widths,
+four attention heads, residual/FFN widths 256/128, 16 experts) gives 494 identical IDs / 493 positions, mean
+KL 0.00019, max 0.00185 and top-1 58.22% on the branch. All three tokenizer texts match (494/783/204 IDs),
+and fourteen chat-template cases render exactly. A diagnostic GGUF copy adding sigmoid gating plus the
+tool's scratch-only latent-epsilon row gives mean/max KL 0.00000 and top-1 100%. It uses the same unmodified
+native F32 reference. This isolates the missing export facts; it is not a standard converter gate, and no
+name-based engine exception or global change to existing DeepSeek normalization is made.

@@ -2216,8 +2216,16 @@ the 512-token component stack at the trained head/index widths measures mean KL 
 an isolated first-layer CSA test matches all 512 top-2 selections. These fixtures explicitly use dense FFNs
 and omit learned sinks; they do not establish full DeepSeek-V4 support. Projections use the normal backend
 route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
-AVX2 and scalar). Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
+AVX2 and scalar). Quantized component tests also cover attention widths different from the residual width.
+Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
 every position in every block, including nonclosing positions; memory planning includes that cost.
+
+GLM-4.7-Flash remains a real-model streaming smoke result, not a conformance claim. Its two-block F32 tiny
+checkpoint converted with b11819 matches 494 token IDs but fails numerically (mean KL 0.00019, top-1 58.22%).
+The export omits sigmoid `expert_gating_func`, and its `deepseek2` label does not distinguish the reference's
+1e-6 latent normalization from its 1e-5 block normalization. A diagnostic copy with sigmoid metadata and the
+derived latent-epsilon row reaches mean KL 0.00000 and top-1 100%; that changes the file and the scratch row,
+so it is not the branch's support gate. The published layout needs these facts represented unambiguously.
 
 The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
 precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete

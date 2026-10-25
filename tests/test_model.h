@@ -176,6 +176,7 @@ struct TinyModelSpec {
     // sliding-only (0), nonoverlapping and overlapping compressed blocks.
     int32_t shared_output_groups = 2;
     int32_t shared_output_rank = 32;
+    int32_t shared_head_dim = 0;  // 0: n_embd / n_head; otherwise independent attention width
     std::vector<int32_t> compression_strides;
     std::vector<bool> compression_overlap;
     int32_t hc_count = 0;

@@ -93,7 +93,8 @@ public:
     Reference(const MmapLoader& file, test::TinyModelSpec spec) : file_(file), spec_(std::move(spec)) {}
     Rows logits(const std::vector<int32_t>& tokens) const {
         const auto d = static_cast<size_t>(spec_.n_embd), heads = static_cast<size_t>(spec_.n_head);
-        const size_t hd = d / heads, hc = static_cast<size_t>(spec_.hc_count);
+        const size_t hd = spec_.shared_head_dim > 0 ? static_cast<size_t>(spec_.shared_head_dim) : d / heads;
+        const auto hc = static_cast<size_t>(spec_.hc_count);
         const Row embedding = weights("token_embd.weight");
         Rows x(tokens.size()), streams(tokens.size());
         for (size_t t = 0; t < tokens.size(); ++t) {
@@ -169,7 +170,7 @@ public:
                 }
                 const size_t selected = overlap ? std::min(ready, static_cast<size_t>(spec_.index_topk)) : ready;
                 std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
-                Row attended(d, 0.0f);
+                Row attended(heads * hd, 0.0f);
                 for (size_t h = 0; h < heads; ++h) {
                     std::vector<const Row*> visible;
                     const size_t first = t + 1 > static_cast<size_t>(spec_.sliding_window) ? t + 1 - static_cast<size_t>(spec_.sliding_window) : 0;
@@ -193,7 +194,7 @@ public:
                 }
                 rotate(attended, spec_.n_head, spec_.rope_dim, -static_cast<int>(t), base);
                 Row grouped;
-                const size_t groups = static_cast<size_t>(spec_.shared_output_groups), cols = d / groups;
+                const size_t groups = static_cast<size_t>(spec_.shared_output_groups), cols = heads * hd / groups;
                 const auto rank = static_cast<size_t>(spec_.shared_output_rank);
                 const Row wa = weights(p + "attn_output_a.weight");
                 for (size_t group = 0; group < groups; ++group) {
@@ -369,6 +370,7 @@ TEST_CASE("Shared-KV quantized projections match independent dequantized computa
                             DType::Q4_1, DType::Q4_K, DType::Q5_K}) {
         auto spec = test::compressed_spec();
         spec.n_embd = 512;
+        spec.shared_head_dim = 256;  // attention width 1024 differs from residual width 512
         spec.n_ff = 256;
         spec.mla_q_rank = spec.shared_output_rank = 256;
         spec.index_dim = 128;
