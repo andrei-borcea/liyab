@@ -286,3 +286,6 @@ registry. The gpt-oss trace proposes its complete row including SwigluOai and it
 uses `post_attention_norm`; ERNIE uses adjacent-pair RoPE and renormalizes its selected probabilities. ERNIE's
 reduced configuration sets `intermediate_size=256` with one KV head and two 128-wide shared experts, preserving
 the converter's coupled shared-width metadata. Tiny numerical results are recorded in the README.
+The `glm4` table entry is covered by an explicit split/flag test, the 498-token conformance comparison, and
+fourteen reference chat-template renderings. Its normalizer is absent and `ignore_merges` is true, as in the
+published tokenizer JSON.

@@ -2834,3 +2834,5 @@ The original four-head random gpt-oss checkpoint gave KL 0.00000 and top-1 98.76
 choice matched a reference rounded the same way. That rounded reference is diagnostic, and the table uses the
 standard untouched reference. The smaller checkpoint keeps every block kind, crosses the sliding window, and
 retains top-4 selection among sixteen experts.
+GLM4 tokenization matches all 498 token IDs in its tiny conformance text; its fourteen author-template reference
+conversations render byte for byte through the same chat interpreter.

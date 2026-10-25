@@ -71,8 +71,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
+const std::array<Row, 12>& table() {
+    static const std::array<Row, 12> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -88,6 +88,7 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"glm4"}, {{kLlama3, true}}, false, true},
     }};
     return rows;
 }
