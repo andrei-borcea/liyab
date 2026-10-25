@@ -814,7 +814,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.set("latent_norm_eps", 0.0, "no latent projections")
     elif len(latent_eps) == 1:
         value = latent_eps.pop()
-        d.set("latent_norm_eps", 0.0 if math.isclose(value, eps) else value,
+        d.set("latent_norm_eps", 0.0 if _close(value, eps) else value,
               "recomputed RMS normalization of the shared key/value latent")
 
     # --- RoPE: pairing (reference + converter), frequencies, NoPE blocks ---

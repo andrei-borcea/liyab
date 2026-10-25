@@ -276,6 +276,7 @@ and refuses a shared first block. `attention.indexer.kpool > 1` is explicitly un
 `reference_trace.py` recomputes the indexer's rectified, weighted causal scores and tests both rotary pairings
 against its observed integer position selections. `ArchSpec::indexer_rope` records that pairing independently of
 the main attention's, and `latent_norm_eps` records a latent RMS epsilon differing from the block norms.
+The epsilon comparison permits GGUF's F32 metadata rounding, as the other scalar comparisons do.
 Shared layers must pass the preceding layer's indices unchanged. The trace reconstructs query and KV latent
 normalization and expanded MLA keys/values; the description compares both their geometry and attention scale
 with the GGUF's split absorbed/expanded metadata. On the tiny GLM-5 checkpoint it proposes exactly:
@@ -291,6 +292,14 @@ The standard F32 reference gate uses the original latent/indexer geometry, four 
 diagnostics fail top-1 and remain numerical limitations, as recorded in the README; a rounded-KV diagnostic is
 kept separate from the standard reference gate. No registry row is proposed when the latent decomposition or
 indexer pairing cannot be established.
+
+DeepSeek-V3.2 (`a7e62ac04ecb2c0a54d736dc46601c5606cf10a6`) is checked with four blocks, residual width 256,
+original query/KV/indexer widths and `index_topk=384`: 485 identical IDs, 484 scored positions, mean KL 0.00000,
+maximum 0.00074, top-1 99.59%. At top-k 8 all 485 first-layer selections match the reference. The description
+proposes exactly `{"deepseek32", RopeLayout::Adjacent, "ffn_norm", true}`. The converter's BOS assertion had to
+be removed in a local copy because this official tokenizer explicitly sets `add_bos_token=false`; that rule
+is preserved in both the reference and GGUF. This revision supplies no Jinja chat template. Top-k 256 diagnostics
+at widths 256 and 512 give top-1 98.76% and remain below the required gate.
 
 The README's GLM-5.2 capacity estimates use the official configuration revision
 `cf457fa734ab149ffef225f80893eb38c6ff5cdc`, without downloading its weights. There are 21 full indexers and
