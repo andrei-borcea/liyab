@@ -89,6 +89,15 @@ void GgufWriter::add_f32_array(const std::string& key, const std::vector<float>&
     ++n_kv_;
 }
 
+void GgufWriter::add_u8_array(const std::string& key, const std::vector<uint8_t>& v) {
+    put_string(kv_, key);
+    put<uint32_t>(kv_, kArray);
+    put<uint32_t>(kv_, 0);  // GGUF U8
+    put<uint64_t>(kv_, v.size());
+    kv_.insert(kv_.end(), v.begin(), v.end());
+    ++n_kv_;
+}
+
 void GgufWriter::add_i32_array(const std::string& key, const std::vector<int32_t>& v) {
     put_string(kv_, key);
     put<uint32_t>(kv_, kArray);
@@ -298,6 +307,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32("tokenizer.ggml.bos_token_id", 1);
     w.add_u32("tokenizer.ggml.eos_token_id", 2);
     if (s.add_bos >= 0) w.add_bool("tokenizer.ggml.add_bos_token", s.add_bos != 0);
+    if (s.identity_normalizer) {
+        w.add_u8_array("tokenizer.ggml.precompiled_charsmap", {});
+        w.add_bool("tokenizer.ggml.add_space_prefix", true);
+    }
     if (s.pooling_type >= 0) w.add_u32(a + ".pooling_type", static_cast<uint32_t>(s.pooling_type));
     if (s.add_eos >= 0) w.add_bool("tokenizer.ggml.add_eos_token", s.add_eos != 0);
     if (!s.cls_labels.empty()) w.add_string_array(a + ".classifier.output_labels", s.cls_labels);
@@ -583,6 +596,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
 TinyModelSpec classic_model_spec(const std::string& arch) {
     TinyModelSpec s;
     s.arch = arch;
+    s.identity_normalizer = arch == "orion";
     s.norm_bias = arch != "olmo" && arch != "command-r" && arch != "apertus" && arch != "arcee" && arch != "dbrx";
     s.projection_bias = s.norm_bias;
     s.ungated = arch == "gpt2" || arch == "gptneox" || arch == "falcon" || arch == "bloom" || arch == "mpt" ||

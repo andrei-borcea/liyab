@@ -1290,6 +1290,29 @@ TEST_CASE("Metaspace first: controls preserve real spaces without adding dummy s
     CHECK(*explicit_bos == std::vector<int32_t>({t.bos(), hello}));
 }
 
+TEST_CASE("SentencePiece byte fallback follows token types and groups unknown runs") {
+    for (const int32_t type : {1, 6}) {
+        test::GgufWriter w;
+        w.add_string("general.architecture", "llama");
+        w.add_string("tokenizer.ggml.model", "llama");
+        w.add_string_array("tokenizer.ggml.tokens", {"<unk>", "<s>", "</s>", "<0xCD>", "<0x91>", "x"});
+        w.add_i32_array("tokenizer.ggml.token_type", {2, 3, 3, type, type, 1});
+        w.add_u32("tokenizer.ggml.unknown_token_id", 0);
+        w.add_bool("tokenizer.ggml.add_space_prefix", false);
+        const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_byte_types.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(*file.value());
+        REQUIRE(tok.has_value());
+        auto ids = tok->encode("\u0351\u0351x", false);
+        REQUIRE(ids.has_value());
+        CHECK(*ids == (type == 6 ? std::vector<int32_t>({3, 4, 3, 4, 5}) : std::vector<int32_t>({0, 5})));
+        CHECK(tok->piece(3) == (type == 6 ? std::string_view("\xcd") : std::string_view("<0xCD>")));
+        std::remove(path.c_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transformer
 // ---------------------------------------------------------------------------

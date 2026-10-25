@@ -314,3 +314,20 @@ this field from encoding with and without special tokens.
 
 The Command-R and Arcee templates are checked byte for byte against their own transformers tokenizers,
 including generation prompts, tool requests, Unicode text and rejected conversations.
+
+Orion's published converter omits its SentencePiece normalization map and dummy-space policy. The generic
+SentencePiece path reads `tokenizer.ggml.precompiled_charsmap` when present; otherwise `ArchSpec::spm_charsmap`
+selects an exact registered map by SHA-256. `spm_add_space_prefix_default` supplies an omitted prefix key.
+The Orion row records the map from official `OrionStarAI/Orion-14B-Base` revision
+`b988a511e9c880a465e704c57e3f297a3e7ef282`: NMT-NFKC with tabs/newlines retained, no dummy prefix and no whitespace
+collapse. This is the trained map, including its Unicode-version choices, rather than a substitute contemporary
+NFKC transform. `tools/spm_normalizer.py` reads the model's protobuf fields without external protobuf packages
+and emits the map data reproducibly. The description tool compares the native reference's exact map digest
+and refuses a missing unregistered map. Character-map offsets and replacement terminators are validated at load;
+normalization uses longest-prefix matches on every CPU backend before SentencePiece BPE.
+The same converter also drops SentencePiece's user-defined token types. `spm_user_defined` identifies the exact
+307-symbol set from that tokenizer, used only for the legacy omitted-map layout. Those symbols bypass character
+normalization and remain indivisible during BPE; this is what preserves tabs, newlines and two-space pieces.
+Files carrying an explicit character map use their own token types instead of the fallback.
+SentencePiece byte fallback follows BYTE token types, not token spelling. Without them, consecutive unknown
+characters form one unknown token; normal vocabulary entries spelled `<0xXX>` decode literally.

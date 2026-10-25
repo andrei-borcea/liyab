@@ -102,7 +102,7 @@ RECORDER = Recorder()
 
 def _tensors(obj):
     if torch.is_tensor(obj):
-        return [obj.detach()]
+        return [obj.detach().clone()]
     if isinstance(obj, (list, tuple)):
         out = []
         for o in obj:
@@ -452,8 +452,8 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     try:
         model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
                                                  attn_implementation=ATTN_IMPL)
-    except ValueError as error:
-        if "attention" not in str(error).lower():
+    except (ValueError, KeyError) as error:
+        if not (isinstance(error, KeyError) and error.args == (ATTN_IMPL,)) and "attention" not in str(error).lower():
             raise
         reduced._attn_implementation = "eager"
         model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
@@ -473,8 +473,8 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
 
         def hook(module, args, kwargs, output, path=path):
             RECORDER.calls.append(Call(RECORDER.next(), path, module,
-                                       [a.detach() if torch.is_tensor(a) else a for a in args],
-                                       {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
+                                       [a.detach().clone() if torch.is_tensor(a) else a for a in args],
+                                       {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
                                        _tensors(output)))
             stack.pop()
 
@@ -484,10 +484,23 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
         handles.append(mod.register_forward_pre_hook(enter))
         handles.append(mod.register_forward_hook(hook, with_kwargs=True))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
-    with torch.no_grad(), NativeAttentionTrace(stack):
-        out = model(input_ids=ids, use_cache=False)
-    for h in handles:
-        h.remove()
+    try:
+        try:
+            with torch.no_grad(), NativeAttentionTrace(stack):
+                out = model(input_ids=ids, use_cache=False)
+        except KeyError as error:
+            if error.args != (ATTN_IMPL,):
+                raise
+            # Some implementations expose only their local eager/SDPA map.
+            # Observe their eager operations through the same numerical trace.
+            model.set_attn_implementation("eager")
+            stack.clear()
+            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear()
+            with torch.no_grad(), NativeAttentionTrace(stack):
+                out = model(input_ids=ids, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
     return Trace(text, reduced, n, keep, model, layers_path, layers, list(RECORDER.calls), list(RECORDER.attn), ids,
                  logits, type(model).__name__, list(RECORDER.clamps))

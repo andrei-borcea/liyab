@@ -131,6 +131,15 @@ struct ArchSpec {
     // SentencePiece's BOS policy when tokenizer.ggml.add_bos_token is absent.
     // Explicit metadata wins. Unused for BPE, whose absent-key default is false.
     bool spm_add_bos_default = true;
+    // Absent add_space_prefix metadata: SentencePiece's dummy-space policy.
+    bool spm_add_space_prefix_default = true;
+    // SHA-256 of a registered SentencePiece character map when GGUF omits
+    // precompiled_charsmap. Empty: identity. Explicit map metadata wins.
+    std::string_view spm_charsmap = "";
+    // Exact registered user-defined symbols when a converter loses their
+    // token types along with the omitted character map; empty, or explicit
+    // character-map metadata: the GGUF's types fully describe them.
+    std::string_view spm_user_defined = "";
 };
 
 // Every architecture Liyab runs, in registry order.

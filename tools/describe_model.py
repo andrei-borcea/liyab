@@ -481,7 +481,8 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
-                  "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default")
+                  "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined")
 
 
 def _close(a, b, rel=1e-5):
@@ -1465,6 +1466,9 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
     if kind != "llama":
         d.set("spm_prefix_after_control", True, "not a SentencePiece vocabulary; control-prefix policy is unused")
         d.set("spm_add_bos_default", True, "not a SentencePiece vocabulary; absent BOS metadata means no BOS")
+        d.set("spm_add_space_prefix_default", True, "not a SentencePiece vocabulary; dummy-space policy is unused")
+        d.set("spm_charsmap", "", "not a SentencePiece vocabulary; compiled character map is unused")
+        d.set("spm_user_defined", "", "not a SentencePiece vocabulary; user-defined symbol fallback is unused")
     try:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
@@ -1507,7 +1511,9 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
     if kind == "llama" and plain:
         piece = tok.convert_ids_to_tokens(plain[0])
         ref_prefix = isinstance(piece, str) and piece.startswith("▁")
-        add_prefix = bool(g.metadata.get("tokenizer.ggml.add_space_prefix", True))
+        d.set("spm_add_space_prefix_default", ref_prefix, "observed initial dummy-space behavior of the reference tokenizer")
+        default_prefix = engine.rows.get(g.arch, ({},))[0].get("spm_add_space_prefix_default", True)
+        add_prefix = bool(g.metadata.get("tokenizer.ggml.add_space_prefix", default_prefix))
         if add_prefix != ref_prefix:
             d.file_issues.append(f"the model's tokenizer {'puts a' if ref_prefix else 'puts no'} space before the "
                                  f"text, the GGUF {'asks for one' if add_prefix else 'asks for none'} "
@@ -1533,6 +1539,42 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
                   "observed dummy-space behavior after a literal BOS/EOS control token")
         else:
             d.unknown.append("spm_prefix_after_control: no consistent control-prefix behavior was observed")
+        sp_model = getattr(tok, "sp_model", None)
+        if sp_model is not None and hasattr(sp_model, "serialized_model_proto"):
+            from spm_normalizer import read_normalizer
+            normalizer = read_normalizer(sp_model.serialized_model_proto())
+            digest = normalizer["sha256"]
+            if normalizer["remove_extra_whitespaces"] or not normalizer["escape_whitespaces"]:
+                d.missing.append("SentencePiece normalization with collapsed or unescaped whitespace")
+            explicit = g.metadata.get("tokenizer.ggml.precompiled_charsmap")
+            if explicit is not None:
+                import hashlib
+                if hashlib.sha256(bytes(explicit)).hexdigest() != digest:
+                    d.file_issues.append("the GGUF precompiled character map differs from the reference")
+                fallback = engine.rows.get(g.arch, ({},))[0].get("spm_charsmap", "")
+            else:
+                fallback = digest
+                with open(os.path.join(REPO, "src/core/spm_normalizer.inc"), encoding="utf-8") as source:
+                    registered = source.read(400)
+                if digest and digest not in registered:
+                    d.missing.append("the file omits its SentencePiece character map and no exact registered map matches")
+            d.set("spm_charsmap", fallback, "exact SHA-256 of the native SentencePiece normalization map")
+            symbols = normalizer["user_defined"]
+            vocabulary = g.metadata.get("tokenizer.ggml.tokens", [])
+            types = g.metadata.get("tokenizer.ggml.token_type", [])
+            ids = {token: i for i, token in enumerate(vocabulary)}
+            preserved = all(token in ids and ids[token] < len(types) and types[ids[token]] == 4 for token in symbols)
+            symbols_fallback = engine.rows.get(g.arch, ({},))[0].get("spm_user_defined", "") if preserved else normalizer["user_defined_sha256"]
+            if symbols_fallback:
+                with open(os.path.join(REPO, "src/core/spm_normalizer.inc"), encoding="utf-8") as source:
+                    if symbols_fallback not in source.read():
+                        d.missing.append("the file loses SentencePiece user-defined types and no exact registered symbols match")
+            d.set("spm_user_defined", symbols_fallback, "exact native user-defined symbols, or the file's preserved token types")
+        else:
+            # Fast Metaspace tokenizers with no compiled map are checked by
+            # the token gate; the existing normalizer profiles own their NFC.
+            d.set("spm_charsmap", "", "the reference tokenizer has no native compiled SentencePiece map")
+            d.set("spm_user_defined", "", "the fast tokenizer's user-defined symbols come from the GGUF token types")
 
 
 # ----------------------------------------------------------------------------------------------------------------

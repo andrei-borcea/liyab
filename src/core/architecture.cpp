@@ -147,7 +147,12 @@ constexpr ArchSpec kArchitectures[] = {
     // per-head Q/K LayerNorms where the file has them (12B).
     {.name = "stablelm", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
     // Orion: a Llama block with LayerNorms.
-    {.name = "orion", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
+    {.name = "orion", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer,
+     .spm_prefix_after_control = false,
+     .spm_add_bos_default = false,
+     .spm_add_space_prefix_default = false,
+     .spm_charsmap = "51d3684747b35ef99cd4802f37cc1ee0c6bec4d060814f774efb1066d3c167f2",
+     .spm_user_defined = "e98a1435e08f8182b13816335751bcea918df2a67331f73288af701d0905c7f4"},
     // OLMo (1): non-parametric LayerNorms (no norm tensors), optional clip_qkv.
     {.name = "olmo", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .norm = NormKind::Layer},
     // Command-R: parallel blocks with one shared LayerNorm (no bias),

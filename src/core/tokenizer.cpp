@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <optional>
 #include <queue>
+#include <unordered_set>
 
 #include "core/log.h"
 #include "core/architecture.h"
@@ -121,8 +122,44 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     tok.bos_ = token_id(model, "tokenizer.ggml.bos_token_id", vocab).value_or(-1);
     tok.eos_ = token_id(model, "tokenizer.ggml.eos_token_id", vocab).value_or(-1);
     tok.unk_ = token_id(model, "tokenizer.ggml.unknown_token_id", vocab).value_or(-1);
+    if (tok.unk_ < 0) {
+        // Some SentencePiece converters preserve UNKNOWN's token type but
+        // omit its ID metadata. The type is unambiguous vocabulary data.
+        for (size_t i = 0; i < n; ++i) {
+            if (tok.types_[i] != kUnknown) continue;
+            if (tok.unk_ >= 0) return Status(ErrorCode::InvalidModel, "multiple UNKNOWN vocabulary entries without an unknown-token ID");
+            tok.unk_ = static_cast<int32_t>(i);
+        }
+    }
     const auto architecture = model.get_string("general.architecture");
     const ArchSpec* spec = architecture ? find_architecture(*architecture) : nullptr;
+    tok.add_space_prefix_ = spec == nullptr || spec->spm_add_space_prefix_default;
+    std::span<const uint8_t> charsmap = spec == nullptr ? std::span<const uint8_t>() : SpmNormalizer::registered_map(spec->spm_charsmap);
+    if (spec != nullptr && !spec->spm_charsmap.empty() && charsmap.empty()) {
+        return Status(ErrorCode::Unsupported, "unregistered SentencePiece character map");
+    }
+    if (const GgufValue* map = model.metadata("tokenizer.ggml.precompiled_charsmap")) {
+        if (map->type != GgufValue::Type::Array || map->array_type != GgufValue::Type::U8) {
+            return Status(ErrorCode::InvalidModel, "tokenizer.ggml.precompiled_charsmap must be a byte array");
+        }
+        charsmap = {map->array_data, static_cast<size_t>(map->array_size)};
+    }
+    auto normalizer = SpmNormalizer::load(charsmap);
+    if (!normalizer) return normalizer.status();
+    tok.spm_normalizer_ = *normalizer;
+    if (spec != nullptr && !spec->spm_user_defined.empty() && model.metadata("tokenizer.ggml.precompiled_charsmap") == nullptr) {
+        const auto symbols = SpmNormalizer::registered_user_defined(spec->spm_user_defined);
+        if (symbols.empty()) return Status(ErrorCode::Unsupported, "unregistered SentencePiece user-defined symbols");
+        const std::unordered_set<std::string_view> protected_symbols(symbols.begin(), symbols.end());
+        size_t found = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (protected_symbols.contains(tok.texts_[i])) {
+                tok.types_[i] = kUserDefined;
+                ++found;
+            }
+        }
+        if (found != symbols.size()) return Status(ErrorCode::InvalidModel, "missing registered SentencePiece user-defined symbols");
+    }
     if (const GgufValue* v = model.metadata("tokenizer.ggml.add_bos_token")) {
         tok.add_bos_ = v->as_bool().value_or(true);
     } else {
@@ -146,7 +183,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
 
         uint8_t byte = 0;
         if (tok.kind_ == Kind::Spm) {
-            if ((type == kByte || type == kNormal) && parse_byte_token(text, byte)) {
+            if (type == kByte && parse_byte_token(text, byte)) {
+                tok.spm_byte_fallback_ = true;
                 piece.assign(1, static_cast<char>(byte));
                 continue;
             }
@@ -352,6 +390,9 @@ Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool 
 }
 
 void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const {
+    const std::string mapped = spm_normalizer_.empty() ? std::string() : spm_normalizer_.normalize(text);
+    if (!spm_normalizer_.empty()) text = mapped;
+    if (text.empty()) return;
     std::string normalized;
     normalized.reserve(text.size() * 2 + kSpmSpace.size());
     if (space_prefix) normalized += kSpmSpace;
@@ -367,12 +408,23 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
         int32_t next;
         const char* text;
         size_t size;
+        bool protected_symbol;
     };
     std::vector<Symbol> symbols;
     for (size_t pos = 0; pos < normalized.size();) {
-        const size_t len = std::min(utf8_len(static_cast<unsigned char>(normalized[pos])), normalized.size() - pos);
+        size_t len = std::min(utf8_len(static_cast<unsigned char>(normalized[pos])), normalized.size() - pos);
+        bool protected_symbol = false;
+        // User-defined symbols are indivisible even when their spelling was
+        // produced by whitespace escaping (e.g. SentencePiece's two spaces).
+        for (const int32_t id : special_by_byte_[static_cast<unsigned char>(normalized[pos])]) {
+            if (types_[static_cast<size_t>(id)] == kUserDefined && normalized.compare(pos, texts_[static_cast<size_t>(id)].size(), texts_[static_cast<size_t>(id)]) == 0) {
+                len = texts_[static_cast<size_t>(id)].size();
+                protected_symbol = true;
+                break;
+            }
+        }
         const auto index = static_cast<int32_t>(symbols.size());
-        symbols.push_back({index - 1, index + 1, normalized.data() + pos, len});
+        symbols.push_back({index - 1, index + 1, normalized.data() + pos, len, protected_symbol});
         pos += len;
     }
     symbols.back().next = -1;
@@ -389,6 +441,7 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
     std::priority_queue<Bigram, std::vector<Bigram>, decltype(worse)> queue(worse);
     auto try_add = [&](int32_t left, int32_t right) {
         if (left < 0 || right < 0) return;
+        if (symbols[static_cast<size_t>(left)].protected_symbol || symbols[static_cast<size_t>(right)].protected_symbol) return;
         const std::string_view merged(symbols[static_cast<size_t>(left)].text,
                                       symbols[static_cast<size_t>(left)].size + symbols[static_cast<size_t>(right)].size);
         const auto it = lookup_.find(merged);
@@ -418,11 +471,17 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
             out.push_back(it->second);
             continue;
         }
+        if (!spm_byte_fallback_) {
+            // Without BYTE token types, <0xXX> spellings are ordinary
+            // vocabulary entries. SentencePiece groups an unknown run.
+            if (out.empty() || out.back() != unk_) out.push_back(unk_);
+            continue;
+        }
         for (size_t k = 0; k < s.size; ++k) {  // byte fallback
             char byte_text[8];
             std::snprintf(byte_text, sizeof byte_text, "<0x%02X>", static_cast<unsigned char>(s.text[k]));
             const auto byte_it = lookup_.find(byte_text);
-            if (byte_it != lookup_.end()) out.push_back(byte_it->second);
+            if (byte_it != lookup_.end() && types_[static_cast<size_t>(byte_it->second)] == kByte) out.push_back(byte_it->second);
             else out.push_back(unk_);  // -1 when the vocabulary has no <unk>: reported by encode()
         }
     }

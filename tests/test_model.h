@@ -22,6 +22,7 @@ public:
     void add_string_array(const std::string& key, const std::vector<std::string>& v);
     void add_f32_array(const std::string& key, const std::vector<float>& v);
     void add_i32_array(const std::string& key, const std::vector<int32_t>& v);
+    void add_u8_array(const std::string& key, const std::vector<uint8_t>& v);
     void add_bool_array(const std::string& key, const std::vector<bool>& v);
     // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
     void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
@@ -162,6 +163,7 @@ struct TinyModelSpec {
     int32_t pooling_type = -1;            // >= 0: <arch>.pooling_type
     int32_t add_eos = -1;                 // >= 0: tokenizer.ggml.add_eos_token (nonzero: true)
     int32_t add_bos = 1;                  // -1: omit metadata; 0/1: explicit tokenizer BOS policy
+    bool identity_normalizer = false;    // explicit identity map and dummy prefix for the synthetic vocabulary
     std::vector<std::string> cls_labels;  // non-empty: <arch>.classifier.output_labels
     // > 0: a ranking head cls.output.weight of this many rows (in output_type):
     // the output head's rows of the tokens in cls_rows_from when given (its

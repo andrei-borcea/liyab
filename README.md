@@ -503,6 +503,10 @@ What the port does differently from the POSIX platforms:
     Nemotron's Metaspace `first` policy adds a dummy space only at the start of plain text; real spaces after
     literal controls remain significant, including when matching saved contexts. Its absent BOS metadata
     defaults to no BOS; an explicit file setting always wins.
+    SentencePiece compiled character maps run before BPE when the GGUF records one. Orion's converter omits
+    its map and initial-space policy, so its architecture row supplies the exact registered map and defaults;
+    this preserves its trained NMT-NFKC normalization, tabs and newlines without changing existing tokenizers.
+    Byte fallback follows BYTE token types; ordinary `<0xXX>` vocabulary entries retain their literal text.
   * **Checked token for token** against each model's Hugging Face tokenizer, special tokens, contractions,
     digits, white-space runs, composed and decomposed accents, CJK, emoji and right-to-left text included
     ([Correctness](#correctness)).

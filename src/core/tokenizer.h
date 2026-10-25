@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/pre_tokenizer.h"
+#include "core/spm_normalizer.h"
 #include "liyab/mmap_loader.h"
 
 namespace liyab {
@@ -108,6 +109,8 @@ private:
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
     bool spm_prefix_after_control_ = true;
+    SpmNormalizer spm_normalizer_;
+    bool spm_byte_fallback_ = false;
 };
 
 }  // namespace liyab
