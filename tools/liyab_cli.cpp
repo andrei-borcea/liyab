@@ -194,7 +194,7 @@ void print_stats(const liyab_generation_stats& stats) {
         const double per = 1.0 / stats.generated_tokens;
         const double phases[] = {stats.attention_ms, stats.delta_net_ms, stats.router_ms, stats.experts_ms,
                                  stats.shared_expert_ms, stats.dense_ffn_ms, stats.lm_head_ms};
-        const char* names[] = {"attention", "DeltaNet", "router", "experts", "shared expert", "dense FFN", "LM head"};
+        const char* names[] = {"attention", "recurrent", "router", "experts", "shared expert", "dense FFN", "LM head"};
         double timed = 0.0;
         std::fprintf(stderr, "decode ms/token:");
         for (size_t i = 0; i < sizeof phases / sizeof phases[0]; ++i) {
@@ -240,6 +240,7 @@ void usage() {
                  "                     reply to it and TEXT, so the engine reuses its context as in a chat\n"
                  "  --json             stdout: one JSON line after loading (load_ms, context, memory plan)\n"
                  "                     and one per turn (stats, peak RSS, reply) instead of the text\n"
+                 "                     phases_ms.delta_net counts every recurrent mixer (legacy key)\n"
                  "  --temp T           temperature, 0 = greedy (default 0.8)\n"
                  "  --top-k K          (default 40)    --top-p P (default 0.95)\n"
                  "  --seed N           RNG seed (default random)\n"

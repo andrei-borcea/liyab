@@ -151,6 +151,7 @@ struct TinyModelSpec {
     bool mamba_weighted_norms = false;
     bool mamba_bias = false;
     bool mamba_topology = false;
+    bool mamba_parallel = false;  // invalid variant: attention and SSM in one block, for rejection tests
 
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their

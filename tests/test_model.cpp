@@ -406,6 +406,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 }
             }
             w.add_tensor(p + "ssm_out.weight", {di, d}, s.attn_type, random(di * d, s.weight_scale));
+            if (s.mamba_parallel) {
+                w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+                w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+                w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+                w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            }
             if (s.mamba_bias) {
                 w.add_tensor(p + "ssm_in.bias", {input}, DType::F32, random(input, 0.1f));
                 w.add_tensor(p + "ssm_out.bias", {d}, DType::F32, random(d, 0.1f));

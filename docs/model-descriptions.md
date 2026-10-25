@@ -36,6 +36,10 @@ projections select attention; an FFN without mixer tensors is an FFN-only
 block. The loader rejects empty blocks and mixed SSM geometries.
 Any attention projection identifies attention, including K/V/output: an
 incomplete set fails binding rather than silently becoming an FFN-only block.
+Likewise, a partial FFN or SSM projection set remains that part and fails
+validation/binding; expert projections require a router. Parallel attention
+and Mamba tensors in one block are explicitly refused until that topology
+is implemented.
 
 Mamba-1 uses the file's convolution, input, selective, time-step and output
 projections; `ssm_a` already holds `-exp(A_log)`, as converter b11819 writes
@@ -64,6 +68,12 @@ rollback for all projection formats and four KV cache types. Existing
 context, tree-draft and prefix-cache tests also exercise Mamba states.
 Synthetic golden cases combine SSM, attention and FFN-only blocks, including
 MoE FFNs with in-place and streamed experts.
+GPU prefill and decode projection checks use F32 throughout, keeping projection roundoff
+separate from discrete Q8 activation rounding in the output head. Each GPU
+backend is destroyed before the model mappings whose buffers it wraps.
+The CLI labels their phase `recurrent`. The C API field `delta_net_ms` and
+JSON key `phases_ms.delta_net` keep their names and include all recurrent
+mixers; neither the ABI layout nor existing JSON keys change.
 
 Rows established against transformers 5.19.0 and converter b11819:
 

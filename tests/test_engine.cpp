@@ -3983,7 +3983,7 @@ TEST_CASE("The prefix cache brings back a conversation whose text re-encodes dif
         // reply again; an attention-only one keeps the reply's tokens.
         Engine& r = *reference.value();
         REQUIRE(r.prefill(head, true).is_ok());
-        if (std::string(arch) != "llama") {
+        if (std::string(arch) == "qwen35") {
             REQUIRE(r.prefill(a, true).is_ok());
         } else {
             CHECK(run(r, a) == reply_a);

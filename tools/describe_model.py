@@ -733,8 +733,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for b in range(n_layers):
         ts = blocks.get(b, set())
         p = {}
-        if "ssm_conv1d.weight" in ts:
-            p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if "ssm_d" in ts else "deltanet"
+        if {"ssm_conv1d.weight", "ssm_in.weight", "ssm_x.weight", "ssm_out.weight", "ssm_a", "ssm_d"} & ts:
+            p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if {"ssm_d", "ssm_in.weight", "ssm_x.weight"} & ts else "deltanet"
+            if p["mixer"] in ("mamba", "mamba2") and "attn_output.weight" in ts:
+                d.missing.append(f"block {b}: parallel attention and Mamba mixers in one block")
         elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight", "attn_k.weight",
                   "attn_v.weight", "attn_output.weight"} & ts:
             p["mixer"] = "none"
@@ -750,11 +752,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
             p["selection_bias"] = "exp_probs_b.bias" in ts
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
-        elif "ffn_up.weight" in ts:
+        elif {"ffn_up.weight", "ffn_gate.weight", "ffn_down.weight"} & ts:
             p["ffn"] = "dense"
             p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * n_ff
         else:
             p["ffn"] = "none"
+        if "ffn_gate_inp.weight" not in ts and {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight",
+                                                "ffn_gate_up_exps.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"} & ts:
+            d.file_issues.append(f"block {b}: expert projections require ffn_gate_inp.weight")
         plans.append(p)
 
     # --- the reference, block by block ---
@@ -1265,7 +1270,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                            + (", a shared expert" + (" with a sigmoid gate" if f["shared_expert"].get("gate") else "")
                               if f.get("shared_expert") else ""))
     elif bf:
-        d.set("moe_norm_weights", False, "dense FFNs (the MoE default does not apply)")
+        d.set("moe_norm_weights", False, "no MoE FFNs in the traced blocks (the MoE default does not apply)")
 
     # --- embeddings and logits ---
     es = facts.get("embedding_scale")

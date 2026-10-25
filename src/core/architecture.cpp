@@ -134,8 +134,14 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // come from ssm_x, else Gated DeltaNet), attention projections make it
     // attention, and a block with neither has no mixer (its FFN alone).
     auto mixer_of = [&](int32_t l) {
-        if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr) {
-            if (f.tensor(block_tensor(l, "ssm_d")) == nullptr) return MixerKind::DeltaNet;
+        if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_in.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_out.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_a")) != nullptr || f.tensor(block_tensor(l, "ssm_d")) != nullptr) {
+            if (f.tensor(block_tensor(l, "ssm_d")) == nullptr &&
+                f.tensor(block_tensor(l, "ssm_in.weight")) == nullptr &&
+                f.tensor(block_tensor(l, "ssm_x.weight")) == nullptr) return MixerKind::DeltaNet;
             return f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ? MixerKind::Mamba : MixerKind::Mamba2;
         }
         for (const char* t : {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight",
@@ -338,6 +344,11 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
         b.mixer = mixer_of(l);
+        if ((b.mixer == MixerKind::Mamba || b.mixer == MixerKind::Mamba2) &&
+            f.tensor(block_tensor(l, "attn_output.weight")) != nullptr) {
+            return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                              ": parallel attention and Mamba mixers in one block are not supported");
+        }
         if (b.mixer == MixerKind::Attention) {
             ++c.n_attn_layers;
             b.latent = f.tensor(block_tensor(l, "attn_kv_a_mqa.weight")) != nullptr;
@@ -354,12 +365,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             b.fused_gate_up =
                 f.tensor(block_tensor(l, "ffn_gate.weight")) == nullptr && up->rows() == 2 * int64_t{c.n_ff};
-        } else if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr) {
+        } else if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr &&
+                   f.tensor(block_tensor(l, "ffn_gate.weight")) == nullptr &&
+                   f.tensor(block_tensor(l, "ffn_down.weight")) == nullptr) {
             b.ffn = FfnKind::None;
-            if (b.mixer == MixerKind::None) {
-                return Status(ErrorCode::InvalidModel,
-                              "block " + std::to_string(l) + " has neither a token mixer nor an FFN");
-            }
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
@@ -369,6 +378,18 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
                               f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
+        } else {
+            for (const char* name : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight",
+                                     "ffn_gate_up_exps.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"}) {
+                if (f.tensor(block_tensor(l, name)) != nullptr) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                      ": expert projections require ffn_gate_inp.weight");
+                }
+            }
+        }
+        if (b.mixer == MixerKind::None && b.ffn == FfnKind::None) {
+            return Status(ErrorCode::InvalidModel,
+                          "block " + std::to_string(l) + " has neither a token mixer nor an FFN");
         }
         if (b.ffn == FfnKind::Dense && c.n_ff <= 0) {
             return Status(ErrorCode::InvalidModel, "missing or invalid " + key("feed_forward_length"));

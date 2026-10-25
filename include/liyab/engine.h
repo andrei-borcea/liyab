@@ -84,7 +84,7 @@ struct EngineConfig {
     // caps the OS counters do not show (HyperOS stops apps above 6 GiB PSS).
     int64_t memory_budget_mb = 0;
     // With expert streaming (MoE): convert the resident Q8_0 matrices
-    // (attention / DeltaNet projections, shared experts) to Q4_K (4) or Q5_K
+    // (attention / recurrent projections, shared experts) to Q4_K (4) or Q5_K
     // (5) at load. Lossy, opt-in: fewer bytes read per token, and the memory
     // saved goes to the expert cache. Converted on every core at load;
     // ignored when experts are not streamed. 0: off. -1: automatic, only when
@@ -120,7 +120,7 @@ struct EngineConfig {
     // cache layout, key scales, kernels and the LoRA adapter selected (see
     // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
-    // restores it; recurrent (DeltaNet) states are kept as images at the
+    // restores it; recurrent mixer states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model
     // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
     // of memory_budget_mb; on a MoE whose experts stream, only as far as the
@@ -418,7 +418,7 @@ struct PromptSegment {
 // (Engine::set_adapter), and a pass without one costs what it did.
 //  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each
 //    matrix's own rank; alpha 0 or absent: s = scale), as PEFT computes it.
-//  * Dense matrices of every block (attention, DeltaNet, FFN, the shared
+//  * Dense matrices of every block (attention, recurrent mixers, FFN, the shared
 //    expert, the router, latent attention's whole projections) and the LM
 //    head; a mixture of experts' per-expert stacks (each expert its slice).
 //    Refused: adapters of the token embeddings, of latent attention's
@@ -574,7 +574,7 @@ public:
     // A prompt that leaves that text partway keeps its tokens up to the last
     // one whose text it still starts with. Otherwise the longest common token
     // prefix is kept: any length on
-    // attention-only models; on hybrid (DeltaNet) models, whose recurrent
+    // attention-only models; on recurrent models (DeltaNet or Mamba), whose
     // states cannot rewind, up to the nearest state snapshot, taken at the end
     // of every prompt and prefill (Transformer::snapshot_state), so an edited
     // last reply or a dropped turn recomputes only what follows that point.

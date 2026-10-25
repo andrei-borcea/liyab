@@ -123,46 +123,92 @@ TEST_CASE("Mamba GPU projections retain CPU recurrent-scan semantics") {
     const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ssm_gpu.gguf";
     struct Cleanup { std::string path; ~Cleanup() { std::remove(path.c_str()); } } cleanup{path};
     for (auto make : {make_metal_backend, make_vulkan_backend}) {
-        auto gpu = make();
-        if (!gpu) continue;
-        const Route route{gpu->get(), gpu->get(), cpu.get()};
         for (const char* arch : {"mamba", "mamba2"}) {
             test::TinyModelSpec s;
             s.arch = arch;
-            s.attn_type = DType::F32;
+            // Keep the whole graph float: small projection roundoff must
+            // not become a discontinuous Q8 activation rounding difference
+            // in the output head when checking the scan's GPU routing.
+            s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
             test::write_tiny_model(path, s);
             auto load = [&]() { return Transformer::load(std::move(MmapLoader::open(path)).value(), {}); };
             auto ref = load(), model = load();
             REQUIRE(ref && model);
+            // A GPU backend caches wrappers around model mappings; destroy
+            // it before either mapping, and do not reuse it for another file.
+            auto gpu = make();
+            if (!gpu) {
+                std::printf("  skipped: %s\n", gpu.status().to_string().c_str());
+                break;
+            }
+            std::printf("  %s: %s\n", arch, gpu.value()->description().c_str());
+            const Route route{gpu->get(), gpu->get(), cpu.get()};
             auto a = (*ref)->forward(ids, Transformer::Logits::All, reference, pool);
             REQUIRE(a);
             const std::vector<float> expected(a->begin(), a->end());
             auto b = (*model)->forward(ids, Transformer::Logits::All, route, pool);
             REQUIRE(b);
             for (size_t i = 0; i < expected.size(); ++i) CHECK_NEAR((*b)[i], expected[i], 1e-3);
+            for (const int32_t token : ids) {
+                const std::span<const int32_t> step(&token, 1);
+                auto c = (*ref)->forward(step, Transformer::Logits::Last, reference, pool);
+                REQUIRE(c);
+                const std::vector<float> row(c->begin(), c->end());
+                auto d = (*model)->forward(step, Transformer::Logits::Last, route, pool);
+                REQUIRE(d);
+                for (size_t i = 0; i < row.size(); ++i) CHECK_NEAR((*d)[i], row[i], 1e-3);
+            }
         }
     }
 }
 
-TEST_CASE("An incomplete attention mixer is rejected instead of becoming an FFN-only block") {
+TEST_CASE("Incomplete projection sets are rejected instead of silently dropping a block part") {
     const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ssm_incomplete.gguf";
     struct Cleanup { std::string path; ~Cleanup() { std::remove(path.c_str()); } } cleanup{path};
-    test::write_tiny_model(path);
-    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
-    const std::string bytes((std::istreambuf_iterator<char>(file)), {});
-    const std::string name = "blk.0.attn_q.weight", renamed = "blk.0.bad__q.weight";
-    const auto at = bytes.find(name);
-    REQUIRE(at != std::string::npos && name.size() == renamed.size());
-    file.clear();
-    file.seekp(static_cast<std::streamoff>(at));
-    file.write(renamed.data(), static_cast<std::streamsize>(renamed.size()));
-    file.close();
-    auto mapped = MmapLoader::open(path);
-    REQUIRE(mapped);
-    auto model = Transformer::load(std::move(mapped).value(), {});
-    CHECK(!model);
-    CHECK(model.status().code() == ErrorCode::InvalidModel);
-    CHECK(model.status().to_string().find("attn_q.weight") != std::string::npos);
+    for (const std::string suffix : {"attn_q.weight", "ffn_up.weight", "ffn_gate_inp.weight", "ssm_conv1d.weight"}) {
+        test::TinyModelSpec spec;
+        if (suffix == "ffn_gate_inp.weight") {
+            spec.arch = "qwen3moe";
+            spec.n_expert = 4;
+            spec.n_expert_used = 2;
+        }
+        if (suffix == "ssm_conv1d.weight") spec.arch = "mamba";
+        test::write_tiny_model(path, spec);
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(file)), {});
+        const std::string name = "blk.0." + suffix;
+        std::string renamed = name;
+        renamed[6] = 'x';  // preserve the GGUF header length and every tensor's offset
+        const auto at = bytes.find(name);
+        REQUIRE(at != std::string::npos);
+        file.clear();
+        file.seekp(static_cast<std::streamoff>(at));
+        file.write(renamed.data(), static_cast<std::streamsize>(renamed.size()));
+        file.close();
+        auto mapped = MmapLoader::open(path);
+        REQUIRE(mapped);
+        auto model = Transformer::load(std::move(mapped).value(), {});
+        REQUIRE(!model);
+        CHECK(model.status().code() == ErrorCode::InvalidModel);
+        CHECK(model.status().to_string().find(suffix) != std::string::npos);
+    }
+}
+
+TEST_CASE("Parallel attention and Mamba are refused with the missing topology named") {
+    const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ssm_parallel.gguf";
+    struct Cleanup { std::string path; ~Cleanup() { std::remove(path.c_str()); } } cleanup{path};
+    for (const char* arch : {"mamba", "mamba2"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.mamba_parallel = true;
+        test::write_tiny_model(path, spec);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file);
+        auto description = describe_model(**file);
+        REQUIRE(!description);
+        CHECK(description.status().code() == ErrorCode::Unsupported);
+        CHECK(description.status().to_string().find("parallel attention and Mamba") != std::string::npos);
+    }
 }
 
 TEST_MAIN()
