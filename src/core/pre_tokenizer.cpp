@@ -50,6 +50,9 @@ constexpr const char* kEachDigit = R"(\p{N})";
 // Mistral-Nemo and later Mistral models (Tekken): the GPT-4o words without the contractions, single digits.
 constexpr const char* kTekken =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Seed-OSS: single digits and punctuation split separately from following newlines; NFC first.
+constexpr const char* kSeedCoder =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1}| ?[^\s\p{L}\p{N}\r\n]+|\s*[\r\n]+|\s+(?!\S)|\s+)";
 // Youtu-LLM: Hangul, CJK punctuation, Bopomofo and Han/kana runs first, then the GPT-4o words with single
 // digits. The file writes the first class as \p{Hangul}; script properties are not part of core/regex.h, so it
 // is spelled out as the Hangul script's ranges (Unicode 16 Scripts.txt: the set Oniguruma matches, checked code
@@ -71,10 +74,10 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
-        {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
-        {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
+const std::array<Row, 13>& table() {
+    static const std::array<Row, 13> rows = {{
+        {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
+        {{"llama-bpe", "llama3", "smaug-bpe"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},
@@ -88,6 +91,9 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        // OLMo 2 / 3 (dbrx): Llama 3's regex, ordinary merge ranks and no normalization.
+        {{"dbrx"}, {{kLlama3, false}}, false, false},
+        {{"seed-coder"}, {{kSeedCoder, true}}, true, false},
     }};
     return rows;
 }

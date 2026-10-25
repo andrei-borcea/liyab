@@ -450,6 +450,27 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     }
     CHECK(PreTokenizer::for_name("qwen2")->nfc() && PreTokenizer::for_name("qwen35")->nfc());
     CHECK(!PreTokenizer::for_name("llama3")->nfc() && PreTokenizer::for_name("llama3")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("smaug-bpe")->nfc() && PreTokenizer::for_name("smaug-bpe")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("dbrx")->nfc() && !PreTokenizer::for_name("dbrx")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("exaone4")->nfc() && !PreTokenizer::for_name("exaone4")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("refact")->nfc() && !PreTokenizer::for_name("refact")->ignore_merges());
+    {
+        auto seed = PreTokenizer::for_name("seed-coder");
+        REQUIRE(seed.has_value());
+        CHECK(seed->nfc() && !seed->ignore_merges());
+        std::vector<std::string_view> pieces;
+        seed->split("a!\n12", pieces);
+        CHECK(pieces == std::vector<std::string_view>({"a", "!", "\n", "1", "2"}));
+    }
+    for (const std::string text : {"We're testing 12345.\n", "東京 café!  42\r\n"}) {
+        std::vector<std::string_view> llama, smaug;
+        PreTokenizer::for_name("llama3")->split(text, llama);
+        PreTokenizer::for_name("smaug-bpe")->split(text, smaug);
+        CHECK(llama == smaug);
+        std::vector<std::string_view> dbrx;
+        PreTokenizer::for_name("dbrx")->split(text, dbrx);
+        CHECK(llama == dbrx);
+    }
     CHECK(PreTokenizer::for_name("hunyuan")->ignore_merges() && !PreTokenizer::for_name("qwen2")->ignore_merges());
 
     auto unknown = PreTokenizer::for_name("starcoder-9");

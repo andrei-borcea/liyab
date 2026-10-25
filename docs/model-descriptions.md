@@ -83,6 +83,10 @@ trip), the tensors the forward pass binds from `transformer.cpp`, the pre-tokeni
 `pre_tokenizer.cpp` and `tokenizer.cpp`. An `ArchSpec` field the tool has no rule for makes it refuse to propose
 rows until the rule is added.
 
+The modern model tokenizer rules (`smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`) are validated on all
+three gate texts. SmolLM3's chat template is also recorded in `tests/data/chat_templates.json`; its 14 cases render
+exactly as transformers does. An OLMo 2 base checkpoint has no chat template to render.
+
 ## The conformance gate
 
 `--gate` verifies the row on a build that has it:
