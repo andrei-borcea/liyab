@@ -118,7 +118,7 @@ These rules decide what goes into the code:
 | Windows x64 port of the engine, `liyab-cli`, the tests and tools: file mapping, unbuffered direct reads, processor groups and hybrid cores, UTF-8 paths and console; MSVC or clang-cl | 🟡 written, not yet compiled or run on Windows ([Windows](#windows-x64)) |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) laid out per block (windowed blocks keep only their window), with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
-| Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
+| Context kept between turns, recurrent-state snapshots for DeltaNet and compressed attention, save/restore to disk | ✅ |
 | Shared K=V attention components: sliding + overlapping/nonoverlapping gated compression, compressed-key selection, grouped output, manifold-constrained residual streams | 🧪 CPU component checks pass; full DeepSeek-V4 also requires the MoE routing, clipping and learned-sink integration |
 | Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU and Metal backends |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |

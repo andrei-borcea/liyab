@@ -2725,7 +2725,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
-        // Rejected drafts are rolled back; recurrent (DeltaNet) states need a
+        // Rejected drafts are rolled back; recurrent (DeltaNet or compression) states need a
         // checkpoint per position of a verification batch (k + 1).
         impl->target->set_rollback_window(config.draft_tokens + 1);
         draft.value()->set_rollback_window(config.draft_tokens + 1);

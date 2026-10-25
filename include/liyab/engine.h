@@ -120,7 +120,7 @@ struct EngineConfig {
     // cache layout, key scales, kernels and the LoRA adapter selected (see
     // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
-    // restores it; recurrent (DeltaNet) states are kept as images at the
+    // restores it; recurrent (DeltaNet or compression) states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model
     // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
     // of memory_budget_mb; on a MoE whose experts stream, only as far as the
@@ -574,7 +574,7 @@ public:
     // A prompt that leaves that text partway keeps its tokens up to the last
     // one whose text it still starts with. Otherwise the longest common token
     // prefix is kept: any length on
-    // attention-only models; on hybrid (DeltaNet) models, whose recurrent
+    // attention-only models; on stateful (DeltaNet or compression) models, whose recurrent
     // states cannot rewind, up to the nearest state snapshot, taken at the end
     // of every prompt and prefill (Transformer::snapshot_state), so an edited
     // last reply or a dropped turn recomputes only what follows that point.

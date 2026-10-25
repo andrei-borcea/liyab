@@ -387,6 +387,7 @@ arrays through rollback, draft trees, sequences and context images. A closed win
 entry follows its closing source token in the paged auxiliary-key image. Tree queries resolve that token
 through their ancestry before reading the entry. Index head weights remain signed; only query/key dot scores
 are rectified.
+Public context and prefix-cache contracts include compression in their stateful snapshot/rollback rules.
 
 This first layout retains raw shared-KV rows for the finite context, applying the model's sliding mask during
 attention. It reserves `head_dim + index_dim` F32 auxiliary channels in each attention block at every position,

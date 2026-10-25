@@ -230,7 +230,7 @@ public:
     // itself) alone followed the context: at position n_past() + its depth,
     // attending to the context and to its ancestors only (the same visible
     // positions, in the same order and spans, as a linear pass over its
-    // branch), recurrent (DeltaNet) blocks continuing from the state after
+    // branch), stateful (DeltaNet or compression) blocks continuing from the state after
     // its parent. So its row of logits (one per token, in token order, as
     // Logits::All) has the bits a linear pass over its branch gives it
     // (attention never depends on the batch; the CPU backend's matmuls give a
@@ -323,7 +323,7 @@ public:
     static constexpr int32_t kLatentTileMin = 16;
     static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
-    // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
+    // Bytes held by the recurrent (DeltaNet or compression) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     // The most a context made now (make_context()) holds besides its KV
     // pages, which it maps as it uses them: its recurrent states, its
@@ -335,7 +335,7 @@ public:
     // exactly as it always has.
     [[nodiscard]] size_t context_state_bytes() const noexcept;
     // Whether the context carries a state bound to its position, beyond KV
-    // rows any prefix of it can be cut from: recurrent (DeltaNet) states, or
+    // rows any prefix of it can be cut from: recurrent (DeltaNet or compression) states, or
     // the rows of the last window of windowed attention blocks, whose older
     // rows the cache lets go (KvCache::layer_windows). Such a context returns
     // only to where that state is kept (snapshots, the rollback margin).
@@ -402,7 +402,7 @@ public:
     // positions, as long as the windowed blocks still hold the rows of the
     // window before n (the rollback margin kept behind the end, a snapshot's
     // pinned window: InvalidArgument otherwise, see KvCache::truncate()).
-    // Recurrent (DeltaNet) states cannot be rewound, so hybrid models restore
+    // Recurrent (DeltaNet or compression) states cannot be rewound, so hybrid models restore
     // a copy instead: they accept n == 0, n == n_past(), any n whose position
     // n - 1 is still inside the rollback window, or the position of a state
     // snapshot (Unsupported otherwise). Snapshots past n are discarded.
@@ -779,7 +779,7 @@ private:
     // The bound weights of one block (its structure is config_.blocks[layer]).
     struct Layer {
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
-        int32_t state_slot = -1;  // index into states_ (DeltaNet)
+        int32_t state_slot = -1;  // index into states_ (DeltaNet or compression)
         int32_t window = 0;       // attention: visible positions (BlockPlan::windowed); 0: all
         int32_t rope_table = 0;   // attention: index into rope_tables_
         std::array<const TensorView*, kWeightRoles> w{};
@@ -800,7 +800,7 @@ private:
     // bounded softmax accumulators, ssm empty; the same snapshots, checkpoint
     // ring and saved-context images carry both kinds without special cases.
     struct RecurrentState {
-        std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
+        std::vector<float> conv;  // DeltaNet: last kernel-1 inputs per channel; compression: channelwise softmax accumulators
         std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
         // Rollback ring: slot s holds [conv | ssm] after the token at the
         // position checkpoint_pos_[s] (slot = position % rollback window).
