@@ -106,6 +106,13 @@ widths 128, and two blocks; Mamba-1 has dt rank 8, Mamba-2 has four 32-wide
 heads, state size 16 and reference chunk size 16. SSM goldens cover both
 norm groupings, weighted and weightless dt/B/C norms, convolution without
 history, biases and mixed topology on ARM NEON, x86 AVX2 and x86 scalar.
+Nine SSM golden cases are pinned on each platform; all 111 pre-existing
+hashes remain unchanged. The README correctness table includes the three
+real F16 checkpoints above; its testing table lists the focused `test_ssm`
+suite. The final experimental release passes all 15 test modules on native
+ARM64 and Rosetta x86-64 with AVX2 enabled and disabled, with actual Metal
+access. The Android ARM64 experimental build also passes; Vulkan execution
+remains an on-device integration check.
 
 The converter calls the GPT-NeoX/Mamba ByteLevel tokenizer `olmo` (the
 existing GPT-2 regex after NFC). Falcon-Mamba's `falcon` pipeline isolates contiguous
