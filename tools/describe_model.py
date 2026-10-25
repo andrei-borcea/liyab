@@ -25,6 +25,8 @@ Where the facts come from:
   key projection, which tell whether the converter permuted its rows (so how RoPE pairs dimensions in the file),
   and one block's norm weights, which tell which GGUF tensor holds which norm and whether a norm the reference
   applies as x * (1 + w) is stored as 1 + w.
+  Local PyTorch .bin checkpoints are inspected with torch.load(weights_only=True, mmap=True); remote tensor
+  inspection requires safetensors. The local reader maps storage and materializes only the requested rows.
 * The engine's own sources: the ArchSpec fields and enums (architecture.h), the registry rows and the metadata keys
   and RoPE scaling types describe_model() reads (architecture.cpp: what the engine takes from the file, such as an
   attention scale, soft caps or YaRN, is supported exactly when it reads it), the tensors the forward pass binds
@@ -238,7 +240,7 @@ def block_index(name):
 
 
 class Checkpoint:
-    """Safetensors tensors of a Hugging Face model (local directory or repository), read on demand."""
+    """Safetensors (local or remote) and local PyTorch checkpoint tensors, read on demand."""
 
     DTYPES = {"F32": ("<f4", 4), "F16": ("<f2", 2), "BF16": ("<u2", 2)}
 
@@ -246,13 +248,35 @@ class Checkpoint:
         self.model, self.revision = model, revision
         self.files = {}  # shard name -> (source, header dict, data start)
         self.index = {}  # tensor name -> shard name
+        self.pytorch = {}  # local shard name -> memory-mapped state dictionary
         index = self._json("model.safetensors.index.json")
         if index is not None:
             self.index = dict(index["weight_map"])
+        elif os.path.isdir(model) and not os.path.exists(os.path.join(model, "model.safetensors")):
+            index = self._json("pytorch_model.bin.index.json")
+            if index is not None:
+                self.index = dict(index["weight_map"])
+            elif os.path.isfile(os.path.join(model, "pytorch_model.bin")):
+                self.index = dict.fromkeys(self._pytorch_shard("pytorch_model.bin"), "pytorch_model.bin")
+            else:
+                raise FormatError(f"no safetensors or PyTorch checkpoint in {model}")
         else:
             for name in self._header("model.safetensors")[0]:
                 if name != "__metadata__":
                     self.index[name] = "model.safetensors"
+
+    def _pytorch_shard(self, shard):
+        """Maps a local zip checkpoint without executing pickle globals or copying all its storage."""
+        if shard not in self.pytorch:
+            import torch
+            if not os.path.isdir(self.model):
+                raise FormatError("PyTorch checkpoints must be local; remote inspection requires safetensors")
+            state = torch.load(self._path(shard), map_location="cpu", weights_only=True, mmap=True)
+            if not isinstance(state, dict) or any(not isinstance(k, str) or not isinstance(v, torch.Tensor)
+                                                   for k, v in state.items()):
+                raise FormatError(f"{shard}: expected a tensor state dictionary")
+            self.pytorch[shard] = state
+        return self.pytorch[shard]
 
     def _path(self, name):
         if os.path.isdir(self.model):
@@ -271,8 +295,8 @@ class Checkpoint:
             return None
         try:
             src = ByteSource(path)
-            src.file.seek(0)
-            return json.loads(src.file.read())
+            with src.file:
+                return json.load(src.file)
         except (FileNotFoundError, OSError):
             return None
 
@@ -295,6 +319,15 @@ class Checkpoint:
         """The tensor, or `rows` of its rows from `first_row` (rows of the leading dimension), as float32."""
         import numpy as np
         shard = self.index[name]
+        if shard.endswith(".bin"):
+            value = self._pytorch_shard(shard)[name]
+            scalar = value.ndim == 0
+            value = value.reshape(1) if scalar else value
+            rows = value.shape[0] - first_row if rows is None else rows
+            if first_row < 0 or rows < 0 or first_row + rows > value.shape[0]:
+                raise FormatError(f"{name}: tensor row range is outside its shape")
+            values = value[first_row:first_row + rows].float().numpy()
+            return values.reshape(()) if scalar and rows == 1 else values
         header, _ = self._header(shard)
         src, _, start = self.files[shard]
         info = header[name]

@@ -362,6 +362,11 @@ Learned position embeddings combined with an embedding norm are refused because 
 established; either a scale or a bias tensor establishes the norm's presence, including bias-only LayerNorm.
 The optional `attn_output.bias` is bound for ordinary and latent attention alike. It is added after the output
 projection in both absorbed and expanded latent forms, before any post-mixer norm or residual add.
+Local PyTorch `.bin` checkpoints and their indexed shards can supply the reference tensors too. The reader uses
+`torch.load(weights_only=True, mmap=True)`, maps each shard only when requested, and materializes only the rows
+needed for matching. Remote checkpoint inspection still requires safetensors. Run
+`python tests/test_describe_model.py` in the reference environment to compare both readers, scalar and partial
+rows, invalid row ranges, missing/malformed checkpoints and lazy loading of PyTorch shards.
 
 ### Classic conformance
 
