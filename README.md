@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `gemma3n`, `gemma-embedding` (bidirectional pooling) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -143,8 +143,9 @@ These rules decide what goes into the code:
 The model planner also recognizes Gemma 3n's AltUp residual streams, Laurel low-rank branches, per-layer token
 embeddings, Gaussian gate sparsity and shared keys/values. These compose with Gemma's existing GeGLU and sandwich
 norms. Gemma 4 adds optional key-as-value projections and block output scales; files with different local/global
-head geometry or different FFN widths are currently refused with an explicit reason. These new registry rows are
-under conformance validation; their presence alone is not a real-model support claim.
+head geometry or different FFN widths are currently refused with an explicit reason. Gemma 3n E2B's BF16 conversion
+passes the real-model gate: mean KL 0.00000, top-1 100%, and identical token IDs on all three tokenizer texts.
+Gemma 4 remains limited to tiny checks with uniform geometry.
 The per-layer table stays memory-mapped and is read by token row; scratch holds only the current batch's per-layer
 inputs and residual streams. Dense projections use the existing CPU/Metal/Vulkan routing and CPU fallback; the
 small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional attention over each complete
@@ -156,6 +157,9 @@ which can differ from vocabulary scores. Existing SentencePiece tokenizers keep 
 Gemma 4's four-block test with uniform head geometry matches all 512 token IDs, mean KL 0.00000 and top-1 99.22%;
 the full checkpoints still need the generic per-block geometry work. Converter compatibility details are in
 [model descriptions](docs/model-descriptions.md#gemma-residual-and-embedding-parts).
+Text conformance of a multimodal checkpoint loads its registered text decoder alone; the reference tool infers
+the decoder namespace from the checkpoint's embedding key, without requiring unused vision/audio packages.
+Its `--config` overrides apply to the text configuration.
 
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
 iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,

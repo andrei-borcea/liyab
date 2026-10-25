@@ -200,6 +200,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| Gemma 3n E2B it (unsloth, converted BF16) | registry's `gemma3n` | 523 / 801 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 
@@ -243,6 +244,10 @@ For this check only, a copy of converter b11819 accepts transformers 5.19's homo
 (`head_dim` without `global_head_dim` or explicit per-layer overrides) and records the tokenizer's actual BOS rule.
 The stock converter forces BOS where that tokenizer export has no BOS postprocessor. Liyab follows the GGUF's BOS
 flag; it does not override a published file's metadata. The shared converter is unchanged.
+For text conformance of multimodal checkpoints, `conform_reference.py` uses the text configuration's registered
+causal LM and matches its input-embedding parameter suffix to the checkpoint keys to establish the namespace.
+An ambiguous match is refused. Vision/audio towers and their optional dependencies are not instantiated;
+`--config` changes the selected text configuration.
 
 `gemma-embedding` uses bidirectional attention. Pooling runs an entire input in one pass and shares no prefix
 because every hidden state depends on later tokens. Windowed blocks see half the stored window on each side.
@@ -250,7 +255,8 @@ Incremental continuation, causal tree drafts and rolling caches are refused; cal
 the complete calibration input in one pass too.
 The pooling layer validates and applies optional `dense_2.weight` and `dense_3.weight` in order before truncation
 and normalization; `Engine::embedding_size()` reports the projected width. Biases on these dense layers are
-explicitly refused. No real-model conformance claim is made until a measured run is recorded.
+explicitly refused. Its BF16 real-model check covers 39 inputs: identical tokenizations and minimum cosine
+0.99992651 against the independent float32 reference on CPU and Metal.
 
 The description tool establishes direction from the traced attention contract, unscaled scores from the actual
 attention scale, and value normalization by matching projected values with and without unweighted RMS norm.
@@ -261,8 +267,12 @@ attention call. A topology it cannot establish is reported as unknown and no row
 The four-block Gemma 3n tiny check exercises all these paths: 512 identical token IDs, mean KL 0.00000,
 maximum KL 0.00001 and top-1 agreement 99.41% with F32 weights/F16 KV. EmbeddingGemma's BF16 conversion matches
 all 39 pooling-case tokenizations on CPU and Metal (minimum cosine 0.99992651 against float32); the independent
-reference matches sentence-transformers at minimum cosine 0.9999998. Full Gemma 3n real-model validation and
-Gemma 4's heterogeneous geometry remain pending; the latter belongs to the generic per-block geometry work.
+reference matches sentence-transformers at minimum cosine 0.9999998. Gemma 3n E2B it, converted from unsloth
+revision `c4291af6285b4f90d88bdf6f9a634a8d2f262cc8` to BF16, also passes the real-model gate: the tool proposes
+exactly the registered row, all three tokenizer texts match, and the 512-token float32-reference comparison gives
+mean KL 0.00000, maximum 0.00001 and top-1 100.00%. Gemma 4's heterogeneous geometry remains pending in the
+generic per-block geometry work. The separate K-equals-V/no-per-layer-input Gemma 4 tiny case gives mean KL
+0.00000, maximum 0.00002, top-1 99.02%, and 512 identical IDs.
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
