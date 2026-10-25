@@ -67,6 +67,12 @@ x86_64-avx2 llama 843d1f69e41d69be
 x86_64-avx2 llama-f16kv c3762e1cc6e0440f
 x86_64-avx2 llama-sliding c8828407db88fd5d
 x86_64-avx2 llama-tied-ropefreqs-linear a4d8576d6ed1de09
+x86_64-avx2 mamba c598d51abdeac088
+x86_64-avx2 mamba-conv1 e292b9ee7d970180
+x86_64-avx2 mamba-weighted-norms-bias 41001214e4fb9837
+x86_64-avx2 mamba-weightless-norms-bias f90983e221d0334e
+x86_64-avx2 mamba2 4bcf0797ae6ea9aa
+x86_64-avx2 mamba2-groups-bias 86795143b76eb77c
 x86_64-avx2 mistral 843d1f69e41d69be
 x86_64-avx2 phi3 337dd37074d855f6
 x86_64-avx2 phi3-longrope-partial aced195c53a3204c
@@ -83,6 +89,9 @@ x86_64-avx2 qwen3moe-fused-gate-up 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-avx2 ssm-attention-ffn-only 10f4424928d0f5e3
+x86_64-avx2 ssm-attention-moe-only 5d1346cccde8356a
+x86_64-avx2 ssm-attention-moe-only-streamed 5d1346cccde8356a
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
 x86_64-scalar deepseek2-mla-expanded 3ed966c7eb7877ca
 x86_64-scalar deepseek2-mla-expanded-f16kv e2777a2c65681852
@@ -104,6 +113,12 @@ x86_64-scalar llama 2a2c3fdf395984c3
 x86_64-scalar llama-f16kv 1d8a75ee16139e6b
 x86_64-scalar llama-sliding 26c95a77ea702589
 x86_64-scalar llama-tied-ropefreqs-linear e4499afb345e6047
+x86_64-scalar mamba c89ccded5038307f
+x86_64-scalar mamba-conv1 981710928fde1383
+x86_64-scalar mamba-weighted-norms-bias 18c1d472b146138a
+x86_64-scalar mamba-weightless-norms-bias 733b77ddec48768f
+x86_64-scalar mamba2 6a952624469f51e0
+x86_64-scalar mamba2-groups-bias 3b62b66e2af48d9b
 x86_64-scalar mistral 2a2c3fdf395984c3
 x86_64-scalar phi3 bdad607f80f9e074
 x86_64-scalar phi3-longrope-partial a6d5e9dcb4754c11
@@ -120,3 +135,6 @@ x86_64-scalar qwen3moe-fused-gate-up abc771ef46e2fa79
 x86_64-scalar qwen3moe-fused-gate-up-streamed abc771ef46e2fa79
 x86_64-scalar qwen3moe-sigmoid-bias-shared 029803af7cad79e0
 x86_64-scalar qwen3moe-streamed abc771ef46e2fa79
+x86_64-scalar ssm-attention-ffn-only 210cee56f225f25f
+x86_64-scalar ssm-attention-moe-only 3ad66cfc314faa26
+x86_64-scalar ssm-attention-moe-only-streamed 3ad66cfc314faa26

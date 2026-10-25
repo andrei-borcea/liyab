@@ -34,6 +34,8 @@ The `mamba` and `mamba2` rows describe stacks without an FFN. A block with
 Mamba-2. `ssm_conv1d` without `ssm_d` remains Gated DeltaNet. Attention
 projections select attention; an FFN without mixer tensors is an FFN-only
 block. The loader rejects empty blocks and mixed SSM geometries.
+Any attention projection identifies attention, including K/V/output: an
+incomplete set fails binding rather than silently becoming an FFN-only block.
 
 Mamba-1 uses the file's convolution, input, selective, time-step and output
 projections; `ssm_a` already holds `-exp(A_log)`, as converter b11819 writes
@@ -62,6 +64,38 @@ rollback for all projection formats and four KV cache types. Existing
 context, tree-draft and prefix-cache tests also exercise Mamba states.
 Synthetic golden cases combine SSM, attention and FFN-only blocks, including
 MoE FFNs with in-place and streamed experts.
+
+Rows established against transformers 5.19.0 and converter b11819:
+
+```cpp
+{"mamba", RopeLayout::Halves, "", false},
+{.name = "mamba2", .rope = RopeLayout::Halves, .ffn_norm = "", .moe_norm_weights = false,
+ .ssm_norm_grouped = false},
+```
+
+The following comparisons use 511 prediction positions and F16 KV. Every
+case has identical token IDs. The real checkpoints also pass
+`describe_model.py --gate`, including its three tokenizer texts and the
+exact registry-row comparison.
+
+| Checkpoint / tiny configuration | GGUF | Mean KL | Top-1 |
+| :--- | :--- | ---: | ---: |
+| Tiny `state-spaces/mamba-130m-hf` | F32 | 0.00000 | 100% |
+| Tiny `tiiuae/falcon-mamba-7b`, weightless mixer norms | F32 | 0.00000 | 100% |
+| Tiny `AntonV/mamba2-130m-hf` | F32 | 0.00000 | 100% |
+| Tiny Mamba-2, two B/C groups and projection biases | F32 | 0.00000 | 100% |
+| Tiny `mistralai/Mamba-Codestral-7B-v0.1`, two groups | F32 | 0.00000 | 100% |
+| `state-spaces/mamba-130m-hf` | F16 | 0.00001 | 99.61% |
+| `state-spaces/mamba-370m-hf` | F16 | 0.00000 | 100% |
+| `AntonV/mamba2-130m-hf` | F16 | 0.00000 | 100% |
+
+The AntonV configuration omits `architectures`; the validation copy adds
+`["Mamba2ForCausalLM"]` before conversion. Its weights and forward settings
+are unchanged. No converter code is patched. Tiny widths are 64, inner
+widths 128, and two blocks; Mamba-1 has dt rank 8, Mamba-2 has four 32-wide
+heads, state size 16 and reference chunk size 16. SSM goldens cover both
+norm groupings, weighted and weightless dt/B/C norms, convolution without
+history, biases and mixed topology on ARM NEON, x86 AVX2 and x86 scalar.
 
 The converter calls the GPT-NeoX/Mamba ByteLevel tokenizer `olmo` (the
 existing GPT-2 regex after NFC). Falcon-Mamba's `falcon` pipeline isolates contiguous

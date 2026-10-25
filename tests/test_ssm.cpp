@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <vector>
 
 #include "core/ssm_scan.h"
@@ -140,6 +142,27 @@ TEST_CASE("Mamba GPU projections retain CPU recurrent-scan semantics") {
             for (size_t i = 0; i < expected.size(); ++i) CHECK_NEAR((*b)[i], expected[i], 1e-3);
         }
     }
+}
+
+TEST_CASE("An incomplete attention mixer is rejected instead of becoming an FFN-only block") {
+    const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ssm_incomplete.gguf";
+    struct Cleanup { std::string path; ~Cleanup() { std::remove(path.c_str()); } } cleanup{path};
+    test::write_tiny_model(path);
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(file)), {});
+    const std::string name = "blk.0.attn_q.weight", renamed = "blk.0.bad__q.weight";
+    const auto at = bytes.find(name);
+    REQUIRE(at != std::string::npos && name.size() == renamed.size());
+    file.clear();
+    file.seekp(static_cast<std::streamoff>(at));
+    file.write(renamed.data(), static_cast<std::streamsize>(renamed.size()));
+    file.close();
+    auto mapped = MmapLoader::open(path);
+    REQUIRE(mapped);
+    auto model = Transformer::load(std::move(mapped).value(), {});
+    CHECK(!model);
+    CHECK(model.status().code() == ErrorCode::InvalidModel);
+    CHECK(model.status().to_string().find("attn_q.weight") != std::string::npos);
 }
 
 TEST_MAIN()

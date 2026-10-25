@@ -735,7 +735,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         p = {}
         if "ssm_conv1d.weight" in ts:
             p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if "ssm_d" in ts else "deltanet"
-        elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight"} & ts:
+        elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight", "attn_k.weight",
+                  "attn_v.weight", "attn_output.weight"} & ts:
             p["mixer"] = "none"
         else:
             p["mixer"] = "attention"

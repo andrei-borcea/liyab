@@ -138,7 +138,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             if (f.tensor(block_tensor(l, "ssm_d")) == nullptr) return MixerKind::DeltaNet;
             return f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ? MixerKind::Mamba : MixerKind::Mamba2;
         }
-        for (const char* t : {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight"}) {
+        for (const char* t : {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight",
+                              "attn_k.weight", "attn_v.weight", "attn_output.weight"}) {
             if (f.tensor(block_tensor(l, t)) != nullptr) return MixerKind::Attention;
         }
         return MixerKind::None;

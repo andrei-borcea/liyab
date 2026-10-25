@@ -109,6 +109,7 @@ These rules decide what goes into the code:
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | State-space mixers: `mamba` (Mamba-1, Falcon-Mamba) and `mamba2` (Mamba-2); mixer-only and FFN-only blocks planned from tensors | CPU selective scans and depthwise convolution, with NEON, AVX2/FMA and scalar paths; Metal/Vulkan use CPU scans with their normal projection routing. Validation: [model descriptions](docs/model-descriptions.md#state-space-mixers). |
+| Block-plan validation | Partial attention projections remain an attention block and fail binding; a missing query cannot silently turn it into an FFN-only block. |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Mamba pre-tokenizers: GPT-NeoX (`olmo`, NFC then GPT-2 rules) and Falcon-Mamba (`falcon`, punctuation then ByteLevel and digit groups) | Data in the same pre-tokenizer table |
