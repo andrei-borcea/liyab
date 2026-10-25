@@ -2155,6 +2155,10 @@ positions; weights drawn wide, so attention and outputs are sharp and a wrong pa
   renormalized top-3 scaled by 2.5, one shared expert): median KL 0.00001, top-1 99.80%; the mean, 0.0037, is one
   position whose expert choice flipped at a near-tie.
 
+Group-limited routing has synthetic logit hashes pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar for
+softmax group maxima and sigmoid groups scored by their two best biased probabilities, both in place and
+streamed. The existing dense and latent-attention hashes are unchanged.
+
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
 for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B

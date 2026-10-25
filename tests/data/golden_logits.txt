@@ -75,6 +75,9 @@ x86_64-avx2 qwen35moe a3f11d7bbcffbcce
 x86_64-avx2 qwen3moe 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-fused-gate-up 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
+x86_64-avx2 qwen3moe-grouped-sigmoid-bias 6e8e32732c024191
+x86_64-avx2 qwen3moe-grouped-sigmoid-bias-streamed 6e8e32732c024191
+x86_64-avx2 qwen3moe-grouped-softmax c62a98886a4aad8c
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
@@ -112,5 +115,8 @@ x86_64-scalar qwen35moe 1c7a57b54e1cf1df
 x86_64-scalar qwen3moe abc771ef46e2fa79
 x86_64-scalar qwen3moe-fused-gate-up abc771ef46e2fa79
 x86_64-scalar qwen3moe-fused-gate-up-streamed abc771ef46e2fa79
+x86_64-scalar qwen3moe-grouped-sigmoid-bias d2cc081964b7e0db
+x86_64-scalar qwen3moe-grouped-sigmoid-bias-streamed d2cc081964b7e0db
+x86_64-scalar qwen3moe-grouped-softmax fc340deb1480b6fb
 x86_64-scalar qwen3moe-sigmoid-bias-shared 029803af7cad79e0
 x86_64-scalar qwen3moe-streamed abc771ef46e2fa79

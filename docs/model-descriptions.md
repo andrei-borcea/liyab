@@ -252,3 +252,5 @@ to the reference's experts; `describe_model.py` checks the observed geometry and
 A rule it cannot establish still prevents proposing a registry row. No new `ArchSpec` field is needed.
 `tiny_checkpoint.py` removes a published checkpoint's quantization configuration before saving its random F32
 weights, since those tensors are not quantized.
+The group-routing golden cases are pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar; streamed and resident
+biased routing agree exactly on each platform.
