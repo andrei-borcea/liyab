@@ -108,12 +108,33 @@ void GgufWriter::add_bool_array(const std::string& key, const std::vector<bool>&
 }
 
 void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DType type,
-                            const std::vector<float>& values) {
+                            const std::vector<float>& values, std::span<const uint8_t> block_pattern) {
     Tensor t{name, std::move(ne), type, {}};
     const int64_t row = t.ne[0];
     const auto rows = static_cast<int64_t>(values.size()) / row;
     const size_t row_bytes = dtype_row_bytes(type, row);
     t.data.resize(row_bytes * static_cast<size_t>(rows));
+    if (!block_pattern.empty()) {
+        tensors_.push_back(std::move(t));
+        if (!set_tensor_block_pattern(name, block_pattern)) {
+            std::fprintf(stderr, "invalid encoded block pattern for %s (%s)\n", name.c_str(),
+                         std::string(dtype_traits(type).name).c_str());
+            std::abort();
+        }
+        return;
+    }
+    // Keep this list aligned with the runtime encoders, plus BF16 below.
+    // Unsupported types must never silently produce all-zero test weights.
+    switch (type) {
+        case DType::F32: case DType::F16: case DType::BF16:
+        case DType::Q8_0: case DType::Q4_0: case DType::Q4_1:
+        case DType::Q4_K: case DType::Q5_K:
+            break;
+        default:
+            std::fprintf(stderr, "no test encoder for %s (%s); supply explicit encoded blocks\n", name.c_str(),
+                         std::string(dtype_traits(type).name).c_str());
+            std::abort();
+    }
     if (type == DType::BF16) {  // quant::quantize_row has no BF16: the upper half, rounded to nearest even
         for (size_t i = 0; i < values.size(); ++i) {
             uint32_t bits = 0;
@@ -162,6 +183,68 @@ void GgufWriter::write(const std::string& path) const {
         std::abort();
     }
     std::fclose(f);
+}
+
+bool GgufWriter::set_tensor_block_pattern(const std::string& name, std::span<const uint8_t> pattern) {
+    const auto it = std::find_if(tensors_.begin(), tensors_.end(), [&](const Tensor& t) { return t.name == name; });
+    if (it == tensors_.end()) return false;
+    const auto bytes = static_cast<size_t>(dtype_traits(it->type).block_bytes);
+    if (pattern.empty() || pattern.size() % bytes != 0 || it->data.size() % bytes != 0) return false;
+    for (size_t at = 0; at < it->data.size(); at += bytes) {
+        std::memcpy(it->data.data() + at, pattern.data() + at % pattern.size(), bytes);
+    }
+    return true;
+}
+
+bool load_quant_vectors(std::vector<QuantVector>& out, const std::string& filename) {
+    std::string dir = LIYAB_TEST_DATA_DIR;
+    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
+    const std::string path = dir + "/" + filename;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        std::printf("  quant vectors unavailable: %s (set LIYAB_TEST_DATA)\n", path.c_str());
+        return false;
+    }
+    std::vector<uint8_t> file;
+    uint8_t chunk[4096];
+    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
+    const bool read_ok = std::ferror(f) == 0;
+    std::fclose(f);
+    size_t pos = 0;
+    auto read = [&](void* dst, size_t size) {
+        if (size > file.size() - pos) return false;
+        std::memcpy(dst, file.data() + pos, size);
+        pos += size;
+        return true;
+    };
+    char magic[4];
+    uint32_t version = 0, count = 0;
+    std::vector<QuantVector> vectors;
+    bool valid = read_ok && read(magic, 4) && std::memcmp(magic, "LYQV", 4) == 0 && read(&version, 4) &&
+                 version == 1 && read(&count, 4) && count <= (file.size() - pos) / 8;
+    for (uint32_t i = 0; valid && i < count; ++i) {
+        uint32_t type = 0, blocks = 0;
+        QuantVector v;
+        valid = read(&type, 4) && read(&blocks, 4) && dtype_from_ggml(type, v.type) && blocks > 0;
+        if (!valid) break;
+        const auto traits = dtype_traits(v.type);
+        const uint64_t bytes = uint64_t{blocks} * traits.block_bytes;
+        const uint64_t values = uint64_t{blocks} * traits.block_size;
+        valid = bytes + values * sizeof(float) <= file.size() - pos;
+        if (!valid) break;
+        v.n = static_cast<int64_t>(values);
+        v.blocks.resize(static_cast<size_t>(bytes));
+        v.expected.resize(static_cast<size_t>(values));
+        valid = read(v.blocks.data(), v.blocks.size()) && read(v.expected.data(), v.expected.size() * sizeof(float)) &&
+                std::all_of(v.expected.begin(), v.expected.end(), [](float x) { return std::isfinite(x); });
+        vectors.push_back(std::move(v));
+    }
+    if (!valid || pos != file.size()) {
+        std::printf("  malformed quant vectors: %s\n", path.c_str());
+        return false;
+    }
+    out = std::move(vectors);
+    return true;
 }
 
 std::vector<std::string> tiny_vocab() {
@@ -379,7 +462,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             const int64_t di = 2 * d, ns = 16, heads = 4, rank = mamba_rank;
             const int64_t channels = v2 ? di + 2 * s.mamba_groups * ns : di;
             const int64_t input = v2 ? di + channels + heads : 2 * di;
-            w.add_tensor(p + "ssm_in.weight", {d, input}, s.attn_type, random(d * input, s.weight_scale));
+            w.add_tensor(p + "ssm_in.weight", {d, input}, s.attn_type, random(d * input, s.weight_scale), s.ssm_block_pattern);
             w.add_tensor(p + "ssm_conv1d.weight", {s.mamba_kernel, channels}, DType::F32,
                          random(s.mamba_kernel * channels, 0.3f));
             w.add_tensor(p + "ssm_conv1d.bias", {channels}, DType::F32, random(channels, 0.1f));
@@ -394,8 +477,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                              norm_weights(di));
             } else {
                 w.add_tensor(p + "ssm_x.weight", {di, rank + 2 * ns}, s.attn_type,
-                             random(di * (rank + 2 * ns), s.weight_scale));
-                w.add_tensor(p + "ssm_dt.weight", {rank, di}, s.attn_type, random(rank * di, s.weight_scale));
+                             random(di * (rank + 2 * ns), s.weight_scale), s.ssm_block_pattern);
+                w.add_tensor(p + "ssm_dt.weight", {rank, di}, s.attn_type, random(rank * di, s.weight_scale), s.ssm_block_pattern);
                 if (s.mamba_norms || s.mamba_weighted_norms) {
                     // Current transformers saves these dummy weights although
                     // Falcon-Mamba's mixer norms do not multiply by them.
@@ -405,7 +488,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                     w.add_tensor(p + "ssm_c_norm.weight", {ns}, DType::F32, norm_weights(ns));
                 }
             }
-            w.add_tensor(p + "ssm_out.weight", {di, d}, s.attn_type, random(di * d, s.weight_scale));
+            w.add_tensor(p + "ssm_out.weight", {di, d}, s.attn_type, random(di * d, s.weight_scale), s.ssm_block_pattern);
             if (s.mamba_parallel) {
                 w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
                 w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));

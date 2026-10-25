@@ -64,7 +64,23 @@ settings with metadata. A pure SSM trace reduces its residual width while
 preserving expansion and head/group divisibility, as does
 `tiny_checkpoint.py --width`. `test_ssm` checks scans
 against independent scalar equations and compares prefill, decode and
-rollback for all projection formats and four KV cache types. Existing
+rollback for all 26 projection formats and four KV cache types. Reader-only
+formats use `ssm_quant_vectors.bin`, derived from the existing independent
+`quant_vectors.bin` blocks through an opt-in test-writer replacement. Every
+block uses the same RMS target, `0.5 / sqrt(256)`, before scale rounding;
+integer codes/grids are preserved. This bounds repeated correlated rows
+without changing tolerances or selecting a rule by format or platform.
+Normal synthetic fixtures, original quant vectors and golden hashes remain
+unchanged. Regenerate with
+`python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin`
+using gguf 0.19.0 and NumPy. The generator
+checks the source reference values and independently decodes the scaled
+blocks with gguf-py. The ordinary writer still uses its eight implemented
+encoders and aborts with a named diagnostic when a reader-only format lacks
+an explicit encoded payload; production quantization behavior is unchanged.
+Tests require nonzero decoded weights,
+projection outputs, convolution history and scan state, and verify that
+ablating each projection or the carried scan state changes the logits. Existing
 context, tree-draft and prefix-cache tests also exercise Mamba states.
 Synthetic golden cases combine SSM, attention and FFN-only blocks, including
 MoE FFNs with in-place and streamed experts.

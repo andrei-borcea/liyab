@@ -5,6 +5,7 @@
 #define LIYAB_TESTS_TEST_MODEL_H
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -23,8 +24,16 @@ public:
     void add_f32_array(const std::string& key, const std::vector<float>& v);
     void add_i32_array(const std::string& key, const std::vector<int32_t>& v);
     void add_bool_array(const std::string& key, const std::vector<bool>& v);
-    // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
-    void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
+    // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`,
+    // or replaced by repeated whole encoded blocks when explicitly supplied.
+    // Aborts for reader-only formats without a payload, or malformed patterns:
+    // quantize_row deliberately has no encoder for those weight-only types.
+    void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values,
+                    std::span<const uint8_t> block_pattern = {});
+    // Replaces an existing tensor with repeated whole encoded blocks. Returns
+    // false for a missing tensor or an empty/incomplete block pattern. Opt-in:
+    // the ordinary writer and every existing golden fixture stay unchanged.
+    bool set_tensor_block_pattern(const std::string& name, std::span<const uint8_t> pattern);
     // Writes the file; aborts the test binary on I/O failure.
     void write(const std::string& path) const;
 
@@ -152,6 +161,9 @@ struct TinyModelSpec {
     bool mamba_bias = false;
     bool mamba_topology = false;
     bool mamba_parallel = false;  // invalid variant: attention and SSM in one block, for rejection tests
+    // Explicit encoded blocks for SSM projections only. Empty keeps the
+    // original random encoder path and every existing golden unchanged.
+    std::vector<uint8_t> ssm_block_pattern;
 
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their
@@ -180,6 +192,17 @@ std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
+
+// Encoded GGML blocks and independently decoded values from gguf-py. Reads
+// tests/data/quant_vectors.bin (LIYAB_TEST_DATA overrides the directory).
+struct QuantVector {
+    DType type{};
+    int64_t n = 0;
+    std::vector<uint8_t> blocks;
+    std::vector<float> expected;
+};
+// False for absent or malformed data; reports the reason. No partial result.
+bool load_quant_vectors(std::vector<QuantVector>& out, const std::string& filename = "quant_vectors.bin");
 
 }  // namespace liyab::test
 
