@@ -144,7 +144,8 @@ description tool verifies either spelling against the reference's offset-folded 
 For `pfnet/plamo-3-610m-fin-instruct`, a tiny checkpoint with two blocks, window 8 and period 2 exercises both block
 kinds: identical 512 reference IDs, mean KL 0.00000 and top-1 99.61% with F16 KV. Keeping the original eight-block
 period instead gives mean KL 0.00000 (maximum 0.00005) and top-1 98.83%, below the tiny acceptance threshold. Its
-real-model gate is pending. The original-period file proposes the registered `plamo3` row exactly; the two-block
+real F16 checkpoint passes the gate with mean KL 0.00000, maximum 0.00002 and 100% top-1. The original-period file
+proposes the registered `plamo3` row exactly; the two-block
 file's explicit metadata overrides its period, and the tool proposes period 2 for that reduced configuration.
 `conform_reference.py`, `tokenizer_reference.py --transformers` and `chat_template_reference.py` accept
 `--slow-tokenizer` to use the model authors' original implementation when conversion to a fast tokenizer changes
@@ -166,6 +167,12 @@ processor, so this measures the text-only route of the authors' original impleme
 `chat_template_reference.py --model NAME=TOKENIZER:TEMPLATE` renders that explicit file with transformers'
 Jinja renderer. This also covers Mistral's backend, whose native chat formatter ignores a Jinja template
 argument. InternLM2 and Ministral 3 each have 14 new fixtures, all byte-identical in the engine.
+To expose a window boundary within the 13-token trace, the tracer reduces a uniform scalar `sliding_window` /
+`window_size` through the configuration's constructor, verifies the resulting mask, then maps that observed size
+back to the original configured size. This keeps local/global blocks distinguishable even when the full window
+is thousands of tokens. It changes only the tracing configuration; the teacher-forced reference and engine gate
+run the checkpoint's original window. An OLMo 3 regression verifies three local blocks and a global block; the
+real PLaMo 3 description now derives its exact local-base/period row instead of conflating short causal masks.
 
 ## The conformance gate
 
@@ -285,6 +292,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | SmolLM3-3B (F16, b11819 conversion of revision `a07cc9a`) | registry's `smollm3`, exact | 498 / 797 / 165, identical | 497 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
+| PLaMo-3-610m-fin-instruct (F16, b11819 conversion of revision `a000b59`) | registry's `plamo3`, exact | 521 / 950 / 251, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 

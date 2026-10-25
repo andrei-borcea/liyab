@@ -957,6 +957,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     for tname in sorted(main_tables):
         check_table(tname, "attention blocks" if not (global_tables and window_tables) else "globally attending blocks")
     rope_params = cfg.get("rope_parameters") or {}
+    if facts.get("window_probe"):
+        probe = facts["window_probe"]
+        d.notes.append(f"window boundary verified with a reduced {probe['traced']}-position window; "
+                       f"the original configuration's uniform window is {probe['configured']}")
     rope_types = {v.get("rope_type") for v in rope_params.values() if isinstance(v, dict)} or {rope_params.get("rope_type")}
     if "dynamic" in rope_types:
         d.notes.append("the reference's dynamic RoPE recomputes its frequencies once a sequence grows past "

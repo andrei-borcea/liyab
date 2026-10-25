@@ -192,6 +192,14 @@ def blocks_to_trace(cfg):
 def reduced_config(config):
     """A copy of the text configuration with fewer blocks, a small vocabulary, narrow FFNs and few experts."""
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
+    # A window longer than the trace looks exactly like global causal
+    # attention. Shorten a uniform configured window so its boundary is
+    # exercised, just as FFN widths are reduced below. Reconstruct through
+    # the configuration owner so aliases and computed layer types agree.
+    windows = {k: getattr(cfg, k, None) for k in ("sliding_window", "window_size")}
+    windows = {k: v for k, v in windows.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+    if len(set(windows.values())) == 1 and next(iter(windows.values())) > SEQ // 2:
+        cfg = type(cfg).from_dict({**cfg.to_dict(), **{k: SEQ // 2 for k in windows}})
     key, n = _layer_count(cfg)
     keep = blocks_to_trace(cfg)
     for k, v in list(vars(cfg).items()):
@@ -1115,6 +1123,18 @@ def describe_reference(model_id, revision=None, trust_remote_code=False):
     trace = run_trace(model_id, revision, trust_remote_code)
     facts = analyze(trace)
     cfg = trace.config
+    original_windows = {getattr(cfg, k, None) for k in ("sliding_window", "window_size")
+                        if isinstance(getattr(cfg, k, None), int) and getattr(cfg, k) > 0}
+    reduced_windows = {getattr(trace.reduced, k, None) for k in ("sliding_window", "window_size")
+                       if isinstance(getattr(trace.reduced, k, None), int) and getattr(trace.reduced, k) > 0}
+    if len(original_windows) == len(reduced_windows) == 1 and original_windows != reduced_windows:
+        original, reduced = next(iter(original_windows)), next(iter(reduced_windows))
+        facts["window_probe"] = {"configured": original, "traced": reduced}
+        for block in facts["block_facts"]:
+            mixer = block.get("mixer", {})
+            if mixer.get("window") == reduced:
+                mixer["observed_window"] = reduced
+                mixer["window"] = original
     facts["config"] = {k: v for k, v in cfg.to_dict().items() if not k.startswith("_") or k == "_sliding_window_pattern"}
     for key in ("layer_types", "interleaved_sliding_window"):
         value = getattr(cfg, key, None)

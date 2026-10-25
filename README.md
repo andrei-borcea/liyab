@@ -107,9 +107,9 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
-| Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4) | ✅ token-identical to each model's Hugging Face tokenizer |
+| Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
@@ -161,7 +161,8 @@ The `plamo3` tokenizer uses integer-score unigram segmentation with byte fallbac
 Unicode. It keeps the authors' boundaries around special spellings, repeated characters and consecutive spaces.
 Norm vectors accept the converter's bare names as well as names ending in `.weight`, including PLaMo3's post norms.
 PLaMo3's two-block tiny case (local/global attention, an eight-token window) gives mean KL 0.00000 and 99.61% top-1.
-Its real-model gate remains pending; the eight-block tiny case gives 98.83% top-1 with F16 KV, below the tiny threshold.
+The real 610m-fin-instruct F16 checkpoint passes the gate at mean KL 0.00000 and 100% top-1. The eight-block tiny
+case gives 98.83% top-1 with F16 KV, below the tiny threshold.
 Reference tools offer `--slow-tokenizer` when a new library's fast conversion changes the authors' SentencePiece
 segmentation; `describe_model.py --reference-slow-tokenizer` applies that choice consistently throughout its gate.
 Reference tracing also observes legacy eager attention's paired matrix products, accepting their scale and mask
@@ -173,6 +174,8 @@ context is not implemented. For multimodal checkpoints such as Ministral 3, the 
 transformers' image/text model class and runs the same text-only prompt, without images or added image tokens.
 InternLM2 and Ministral 3 each have 14 template fixtures. An explicit template file is rendered through
 transformers' Jinja renderer, including for tokenizers whose own chat formatter does not use Jinja.
+Reference tracing shortens a uniform configured attention window so its boundary occurs within the probe,
+verifies the actual mask there and reports the original configured size. Full conformance uses the original size.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
@@ -442,6 +445,10 @@ What the port does differently from the POSIX platforms:
   * `smollm3` (SmolLM3-3B): every fourth block leaves Q/K unrotated; its `smaug-bpe` tokenizer and own chat
     template match transformers. The real F16 checkpoint passes `describe_model.py --gate` with identical
     498 prompt IDs, mean KL 0.00000 and 100% top-1 agreement; projections use the existing CPU/Metal/Vulkan routes;
+  * `plamo3` (PLaMo-3-610m-fin-instruct): fused QKV and gate/up projections, Q/K and sandwich RMSNorms,
+    seven local RoPE/windowed blocks per global YaRN block, raw unigram tokenizer. The real F16 checkpoint
+    passes the gate with identical 512 prompt IDs, mean KL 0.00000 and 100% top-1. Norms, RoPE and tokenization
+    run on the CPU; projections retain CPU/Metal/Vulkan routing;
   * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
     proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
     The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
@@ -536,7 +543,8 @@ What the port does differently from the POSIX platforms:
     the same order. That holds on the file's layout or repacked, for one activation row or several. A row's result
     is then the same bits whichever kernel computed it, so logits depend neither on the batch size nor on the layout
     (tested for every format).
-* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3) and byte-level BPE (`gpt2`).
+* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3), byte-level BPE (`gpt2`) and raw unigram
+  (`plamo3`: integer-cost segmentation, longest-prefix ties and byte fallback).
   * **Pre-tokenizers are data.** Before merging, a byte-level BPE tokenizer cuts the text into pieces with regular
     expressions. Each scheme is one row of a table keyed by the GGUF's `tokenizer.ggml.pre`
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
