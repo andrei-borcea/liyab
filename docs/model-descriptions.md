@@ -348,3 +348,8 @@ representative F32 tiny checkpoint; no real-model KL result is inferred from tha
 pass on NEON-dotprod, AVX2 and scalar without moving previous entries. All fourteen native and both x86 test
 targets pass; the Android experimental build also passes. The saved reproduction recipe was rerun from pinned
 upstream revisions for both GPT-OSS and DeepSeek-MoE v1, reproducing their stated conformance and tokenizer results.
+
+Mixtral-8x7B-Instruct-v0.1's author template has a dedicated fourteen-case fixture generated from revision
+`eba92302a2861cdc0098cc54bc9f17cb2c47eb61` with `tools/chat_template_reference.py`. Thirteen conversations match
+transformers byte for byte, including the optional system message and BOS/INST/EOS framing; the tool-result
+conversation is refused for its nonalternating roles. Native, AVX2 and scalar text suites check the same fixture.

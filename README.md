@@ -2870,3 +2870,8 @@ Harmony template with resident F16 KV and forced block streaming with Q8_0 KV. T
 the numerical conformance table above uses the random-weight F32 checkpoints. Sixty golden cases are pinned for
 NEON-dotprod, x86 AVX2 and x86 scalar, preserving every earlier hash. The final native and both x86 test suites
 pass all fourteen targets, including sequence and KV-store reuse, and the Android experimental build passes.
+
+Mixtral's own chat template is checked against fourteen transformers reference cases: thirteen render byte for
+byte, and a tool-result conversation is refused because the template requires alternating user/assistant turns.
+The fixture covers its optional initial system message, BOS, `[INST]` framing and assistant EOS on native,
+x86 AVX2 and x86 scalar builds.
