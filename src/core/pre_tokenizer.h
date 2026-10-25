@@ -10,6 +10,8 @@
 //     step: a pattern (core/regex.h) and whether the text between matches is
 //     kept as pieces of its own (Split "Isolated") or dropped (Split
 //     "Removed" with invert, which keeps only the matches);
+//   * whether a step runs on ByteLevel's encoded byte alphabet. Such steps
+//     return byte boundaries, including boundaries inside UTF-8 characters;
 //   * NFC normalization of the text first (the Qwen tokenizers);
 //   * `ignore_merges`: a piece that is a vocabulary entry as a whole is that
 //     token, without merging (Llama 3, Hunyuan, Tekken).
@@ -52,6 +54,7 @@ private:
     struct Step {
         Regex regex;
         bool keep_gaps;
+        bool byte_encoded;
     };
     PreTokenizer() = default;
     std::string name_;

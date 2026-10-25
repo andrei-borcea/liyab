@@ -410,7 +410,7 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
     const Cases& c = cases();
     size_t checked = 0;
     for (const auto& row : c.rows) {
-        if (row[0] != "S") continue;
+        if (row[0] != "S" && row[0] != "B") continue;
         auto pre = PreTokenizer::for_name(row[1]);
         REQUIRE(pre.has_value());
         const std::string& text = c.texts.at(row[2]);
@@ -418,8 +418,9 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
         pre->split(text, pieces);
         Spans got;
         for (const std::string_view p : pieces) {
-            const size_t start = codepoints(std::string_view(text.data(), static_cast<size_t>(p.data() - text.data())));
-            got.emplace_back(start, start + codepoints(p));
+            const size_t byte = static_cast<size_t>(p.data() - text.data());
+            const size_t start = row[0] == "B" ? byte : codepoints(std::string_view(text.data(), byte));
+            got.emplace_back(start, start + (row[0] == "B" ? p.size() : codepoints(p)));
         }
         const Spans want = parse_spans(row.size() > 3 ? row[3] : "");
         if (got != want) {
@@ -451,6 +452,16 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(PreTokenizer::for_name("qwen2")->nfc() && PreTokenizer::for_name("qwen35")->nfc());
     CHECK(!PreTokenizer::for_name("llama3")->nfc() && PreTokenizer::for_name("llama3")->ignore_merges());
     CHECK(PreTokenizer::for_name("hunyuan")->ignore_merges() && !PreTokenizer::for_name("qwen2")->ignore_merges());
+    // GPT-NeoX/Mamba's ByteLevel tokenizer is published by the converter as
+    // "olmo". It uses the unmodified GPT-2 regex and keeps merge boundaries.
+    auto olmo = PreTokenizer::for_name("olmo");
+    REQUIRE(olmo);
+    CHECK(olmo->nfc() && !olmo->ignore_merges());
+    std::vector<std::string_view> a, b;
+    const std::string text = "Hello 12345\n we're testing\tnaïve 中文!";
+    olmo->split(text, a);
+    PreTokenizer::for_name("gpt2")->split(text, b);
+    CHECK(a == b);
 
     auto unknown = PreTokenizer::for_name("starcoder-9");
     REQUIRE(!unknown.has_value());

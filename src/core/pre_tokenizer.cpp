@@ -59,9 +59,16 @@ constexpr const char* kYoutuCjk =
 constexpr const char* kYoutuWords =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
+// Falcon-Mamba: Punctuation(Contiguous), ByteLevel, Digits(false), then
+// isolated ASCII triples. HF Punctuation includes ASCII symbols and P*.
+constexpr const char* kFalconPunct = R"([\p{P}!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]+)";
+constexpr const char* kNumberRuns = R"(\p{N}+)";
+constexpr const char* kAsciiTriples = R"([0-9]{3})";
+
 struct StepSpec {
     const char* pattern;
     bool keep_gaps;  // Split "Isolated"; false: "Removed" with invert (only the matches are kept)
+    bool byte_encoded = false;  // steps after ByteLevel: classes of encoded bytes, not original Unicode
 };
 
 struct Row {
@@ -71,8 +78,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
+const std::array<Row, 13>& table() {
+    static const std::array<Row, 13> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -88,6 +95,8 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"falcon"}, {{kFalconPunct, true}, {kGpt2, true}, {kNumberRuns, true, true}, {kAsciiTriples, true, true}}, false, false},
+        {{"olmo"}, {{kGpt2, true}}, true, false},  // GPT-NeoX/Mamba: NFC before ByteLevel
     }};
     return rows;
 }
@@ -121,10 +130,13 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.name_ = std::string(name);
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
+        bool encoded = false;
         for (const StepSpec& step : row.steps) {
+            if (encoded && !step.byte_encoded) return Status(ErrorCode::Internal, "raw split after encoded-byte split");
+            encoded = step.byte_encoded;
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
-            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps});
+            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps, step.byte_encoded});
         }
         return pre;
     }
@@ -150,7 +162,27 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
     thread_local std::vector<std::pair<uint32_t, uint32_t>> current, next;
     current.assign(1, {0u, static_cast<uint32_t>(d.cps.size())});
     if (d.cps.empty()) current.clear();
+    bool encoded = false;
     for (const Step& step : steps_) {
+        if (step.byte_encoded && !encoded) {
+            // Preserve the pieces, changing their coordinate system from
+            // original code points to original bytes. Encoded bytes have
+            // their own Unicode classes (e.g. byte 0xB2 maps to numeric ²).
+            for (auto& [from, to] : current) {
+                from = d.offsets[from];
+                to = d.offsets[to];
+            }
+            d.cps.resize(text.size());
+            d.keys.resize(text.size());
+            d.offsets.resize(text.size() + 1);
+            for (size_t i = 0; i < text.size(); ++i) {
+                d.cps[i] = unicode::gpt2_byte_codepoint(static_cast<uint8_t>(text[i]));
+                d.keys[i] = regex_key(d.cps[i]);
+                d.offsets[i] = static_cast<uint32_t>(i);
+            }
+            d.offsets[text.size()] = static_cast<uint32_t>(text.size());
+            encoded = true;
+        }
         next.clear();
         for (const auto& [from, to] : current) {
             // A piece is matched on its own: anchors and lookaheads see its ends.

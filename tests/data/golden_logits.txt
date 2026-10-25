@@ -21,6 +21,12 @@ arm64-neon-dotprod llama 843d1f69e41d69be
 arm64-neon-dotprod llama-f16kv c3762e1cc6e0440f
 arm64-neon-dotprod llama-sliding c8828407db88fd5d
 arm64-neon-dotprod llama-tied-ropefreqs-linear a8b8d00b97943246
+arm64-neon-dotprod mamba 010d9638612979da
+arm64-neon-dotprod mamba-conv1 e292b9ee7d970180
+arm64-neon-dotprod mamba-weighted-norms-bias 97fdc3895f7af18c
+arm64-neon-dotprod mamba-weightless-norms-bias d162b4010f419a34
+arm64-neon-dotprod mamba2 4bcf0797ae6ea9aa
+arm64-neon-dotprod mamba2-groups-bias 86795143b76eb77c
 arm64-neon-dotprod mistral 843d1f69e41d69be
 arm64-neon-dotprod phi3 9c3751723cbcaeb6
 arm64-neon-dotprod phi3-longrope-partial aced195c53a3204c
@@ -37,6 +43,9 @@ arm64-neon-dotprod qwen3moe-fused-gate-up 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
+arm64-neon-dotprod ssm-attention-ffn-only 10f4424928d0f5e3
+arm64-neon-dotprod ssm-attention-moe-only 5d1346cccde8356a
+arm64-neon-dotprod ssm-attention-moe-only-streamed 5d1346cccde8356a
 x86_64-avx2 deepseek2-mla 191166464f5adf1d
 x86_64-avx2 deepseek2-mla-expanded 38ed3ca545816896
 x86_64-avx2 deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c

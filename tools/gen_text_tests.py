@@ -21,6 +21,7 @@ non-ASCII code point):
                                       or start-end when it does not start where the piece before ended
     E pattern                         a pattern that must fail to compile
     S pre_name text_id spans          a pre-tokenizer split of the text (NFC-normalized first when the row says so)
+    B pre_name text_id spans          a pre-tokenizer split in byte offsets (steps after ByteLevel can split UTF-8)
     N input expected                  NFC normalization
 """
 import os
@@ -239,6 +240,35 @@ def main():
         cases.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 8))))
     for s in cases:
         out.append(f"N\t{esc(s)}\t{esc(unicodedata.normalize('NFC', s))}")
+    # The SSM tokenizers' original Rust pipelines, rather than a second copy
+    # of the regex table. Keep these additive so existing pattern/text ids
+    # and their pinned expectations remain stable.
+    ssm_pre = {
+        "olmo": pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True),
+        "falcon": pre_tokenizers.Sequence([
+            pre_tokenizers.Punctuation(behavior="contiguous"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True),
+            pre_tokenizers.Digits(individual_digits=False),
+            pre_tokenizers.Split(Regex("[0-9][0-9][0-9]"), behavior="isolated"),
+        ]),
+    }
+    for name, pre in ssm_pre.items():
+        for t in texts:
+            # The Rust offsets refer to whole original characters even when
+            # a later step cuts their encoded bytes. Decode the actual
+            # pieces to bytes to establish their exact boundaries instead.
+            alphabet = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+            chars = alphabet + [256 + i for i in range(256 - len(alphabet))]
+            byte_values = alphabet + [b for b in range(256) if b not in alphabet]
+            decoder = dict(zip(map(chr, chars), byte_values))
+            spans, pos = [], 0
+            for piece, _ in pre.pre_tokenize_str(t):
+                raw = bytes(decoder[c] for c in piece)
+                assert t.encode()[pos:pos + len(raw)] == raw
+                spans.append((pos, pos + len(raw)))
+                pos += len(raw)
+            assert pos == len(t.encode())
+            out.append(f"B\t{name}\t{text_id(t)}\t{spans_text(spans)}")
     print("\n".join(out))
     print(f"{disagreements} split(s) where Python's regex and the tokenizers differ (tokenizers kept)",
           file=sys.stderr)

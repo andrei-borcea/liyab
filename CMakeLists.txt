@@ -141,6 +141,7 @@ add_library(liyab_core OBJECT
   src/core/architecture.cpp
   src/core/key_scaling.cpp
   src/core/portable_math.cpp
+  src/core/ssm_scan.cpp
   src/core/transformer.cpp
   src/core/expert_store.cpp
   src/core/direct_io.cpp
@@ -355,6 +356,7 @@ if(LIYAB_BUILD_TESTS)
   list(APPEND _liyab_tests test_kv_reuse)
   list(APPEND _liyab_tests test_lora)
   list(APPEND _liyab_tests test_sequences)
+  list(APPEND _liyab_tests test_ssm)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()

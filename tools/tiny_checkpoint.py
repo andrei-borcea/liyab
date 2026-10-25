@@ -78,7 +78,24 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
 
     head_key, n_head = first(cfg, HEAD_KEYS)
     hidden_key, hidden = first(cfg, HIDDEN_KEYS)
-    if head_key and hidden_key:
+    pure_ssm = hasattr(cfg, "state_size") and hasattr(cfg, "conv_kernel") and not hasattr(cfg, "num_attention_heads")
+    if pure_ssm and hidden_key:
+        expand = int(getattr(cfg, "expand", 2))
+        if head_key:
+            groups = int(getattr(cfg, "n_groups", 1))
+            head_dim = int(cfg.head_dim)
+            new_heads = max(groups, min(heads, n_head))
+            new_heads -= new_heads % groups
+            hidden = width or new_heads * head_dim // expand
+            if hidden * expand % (groups * head_dim):
+                raise ValueError("SSM width times expansion must be divisible by groups times head_dim")
+            setattr(cfg, head_key, hidden * expand // head_dim)
+        else:
+            hidden = width or min(hidden, 128)
+        setattr(cfg, hidden_key, hidden)
+        if hasattr(cfg, "intermediate_size"):
+            cfg.intermediate_size = hidden * expand
+    elif head_key and hidden_key:
         dim_key, head_dim = first(cfg, HEAD_DIM_KEYS)
         head_dim = head_dim or hidden // n_head
         new_heads = min(heads, n_head)
@@ -98,7 +115,7 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
         setattr(cfg, hidden_key, width or new_heads * head_dim)
 
     for k, v in list(vars(cfg).items()):
-        if isinstance(v, int) and not isinstance(v, bool) and v > ffn and ("intermediate_size" in k or k in FFN_KEYS):
+        if not pure_ssm and isinstance(v, int) and not isinstance(v, bool) and v > ffn and ("intermediate_size" in k or k in FFN_KEYS):
             setattr(cfg, k, ffn)
 
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
@@ -141,7 +158,7 @@ def main():
     parser.add_argument("--heads", type=int, default=4, help="attention heads (default 4)")
     parser.add_argument("--kv-heads", type=int, default=2,
                         help="key/value heads when the model groups them (default 2)")
-    parser.add_argument("--width", type=int, help="residual width (default heads x the model's head size)")
+    parser.add_argument("--width", type=int, help="residual width (default attention heads x head size; pure SSMs preserve expansion and head/group divisibility)")
     parser.add_argument("--ffn", type=int, default=128, help="FFN and expert widths (default 128)")
     parser.add_argument("--experts", type=int, default=16, help="routed experts (default 16)")
     parser.add_argument("--config", help="JSON object of configuration fields to set after the reduction")

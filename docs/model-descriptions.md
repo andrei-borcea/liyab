@@ -25,6 +25,68 @@ Liyab: the 4 GB of float32 weights of a 1B model, 13 GB for a 3B one.
 * [The conformance gate](#the-conformance-gate)
 * [Validation](#validation)
 * [Limits](#limits)
+* [State-space mixers](#state-space-mixers)
+
+## State-space mixers
+
+The `mamba` and `mamba2` rows describe stacks without an FFN. A block with
+`ssm_conv1d` and `ssm_d` is Mamba-1 when it also has `ssm_x`, otherwise
+Mamba-2. `ssm_conv1d` without `ssm_d` remains Gated DeltaNet. Attention
+projections select attention; an FFN without mixer tensors is an FFN-only
+block. The loader rejects empty blocks and mixed SSM geometries.
+
+Mamba-1 uses the file's convolution, input, selective, time-step and output
+projections; `ssm_a` already holds `-exp(A_log)`, as converter b11819 writes
+it. Mamba-2 splits the inner stream into heads, with groups sharing B/C,
+per-head decay and D skip, then gated RMS normalization. Both use existing
+matmuls for every projection format. Scans and convolution run on CPU
+(NEON, AVX2/FMA or scalar); GPU routes can still project on Metal/Vulkan.
+
+Falcon-Mamba's `ssm.dt_b_c_rms` enables weightless dt/B/C RMS norms. The
+epsilon is `ArchSpec::ssm_dt_b_c_eps` (1e-6); b11819 does not write
+`mixer_rms_eps`. Current transformers' saved norm weights are dummy tensors
+and do not affect these norms. Other weighted dt/B/C norms use the file's
+RMS epsilon. Nondefault dt clipping is not expressible by b11819 and the
+description tool refuses to propose a row for it. `ssm_norm_grouped`
+distinguishes a gated norm over each group from transformers Mamba-2's norm
+over all inner channels. The trace recomputes the gated norm to establish
+this fact; the converter reshapes both forms identically.
+
+The reference trace recognizes the projections and state tensors, observes
+the mixer-only residual, and compares SSM geometry, activation and norm
+settings with metadata. A pure SSM trace reduces its residual width while
+preserving expansion and head/group divisibility, as does
+`tiny_checkpoint.py --width`. `test_ssm` checks scans
+against independent scalar equations and compares prefill, decode and
+rollback for all projection formats and four KV cache types. Existing
+context, tree-draft and prefix-cache tests also exercise Mamba states.
+Synthetic golden cases combine SSM, attention and FFN-only blocks, including
+MoE FFNs with in-place and streamed experts.
+
+The converter calls the GPT-NeoX/Mamba ByteLevel tokenizer `olmo` (the
+existing GPT-2 regex after NFC). Falcon-Mamba's `falcon` pipeline isolates contiguous
+punctuation, applies ByteLevel, isolates number runs, then ASCII triples.
+The last two steps classify ByteLevel's encoded bytes, so the table marks
+them as byte-alphabet steps. They may split inside an original UTF-8
+character; the BPE encoder receives the exact resulting byte ranges.
+`tools/gen_text_tests.py` checks both against the Rust tokenizer pipelines;
+the resulting split records are appended to `tests/data/text_cases.txt`.
+These base checkpoints supply no chat template; no template is invented.
+The gate escapes non-UTF-8 byte-token diagnostics instead of failing while
+decoding a tokenizer tool's output; token IDs are still compared exactly.
+
+The next hybrid families remain separate validation work. This section does
+not register them merely because they contain an SSM:
+
+| Family | Remaining parts and ownership |
+| :--- | :--- |
+| Jamba | Per-block KV-head arrays and attention without RoPE (modern); architecture facts and conformance of weighted dt/B/C norms and dense/MoE combinations (ssm/moe). |
+| Falcon-H1 | Attention and SSM in parallel inside one block, partial SSM widths and D layouts (ssm); verify the converter's baked multipliers against the reference. |
+| Granite 4 hybrid | Per-block head arrays and NoPE (modern); embedding/residual/logit multipliers (classic/modern), then shared/routed-expert conformance (moe). |
+| Nemotron-H | Ungated ReLU-squared FFN (classic), per-block head metadata (modern); grouped SSM norm is implemented here. |
+| Nemotron-H-MoE | Nemotron-H parts plus its expert/routing variants (moe; group-limited selection deepseek-dsa). |
+| Plamo2 | Per-block head arrays (modern); its distinct headwise B/C, dt/B/C normalization and SSM projection/state layout (ssm). |
+| Bamba | Its converter uses `granitehybrid` with per-block KV-head arrays (modern); register only after its full hybrid facts and conformance are established. |
 
 ## Where the facts come from
 

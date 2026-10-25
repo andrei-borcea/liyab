@@ -480,7 +480,8 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
                     "ssm_conv1d.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight"}
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
-                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa")
+                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "ssm_dt_b_c_eps",
+                  "ssm_norm_grouped")
 
 
 def _close(a, b, rel=1e-5):
@@ -733,7 +734,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         ts = blocks.get(b, set())
         p = {}
         if "ssm_conv1d.weight" in ts:
-            p["mixer"] = "deltanet"
+            p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if "ssm_d" in ts else "deltanet"
+        elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight"} & ts:
+            p["mixer"] = "none"
         else:
             p["mixer"] = "attention"
             p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * q_dim
@@ -746,15 +749,46 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
             p["selection_bias"] = "exp_probs_b.bias" in ts
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
-        else:
+        elif "ffn_up.weight" in ts:
             p["ffn"] = "dense"
             p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * n_ff
+        else:
+            p["ffn"] = "none"
         plans.append(p)
 
     # --- the reference, block by block ---
     bf = facts["block_facts"]
     att_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "attention"]
     rec_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "recurrent"]
+    ssm_blocks = [b for b in bf if b.get("mixer", {}).get("kind") in ("mamba", "mamba2")]
+    for b in ssm_blocks:
+        m = b["mixer"]
+        i = b["index"]
+        if plans[i]["mixer"] != m["kind"] or plans[i]["ffn"] != "none":
+            d.file_issues.append(f"block {i}: SSM topology differs from the reference")
+        # The reduced trace preserves scalar settings; geometry is compared
+        # to the full configuration because width/head count were reduced.
+        for key, want in (("ssm.conv_kernel", cfg.get("conv_kernel")),
+                          ("ssm.inner_size", cfg.get("intermediate_size")),
+                          ("ssm.state_size", cfg.get("state_size")),
+                          ("ssm.time_step_rank", cfg.get("num_heads") if m["kind"] == "mamba2" else cfg.get("time_step_rank"))):
+            if want is not None and g.key(key) != want:
+                d.file_issues.append(f"{key}: {g.key(key)} in the file, {want} in the reference")
+        if m["activation"] != "silu":
+            d.missing.append(f"SSM activation {m['activation']} (the engine implements SiLU)")
+        if bool(g.key("ssm.dt_b_c_rms", False)) != bool(m["dt_b_c_rms"]):
+            d.file_issues.append("ssm.dt_b_c_rms disagrees with the reference's mixer norms")
+        if m["dt_b_c_rms"]:
+            d.set("ssm_dt_b_c_eps", m["dt_b_c_eps"], "the reference mixer's weightless dt/B/C norm epsilon; not written by converter b11819")
+        if m["dt_limit"] != [0.0, float("inf")]:
+            d.missing.append(f"SSM dt limits {m['dt_limit']}: converter b11819 does not write them")
+        if m["kind"] == "mamba2" and int(g.key("ssm.group_count", 1)) != int(cfg.get("n_groups", 1)):
+            d.file_issues.append("ssm.group_count disagrees with the reference")
+        if m["kind"] == "mamba2":
+            d.set("ssm_norm_grouped", m["norm_grouped"], "the reference gated norm's observed grouping (the converter reshapes both forms identically)")
+    if ssm_blocks and not att_blocks:
+        d.set("rope", "Halves", "no attention or rotary embedding in an SSM-only stack; pairing is unused")
+        d.set("ffn_norm", "", "mixer-only blocks have no FFN norm")
     for b in bf:
         for u in b.get("unknown", []):
             d.unknown.append(f"block {b['index']}: {u}")
@@ -1001,7 +1035,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     # The q.k scale the engine uses: the file's attention.scale when it reads that key, else 1/sqrt(head_dim);
     # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
     file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
-    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(head_dim))) * qk_factor ** 2
+    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(max(head_dim, 1)))) * qk_factor ** 2
     file_cap = g.key("attn_logit_softcapping") if "attn_logit_softcapping" in engine.file_keys else None
     for b in att_blocks:
         m = b["mixer"]
@@ -1308,6 +1342,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for i, p in enumerate(plans):
         if p["mixer"] == "deltanet":
             mix = "Gated DeltaNet"
+        elif p["mixer"] in ("mamba", "mamba2", "none"):
+            mix = {"mamba": "Mamba-1", "mamba2": "Mamba-2", "none": "no mixer"}[p["mixer"]]
         else:
             mix = "attention" + ("".join(f", {t}" for t, on in (("fused QKV", p["fused_qkv"]),
                                                                 ("QKV biases", p["qkv_bias"]),
@@ -1315,8 +1351,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                                                                 ("gated output", p["attn_gate"])) if on))
         if p["ffn"] == "moe":
             ffn = "MoE FFN" + (" + shared expert" if p["shared_expert"] else "")
-        else:
+        elif p["ffn"] == "dense":
             ffn = "dense FFN" + (" (fused gate/up)" if p["fused_gate_up"] else "")
+        else:
+            ffn = "no FFN"
         groups.setdefault(f"{mix}; {ffn}", []).append(i)
     for what, idx in groups.items():
         d.parts.append(f"{'block' if len(idx) == 1 else 'blocks'} {_ranges(idx)}: {what}")
@@ -1413,7 +1451,11 @@ def run(cmd, log, cwd=None, env=None):
     with open(log, "a") as out:
         out.write("$ " + " ".join(cmd) + "\n")
         out.flush()
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        # Tokenizer diagnostics can include raw byte-token pieces that are not
+        # UTF-8 by themselves. Preserve those bytes as escapes in the gate log;
+        # token-id comparison must not fail while decoding its diagnostics.
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, errors="backslashreplace")
         out.write(p.stdout)
     return p.returncode, p.stdout
 

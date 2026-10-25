@@ -211,6 +211,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
 
     GgufWriter w;
     const std::string& a = s.arch;
+    const int32_t mamba = s.mamba > 0 ? s.mamba : a == "mamba" ? 1 : a == "mamba2" ? 2 : 0;
+    const int64_t mamba_rank = std::max(32, dtype_traits(s.attn_type).block_size);
     w.add_string("general.architecture", a);
     w.add_string("general.name", "liyab-tiny-test");
     w.add_u32(a + ".block_count", static_cast<uint32_t>(s.n_layers));
@@ -239,6 +241,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
     }
     const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
+    if (mamba > 0) {
+        w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(s.mamba_kernel));
+        w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(2 * s.n_embd));
+        w.add_u32(a + ".ssm.state_size", 16);
+        w.add_u32(a + ".ssm.time_step_rank", mamba == 1 ? static_cast<uint32_t>(mamba_rank) : 4);
+        if (mamba == 2) w.add_u32(a + ".ssm.group_count", static_cast<uint32_t>(s.mamba_groups));
+        if (s.mamba_norms) w.add_bool(a + ".ssm.dt_b_c_rms", true);
+    }
     if (s.delta_net_interval > 0) {
         w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(ssm_kernel));
         w.add_u32(a + ".ssm.state_size", static_cast<uint32_t>(ssm_hd));
@@ -364,7 +374,46 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
         w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
-        if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
+        if (mamba > 0 && (!s.mamba_topology || l % 3 == 0)) {
+            const bool v2 = mamba == 2;
+            const int64_t di = 2 * d, ns = 16, heads = 4, rank = mamba_rank;
+            const int64_t channels = v2 ? di + 2 * s.mamba_groups * ns : di;
+            const int64_t input = v2 ? di + channels + heads : 2 * di;
+            w.add_tensor(p + "ssm_in.weight", {d, input}, s.attn_type, random(d * input, s.weight_scale));
+            w.add_tensor(p + "ssm_conv1d.weight", {s.mamba_kernel, channels}, DType::F32,
+                         random(s.mamba_kernel * channels, 0.3f));
+            w.add_tensor(p + "ssm_conv1d.bias", {channels}, DType::F32, random(channels, 0.1f));
+            const int64_t decay = v2 ? heads : di * ns, skip = v2 ? heads : di;
+            std::vector<float> a_neg = random(decay, 0.5f);
+            for (float& x : a_neg) x = -std::exp(x);
+            w.add_tensor(p + "ssm_a", {v2 ? 1 : ns, v2 ? heads : di}, DType::F32, a_neg);
+            w.add_tensor(p + "ssm_d", {skip}, DType::F32, random(skip, 0.5f));
+            w.add_tensor(p + "ssm_dt.bias", {skip}, DType::F32, random(skip, 0.5f));
+            if (v2) {
+                w.add_tensor(p + "ssm_norm.weight", {di / s.mamba_groups, s.mamba_groups}, DType::F32,
+                             norm_weights(di));
+            } else {
+                w.add_tensor(p + "ssm_x.weight", {di, rank + 2 * ns}, s.attn_type,
+                             random(di * (rank + 2 * ns), s.weight_scale));
+                w.add_tensor(p + "ssm_dt.weight", {rank, di}, s.attn_type, random(rank * di, s.weight_scale));
+                if (s.mamba_norms || s.mamba_weighted_norms) {
+                    // Current transformers saves these dummy weights although
+                    // Falcon-Mamba's mixer norms do not multiply by them.
+                    const int64_t dt_norm = s.mamba_norms ? di : rank;
+                    w.add_tensor(p + "ssm_dt_norm.weight", {dt_norm}, DType::F32, norm_weights(dt_norm));
+                    w.add_tensor(p + "ssm_b_norm.weight", {ns}, DType::F32, norm_weights(ns));
+                    w.add_tensor(p + "ssm_c_norm.weight", {ns}, DType::F32, norm_weights(ns));
+                }
+            }
+            w.add_tensor(p + "ssm_out.weight", {di, d}, s.attn_type, random(di * d, s.weight_scale));
+            if (s.mamba_bias) {
+                w.add_tensor(p + "ssm_in.bias", {input}, DType::F32, random(input, 0.1f));
+                w.add_tensor(p + "ssm_out.bias", {d}, DType::F32, random(d, 0.1f));
+            }
+            continue;  // a mixer-only block
+        } else if (s.mamba_topology && l % 3 == 2) {
+            // No mixer tensors: the block below is an FFN alone.
+        } else if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
             w.add_tensor(p + "attn_qkv.weight", {d, conv_dim}, s.attn_type, random(d * conv_dim, s.weight_scale));

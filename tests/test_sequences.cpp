@@ -338,11 +338,12 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
 }
 
 TEST_CASE("Sequences together: hybrid (DeltaNet) models continue each sequence's states, checkpoints included") {
+    for (const char* arch : {"qwen35", "mamba", "mamba2"}) {
     test::TinyModelSpec s;
-    s.arch = "qwen35";
+    s.arch = arch;
     s.n_layers = 4;
-    s.delta_net_interval = 2;
-    const std::string& path = model_path("hybrid", s);
+    if (std::string_view(arch) == "qwen35") s.delta_net_interval = 2;
+    const std::string& path = model_path(std::string("state_") + arch, s);
     TransformerOptions options;
     CHECK(check_schedule("hybrid", path, options, mixed_plans()));
     CHECK(check_schedule("hybrid, rollback window", path, options, mixed_plans(), 4));
@@ -377,6 +378,7 @@ TEST_CASE("Sequences together: hybrid (DeltaNet) models continue each sequence's
     CHECK(same_bits(*again, std::span<const float>(all).subspan(4 * rows)));
     model->swap_context(**other);
     CHECK(model->n_past() == 10);
+    }
 }
 
 TEST_CASE("Sequences together: a mixture of experts reads the union of the experts, each sequence its bits") {

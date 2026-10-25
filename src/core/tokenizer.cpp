@@ -25,10 +25,8 @@ size_t utf8_len(unsigned char lead) noexcept { return unicode::utf8_length(lead)
 const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
     static const std::unordered_map<int32_t, uint8_t> table = [] {
         std::unordered_map<int32_t, uint8_t> m;
-        int32_t extra = 0;
         for (int32_t b = 0; b < 256; ++b) {
-            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-            m[printable ? b : 256 + extra++] = static_cast<uint8_t>(b);
+            m[static_cast<int32_t>(unicode::gpt2_byte_codepoint(static_cast<uint8_t>(b)))] = static_cast<uint8_t>(b);
         }
         return m;
     }();
@@ -39,10 +37,8 @@ const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
 const std::array<std::string, 256>& gpt2_byte_encoder() {
     static const std::array<std::string, 256> table = [] {
         std::array<std::string, 256> t;
-        int32_t extra = 0;
         for (int32_t b = 0; b < 256; ++b) {
-            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-            const uint32_t cp = printable ? static_cast<uint32_t>(b) : static_cast<uint32_t>(256 + extra++);
+            const uint32_t cp = unicode::gpt2_byte_codepoint(static_cast<uint8_t>(b));
             std::string utf8;
             if (cp < 0x80) {
                 utf8 += static_cast<char>(cp);

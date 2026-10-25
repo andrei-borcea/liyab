@@ -141,6 +141,16 @@ struct TinyModelSpec {
     // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
+    // SSM synthetic blocks, selected by tensors rather than the architecture
+    // name: 1 = Mamba-1, 2 = Mamba-2. Optional attention/FFN-only blocks
+    // exercise mixed topology; norm and biases exercise Falcon-Mamba.
+    int32_t mamba = 0;
+    int32_t mamba_groups = 1;
+    int32_t mamba_kernel = 4;
+    bool mamba_norms = false;
+    bool mamba_weighted_norms = false;
+    bool mamba_bias = false;
+    bool mamba_topology = false;
 
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their
