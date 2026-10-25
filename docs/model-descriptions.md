@@ -122,6 +122,14 @@ checks the converter's folded weights. Native SDPA observation also verifies the
 additional additive score biases remain unknown.
 `chat_template_reference.py --trust-remote-code` enables official custom tokenizer code when recording templates;
 the default still loads tokenizers without executing remote code.
+For `chatglm-spm`, the initial-special-token rule is `[gMASK], sop`, independently of the ordinary BOS flag.
+The tokenizer resolves these control tokens from the vocabulary, refuses an incomplete prefix, and inserts it
+once; segmented encoding keeps an automatic prefix before the reusable text. The description tool compares the
+scheme's prefix with the official tokenizer's actual special-token output.
+ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder templates have 14 reference cases each.
+ChatGLM3's tiny forward pass matches after adding its prefix, but the published converter also renames the
+SentencePiece BOS/EOS strings and marks more literal spellings as control tokens than its official tokenizer
+recognizes by default. Its three-text tokenizer gate therefore remains incomplete.
 
 ## The conformance gate
 

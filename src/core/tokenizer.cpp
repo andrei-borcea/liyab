@@ -226,6 +226,23 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     }
     tok.special_.assign(n, false);
     for (const int32_t id : tok.control_) tok.special_[static_cast<size_t>(id)] = true;
+    const auto scheme = model.get_string("tokenizer.ggml.pre");
+    if (tok.kind_ == Kind::Spm && scheme && *scheme == "chatglm-spm") {
+        // This tokenizer's start-of-sequence rule is a two-token prefix,
+        // independent of the converter's false ordinary add_bos_token flag.
+        for (const char* text : {"[gMASK]", "sop"}) {
+            const auto it = tok.lookup_.find(text);
+            if (it == tok.lookup_.end() || !tok.special_[static_cast<size_t>(it->second)]) {
+                return Status(ErrorCode::InvalidModel, "chatglm-spm vocabulary lacks special token '" + std::string(text) + "'");
+            }
+            tok.initial_tokens_.push_back(it->second);
+            tok.initial_text_ += text;
+        }
+        tok.add_bos_ = true;
+    } else if (tok.bos_ >= 0) {
+        tok.initial_tokens_.push_back(tok.bos_);
+        if (tok.special_[static_cast<size_t>(tok.bos_)]) tok.initial_text_ = tok.texts_[static_cast<size_t>(tok.bos_)];
+    }
     std::sort(tok.control_.begin(), tok.control_.end(), [&](int32_t a, int32_t b) {
         return tok.texts_[static_cast<size_t>(a)].size() > tok.texts_[static_cast<size_t>(b)].size();
     });
@@ -290,10 +307,12 @@ std::string_view Tokenizer::prompt_text(int32_t id, bool segment_start) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
-    if (add_bos && bos_ >= 0 && special_[static_cast<size_t>(bos_)] && text.starts_with(texts_[static_cast<size_t>(bos_)])) {
-        add_bos = false;  // the text spells its BOS (a chat template wrote it): no second one
-    }
     return encode_from(text, add_bos, true);
+}
+
+std::span<const int32_t> Tokenizer::initial_tokens(std::string_view text, bool add_bos) const {
+    if (!add_bos || (!initial_text_.empty() && text.starts_with(initial_text_))) return {};
+    return initial_tokens_;
 }
 
 std::string_view Tokenizer::token_text(int32_t id) const {
@@ -329,8 +348,8 @@ size_t Tokenizer::find_special(std::string_view text, size_t from, int32_t& id) 
 
 Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool add_bos, bool after_control) const {
     if (kind_ == Kind::Gpt2 && !pre_) return pre_error_;
-    std::vector<int32_t> out;
-    if (add_bos && bos_ >= 0) out.push_back(bos_);
+    const auto initial = initial_tokens(text, add_bos);
+    std::vector<int32_t> out(initial.begin(), initial.end());
     // Split around control-token texts; plain segments go through SPM. As in
     // llama.cpp, a segment gets the space prefix when it starts the text or
     // follows a control token.

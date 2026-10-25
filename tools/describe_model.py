@@ -1527,6 +1527,11 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
     add_bos = bool(add_bos) and bos is not None
     plain = tok("The sea", add_special_tokens=False)["input_ids"]
     special = tok("The sea", add_special_tokens=True)["input_ids"]
+    if g.metadata.get("tokenizer.ggml.pre") == "chatglm-spm":
+        tokens = g.metadata.get("tokenizer.ggml.tokens", [])
+        prefix = [tokens.index(text) if text in tokens else -1 for text in ("[gMASK]", "sop")]
+        if special != prefix + plain:
+            d.file_issues.append("chatglm-spm's [gMASK], sop prefix differs from the reference tokenizer")
     ref_bos = len(special) > len(plain) and special[0] == bos and special[1:1 + len(plain)] == plain
     # What the model's tokenizer_config.json declares. transformers does not always apply it (version 5 runs
     # DeepSeek's tokenizer.json as it is, without the BOS its LlamaTokenizerFast class added).

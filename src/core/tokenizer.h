@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -26,8 +27,9 @@ public:
     static Result<Tokenizer> load(const MmapLoader& model);
 
     // Text → token ids, as the model's Hugging Face tokenizer encodes them.
-    // `add_bos` adds no BOS to a text that starts with the BOS token's own
-    // text (a rendered chat template wrote it).
+    // `add_bos` adds the scheme's initial special tokens unless the text
+    // already spells them (a rendered chat template wrote them). Usually
+    // this is one BOS; chatglm-spm uses [gMASK], sop instead.
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
     // and byte-level BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
@@ -37,6 +39,10 @@ public:
     // the text between them is normalized (NFC for the Qwen families) and
     // pre-tokenized on its own.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
+    // Initial special tokens to insert before `text`, or an empty span when
+    // disabled/already written. Borrows this tokenizer; used by segmented
+    // encoding to keep automatic prefix tokens outside reusable segments.
+    [[nodiscard]] std::span<const int32_t> initial_tokens(std::string_view text, bool add_bos) const;
     // Encodes `text` that directly follows already-encoded text ending with
     // token `previous` (a prompt that continues the context): no BOS and, for
     // SentencePiece vocabularies, the space prefix only after a control token,
@@ -106,6 +112,8 @@ private:
     int32_t unk_ = -1;
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
+    std::vector<int32_t> initial_tokens_;
+    std::string initial_text_;  // their literal spelling, when all are special
 };
 
 }  // namespace liyab

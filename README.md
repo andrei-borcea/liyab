@@ -154,6 +154,9 @@ Tiny-checkpoint JSON overrides pass through the configuration constructor, prese
 The description tool measures scalar offsets in RMSNorm weights and verifies that conversion folds them into
 the stored weights. Native SDPA traces check causal/window masks and report additional score biases as unknown.
 `chat_template_reference.py --trust-remote-code` can record templates from trusted official custom tokenizers.
+The `chatglm-spm` tokenizer scheme adds its `[gMASK], sop` prefix when initial special tokens are requested,
+recognizes a prefix already written by a chat template, and keeps automatic prefix tokens outside reusable segments.
+Template fixtures also cover ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder (14 cases each).
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the

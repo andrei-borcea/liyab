@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/kv_reuse.h"
 #include "core/pre_tokenizer.h"
 #include "core/regex.h"
 #include "core/tokenizer.h"
@@ -158,6 +159,11 @@ size_t codepoints(std::string_view text) {
 // ---------------------------------------------------------------------------
 class GgufWriter {
 public:
+    void boolean(const std::string& key, bool value) {
+        header(key, 7);
+        body_ += static_cast<char>(value);
+        ++count_;
+    }
     void string(const std::string& key, const std::string& value) {
         header(key, 8);
         str(value);
@@ -570,6 +576,42 @@ TEST_CASE("Tokenizer loads the published converter's integer Tekken scores and r
         auto t = Tokenizer::load(**f);
         CHECK(t.has_value() == !short_scores);
         if (t) CHECK(t->encode("ab", false).has_value());
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("SentencePiece scheme prefixes stay outside reusable segments and are inserted once") {
+    for (const bool missing : {false, true}) {
+        GgufWriter w;
+        w.string("tokenizer.ggml.model", "llama");
+        w.string("tokenizer.ggml.pre", "chatglm-spm");
+        w.boolean("tokenizer.ggml.add_bos_token", false);
+        w.strings("tokenizer.ggml.tokens", {"<unk>", "[gMASK]", missing ? "missing" : "sop", "▁", "h", "i", "hi", "▁hi"});
+        w.ints("tokenizer.ggml.token_type", {2, 3, 3, 1, 1, 1, 1, 1});
+        w.ints("tokenizer.ggml.scores", {-100, -100, -100, -10, -10, -10, 0, 1});
+        const std::string path = test::temp_dir() + "/liyab_scheme_prefix.gguf";
+        REQUIRE(w.write(path));
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        if (missing) {
+            REQUIRE(!tok.has_value());
+            CHECK(tok.status().message().find("sop") != std::string::npos);
+        } else {
+            REQUIRE(tok.has_value());
+            CHECK(tok->add_bos_default());
+            CHECK(tok->encode("hi", true).value() == (std::vector<int32_t>{1, 2, 7}));
+            CHECK(tok->encode("hi", false).value() == (std::vector<int32_t>{7}));
+            CHECK(tok->encode("[gMASK]sophi", true).value() == (std::vector<int32_t>{1, 2, 7}));
+            CHECK(tok->encode_continuation("hi", 7).value() == (std::vector<int32_t>{6}));
+            CHECK(tok->encode_continuation("hi", 2).value() == (std::vector<int32_t>{7}));
+            std::vector<int32_t> tokens;
+            std::vector<TokenSegment> segments;
+            REQUIRE(encode_segmented(*tok, "hi", 0, std::vector<PromptSegment>{{0, 2}}, true, tokens, segments).is_ok());
+            CHECK(tokens == (std::vector<int32_t>{1, 2, 7}));
+            REQUIRE(segments.size() == 1);
+            CHECK(segments[0].begin == 2 && segments[0].end == 3);
+        }
         std::remove(path.c_str());
     }
 }
