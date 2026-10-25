@@ -399,6 +399,10 @@ registry row and all three tokenizer texts. These results do not stand in for pe
 | `bigcode/tiny_starcoder_py` | F16 | 0.00000 | 99.80% |
 | `stabilityai/stablelm-2-1_6b` | Q8_0 | 0.00130 | 97.46% |
 
+The unmodified b11819 converter rejects a reduced official `tiiuae/falcon-rw-1b` checkpoint at
+`transformer.h.0.post_attention_layernorm.bias` (unmapped tensor). Its full weights were not downloaded;
+Falcon evidence above covers the 7B configuration and its separate-norm variant.
+
 OLMo-1B, Phi-2, StarCoder2-3B and Minitron-4B real gates remain pending. The larger configurations above have
 tiny conformance only. Command-R and Arcee chat templates are checked byte for byte against transformers;
 the other selected base tokenizers do not provide a chat template.
