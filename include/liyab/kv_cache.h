@@ -93,6 +93,13 @@ struct KvCacheConfig {
     // comment). A window that holds every position of the context should be
     // given as 0: it would only cost the bookkeeping of a windowed group.
     std::vector<int32_t> layer_windows;
+    // Auxiliary key channels following each key row (DSA's index keys), in
+    // F32, independent of the main cache's format: rounding a score can
+    // change a discrete top-k selection. 0: none. Requires values_in_keys.
+    // These channels are carried by every page/image,
+    // copied and released with its main row, but are never attention values
+    // or scaled by scale_keys().
+    int32_t auxiliary_dim = 0;
 };
 
 class LIYAB_API KvCache {
@@ -124,9 +131,8 @@ public:
     // Whether some layer has a window of its own (layer_windows), i.e. the
     // cache keeps only the recent rows of those layers.
     [[nodiscard]] bool has_windowed_layers() const noexcept { return windowed_groups_ > 0; }
-    // A hash of the per-block layout (which layers keep which window); 0
-    // without windowed layers, so it changes nothing that hashes it for the
-    // caches that have none.
+    // A hash of the per-block windows and auxiliary key geometry; 0 when
+    // neither is present, preserving the fingerprints of ordinary caches.
     [[nodiscard]] uint64_t layout_fingerprint() const noexcept { return layout_fingerprint_; }
 
     // Positions visible to a query at `pos` through the engine's window:
@@ -163,6 +169,13 @@ public:
     // values_in_keys, `v` is ignored (it may be nullptr) and v_row() points
     // into the key row at channel value_offset.
     void store(int32_t layer, int32_t pos, const float* k, const float* v);
+    // Writes auxiliary_dim floats per KV head at a reserved position;
+    // store() must have written its main row first (it clears auxiliary
+    // channels). Exclusive access, the same layer/position bounds as store().
+    void store_auxiliary(int32_t layer, int32_t pos, const float* keys);
+    // Raw F32 auxiliary key row of kv_head (auxiliary_dim channels), valid
+    // while its mapped page remains. Bounds and thread safety as k_row().
+    [[nodiscard]] const uint8_t* auxiliary_key(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     [[nodiscard]] const uint8_t* k_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     [[nodiscard]] const uint8_t* v_row(int32_t layer, int32_t pos, int32_t kv_head) const noexcept;
     // One layer's rows with where they live resolved once: attention reads a
@@ -291,7 +304,7 @@ public:
     [[nodiscard]] size_t image_value_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept;
     // Whether `layer` keeps every position (it is in rows images).
     [[nodiscard]] bool keeps_every_position(int32_t layer) const noexcept;
-    // Bytes of one cached row: head_dim values in the cache's format.
+    // Bytes of one cached row: head_dim + auxiliary_dim values in the cache's format.
     [[nodiscard]] size_t head_row_bytes() const noexcept { return row_bytes_; }
 
     // --- Window pages (saved contexts; the engine's KV store keeps windowed rows page by page) --

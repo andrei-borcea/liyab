@@ -254,3 +254,12 @@ A rule it cannot establish still prevents proposing a registry row. No new `Arch
 weights, since those tensors are not quantized.
 The group-routing golden cases are pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar; streamed and resident
 biased routing agree exactly on each platform.
+
+### Auxiliary index-key storage
+
+`KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. These channels are owned by
+the paged cache and copied, saved and released with the main row. They are not attention values and do not take
+part in per-channel main-key scaling. `KvCache::bytes_per_token()` and the image layout include their bytes;
+the layout fingerprint separates these contexts from ordinary KV images. Mixed-format rows remain raw in the
+prefix store so a codec cannot round an index key and change a later position selection. The cache tests cover
+all four main KV types, page images, position copies, scaling and rollback.

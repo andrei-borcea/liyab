@@ -2159,6 +2159,13 @@ Group-limited routing has synthetic logit hashes pinned on ARM64 NEON dotprod, x
 softmax group maxima and sigmoid groups scored by their two best biased probabilities, both in place and
 streamed. The existing dense and latent-attention hashes are unchanged.
 
+The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
+precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete
+top-k selection. Page copies, rollback, context images and the prefix store carry these channels with the main
+row; key scaling leaves them unchanged. Their bytes count toward the memory budget and sequence context size.
+Mixed-format images use the store's raw-image fallback, including when lossy prefix compression is requested,
+so storage does not change index keys. Ordinary KV images retain their existing codecs and layout.
+
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
 for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B
