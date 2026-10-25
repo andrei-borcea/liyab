@@ -107,10 +107,21 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
 
     tok.scores_.assign(n, 0.0f);
     if (const GgufValue* s = model.metadata("tokenizer.ggml.scores")) {
-        if (s->type != GgufValue::Type::Array || s->array_type != GgufValue::Type::F32 || s->array_size != n) {
+        if (s->type != GgufValue::Type::Array || s->array_size != n ||
+            (s->array_type != GgufValue::Type::F32 && s->array_type != GgufValue::Type::I32)) {
             return Status(ErrorCode::InvalidModel, "tokenizer.ggml.scores does not match the vocabulary");
         }
-        std::memcpy(tok.scores_.data(), s->array_data, n * sizeof(float));
+        if (s->array_type == GgufValue::Type::F32) {
+            std::memcpy(tok.scores_.data(), s->array_data, n * sizeof(float));
+        } else {
+            // The published converter writes Tekken's integer merge ranks
+            // as I32 scores. Read their numeric values, never their bits.
+            for (size_t i = 0; i < n; ++i) {
+                int32_t score = 0;
+                std::memcpy(&score, s->array_data + i * sizeof(score), sizeof(score));
+                tok.scores_[i] = static_cast<float>(score);
+            }
+        }
     }
     tok.types_.assign(n, kNormal);
     if (const GgufValue* t = model.metadata("tokenizer.ggml.token_type")) {

@@ -14,7 +14,7 @@
 // elif / else, for (tuple targets, `if` filters, else, loop.index / index0 /
 // revindex / first / last / length / previtem / nextitem / cycle), break /
 // continue, set (names, namespace attributes, blocks), macro with defaults,
-// generation blocks; literals, lists, dicts, tuples, attribute / item /
+// generation blocks; literals, lists, dicts (string and scalar keys), tuples, attribute / item /
 // slice access, calls with keyword arguments, + - * / // % ** ~, comparisons,
 // in / not in, and / or / not, conditional expressions; Python string,
 // list and dict methods (split, strip, startswith, items, get...); the
@@ -106,10 +106,10 @@ private:
 };
 
 struct Object {
-    std::vector<std::pair<std::string, Value>> entries;  // insertion order, as Python dicts
+    std::vector<std::pair<Value, Value>> entries;  // insertion order, scalar keys retain their types
     bool is_namespace = false;
-    [[nodiscard]] const Value* find(std::string_view key) const;
-    void set(const std::string& key, Value value);
+    [[nodiscard]] const Value* find(const Value& key) const;
+    void set(const Value& key, Value value);
 };
 
 struct Callable {

@@ -141,6 +141,11 @@ merge ranks. Granite (`refact`) and EXAONE 4 (`exaone4`) use GPT-2's ByteLevel r
 normalizes NFC and splits punctuation separately from following newlines. These tokenizers are checked against
 their Hugging Face token IDs on prose, edge cases and chat text. SmolLM3's own chat template is pinned in the
 template fixture, with 14 byte-identical reference renders.
+GLM-4's `glm4` pre-tokenizer uses the Llama-3 split and whole-piece vocabulary lookup without normalization.
+The tokenizer also reads the integer scores the converter writes for Tekken. The template fixture includes
+GLM-4, Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS; scalar dictionary keys retain their Python types,
+including Seed-OSS's integer thinking-budget lookup. The reference tool disables the unused generation cache
+for its single teacher-forced pass.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the

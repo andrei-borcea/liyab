@@ -12,7 +12,7 @@
 //     "Removed" with invert, which keeps only the matches);
 //   * NFC normalization of the text first (the Qwen tokenizers);
 //   * `ignore_merges`: a piece that is a vocabulary entry as a whole is that
-//     token, without merging (Llama 3, SmolLM3, Hunyuan, Tekken). OLMo's
+//     token, without merging (Llama 3, SmolLM3, GLM-4, Hunyuan, Tekken). OLMo's
 //     dbrx uses Llama 3's split with ordinary merge ranks; refact and exaone4
 //     use GPT-2's ByteLevel split. Seed-OSS normalizes NFC and separates
 //     punctuation from following newlines.

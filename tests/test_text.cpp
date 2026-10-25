@@ -451,6 +451,7 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(PreTokenizer::for_name("qwen2")->nfc() && PreTokenizer::for_name("qwen35")->nfc());
     CHECK(!PreTokenizer::for_name("llama3")->nfc() && PreTokenizer::for_name("llama3")->ignore_merges());
     CHECK(!PreTokenizer::for_name("smaug-bpe")->nfc() && PreTokenizer::for_name("smaug-bpe")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("glm4")->nfc() && PreTokenizer::for_name("glm4")->ignore_merges());
     CHECK(!PreTokenizer::for_name("dbrx")->nfc() && !PreTokenizer::for_name("dbrx")->ignore_merges());
     CHECK(!PreTokenizer::for_name("exaone4")->nfc() && !PreTokenizer::for_name("exaone4")->ignore_merges());
     CHECK(!PreTokenizer::for_name("refact")->nfc() && !PreTokenizer::for_name("refact")->ignore_merges());
@@ -467,6 +468,9 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
         PreTokenizer::for_name("llama3")->split(text, llama);
         PreTokenizer::for_name("smaug-bpe")->split(text, smaug);
         CHECK(llama == smaug);
+        std::vector<std::string_view> glm;
+        PreTokenizer::for_name("glm4")->split(text, glm);
+        CHECK(llama == glm);
         std::vector<std::string_view> dbrx;
         PreTokenizer::for_name("dbrx")->split(text, dbrx);
         CHECK(llama == dbrx);
@@ -549,6 +553,27 @@ TEST_CASE("Byte-level BPE: an unknown pre-tokenizer loads but cannot encode, nam
     CHECK(ids.status().message().find("qwen35") != std::string::npos);
 }
 
+TEST_CASE("Tokenizer loads the published converter's integer Tekken scores and rejects a short array") {
+    const BpeVocab v = bpe_vocab(false);
+    for (const bool short_scores : {false, true}) {
+        GgufWriter w;
+        w.string("tokenizer.ggml.model", "gpt2");
+        w.string("tokenizer.ggml.pre", "tekken");
+        w.strings("tokenizer.ggml.tokens", v.tokens);
+        w.ints("tokenizer.ggml.token_type", v.types);
+        w.strings("tokenizer.ggml.merges", v.merges);
+        w.ints("tokenizer.ggml.scores", std::vector<int32_t>(v.tokens.size() - (short_scores ? 1 : 0), -1000));
+        const std::string path = test::temp_dir() + "/liyab_integer_scores.gguf";
+        REQUIRE(w.write(path));
+        auto f = MmapLoader::open(path);
+        REQUIRE(f.has_value());
+        auto t = Tokenizer::load(**f);
+        CHECK(t.has_value() == !short_scores);
+        if (t) CHECK(t->encode("ab", false).has_value());
+        std::remove(path.c_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat templates
 // ---------------------------------------------------------------------------
@@ -589,7 +614,7 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
     size_t rendered = 0, refused = 0;
     for (const auto& [name, entry] : data->fields().entries) {
         auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
-        if (!tmpl) std::printf("  %s: %s\n", name.c_str(), tmpl.status().message().c_str());
+        if (!tmpl) std::printf("  %s: %s\n", name.as_string().c_str(), tmpl.status().message().c_str());
         REQUIRE(tmpl.has_value());
         const jinja::Value& special = *entry.fields().find("special");
         size_t index = 0;
@@ -597,14 +622,14 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
             const std::string request = c.fields().find("request")->to_json();
             auto out = tmpl->render_chat(request, special);
             if (const jinja::Value* want = c.fields().find("output")) {
-                if (!out) std::printf("  %s case %zu: %s\n", name.c_str(), index, out.status().message().c_str());
+                if (!out) std::printf("  %s case %zu: %s\n", name.as_string().c_str(), index, out.status().message().c_str());
                 else if (*out != want->as_string()) {
-                    std::printf("  %s case %zu differs %s\n", name.c_str(), index, first_difference(*out, want->as_string()).c_str());
+                    std::printf("  %s case %zu differs %s\n", name.as_string().c_str(), index, first_difference(*out, want->as_string()).c_str());
                 }
                 CHECK(out.has_value() && *out == want->as_string());
                 ++rendered;
             } else {
-                if (out) std::printf("  %s case %zu: rendered, but transformers refused it\n", name.c_str(), index);
+                if (out) std::printf("  %s case %zu: rendered, but transformers refused it\n", name.as_string().c_str(), index);
                 CHECK(!out.has_value());
                 ++refused;
             }
@@ -678,6 +703,11 @@ TEST_CASE("Chat templates: Jinja semantics transformers relies on") {
     // Python's printing and arithmetic.
     CHECK(render(R"({{ none }}|{{ true }}|{{ 1.0 }}|{{ [1, "a", none] }}|{{ {"a": 1} }}|{{ 1/2 }}|{{ -7//2 }}|{{ -7 % 3 }}|{{ 1e20 }}|{{ 1e-05 }})") ==
           "None|True|1.0|[1, 'a', None]|{'a': 1}|0.5|-4|2|1e+20|1e-05");
+    CHECK(render(R"({% set d = {10: 'ten', 2: 'two', '2': 'string', true: 'one', 1: 'updated', none: 'nil'} %}{{ d[2] }}|{{ d.get('2') }}|{{ 10 in d }}|{{ d[true] }}|{{ d[none] }}|{{ d.keys() }})") ==
+          "two|string|True|updated|nil|[10, 2, '2', True, None]");
+    CHECK(render(R"({% for k,v in {1024: 256, 0: 0, 512: 128}|dictsort %}{{ k }}:{{ v }};{% endfor %})") ==
+          "0:0;512:128;1024:256;");
+    CHECK(render(R"({{ {2: 'two', 1: 'one'}|tojson(sort_keys=true) }})") == "{\"1\": \"one\", \"2\": \"two\"}");
     CHECK(render(R"({{ "abc"[::-1] }}{{ [1,2,3][-1] }}{{ "a b  c".split() }}{{ " x ".strip() }}{{ "a,b,c".split(",", 1) }})") ==
           "cba3['a', 'b', 'c']x['a', 'b,c']");
     // transformers' tojson: keys in order, non-ASCII kept, ", " / ": " separators.

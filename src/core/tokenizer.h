@@ -21,6 +21,8 @@ class Tokenizer {
 public:
     enum class Kind { Spm, Gpt2 };
 
+    // Loads vocabulary metadata. Scores may be F32 or the converter's I32
+    // Tekken ranks; lengths and element types must match the vocabulary.
     static Result<Tokenizer> load(const MmapLoader& model);
 
     // Text → token ids, as the model's Hugging Face tokenizer encodes them.

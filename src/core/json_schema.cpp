@@ -67,7 +67,8 @@ public:
         }
         if (!s.is_object()) return fail(ErrorCode::InvalidArgument, path, "a schema must be an object or a boolean");
         const jinja::Object& o = s.fields();
-        for (const auto& [key, value] : o.entries) {
+        for (const auto& [key_value, value] : o.entries) {
+            const std::string& key = key_value.as_string();
             if (kUnsupported.contains(key)) return fail(ErrorCode::Unsupported, path, "keyword '" + key + "' is not supported");
             if (key == "uniqueItems" && value.truthy()) {
                 return fail(ErrorCode::Unsupported, path, "keyword 'uniqueItems' is not supported");
@@ -321,7 +322,8 @@ private:
     // Constraint keywords next to anyOf / oneOf / allOf / $ref are refused
     // (they would need an intersection of schemas).
     Status no_siblings(const jinja::Object& o, std::string_view keyword, const std::string& path) const {
-        for (const auto& [key, value] : o.entries) {
+        for (const auto& [key_value, value] : o.entries) {
+            const std::string& key = key_value.as_string();
             if (key == keyword || key == "nullable" || kAnnotations.contains(key)) continue;
             if (key == "type" && keyword != "$ref") continue;  // checked per branch below
             return fail(ErrorCode::Unsupported, path, "'" + key + "' next to '" + std::string(keyword) + "' is not supported");
@@ -470,7 +472,8 @@ public:
     Result<Node> raw_string(const Value& s, const std::string& path) {
         if (!s.is_object()) return fail(ErrorCode::InvalidArgument, path, "%string needs a schema object");
         const jinja::Object& o = s.fields();
-        for (const auto& [key, value] : o.entries) {
+        for (const auto& [key_value, value] : o.entries) {
+            const std::string& key = key_value.as_string();
             if (kUnsupported.contains(key)) return fail(ErrorCode::Unsupported, path, "keyword '" + key + "' is not supported");
         }
         auto literal_of = [&](const Value& v) -> Result<Node> {
@@ -619,7 +622,8 @@ private:
         };
         std::vector<Member> list;
         if (props != nullptr) {
-            for (const auto& [name, schema] : props->fields().entries) {
+            for (const auto& [name_value, schema] : props->fields().entries) {
+                const std::string& name = name_value.as_string();
                 auto n = compile(schema, path + "/properties/" + name);
                 if (!n) return n;
                 const bool req = std::find(required.begin(), required.end(), name) != required.end();

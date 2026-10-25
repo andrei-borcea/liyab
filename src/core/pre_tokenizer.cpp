@@ -77,7 +77,7 @@ struct Row {
 const std::array<Row, 13>& table() {
     static const std::array<Row, 13> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
-        {{"llama-bpe", "llama3", "smaug-bpe"}, {{kLlama3, true}}, false, true},
+        {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},

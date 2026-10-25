@@ -33,6 +33,8 @@ metadata is compared with the model run with the same RoPE parameters, e.g.
 "factor": 4.0, "original_max_position_embeddings": 32768}}'.
 --attn-implementation picks transformers' attention kernel: Gemma 2 needs
 "eager", the default kernel leaves its attention soft cap out.
+The teacher-forced pass disables the generation cache: every position is
+computed in one call, so no cache state is needed or reused.
 
 --lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
 a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
@@ -93,7 +95,7 @@ def main():
         model = PeftModel.from_pretrained(model, args.lora)
     model.eval()
     with torch.no_grad():
-        logits = model(torch.tensor([ids])).logits[0, :-1].float()
+        logits = model(torch.tensor([ids]), use_cache=False).logits[0, :-1].float()
     logp = torch.log_softmax(logits, dim=-1)
     top_logp, top_ids = torch.topk(logp, KTOP, dim=-1)
     target = logp[torch.arange(len(ids) - 1), torch.tensor(ids[1:])]
