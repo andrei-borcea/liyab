@@ -235,6 +235,14 @@ Per-layer tables remain in the file mapping; each pass materializes only its tok
 `gemma4` also plans absent value projections as values from the key projection, before normalization and RoPE,
 and binds optional `layer_output_scale`. Different local/global head geometry and different per-block FFN widths
 are explicitly rejected pending their generic implementation; the row does not assert support for such files.
+Its tokenizer applies the explicit `tokenizer.ggml.merges` ranks after SentencePiece space normalization, rather
+than selecting merges by vocabulary score.
+With uniform local/global geometry, the four-block Gemma 4 tiny check gives mean KL 0.00000, maximum KL 0.00006,
+top-1 agreement 99.22%, and 512 identical token IDs; the conformance, edge and chat tokenizer texts also match.
+For this check only, a copy of converter b11819 accepts transformers 5.19's homogeneous configuration serialization
+(`head_dim` without `global_head_dim` or explicit per-layer overrides) and records the tokenizer's actual BOS rule.
+The stock converter forces BOS where that tokenizer export has no BOS postprocessor. Liyab follows the GGUF's BOS
+flag; it does not override a published file's metadata. The shared converter is unchanged.
 
 `gemma-embedding` uses bidirectional attention. Pooling runs an entire input in one pass and shares no prefix
 because every hidden state depends on later tokens. Windowed blocks see half the stored window on each side.

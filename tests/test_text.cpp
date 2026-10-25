@@ -158,6 +158,11 @@ size_t codepoints(std::string_view text) {
 // ---------------------------------------------------------------------------
 class GgufWriter {
 public:
+    void boolean(const std::string& key, bool value) {
+        header(key, 7);
+        body_ += static_cast<char>(value);
+        ++count_;
+    }
     void string(const std::string& key, const std::string& value) {
         header(key, 8);
         str(value);
@@ -462,6 +467,29 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------
+TEST_CASE("SentencePiece-normalized BPE: explicit pair ranks override vocabulary scores") {
+    const std::string path = test::temp_dir() + "/liyab_ranked_spm_" + std::to_string(test::process_id()) + ".gguf";
+    GgufWriter writer;
+    writer.string("tokenizer.ggml.model", "gemma4");
+    writer.boolean("tokenizer.ggml.add_space_prefix", false);
+    writer.strings("tokenizer.ggml.tokens", {"a", "b", "c", "ab", "bc", "abc", "▁", "▁a", "<end>"});
+    writer.ints("tokenizer.ggml.token_type", {1, 1, 1, 1, 1, 1, 1, 1, 3});
+    writer.strings("tokenizer.ggml.merges", {"b c", "a b"});
+    REQUIRE(writer.write(path));
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    auto tokenizer = Tokenizer::load(**file);
+    REQUIRE(tokenizer.has_value());
+    auto abc = tokenizer->encode("abc", false);
+    REQUIRE(abc.has_value());
+    CHECK(*abc == (std::vector<int32_t>{0, 4}));
+    auto spaced = tokenizer->encode(" abc<end>ab", false);
+    REQUIRE(spaced.has_value());
+    CHECK(*spaced == (std::vector<int32_t>{6, 0, 4, 8, 3}));
+    CHECK(tokenizer->piece(6) == " ");
+    std::remove(path.c_str());
+}
+
 TEST_CASE("Byte-level BPE: merges by rank, NFC per family, ignore_merges, specials") {
     const BpeVocab v = bpe_vocab(false);
     const std::string G = byte_text(' ');

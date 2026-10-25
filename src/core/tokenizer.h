@@ -27,6 +27,7 @@ public:
     // `add_bos` adds no BOS to a text that starts with the BOS token's own
     // text (a rendered chat template wrote it).
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
+    // and SentencePiece-normalized BPE with explicit merge ranks ("gemma4")
     // and byte-level BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
     // tokenizer.ggml.pre returns Unsupported naming it and the supported
@@ -104,6 +105,7 @@ private:
     int32_t unk_ = -1;
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
+    bool ranked_spm_ = false;  // SentencePiece normalization, tokenizer.ggml.merges priorities rather than scores
 };
 
 }  // namespace liyab

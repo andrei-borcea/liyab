@@ -151,6 +151,11 @@ small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional
 input, mean pooling, the GGUF's `dense_2`/`dense_3` projections, then optional truncation and L2 normalization.
 Bidirectional models reject incremental continuation, tree drafts and rolling caches; quantized-key calibration
 also reads its complete text in one pass. Shared key-as-value projections include their projection bias.
+The `gemma4` tokenizer uses SentencePiece space normalization with the file's explicit BPE merge priorities,
+which can differ from vocabulary scores. Existing SentencePiece tokenizers keep their score-based merges.
+Gemma 4's four-block test with uniform head geometry matches all 512 token IDs, mean KL 0.00000 and top-1 99.22%;
+the full checkpoints still need the generic per-block geometry work. Converter compatibility details are in
+[model descriptions](docs/model-descriptions.md#gemma-residual-and-embedding-parts).
 
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
 iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,

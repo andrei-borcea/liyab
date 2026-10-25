@@ -96,6 +96,7 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     if (*kind == "llama" || *kind == "gemma4") tok.kind_ = Kind::Spm;
     else if (*kind == "gpt2") tok.kind_ = Kind::Gpt2;
     else return Status(ErrorCode::Unsupported, "tokenizer type '" + std::string(*kind) + "' is not supported");
+    tok.ranked_spm_ = *kind == "gemma4";
 
     const GgufValue* tokens = model.metadata("tokenizer.ggml.tokens");
     if (!tokens || tokens->type != GgufValue::Type::Array || tokens->array_type != GgufValue::Type::String ||
@@ -187,6 +188,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             tok.pre_error_ = scheme.status();
             LIYAB_LOG_WARN("%s: text cannot be encoded, token ids only", tok.pre_error_.message().c_str());
         }
+    }
+    if (tok.kind_ == Kind::Gpt2 || tok.ranked_spm_) {
         const GgufValue* merges = model.metadata("tokenizer.ggml.merges");
         if (merges == nullptr || merges->array_type != GgufValue::Type::String) {
             return Status(ErrorCode::InvalidModel, "BPE vocabulary without tokenizer.ggml.merges");
@@ -207,10 +210,12 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             if (left == tok.lookup_.end() || right == tok.lookup_.end() || merged == tok.lookup_.end()) continue;
             tok.merges_.emplace(merge_key(left->second, right->second), Merge{static_cast<int32_t>(r), merged->second});
         }
-        const auto& encoder = gpt2_byte_encoder();
-        for (size_t b = 0; b < 256; ++b) {
-            const auto it = tok.lookup_.find(encoder[b]);
-            tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
+        if (tok.kind_ == Kind::Gpt2) {
+            const auto& encoder = gpt2_byte_encoder();
+            for (size_t b = 0; b < 256; ++b) {
+                const auto it = tok.lookup_.find(encoder[b]);
+                tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
+            }
         }
     }
     tok.special_.assign(n, false);
@@ -392,7 +397,18 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
                                       symbols[static_cast<size_t>(left)].size + symbols[static_cast<size_t>(right)].size);
         const auto it = lookup_.find(merged);
         if (it == lookup_.end()) return;
-        queue.push({left, right, scores_[static_cast<size_t>(it->second)], merged.size()});
+        float priority = scores_[static_cast<size_t>(it->second)];
+        if (ranked_spm_) {
+            const auto& a = symbols[static_cast<size_t>(left)];
+            const auto& b = symbols[static_cast<size_t>(right)];
+            const auto ia = lookup_.find(std::string_view(a.text, a.size));
+            const auto ib = lookup_.find(std::string_view(b.text, b.size));
+            if (ia == lookup_.end() || ib == lookup_.end()) return;
+            const auto rule = merges_.find(merge_key(ia->second, ib->second));
+            if (rule == merges_.end()) return;
+            priority = -static_cast<float>(rule->second.rank);
+        }
+        queue.push({left, right, priority, merged.size()});
     };
     for (size_t i = 1; i < symbols.size(); ++i) try_add(static_cast<int32_t>(i - 1), static_cast<int32_t>(i));
 
