@@ -265,6 +265,22 @@ weights, since those tensors are not quantized.
 The group-routing golden cases are pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar; streamed and resident
 biased routing agree exactly on each platform.
 
+Pinned official DeepSeek-V2-Lite-Chat (`85864749cd611b4353ce1decdb286193298f64c7`) and DeepSeek-V3
+(`e815299b0bcbac849fa540c768ef21845365c9eb`) configurations produce the unchanged row:
+
+```cpp
+    {"deepseek2", RopeLayout::Adjacent, "ffn_norm", false},
+```
+
+At residual width 256, V2-Lite keeps its original 512-wide latent, single query projection and dense/MoE
+blocks; its F32 checkpoint gives 512 identical IDs, 511 positions, mean KL 0.00000 and top-1 99.80% with F16 KV.
+V3 keeps its original 1,536-wide query latent and 512-wide KV latent, three dense blocks and one MoE block with
+sixteen experts in eight groups, four selected groups and eight selected experts. It gives 485 identical IDs,
+484 positions, mean KL 0.00000 and top-1 99.38%. Both tokenizers match all three texts (617/1,013/241 IDs for V2,
+485/783/217 for V3). The b11819 converter needs a local exact-fingerprint registration for the older V2 tokenizer;
+the existing `deepseek-llm` pre-tokenizer then reproduces its IDs. No reference forward implementation is patched.
+These are random-weight checks, without a real V2-Lite regression result.
+
 ### Auxiliary index-key storage
 
 `KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. These channels are owned by

@@ -2193,6 +2193,14 @@ Group-limited routing has synthetic logit hashes pinned on ARM64 NEON dotprod, x
 softmax group maxima and sigmoid groups scored by their two best biased probabilities, both in place and
 streamed. The existing dense and latent-attention hashes are unchanged.
 
+Canonical tiny checkpoints from the pinned official configurations also exercise the current converter layout.
+DeepSeek-V2-Lite-Chat (`85864749cd611b4353ce1decdb286193298f64c7`) preserves its original latent widths and
+single query projection: 512 identical token IDs, 511 positions, mean KL 0.00000 and top-1 99.80% with F32
+weights and F16 KV. DeepSeek-V3 (`e815299b0bcbac849fa540c768ef21845365c9eb`) includes three dense blocks and
+one grouped MoE block, selecting four of eight groups before eight of sixteen experts: 485 identical IDs,
+484 positions, mean KL 0.00000 and top-1 99.38%. Both propose the existing `deepseek2` row and match all three
+tokenizer texts. These checks use random weights; the required real V2-Lite regression remains unmeasured.
+
 The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
 precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete
 top-k selection. Page copies, rollback, context images and the prefix store carry these channels with the main
