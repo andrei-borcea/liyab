@@ -9,6 +9,8 @@ chat template interpreter against, byte for byte.
 Each --model is NAME=TOKENIZER[:TEMPLATE]: a Hugging Face model id or local directory whose tokenizer supplies the
 special tokens (bos_token, eos_token...) and, unless a TEMPLATE file is given (e.g. one written by
 tools/gguf_vocab.py --template, as the GGUF carries it), the chat template. Only tokenizer files are read.
+An explicit TEMPLATE uses transformers' Jinja renderer directly, including when a tokenizer backend implements
+its chat protocol outside Jinja and ignores apply_chat_template's template argument.
 
 For every template the same conversations are rendered: system / user / assistant turns, a conversation without
 a system message, replies carrying reasoning (inline <think> blocks and reasoning_content), tools with tool calls
@@ -83,6 +85,8 @@ def main():
         template = open(template_file, encoding="utf-8").read() if template_file else tok.chat_template
         if isinstance(template, dict):
             template = template.get("default")
+        if not isinstance(template, str):
+            parser.error(f"{source} has no Jinja chat template; supply NAME=TOKENIZER:TEMPLATE")
         special = {k: getattr(tok, k) for k in ("bos_token", "eos_token", "unk_token", "pad_token")
                    if isinstance(getattr(tok, k, None), str)}
         cases = []
@@ -92,9 +96,16 @@ def main():
                 request["date_string"] = "26 Jul 2024"
             kwargs = {k: v for k, v in request.items() if k not in ("messages", "tools", "add_generation_prompt")}
             try:
-                text = tok.apply_chat_template(request["messages"], tools=request.get("tools"), tokenize=False,
-                                               add_generation_prompt=request.get("add_generation_prompt", False),
-                                               chat_template=template, **kwargs)
+                if template_file:
+                    from transformers.utils.chat_template_utils import render_jinja_template
+                    rendered, _ = render_jinja_template(
+                        conversations=[request["messages"]], tools=request.get("tools"), chat_template=template,
+                        add_generation_prompt=request.get("add_generation_prompt", False), **special, **kwargs)
+                    text = rendered[0]
+                else:
+                    text = tok.apply_chat_template(request["messages"], tools=request.get("tools"), tokenize=False,
+                                                   add_generation_prompt=request.get("add_generation_prompt", False),
+                                                   chat_template=template, **kwargs)
                 cases.append({"request": request, "output": text})
             except Exception as e:  # the template refuses the conversation: Liyab must refuse it too
                 cases.append({"request": request, "error": f"{type(e).__name__}: {e}"})

@@ -163,6 +163,9 @@ gate remains pending; dynamic RoPE growth beyond the original context remains a 
 The teacher-forced reference selects `AutoModelForImageTextToText` when a multimodal checkpoint has no
 `AutoModelForCausalLM` class. Its tokenizer IDs are passed directly to the model without images or an image
 processor, so this measures the text-only route of the authors' original implementation.
+`chat_template_reference.py --model NAME=TOKENIZER:TEMPLATE` renders that explicit file with transformers'
+Jinja renderer. This also covers Mistral's backend, whose native chat formatter ignores a Jinja template
+argument. InternLM2 and Ministral 3 each have 14 new fixtures, all byte-identical in the engine.
 
 ## The conformance gate
 
