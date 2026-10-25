@@ -348,7 +348,7 @@ groups only after both repeated keys and values agree bit for bit, then matches 
 An observed GELU function's mode is authoritative when its input and output link exactly to the FFN projections;
 small activations can otherwise make erf and tanh approximations indistinguishable at the trace's tolerance.
 The xIELU path is the ungated FFN described above; files requesting a gated xIELU FFN are refused explicitly.
-Synthetic F16 GPT-2, Falcon, BLOOM and Apertus models compare CPU execution with GPU projections plus CPU
+Synthetic F16 GPT-2, Falcon, BLOOM, Apertus and biased latent-attention models compare CPU execution with GPU projections plus CPU
 operations through prefill, decode and rollback; available Metal/Vulkan backends use the existing operation routing.
 ReLU and ReLU² have NEON and runtime-dispatched AVX2 kernels with scalar tails, for ungated and gated FFNs.
 Comparison/select retains the scalar signed-zero and NaN behavior. Their arithmetic order stays unchanged;
@@ -358,3 +358,47 @@ gated projections on every KV type.
 The reference trace reduces FFN widths and expert counts in typed child configurations too. Original residual
 and head dimensions remain intact for matching file geometry; nested DBRX FFNs no longer allocate the full
 expert widths while describing an architecture without its weights.
+Learned position embeddings combined with an embedding norm are refused because their relative order is not
+established; either a scale or a bias tensor establishes the norm's presence, including bias-only LayerNorm.
+The optional `attn_output.bias` is bound for ordinary and latent attention alike. It is added after the output
+projection in both absorbed and expanded latent forms, before any post-mixer norm or residual add.
+
+### Classic conformance
+
+F32 checkpoints with reduced dimensions and random weights exercise the real transformers implementations,
+using F16 KV and the same 512-token conformance text. Every row below has identical token IDs on all three
+tokenizer texts and an exactly matching derived registry row. Printed KL values are rounded to five decimals.
+
+| Architecture | Source configuration | Tiny mean KL | Tiny top-1 |
+| :--- | :--- | ---: | ---: |
+| `gpt2` | `openai-community/gpt2` | 0.00000 | 100.00% |
+| `gptneox` | `EleutherAI/pythia-410m-deduped` | 0.00000 | 100.00% |
+| `falcon` | `tiiuae/falcon-7b`, shared and separate branch norms | 0.00000 | 100.00% |
+| `bloom` | `bigscience/bloomz-560m`, four and three heads | 0.00000 | 100.00% |
+| `mpt` | `anas-awadalla/mpt-7b` | 0.00000 | 100.00% |
+| `starcoder` | `bigcode/tiny_starcoder_py` | 0.00000 | 100.00% |
+| `starcoder2` | `bigcode/starcoder2-3b`, explicit 32-position window | 0.00000 | 100.00% |
+| `phi2` | `microsoft/phi-2` | 0.00000 | 100.00% |
+| `stablelm` | `stabilityai/stablelm-2-1_6b`, with and without per-head Q/K norms | 0.00000 | 100.00% |
+| `orion` | official `OrionStarAI/Orion-14B-Base` code | 0.00000 | 100.00% |
+| `olmo` | `allenai/OLMo-1B-hf` | 0.00000 | 100.00% |
+| `command-r` | `mlx-community/c4ai-command-r-v01-4bit` configuration, with and without Q/K norms | 0.00000 | 100.00% |
+| `nemotron` | `nvidia/Minitron-4B-Base` | 0.00000 | 99.80% |
+| `apertus` | `swiss-ai/Apertus-8B-2509` | 0.00000 | 99.80% |
+| `arcee` | `arcee-ai/AFM-4.5B` | 0.00000 | 100.00% |
+| `dbrx` | `alpindale/dbrx-instruct`, native GPT-4 tokenizer export | 0.00000 | 100.00% |
+
+Real checkpoints measured so far use the full weights and pass the description tool's gate, including the
+registry row and all three tokenizer texts. These results do not stand in for pending family gates.
+
+| Checkpoint | GGUF | Mean KL | Top-1 |
+| :--- | :--- | ---: | ---: |
+| `openai-community/gpt2` | F16 | 0.00001 | 99.61% |
+| `EleutherAI/pythia-410m-deduped` | F16 | 0.00065 | 97.46% |
+| `bigscience/bloomz-560m` | F16 | 0.00000 | 99.80% |
+| `bigcode/tiny_starcoder_py` | F16 | 0.00000 | 99.80% |
+| `stabilityai/stablelm-2-1_6b` | Q8_0 | 0.00130 | 97.46% |
+
+OLMo-1B, Phi-2, StarCoder2-3B and Minitron-4B real gates remain pending. The larger configurations above have
+tiny conformance only. Command-R and Arcee chat templates are checked byte for byte against transformers;
+the other selected base tokenizers do not provide a chat template.

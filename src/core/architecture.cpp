@@ -452,7 +452,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (pos->cols() != c.n_embd || pos->rows() <= 0 || pos->rows() > (int64_t{1} << 24)) {
             return Status(ErrorCode::InvalidModel, "malformed position_embd.weight");
         }
-        if (f.tensor("token_embd_norm.weight") != nullptr) {
+        if (f.tensor("token_embd_norm.weight") != nullptr || f.tensor("token_embd_norm.bias") != nullptr) {
             // The embedding norm would have to follow the position embeddings,
             // which the engine adds after it (no supported model has both).
             return Status(ErrorCode::Unsupported, "an embedding norm with learned position embeddings is not supported");

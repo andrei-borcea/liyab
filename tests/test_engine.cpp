@@ -266,6 +266,7 @@ public:
                 }
             }
             const auto wo = weights(p + "attn_output.weight");
+            const auto bo = f_.tensor(p + "attn_output.bias") ? weights(p + "attn_output.bias") : std::vector<float>{};
             for (int t = 0; t < n; ++t) {
                 std::vector<float> att(static_cast<size_t>(heads_ * vd_), 0.0f);
                 for (int hh = 0; hh < heads_; ++hh) {
@@ -283,7 +284,8 @@ public:
                         for (int i = 0; i < vd_; ++i) att[hh * vd_ + i] += static_cast<float>(s[j] / sum * values[j][hh * vd_ + i]);
                     }
                 }
-                const auto o = matvec(wo, att);
+                auto o = matvec(wo, att);
+                for (size_t i = 0; i < bo.size(); ++i) o[i] += bo[i];
                 for (int i = 0; i < d_; ++i) x[t][i] += o[i];
             }
             const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
@@ -1222,11 +1224,20 @@ TEST_CASE("GPU backends (Metal / Vulkan) agree with the CPU backend") {
 
 TEST_CASE("Classic CPU operations compose with GPU projections through prefill, decode and rollback") {
     for (auto make : {make_metal_backend, make_vulkan_backend}) {
-        for (const std::string arch : {"gpt2", "falcon", "bloom", "apertus"}) {
+        for (const std::string arch : {"gpt2", "falcon", "bloom", "apertus", "deepseek2"}) {
             auto spec = test::classic_model_spec(arch);
+            if (arch == "deepseek2") {
+                spec = {};
+                spec.arch = arch;
+                spec.n_head_kv = 1;
+                spec.rope_dim = 32;
+                spec.mla_kv_rank = spec.mla_q_rank = 64;
+                spec.attn_output_bias = true;
+            }
             spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F16;
             TransformerOptions options;
             options.kv_type = KvCacheType::F16;
+            options.latent_form = LatentForm::Expanded;  // latent prefill expands; single-token decode absorbs
             const auto path = model_path("classic_gpu_" + arch, spec);
             auto reference = load_transformer(path, options), accelerated = load_transformer(path, options);
             REQUIRE(reference != nullptr && accelerated != nullptr);
@@ -1627,6 +1638,31 @@ TEST_CASE("describe_model refuses a gated xIELU variant instead of choosing anot
     CHECK(described.status().message().find("gated xIELU FFN in block 0") != std::string::npos);
 }
 
+TEST_CASE("describe_model refuses learned positions with a scale-only or bias-only embedding norm") {
+    for (const bool scale : {false, true}) {
+        test::GgufWriter w;
+        w.add_string("general.architecture", "gpt2");
+        w.add_u32("gpt2.block_count", 1);
+        w.add_u32("gpt2.embedding_length", 32);
+        w.add_u32("gpt2.feed_forward_length", 32);
+        w.add_u32("gpt2.attention.head_count", 1);
+        w.add_tensor("token_embd.weight", {32, 8}, DType::F32, std::vector<float>(256));
+        w.add_tensor("position_embd.weight", {32, 8}, DType::F32, std::vector<float>(256));
+        w.add_tensor(scale ? "token_embd_norm.weight" : "token_embd_norm.bias", {32}, DType::F32,
+                     std::vector<float>(32, 1.0f));
+        const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) +
+                                 (scale ? "_position_norm_scale.gguf" : "_position_norm_bias.gguf");
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(!described.has_value());
+        CHECK(described.status().code() == ErrorCode::Unsupported);
+        CHECK(described.status().message().find("embedding norm with learned position embeddings") != std::string::npos);
+        std::remove(path.c_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key scaling for quantized KV caches (core/key_scaling.h)
 // ---------------------------------------------------------------------------
@@ -1768,6 +1804,53 @@ TEST_CASE("Latent attention over cached latents matches an explicit per-head ref
             stepwise.insert(stepwise.end(), r->begin(), r->end());
         }
         CHECK(stepwise == batched);
+    }
+}
+
+TEST_CASE("Latent attention applies its output bias in both forms and on every KV type") {
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 33, 120, 7, 260};
+    for (const int32_t q_rank : {0, 64}) {
+        auto spec = latent_spec(q_rank);
+        spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        const auto plain_path = model_path("latent_bias_plain_q" + std::to_string(q_rank), spec);
+        spec.attn_output_bias = true;
+        const auto path = model_path("latent_bias_q" + std::to_string(q_rank), spec);
+        for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                TransformerOptions options;
+                options.kv_type = kv;
+                options.latent_form = form;
+                auto model = load_transformer(path, options), plain = load_transformer(plain_path, options);
+                REQUIRE(model && plain);
+                auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+                auto without_bias = plain->forward(tokens, Transformer::Logits::All, route, pool);
+                REQUIRE(got && without_bias);
+                const std::vector<float> saved(got->begin(), got->end());
+                CHECK(max_abs_diff(*without_bias, saved) > 1e-3);
+                const auto vocab = static_cast<size_t>(model->config().n_vocab);
+                if (kv == KvCacheType::F16) {
+                    const auto expected = LatentReference(model->file()).logits(tokens);
+                    for (size_t t = 0; t < tokens.size(); ++t) {
+                        CHECK(max_abs_diff(std::span(saved).subspan(t * vocab, vocab), expected[t]) < 2e-2);
+                    }
+                }
+                REQUIRE(model->truncate(7).is_ok());
+                auto replay = model->forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+                REQUIRE(replay.has_value());
+                CHECK(std::memcmp(replay->data(), saved.data() + 7 * vocab, replay->size_bytes()) == 0);
+                if (form == LatentForm::Absorbed) {
+                    model->reset();
+                    for (size_t t = 0; t < tokens.size(); ++t) {
+                        auto step = model->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::All, route, pool);
+                        REQUIRE(step.has_value());
+                        CHECK(std::memcmp(step->data(), saved.data() + t * vocab, step->size_bytes()) == 0);
+                    }
+                }
+            }
+        }
     }
 }
 

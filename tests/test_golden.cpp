@@ -333,6 +333,14 @@ std::vector<GoldenCase> cases() {
     s = {};
     s.projection_bias = s.fused_gate_up = true;
     add("dense-fused-bias", s);
+    s = {};
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = s.mla_q_rank = 64;
+    s.attn_output_bias = true;
+    add("latent-output-bias", s, absorbed);
+    add("latent-output-bias-expanded", s, expanded);
     return out;
 }
 

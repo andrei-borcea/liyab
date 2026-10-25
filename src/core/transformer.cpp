@@ -96,6 +96,16 @@ void layernorm(const float* x, const float* w, const float* b, float* out, int32
 // An optional per-element vector as a pointer (nullptr when absent).
 const float* opt(const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); }
 
+// Every projection adds its optional bias to each output row before the
+// activation, output scaling or residual add that consumes the projection.
+void add_bias(const std::vector<float>& bias, float* y, size_t n) {
+    if (bias.empty()) return;
+    for (size_t t = 0; t < n; ++t) {
+        float* row = y + t * bias.size();
+        for (size_t i = 0; i < bias.size(); ++i) row[i] += bias[i];
+    }
+}
+
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 // GELU with the tanh approximation (PyTorch's gelu(approximate="tanh")):
@@ -869,6 +879,9 @@ Status Transformer::bind_weights() {
                                                ? c.spec->ffn_norm : c.spec->attn_norm;
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".weight"), c.n_embd, norm_weights, L.attn_norm));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".bias"), c.n_embd, false, L.attn_norm_b));
+        if (plan.mixer == MixerKind::Attention) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
+        }
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -923,7 +936,6 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
             LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), c.n_head, L.q_norm));
             LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), c.n_head_kv, L.k_norm));
             if (c.spec->norm == NormKind::Layer) {
@@ -1997,12 +2009,7 @@ void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool) {
 void Transformer::finish_logits(int32_t rows) {
     const ModelConfig& c = config_;
     const auto vocab = static_cast<size_t>(c.n_vocab);
-    if (!output_bias_.empty()) {
-        for (size_t r = 0; r < static_cast<size_t>(rows); ++r) {
-            float* row = logits_.data() + r * vocab;
-            for (size_t i = 0; i < vocab; ++i) row[i] += output_bias_[i];
-        }
-    }
+    add_bias(output_bias_, logits_.data(), static_cast<size_t>(rows));
     if (c.logit_scale != 1.0f) {
         for (size_t i = 0; i < static_cast<size_t>(rows) * vocab; ++i) logits_[i] *= c.logit_scale;
     }
@@ -2407,10 +2414,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
     LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
-    const auto d = static_cast<size_t>(c.n_embd);
-    for (size_t t = 0; t < un && !L.bo.empty(); ++t) {
-        for (size_t i = 0; i < d; ++i) xb_[t * d + i] += L.bo[i];
-    }
+    add_bias(L.bo, xb_.data(), un);
     return Status::ok();
 }
 
@@ -2911,7 +2915,9 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     }
     form_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     latent_ms_ += form_ms;
-    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
+    add_bias(L.bo, xb_.data(), un);
+    return Status::ok();
 }
 
 // Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention):
@@ -3264,21 +3270,14 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
     };
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const auto ff = static_cast<size_t>(c.n_ff);
-    // Adds a projection's bias (when bound) to each of the n rows of `y`.
-    auto add_bias = [n](const std::vector<float>& bias, float* y) {
-        for (size_t t = 0; t < static_cast<size_t>(n) && !bias.empty(); ++t) {
-            float* row = y + t * bias.size();
-            for (size_t i = 0; i < bias.size(); ++i) row[i] += bias[i];
-        }
-    };
     if (c.blocks[static_cast<size_t>(layer)].ffn == FfnKind::Ungated) {
         // down(act(up x + b_up)) + b_down
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb_.data()));
-        add_bias(L.b_up, hb_.data());
+        add_bias(L.b_up, hb_.data(), static_cast<size_t>(n));
         ungated_activation(c.spec->ffn_activation, c.xielu.empty() ? nullptr : &c.xielu[static_cast<size_t>(layer)],
                            hb_.data(), rows);
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
-        add_bias(L.b_down, xb_.data());
+        add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
         return Status::ok();
     }
     if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
@@ -3293,7 +3292,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
             gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff);
         }
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
-        add_bias(L.b_down, xb_.data());
+        add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
         return Status::ok();
     }
     if (hook != nullptr) {
@@ -3304,11 +3303,11 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
     }
-    add_bias(L.b_gate, hb_.data());
-    add_bias(L.b_up, hb2_.data());
+    add_bias(L.b_gate, hb_.data(), static_cast<size_t>(n));
+    add_bias(L.b_up, hb2_.data(), static_cast<size_t>(n));
     gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows);
     LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
-    add_bias(L.b_down, xb_.data());
+    add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
     return Status::ok();
 }
 

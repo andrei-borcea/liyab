@@ -853,7 +853,8 @@ private:
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
     // or keys and values expanded per head from the cached latents
-    // (latent_expanded()); then attn_output.
+    // (latent_expanded()); then attn_output and its optional output bias,
+    // just as for ordinary attention.
     Status latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                   ThreadPool& pool, const uint8_t* head_mask);
     // Latent attention's projections of the n normalized rows in xb_: each

@@ -149,6 +149,7 @@ struct TinyModelSpec {
     bool norm_bias = false;           // LayerNorm offsets, including output_norm
     bool no_norm_weights = false;     // non-parametric LayerNorm (OLMo)
     bool projection_bias = false;     // Q/K/V/O, FFN and output biases
+    bool attn_output_bias = false;    // attention output only, also for latent attention
     bool shared_parallel_norm = false; // omit ffn_norm (one shared norm)
     bool embedding_norm = false;      // token_embd_norm, as in BLOOM
     bool learned_positions = false;   // context_length absolute position rows

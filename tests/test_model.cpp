@@ -448,6 +448,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                          random(rank * s.mla_v * heads, s.weight_scale));
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
+            bias(p + "attn_output.bias", d, s.projection_bias || s.attn_output_bias);
         } else {
             const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
             if (s.fused_qkv) {  // the same draws as separate matrices, stacked [q | k | v]
@@ -477,6 +478,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 }
                 bias(p + "attn_output.bias", d, true);
             }
+            if (s.attn_output_bias && !s.projection_bias) bias(p + "attn_output.bias", d, true);
             if (s.qk_norm) {
                 w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
                 std::vector<float> k_norm = norm_weights(hd);
