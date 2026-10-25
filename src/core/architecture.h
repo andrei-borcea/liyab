@@ -103,10 +103,9 @@ struct ArchSpec {
     // ones). 0: windowed blocks rotate like the others.
     float rope_base_swa = 0.0f;
     // The norms' formula. LayerNorm architectures read their epsilon from
-    // <arch>.attention.layer_norm_epsilon. With LayerNorm, a file without
-    // output_norm.weight has no norm weights at all (OLMo's non-parametric
-    // norms); otherwise every norm's weight is required and biases are bound
-    // where present.
+    // <arch>.attention.layer_norm_epsilon. Each LayerNorm independently
+    // binds its optional weight and bias (OLMo's non-parametric norms have
+    // neither); RMSNorm requires a weight.
     NormKind norm = NormKind::Rms;
     // Every block is parallel (BlockPlan::parallel) when the file has no
     // <arch>.use_parallel_residual: the FFN reads the block input normed

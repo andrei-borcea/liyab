@@ -459,6 +459,19 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(unknown.status().message().find(names) != std::string::npos);
 }
 
+TEST_CASE("Classic pre-tokenizers match their published tokenizer splits") {
+    const std::string text = "Hello world! test (cats) 123.\nNext";
+    for (const auto& [name, expected] : std::vector<std::pair<const char*, std::vector<std::string>>>{
+             {"bloom", {"Hello", " world", "!", " test", " (", "cats", ")", " 123", ".\n", "Next"}},
+             {"starcoder", {"Hello", " world", "!", " test", " (", "cats", ")", " ", "1", "2", "3", ".", "\n", "Next"}}}) {
+        auto pre = PreTokenizer::for_name(name);
+        REQUIRE(pre.has_value());
+        std::vector<std::string_view> pieces;
+        pre->split(text, pieces);
+        CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------

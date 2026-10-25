@@ -184,6 +184,9 @@ std::vector<MoveCase> move_cases() {
     s.mla_kv_rank = 64;
     s.k_norm_outlier = 60.0f;
     add("deepseek2-mla-keyscaled", s, {}, true);
+    add("bloom-alibi", test::classic_model_spec("bloom"));
+    add("mpt-alibi", test::classic_model_spec("mpt"));
+    add("command-r-headnorms", test::classic_model_spec("command-r"));
     return out;
 }
 

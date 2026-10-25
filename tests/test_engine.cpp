@@ -2672,6 +2672,37 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
     CHECK(!batched->truncate(11).is_ok());
 }
 
+TEST_CASE("Classic models: batching and rollback preserve every logit on every KV type") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens(70);
+    for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = 3 + static_cast<int32_t>((i * 37) % 280);
+    for (const std::string arch : {"gpt2", "gptneox", "falcon", "bloom", "mpt", "starcoder", "starcoder2", "phi2",
+                                  "stablelm", "orion", "olmo", "command-r", "nemotron", "apertus", "arcee", "dbrx"}) {
+        for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            const auto& path = model_path("classic_batch_" + arch, test::classic_model_spec(arch));
+            auto batch = load_transformer(path, options), step = load_transformer(path, options);
+            REQUIRE(batch && step);
+            auto all = batch->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(all.has_value());
+            const std::vector<float> saved(all->begin(), all->end());
+            const auto vocab = static_cast<size_t>(batch->config().n_vocab);
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                auto one = step->forward(std::span(tokens).subspan(i, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(one.has_value());
+                CHECK(std::memcmp(one->data(), saved.data() + i * vocab, vocab * sizeof(float)) == 0);
+            }
+            REQUIRE(batch->truncate(65).is_ok());
+            auto replay = batch->forward(std::span(tokens).subspan(65), Transformer::Logits::All, route, pool);
+            REQUIRE(replay.has_value());
+            CHECK(std::memcmp(replay->data(), saved.data() + 65 * vocab, replay->size_bytes()) == 0);
+        }
+    }
+}
+
 TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactly") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";
@@ -3277,8 +3308,9 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
 }
 
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
-    for (const char* arch : {"llama", "qwen35"}) {
-        test::TinyModelSpec spec;
+    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r"}) {
+        test::TinyModelSpec spec = std::string(arch) == "llama" || std::string(arch) == "qwen35"
+                                       ? test::TinyModelSpec{} : test::classic_model_spec(arch);
         spec.arch = arch;
         spec.n_layers = 4;
         if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
@@ -3304,15 +3336,24 @@ TEST_CASE("The prefix cache brings back a conversation another one replaced, exa
             b += i % 2 ? " world" : " hello world";
         }
         Engine& e = *cached.value();
-        const std::string reply_a = run(e, a);
-        run(e, b);  // another conversation: A's context goes to the prefix cache
+        const bool classic = std::string(arch) != "llama" && std::string(arch) != "qwen35";
+        std::string reply_a;
+        if (classic) {
+            // Keep an exact prompt prefix: random classic weights can emit
+            // EOS early or text that re-encodes differently at the boundary.
+            REQUIRE(e.prefill(a, true).is_ok());
+            REQUIRE(e.prefill(b, true).is_ok());
+        } else {
+            reply_a = run(e, a);
+            run(e, b);  // another conversation: A's context goes to the prefix cache
+        }
         const std::string next_a = a + reply_a + " hello";
         GenerationStats st{};
         const std::string out = run(e, next_a, &st);
         const auto a_tokens = static_cast<int32_t>(e.tokenize(a, true)->size());
         // A's prompt and its reply as generated, but the reply's last token,
         // which was sampled and never processed: nothing of A done again.
-        CHECK(st.cached_prefix_tokens == a_tokens + 5);
+        CHECK(st.cached_prefix_tokens == a_tokens + (classic ? 0 : 5));
         CHECK(out == run(*fresh.value(), next_a));
     }
 }
@@ -4166,7 +4207,10 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     hybrid.delta_net_interval = 2;
     const std::string dir = test::temp_dir();
     // ... also with latent attention: its cache pages hold key rows only, values inside them.
-    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64))}) {
+    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64)),
+                                   model_path("saved_gpt2", test::classic_model_spec("gpt2")),
+                                   model_path("saved_bloom", test::classic_model_spec("bloom")),
+                                   model_path("saved_command-r", test::classic_model_spec("command-r"))}) {
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);
@@ -5190,6 +5234,9 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
     };
     std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")},
                                {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)}};
+    for (const std::string arch : {"gpt2", "gptneox", "bloom", "olmo", "stablelm", "command-r", "apertus"}) {
+        cases.push_back({"tree_classic_" + arch, test::classic_model_spec(arch)});
+    }
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";
@@ -5213,7 +5260,7 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
     const Route route{cpu.get(), cpu.get(), cpu.get()};
     constexpr int32_t kPrefix = 40;  // past the windowed blocks' window of 16
     for (const Case& c : cases) {
-        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16}) {
+        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
             std::printf("  tree pass: %s %s\n", c.name.c_str(), type == KvCacheType::F16 ? "f16" : "q8_0");
             TransformerOptions options;
             options.context_length = 256;

@@ -21,6 +21,9 @@ namespace {
 // GPT-2 (Hugging Face ByteLevel with use_regex): also Phi-2.
 constexpr const char* kGpt2 =
     R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)";
+// BLOOM's tokenizer.json Split, with its nested character class flattened
+// to the equivalent excluded set (cross-checked against Oniguruma).
+constexpr const char* kBloom = R"( ?[^\s.,!?\x{2026}\x{3002}\x{FF0C}\x{3001}\x{0964}\x{06D4}\x{060C}()|]+)";
 // Llama 3: case-insensitive contractions, digits in groups of up to three.
 constexpr const char* kLlama3 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -71,8 +74,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
+const std::array<Row, 15>& table() {
+    static const std::array<Row, 15> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -88,6 +91,10 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"bloom"}, {{kBloom, true}}, false, false},
+        {{"starcoder", "refact"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
+        {{"gpt-neox", "mpt", "olmo"}, {{kGpt2, true}}, false, false},
+        {{"stablelm2"}, {{kQwen2, false}}, false, false},
     }};
     return rows;
 }

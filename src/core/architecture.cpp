@@ -132,6 +132,7 @@ constexpr ArchSpec kArchitectures[] = {
      .ffn_norm = "ffn_norm",
      .moe_norm_weights = false,
      .ffn_activation = FfnActivation::GeluTanh,
+     .swa_period = 1,
      .norm = NormKind::Layer},
     // Phi-2: parallel blocks with one shared norm, partial RoPE, a biased LM head.
     {.name = "phi2",

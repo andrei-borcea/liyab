@@ -142,6 +142,20 @@ struct TinyModelSpec {
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
 
+    // Classic blocks. Optional tensors use an independent generator, so
+    // enabling biases never changes the projection weights being compared.
+    bool ungated = false;             // ffn_up -> activation -> ffn_down
+    bool norm_bias = false;           // LayerNorm offsets, including output_norm
+    bool no_norm_weights = false;     // non-parametric LayerNorm (OLMo)
+    bool projection_bias = false;     // Q/K/V/O, FFN and output biases
+    bool shared_parallel_norm = false; // omit ffn_norm (one shared norm)
+    bool embedding_norm = false;      // token_embd_norm, as in BLOOM
+    bool learned_positions = false;   // context_length absolute position rows
+    bool per_head_qk_norm = false;    // distinct LayerNorm weight for each head
+    float logit_scale = 1.0f;
+    float clamp_kqv = 0.0f;
+    int32_t parallel_residual = -1;    // -1: row default, 0/1: metadata override
+
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their
     // own, so the other weights stay those of the same spec without them.
@@ -162,6 +176,10 @@ struct TinyModelSpec {
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
 };
+
+// A representative classic block layout, shared by the cache, sequence and
+// rollback tests. The architecture must be one of the classic registry rows.
+TinyModelSpec classic_model_spec(const std::string& arch);
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
 // lowercase letters, and every substring of "▁hello" / "▁world".

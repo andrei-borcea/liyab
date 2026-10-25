@@ -15,6 +15,11 @@
 #include "core/quant.h"
 #include "core/thread_pool.h"
 
+#if defined(LIYAB_USE_AVX2)
+#include <immintrin.h>
+#include "core/quant_x86.h"
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -35,6 +40,25 @@ void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
     for (int32_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
 }
 
+#if defined(LIYAB_USE_AVX2)
+// Keep the baseline binary runnable without AVX2, as in quant_x86.cpp.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma,f16c")))
+#endif
+int32_t layernorm_affine_avx2(const float* x, const float* w, const float* b, float* out, int32_t n,
+                              float mean, float scale) {
+    const __m256 m = _mm256_set1_ps(mean), s = _mm256_set1_ps(scale);
+    int32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), m), s);
+        if (w != nullptr) v = _mm256_mul_ps(v, _mm256_loadu_ps(w + i));
+        if (b != nullptr) v = _mm256_add_ps(v, _mm256_loadu_ps(b + i));
+        _mm256_storeu_ps(out + i, v);
+    }
+    return i;
+}
+#endif
+
 // LayerNorm: (x - mean) / sqrt(var + eps), times w and plus b where given.
 // Mean and variance are accumulated in double, as rms_scale() accumulates,
 // so the result does not depend on how a compiler orders a float sum.
@@ -43,13 +67,25 @@ void layernorm(const float* x, const float* w, const float* b, float* out, int32
     for (int32_t i = 0; i < n; ++i) sum += x[i];
     const double mean = sum / n;
     double ss = 0.0;
-    for (int32_t i = 0; i < n; ++i) {
-        const double dev = x[i] - mean;
+    for (int32_t j = 0; j < n; ++j) {
+        const double dev = x[j] - mean;
         ss += dev * dev;
     }
     const auto m = static_cast<float>(mean);
     const auto scale = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
-    for (int32_t i = 0; i < n; ++i) {
+    int32_t i = 0;
+#if defined(LIYAB_USE_AVX2)
+    if (quant::x86::avx2_enabled()) i = layernorm_affine_avx2(x, w, b, out, n, m, scale);
+#elif defined(__ARM_NEON)
+    const float32x4_t mv = vdupq_n_f32(m), sv = vdupq_n_f32(scale);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vmulq_f32(vsubq_f32(vld1q_f32(x + i), mv), sv);
+        if (w != nullptr) v = vmulq_f32(v, vld1q_f32(w + i));
+        if (b != nullptr) v = vaddq_f32(v, vld1q_f32(b + i));
+        vst1q_f32(out + i, v);
+    }
+#endif
+    for (; i < n; ++i) {
         float v = (x[i] - m) * scale;
         if (w != nullptr) v *= w[i];
         if (b != nullptr) v += b[i];
@@ -749,16 +785,15 @@ Status Transformer::bind_weights() {
     } else {
         output_ = token_embd_;  // tied embeddings
     }
-    // Norm weights: always with RMSNorm; with LayerNorm a file without a final
-    // norm weight has none anywhere (OLMo's non-parametric norms). Biases are
-    // bound where present.
-    const bool norm_weights = c.spec->norm == NormKind::Rms || f.tensor("output_norm.weight") != nullptr;
+    // RMSNorm requires weights. Each LayerNorm independently allows an
+    // optional scale and offset, including OLMo's non-parametric norms.
+    const bool norm_weights = c.spec->norm == NormKind::Rms;
     LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, norm_weights, output_norm_));
     LIYAB_RETURN_IF_ERROR(vec("output_norm.bias", c.n_embd, false, output_norm_b_));
     LIYAB_RETURN_IF_ERROR(vec("output.bias", c.n_vocab, false, output_bias_));
     LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.weight", c.n_embd, false, embd_norm_));
     LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.bias", c.n_embd, false, embd_norm_b_));
-    if (c.spec->norm == NormKind::Rms && embd_norm_.empty() != embd_norm_b_.empty()) {
+    if (c.spec->norm == NormKind::Rms && !embd_norm_b_.empty()) {
         return Status(ErrorCode::InvalidModel, "an RMS embedding norm with a bias");
     }
     if (c.n_positions > 0) position_embd_ = f.tensor("position_embd.weight");  // shape checked by describe_model()
@@ -767,7 +802,7 @@ Status Transformer::bind_weights() {
     auto qk_vec = [&](const std::string& name, int64_t heads, std::vector<float>& out) -> Status {
         const TensorView* t = f.tensor(name);
         if (t == nullptr) return Status::ok();
-        const bool per_head = t->ne[0] == c.head_dim && t->ne[1] == heads && t->ne[2] == 1 && heads > 1;
+        const bool per_head = t->n_dims == 2 && t->ne[0] == c.head_dim && t->ne[1] == heads && heads > 1;
         if (t->elements() != c.head_dim && !per_head) {
             return Status(ErrorCode::Unsupported, "tensor '" + name + "' is not a per-head norm of " +
                                                       std::to_string(c.head_dim) + " (norms over all heads together "
@@ -846,10 +881,8 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), c.n_head, L.q_norm));
             LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), c.n_head_kv, L.k_norm));
             if (c.spec->norm == NormKind::Layer) {
-                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.bias"), static_cast<int64_t>(L.q_norm.size()),
-                                          false, L.q_norm_b));
-                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.bias"), static_cast<int64_t>(L.k_norm.size()),
-                                          false, L.k_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), c.n_head, L.q_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), c.n_head_kv, L.k_norm_b));
             }
         } else {
             L.state_slot = state_slots++;
@@ -867,9 +900,6 @@ Status Transformer::bind_weights() {
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd,
                                   norm_weights && !plan.parallel, L.ffn_norm));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
-        if (L.ffn_norm.empty() && !L.ffn_norm_b.empty()) {
-            return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": an FFN norm bias without its weight");
-        }
         if (!c.spec->post_mixer_norm.empty()) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
                                       false, L.post_mixer_norm));
@@ -894,6 +924,12 @@ Status Transformer::bind_weights() {
             if (plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
                 LIYAB_RETURN_IF_ERROR(
                     matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{c.n_ff}, L.w[kUp]));
+                std::vector<float> bias;
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), 2 * int64_t{c.n_ff}, false, bias));
+                if (!bias.empty()) {
+                    L.b_gate.assign(bias.begin(), bias.begin() + c.n_ff);
+                    L.b_up.assign(bias.begin() + c.n_ff, bias.end());
+                }
             } else {
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
@@ -2035,12 +2071,12 @@ void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
     auto row = [hd](const std::vector<float>& v, size_t h) {
         return v.empty() ? nullptr : v.data() + (v.size() > hd ? h * hd : 0);
     };
-    if (q != nullptr && !L.q_norm.empty()) {
+    if (q != nullptr && (!L.q_norm.empty() || !L.q_norm_b.empty())) {
         for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
             norm_row(q + h * hd, row(L.q_norm, h), row(L.q_norm_b, h), q + h * hd, c.head_dim);
         }
     }
-    if (!L.k_norm.empty()) {
+    if (!L.k_norm.empty() || !L.k_norm_b.empty()) {
         for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
             norm_row(k + h * hd, row(L.k_norm, h), row(L.k_norm_b, h), k + h * hd, c.head_dim);
         }
@@ -3203,7 +3239,9 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         hb2_.resize(2 * rows);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kUp], xb_.data(), hb2_.data(), n));
         for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
-            const float* gate_up = hb2_.data() + t * 2 * ff;
+            float* gate_up = hb2_.data() + t * 2 * ff;
+            for (size_t i = 0; i < L.b_gate.size(); ++i) gate_up[i] += L.b_gate[i];
+            for (size_t i = 0; i < L.b_up.size(); ++i) gate_up[ff + i] += L.b_up[i];
             gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff);
         }
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
@@ -3643,7 +3681,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     if (plan.parallel) {
         par_in_.resize(un * d);
         for (size_t t = 0; t < un; ++t) {
-            if (L.ffn_norm.empty()) {
+            if (L.ffn_norm.empty() && L.ffn_norm_b.empty()) {
                 std::copy_n(xb_.data() + t * d, d, par_in_.data() + t * d);
             } else {
                 norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), par_in_.data() + t * d, c.n_embd);

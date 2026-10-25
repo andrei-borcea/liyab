@@ -241,3 +241,35 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
+
+## Classic transformer parts
+
+The generic planner also recognizes `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`,
+`stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee` and `dbrx`. Registry presence alone is not
+conformance evidence: the family gates and their measured results must accompany a support claim.
+
+`ArchSpec::norm` selects LayerNorm or RMSNorm. Each LayerNorm binds its own optional weight and bias; omitting
+both implements OLMo 1's non-parametric normalization. The converter stores Nemotron LayerNorm1P weights as
+`1 + w`, so the runtime applies ordinary LayerNorm. Norm arithmetic uses double precision for mean and variance,
+then a scalar, NEON or AVX2 affine step. The AVX2 path uses the existing CPU feature dispatch.
+
+A dense block without a gate and with an `n_ff`-row up projection plans an ungated FFN: `down(act(up(x) + b)) + b`.
+Supported activations include exact GELU (erf), GELU (tanh), ReLU, ReLU squared and Apertus xIELU. The latter reads
+its per-block parameters from the four `xielu.*` GGUF arrays. Split and fused gate/up projections apply their
+optional biases after projection; attention output and LM-head biases follow the same rule. `logit_scale`
+multiplies biased logits before any final soft-cap.
+
+Parallel residual blocks preserve the normalized block input for the FFN while attention runs. The FFN uses its
+own norm when present, otherwise the attention norm's input. Learned position rows are added at each sequence's
+absolute positions and limit the addressable context. Their residuals cannot be moved for segment reuse; the
+engine refuses that operation. Prefix reuse and context save/restore keep the original positions.
+
+ALiBi adds each query head's slope times the logical key-to-query distance before softmax, independently of page
+slots and speculative tree row slots. Q/K/V clamping follows projection and bias, before normalization and RoPE.
+Per-head Q/K norms accept shared head weights or one row per head. StarCoder2's declared sliding window uses the
+existing per-block paged-cache layout.
+
+These elementwise operations execute on the CPU with Metal/Vulkan projection routing unchanged. The CPU is the
+reference; the new norms have scalar, NEON and x86 AVX2 affine paths. Synthetic golden cases cover every added
+part; batching, rollback, speculative trees, sequences, prefix caching, context files and segment reuse exercise
+how those parts compose with existing caches.

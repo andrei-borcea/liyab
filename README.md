@@ -108,6 +108,7 @@ These rules decide what goes into the code:
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Classic transformer parts: LayerNorm, optional projection biases, ungated GELU/ReLU²/xIELU FFNs, parallel residuals, learned positions, ALiBi, Q/K/V clamping and output scaling | Implemented on CPU; family conformance is tracked in [model descriptions](docs/model-descriptions.md#classic-transformer-parts) |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -484,6 +485,7 @@ What the port does differently from the POSIX platforms:
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
     asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan, Tekken). Rows:
     `default` / `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`,
+    `bloom`, `starcoder`, `gpt-neox`, `mpt`,
     `hunyuan`, `hunyuan-dense` / `deepseek-v3`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
     digit alone, then GPT-2's split), `tekken` (Mistral-Nemo) and `youtu` (Youtu-LLM: Hangul, CJK punctuation,
     Bopomofo and Han/kana runs first; its `\p{Hangul}` is written out as the script's code-point ranges, since the
