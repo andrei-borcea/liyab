@@ -2228,7 +2228,8 @@ derived latent-epsilon row reaches mean KL 0.00000 and top-1 100%; that changes 
 so it is not the branch's support gate. The published layout needs these facts represented unambiguously.
 
 The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
-precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete
+precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows; each key row's byte size includes both encodings.
+Rounding an index score can change its discrete
 top-k selection. Page copies, rollback, context images and the prefix store carry these channels with the main
 row; key scaling leaves them unchanged. Their bytes count toward the memory budget and sequence context size.
 Mixed-format images use the store's raw-image fallback, including when lossy prefix compression is requested,

@@ -308,7 +308,8 @@ public:
     [[nodiscard]] size_t image_value_offset(int32_t slots, int32_t layer, int32_t slot, int32_t kv_head) const noexcept;
     // Whether `layer` keeps every position (it is in rows images).
     [[nodiscard]] bool keeps_every_position(int32_t layer) const noexcept;
-    // Bytes of one cached row: head_dim + auxiliary_dim values in the cache's format.
+    // Bytes of one cached key row: head_dim values in the main cache's
+    // format, followed by auxiliary_dim F32 channels.
     [[nodiscard]] size_t head_row_bytes() const noexcept { return row_bytes_; }
 
     // --- Window pages (saved contexts; the engine's KV store keeps windowed rows page by page) --

@@ -291,7 +291,8 @@ streaming slot, and count toward the expert-cache planning margin.
 
 ### Auxiliary index-key storage
 
-`KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. These channels are owned by
+`KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. `head_row_bytes()` includes
+the main row in its cache format and those F32 channels. These channels are owned by
 the paged cache and copied, saved and released with the main row. They are not attention values and do not take
 part in per-channel main-key scaling. `KvCache::bytes_per_token()` and the image layout include their bytes;
 the layout fingerprint separates these contexts from ordinary KV images. Mixed-format rows remain raw in the
