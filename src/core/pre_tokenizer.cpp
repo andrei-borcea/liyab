@@ -30,6 +30,9 @@ constexpr const char* kQwen2 =
 // Qwen3.5 / Qwen3.6: combining marks belong to words.
 constexpr const char* kQwen35 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Ling 2.0: single digits, possessive word/symbol prefixes and one newline per match.
+constexpr const char* kBailingMoe2 =
+    R"('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)";
 // GPT-4o (o200k; Phi-4-mini): upper/lower case aware words with contractions attached.
 constexpr const char* kGpt4o =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -71,8 +74,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
+const std::array<Row, 12>& table() {
+    static const std::array<Row, 12> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         // GLM-4/5 use the same Split expression and ignore_merges contract.
         {{"llama-bpe", "llama3", "glm4"}, {{kLlama3, true}}, false, true},
@@ -91,6 +94,7 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"bailingmoe2"}, {{kBailingMoe2, true}}, true, false},
     }};
     return rows;
 }

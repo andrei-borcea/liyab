@@ -44,6 +44,8 @@ arm64-neon-dotprod qwen3moe-grouped-sigmoid-bias-streamed 6e8e32732c024191
 arm64-neon-dotprod qwen3moe-grouped-softmax c49d47814684b380
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
+arm64-neon-dotprod bailingmoe2-fused-qk-norm-grouped bef3ffe709eb2f95
+arm64-neon-dotprod bailingmoe2-fused-qk-norm-grouped-streamed bef3ffe709eb2f95
 x86_64-avx2 deepseek2-mla 191166464f5adf1d
 x86_64-avx2 deepseek2-mla-expanded 38ed3ca545816896
 x86_64-avx2 deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c
@@ -88,6 +90,8 @@ x86_64-avx2 qwen3moe-grouped-sigmoid-bias-streamed 6e8e32732c024191
 x86_64-avx2 qwen3moe-grouped-softmax c62a98886a4aad8c
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-avx2 bailingmoe2-fused-qk-norm-grouped bef3ffe709eb2f95
+x86_64-avx2 bailingmoe2-fused-qk-norm-grouped-streamed bef3ffe709eb2f95
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
 x86_64-scalar deepseek2-mla-expanded 3ed966c7eb7877ca
 x86_64-scalar deepseek2-mla-expanded-f16kv e2777a2c65681852
@@ -132,3 +136,5 @@ x86_64-scalar qwen3moe-grouped-sigmoid-bias-streamed d2cc081964b7e0db
 x86_64-scalar qwen3moe-grouped-softmax fc340deb1480b6fb
 x86_64-scalar qwen3moe-sigmoid-bias-shared 029803af7cad79e0
 x86_64-scalar qwen3moe-streamed abc771ef46e2fa79
+x86_64-scalar bailingmoe2-fused-qk-norm-grouped 26a0d0f5e868dcb9
+x86_64-scalar bailingmoe2-fused-qk-norm-grouped-streamed 26a0d0f5e868dcb9

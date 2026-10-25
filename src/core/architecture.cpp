@@ -71,6 +71,7 @@ constexpr ArchSpec kArchitectures[] = {
     {"deepseek32", RopeLayout::Adjacent, "ffn_norm", true},
     {.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
      .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f},
+    {"bailingmoe2", RopeLayout::Halves, "ffn_norm", true},
 };
 
 }  // namespace

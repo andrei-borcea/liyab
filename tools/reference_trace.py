@@ -5,15 +5,17 @@ A reduced copy of the model is built from its configuration with random weights:
 every kind of block the configuration lists), a small vocabulary, narrow FFNs and few experts. The widths of the
 residual stream and of the attention heads are kept, so every scale, base and multiplier is the model's own. One
 pass over a short sequence is recorded: what every module receives and returns, and, through an attention function
-registered with transformers, the queries, keys and values each attention gets with its arguments (scale, window,
-soft-cap). The facts the engine needs are then established by recomputing them, never from class or module names:
+registered with transformers (or an observed direct PyTorch SDPA call), the queries, keys and values each attention
+gets with its arguments (scale, window, soft-cap). The facts the engine needs are then established by recomputing
+them, never from class or module names:
 
 * the order of norms, token mixer and FFN in a block and how the residual adds combine them;
 * each norm's formula (RMSNorm multiplying by w or by 1 + w, LayerNorm);
 * how keys and queries are rotated (which dimensions are paired, how many, with which frequencies), whether their
   norms come before or after the rotation, and over how many dimensions those norms reach;
 * the attention scale, window and soft-cap, and whether the attention output is gated;
-* the FFN's form and activation, and a mixture of experts' routing (probabilities, selection bias, top-k,
+* the FFN's form and activation, and a mixture of experts' routing (fused or individually observed experts,
+  probabilities, selection bias, top-k,
   renormalization, scale, shared expert and its gate);
 * how the embeddings enter the first block and how the logits leave the last one.
 
@@ -31,6 +33,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 SEQ = 13  # trace length: prime, so it is never mistaken for a head count when shapes are matched
 VOCAB = 512  # reduced vocabulary (the trace's token ids are below it)
@@ -369,8 +372,20 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     _register_attention()
     reduced._attn_implementation = ATTN_IMPL
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
-                                             attn_implementation=ATTN_IMPL)
+    direct_sdpa = False
+    try:
+        model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                 attn_implementation=ATTN_IMPL)
+    except KeyError as error:
+        if error.args != (ATTN_IMPL,):
+            raise
+        # Older remote implementations dispatch through a local table instead
+        # of AttentionInterface. Observe their standard PyTorch operation.
+        direct_sdpa = True
+        reduced._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                 attn_implementation="sdpa")
     model.eval()
     _randomize(model)
     layers_path, layers = _decoder_layers(model, keep)
@@ -378,22 +393,62 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     RECORDER.calls.clear()
     RECORDER.attn.clear()
     handles = []
+    stack = []
     for path, mod in model.named_modules():
         if mod is model:
             continue
+
+        if direct_sdpa:
+            handles.append(mod.register_forward_pre_hook(lambda module, args: stack.append(module)))
 
         def hook(module, args, kwargs, output, path=path):
             RECORDER.calls.append(Call(RECORDER.next(), path, module,
                                        [a.detach() if torch.is_tensor(a) else a for a in args],
                                        {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
                                        _tensors(output)))
+            if direct_sdpa:
+                stack.pop()
 
         handles.append(mod.register_forward_hook(hook, with_kwargs=True))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
-    with torch.no_grad():
-        out = model(input_ids=ids, use_cache=False)
-    for h in handles:
-        h.remove()
+    original_sdpa = F.scaled_dot_product_attention
+
+    def traced_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
+        # Remote GQA implementations often repeat KV before calling SDPA.
+        # Collapse only exactly repeated heads, preserving the tensors the
+        # projections and per-head norms actually produced.
+        kv_heads = getattr(reduced, "num_key_value_heads", key.shape[1])
+        k, v = key, value
+        if key.shape[1] > kv_heads and key.shape[1] % kv_heads == 0:
+            groups = key.shape[1] // kv_heads
+            if torch.equal(key, key[:, ::groups].repeat_interleave(groups, dim=1)) and torch.equal(
+                    value, value[:, ::groups].repeat_interleave(groups, dim=1)):
+                k, v = key[:, ::groups], value[:, ::groups]
+        causal = is_causal
+        if attn_mask is not None:
+            expected = torch.ones_like(attn_mask, dtype=torch.bool).tril()
+            visible = attn_mask if attn_mask.dtype == torch.bool else attn_mask == 0
+            if not torch.equal(visible, expected) or (attn_mask.dtype != torch.bool and
+                    not torch.all(attn_mask[~visible] < -1e20)):
+                raise ValueError("direct SDPA trace needs a full causal mask; its mask semantics are unknown")
+            causal = True
+        rec = AttnCall(RECORDER.next(), stack[-1], query.detach().clone(), k.detach().clone(),
+                       v.detach().clone(), {"scaling": kwargs.get("scale", query.shape[-1] ** -0.5),
+                                            "is_causal": causal, "dropout": dropout_p})
+        RECORDER.attn.append(rec)
+        result = original_sdpa(query, key, value, attn_mask, dropout_p, is_causal, **kwargs)
+        rec.output = result.transpose(1, 2).detach().clone()
+        return result
+
+    try:
+        if direct_sdpa:
+            F.scaled_dot_product_attention = traced_sdpa
+        with torch.no_grad():
+            out = model(input_ids=ids, use_cache=False)
+    finally:
+        F.scaled_dot_product_attention = original_sdpa
+        for h in handles:
+            h.remove()
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
     return Trace(text, reduced, n, keep, model, layers_path, layers, list(RECORDER.calls), list(RECORDER.attn), ids,
                  logits, type(model).__name__)
@@ -762,8 +817,55 @@ def analyze_moe(ffn_call, block_calls, cfg):
             experts_call = (c, ints[0], floats[0])
             break
     if experts_call is None:
-        f["unknown"].append("no experts call with routed indices and weights was observed")
-        return f
+        # Older modules return routing from a gate and call ModuleList
+        # experts individually. Reconstruct their weighted sum from observed
+        # inputs/outputs, checking the router's token ordering for every call.
+        for gate in inside:
+            indices = next((a for a in gate.outputs if not a.is_floating_point() and a.dim() == 2
+                            and a.shape[0] == n_tokens), None)
+            weights = next((a for a in gate.outputs if a.is_floating_point() and indices is not None
+                            and a.shape == indices.shape), None)
+            if indices is None or weights is None:
+                continue
+            count = max([getattr(cfg, key) for key in EXPERT_COUNT_KEYS
+                         if isinstance(getattr(cfg, key, None), int)] or [0])
+            for name, module in ffn_call.module.named_children():
+                if not isinstance(module, nn.ModuleList) or len(module) != count:
+                    continue
+                order = indices.flatten().argsort()
+                flat_ids = indices.flatten()[order]
+                x = ffn_call.input.reshape(n_tokens, -1)
+                flat_out = torch.empty(indices.numel(), x.shape[-1], dtype=x.dtype)
+                activation = set()
+                observed = []
+                for expert, item in enumerate(module):
+                    slots = order[flat_ids == expert]
+                    if slots.numel() == 0:
+                        continue
+                    calls = [call for call in inside if call.module is item]
+                    if len(calls) != 1 or not close(calls[0].input, x[slots // indices.shape[1]]):
+                        break
+                    call = calls[0]
+                    facts = analyze_dense_ffn(call, block_calls)
+                    if facts.get("unknown") or not facts.get("gated"):
+                        break
+                    activation.add(facts["activation"])
+                    flat_out[slots] = call.output
+                    observed.append(call)
+                else:
+                    if len(activation) != 1 or not observed:
+                        continue
+                    total = (flat_out.reshape(*indices.shape, -1) * weights.unsqueeze(-1)).sum(1)
+                    aggregate = Call(max(c.order for c in observed), ffn_call.path + "." + name, module,
+                                     [x, indices, weights], {}, [total.reshape(ffn_call.output.shape)])
+                    experts_call = (aggregate, indices, weights)
+                    f["expert_activation"] = activation.pop()
+                    break
+            if experts_call is not None:
+                break
+        if experts_call is None:
+            f["unknown"].append("no experts call or verified per-expert routed outputs were observed")
+            return f
     ecall, idx, wts = experts_call
     k = idx.shape[1]
     # The expert count: the leading dimension of the experts' 3-D weights, else the configuration's.
@@ -863,7 +965,7 @@ def analyze_moe(ffn_call, block_calls, cfg):
     # module holds them in that layout (transformers' fused experts).
     params = dict(ecall.module.named_parameters(recurse=False))
     gu, dn = params.get("gate_up_proj"), params.get("down_proj")
-    f["expert_activation"] = None
+    f.setdefault("expert_activation", None)
     if gu is not None and dn is not None and gu.dim() == 3 and dn.dim() == 3:
         x = ecall.input.reshape(n_tokens, -1).float()
         for name, act in ACTIVATIONS.items():
@@ -1048,7 +1150,7 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)
-                 for a in list(c.args) + list(c.kwargs.values()) if torch.is_tensor(a))
+                 for a in list(c.args) + list(c.kwargs.values()) + c.outputs if torch.is_tensor(a))
     b["ffn"] = analyze_moe(ffn, block_calls, trace.reduced) if is_moe else analyze_dense_ffn(ffn, block_calls)
     return b
 

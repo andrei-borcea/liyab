@@ -286,6 +286,19 @@ std::vector<GoldenCase> cases() {
     s.index_full = {true, false};
     s.mla_v = 128;  // output heads wider than the cached head
     add("glm-dsa-shared-indexed", s);
+    s = {};
+    s.arch = "bailingmoe2";
+    s.fused_qkv = true;
+    s.qk_norm = true;
+    s.rope_dim = 32;
+    s.n_expert = 16;
+    s.n_expert_used = 4;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    s.expert_bias = true;
+    s.sigmoid_gating = true;
+    add("bailingmoe2-fused-qk-norm-grouped", s);
+    add("bailingmoe2-fused-qk-norm-grouped-streamed", s, streamed);
     return out;
 }
 

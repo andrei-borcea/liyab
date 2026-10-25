@@ -35,7 +35,9 @@ block the configuration lists), the vocabulary is 512 tokens, the FFNs 64 wide a
 random, with norm weights drawn away from 0 and 1 so that a norm multiplying by `w` and one multiplying by `1 + w`
 differ. One pass over 13 tokens is recorded: every module's inputs and outputs (forward hooks), and the queries,
 keys and values each attention receives with its arguments, through an attention function registered with
-transformers. Each fact is then recomputed from the records, never read from a class or module name:
+transformers. Older remote implementations dispatching directly through PyTorch SDPA are observed at that
+operation instead; only a verified full causal mask is accepted there. Each fact is then recomputed from the
+records, never read from a class or module name:
 
 | Fact | How it is established |
 | :--- | :--- |
@@ -227,13 +229,15 @@ KV projection's rows with the checkpoint before proposing the RoPE pairing. Nume
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
-  leaves the attention facts unknown.
+  leaves the attention facts unknown unless its direct PyTorch SDPA operation can be observed and its causal mask
+  verified.
 * **A prefix of the blocks is traced.** The shortest prefix holding every kind of block the configuration lists per
   block (`layer_types` and similar lists, the first MoE block, a full-attention interval), at least 2. Which blocks
   attend through a window comes from `layer_types` when the configuration has it; otherwise every traced block
   must agree, and the tool says it assumed the rest do too.
-* **Experts' weights.** The experts' activation is recomputed from transformers' fused 3-D expert weights; other
-  layouts leave it to the dense blocks' activation.
+* **Experts' weights.** The experts' activation is recomputed from transformers' fused 3-D expert weights or
+  individually observed ModuleList experts whose routed inputs and weighted sum can be verified; unknown layouts
+  remain unknown.
 * **What the tool knows of the engine.** Row fields come from `architecture.h` and need a rule each in the tool (it
   refuses rows while one has none). Features the engine takes from the file are recognized by the metadata keys
   `describe_model()` reads: an attention scale (`attention.scale`), soft caps (`attn_logit_softcapping`,
@@ -300,6 +304,23 @@ proposes exactly `{"deepseek32", RopeLayout::Adjacent, "ffn_norm", true}`. The c
 be removed in a local copy because this official tokenizer explicitly sets `add_bos_token=false`; that rule
 is preserved in both the reference and GGUF. This revision supplies no Jinja chat template. Top-k 256 diagnostics
 at widths 256 and 512 give top-1 98.76% and remain below the required gate.
+
+GLM-5.2 at revision `cf457fa734ab149ffef225f80893eb38c6ff5cdc` proposes the same `glm-dsa` row. Its four-block
+tiny checkpoint keeps the original latent/index widths and top-k 256, with three full indexers and a shared
+fourth block: 494 identical IDs, 493 positions, mean KL 0.00000, maximum 0.00008, top-1 99.80%. Its own template
+passes 14 reference renders and its tokenizer matches the three tokenizer texts.
+
+Ling-mini-2.0 (`inclusionAI/Ling-mini-2.0`, revision `a810f6416bc4e1e29c9d7f271dd2fa7e56e71eab`) proposes
+`{"bailingmoe2", RopeLayout::Halves, "ffn_norm", true}`. Individual ModuleList expert calls are verified against
+the router's token ordering and their weighted outputs reconstructed; each used expert's activation must agree.
+The two-block tiny checkpoint uses width 512, four query/two KV heads of 128 channels, 64 rotary channels,
+16 experts/top-8 and four of eight groups: F32 reference, F16 KV, 512 identical IDs, mean KL 0.00000, maximum
+0.00040, top-1 99.61%. Fourteen template renders and all three tokenizer texts match. Its transformers-4-era
+remote code needs compatibility for removed helpers, RoPE initialization and tied-weight metadata. Transformers 5
+also materializes its nonpersistent RoPE buffer without calling the old constructor rule; the reference driver
+restores that exact rule after loading. A reference with the resulting zero frequencies failed (KL 0.00470,
+top-1 5.87%) and is retained separately from the corrected reference evidence. No engine numerical patch was
+needed. Golden cases cover resident and streamed fused-QKV, Q/K-norm and grouped-routing execution.
 
 The README's GLM-5.2 capacity estimates use the official configuration revision
 `cf457fa734ab149ffef225f80893eb38c6ff5cdc`, without downloading its weights. There are 21 full indexers and

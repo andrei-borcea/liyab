@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `glm-dsa` (GLM-5 tiny checkpoint), `deepseek32` (DeepSeek-V3.2 tiny checkpoint) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `glm-dsa` (GLM-5/5.2 tiny checkpoints), `deepseek32` (DeepSeek-V3.2 tiny checkpoint), `bailingmoe2` (Ling 2.0 tiny checkpoint) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -437,6 +437,10 @@ What the port does differently from the POSIX platforms:
     Experts compete only inside the chosen groups; their weights still use the unbiased probabilities, the file's
     renormalization rule and routed scale. CPU selection is shared by in-place and streamed experts, with the same
     rule in the streaming predictor; matmuls retain their CPU/Metal/Vulkan routes.
+  * `bailingmoe2` (Ling 2.0): fused contiguous Q/K/V projections, per-head Q/K RMS norms before partial halves
+    RoPE, dense leading FFNs and grouped sigmoid MoE with selection bias, normalized routed weights and shared
+    experts. These reuse the generic attention and MoE paths; CPU is the reference and projections retain the
+    existing Metal/Vulkan routing. Its NFC BPE pre-tokenizer preserves single digits and possessive symbol runs.
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -596,6 +600,13 @@ across all 78 blocks, including shared-indexer blocks: 0.25 GiB at 2,048 positio
 Thus Q4_K with a 3% cache starts at about 21.4 GiB for weights/cache/a short context, or 37.0 GiB at 128K,
 before activations, allocator overhead and the OS. A 15% Q4_K expert cache alone takes 56.95 GiB. These are
 capacity estimates, not measured GLM-5.2 throughput or a full-model conformance result.
+
+A short GLM-4.7-Flash Q4_K_M CPU streaming run on an M4 Pro (four threads, F16 KV, 512-token context) used a
+435,191,808-byte expert cache, about 3% of the experts, and answered the capital-of-France prompt correctly.
+It generated seven tokens at 4.278 tok/s. Across 18 prompt plus seven generated tokens it recorded 56.45% ready
+cache hits, 16,606,912,512 bytes read (633.5 MiB per processed token) and 2,315.656 ms waiting for experts.
+These are aggregate prompt/decode counters from one short smoke run, not decode-only bandwidth measurements;
+the CLI labels the stall fraction as prefill plus decode. The file declares `deepseek2`; MTP blocks are skipped.
 
 * **Optional lossy trade-offs**, all measured with `liyab-kl` (see [results](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)):
   * `requant_bits` 4/5: fewer resident bytes;
@@ -2214,6 +2225,16 @@ diagnostics expose numerical sensitivity at discrete selection boundaries and ar
 The model's own chat template passes all 14 reference renders. Its `glm4` pre-tokenizer uses the Llama-3 split
 expression and merge rules. No real GLM-5 weights were loaded.
 
+GLM-5.2's four-block tiny checkpoint includes three full indexers and one shared-indexer/MoE block: 494 identical
+IDs, 493 positions, mean KL 0.00000, maximum 0.00008 and top-1 99.80% with the original latent/index widths and
+top-k 256. Its template passes 14 renders. Ling-mini-2.0's two-block F32 checkpoint covers fused QKV, partial RoPE,
+Q/K norms, dense and grouped MoE FFNs plus a shared expert: 512 identical IDs, mean KL 0.00000, maximum 0.00040,
+top-1 99.61% with F16 KV. Its older remote code requires transformers-5 compatibility shims, including restoring
+the nonpersistent RoPE buffer from its constructor formula after loading. Its template passes 14 renders.
+GLM-5.2 and Ling tokenizers match all three tokenizer texts. These are tiny-checkpoint results, without real
+weights. The description tool verifies individually observed expert calls and direct causal PyTorch SDPA calls
+when an older remote implementation does not use transformers' attention registry.
+
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
 for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B
@@ -2719,7 +2740,7 @@ Implemented features are described above. These are next, in order:
     locked in RAM;
   * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
     of their own, such as a temporary directory under a user name with accents.
-* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V3.2 and V4.
+* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V4.
   Group routing for V2/V3/R1 is implemented; their full-model validation remains pending. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
   its keys unscaled (the key scales are measured on a text it cannot encode).

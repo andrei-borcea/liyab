@@ -486,6 +486,17 @@ TEST_CASE("GLM uses Llama-3 splitting and merge rules") {
     CHECK(!glm->nfc() && glm->ignore_merges());
 }
 
+TEST_CASE("Ling 2.0 keeps contractions, single digits and possessive symbol runs") {
+    auto pre = PreTokenizer::for_name("bailingmoe2");
+    REQUIRE(pre.has_value());
+    const std::string text = "Can't 12 !\nend";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Can", "'t", " ", "1", "2", " !\n", "end"};
+    CHECK(pieces == expected);
+    CHECK(pre->nfc() && !pre->ignore_merges());
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------
