@@ -459,6 +459,17 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(unknown.status().message().find(names) != std::string::npos);
 }
 
+TEST_CASE("GLM4 pre-tokenization keeps three-digit groups, contractions and Unicode words") {
+    auto pre = PreTokenizer::for_name("glm4");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    const std::string text = "Hello 1234 can't\n世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Hello", " ", "123", "4", " can", "'t", "\n", "世界"};
+    CHECK(pieces == expected);
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------

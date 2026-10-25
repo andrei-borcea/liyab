@@ -20,7 +20,8 @@ What is kept and why:
   largest tensors (vocabulary x width).
 * The size of a key/query head: RoPE tables, frequency factors (LongRoPE, Llama 3) and the default attention
   scale depend on it. The width of the residual stream becomes heads x head size (unless --width sets it).
-* Every scalar of the configuration (bases, epsilons, multipliers, windows, soft caps, routing parameters).
+* Every scalar of the configuration (bases, epsilons, multipliers, windows, soft caps, routing parameters). A
+  quantization configuration is dropped: the checkpoint's weights are float32.
 
 What shrinks: the blocks (the shortest prefix holding every kind of block, at least 2; multi-token-prediction
 blocks dropped), the attention heads (--heads, default 4; key/value heads in the model's ratio: as many as the
@@ -43,7 +44,7 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from reference_trace import EXPERT_COUNT_KEYS, TOP_K_KEYS, _layer_count, _randomize, blocks_to_trace  # noqa: E402
+from reference_trace import EXPERT_COUNT_KEYS, TOP_K_KEYS, _layer_count, _randomize, blocks_to_trace, canonical_rope_config  # noqa: E402
 
 HIDDEN_KEYS = ("hidden_size", "n_embd", "d_model", "model_dim")
 HEAD_KEYS = ("num_attention_heads", "n_head", "num_heads", "n_heads")
@@ -100,6 +101,8 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
     for k, v in list(vars(cfg).items()):
         if isinstance(v, int) and not isinstance(v, bool) and v > ffn and ("intermediate_size" in k or k in FFN_KEYS):
             setattr(cfg, k, ffn)
+        elif isinstance(v, (list, tuple)) and ("intermediate_size" in k or k in FFN_KEYS):
+            setattr(cfg, k, type(v)(min(x, ffn) if isinstance(x, int) and x > 0 else x for x in v))
 
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
     for k in EXPERT_COUNT_KEYS:
@@ -158,8 +161,13 @@ def main():
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
     keep, n = reduce(cfg, args.heads, args.kv_heads, args.width, args.ffn, args.experts)
+    # The random weights are float32: a quantization the model was published in (gpt-oss's MXFP4 experts) would
+    # make transformers load them as quantized tensors and the converter read them as such.
+    if hasattr(cfg, "quantization_config"):
+        delattr(cfg, "quantization_config")
     for field, value in json.loads(args.config or "{}").items():
         setattr(cfg, field, value)
+    canonical_rope_config(cfg)
 
     torch.manual_seed(args.seed)
     model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)

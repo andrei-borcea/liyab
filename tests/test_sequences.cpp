@@ -309,7 +309,7 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
 }
 
 TEST_CASE("Sequences together: windowed blocks and fused projections keep each sequence's bits") {
-    for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3", "gpt-oss"}) {
         test::TinyModelSpec s;
         s.arch = arch;
         s.sliding_window = 16;
@@ -323,6 +323,12 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
             s.post_norms = true;
             s.attn_softcap = 50.0f;
             s.final_softcap = 30.0f;
+        } else if (arch == "gpt-oss") {
+            s.n_expert = 8;
+            s.n_expert_used = 3;
+            s.identical_experts = false;
+            s.router_bias = s.expert_projection_bias = true;
+            s.attention_sinks = s.attention_output_bias = true;
         } else {
             s.fused_qkv = true;
             s.fused_gate_up = true;

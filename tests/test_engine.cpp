@@ -20,6 +20,7 @@
 
 #include "core/draft_budget.h"
 #include "core/quant.h"
+#include "core/quant_blocks.h"
 #include "core/sampling.h"
 #include "core/suffix_drafter.h"
 #include "core/thread_pool.h"
@@ -106,6 +107,8 @@ public:
             const std::string p = "blk." + std::to_string(l) + ".";
             const auto wq = weights(p + "attn_q.weight"), wk = weights(p + "attn_k.weight");
             const auto wv = weights(p + "attn_v.weight"), wo = weights(p + "attn_output.weight");
+            const auto sink_logits = f_.tensor(p + "attn_sinks.weight") ? weights(p + "attn_sinks.weight") : std::vector<float>{};
+            const auto output_bias = f_.tensor(p + "attn_output.bias") ? weights(p + "attn_output.bias") : std::vector<float>{};
             std::vector<std::vector<float>> q(n), k(n), v(n);
             for (int t = 0; t < n; ++t) {
                 const auto h = norm(x[t], weights(p + "attn_norm.weight"));
@@ -132,7 +135,8 @@ public:
                         s.push_back(dot / std::sqrt(static_cast<double>(hd_)));
                         mx = std::max(mx, s.back());
                     }
-                    double sum = 0;
+                    if (!sink_logits.empty()) mx = std::max(mx, static_cast<double>(sink_logits[h]));
+                    double sum = sink_logits.empty() ? 0.0 : std::exp(sink_logits[h] - mx);
                     for (double& e : s) sum += (e = std::exp(e - mx));
                     for (size_t idx = 0; idx < visible.size(); ++idx) {
                         for (int i = 0; i < hd_; ++i) {
@@ -141,7 +145,7 @@ public:
                     }
                 }
                 const auto o = matvec(wo, att);
-                for (int i = 0; i < d_; ++i) x[t][i] += o[i];
+                for (int i = 0; i < d_; ++i) x[t][i] += o[i] + (output_bias.empty() ? 0.0f : output_bias[i]);
             }
             const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
             const auto wd = weights(p + "ffn_down.weight");
@@ -342,7 +346,7 @@ private:
     int d_, heads_, layers_, rank_, q_rank_, rd_, nope_, vd_;
 };
 
-double max_abs_diff(std::span<const float> a, const std::vector<float>& b) {
+double max_abs_diff(std::span<const float> a, std::span<const float> b) {
     double m = 0;
     for (size_t i = 0; i < b.size(); ++i) m = std::max(m, std::fabs(static_cast<double>(a[i]) - b[i]));
     return m;
@@ -1275,6 +1279,150 @@ TEST_CASE("Transformer matches the float reference (F32 weights, F16 KV)") {
         const auto row = logits->subspan(t * vocab, vocab);
         CHECK(max_abs_diff(row, expected[t]) < 2e-2);
         CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+    }
+}
+
+TEST_CASE("Learned attention sinks and output bias match a full softmax reference") {
+    auto spec = f32_spec();
+    spec.attention_sinks = spec.attention_output_bias = true;
+    const auto& path = model_path("learned_sinks_reference", spec);
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    const Reference ref(*file.value());
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 36; ++i) tokens.push_back(3 + (i * 37) % 250);
+    for (const int window : {0, 12}) {
+        TransformerOptions options;
+        options.kv_type = KvCacheType::F16;
+        options.sliding_window = window;
+        options.sink_tokens = window ? 2 : 0;
+        auto model = load_transformer(path, options);
+        REQUIRE(model != nullptr);
+        const auto expected = ref.logits(tokens, window, options.sink_tokens);
+        auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(got.has_value());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            CHECK(max_abs_diff(got->subspan(t * expected[t].size(), expected[t].size()), expected[t]) < 0.003f);
+        }
+    }
+}
+
+TEST_CASE("Biased clamped experts and sinks agree through streamed fused projections and rollback") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.n_expert = 8;
+    spec.n_expert_used = 3;
+    spec.identical_experts = false;
+    spec.router_bias = spec.expert_projection_bias = true;
+    spec.attention_sinks = spec.attention_output_bias = true;
+    spec.sliding_window = 12;
+    auto fused = spec;
+    fused.fused_gate_up = true;
+    const auto& split_path = model_path("gpt_oss_split_bias", spec);
+    const auto& fused_path = model_path("gpt_oss_fused_bias", fused);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 36; ++i) tokens.push_back(3 + (i * 37) % 250);
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = type;
+        options.expert_cache_bytes = 0;
+        options.keep_windowed_rows = true;  // speculative rejection can revisit rows before the window
+        auto a = load_transformer(split_path, options);
+        options.expert_cache_bytes = 1;
+        auto b = load_transformer(fused_path, options);
+        REQUIRE(a != nullptr && b != nullptr);
+        REQUIRE(b->expert_store() != nullptr);
+        auto expected = a->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(expected.has_value());
+        const std::vector<float> expected_copy(expected->begin(), expected->end());
+        auto got = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(got.has_value());
+        CHECK(max_abs_diff(expected_copy, *got) == 0.0f);
+        a->reset();
+        b->reset();
+        for (const int32_t token : tokens) {
+            auto x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+            auto y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+            REQUIRE(x.has_value() && y.has_value());
+            CHECK(max_abs_diff(*x, *y) == 0.0f);
+        }
+        REQUIRE(b->truncate(24).is_ok());
+        auto replay = b->forward(std::span<const int32_t>(tokens).subspan(24), Transformer::Logits::Last, route, pool);
+        REQUIRE(replay.has_value());
+        auto last = std::span<const float>(expected_copy).last(replay->size());
+        CHECK(max_abs_diff(*replay, last) < 0.002f);
+    }
+}
+
+TEST_CASE("Mixtral expert width and router normalization follow tensors and architecture defaults") {
+    test::TinyModelSpec spec;
+    spec.n_expert = 4;
+    spec.n_expert_used = 2;
+    spec.omit_expert_width = true;
+    spec.expert_weights_norm = -1;
+    auto model = load_transformer(model_path("mixtral_metadata", spec));
+    REQUIRE(model != nullptr);
+    CHECK(model->config().n_ff_expert == spec.n_ff);
+    CHECK(model->config().moe_norm_weights);
+}
+
+TEST_CASE("MXFP4 prefill kernels preserve decode bits for odd blocks and partial row tiles") {
+    std::mt19937 rng(818);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (const int64_t n : {32, 96, 256, 1056}) {
+        std::vector<quant::BlockMxfp4> w(static_cast<size_t>(n / 32));
+        for (auto& b : w) {
+            b.e = static_cast<uint8_t>(124 + rng() % 7);
+            for (auto& q : b.qs) q = static_cast<uint8_t>(rng());
+        }
+        std::vector<quant::BlockQ8_0> x(static_cast<size_t>(9 * n / 32));
+        std::vector<float> input(static_cast<size_t>(9 * n));
+        for (float& v : input) v = normal(rng);
+        quant::quantize_row_q8_0(input.data(), x.data(), 9 * n);
+        const quant::BlockQ8_0* rows[9];
+        for (size_t r = 0; r < 9; ++r) rows[r] = x.data() + r * static_cast<size_t>(n / 32);
+        for (const int count : {1, 2, 3, 4, 5, 7, 8, 9}) {
+            float got[9]{};
+            quant::dot_mxfp4_q8_0_rows(w.data(), rows, count, n, got);
+            for (int r = 0; r < count; ++r) {
+                const float expected = quant::dot_mxfp4_q8_0(w.data(), rows[r], n);
+                CHECK(std::memcmp(&got[r], &expected, sizeof(float)) == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("Separate attention output gates preserve fused-query gate bits for every KV type") {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen3";
+    spec.qk_norm = spec.attn_gate = true;
+    auto split = spec;
+    split.separate_attention_gate = true;
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = type;
+        auto a = load_transformer(model_path("attention_fused_gate", spec), options);
+        auto b = load_transformer(model_path("attention_separate_gate", split), options);
+        REQUIRE(a != nullptr && b != nullptr);
+        auto x = a->forward(tokens, Transformer::Logits::All, route, pool);
+        auto y = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(x.has_value() && y.has_value());
+        CHECK(max_abs_diff(*x, *y) == 0.0f);
+        const int32_t token = 280;
+        x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+        y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(x.has_value() && y.has_value());
+        CHECK(max_abs_diff(*x, *y) == 0.0f);
     }
 }
 

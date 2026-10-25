@@ -161,6 +161,14 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+    // Optional MoE projection biases and learned attention sink logits. A separate
+    // generator supplies these tensors so existing synthetic cases keep their bits.
+    bool router_bias = false;
+    bool expert_projection_bias = false;
+    bool attention_output_bias = false;
+    bool attention_sinks = false;
+    bool omit_expert_width = false;  // Mixtral: infer the expert width from down projections
+    bool separate_attention_gate = false;  // attn_gate instead of a fused [query | gate], with attn_gate true
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

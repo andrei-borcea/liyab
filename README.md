@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `gpt-oss`, `qwen2moe`, `glm4moe`, `dots1`, `ernie4_5-moe` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -2796,3 +2796,41 @@ work, [CITATION.cff](CITATION.cff) has the citation.
 
 Apache 2.0 (see [`LICENSE`](LICENSE)). The low-bit NEON dot kernels are adapted from llama.cpp / ggml (MIT); see
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+MoE projection variants: optional router logit bias and per-expert gate/up/down biases are applied before routing
+and after their respective projections. `SwigluOai` clamps gate values above 7, clamps up values to [-7, 7], then
+computes `gate * sigmoid(1.702 * gate) * (up + 1)`. Learned per-head `attn_sinks.weight` contributes one score only
+to each attention softmax denominator, including windowed attention. These elementwise operations run on the CPU
+beside the existing backend projection routing. MXFP4 projections use the existing NEON and AVX2/FMA codebook
+kernels (scalar fallback), including expert slices loaded through the bounded expert cache. Mixtral's `llama`
+files renormalize selected router weights and infer expert width from the down projection when metadata omits it.
+MXFP4 prefill shares each nibble lookup and exponent conversion across up to four activation rows on NEON and
+AVX2/FMA, preserving the corresponding decode kernel's float accumulation order. The CPU backend uses this path
+for resident and streamed expert matrices; scalar targets retain the single-row kernel.
+The tiny-checkpoint and reference-trace tools also reduce per-block lists of FFN widths, retaining each block's
+original width when it is already smaller than the requested test width.
+Tiny fixtures randomize declared persistent router selection-bias buffers as well as parameters, so those paths
+are exercised even when the published configuration initializes the corrections to zero.
+The `glm4` pre-tokenizer uses the model's three-digit grouping and contraction rules, without normalization and
+with vocabulary-first merge lookup. Harmony and Qwen2MoE templates have byte-for-byte reference fixtures.
+A gated attention block can also store its sigmoid gate in a separate `attn_gate.weight` projection (AFMoE),
+instead of fusing it into each query head. It follows the same CPU/Metal/Vulkan projection routing.
+For legacy configurations, the tiny-checkpoint and trace tools canonicalize RoPE's `type` spelling to
+`rope_type`, preserving the scaling type and every numerical parameter.
+
+Tiny MoE conformance against the models' transformers implementations (F32 GGUF, F16 KV, full fixed text):
+
+| Architecture / configuration | Positions | Mean KL | Top-1 |
+| --- | ---: | ---: | ---: |
+| gpt-oss, two heads, top-4/16, both block kinds, window 128 | 483 | 0.00000 | 99.79% |
+| Mixtral (`llama`), top-2 routing with inferred expert width | 511 | 0.00000 | 100.00% |
+| qwen2moe, routed and gated shared experts | 511 | 0.00000 | 100.00% |
+| dots1, leading dense block and nonzero selection correction | 511 | 0.00000 | 99.80% |
+| glm4moe, leading dense blocks and shared experts | 497 | 0.00000 | 100.00% |
+| ernie4_5-moe, leading dense block and two shared experts | 511 | 0.00000 | 99.80% |
+
+The original four-head random gpt-oss checkpoint gave KL 0.00000 and top-1 98.76%, below the tiny gate. Seven of
+959 expert selections changed when F32 reference keys/values were rounded to the F16 cache format; every routing
+choice matched a reference rounded the same way. That rounded reference is diagnostic, and the table uses the
+standard untouched reference. The smaller checkpoint keeps every block kind, crosses the sliding window, and
+retains top-4 selection among sixteen experts.

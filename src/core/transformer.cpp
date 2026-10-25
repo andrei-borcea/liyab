@@ -52,6 +52,17 @@ void gated_activation(FfnActivation act, const float* gate, const float* up, flo
         for (size_t i = 0; i < n; ++i) out[i] = gelu_tanh(gate[i]) * up[i];
         return;
     }
+    if (act == FfnActivation::SwigluOai) {
+        // As the reference computes it: glu = g * sigmoid(1.702 g), then (u + 1) * glu.
+        constexpr float kAlpha = 1.702f, kLimit = 7.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float g = std::min(gate[i], kLimit);
+            const float u = std::clamp(up[i], -kLimit, kLimit);
+            const float glu = g * (1.0f / (1.0f + std::exp(-(g * kAlpha))));
+            out[i] = (u + 1.0f) * glu;
+        }
+        return;
+    }
     for (size_t i = 0; i < n; ++i) out[i] = silu(gate[i]) * up[i];
 }
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
@@ -698,6 +709,9 @@ Status Transformer::bind_weights() {
                 matrix(block_tensor(l, "attn_output.weight"), int64_t{c.n_head} * m.v_dim, c.n_embd, L.w[kO]));
         } else if (plan.mixer == MixerKind::Attention) {
             L.kv_slot = kv_slots++;
+            if (f.tensor(block_tensor(l, "attn_gate.weight")) != nullptr) {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_gate.weight"), c.n_embd, q_dim, L.w[kZ]));
+            }
             if (plan.fused_qkv) {
                 LIYAB_RETURN_IF_ERROR(
                     matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, q_dim + 2 * kv_dim, L.w[kQkv]));
@@ -711,7 +725,7 @@ Status Transformer::bind_weights() {
                 }
             } else {
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q.weight"), c.n_embd,
-                                             plan.attn_gate ? 2 * q_dim : q_dim, L.w[kQ]));
+                                             plan.attn_gate && L.w[kZ] == nullptr ? 2 * q_dim : q_dim, L.w[kQ]));
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_k.weight"), c.n_embd, kv_dim, L.w[kK]));
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_v.weight"), c.n_embd, kv_dim, L.w[kV]));
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q.bias"), q_dim, false, L.bq));
@@ -719,6 +733,8 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_sinks.weight"), c.n_head, false, L.sinks));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
         } else {
@@ -773,6 +789,12 @@ Status Transformer::bind_weights() {
         }
         LIYAB_RETURN_IF_ERROR(experts("ffn_down_exps.weight", c.n_ff_expert, c.n_embd, L.w[kDownExps]));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "exp_probs_b.bias"), c.n_expert, false, L.expert_bias));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_inp.bias"), c.n_expert, false, L.router_bias));
+        // Per-expert biases ([rows, n_expert] in the file: expert e's at e * rows).
+        const int64_t E = c.n_expert;
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_exps.bias"), E * c.n_ff_expert, false, L.gate_exps_bias));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up_exps.bias"), E * c.n_ff_expert, false, L.up_exps_bias));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down_exps.bias"), E * c.n_embd, false, L.down_exps_bias));
         if (plan.shared_expert) {
             const int64_t sh = c.n_ff_shared > 0 ? c.n_ff_shared : f.tensor(block_tensor(l, "ffn_up_shexp.weight"))->rows();
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate_shexp.weight"), c.n_embd, sh, L.w[kGateShared]));
@@ -1372,7 +1394,8 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 // keeps only those positions (KvCache's per-block layout), so a windowed block
 // saves memory as well as compute (with TransformerOptions::keep_windowed_rows,
 // compute only).
-void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
+void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask,
+                            const float* sinks) {
     const ModelConfig& c = config_;
     // Each segment's rows of the block, their group and offsets resolved
     // once for the pass (a pass of several sequences reads several caches).
@@ -1541,13 +1564,18 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     };
     // Token t's spans of head h (mx[sp], sm[sp], out + sp * vd), merged in
     // order into att_: exp(m_s - M) rescales each span's sum and weighted V
-    // to the overall maximum M.
+    // to the overall maximum M. A sink logit s_h (gpt-oss) is one more score
+    // of the softmax, with no value: it joins the maximum and adds exp(s_h -
+    // M) to the denominator only. It is the same for every position, so it
+    // is added once here rather than per span: the spans, and therefore how a
+    // token's attention rounds, stay those of a model without sinks.
     auto merge = [&](int32_t t, int32_t h, int32_t spans, const float* mx, const float* sm, const float* out) {
         float* dst = att_.data() + static_cast<size_t>(t) * out_dim + static_cast<size_t>(h) * uvd;
         std::fill(dst, dst + vd, 0.0f);
         if (head_mask != nullptr && head_mask[h] == 0) return;  // pruned head: contributes nothing
         float m = -INFINITY;
         for (int32_t sp = 0; sp < spans; ++sp) m = std::max(m, mx[sp]);
+        if (sinks != nullptr) m = std::max(m, sinks[h]);
         float sum = 0.0f;
         for (int32_t sp = 0; sp < spans; ++sp) {
             if (sm[sp] == 0.0f) continue;
@@ -1556,6 +1584,7 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
             const float* src = out + static_cast<size_t>(sp) * uvd;
             for (size_t d = 0; d < uvd; ++d) dst[d] += w * src[d];
         }
+        if (sinks != nullptr) sum += std::exp(sinks[h] - m);
         const float inv = 1.0f / sum;
         for (size_t d = 0; d < uvd; ++d) dst[d] *= inv;
     };
@@ -2052,6 +2081,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const bool gated = c.blocks[static_cast<size_t>(layer)].attn_gate;
+    const bool fused_gate = gated && L.w[kZ] == nullptr;
     const auto un = static_cast<size_t>(n);
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
     const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
@@ -2060,17 +2090,20 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
-    if (gated) qg_.resize(un * 2 * q_dim);
+    if (fused_gate) qg_.resize(un * 2 * q_dim);
+    if (gated) gate_.resize(un * q_dim);
+    if (L.w[kZ] != nullptr) {
+        LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kZ], xb_.data(), gate_.data(), n));
+    }
     if (c.blocks[static_cast<size_t>(layer)].fused_qkv) {
         // One [q | k | v] projection per token, split into q_, k_ and v_.
         LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, route.attention, w, n));
     } else {
         const TensorView* qkv[] = {&w[kQ], &w[kK], &w[kV]};
-        float* outs[] = {gated ? qg_.data() : q_.data(), k_.data(), v_.data()};
+        float* outs[] = {fused_gate ? qg_.data() : q_.data(), k_.data(), v_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, qkv, xb_.data(), outs, n));
     }
-    if (gated) {
-        gate_.resize(un * q_dim);
+    if (fused_gate) {
         for (size_t t = 0; t < un; ++t) {
             for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
                 const float* src = qg_.data() + (t * static_cast<size_t>(c.n_head) + h) * 2 * hd;
@@ -2097,11 +2130,18 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, v);
         }
     }
-    attention(L.kv_slot, L.window, n, pool, head_mask);
+    attention(L.kv_slot, L.window, n, pool, head_mask, L.sinks.empty() ? nullptr : L.sinks.data());
     if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
-    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
+    if (!L.bo.empty()) {
+        const size_t d = static_cast<size_t>(c.n_embd);
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t i = 0; i < d; ++i) xb_[t * d + i] += L.bo[i];
+        }
+    }
+    return Status::ok();
 }
 
 Status Transformer::per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out,
@@ -2885,15 +2925,28 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
         rmsnorm(x_.data() + t * d, L.ffn_norm.data(), pred_in_.data() + t * d, c.n_embd, c.rms_eps);
     }
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
+    if (!L.router_bias.empty()) {
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t e = 0; e < E; ++e) pred_logits_[t * E + e] += L.router_bias[e];
+        }
+    }
     std::vector<int32_t> order(E);
     std::vector<int32_t> picks;
     std::vector<int32_t> best_rank(E, -1);
     const bool cut = expert_mass_ < 1.0f || (max_experts_ > 0 && max_experts_ < c.n_expert_used);
-    std::vector<float> probs(cut ? E : 0);
+    const bool biased_softmax = c.moe_gating == MoeGating::Softmax && !L.expert_bias.empty();
+    std::vector<float> probs(cut || biased_softmax ? E : 0);
     for (size_t t = 0; t < un; ++t) {
         const float* logits = pred_logits_.data() + t * E;
-        auto score = [&](int32_t e) {  // softmax and sigmoid are monotonic; the selection bias is added on top
-            const float p = c.moe_gating == MoeGating::Softmax ? logits[e] : sigmoid(logits[e]);
+        if (biased_softmax) {
+            const float mx = *std::max_element(logits, logits + E);
+            float sum = 0.0f;
+            for (size_t e = 0; e < E; ++e) sum += probs[e] = std::exp(logits[e] - mx);
+            for (float& p : probs) p /= sum;
+        }
+        auto score = [&](int32_t e) {  // selection corrections are in probability space, never logit space
+            const float p = biased_softmax ? probs[static_cast<size_t>(e)] :
+                            c.moe_gating == MoeGating::Softmax ? logits[e] : sigmoid(logits[e]);
             return p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
         };
         for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
@@ -2989,9 +3042,11 @@ size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const
 }
 
 // Mixture of experts, as llama.cpp's build_moe_ffn: router probabilities
-// (softmax or sigmoid), top-k selection (optionally on probability + bias),
-// optional renormalization and scale; each selected expert is a gated FFN
-// (its gate and up projections separate or one [gate | up] matrix).
+// (softmax or sigmoid of the logits, plus the router's bias when it has one),
+// top-k selection (optionally on probability + bias), optional
+// renormalization and scale; each selected expert is a gated FFN (its gate
+// and up projections separate or one [gate | up] matrix, each projection
+// optionally with the expert's own bias).
 // Tokens are grouped by expert so a batch reads every expert once. A shared
 // expert, optionally scaled by sigmoid(shared_gate . x), is added on top.
 Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route) {
@@ -3014,6 +3069,11 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     if (expert_store_ != nullptr) expert_store_->set_batch(n > 1 && !steps_only_);
     router_.resize(un * E);
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
+    if (!L.router_bias.empty()) {  // a router with a bias (gpt-oss): part of the logits, selection and weights alike
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t e = 0; e < E; ++e) router_[t * E + e] += L.router_bias[e];
+        }
+    }
 
     // Routing: per expert, the tokens that selected it, with the gate weight
     // and the expert's rank in that token's top-k.
@@ -3259,6 +3319,21 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             return st;
         }
         adapter_runner_.add_updates(adapter_items_, adapter_pool_);
+        // Per-expert biases of the gate and up projections (gpt-oss), each
+        // expert's own over the rows of its users.
+        if (!L.gate_exps_bias.empty() || !L.up_exps_bias.empty()) {
+            for (size_t i = 0; i < wave.size(); ++i) {
+                const size_t users = assigned[static_cast<size_t>(wave[i])].size();
+                const size_t at = static_cast<size_t>(wave[i]) * ff;
+                for (size_t u = 0; u < users; ++u) {
+                    const size_t r = first_row[i] + u;
+                    float* gate = fused ? eh2_.data() + r * 2 * ff : eh_.data() + r * ff;
+                    float* up = fused ? gate + ff : eh2_.data() + r * ff;
+                    for (size_t j = 0; j < ff && !L.gate_exps_bias.empty(); ++j) gate[j] += L.gate_exps_bias[at + j];
+                    for (size_t j = 0; j < ff && !L.up_exps_bias.empty(); ++j) up[j] += L.up_exps_bias[at + j];
+                }
+            }
+        }
         if (fused) {  // the same rows as the split matrices give, so the same bits
             for (size_t r = 0; r < rows_total; ++r) {
                 const float* gate_up = eh2_.data() + r * 2 * ff;
@@ -3285,10 +3360,15 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         adapter_runner_.add_updates(adapter_items_, adapter_pool_);
         for (size_t i = 0; i < first_row.size(); ++i) {
             const auto& users = assigned[static_cast<size_t>(wave[i])];
+            const float* bias = L.down_exps_bias.empty() ? nullptr
+                                                          : L.down_exps_bias.data() + static_cast<size_t>(wave[i]) * d;
             for (size_t u = 0; u < users.size(); ++u) {
                 float* dst = ranked_out_.data() + (static_cast<size_t>(users[u].token) * K + users[u].rank) * d;
-                const float* src = eout_.data() + (first_row[i] + u) * d;
+                float* src = eout_.data() + (first_row[i] + u) * d;
                 const float weight = users[u].weight;
+                if (bias != nullptr) {  // the down projection's bias, before the router weight (gpt-oss)
+                    for (size_t j = 0; j < d; ++j) src[j] += bias[j];
+                }
                 for (size_t j = 0; j < d; ++j) dst[j] = weight * src[j];
             }
         }

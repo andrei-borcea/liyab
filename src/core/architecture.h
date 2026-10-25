@@ -14,9 +14,10 @@
 //    metadata, and each block's structure from the tensors present (which
 //    token mixer, fused or separate projections, a gated attention output,
 //    a windowed attention, a dense or mixture-of-experts FFN, a shared
-//    expert). Optional per-element tensors (QKV biases, Q/K norms, the norms
-//    after the mixer and the FFN, the shared expert's gate, the router's
-//    selection bias, RoPE frequency factors) are bound where present and
+//    expert). Optional per-element tensors (QKV biases, the attention output
+//    bias, attention sinks, Q/K norms, the norms after the mixer and the FFN,
+//    the shared expert's gate, the router's bias and selection bias, the
+//    experts' biases, RoPE frequency factors) are bound where present and
 //    need no plan entry.
 //
 // describe_model() is a pure function of the file: it reads metadata and
@@ -52,6 +53,11 @@ enum class QkNormOrder : uint8_t {
 enum class FfnActivation : uint8_t {
     SiLU,      // SwiGLU: Llama, Qwen, Phi, Hunyuan
     GeluTanh,  // GeGLU, with the tanh approximation of GELU: Gemma
+    // gpt-oss's clamped SwiGLU: g = min(gate, 7), u = clamp(up, -7, 7),
+    // g * sigmoid(1.702 g) * (u + 1). The converter writes neither constant
+    // (the reference's swiglu_limit and swiglu_alpha): they are the
+    // activation's definition.
+    SwigluOai,
 };
 
 // The facts about one architecture that its tensors cannot tell. The fields
@@ -64,7 +70,10 @@ struct ArchSpec {
     // another family (Gemma's post_attention_norm follows the attention output).
     std::string_view ffn_norm;
     // MoE: whether the top-k router weights are renormalized to sum to 1 when
-    // the file has no <arch>.expert_weights_norm.
+    // the file has no <arch>.expert_weights_norm. With softmax gating, true
+    // is also a softmax over the selected top-k logits alone (gpt-oss): the
+    // softmax over every expert renormalized over the top k is the same
+    // function. An architecture whose models are all dense says false.
     bool moe_norm_weights;
     QkNormOrder qk_norm = QkNormOrder::BeforeRope;
     FfnActivation ffn_activation = FfnActivation::SiLU;
@@ -120,8 +129,9 @@ struct BlockPlan {
     // ModelConfig::mla). Keys and values come from one compressed latent per
     // position, which is what the KV cache stores.
     bool latent = false;
-    // Attention: attn_q projects [q | gate] per head (twice as tall) and the
-    // attention output is multiplied by sigmoid(gate).
+    // Attention: attn_q projects [q | gate] per head (twice as tall), or
+    // attn_gate projects the gate separately. The attention output is
+    // multiplied by sigmoid(gate).
     bool attn_gate = false;
     // Attention: sees only the last ModelConfig::sliding_window positions
     // (ArchSpec::swa_period), and rotates with ModelConfig::rope_base_swa
@@ -235,7 +245,10 @@ struct ModelConfig {
     // Mixture of experts (zero when every FFN is dense).
     int32_t n_expert = 0;        // routed experts per MoE block
     int32_t n_expert_used = 0;   // experts selected per token (top-k)
-    int32_t n_ff_expert = 0;     // hidden size of one routed expert
+    // Hidden size of one routed expert: <arch>.expert_feed_forward_length,
+    // else the experts' tensors (the llama converter writes Mixtral without
+    // the key).
+    int32_t n_ff_expert = 0;
     int32_t n_ff_shared = 0;     // hidden size of the shared expert (0: from its tensors)
     MoeGating moe_gating = MoeGating::Softmax;
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1

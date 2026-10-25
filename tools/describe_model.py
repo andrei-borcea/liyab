@@ -472,7 +472,7 @@ class Engine:
 
 # Activations the reference trace names, and the FfnActivation value that runs each (when the enum has it).
 ACTIVATION_ENUM = {"silu": "SiLU", "gelu_tanh": "GeluTanh", "gelu": "Gelu", "relu": "Relu", "relu2": "ReluSquared",
-                   "gelu_quick": "GeluQuick"}
+                   "gelu_quick": "GeluQuick", "swiglu_oai": "SwigluOai"}
 QK_ORDER_ENUM = {"before_rope": "BeforeRope", "after_rope": "AfterRope"}
 LAYOUT_ENUM = {"halves": "Halves", "adjacent": "Adjacent"}
 # The DeltaNet tensors the engine binds (transformer.cpp, bind_weights), present together in a recurrent block.
@@ -736,7 +736,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["mixer"] = "deltanet"
         else:
             p["mixer"] = "attention"
-            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * q_dim
+            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * q_dim or "attn_gate.weight" in ts
             p["fused_qkv"] = "attn_q.weight" not in ts and "attn_qkv.weight" in ts
             p["qkv_bias"] = bool({"attn_q.bias", "attn_qkv.bias"} & ts)
             p["qk_norm"] = "attn_k_norm.weight" in ts
@@ -745,6 +745,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["shared_expert"] = "ffn_up_shexp.weight" in ts
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
             p["selection_bias"] = "exp_probs_b.bias" in ts
+            p["router_bias"] = "ffn_gate_inp.bias" in ts
+            p["expert_biases"] = bool({"ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"} & ts)
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
         else:
             p["ffn"] = "dense"
@@ -1027,7 +1029,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         elif cap:
             d.parts.append(f"attention scores soft-capped at {cap:g} (from the file)")
         if m.get("sinks"):
-            d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
+            if "attn_sinks.weight" not in engine.block_tensors:
+                d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
+            elif f"blk.{i}.attn_sinks.weight" not in g.tensors:
+                d.file_issues.append(f"block {i}: learned attention sinks in the reference but none in the file")
+            else:
+                d.parts.append(f"block {i}: learned sink logits in the attention softmax denominator")
         if not m.get("causal", True):
             d.missing.append(f"block {i}: non-causal attention")
         if m["head_dim"] != head_dim or m["heads"] != n_head or m["kv_heads"] != n_head_kv:
@@ -1193,6 +1200,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                                      f"(expert_gating_func)")
             if bool(f.get("selection_bias")) != bool(plan.get("selection_bias")):
                 d.file_issues.append(f"block {i}: an expert selection bias in one of the reference and the file only")
+            if bool(f.get("router_bias")) != bool(plan.get("router_bias")):
+                d.file_issues.append(f"block {i}: a router logit bias in one of the reference and the file only")
+            if bool(f.get("expert_biases")) != bool(plan.get("expert_biases")):
+                d.file_issues.append(f"block {i}: expert projection biases in one of the reference and the file only")
             fnorm = g.key("expert_weights_norm")
             if fnorm is not None and bool(fnorm) != bool(f["norm_topk"]):
                 d.file_issues.append(f"block {i}: expert_weights_norm {fnorm} in the file, the reference "
@@ -1230,7 +1241,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                            + (", a shared expert" + (" with a sigmoid gate" if f["shared_expert"].get("gate") else "")
                               if f.get("shared_expert") else ""))
     elif bf:
-        d.set("moe_norm_weights", False, "dense FFNs (the MoE default does not apply)")
+        # A dense checkpoint cannot establish an expert-routing default. Keep
+        # a registered family's value: e.g. llama also names Mixtral files.
+        inactive = engine.rows.get(arch, ({}, ""))[0].get("moe_norm_weights", False)
+        d.set("moe_norm_weights", inactive, "dense FFNs: inactive; preserve the registered family's MoE default "
+                                             "(unmeasurable without an expert checkpoint)")
 
     # --- embeddings and logits ---
     es = facts.get("embedding_scale")

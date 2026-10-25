@@ -241,3 +241,48 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
+
+## Biased experts and learned attention sinks
+
+Optional `ffn_gate_inp.bias` is added to the router logits; `exp_probs_b.bias` remains a separate selection-only
+correction after softmax or sigmoid. The converter maps Flint's `.gate.expert_bias.bias` to that selection
+correction. Expert projection biases have shape `[rows, experts]` in GGUF order and apply before activation or
+router weighting. Shared-expert width and leading dense blocks already follow the tensors present; the metadata
+counts do not cause an extra expert or a block to execute.
+
+The reference trace recomputes fused expert outputs in either matrix orientation and with contiguous or
+interleaved gate/up values, including projection biases. It recognizes `SwigluOai` only when the observed output
+matches the activation and the reference's alpha and limit are 1.702 and 7. An unknown expert activation refuses
+a proposed row. Learned sink logits are checked against `attn_sinks.weight` in the file and join the attention
+softmax denominator once per query head, after merging its paged-cache spans.
+MXFP4 batched matmuls share a weight decode across four input rows on NEON and AVX2; their tests compare every
+result bit with single-row decode for partial row tiles and odd numbers of 32-value blocks. Decode dispatch and
+existing quantized formats retain their kernels and accumulation order.
+Per-block FFN width lists are reduced alongside scalar widths when constructing tiny checkpoints and reference
+traces; attention sizes, routing parameters, and shared-expert counts keep their original contracts.
+Learned sinks are covered by the multi-sequence scheduling tests and by KV relocation and segment-store reuse
+checks, including quantized key scaling. They add no per-sequence state: their only persistent values are the
+model's head logits. Router prefetch applies selection corrections in probability space, matching actual routing.
+A dense checkpoint cannot establish its family's unused expert-routing default. The tool preserves that field
+from a registered row and labels it unmeasurable from this checkpoint. Mixtral, which shares `llama` with dense
+Llama, supplies the evidence for that family's renormalization default; dense Llama's logits are unaffected.
+The trace randomizes declared router selection-correction buffers (`e_score_correction`,
+`e_score_correction_bias`, `expert_bias`), which otherwise start at zero and hide their effect. It compares
+candidate corrections anywhere inside the FFN with the experts' observed indices and weights; mathematical
+buffers such as RoPE frequencies retain their configured values.
+GLM-4 MoE binds `post_attention_norm` before the FFN. Its `glm4` BPE pre-tokenizer uses the same split expression
+as Llama 3, has no normalization, and honors `ignore_merges` from the tokenizer contract. Its sparse block plan
+skips trailing MTP blocks through `nextn_predict_layers`, as the existing loader already does.
+A separate attention output-gate tensor is planned alongside the existing fused query/gate layout. Both forms
+apply the sigmoid after attention and before the output projection; fused and separate gates together are
+rejected as ambiguous. Golden cases and all-KV-type tests compare the two layouts bit for bit.
+Legacy `rope_parameters.type` is renamed to `rope_parameters.rope_type` before constructing a transformers
+reference (including nested per-layer parameter dictionaries). This is a spelling compatibility fix; factors,
+bases, and scaling algorithms are unchanged.
+
+The tiny checkpoints for Qwen1.5-MoE-A2.7B, Mixtral-8x7B, dots.llm1.inst, GLM-4.5 and ERNIE-4.5-21B-A3B exercise
+routed and shared experts and leading dense blocks. The proposed Qwen2MoE, Mixtral and dots1 rows match the
+registry. The gpt-oss trace proposes its complete row including SwigluOai and its alternating window. GLM-4 MoE
+uses `post_attention_norm`; ERNIE uses adjacent-pair RoPE and renormalizes its selected probabilities. ERNIE's
+reduced configuration sets `intermediate_size=256` with one KV head and two 128-wide shared experts, preserving
+the converter's coupled shared-width metadata. Tiny numerical results are recorded in the README.

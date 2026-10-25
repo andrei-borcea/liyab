@@ -213,6 +213,10 @@ void dot_lowbit_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x
 // (dispatched by dot_quantized). `n` is a multiple of 32.
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
+// Same result, bit for bit on each kernel set, for several activation rows.
+// NEON and AVX2 share each MXFP4 decode across up to four rows. Pure and
+// thread-safe; n must be a multiple of 32, x/out hold at least rows entries.
+void dot_mxfp4_q8_0_rows(const void* row, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
 
 float bf16_to_fp32(uint16_t h) noexcept;
 float dot_bf16_f32(const uint16_t* w, const float* x, int64_t n) noexcept;

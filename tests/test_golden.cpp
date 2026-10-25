@@ -255,6 +255,47 @@ std::vector<GoldenCase> cases() {
     s.longrope_ctx = 32;  // shorter: the long factors
     s.rope_dim = 16;      // partial rotation (Phi-4-mini)
     add("phi3-longrope-partial", s);
+    s = moe_spec("llama");
+    s.expert_weights_norm = -1;
+    s.omit_expert_width = true;
+    add("mixtral-inferred-expert-width", s);
+    s = {};
+    s.arch = "qwen3";
+    s.qk_norm = s.attn_gate = true;
+    add("qwen3-fused-attention-gate", s);
+    s.separate_attention_gate = true;
+    add("qwen3-separate-attention-gate", s);
+    for (const char* arch : {"qwen2moe", "glm4moe", "dots1", "ernie4_5-moe"}) {
+        s = moe_spec(arch);
+        s.expert_weights_norm = -1;
+        s.n_ff_shared = 64;
+        s.dense_lead = 1;
+        add(arch, s);
+    }
+    s = moe_spec("gpt-oss");
+    s.router_bias = s.expert_projection_bias = true;
+    s.attention_sinks = s.attention_output_bias = true;
+    s.sliding_window = 12;
+    add("gpt-oss-biased-sinks", s);
+    add("gpt-oss-biased-sinks-streamed", s, streamed);
+    s.fused_gate_up = true;
+    add("gpt-oss-fused-biased-sinks", s, streamed);
+    auto mxfp4 = s;
+    mxfp4.ffn_type = DType::MXFP4;
+    add("gpt-oss-mxfp4", mxfp4);
+    add("gpt-oss-mxfp4-streamed", mxfp4, streamed);
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions kv = streamed;
+        kv.kv_type = type;
+        const char* name = type == KvCacheType::F16 ? "gpt-oss-sinks-f16kv" :
+                           type == KvCacheType::Q4_0 ? "gpt-oss-sinks-q4_0kv" : "gpt-oss-sinks-q4_1kv";
+        auto scaled = s;
+        if (type != KvCacheType::F16) {
+            scaled.qk_norm = true;
+            scaled.k_norm_outlier = 60.0f;
+        }
+        add(name, scaled, kv, type != KvCacheType::F16);
+    }
     return out;
 }
 
