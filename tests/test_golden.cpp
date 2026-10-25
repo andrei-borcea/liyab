@@ -299,6 +299,14 @@ std::vector<GoldenCase> cases() {
     s.sigmoid_gating = true;
     add("bailingmoe2-fused-qk-norm-grouped", s);
     add("bailingmoe2-fused-qk-norm-grouped-streamed", s, streamed);
+    s = {};
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_legacy = true;
+    add("deepseek2-combined-mla", s, absorbed);
+    add("deepseek2-combined-mla-expanded", s, expanded);
     return out;
 }
 

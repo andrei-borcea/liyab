@@ -281,6 +281,14 @@ sixteen experts in eight groups, four selected groups and eight selected experts
 the existing `deepseek-llm` pre-tokenizer then reproduces its IDs. No reference forward implementation is patched.
 These are random-weight checks, without a real V2-Lite regression result.
 
+Files predating split MLA projections describe the expanded head with `attention.key_length`, `value_length`
+and one KV head per query head. `describe_model()` normalizes those dimensions to the cached latent and plans
+`BlockPlan::latent_combined` from `attn_kv_b.weight`; ambiguous combined/split tensors are refused. The description
+tool compares the corresponding expanded dimensions to the observed reference geometry. At block acquisition,
+the key rows are dequantized and transposed to F32 and value rows retain their original bytes, then both use
+the existing absorbed or expanded forward pass. These copies are bounded by one block, work after rebasing a
+streaming slot, and count toward the expert-cache planning margin.
+
 ### Auxiliary index-key storage
 
 `KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. These channels are owned by

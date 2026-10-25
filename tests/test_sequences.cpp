@@ -415,6 +415,13 @@ TEST_CASE("Sequences together: latent attention takes each sequence's own form, 
             const char* names[] = {"auto", "absorbed", "expanded"};
             CHECK(check_schedule(std::string("latent ") + names[static_cast<int>(form)], path, options, mixed_plans()));
         }
+        s.mla_legacy = true;
+        const std::string& combined = model_path("latent_combined_q" + std::to_string(q_rank), s);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+            TransformerOptions options;
+            options.latent_form = form;
+            CHECK(check_schedule("latent combined", combined, options, mixed_plans()));
+        }
     }
 }
 
@@ -783,12 +790,13 @@ test::TinyModelSpec moe_spec() {
     return s;
 }
 
-test::TinyModelSpec latent_spec() {
+test::TinyModelSpec latent_spec(bool combined = false) {
     test::TinyModelSpec s;
     s.arch = "deepseek2";
     s.n_head_kv = 1;
     s.rope_dim = 32;
     s.mla_kv_rank = 64;
+    s.mla_legacy = combined;
     return s;
 }
 
@@ -806,7 +814,8 @@ TEST_CASE("Engine sequences generate together, each one's output what it gives a
     windowed.sliding_window = 16;
     windowed.post_norms = true;
     for (const Model& m : {Model{"llama", {}}, Model{"hybrid", hybrid_spec()}, Model{"moe streamed", moe_spec(), 1},
-                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed}}) {
+                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed},
+                           Model{"latent combined", latent_spec(true)}}) {
         EngineConfig config = engine_config(model_path(std::string("engine_") + m.name, m.spec), 4);
         config.expert_cache_mb = m.expert_cache_mb;
         Engine::SchedulerStats st;

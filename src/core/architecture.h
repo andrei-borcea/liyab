@@ -124,6 +124,9 @@ struct BlockPlan {
     // ModelConfig::mla). Keys and values come from one compressed latent per
     // position, which is what the KV cache stores.
     bool latent = false;
+    // Older MLA files keep per-head [key | value] expansion rows in one
+    // attn_kv_b matrix. Binding normalizes it to the split execution layout.
+    bool latent_combined = false;
     // Latent attention restricted by a lightning indexer (indexer.attn_k).
     bool indexed = false;
     // No own projections: reuse the preceding full indexer's selection.

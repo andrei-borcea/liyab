@@ -137,7 +137,7 @@ struct TinyModelSpec {
     int32_t mla_q_rank = 0;
     int32_t mla_nope = 32;
     int32_t mla_v = 32;
-    bool mla_legacy = false;  // no *_mla keys, as in files converted before attn_kv_b was split
+    bool mla_legacy = false;  // expanded-head metadata and combined attn_kv_b, before the converter split it
     // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;

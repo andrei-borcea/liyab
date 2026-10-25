@@ -431,7 +431,8 @@ What the port does differently from the POSIX platforms:
     `TransformerOptions::latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled for the
     per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the absorbed form
     multiplies the attention output back, the expanded one the latents before it expands them. Files converted
-    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again.
+    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are normalized at block acquisition: keys decoded
+    and transposed to F32, value rows copied with their original quantization, one block of temporary memory.
     Group-limited routing reads `expert_group_count` and `expert_group_used_count`: groups score their maximum
     probability without a selection bias (V2), or the sum of their two best biased probabilities with one (V3/R1).
     Experts compete only inside the chosen groups; their weights still use the unbiased probabilities, the file's
@@ -2200,6 +2201,11 @@ weights and F16 KV. DeepSeek-V3 (`e815299b0bcbac849fa540c768ef21845365c9eb`) inc
 one grouped MoE block, selecting four of eight groups before eight of sixteen experts: 485 identical IDs,
 484 positions, mean KL 0.00000 and top-1 99.38%. Both propose the existing `deepseek2` row and match all three
 tokenizer texts. These checks use random weights; the required real V2-Lite regression remains unmeasured.
+
+Older latent-attention files with combined `attn_kv_b` tensors use the same forward paths. Their expanded-head
+metadata is normalized to the latent cache layout. A block's key expansion is decoded and transposed to F32
+while its quantized value rows are copied unchanged; these temporary buffers live only while that block runs,
+including during layer streaming, and their peak bytes are reserved before sizing the expert cache.
 
 The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
 precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete

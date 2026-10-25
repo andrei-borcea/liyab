@@ -612,7 +612,8 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
             auto repacked = model->file_->requantize(
                 [&](const TensorView& t) {
                     return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
-                           t.name != "token_embd.weight" && !model->file_->converted(t);
+                           t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
+                           !model->file_->converted(t);
                 },
                 r.to);
             if (!repacked) return repacked.status();
@@ -705,8 +706,13 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "indexer.k_norm.weight"), c.index_dim, true, L.index_norm));
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "indexer.k_norm.bias"), c.index_dim, true, L.index_bias));
             }
-            LIYAB_RETURN_IF_ERROR(per_head("attn_k_b.weight", m.nope_dim, m.kv_rank, L.w[kKb]));
-            LIYAB_RETURN_IF_ERROR(per_head("attn_v_b.weight", m.kv_rank, m.v_dim, L.w[kVb]));
+            if (plan.latent_combined) {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_kv_b.weight"), m.kv_rank,
+                                             int64_t{c.n_head} * (int64_t{m.nope_dim} + m.v_dim), L.w[kKvB]));
+            } else {
+                LIYAB_RETURN_IF_ERROR(per_head("attn_k_b.weight", m.nope_dim, m.kv_rank, L.w[kKb]));
+                LIYAB_RETURN_IF_ERROR(per_head("attn_v_b.weight", m.kv_rank, m.v_dim, L.w[kVb]));
+            }
             LIYAB_RETURN_IF_ERROR(
                 matrix(block_tensor(l, "attn_output.weight"), int64_t{c.n_head} * m.v_dim, c.n_embd, L.w[kO]));
         } else if (plan.mixer == MixerKind::Attention) {
@@ -818,6 +824,53 @@ size_t Transformer::recurrent_state_bytes() const noexcept {
 // ---------------------------------------------------------------------------
 // Forward pass
 // ---------------------------------------------------------------------------
+Status CombinedLatentWeights::bind(const TensorView& source, const LatentAttention& m, int32_t n_heads) {
+    if (m.kv_rank <= 0 || m.nope_dim <= 0 || m.v_dim <= 0 || n_heads <= 0 || source.n_dims != 2 ||
+        source.ne[2] != 1 || source.ne[3] != 1 ||
+        source.cols() != m.kv_rank || source.rows() != int64_t{n_heads} * (int64_t{m.nope_dim} + m.v_dim)) {
+        return Status(ErrorCode::InvalidModel, "combined latent expansion has inconsistent dimensions");
+    }
+    DType type;
+    if (!dtype_from_ggml(static_cast<uint32_t>(source.type), type) ||
+        m.kv_rank % dtype_traits(type).block_size != 0) {
+        return Status(ErrorCode::Unsupported, "combined latent expansion needs ordinary on-disk weight rows");
+    }
+    if (source.data == nullptr || source.nbytes / source.row_bytes() < static_cast<size_t>(source.rows())) {
+        return Status(ErrorCode::InvalidModel, "combined latent expansion has incomplete weight rows");
+    }
+    const auto rank = static_cast<size_t>(m.kv_rank);
+    const auto nope = static_cast<size_t>(m.nope_dim);
+    const auto vd = static_cast<size_t>(m.v_dim);
+    const auto heads = static_cast<size_t>(n_heads);
+    if (nope > std::numeric_limits<size_t>::max() / heads / rank / sizeof(float)) {
+        return Status(ErrorCode::InvalidModel, "combined latent expansion is too large");
+    }
+    keys_.resize(heads * rank * nope);
+    values_.resize(heads * vd * source.row_bytes());
+    std::vector<float> row(rank);
+    for (size_t h = 0; h < heads; ++h) {
+        const auto start = static_cast<int64_t>(h * (nope + vd));
+        for (size_t i = 0; i < nope; ++i) {
+            quant::dequantize_row(source.type, source.row(start + static_cast<int64_t>(i)), row.data(), m.kv_rank);
+            for (size_t r = 0; r < rank; ++r) keys_[(h * rank + r) * nope + i] = row[r];
+        }
+        std::memcpy(values_.data() + h * vd * source.row_bytes(),
+                    source.row(start + m.nope_dim), vd * source.row_bytes());
+    }
+    key_ = source;
+    key_.type = DType::F32;
+    key_.n_dims = 3;
+    key_.ne = {m.nope_dim, m.kv_rank, n_heads, 1};
+    key_.data = reinterpret_cast<const uint8_t*>(keys_.data());
+    key_.nbytes = keys_.size() * sizeof(float);
+    value_ = source;
+    value_.n_dims = 3;
+    value_.ne = {m.kv_rank, m.v_dim, n_heads, 1};
+    value_.data = values_.data();
+    value_.nbytes = values_.size();
+    return Status::ok();
+}
+
 class Transformer::BlockWeights {
 public:
     BlockWeights(Transformer& model, int32_t layer) : model_(model) {
@@ -830,19 +883,30 @@ public:
                                               : model.layer_items_[static_cast<size_t>(layer)];
         if (item_ < 0) {
             model.file_->begin_layer(layer);  // mmap path: advance the prefetch window (if any)
-            return;
+        } else {
+            auto base = model.layer_source_->acquire(item_);
+            if (!base) {
+                status_ = base.status();
+                return;
+            }
+            acquired_ = true;
+            // Every block tensor lies inside the block's byte range, so its slot
+            // address is the slot base plus its offset within that range.
+            const size_t range_begin = model.file_->layer_range(layer).first;
+            for (size_t i = 0; i < kWeightRoles; ++i) {
+                if (L.w[i] != nullptr) views_[i].data = base.value() + (views_[i].file_offset - range_begin);
+            }
         }
-        auto base = model.layer_source_->acquire(item_);
-        if (!base) {
-            status_ = base.status();
-            return;
-        }
-        acquired_ = true;
-        // Every block tensor lies inside the block's byte range, so its slot
-        // address is the slot base plus its offset within that range.
-        const size_t range_begin = model.file_->layer_range(layer).first;
-        for (size_t i = 0; i < kWeightRoles; ++i) {
-            if (L.w[i] != nullptr) views_[i].data = base.value() + (views_[i].file_offset - range_begin);
+        if (L.w[kKvB] != nullptr) {
+            // The old tensor stores [head][nope + value][rank]. Absorption
+            // needs its key part transposed. Decode that part losslessly to
+            // F32, preserving the original quantized value rows byte for
+            // byte. Only this block's temporary copies exist, including under
+            // layer streaming; no on-flash cache or model-sized copy is made.
+            status_ = legacy_.bind(views_[kKvB], model.config_.mla, model.config_.n_head);
+            if (!status_.is_ok()) return;
+            views_[kKb] = legacy_.key();
+            views_[kVb] = legacy_.value();
         }
     }
     ~BlockWeights() {
@@ -865,6 +929,7 @@ private:
     bool acquired_ = false;
     Status status_;
     TensorView views_[kWeightRoles];
+    CombinedLatentWeights legacy_;
 };
 
 void Transformer::reset() noexcept {
@@ -2898,8 +2963,17 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
     // borrow theirs from the cache while they exist (ExpertStore::lend(),
     // context_state_bytes()), so the plan, and with it the requantization
     // decision, never depends on how many might be made.
+    size_t legacy_scratch = 0;
+    for (const Layer& l : layers_) {
+        if (l.w[kKvB] == nullptr) continue;
+        const auto rank = static_cast<size_t>(c.mla.kv_rank);
+        const auto heads = static_cast<size_t>(c.n_head);
+        legacy_scratch = std::max(legacy_scratch,
+            (heads * rank * static_cast<size_t>(c.mla.nope_dim) + rank) * sizeof(float) +
+            heads * static_cast<size_t>(c.mla.v_dim) * l.w[kKvB]->row_bytes());
+    }
     const size_t margin = (memory_budget > 0 ? size_t{512} << 20 : size_t{1} << 30) +
-                          static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes();
+                          static_cast<size_t>(kStateSnapshots) * recurrent_state_bytes() + legacy_scratch;
     // The budget came without the reserve (TransformerOptions::reserve_bytes),
     // which the loader set aside when it decided to stream; the cache plans
     // with it and hands back only what it can spare.

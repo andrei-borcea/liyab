@@ -217,7 +217,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32(a + ".embedding_length", static_cast<uint32_t>(s.n_embd));
     w.add_u32(a + ".feed_forward_length", static_cast<uint32_t>(s.n_ff));
     w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
-    w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.mla_legacy ? s.n_head : s.n_head_kv));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
@@ -235,8 +235,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b
         w.add_u32(a + ".attention.kv_lora_rank", static_cast<uint32_t>(s.mla_kv_rank));
         if (s.mla_q_rank > 0) w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
-        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.mla_kv_rank + s.rope_dim));
-        w.add_u32(a + ".attention.value_length", static_cast<uint32_t>(s.mla_kv_rank));
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>((s.mla_legacy ? s.mla_nope : s.mla_kv_rank) + s.rope_dim));
+        w.add_u32(a + ".attention.value_length", static_cast<uint32_t>(s.mla_legacy ? s.mla_v : s.mla_kv_rank));
         if (!s.mla_legacy) {
             w.add_u32(a + ".attention.key_length_mla", static_cast<uint32_t>(s.mla_nope + s.rope_dim));
             w.add_u32(a + ".attention.value_length_mla", static_cast<uint32_t>(s.mla_v));
@@ -408,10 +408,25 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 kv_norm[static_cast<size_t>(rank - 3)] = s.k_norm_outlier;
             }
             w.add_tensor(p + "attn_kv_a_norm.weight", {rank}, DType::F32, kv_norm);
-            w.add_tensor(p + "attn_k_b.weight", {s.mla_nope, rank, heads}, s.attn_type,
-                         random(s.mla_nope * rank * heads, s.weight_scale));
-            w.add_tensor(p + "attn_v_b.weight", {rank, s.mla_v, heads}, s.attn_type,
-                         random(rank * s.mla_v * heads, s.weight_scale));
+            const auto kb = random(s.mla_nope * rank * heads, s.weight_scale);
+            const auto vb = random(rank * s.mla_v * heads, s.weight_scale);
+            if (s.mla_legacy) {
+                std::vector<float> combined(static_cast<size_t>(heads * (s.mla_nope + s.mla_v) * rank));
+                for (int64_t h = 0; h < heads; ++h) {
+                    for (int64_t i = 0; i < s.mla_nope; ++i) {
+                        for (int64_t r = 0; r < rank; ++r) {
+                            combined[static_cast<size_t>((h * (s.mla_nope + s.mla_v) + i) * rank + r)] =
+                                kb[static_cast<size_t>((h * rank + r) * s.mla_nope + i)];
+                        }
+                    }
+                    std::copy_n(vb.data() + h * s.mla_v * rank, s.mla_v * rank,
+                                combined.data() + (h * (s.mla_nope + s.mla_v) + s.mla_nope) * rank);
+                }
+                w.add_tensor(p + "attn_kv_b.weight", {rank, heads * (s.mla_nope + s.mla_v)}, s.attn_type, combined);
+            } else {
+                w.add_tensor(p + "attn_k_b.weight", {s.mla_nope, rank, heads}, s.attn_type, kb);
+                w.add_tensor(p + "attn_v_b.weight", {rank, s.mla_v, heads}, s.attn_type, vb);
+            }
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
         } else {

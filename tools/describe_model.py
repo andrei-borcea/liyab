@@ -788,9 +788,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                     d.unknown.append(f"block {b['index']}: shared key/value latent was not established")
                     continue
                 expected = (latent_rank, int(g.key("attention.q_lora_rank", 0) or 0), scored_dim - rope_dim,
-                            int(g.key("attention.value_length_mla", 0)))
+                            int(g.key("attention.value_length_mla", vlen or 0)))
                 observed = tuple(latent[k] for k in ("kv_rank", "q_rank", "nope_dim", "v_dim"))
-                if observed != expected or head_dim != latent_rank + rope_dim or vlen != latent_rank:
+                key_mla = g.key("attention.key_length_mla")
+                value_mla = g.key("attention.value_length_mla")
+                geometry = ((n_head_kv == n_head and vlen == expected[-1]) if key_mla is None and value_mla is None
+                            else (key_mla is not None and value_mla is not None and n_head_kv == 1 and
+                                  head_dim == latent_rank + rope_dim and vlen == latent_rank))
+                if observed != expected or not geometry:
                     d.file_issues.append(f"block {b['index']}: inconsistent shared key/value latent geometry")
             d.parts.append("multi-head latent attention: reconstructed expanded keys and values from the normalized shared latent")
         else:

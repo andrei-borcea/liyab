@@ -166,21 +166,36 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (const auto kv_rank = f.get_int(key("attention.kv_lora_rank")); kv_rank && *kv_rank > 0) {
         // Multi-head latent attention. The converter states the absorbed
         // geometry (one KV head of [k_pe | latent], values the latent) and
-        // the per-head one apart (*_mla): files from before it split
-        // attn_kv_b into attn_k_b / attn_v_b have neither.
+        // the per-head one apart (*_mla). Older files describe the expanded
+        // head instead and keep attn_kv_b combined. Normalize both metadata
+        // layouts here; the block plan still records the tensor's layout.
         LatentAttention& m = c.mla;
         const auto key_mla = f.get_int(key("attention.key_length_mla"));
         const auto value_mla = f.get_int(key("attention.value_length_mla"));
-        if (!key_mla || !value_mla) {
-            return Status(ErrorCode::Unsupported,
-                          "this " + c.arch + " file predates split attn_k_b / attn_v_b tensors (no " +
-                              key("attention.key_length_mla") + "): convert the model again with a current converter");
+        if (key_mla.has_value() != value_mla.has_value()) {
+            return Status(ErrorCode::InvalidModel, "latent attention needs both key_length_mla and value_length_mla");
+        }
+        const int64_t trained_key = key_mla.value_or(c.head_dim);
+        const int64_t trained_value = value_mla.value_or(value_length.value_or(0));
+        const int64_t query_rank = f.get_int(key("attention.q_lora_rank")).value_or(0);
+        if (*kv_rank > (int64_t{1} << 20) || c.rope_dim <= 0 || int64_t{c.rope_dim} + *kv_rank > INT32_MAX ||
+            trained_key <= c.rope_dim || trained_key > INT32_MAX || trained_value <= 0 || trained_value > INT32_MAX ||
+            query_rank < 0 || query_rank > INT32_MAX) {
+            return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
         }
         m.kv_rank = static_cast<int32_t>(*kv_rank);
-        m.q_rank = static_cast<int32_t>(f.get_int(key("attention.q_lora_rank")).value_or(0));
-        m.nope_dim = static_cast<int32_t>(*key_mla - c.rope_dim);
-        m.v_dim = static_cast<int32_t>(*value_mla);
+        m.q_rank = static_cast<int32_t>(query_rank);
+        m.nope_dim = static_cast<int32_t>(trained_key - c.rope_dim);
+        m.v_dim = static_cast<int32_t>(trained_value);
         c.value_dim = static_cast<int32_t>(value_length.value_or(0));
+        if (!key_mla) {
+            if (c.n_head_kv != c.n_head) {
+                return Status(ErrorCode::InvalidModel, "combined latent attention must describe one expanded KV head per query head");
+            }
+            c.n_head_kv = 1;
+            c.head_dim = m.kv_rank + c.rope_dim;
+            c.value_dim = m.kv_rank;
+        }
         if (c.n_head_kv != 1 || c.head_dim != m.kv_rank + c.rope_dim || c.value_dim != m.kv_rank ||
             m.nope_dim <= 0 || m.v_dim <= 0 || m.q_rank < 0 || *kv_rank > (int64_t{1} << 20)) {
             return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
@@ -340,6 +355,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 // The KV cache is laid out for one kind of attention.
                 return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": latent attention tensors and " +
                                                            key("attention.kv_lora_rank") + " disagree");
+            }
+            b.latent_combined = f.tensor(block_tensor(l, "attn_kv_b.weight")) != nullptr;
+            const bool split_key = f.tensor(block_tensor(l, "attn_k_b.weight")) != nullptr;
+            const bool split_value = f.tensor(block_tensor(l, "attn_v_b.weight")) != nullptr;
+            if (b.latent && (b.latent_combined ? (split_key || split_value) : (!split_key || !split_value))) {
+                return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                    ": latent attention needs either combined attn_kv_b or both split expansion tensors");
             }
             b.indexed = f.tensor(block_tensor(l, "indexer.attn_k.weight")) != nullptr;
             if (b.indexed && (!b.latent || c.index_heads == 0)) {
