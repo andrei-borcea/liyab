@@ -176,8 +176,10 @@ scripts/build_flutter_app.sh --install
 scripts/build_flutter_app.sh --macos
 ```
 
-The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations. The
-`.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
+The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations.
+The Android build honors `CMAKE_BUILD_PARALLEL_LEVEL`; set it to limit concurrent jobs, for example
+`CMAKE_BUILD_PARALLEL_LEVEL=4 scripts/build_android.sh --experimental`. Unset uses the build generator's default.
+The `.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
 reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 
 ### Windows (x64)
