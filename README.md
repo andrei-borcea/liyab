@@ -2832,9 +2832,25 @@ tokenizer IDs, mean KL 0.00000 and top-1 100%, 99.80% and 99.80%, respectively. 
 transformers; [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts) records the scope,
 perplexities and converter compatibility details.
 
+On an M4 Pro with four CPU workers, BF16 weights and F16 KV, LFM2-350M measures **111.9 tok/s decode** and
+**145.5 tok/s prefill**; LFM2-1.2B measures **30.9 tok/s decode** and **35.3 tok/s prefill**. Decode uses 64 greedy
+tokens after the model's own chat template; prefill uses 512 tokens in one batch, the best of three runs of
+`liyab-bench --prefill`. Both models give coherent replies to the sky-color prompt. These are host CPU numbers;
+phone throughput remains to be measured.
+
 The recurrent regression cases exercise all four KV types, independent sequences, draft rollback, alternative
 tree branches, bounded prefix images restored by another engine, and CPU/GPU projection routing. A KDA check
 compares one worker with eight workers, including rollback and tree retention, to cover value-row partitioning.
 
 Recurrent-state fragments omit empty components before storage copies. ShortConv therefore stores no matrix
 fragment, and a one-tap convolution stores no history; state files retain the same zero-length fields and format.
+
+The additional recurrent paths have 13 golden cases on each of `arm64-neon-dotprod`, `x86_64-avx2` and
+`x86_64-scalar` (50 paths per platform). All 111 existing hashes retain their values and order. The full native,
+Rosetta AVX2 and Rosetta scalar suites each pass 14/14 tests, including actual Metal access on the host; the
+experimental Android build also passes with `CMAKE_BUILD_PARALLEL_LEVEL=4`.
+
+Quiet main/branch measurements of Qwen3-0.6B, Llama-3.2-1B and Qwen3.5-0.8B pass the ±3% prefill/decode gate on
+CPU and the Metal route; 33 paired CLI replies retain identical bytes. Metal's BF16 matrices fall back to the
+CPU in both revisions, so separate F16 files establish actual GPU projection timings. The protocols, warmed
+balanced followups and before/after numbers are recorded in [model descriptions](docs/model-descriptions.md#host-throughput-and-validation).

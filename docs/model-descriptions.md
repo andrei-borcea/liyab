@@ -302,3 +302,52 @@ existing 128-token minimum so that reuse is actually exercised.
 ShortConv's empty matrix state, and a one-tap convolution's empty history, are omitted from the fragment views
 used by prefix storage. Snapshot, rollback and file I/O skip empty buffers while retaining their zero lengths
 in the existing file format. This avoids null-buffer copies without changing serialized bytes.
+
+### Host throughput and validation
+
+The real LFM2 BF16 files were measured on an M4 Pro with four CPU workers and F16 KV. Decode uses 64 greedy
+tokens after the official chat template (the sky-color question); both replies coherently explain Rayleigh
+scattering. Prefill is `liyab-bench --prefill`, 512 tokens, batch 512, best of three runs. Peak RSS is the CLI's
+process peak, including the model and context.
+
+| Model | CPU decode (tok/s) | CPU prefill (tok/s) | Peak RSS (MiB) |
+| :--- | ---: | ---: | ---: |
+| LiquidAI/LFM2-350M | 111.881 | 145.5 | 706.8 |
+| LiquidAI/LFM2-1.2B | 30.917 | 35.3 | 2264.7 |
+
+The final full suites pass 14/14 on native arm64, 14/14 under Rosetta with `ROSETTA_ADVERTISE_AVX=1`, and 14/14
+under Rosetta without it. Their elapsed times were 145.88, 346.22 and 254.71 seconds, respectively. Metal tests
+ran outside the workspace sandbox so they used the actual GPU. The experimental Android script build passes
+with `CMAKE_BUILD_PARALLEL_LEVEL=4`; its dry run selects Ninja `-j 4`, while unset retains the generator's default.
+No C ABI or app sources changed, so Flutter was not run. Phone validation is performed separately.
+
+Each platform pins 50 golden paths, including 13 new recurrent cases (39 added platform/case hashes); all 111
+previous hashes and their order are unchanged. Beyond logits, regressions check KDA's one/eight-worker results,
+rollback and retained tree paths, and ShortConv's one/three-tap live/external state images, empty fields and
+restored checkpoint rings. Earlier contended x86 calibration waits exceeded the existing five-minute deadline;
+all three final suites pass without changing that deadline.
+
+Quiet baseline-main/branch comparisons use four workers, F16 KV and context 1024. CPU prefill below is
+`liyab-bench --prefill`, 512 seeded token IDs, batch 512, best of three runs; CPU decode uses CLI statistics.
+Metal prefill and decode both use CLI statistics: the complete conformance text has 524 / 499 / 524 prompt
+tokens for Qwen3 / Llama / Qwen3.5. Decode uses 64 greedy tokens, except the Qwen CPU followup's 256 tokens.
+The initial matrix alternates main/branch order over three pairs. Longer, warmed, evenly counterbalanced
+six-pair followups resolve the initial Qwen CPU decode and Llama direct-prefill run/order spread; their medians
+are used below. All initial and followup raw runs are retained. All 33 measured CLI pairs have identical output
+bytes, and every final prefill/decode comparison satisfies ±3%.
+
+Metal initializes on the actual GPU outside the workspace sandbox. It has no BF16 matrix kernel in either
+revision, so those projections fall back to CPU. The shared read-only F16 copies separately exercise actual
+Metal projections; attention and recurrent operations continue using their existing CPU routes.
+
+| Model | Route / weights | Prefill main → branch (tok/s) | Decode main → branch (tok/s) | Change prefill / decode |
+| :--- | :--- | ---: | ---: | ---: |
+| Qwen3-0.6B | CPU BF16 | 87.90 → 87.90 | 50.945 → 51.101 | +0.00% / +0.31% |
+| Qwen3-0.6B | Metal BF16 (CPU matrix fallback) | 88.37 → 87.40 | 52.449 → 53.034 | -1.10% / +1.12% |
+| Qwen3-0.6B | Metal F16 (GPU projections) | 249.84 → 249.53 | 27.516 → 27.479 | -0.12% / -0.13% |
+| Llama-3.2-1B-Instruct | CPU BF16 | 36.70 → 36.75 | 27.711 → 27.738 | +0.14% / +0.10% |
+| Llama-3.2-1B-Instruct | Metal BF16 (CPU matrix fallback) | 37.35 → 37.33 | 27.880 → 27.830 | -0.05% / -0.18% |
+| Llama-3.2-1B-Instruct | Metal F16 (GPU projections) | 150.07 → 150.18 | 32.562 → 32.662 | +0.08% / +0.31% |
+| Qwen3.5-0.8B | CPU BF16 | 84.00 → 83.90 | 53.329 → 53.348 | -0.12% / +0.04% |
+| Qwen3.5-0.8B | Metal BF16 (CPU matrix fallback) | 84.09 → 84.10 | 53.114 → 53.288 | +0.00% / +0.33% |
+| Qwen3.5-0.8B | Metal F16 (GPU projections) | 274.58 → 275.07 | 34.028 → 34.256 | +0.18% / +0.67% |
