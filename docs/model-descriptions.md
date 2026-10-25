@@ -279,6 +279,13 @@ The deeper ten-block random diagnostic is retained as a failure: mean KL 0.00001
 91.78%. Rounding its reference keys and values to F16 improves top-1 to 98.83% (maximum KL 0.00006), which
 accounts for most, but not all, of its precision sensitivity. It is not counted as passing conformance.
 
+Existing Qwen3-0.6B and Llama-3.2-1B BF16 outputs remain unchanged in 36 paired CLI comparisons. In the quiet
+performance check, six warmed pairs per configuration with alternating main/branch order kept every median
+prefill/decode change within ±3% (largest measured median change: +1.07% decode time on Qwen's Metal route).
+The CPU prefill tool processed 512 tokens; CLI prefill used 380/407-token prompts, and decode used 64-token replies.
+Llama ended the first request after seven tokens, so its decode check also used an ordinary short question;
+both sets of measurements are retained. BF16 matrix operations on the Metal route use the CPU fallback.
+
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
   leaves the attention facts unknown.

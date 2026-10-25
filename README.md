@@ -2175,6 +2175,12 @@ within the text, gives mean KL 0.00000 and top-1 99.41%. A deeper ten-block rand
 0.00001 but fails the 99% top-1 threshold (91.78%); adding F16 KV rounding to that reference improves it to
 98.83%, so precision accounts for most of that difference. That diagnostic is not a passing conformance case.
 
+Quiet baseline checks on Qwen3-0.6B and Llama-3.2-1B BF16 used six warmed pairs per configuration, alternating
+main/branch order. Median paired CPU prefill throughput changed by −0.34% / +0.27%; 64-token decode time changed
+by −0.74% / −0.42% on CPU and +1.07% / −0.17% on the Metal route. CLI prefill changes stayed within 0.11%.
+All 36 paired CLI replies were byte-identical. These BF16 Metal-route measurements use the existing CPU fallback
+for matrix operations; they do not measure native GPU matrix throughput.
+
 Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
 mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds
 slightly other weights than the Hugging Face repository (16–36% of the values of the tensors compared are equal
