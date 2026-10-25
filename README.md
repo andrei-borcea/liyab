@@ -172,6 +172,8 @@ each attention block and zero-pads unused heads, preserving the same sequence, r
 Latent attention retains uniform head geometry; files that vary its head counts are refused with a precise reason.
 Saved states of models with per-block geometry or explicit modern scalars also check the model-file fingerprint,
 so equal dimensions cannot mix contexts computed with different layouts or scales. Empty blocks create no streaming I/O items.
+Per-block geometry is checked against an independent float reference on CPU and available GPU backends. Streamed
+block projections use the existing CPU route because their reused slot addresses cannot identify persistent GPU weights.
 
 ---
 

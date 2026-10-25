@@ -96,6 +96,8 @@ The planner distinguishes softmax attention, a single linear residual projection
 FFNs are absent. Only softmax-attention blocks own KV slots. Scratch buffers and cache images use the maximum
 dimensions, with inactive KV heads stored as zeros; projections, normalization, grouped-query attention, key
 calibration and relocation use the active dimensions of the block.
+The independent float-reference check also runs through available GPU backends. Streamed block slots retain the
+CPU projection route; its quantized activation arithmetic is the reference for the streaming check.
 Latent attention still uses uniform head geometry; a file varying latent head counts is refused before loading
 the uniform projection path.
 Saved states include the file fingerprint when these arrays or modern scalar/rotation-pattern keys are present;

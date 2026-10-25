@@ -2766,6 +2766,19 @@ TEST_CASE("Per-block geometry matches an independent float reference") {
                              model->config().head_dim);
         for (const float v : padding) CHECK(v == 0.0f);
     }
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        auto gpu = make();
+        if (!gpu) continue;
+        model->reset();
+        const Route gpu_route{gpu->get(), gpu->get(), cpu.get()};
+        auto accelerated = model->forward(tokens, Transformer::Logits::All, gpu_route, pool);
+        REQUIRE(accelerated.has_value());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            const auto row = accelerated->subspan(t * vocab, vocab);
+            CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+            CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+        }
+    }
     // Swapping KV heads between equal-width query blocks preserves the file
     // size and global maxima, but a saved context must still be refused.
     std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
@@ -4477,6 +4490,11 @@ TEST_CASE("Engine routes to CPU when forced and matches the default route") {
 TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place mmap reads") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
     for (const std::string& path : {mixed_model(), model_path("streamed_nas", test::nas_spec())}) {
+    EngineConfig baseline = engine_config(path);
+    baseline.backend = BackendKind::Cpu;
+    auto reference = Engine::create(baseline);
+    REQUIRE(reference.has_value());
+    const auto expected = run(*reference.value(), prompt, greedy(20));
     for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal, BackendKind::Vulkan}) {
         EngineConfig config = engine_config(path);
         config.backend = backend;
@@ -4487,7 +4505,10 @@ TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place 
         REQUIRE(streamed.has_value());
         CHECK(streamed.value()->describe().find("triple-buffered") != std::string::npos);
         GenerationStats stats;
-        const auto expected = run(*in_place.value(), prompt, greedy(20));
+        // Streamed slots must use CPU projections: their addresses are
+        // reused and cannot key persistent GPU weight copies. Quantized GPU
+        // projections do not quantize activations as the CPU does, so an
+        // in-place GPU generation is not this path's numeric reference.
         CHECK(run(*streamed.value(), prompt, greedy(20), &stats) == expected);
         CHECK(!expected.empty());
     }
