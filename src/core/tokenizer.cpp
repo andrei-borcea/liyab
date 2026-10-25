@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <queue>
 
@@ -95,6 +97,7 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     if (!kind) return Status(ErrorCode::InvalidModel, "missing tokenizer.ggml.model");
     if (*kind == "llama") tok.kind_ = Kind::Spm;
     else if (*kind == "gpt2") tok.kind_ = Kind::Gpt2;
+    else if (*kind == "plamo3") tok.kind_ = Kind::Unigram;
     else return Status(ErrorCode::Unsupported, "tokenizer type '" + std::string(*kind) + "' is not supported");
 
     const GgufValue* tokens = model.metadata("tokenizer.ggml.tokens");
@@ -156,9 +159,13 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         if (type == kControl || type == kUnused) continue;
 
         uint8_t byte = 0;
-        if (tok.kind_ == Kind::Spm) {
+        if (tok.kind_ != Kind::Gpt2) {
             if ((type == kByte || type == kNormal) && parse_byte_token(text, byte)) {
                 piece.assign(1, static_cast<char>(byte));
+                continue;
+            }
+            if (tok.kind_ == Kind::Unigram) {
+                piece.assign(text);
                 continue;
             }
             for (size_t pos = 0; pos < text.size();) {
@@ -222,6 +229,51 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         for (size_t b = 0; b < 256; ++b) {
             const auto it = tok.lookup_.find(encoder[b]);
             tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
+        }
+    }
+    if (tok.kind_ == Kind::Unigram) {
+        if (model.metadata("tokenizer.ggml.scores") == nullptr) {
+            return Status(ErrorCode::InvalidModel, "unigram vocabulary without tokenizer.ggml.scores");
+        }
+        tok.byte_token_.fill(-1);
+        tok.unigram_scores_.resize(n);
+        tok.unigram_trie_.emplace_back();
+        for (size_t i = 0; i < n; ++i) {
+            const double score = std::nearbyint(static_cast<double>(tok.scores_[i]) * 10000.0);
+            if (!std::isfinite(score) || score < std::numeric_limits<int32_t>::min() ||
+                score > std::numeric_limits<int32_t>::max()) {
+                return Status(ErrorCode::InvalidModel, "unigram token score is outside its integer range");
+            }
+            tok.unigram_scores_[i] = static_cast<int32_t>(score);
+            uint8_t byte = 0;
+            if (tok.types_[i] == kByte && parse_byte_token(tok.texts_[i], byte)) {
+                tok.byte_token_[byte] = static_cast<int32_t>(i);
+                continue;
+            }
+            if (tok.types_[i] == kUnused) continue;
+            int32_t node = 0;
+            for (const unsigned char c : tok.texts_[i]) {
+                int32_t child = tok.unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && tok.unigram_trie_[static_cast<size_t>(child)].byte != c) {
+                    child = tok.unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) {
+                    if (tok.unigram_trie_.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                        return Status(ErrorCode::InvalidModel, "unigram vocabulary trie is too large");
+                    }
+                    child = static_cast<int32_t>(tok.unigram_trie_.size());
+                    UnigramNode entry;
+                    entry.byte = c;
+                    entry.next = tok.unigram_trie_[static_cast<size_t>(node)].child;
+                    tok.unigram_trie_.push_back(entry);
+                    tok.unigram_trie_[static_cast<size_t>(node)].child = child;
+                }
+                node = child;
+            }
+            tok.unigram_trie_[static_cast<size_t>(node)].token = static_cast<int32_t>(i);
+        }
+        if (std::find(tok.byte_token_.begin(), tok.byte_token_.end(), -1) != tok.byte_token_.end()) {
+            return Status(ErrorCode::InvalidModel, "unigram vocabulary lacks byte fallback tokens");
         }
     }
     tok.special_.assign(n, false);
@@ -350,6 +402,10 @@ Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool 
     if (kind_ == Kind::Gpt2 && !pre_) return pre_error_;
     const auto initial = initial_tokens(text, add_bos);
     std::vector<int32_t> out(initial.begin(), initial.end());
+    if (kind_ == Kind::Unigram) {
+        encode_unigram(text, out);
+        return out;
+    }
     // Split around control-token texts; plain segments go through SPM. As in
     // llama.cpp, a segment gets the space prefix when it starts the text or
     // follows a control token.
@@ -454,6 +510,87 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
             if (byte_it != lookup_.end()) out.push_back(byte_it->second);
             else out.push_back(unk_);  // -1 when the vocabulary has no <unk>: reported by encode()
         }
+    }
+}
+
+void Tokenizer::encode_unigram(std::string_view text, std::vector<int32_t>& out) const {
+    std::vector<uint32_t> chars;
+    std::vector<size_t> offsets;
+    for (size_t at = 0; at < text.size();) {
+        offsets.push_back(at);
+        chars.push_back(unicode::decode_utf8(text, at));
+    }
+    offsets.push_back(text.size());
+    const size_t n = chars.size();
+    std::vector<bool> boundary(n + 1, false);
+    boundary[0] = boundary[n] = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (chars[i] == 0xee00) boundary[i] = boundary[i + 1] = true;
+    }
+    // Match <|plamo:[^|\s]{0,64}|>. These boundaries also protect unknown
+    // special spellings from merging with their surrounding prose.
+    for (size_t i = 0; i < n; ++i) {
+        if (!text.substr(offsets[i]).starts_with("<|plamo:")) continue;
+        size_t end = i + 8;
+        while (end < n && end - (i + 8) < 64 && chars[end] != '|' && !unicode::is_whitespace(chars[end]) &&
+               !(chars[end] >= 0x1c && chars[end] <= 0x1f)) ++end;
+        if (end + 1 < n && chars[end] == '|' && chars[end + 1] == '>') {
+            boundary[i] = boundary[end + 2] = true;
+            i = end + 1;
+        }
+    }
+    // The plamo3 scheme uses the authors' hard splits around runs of two
+    // spaces or four repeated characters (Python '.' excludes a newline).
+    for (size_t i = 0; i < n;) {
+        size_t end = i + 1;
+        while (end < n && !boundary[end] && chars[end] == chars[i]) ++end;
+        if ((chars[i] == ' ' && end - i >= 2) || (chars[i] != '\n' && end - i >= 4)) {
+            boundary[i] = boundary[end] = true;
+        }
+        i = end;
+    }
+    std::vector<int64_t> costs(n + 1);
+    std::vector<size_t> next(n);
+    std::vector<int32_t> token(n, -1);
+    for (size_t start = 0; start < n;) {
+        if (chars[start] == 0xee00) { ++start; continue; }  // the reference's invisible boundary marker
+        size_t end = start + 1;
+        while (end < n && !boundary[end]) ++end;
+        costs[end] = 0;
+        for (size_t i = end; i-- > start;) {
+            costs[i] = costs[i + 1] + 10000000;  // one unknown Unicode character, then byte fallback
+            next[i] = i + 1;
+            int32_t node = 0;
+            size_t after = i + 1;
+            for (size_t pos = offsets[i]; pos < offsets[end]; ++pos) {
+                int32_t child = unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && unigram_trie_[static_cast<size_t>(child)].byte != static_cast<unsigned char>(text[pos])) {
+                    child = unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) break;
+                node = child;
+                if (pos + 1 != offsets[after]) continue;
+                const int32_t id = unigram_trie_[static_cast<size_t>(node)].token;
+                if (id >= 0 && unigram_scores_[static_cast<size_t>(id)] > -20000000) {
+                    const int64_t candidate = costs[after] - unigram_scores_[static_cast<size_t>(id)];
+                    // Equal costs choose the longest prefix, like the
+                    // reference's table sorted by descending piece length.
+                    if (candidate <= costs[i]) {
+                        costs[i] = candidate;
+                        token[i] = id;
+                        next[i] = after;
+                    }
+                }
+                ++after;
+            }
+        }
+        for (size_t i = start; i < end; i = next[i]) {
+            if (token[i] >= 0) out.push_back(token[i]);
+            else for (size_t pos = offsets[i]; pos < offsets[i + 1]; ++pos) {
+                out.push_back(byte_token_[static_cast<unsigned char>(text[pos])]);
+            }
+        }
+        start = end;
     }
 }
 

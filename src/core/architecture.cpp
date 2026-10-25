@@ -144,6 +144,11 @@ constexpr ArchSpec kArchitectures[] = {
     // Deci / Nemotron-NAS: block geometry comes from scalar or per-block
     // head_count, head_count_kv and feed_forward_length, and the tensors.
     {"deci", RopeLayout::Adjacent, "ffn_norm", false},
+    // PLaMo 3: fused QKV and gate/up, folded RMSNorm offsets, Q/K norms,
+    // sandwich norms and windowed blocks with an unscaled local RoPE base.
+    {.name = "plamo3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm", .post_ffn_norm = "post_ffw_norm", .swa_period = 8,
+     .rope_base_swa = 10000.0f},
 };
 
 }  // namespace
@@ -167,6 +172,12 @@ std::string block_tensor(int32_t block, std::string_view suffix) {
     char buf[96];
     std::snprintf(buf, sizeof buf, "blk.%d.%.*s", block, static_cast<int>(suffix.size()), suffix.data());
     return buf;
+}
+
+std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string_view suffix) {
+    const std::string weighted = block_tensor(block, std::string(suffix) + ".weight");
+    const std::string bare = block_tensor(block, suffix);
+    return file.tensor(weighted) != nullptr || file.tensor(bare) == nullptr ? weighted : bare;
 }
 
 Result<ModelConfig> describe_model(const MmapLoader& f) {
@@ -560,7 +571,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         // feeds it the residual stream as it is, and normalizes its output
         // instead. A block with neither norm is a damaged file, not a variant.
         auto has = [&](std::string_view suffix) {
-            return !suffix.empty() && f.tensor(block_tensor(l, std::string(suffix) + ".weight")) != nullptr;
+            return !suffix.empty() && f.tensor(block_norm_tensor(f, l, suffix)) != nullptr;
         };
         b.norm_before_mixer = has("attn_norm");
         b.norm_before_ffn = has(c.spec->ffn_norm);

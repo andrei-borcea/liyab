@@ -691,7 +691,7 @@ Status Transformer::bind_weights() {
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
         const int64_t q_dim = int64_t{plan.n_head} * c.head_dim;
         const int64_t kv_dim = int64_t{plan.n_head_kv} * c.head_dim;
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, plan.norm_before_mixer, L.attn_norm));
+        LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, "attn_norm"), c.n_embd, plan.norm_before_mixer, L.attn_norm));
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -766,13 +766,13 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), c.n_embd, c.n_embd, L.w[kO]));
         }
         LIYAB_RETURN_IF_ERROR(
-            vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd, plan.norm_before_ffn, L.ffn_norm));
+            vec(block_norm_tensor(f, l, c.spec->ffn_norm), c.n_embd, plan.norm_before_ffn, L.ffn_norm));
         if (!c.spec->post_mixer_norm.empty()) {
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->post_mixer_norm), c.n_embd,
                                       false, L.post_mixer_norm));
         }
         if (!c.spec->post_ffn_norm.empty()) {
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_ffn_norm) + ".weight"), c.n_embd,
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->post_ffn_norm), c.n_embd,
                                       false, L.post_ffn_norm));
         }
         if (plan.ffn == FfnKind::Dense) {

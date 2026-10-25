@@ -138,6 +138,16 @@ std::vector<GoldenCase> cases() {
     std::fill(s.block_ff.begin(), s.block_ff.end(), 0);
     add("deci-no-branches", s);
     s = {};
+    s.arch = "plamo3";
+    s.n_layers = 8;
+    s.qk_norm = s.post_norms = s.bare_post_norms = s.fused_qkv = s.fused_gate_up = true;
+    s.sliding_window = 12;
+    s.rope_base = 1000000.0f;
+    s.yarn_factor = 256.0f;
+    s.yarn_ctx = 4096;
+    s.yarn_truncate = false;
+    add("plamo3-bare-norms-local-yarn", s);
+    s = {};
     s.tied_output = true;
     s.rope_freqs = true;
     s.rope_scale = 2.0f;

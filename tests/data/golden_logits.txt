@@ -48,6 +48,7 @@ arm64-neon-dotprod deci-block-geometry 66882118a85fa96b
 arm64-neon-dotprod deci-block-geometry-keyscaled 4b9e5e0950a9c73d
 arm64-neon-dotprod deci-no-branches 773d58c969935958
 arm64-neon-dotprod mistral3-temperature-keyscaled 3c7cce75e74ddb77
+arm64-neon-dotprod plamo3-bare-norms-local-yarn cd5ffefb4714d98a
 x86_64-avx2 deepseek2-mla 191166464f5adf1d
 x86_64-avx2 deepseek2-mla-expanded 38ed3ca545816896
 x86_64-avx2 deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c
@@ -96,6 +97,7 @@ x86_64-avx2 mistral3-temperature-keyscaled 3c7cce75e74ddb77
 x86_64-avx2 mistral3-yarn-temperature 89949615b45e39ae
 x86_64-avx2 olmo2-post-only-whole-qk e1a690486c2ac9cf
 x86_64-avx2 smollm3-nope 1c616d8cc476bb3f
+x86_64-avx2 plamo3-bare-norms-local-yarn cd5ffefb4714d98a
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
 x86_64-scalar deepseek2-mla-expanded 3ed966c7eb7877ca
 x86_64-scalar deepseek2-mla-expanded-f16kv e2777a2c65681852
@@ -144,3 +146,4 @@ x86_64-scalar mistral3-temperature-keyscaled e9a03febb5ea6814
 x86_64-scalar mistral3-yarn-temperature d3fe006564d776ee
 x86_64-scalar olmo2-post-only-whole-qk 9caac0ab4edb6f49
 x86_64-scalar smollm3-nope d5bc01af60d4f0fe
+x86_64-scalar plamo3-bare-norms-local-yarn 4877242fa9d374f5

@@ -8939,5 +8939,374 @@
     "output": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
    }
   ]
+ },
+ "plamo3": {
+  "template": "{{- bos_token + '<|plamo:tag|>' -}}\n{%- if messages|length > 0 and messages[0][\"role\"] == \"system\" -%}\n    {{- 'system' -}}\n    {{- '<|plamo:msg|>' + messages[0]['content'] + '<|plamo:tag|>' -}}\n    {%- set messages_ = messages[1:] -%}\n{%- else -%}\n    {%- set messages_ = messages -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- for tool in tools -%}\n        {{- 'tool_definition' -}}\n        {{- '<|plamo:constrain|>json' -}}\n        {#- Do not use \"+\" to avoid escaping \"<>\" -#}\n        {{- '<|plamo:msg|>' -}}{{- (tool['function']|tojson) -}}{{- '<|plamo:tag|>' -}}\n    {%- endfor -%}\n{%- endif -%}\n{%- macro assistant_role_message_header(allow_reasoning, allow_tool_request) -%}\n    {{- 'assistant' -}}\n    {%- set assistant_functions = [] -%}\n    {%- if allow_tool_request -%}\n        {%- set assistant_functions = assistant_functions + ['tool_request'] -%}\n    {%- endif -%}\n    {%- if allow_reasoning -%}\n        {%- set assistant_functions = assistant_functions + ['think'] -%}\n    {%- endif -%}\n    {%- if assistant_functions -%}\n        {{- '<|plamo:key|>functions<|plamo:val|>' + (assistant_functions|join(',')) -}}\n    {%- endif -%}\n    {%- if allow_tool_request -%}\n        {{- '<|plamo:key|>tool_format<|plamo:val|>json' -}}\n    {%- endif -%}\n    {{- '<|plamo:msg|>' -}}\n{% endmacro %}\n{%- for message in messages_ -%}\n    {%- set skip_plamo_tag = False -%}\n    {%- if message['role'] == 'assistant' -%}\n        {#- Support both 'reasoning' and deprecated 'reasoning_content' -#}\n        {%- set reasoning_ = (message.get('reasoning_content') or message.get('reasoning')) -%}\n        {{- assistant_role_message_header(allow_reasoning=True, allow_tool_request=tools) -}}\n        {#- Reasoning -#}\n        {%- if reasoning_ -%}\n            {{- '<|plamo:begin_think:plamo|>' -}}\n                {{- reasoning_ -}}\n            {{- '<|plamo:end_think:plamo|>' -}}\n        {%- endif -%}\n        {#- Content -#}\n        {%- if 'content' in message and message['content'] -%}\n            {{- message['content'] -}}\n        {%- endif -%}\n        {#- Function calling -#}\n        {%- if tools and 'tool_calls' in message and message['tool_calls'] -%}\n            {{- '<|plamo:begin_tool_requests:plamo|>' -}}\n            {%- for tool_call in message['tool_calls'] -%}\n                {{- '<|plamo:begin_tool_request:plamo|>' -}}\n                    {{- '<|plamo:begin_tool_name:plamo|>' -}}\n                        {{- tool_call['function']['name'] -}}\n                    {{- '<|plamo:end_tool_name:plamo|>' -}}\n                    {{- '<|plamo:begin_tool_arguments:plamo|>' -}}\n                        {{- '<|plamo:constrain|>json' -}}\n                        {%- set arguments_ = tool_call['function']['arguments'] -%}\n                        {#- arguments_ should be a dict but a JSON string is also supported -#}\n                        {%- if arguments_ is string -%}\n                            {{- '<|plamo:msg|>' + arguments_ -}}\n                        {%- else -%}\n                            {#- Do not use \"+\" to avoid escaping \"<>\" -#}\n                            {{- '<|plamo:msg|>' -}}{{- (arguments_|tojson) -}}\n                        {%- endif -%}\n                    {{- '<|plamo:end_tool_arguments:plamo|>' -}}\n                {{- '<|plamo:end_tool_request:plamo|>' -}}\n            {%- endfor -%}\n            {{- '<|plamo:end_tool_requests:plamo|>' -}}\n        {%- endif -%}\n        {%- set skip_plamo_tag = False if reasoning_ else True -%}\n    {%- elif message['role'] == 'tool' -%}\n        {{- 'tool_response' -}}\n        {{- '<|plamo:msg|>' + message['content'] -}}\n    {%- else -%}\n        {{- message['role'] -}}\n        {{- '<|plamo:msg|>' + message['content'] -}}\n    {%- endif -%}\n    {%- if not (loop.last and continue_final_message) and not skip_plamo_tag -%}\n        {{- '<|plamo:tag|>' -}}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- assistant_role_message_header(allow_reasoning=True, allow_tool_request=tools) -}}\n{%- elif continue_final_message -%}\n    {#- append nothing -#}\n{%- endif -%}\n",
+  "special": {
+   "bos_token": "<|plamo:bos|>",
+   "eos_token": "<|plamo:eos|>",
+   "unk_token": "<|plamo:unk|>",
+   "pad_token": "<|plamo:pad|>"
+  },
+  "cases": [
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>Rome.user<|plamo:msg|>And of France? Answer in one word.<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": false
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>Rome.user<|plamo:msg|>And of France? Answer in one word.<|plamo:tag|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      }
+     ]
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>Rome."
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|><think>\nThe user asks about Italy.\n</think>\n\nRome.user<|plamo:msg|>And of France? Answer in one word.<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome.",
+       "reasoning_content": "Italy's capital is Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|><|plamo:begin_think:plamo|>Italy's capital is Rome.<|plamo:end_think:plamo|>Rome.<|plamo:tag|>user<|plamo:msg|>And of France? Answer in one word.<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": false
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true,
+     "preserve_thinking": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|><think>\nThe user asks about Italy.\n</think>\n\nRome.user<|plamo:msg|>And of France? Answer in one word.<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>You are a concise assistant.<|plamo:tag|>tool_definition<|plamo:constrain|>json<|plamo:msg|>{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}<|plamo:tag|>tool_definition<|plamo:constrain|>json<|plamo:msg|>{\"name\": \"add\", \"description\": \"Adds two numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}}}<|plamo:tag|>user<|plamo:msg|>Weather in Rome?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>tool_request,think<|plamo:key|>tool_format<|plamo:val|>json<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      },
+      {
+       "role": "assistant",
+       "content": "",
+       "tool_calls": [
+        {
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": {
+           "city": "Rome"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>tool_definition<|plamo:constrain|>json<|plamo:msg|>{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}<|plamo:tag|>tool_definition<|plamo:constrain|>json<|plamo:msg|>{\"name\": \"add\", \"description\": \"Adds two numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}}}<|plamo:tag|>user<|plamo:msg|>Weather in Rome?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>tool_request,think<|plamo:key|>tool_format<|plamo:val|>json<|plamo:msg|><|plamo:begin_tool_requests:plamo|><|plamo:begin_tool_request:plamo|><|plamo:begin_tool_name:plamo|>get_weather<|plamo:end_tool_name:plamo|><|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>{\"city\": \"Rome\"}<|plamo:end_tool_arguments:plamo|><|plamo:end_tool_request:plamo|><|plamo:end_tool_requests:plamo|>tool_response<|plamo:msg|>{\"temp\": 21, \"sky\": \"clear\"}<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>tool_request,think<|plamo:key|>tool_format<|plamo:val|>json<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "  Città: Zürich, 東京 🌍  \n"
+      },
+      {
+       "role": "user",
+       "content": "\n  ¿Qué tal?  \t"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|>  Città: Zürich, 東京 🌍  \n<|plamo:tag|>user<|plamo:msg|>\n  ¿Qué tal?  \t<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": ""
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|plamo:bos|><|plamo:tag|>system<|plamo:msg|><|plamo:tag|>user<|plamo:msg|>What is the capital of Italy?<|plamo:tag|>assistant<|plamo:key|>functions<|plamo:val|>think<|plamo:msg|>"
+   }
+  ]
  }
 }

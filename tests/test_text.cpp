@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -612,6 +613,83 @@ TEST_CASE("SentencePiece scheme prefixes stay outside reusable segments and are 
             REQUIRE(segments.size() == 1);
             CHECK(segments[0].begin == 2 && segments[0].end == 3);
         }
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("Unigram segmentation minimizes integer costs, keeps hard boundaries and falls back by byte") {
+    for (const bool tie : {false, true}) {
+        test::GgufWriter w;
+        std::vector<std::string> tokens = {"<|plamo:unk|>"};
+        std::vector<int32_t> types = {2};
+        std::vector<float> scores = {0};
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+            types.push_back(6);
+            scores.push_back(-100);
+        }
+        auto add = [&](std::string text, float score) {
+            tokens.push_back(std::move(text)); types.push_back(1); scores.push_back(score);
+            return static_cast<int32_t>(tokens.size() - 1);
+        };
+        const int32_t a = add("a", -1), b = add("b", -1), c = add("c", -1);
+        add("ab", -5);
+        const int32_t bc = add("bc", 0), abc = add("abc", tie ? -1 : -3);
+        const int32_t x = add("x", -1), y = add("y", -1), spaces = add("  ", -1);
+        add("x  y", 0);
+        const int32_t z = add("z", -1), repeated = add("aaaa", 0);
+        add("zaaaab", 0);
+        const int32_t special = add("<|plamo:test|>", 0);
+        add("x<|plamo:test|>y", 0);
+        const int32_t newlines = add("z\n\n\n\nb", 0);
+        w.add_string("tokenizer.ggml.model", "plamo3");
+        w.add_string_array("tokenizer.ggml.tokens", tokens);
+        w.add_i32_array("tokenizer.ggml.token_type", types);
+        w.add_f32_array("tokenizer.ggml.scores", scores);
+        const std::string path = test::temp_dir() + "/liyab_unigram.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        REQUIRE(tok.has_value());
+        CHECK(tok->encode("abc", false).value() == (tie ? std::vector<int32_t>{abc} : std::vector<int32_t>{a, bc}));
+        CHECK(tok->encode("a🌍c", false).value() == (std::vector<int32_t>{a, 1 + 0xf0, 1 + 0x9f, 1 + 0x8c, 1 + 0x8d, c}));
+        CHECK(tok->encode("x  y", false).value() == (std::vector<int32_t>{x, spaces, y}));
+        CHECK(tok->encode("zaaaab", false).value() == (std::vector<int32_t>{z, repeated, b}));
+        CHECK(tok->encode("x<|plamo:test|>y", false).value() == (std::vector<int32_t>{x, special, y}));
+        CHECK(tok->encode("z\n\n\n\nb", false).value() == (std::vector<int32_t>{newlines}));
+        CHECK(tok->encode("a\xee\xb8\x80" "b", false).value() == (std::vector<int32_t>{a, b}));
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("Unigram vocabularies reject invalid scores and missing fallback bytes") {
+    for (const bool bad_score : {false, true}) {
+        test::GgufWriter w;
+        std::vector<std::string> tokens;
+        std::vector<int32_t> types(256, 6);
+        std::vector<float> scores(256, -100);
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+        }
+        if (bad_score) scores[0] = std::numeric_limits<float>::infinity();
+        else types[0] = 5;
+        w.add_string("tokenizer.ggml.model", "plamo3");
+        w.add_string_array("tokenizer.ggml.tokens", tokens);
+        w.add_i32_array("tokenizer.ggml.token_type", types);
+        w.add_f32_array("tokenizer.ggml.scores", scores);
+        const std::string path = test::temp_dir() + "/liyab_bad_unigram.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        REQUIRE(!tok.has_value());
+        CHECK(tok.status().code() == ErrorCode::InvalidModel);
+        CHECK(tok.status().message().find(bad_score ? "score" : "byte fallback") != std::string::npos);
         std::remove(path.c_str());
     }
 }

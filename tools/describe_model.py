@@ -380,6 +380,8 @@ class Engine:
             self.rows[values["name"]] = (values, entry)
         transformer = read("src/core/transformer.cpp")
         self.block_tensors = set(re.findall(r'block_tensor\(\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
+        norms = set(re.findall(r'block_norm_tensor\(\s*\w+\s*,\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
+        self.block_tensors |= norms | {name + ".weight" for name in norms}
         self.block_tensors |= set(re.findall(r'experts\(\s*"([^"]+)"', transformer))
         literals = set(re.findall(r'"([a-z][a-z0-9_]*\.(?:weight|bias))"', transformer))
         self.global_tensors = {t for t in literals if t not in self.block_tensors}
@@ -1043,7 +1045,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 if base is None:
                     d.unknown.append("cannot read the windowed blocks' RoPE base")
                 else:
-                    base = float(f"{base:.6g}")
+                    # Prefer the file's exact scalar once its full frequency
+                    # table is verified; inversion of one F32 frequency can
+                    # turn a base of 10000 into 9999.98.
+                    base = float(g.key("rope.freq_base_swa", float(f"{base:.6g}")))
                     if check_table(t["name"], "windowed blocks", rope_base=base):
                         base_swa = base
                         fb = g.key("rope.freq_base_swa")
@@ -1213,7 +1218,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if b0 is not None and ckpt is not None:
         i = b0["index"]
         candidates = {s: g.values(f"blk.{i}.{s}").reshape(-1) for s in blocks.get(i, set())
-                      if s.endswith(".weight") and len(g.tensors[f"blk.{i}.{s}"]["dims"]) == 1
+                      if len(g.tensors[f"blk.{i}.{s}"]["dims"]) == 1
                       and g.tensors[f"blk.{i}.{s}"]["dims"][0] == n_embd}
         for r in roles:
             info = b0.get(r)
@@ -1227,7 +1232,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             want = w + info.get("weight_offset", 1.0 if info["formula"] == "rms_1p" else 0.0)
             hits = [s for s, v in candidates.items() if v.shape == want.shape and _rel_err(v, want) < 1e-2]
             if len(hits) == 1:
-                norm_names[r] = hits[0][: -len(".weight")]
+                norm_names[r] = hits[0].removesuffix(".weight")
             elif not hits:
                 stored_raw = [s for s, v in candidates.items() if v.shape == w.shape and _rel_err(v, w) < 1e-2]
                 if info["formula"] == "rms_1p" and stored_raw:
@@ -1434,7 +1439,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         pass  # the block's structure is already not the engine's
     elif all(f in d.fields for f in norm_fields):
         names = {row.get(f) for f in norm_fields if row.get(f)}
-        bound = engine.block_tensors | {n + ".weight" for n in names}
+        bound = engine.block_tensors | names | {n + ".weight" for n in names}
         unused = {}
         for b in range(n_layers):
             for s in blocks.get(b, set()) - bound:
@@ -1522,6 +1527,13 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
                        f"are left to the gate")
         return
     kind = g.metadata.get("tokenizer.ggml.model")
+    if kind == "plamo3":
+        for field, expected in (("break_around_consecutive_spaces_threshold", 2),
+                                ("break_around_repeated_chars_threshold", 4)):
+            actual = getattr(tok, field, None)
+            if actual != expected:
+                d.file_issues.append(f"plamo3 tokenizer {field}={actual}; its GGUF scheme uses {expected} "
+                                     "and the converter does not record alternate thresholds")
     bos = g.metadata.get("tokenizer.ggml.bos_token_id")
     add_bos = g.metadata.get("tokenizer.ggml.add_bos_token", kind == "llama")
     add_bos = bool(add_bos) and bos is not None

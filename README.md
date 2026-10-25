@@ -157,6 +157,11 @@ the stored weights. Native SDPA traces check causal/window masks and report addi
 The `chatglm-spm` tokenizer scheme adds its `[gMASK], sop` prefix when initial special tokens are requested,
 recognizes a prefix already written by a chat template, and keeps automatic prefix tokens outside reusable segments.
 Template fixtures also cover ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder (14 cases each).
+The `plamo3` tokenizer uses integer-score unigram segmentation with byte fallback, preserving raw spaces and
+Unicode. It keeps the authors' boundaries around special spellings, repeated characters and consecutive spaces.
+Norm vectors accept the converter's bare names as well as names ending in `.weight`, including PLaMo3's post norms.
+PLaMo3's two-block tiny case (local/global attention, an eight-token window) gives mean KL 0.00000 and 99.61% top-1.
+Its real-model gate remains pending; the eight-block tiny case gives 98.83% top-1 with F16 KV, below the tiny threshold.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the

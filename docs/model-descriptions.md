@@ -132,6 +132,20 @@ ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder templates have 14 r
 ChatGLM3's tiny forward pass matches after adding its prefix, but the published converter also renames the
 SentencePiece BOS/EOS strings and marks more literal spellings as control tokens than its official tokenizer
 recognizes by default. Its three-text tokenizer gate therefore remains incomplete.
+The `plamo3` tokenizer scheme reads the converter's raw vocabulary and scores, rounds scores to the reference's
+integer units and finds the minimum-cost segmentation, preferring the longest prefix on ties. A Unicode character
+without a piece uses byte fallback. Its scheme fixes boundaries around `<|plamo:...|>` spellings, runs of two spaces
+and four repeated non-newline characters; raw whitespace is preserved. Missing byte tokens and invalid scores are
+refused when loading. PLaMo3's block row combines existing sandwich norms, fused projections and local/global RoPE.
+The converter does not record alternate boundary thresholds: the description tool refuses a reference using
+values other than the `plamo3` scheme's two spaces and four repeated characters.
+Norm names resolve both `.weight` and bare vector tensors through one helper shared by planning and loading. The
+description tool verifies either spelling against the reference's offset-folded weights.
+For `pfnet/plamo-3-610m-fin-instruct`, a tiny checkpoint with two blocks, window 8 and period 2 exercises both block
+kinds: identical 512 reference IDs, mean KL 0.00000 and top-1 99.61% with F16 KV. Keeping the original eight-block
+period instead gives mean KL 0.00000 (maximum 0.00005) and top-1 98.83%, below the tiny acceptance threshold. Its
+real-model gate is pending. The original-period file proposes the registered `plamo3` row exactly; the two-block
+file's explicit metadata overrides its period, and the tool proposes period 2 for that reduced configuration.
 
 ## The conformance gate
 

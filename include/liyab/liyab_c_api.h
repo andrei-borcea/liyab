@@ -250,6 +250,8 @@ LIYAB_C_API liyab_status liyab_engine_generate_tokens(liyab_engine* engine, cons
  * Tokenizes `text` (UTF-8). Writes up to `capacity` ids into `out` (may be
  * NULL with capacity 0) and returns the total number of tokens, or -1 on
  * error (see liyab_last_error()).
+ * Nonzero add_bos requests the model's initial special tokens (BOS, or the
+ * scheme's prefix); a prefix already written in text is kept once.
  */
 LIYAB_C_API int32_t liyab_engine_tokenize(const liyab_engine* engine, const char* text, int32_t add_bos, int32_t* out,
                                           int32_t capacity);

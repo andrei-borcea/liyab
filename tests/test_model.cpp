@@ -288,6 +288,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.yarn_beta_fast > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_fast", s.yarn_beta_fast);
         if (s.yarn_beta_slow > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_slow", s.yarn_beta_slow);
         if (s.yarn_log_mul != 0.0f) w.add_f32(a + ".rope.scaling.yarn_log_multiplier", s.yarn_log_mul);
+        if (!s.yarn_truncate) w.add_bool(a + ".rope.scaling.yarn_truncate", false);
     }
     if (s.attn_softcap > 0.0f) w.add_f32(a + ".attn_logit_softcapping", s.attn_softcap);
     if (s.final_softcap > 0.0f) w.add_f32(a + ".final_logit_softcapping", s.final_softcap);
@@ -481,9 +482,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
         if (s.post_norms || s.post_only_norms) {  // Gemma / OLMo: norms after both residual branches
             if (heads > 0 || kv_heads > 0) {
-                w.add_tensor(p + "post_attention_norm.weight", {d}, DType::F32, norm_weights(d));
+                w.add_tensor(p + "post_attention_norm" + (s.bare_post_norms ? "" : ".weight"), {d}, DType::F32, norm_weights(d));
             }
-            if (ff > 0 || s.n_expert > 0) w.add_tensor(p + "post_ffw_norm.weight", {d}, DType::F32, norm_weights(d));
+            if (ff > 0 || s.n_expert > 0) w.add_tensor(p + "post_ffw_norm" + (s.bare_post_norms ? "" : ".weight"), {d}, DType::F32, norm_weights(d));
         }
         if (ff == 0 && s.n_expert == 0) continue;
         const std::vector<float> gate = random(d * ff, s.weight_scale);

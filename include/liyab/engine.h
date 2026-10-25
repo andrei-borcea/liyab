@@ -681,9 +681,11 @@ public:
     // foreground request that follows.
     void cancel_prefill() noexcept;
 
-    // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token),
-    // and not to a text that already starts with the BOS token's text (a
-    // chat template wrote it).
+    // Tokenizes UTF-8 into owned ids; thread-safe, without changing context.
+    // `add_bos` requests the model's initial special tokens: normally BOS
+    // (tokenizer.ggml.add_bos_token), or [gMASK], sop for chatglm-spm. A
+    // prefix already spelled by the text is not added again. Unsupported
+    // for an unknown tokenizer scheme; InvalidArgument for unencodable bytes.
     [[nodiscard]] Result<std::vector<int32_t>> tokenize(std::string_view text, bool add_bos) const;
     [[nodiscard]] std::string token_to_piece(int32_t token) const;
 

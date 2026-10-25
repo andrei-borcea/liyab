@@ -109,6 +109,7 @@ struct TinyModelSpec {
     float rope_base = 10000.0f;  // rope.freq_base (of the global blocks when some are windowed)
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
+    bool bare_post_norms = false; // omit their .weight suffix, as the PLaMo3 converter does
     bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
     // ffn_up holds [gate | up], no ffn_gate (Phi-3); with n_expert > 0, ffn_gate_up_exps holds each
     // expert's [gate | up] (the split tensors' weights, as a converter fuses them)
@@ -130,6 +131,7 @@ struct TinyModelSpec {
     float yarn_beta_fast = 0.0f;
     float yarn_beta_slow = 0.0f;
     float yarn_log_mul = 0.0f;
+    bool yarn_truncate = true;  // false writes the fractional YaRN-ramp convention
     // > 0: attn_logit_softcapping / final_logit_softcapping (Gemma 2) and
     // attention.scale, the q·k scale the file states. Metadata only.
     float attn_softcap = 0.0f;

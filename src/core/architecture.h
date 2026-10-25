@@ -71,7 +71,8 @@ struct ArchSpec {
     // Suffixes of the norms applied to the mixer's and the FFN's outputs
     // before their residual adds ("sandwich" norms: Gemma's
     // post_attention_norm and post_ffw_norm). Bound where a block has them;
-    // empty: the architecture has none.
+    // empty: the architecture has none. Both <suffix>.weight and a bare
+    // <suffix> vector are accepted (the published converter writes both).
     std::string_view post_mixer_norm = {};
     std::string_view post_ffn_norm = {};
     // Token embeddings are multiplied by sqrt(n_embd) before the first block.
@@ -119,6 +120,10 @@ const ArchSpec* find_architecture(std::string_view name) noexcept;
 
 // GGUF name of a block tensor: "blk.<block>.<suffix>".
 std::string block_tensor(int32_t block, std::string_view suffix);
+// Resolves a norm vector's name: prefer <suffix>.weight, else the bare
+// suffix when present. A missing vector returns the conventional .weight
+// name, so required bindings retain their precise missing-tensor error.
+std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string_view suffix);
 
 // How a mixture-of-experts router turns logits into expert probabilities.
 enum class MoeGating : uint8_t { Softmax, Sigmoid };

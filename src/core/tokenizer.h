@@ -1,4 +1,4 @@
-// Liyab — GGUF vocabulary: SentencePiece-BPE and byte-level BPE encoding,
+// Liyab — GGUF vocabulary: SentencePiece-BPE, byte-level BPE and unigram encoding,
 // decoding (internal). Byte-level BPE pre-tokenizers come from a table keyed
 // by tokenizer.ggml.pre (core/pre_tokenizer.h).
 #ifndef LIYAB_CORE_TOKENIZER_H
@@ -20,7 +20,7 @@ namespace liyab {
 
 class Tokenizer {
 public:
-    enum class Kind { Spm, Gpt2 };
+    enum class Kind { Spm, Gpt2, Unigram };
 
     // Loads vocabulary metadata. Scores may be F32 or the converter's I32
     // Tekken ranks; lengths and element types must match the vocabulary.
@@ -102,9 +102,18 @@ private:
         int32_t id;    // the token the pair becomes
     };
     std::unordered_map<uint64_t, Merge> merges_;  // BPE: (left id << 32 | right id) -> merge
-    std::array<int32_t, 256> byte_token_{};       // BPE: each byte's token, -1 when the vocabulary lacks it
+    std::array<int32_t, 256> byte_token_{};       // BPE/unigram: each byte's token, -1 when absent
 
     void encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const;
+    // PLaMo3's integer-score unigram DP, with hard boundaries around its
+    // special-token spellings, consecutive spaces and repeated characters.
+    void encode_unigram(std::string_view text, std::vector<int32_t>& out) const;
+    struct UnigramNode {
+        int32_t child = -1, next = -1, token = -1;
+        unsigned char byte = 0;
+    };
+    std::vector<UnigramNode> unigram_trie_;
+    std::vector<int32_t> unigram_scores_;
     void encode_bpe(std::string_view text, std::vector<int32_t>& out) const;
     void bpe_word(std::string_view word, std::vector<int32_t>& out) const;
     int32_t bos_ = -1;
