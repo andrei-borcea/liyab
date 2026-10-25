@@ -88,6 +88,10 @@ struct ArchSpec {
     // windowed blocks, 1M, linearly scaled on the larger models, in global
     // ones). 0: windowed blocks rotate like the others.
     float rope_base_swa = 0.0f;
+    // Pairing of DSA index queries/keys (independent of the main MLA RoPE).
+    RopeLayout indexer_rope = RopeLayout::Halves;
+    // Query/KV latent RMSNorm epsilon; 0: the file's block norm epsilon.
+    float latent_norm_eps = 0.0f;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -120,6 +124,10 @@ struct BlockPlan {
     // ModelConfig::mla). Keys and values come from one compressed latent per
     // position, which is what the KV cache stores.
     bool latent = false;
+    // Latent attention restricted by a lightning indexer (indexer.attn_k).
+    bool indexed = false;
+    // No own projections: reuse the preceding full indexer's selection.
+    bool index_reuse = false;
     // Attention: attn_q projects [q | gate] per head (twice as tall) and the
     // attention output is multiplied by sigmoid(gate).
     bool attn_gate = false;
@@ -217,6 +225,10 @@ struct ModelConfig {
     float attn_softcap = 0.0f;
     float final_softcap = 0.0f;
     LatentAttention mla;  // kv_rank 0: plain attention
+    // DSA geometry from attention.indexer.* metadata; zero without an indexer.
+    int32_t index_heads = 0;
+    int32_t index_dim = 0;
+    int32_t index_topk = 0;
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).

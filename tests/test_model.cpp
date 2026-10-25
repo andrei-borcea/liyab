@@ -258,6 +258,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     } else if (s.swa_pattern > 0) {
         w.add_u32(a + ".attention.sliding_window_pattern", static_cast<uint32_t>(s.swa_pattern));
     }
+    if (s.index_dim > 0) {
+        w.add_u32(a + ".attention.indexer.head_count", static_cast<uint32_t>(s.index_heads));
+        w.add_u32(a + ".attention.indexer.key_length", static_cast<uint32_t>(s.index_dim));
+        w.add_u32(a + ".attention.indexer.top_k", static_cast<uint32_t>(s.index_topk));
+        if (!s.index_full.empty()) w.add_bool_array(a + ".attention.indexer.types", s.index_full);
+    }
     if (s.rope_dim > 0) w.add_u32(a + ".rope.dimension_count", static_cast<uint32_t>(s.rope_dim));
     if (s.rope_scale > 0.0f) {
         w.add_string(a + ".rope.scaling.type", "linear");
@@ -506,6 +512,26 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ffn_up_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));
             w.add_tensor(p + "ffn_down_shexp.weight", {sh, d}, s.ffn_type, random(sh * d, s.weight_scale));
             if (s.shared_gate) w.add_tensor(p + "ffn_gate_inp_shexp.weight", {d}, DType::F32, random(d, s.weight_scale));
+        }
+    }
+    if (s.index_dim > 0) {
+        std::mt19937_64 index_rng(s.seed ^ 0xd5a);
+        std::normal_distribution<float> index_normal(0.0f, 0.1f);
+        auto weights = [&](int64_t count, bool norm = false) {
+            std::vector<float> out(static_cast<size_t>(count));
+            for (float& value : out) value = index_normal(index_rng) + (norm ? 1.0f : 0.0f);
+            return out;
+        };
+        for (int32_t l = 0; l < s.n_layers; ++l) {
+            if (!s.index_full.empty() && !s.index_full[static_cast<size_t>(l)]) continue;
+            const std::string p = "blk." + std::to_string(l) + ".indexer.";
+            const int64_t dim = s.index_dim, heads = s.index_heads;
+            w.add_tensor(p + "attn_q_b.weight", {s.mla_q_rank, dim * heads}, s.attn_type,
+                         weights(s.mla_q_rank * dim * heads));
+            w.add_tensor(p + "attn_k.weight", {d, dim}, s.attn_type, weights(d * dim));
+            w.add_tensor(p + "proj.weight", {d, heads}, s.attn_type, weights(d * heads));
+            w.add_tensor(p + "k_norm.weight", {dim}, DType::F32, weights(dim, true));
+            w.add_tensor(p + "k_norm.bias", {dim}, DType::F32, weights(dim));
         }
     }
     w.write(path);

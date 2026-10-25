@@ -211,6 +211,8 @@ def reduced_config(config):
             count = max(EXPERTS, top_k + 1)
             count = ((count + groups - 1) // groups) * groups
             setattr(cfg, k, min(v, count))
+    if isinstance(getattr(cfg, "index_topk", None), int):
+        cfg.index_topk = min(cfg.index_topk, SEQ // 2)  # select within the short trace
     return cfg, keep, n
 
 
@@ -506,6 +508,138 @@ def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
     return None
 
 
+def analyze_indexer(trace, mixer_path, block_calls, freqs):
+    """Recompute the observed integer position selection from the indexer's own projections."""
+    cfg = trace.reduced
+    heads, dim = getattr(cfg, "index_n_heads", 0), getattr(cfg, "index_head_dim", 0)
+    if not heads or not dim:
+        return None
+    for call in block_calls:
+        if not _is_descendant(call.path, mixer_path):
+            continue
+        outputs = [t for t in call.outputs if not t.is_floating_point() and t.dim() == 3 and t.shape[1] == SEQ]
+        if not outputs:
+            continue
+        args = [t for t in list(call.args) + list(call.kwargs.values())
+                if torch.is_tensor(t) and t.is_floating_point() and t.dim() == 3]
+        if len(args) < 2:
+            continue
+        hidden, residual = args[:2]
+        linears = _linears(block_calls, call.path)
+        q = next((c for c in linears if close(c.input, residual) and c.output.shape[-1] == heads * dim), None)
+        key = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == dim), None)
+        weight = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == heads), None)
+        norm = next((c for c in block_calls if _is_descendant(c.path, call.path) and _norm_like(c)
+                     and key is not None and close(c.input, key.output)), None)
+        if q is None or key is None or weight is None or norm is None:
+            return Facts(unknown=["indexer projections and key norm could not be established"])
+        form = norm_formula(norm, 1e-6)
+        if not form or form[0] != "layer" or not math.isclose(form[1], 1e-6):
+            return Facts(unknown=[f"indexer key norm is {form}, not LayerNorm with epsilon 1e-6"])
+        observed = outputs[0][0]
+        raw_q, raw_k = _as_heads(q.output, heads, dim), _as_heads(norm.output, 1, dim)
+        matched = []
+        for name, inv, magnitude in freqs:
+            if 2 * inv.numel() > dim:
+                continue
+            for layout in ("adjacent", "halves"):
+                qr, kr = rope(raw_q, inv, layout, magnitude), rope(raw_k, inv, layout, magnitude)
+                scores = torch.relu(qr @ kr.transpose(-1, -2) / math.sqrt(dim))
+                scores = (scores * weight.output.transpose(1, 2).unsqueeze(-1) / math.sqrt(heads)).sum(1)
+                scores = scores.masked_fill(torch.ones(SEQ, SEQ, dtype=torch.bool).triu(1), -torch.inf)
+                ok = True
+                for t in range(SEQ):
+                    count = min(observed.shape[-1], t + 1)
+                    expected = scores[0, t].topk(count).indices.sort().values
+                    actual = observed[t][observed[t] <= t].long().sort().values
+                    if not torch.equal(expected, actual):
+                        ok = False
+                        break
+                if ok:
+                    matched.append((name, layout, int(inv.numel() * 2)))
+        layouts = {m[1] for m in matched}
+        if len(layouts) != 1:
+            return Facts(unknown=["indexer RoPE pairing is not uniquely established by position selection"])
+        return Facts(unknown=[], rope=matched[0][1], table=matched[0][0], rope_dim=matched[0][2],
+                     heads=heads, head_dim=dim, topk=int(getattr(trace.config, "index_topk", 0)),
+                     query=q.path, key=key.path, weights=weight.path, key_norm=norm.path)
+    mixer = next((c for c in block_calls if c.path == mixer_path), None)
+    attention = next((a for a in trace.attn if mixer is not None and a.module is mixer.module), None)
+    indices = attention.kwargs.get("indices") if attention is not None else None
+    if torch.is_tensor(indices):
+        earlier = [a for a in trace.attn if a.order < attention.order]
+        if earlier and torch.is_tensor(earlier[-1].kwargs.get("indices")) and torch.equal(
+                indices, earlier[-1].kwargs["indices"]):
+            return Facts(unknown=[], shared=True)
+    return Facts(unknown=["no indexer's integer position selection was observed"])
+
+
+def analyze_latent_attention(att, linears, norms, freqs, eps, cfg):
+    """Establish MLA by reconstructing both expanded tensors from the observed shared latent.
+
+    The rotary result may be returned in halves even when its input pairs are adjacent;
+    that simultaneous output permutation changes neither query/key dots nor the GGUF row contract.
+    """
+    rank = getattr(cfg, "kv_lora_rank", 0)
+    rd = getattr(cfg, "qk_rope_head_dim", 0)
+    if not rank or not rd:
+        return None
+    heads, hd, vd = att.query.shape[1], att.query.shape[-1], att.value.shape[-1]
+    nope = hd - rd
+    for kv in linears:
+        if kv.output.shape[-1] != rank + rd:
+            continue
+        norm = next((n for n in norms if close(n.input, kv.output[..., :rank])), None)
+        form = norm_formula(norm, eps) if norm is not None else None
+        if not form or form[0] != "rms":
+            continue
+        expanded = next((p for p in linears if close(p.input, norm.output)
+                         and p.output.shape[-1] == heads * (nope + vd)), None)
+        if expanded is None:
+            continue
+        parts = _as_heads(expanded.output, heads, nope + vd)
+        if not close(parts[..., nope:], att.value):
+            continue
+        for query in linears:
+            if query.output.shape[-1] != heads * hd:
+                continue
+            qrank = 0
+            if not close(query.input, kv.input):
+                qnorm = next((n for n in norms if close(n.output, query.input)), None)
+                qform = norm_formula(qnorm, eps) if qnorm is not None else None
+                qa = next((p for p in linears if qnorm is not None and close(p.output, qnorm.input)
+                           and close(p.input, kv.input)), None)
+                if qa is None or qform != form:
+                    continue
+                qrank = query.input.shape[-1]
+            raw_q = _as_heads(query.output, heads, hd)
+            raw_k = kv.output[..., rank:].unsqueeze(1)
+            for name, inv, magnitude in freqs:
+                if 2 * inv.numel() != rd:
+                    continue
+                for layout in ("adjacent", "halves"):
+                    qr = rope(raw_q[..., nope:], inv, layout, magnitude)
+                    kr = rope(raw_k, inv, layout, magnitude)
+                    for permuted in (False, True) if layout == "adjacent" else (False,):
+                        qrot, krot = qr, kr
+                        if permuted:
+                            qrot = torch.cat([qr[..., ::2], qr[..., 1::2]], -1)
+                            krot = torch.cat([kr[..., ::2], kr[..., 1::2]], -1)
+                        q = torch.cat([raw_q[..., :nope], qrot], -1)
+                        k = torch.cat([parts[..., :nope], krot.expand(-1, heads, -1, -1)], -1)
+                        if close(q, att.query) and close(k, att.key):
+                            r = {"table": name, "layout": layout, "dims": rd, "magnitude": magnitude}
+                            return {"kv_rank": rank, "q_rank": qrank, "nope_dim": nope, "v_dim": vd,
+                                    "norm_eps": form[1],
+                                    "kv_projection": kv.path, "kv_norm": norm.path,
+                                    "key": {"projection": kv.path, "projection_layout": "latent", "rope": r,
+                                            "norm": None},
+                                    "query": {"projection": query.path, "projection_layout": "latent", "rope": r,
+                                              "norm": None},
+                                    "value": {"projection": expanded.path, "projection_layout": "latent"}}
+    return None
+
+
 def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     att = [a for a in trace.attn if any(c.module is a.module for c in block_calls if c.path == mixer_path
                                          or _is_descendant(c.path, mixer_path))]
@@ -539,6 +673,10 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
         if close(v, a.value):
             value = {"projection": call.path, "projection_layout": how}
             break
+    latent = analyze_latent_attention(a, linears, norms, freqs, eps, trace.reduced)
+    if latent is not None:
+        key, query, value = latent["key"], latent["query"], latent["value"]
+        f["latent"] = latent
     f["key"] = key
     f["query"] = query
     f["value"] = value
@@ -906,6 +1044,7 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
         mixer_facts = Facts(kind="recurrent", unknown=[],
                             classes=sorted({type(c.module).__name__ for c in block_calls
                                             if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))
+    mixer_facts["indexer"] = analyze_indexer(trace, mixer.path, block_calls, freqs)
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)

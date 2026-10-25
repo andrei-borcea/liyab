@@ -473,6 +473,19 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(unknown.status().message().find(names) != std::string::npos);
 }
 
+TEST_CASE("GLM uses Llama-3 splitting and merge rules") {
+    auto original = PreTokenizer::for_name("llama3");
+    auto glm = PreTokenizer::for_name("glm4");
+    REQUIRE(original.has_value() && glm.has_value());
+    for (const std::string text : {"Hello 1234567!\n", "你好 世界 カナ test's", "a\r\nb   c"}) {
+        std::vector<std::string_view> a, b;
+        original->split(text, a);
+        glm->split(text, b);
+        CHECK(a == b);
+    }
+    CHECK(!glm->nfc() && glm->ignore_merges());
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------

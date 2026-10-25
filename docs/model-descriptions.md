@@ -217,9 +217,11 @@ tool now reproduces the registry's `gemma2` row exactly. Mistral-Nemo-Instruct-2
 in it for their pre-tokenizers alone (`tekken`, `smollm`), which are table rows now: described again (Nemo from
 bartowski's Q8_0 header, SmolLM2 from bartowski's f16), both give the registry's `llama` row with nothing missing
 (Nemo's head size 128 from `key_length`). SmolLM2's f16 file then gave transformers' ids on the whole text and mean KL
-0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention it reports an unknown rather than a
-row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
-such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
+0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention the tool reconstructs expanded
+keys and values from the observed normalized shared latent, the query's low-rank path and rotary suffix, and
+checks the absorbed GGUF geometry separately from the expanded reference geometry. It compares the combined
+KV projection's rows with the checkpoint before proposing the RoPE pairing. Numerical conformance still uses
+`liyab-kl` ([README, Correctness](../README.md#correctness)).
 
 ## Limits
 
@@ -263,3 +265,29 @@ part in per-channel main-key scaling. `KvCache::bytes_per_token()` and the image
 the layout fingerprint separates these contexts from ordinary KV images. Mixed-format rows remain raw in the
 prefix store so a codec cannot round an index key and change a later position selection. The cache tests cover
 all four main KV types, page images, position copies, scaling and rollback.
+
+### Sparse latent attention
+
+`attention.indexer.head_count`, `key_length` and `top_k` describe the lightning indexer; tensors bind its query,
+key and signed head-weight projections plus the key LayerNorm. `attention.indexer.types` distinguishes full
+indexers from blocks sharing the preceding selection. The engine validates these flags against tensor presence
+and refuses a shared first block. `attention.indexer.kpool > 1` is explicitly unsupported.
+
+`reference_trace.py` recomputes the indexer's rectified, weighted causal scores and tests both rotary pairings
+against its observed integer position selections. `ArchSpec::indexer_rope` records that pairing independently of
+the main attention's, and `latent_norm_eps` records a latent RMS epsilon differing from the block norms.
+Shared layers must pass the preceding layer's indices unchanged. The trace reconstructs query and KV latent
+normalization and expanded MLA keys/values; the description compares both their geometry and attention scale
+with the GGUF's split absorbed/expanded metadata. On the tiny GLM-5 checkpoint it proposes exactly:
+
+```cpp
+{.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+ .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f}
+```
+
+The standard F32 reference gate uses the original latent/indexer geometry, four blocks and `index_topk=256`:
+493 scored positions, identical 494 token IDs, mean KL 0.00000, maximum 0.00001, top-1 99.80%. A separate
+`index_topk=8` first-layer comparison checks all 494 causal selections exactly. The smaller full-layer top-k 8/32
+diagnostics fail top-1 and remain numerical limitations, as recorded in the README; a rounded-KV diagnostic is
+kept separate from the standard reference gate. No registry row is proposed when the latent decomposition or
+indexer pairing cannot be established.

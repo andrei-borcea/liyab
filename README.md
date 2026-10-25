@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `glm-dsa` (GLM-5 tiny checkpoint) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -2166,6 +2166,28 @@ row; key scaling leaves them unchanged. Their bytes count toward the memory budg
 Mixed-format images use the store's raw-image fallback, including when lossy prefix compression is requested,
 so storage does not change index keys. Ordinary KV images retain their existing codecs and layout.
 
+**Sparse latent attention.** Lightning indexers project queries from the normalized query latent and keys from
+the block's normalized input, apply a separate key LayerNorm and RoPE, then combine rectified per-head dot
+products with learned signed weights. Each query attends only to its highest-scoring causal positions. Shared
+indexer blocks reuse the preceding full block's selected positions (`attention.indexer.types`). Main and indexer
+RoPE pairings are independent registry facts; GLM's latent RMS norms use epsilon 1e-6 independently of its block
+norm epsilon. With `index_topk` at least the visible context, attention is bit-identical to dense latent
+attention. Equal index scores select earlier positions first, preserving batching and rollback determinism.
+The `deepseek32` row supplies the alternative indexer pairing; a full reference gate for that row is still pending.
+Pooled index keys are refused precisely, and sparse models currently refuse approximate segment relocation.
+Indexer scoring and both sparse attention forms use CPU scalar/NEON/AVX paths; projections use the existing
+operation routing, including Metal and Vulkan CPU fallbacks. The absorbed/expanded choice self-calibrates with
+valid synthetic index keys and accounts for the restricted absorbed attention work.
+
+A tiny GLM-5 checkpoint with all four blocks (three dense FFNs and one MoE), original latent/indexer widths and
+`index_topk=256` gives 494 identical token IDs, mean KL 0.00000 (maximum 0.00001), top-1 99.80% against transformers
+5.19 in F32, with F16 KV. At `index_topk=8`, all 494 first-layer position selections match transformers exactly.
+The full four-layer F32-reference diagnostics with top-k 8 and 32 fail the 99% top-1 gate (98.78% and 92.90%);
+top-k 32 compared against a diagnostic reference with the same F16 main-KV rounding reaches 99.59%. Those
+diagnostics expose numerical sensitivity at discrete selection boundaries and are not the support gate.
+The model's own chat template passes all 14 reference renders. Its `glm4` pre-tokenizer uses the Llama-3 split
+expression and merge rules. No real GLM-5 weights were loaded.
+
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
 for every split into passes and thread count. Measured with `liyab-kl` against transformers in float32 (Youtu-LLM-2B
@@ -2590,7 +2612,7 @@ Implemented features are described above. These are next, in order:
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
    Youtu-LLM). A model's row is established from its Hugging Face implementation and a GGUF and verified by the
    conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
-   * sparse indexed latent attention (DeepSeek-V3.2 and GLM-5);
+   * complete DeepSeek-V3.2 reference gating and sparse segment relocation (GLM-5's tiny sparse gate is in place);
    * later, multimodal and classification models, and encoder-only embedding models (BERT, XLM-R: bidirectional
      attention, learned positions, LayerNorm with bias, WordPiece and Unigram vocabularies).
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),

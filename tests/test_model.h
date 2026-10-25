@@ -166,6 +166,12 @@ struct TinyModelSpec {
     // expert_group_count and expert_group_used_count. Metadata only.
     int32_t n_expert_groups = 0;
     int32_t n_expert_groups_used = 0;
+    // DSA tensors and metadata; the indexer has an independent random stream
+    // so the main weights match a dense twin exactly.
+    int32_t index_dim = 0;
+    int32_t index_heads = 2;
+    int32_t index_topk = 4;
+    std::vector<bool> index_full;  // empty: every indexed block has its own projections
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

@@ -464,6 +464,23 @@ std::string write_adapter(const std::string& name, const std::string& model_path
 
 }  // namespace
 
+TEST_CASE("Sequences together: sparse index keys belong to each sequence in both latent forms") {
+    test::TinyModelSpec s;
+    s.arch = "glm-dsa";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_q_rank = 64;
+    s.index_dim = 64;
+    s.index_topk = 4;
+    const std::string path = model_path("indexed_sequences", s);
+    for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+        TransformerOptions options;
+        options.latent_form = form;
+        CHECK(check_schedule("indexed sequences", path, options, mixed_plans()));
+    }
+}
+
 TEST_CASE("Sequences together: each sequence applies its own LoRA adapter, or none") {
     // Dense: attention, FFN and the LM head adapted.
     {

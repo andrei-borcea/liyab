@@ -639,6 +639,11 @@ public:
     // they meet (a latent-attention head's absorbed query). Valid until the
     // next pass.
     [[nodiscard]] std::span<const float> last_queries() const noexcept { return q_; }
+    // Sparse cache-row indices selected for each query of the last block's
+    // pass, empty for dense attention. Valid until the next mixer pass.
+    [[nodiscard]] std::span<const std::vector<int32_t>> last_index_positions() const noexcept {
+        return index_positions_;
+    }
 
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as
@@ -742,6 +747,7 @@ private:
         // attn_q_a / attn_q_b, attn_kv_a_mqa [n_embd x (kv_rank + rope_dim)], and per head
         // attn_k_b [nope_dim -> kv_rank] (absorbs a query) and attn_v_b [kv_rank -> v_dim] (expands a value)
         kQa, kQb, kKvA, kKb, kVb,
+        kIndexQ, kIndexK, kIndexWeights,  // DSA indexer projections
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
@@ -753,6 +759,7 @@ private:
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
+        std::vector<float> index_norm, index_bias;  // index-key LayerNorm (epsilon 1e-6)
         std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
         std::vector<float> conv1d;   // [channel][kernel] taps
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
@@ -789,6 +796,12 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
+    void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table, RopeLayout layout) const;
+    Status indexer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    std::vector<float> index_q_, index_k_, index_weights_;
+    // Per batch row: selected physical cache positions, in causal order.
+    // Empty outside indexed blocks; keys themselves live in the paged cache.
+    std::vector<std::vector<int32_t>> index_positions_;
     // One sequence's part of the current pass (segs_): its tokens are rows
     // [first, first + n) of the batch, and the state they read and write is
     // its context's, the live one's (forward(), and every pass of a single

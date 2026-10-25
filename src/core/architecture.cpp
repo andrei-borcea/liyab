@@ -68,6 +68,9 @@ constexpr ArchSpec kArchitectures[] = {
     // (planned from the tensors), LongRoPE factors; every block uses the
     // sliding window when the file sets one (Phi-3-mini-4k: 2047).
     {.name = "phi3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .swa_period = 1},
+    {"deepseek32", RopeLayout::Adjacent, "ffn_norm", true},
+    {.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+     .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f},
 };
 
 }  // namespace
@@ -183,6 +186,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
     } else if (value_length && *value_length != c.head_dim) {
         return Status(ErrorCode::Unsupported, "key_length != value_length is not supported");
+    }
+    if (f.get_int(key("attention.indexer.head_count")).value_or(0) != 0) {
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.head_count", c.index_heads));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.key_length", c.index_dim));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.top_k", c.index_topk));
+        if (c.mla.q_rank <= 0 || c.index_dim < c.rope_dim) {
+            return Status(ErrorCode::InvalidModel, "DSA needs low-rank queries and index keys at least rope.dimension_count wide");
+        }
+        if (f.get_int(key("attention.indexer.kpool")).value_or(1) > 1) {
+            return Status(ErrorCode::Unsupported, "pooled DSA index keys are not supported");
+        }
     }
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
@@ -325,6 +339,24 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 // The KV cache is laid out for one kind of attention.
                 return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": latent attention tensors and " +
                                                            key("attention.kv_lora_rank") + " disagree");
+            }
+            b.indexed = f.tensor(block_tensor(l, "indexer.attn_k.weight")) != nullptr;
+            if (b.indexed && (!b.latent || c.index_heads == 0)) {
+                return Status(ErrorCode::InvalidModel, "indexer tensors need latent attention and attention.indexer metadata");
+            }
+            if (c.index_heads > 0) {
+                const GgufValue* types = f.metadata(key("attention.indexer.types"));
+                if (types != nullptr) {
+                    if (types->type != GgufValue::Type::Array || types->array_type != GgufValue::Type::Bool ||
+                        types->array_size < static_cast<uint64_t>(c.n_layers)) {
+                        return Status(ErrorCode::InvalidModel, "invalid " + key("attention.indexer.types"));
+                    }
+                    b.index_reuse = types->array_data[l] == 0;
+                }
+                if (!b.latent || (b.index_reuse == b.indexed) || (b.index_reuse && l == 0)) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                        ": indexer tensors disagree with full/shared indexer metadata");
+                }
             }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;

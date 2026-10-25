@@ -355,8 +355,9 @@ LatentFormChooser::Work LatentFormChooser::work(const ModelConfig& c, int64_t n,
     const auto heads = static_cast<double>(c.n_head);
     const double project = static_cast<double>(m.kv_rank) * (m.nope_dim + m.v_dim);  // per head: k_b and v_b
     Work w;
+    const int64_t selected = c.index_topk > 0 ? std::min(visible, n * c.index_topk) : visible;
     w.absorbed = heads * (static_cast<double>(n) * project +
-                          static_cast<double>(visible) * (c.rope_dim + 2.0 * m.kv_rank));
+                          static_cast<double>(selected) * (c.rope_dim + 2.0 * m.kv_rank));
     w.expanded = heads * (static_cast<double>(positions + 1) * project +
                           static_cast<double>(visible) * (m.nope_dim + c.rope_dim + m.v_dim));
     return w;
@@ -424,6 +425,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // latent channels serving as the values (ModelConfig::mla).
     kv.values_in_keys = c.mla.kv_rank > 0;
     kv.value_offset = kv.values_in_keys ? c.rope_dim : 0;
+    kv.auxiliary_dim = c.index_dim;
     model->max_batch_ = std::max(1, options.max_batch);
     // Per-block layout: a windowed block (Gemma 2 / 3, Phi-3) keeps only the
     // rows its window still shows, so it costs a bounded amount whatever the
@@ -693,6 +695,16 @@ Status Transformer::bind_weights() {
                 out = t;
                 return Status::ok();
             };
+            if (plan.indexed) {
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer.attn_q_b.weight"), m.q_rank,
+                                             int64_t{c.index_heads} * c.index_dim, L.w[kIndexQ]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer.attn_k.weight"), c.n_embd, c.index_dim,
+                                             L.w[kIndexK]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer.proj.weight"), c.n_embd, c.index_heads,
+                                             L.w[kIndexWeights]));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "indexer.k_norm.weight"), c.index_dim, true, L.index_norm));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "indexer.k_norm.bias"), c.index_dim, true, L.index_bias));
+            }
             LIYAB_RETURN_IF_ERROR(per_head("attn_k_b.weight", m.nope_dim, m.kv_rank, L.w[kKb]));
             LIYAB_RETURN_IF_ERROR(per_head("attn_v_b.weight", m.kv_rank, m.v_dim, L.w[kVb]));
             LIYAB_RETURN_IF_ERROR(
@@ -954,7 +966,7 @@ std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
     const KvCacheConfig& kv = kv_->config();
     const bool long_rope = config_.rope_ctx_orig > 0 && context_length_ > config_.rope_ctx_orig;
     const int64_t file = static_cast<int64_t>(file_->file_size()) ^ (long_rope ? int64_t{1} << 62 : 0);
-    return {file, config_.n_layers, config_.n_embd, config_.n_vocab, kv.n_layers, kv.n_head_kv, kv.head_dim,
+    return {file, config_.n_layers, config_.n_embd, config_.n_vocab, kv.n_layers, kv.n_head_kv, kv.head_dim + kv.auxiliary_dim,
             static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
 }
 
@@ -1322,8 +1334,13 @@ void Transformer::rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable
 }
 
 void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const {
+    rope(vec, n_heads, stride, pos, table, config_.spec->rope);
+}
+
+void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table,
+                       RopeLayout layout) const {
     const int32_t half = config_.rope_dim / 2;
-    const bool halves = config_.spec->rope == RopeLayout::Halves;
+    const bool halves = layout == RopeLayout::Halves;
     const float p = static_cast<float>(pos) / table.scale;
     for (int32_t h = 0; h < n_heads; ++h) {
         float* x = vec + static_cast<size_t>(h) * stride;
@@ -1438,7 +1455,9 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     };
     // Positions a query of segment s at `pos` sees: [sink_begin, sink_end) ∪ [first, pos].
     auto seen = [&](const Segment& s, int32_t pos) { return seen_by(*s.kv, pos, window); };
+    const bool indexed = !index_positions_.empty();
     auto spans_of = [&](int32_t t) {
+        if (indexed) return spans_for(static_cast<int32_t>(index_positions_[static_cast<size_t>(t)].size()));
         const Segment& s = segs_[segment_of(t)];
         const int32_t pos = pos_of(s, t);
         const Seen v = seen(s, pos);
@@ -1461,12 +1480,14 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         // Visible positions: attention sinks [sink_begin, sink_end) + [first, pos].
         const Seen vis = seen(s, pos);
         const int32_t n_sinks = vis.sink_end - vis.sink_begin;
-        const int32_t n_visible = n_sinks + (pos - vis.first + 1);
+        const int32_t n_visible = indexed ? static_cast<int32_t>(index_positions_[static_cast<size_t>(t)].size())
+                                          : n_sinks + (pos - vis.first + 1);
         // A tree pass reads the rows of positions n_past + d (the batch's
         // own) from the slot of the token's ancestor at depth d: its branch.
         const int32_t* ancestors =
             tree_depth_.empty() ? nullptr : tree_ancestors_.data() + static_cast<size_t>(t - s.first) * tree_stride_;
         auto position = [&](int32_t i) {
+            if (indexed) return index_positions_[static_cast<size_t>(t)][static_cast<size_t>(i)];
             const int32_t p = i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks);
             return ancestors == nullptr || p < s.n_past ? p : s.n_past + ancestors[p - s.n_past];
         };
@@ -1999,9 +2020,14 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
     std::mt19937 rng(20251017);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> row(kd);
+    std::vector<float> index_key(static_cast<size_t>(c.index_dim));
     for (int32_t pos = 0; pos < context - n; ++pos) {
         for (float& v : row) v = normal(rng);
         kv_->store(L.kv_slot, pos, row.data(), nullptr);
+        if (c.index_heads > 0) {
+            for (float& v : index_key) v = normal(rng);
+            kv_->store_auxiliary(L.kv_slot, pos, index_key.data());
+        }
     }
     n_past_ = context - n;
     const auto un = static_cast<size_t>(n);
@@ -2010,7 +2036,7 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
     xb_.resize(un * std::max(d, q_dim));
     q_.resize(un * q_dim);
     k_.resize(un * kd);
-    att_.resize(un * q_dim);
+    att_.resize(un * std::max(q_dim, static_cast<size_t>(c.n_head) * static_cast<size_t>(c.mla.v_dim)));
     std::vector<float> input(un * d);
     for (float& v : input) v = normal(rng);
     for (size_t t = 0; t < un; ++t) rmsnorm(input.data() + t * d, L.attn_norm.data(), input.data() + t * d, c.n_embd, c.rms_eps);
@@ -2050,6 +2076,7 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
 
 Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                     ThreadPool& pool, const uint8_t* head_mask) {
+    index_positions_.clear();
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const bool gated = c.blocks[static_cast<size_t>(layer)].attn_gate;
@@ -2134,6 +2161,7 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
     const auto rank = static_cast<size_t>(m.kv_rank);
     const size_t qk = static_cast<size_t>(m.nope_dim) + rd;  // a head's query as projected: [q_nope | q_pe]
     const auto kd = static_cast<size_t>(c.head_dim);          // rd + rank: a cached key row
+    const float norm_eps = c.spec->latent_norm_eps > 0.0f ? c.spec->latent_norm_eps : c.rms_eps;
     mla_kv_.resize(un * (rank + rd));
     if (!queries) {
         LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kKvA], xb_.data(), mla_kv_.data(), n));
@@ -2147,7 +2175,7 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
         if (low_rank) {
             for (size_t t = 0; t < un; ++t) {
                 float* row = mla_qa_.data() + t * static_cast<size_t>(m.q_rank);
-                rmsnorm(row, L.q_a_norm.data(), row, m.q_rank, c.rms_eps);
+                rmsnorm(row, L.q_a_norm.data(), row, m.q_rank, norm_eps);
             }
             LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kQb], mla_qa_.data(), mla_q_.data(), n));
         }
@@ -2159,7 +2187,7 @@ Status Transformer::latent_project(int32_t layer, const BlockWeights& w, int32_t
         const float* kv = mla_kv_.data() + t * (rank + rd);
         float* k = k_.data() + t * kd;
         std::copy(kv + rank, kv + rank + rd, k);
-        rmsnorm(kv, L.kv_a_norm.data(), k + rd, m.kv_rank, c.rms_eps);
+        rmsnorm(kv, L.kv_a_norm.data(), k + rd, m.kv_rank, norm_eps);
     }
     return Status::ok();
 }
@@ -2426,6 +2454,10 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, const 
                                 for (size_t r = 0; r < static_cast<size_t>(kScoreKeys) && i + r < c1; ++r) {
                                     float sc = dots[j][r] * scale;
                                     if (softcap > 0.0f) sc = softcap * portable_tanh(sc / softcap);
+                                    if (!index_positions_.empty()) {
+                                        const auto& selected = index_positions_[first + g0 + j0 + j];
+                                        if (!std::binary_search(selected.begin(), selected.end(), mla_rows_[i + r])) sc = -INFINITY;
+                                    }
                                     scores[(j0 + j) * urows + i + r] = sc;
                                 }
                             }
@@ -2442,7 +2474,10 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, const 
                     for (const auto& [i0, i1] : ranges[j]) {
                         for (size_t i = i0; i < i1; ++i) tile_max = std::max(tile_max, sc[i]);
                     }
-                    if (tile_max == -INFINITY) continue;  // nothing visible in this tile
+                    if (tile_max == -INFINITY) {  // an indexed token may select nothing in this tile
+                        for (const auto& [i0, i1] : ranges[j]) std::fill(sc + i0, sc + i1, 0.0f);
+                        continue;
+                    }
                     float& mx = mla_max_[ut];
                     float& sum = mla_sum_[ut];
                     const float next = std::max(mx, tile_max);
@@ -2512,6 +2547,98 @@ Status Transformer::latent_expanded(int32_t layer, const BlockWeights& w, const 
     return Status::ok();
 }
 
+// Lightning indexer: keys from the normalized block input, queries from
+// the normalized query latent, learned signed weights over rectified head
+// scores. Each sequence reads its own cache; tree queries read ancestors.
+Status Transformer::indexer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto dim = static_cast<size_t>(c.index_dim);
+    const auto heads = static_cast<size_t>(c.index_heads);
+    const auto un = static_cast<size_t>(n);
+    index_q_.resize(un * heads * dim);
+    index_k_.resize(un * dim);
+    index_weights_.resize(un * heads);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kIndexQ], mla_qa_.data(), index_q_.data(), n));
+    const TensorView* projections[] = {&w[kIndexK], &w[kIndexWeights]};
+    float* outputs[] = {index_k_.data(), index_weights_.data()};
+    LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, projections, xb_.data(), outputs, n));
+    const RopeTable& table = rope_tables_[static_cast<size_t>(L.rope_table)];
+    for (const Segment& s : segs_) {
+        for (int32_t t = s.first; t < s.first + s.n; ++t) {
+            float* key = index_k_.data() + static_cast<size_t>(t) * dim;
+            double mean = 0.0, variance = 0.0;
+            for (size_t i = 0; i < dim; ++i) mean += key[i];
+            mean /= static_cast<double>(dim);
+            for (size_t i = 0; i < dim; ++i) {
+                const double delta = key[i] - mean;
+                variance += delta * delta;
+            }
+            const float inv = static_cast<float>(1.0 / std::sqrt(variance / static_cast<double>(dim) + 1e-6));
+            for (size_t i = 0; i < dim; ++i) {
+                key[i] = (key[i] - static_cast<float>(mean)) * inv * L.index_norm[i] + L.index_bias[i];
+            }
+            const int32_t pos = pos_of(s, t);
+            rope(key, 1, dim, pos, table, c.spec->indexer_rope);
+            rope(index_q_.data() + static_cast<size_t>(t) * heads * dim, c.index_heads, dim, pos, table,
+                 c.spec->indexer_rope);
+            s.kv->store_auxiliary(L.kv_slot, row_of(s, t), key);
+        }
+    }
+    index_positions_.resize(un);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    const float weight_scale = 1.0f / std::sqrt(static_cast<float>(heads));
+    pool.parallel_for(n, [&](int64_t begin, int64_t end) {
+        thread_local std::vector<float> key, scores;
+        thread_local std::vector<int32_t> order, slots;
+        key.resize(dim);
+        for (int64_t token = begin; token < end; ++token) {
+            const auto t = static_cast<int32_t>(token);
+            const auto ut = static_cast<size_t>(t);
+            const Segment& s = segs_[segment_of(t)];
+            const int32_t pos = pos_of(s, t);
+            const Seen seen = seen_by(*s.kv, pos, L.window);
+            const int32_t sinks = seen.sink_end - seen.sink_begin;
+            const int32_t visible = sinks + pos - seen.first + 1;
+            const int32_t count = std::min(c.index_topk, visible);
+            const int32_t* ancestors = tree_depth_.empty() ? nullptr
+                : tree_ancestors_.data() + static_cast<size_t>(t - s.first) * tree_stride_;
+            slots.resize(static_cast<size_t>(visible));
+            order.resize(static_cast<size_t>(visible));
+            scores.resize(static_cast<size_t>(visible));
+            for (int32_t i = 0; i < visible; ++i) {
+                const int32_t p = i < sinks ? seen.sink_begin + i : seen.first + i - sinks;
+                slots[static_cast<size_t>(i)] = ancestors == nullptr || p < s.n_past ? p
+                    : s.n_past + ancestors[p - s.n_past];
+                order[static_cast<size_t>(i)] = i;
+                if (count == visible) continue;  // the dense identity, including its order and rounding
+                std::memcpy(key.data(), s.kv->auxiliary_key(L.kv_slot, slots[static_cast<size_t>(i)], 0),
+                            dim * sizeof(float));
+                float score = 0.0f;
+                for (size_t h = 0; h < heads; ++h) {
+                    const float* q = index_q_.data() + (ut * heads + h) * dim;
+                    const float dot = quant::dot_f32(q, key.data(), c.index_dim);
+                    score += index_weights_[ut * heads + h] * weight_scale * std::max(0.0f, dot * scale);
+                }
+                scores[static_cast<size_t>(i)] = score;
+            }
+            if (count < visible) {
+                std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int32_t a, int32_t b) {
+                    return scores[static_cast<size_t>(a)] > scores[static_cast<size_t>(b)] ||
+                        (scores[static_cast<size_t>(a)] == scores[static_cast<size_t>(b)] && a < b);
+                });
+                // Attention sums positions in causal order, independent of
+                // batching, sorting implementation and the thread count.
+                std::sort(order.begin(), order.begin() + count);
+            }
+            auto& selected = index_positions_[ut];
+            selected.resize(static_cast<size_t>(count));
+            for (int32_t i = 0; i < count; ++i) selected[static_cast<size_t>(i)] = slots[static_cast<size_t>(order[static_cast<size_t>(i)])];
+        }
+    });
+    return Status::ok();
+}
+
 Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                            ThreadPool& pool, const uint8_t* head_mask) {
     using Clock = std::chrono::steady_clock;
@@ -2556,6 +2683,8 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
             s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
         }
     }
+    if (!c.blocks[static_cast<size_t>(layer)].index_reuse) index_positions_.clear();
+    if (c.blocks[static_cast<size_t>(layer)].indexed) LIYAB_RETURN_IF_ERROR(indexer(layer, w, n, route, pool));
     start = Clock::now();
     if (any_absorbed) {
         // att_: per absorbed token and head, the softmax-weighted latent
@@ -2566,7 +2695,7 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
         // stored with per-channel scales carried their latent divided by them,
         // so the latent is multiplied back first (exact for each channel).
         // Every absorbed row is read before any is written in the [token]
-        // [head][value] layout (narrower: v_dim <= rank), and expanded
+        // [head][value] layout (the scratch holds max(head_dim, v_dim)), and expanded
         // segments write theirs after this (latent_expanded()).
         const float* scales =
             key_scale_.empty() ? nullptr : key_scale_.data() + static_cast<size_t>(L.kv_slot) * kd + rd;
@@ -3372,7 +3501,7 @@ void Transformer::size_batch(int32_t n) {
     q_.resize(un * q_dim);
     k_.resize(un * kv_dim);
     v_.resize(un * kv_dim);
-    att_.resize(un * q_dim);
+    att_.resize(un * std::max(q_dim, static_cast<size_t>(c.n_head) * static_cast<size_t>(c.mla.v_dim)));
 }
 
 Status Transformer::embed(std::span<const int32_t> tokens, std::span<float> x) const {
@@ -3493,6 +3622,9 @@ Status Transformer::run_block_at(int32_t layer, std::span<const int32_t> positio
 }
 
 Status Transformer::reuse_support() const {
+    if (config_.index_heads > 0) {
+        return Status(ErrorCode::Unsupported, "segment reuse with position-dependent sparse index keys is not supported");
+    }
     const ModelConfig& c = config_;
     if (c.hybrid()) {
         return Status(ErrorCode::Unsupported,
@@ -3533,7 +3665,7 @@ Status Transformer::swap_context(std::unique_ptr<KvCache>& kv, int32_t& n_past) 
     const KvCacheConfig& a = kv_->config();
     const KvCacheConfig& b = kv->config();
     if (a.n_layers != b.n_layers || a.n_head_kv != b.n_head_kv || a.head_dim != b.head_dim || a.type != b.type ||
-        a.page_tokens != b.page_tokens || a.values_in_keys != b.values_in_keys || a.value_offset != b.value_offset ||
+        a.page_tokens != b.page_tokens || a.values_in_keys != b.values_in_keys || a.value_offset != b.value_offset || a.auxiliary_dim != b.auxiliary_dim ||
         a.window != b.window || n_past < 0 || n_past > b.max_positions) {
         return Status(ErrorCode::InvalidArgument, "swap_context: a cache of another layout");
     }

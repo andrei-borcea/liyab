@@ -74,7 +74,8 @@ struct Row {
 const std::array<Row, 11>& table() {
     static const std::array<Row, 11> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
-        {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
+        // GLM-4/5 use the same Split expression and ignore_merges contract.
+        {{"llama-bpe", "llama3", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},

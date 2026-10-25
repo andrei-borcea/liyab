@@ -1760,6 +1760,79 @@ TEST_CASE("Latent attention in the expanded form matches the absorbed form and t
 // before the expansion; calibration itself runs absorbed), and a sliding window
 // with attention sinks, where tokens see different positions; and close to the
 // absorbed form throughout.
+TEST_CASE("Sparse latent attention: dense identity, causal batching and saved contexts in every KV format") {
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t t = 0; t < 33; ++t) tokens.push_back(3 + (37 * t) % 250);
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        auto dense = latent_spec(64);
+        dense.arch = "glm-dsa";
+        auto indexed = dense;
+        indexed.index_dim = 64;
+        indexed.index_topk = 128;
+        indexed.index_full.assign(static_cast<size_t>(indexed.n_layers), false);
+        indexed.index_full[0] = true;
+        const std::string plain_path = model_path("dsa_dense", dense);
+        const std::string all_path = model_path("dsa_all", indexed);
+        indexed.index_topk = 4;
+        const std::string sparse_path = model_path("dsa_sparse", indexed);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            TransformerOptions options;
+            options.kv_type = type;
+            options.latent_form = form;
+            auto plain = load_transformer(plain_path, options);
+            auto all = load_transformer(all_path, options);
+            auto sparse = load_transformer(sparse_path, options);
+            REQUIRE(plain != nullptr && all != nullptr && sparse != nullptr);
+            CHECK(sparse->config().blocks[0].indexed);
+            CHECK(sparse->kv_cache().config().auxiliary_dim == 64);
+            auto a = plain->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(a.has_value());
+            const std::vector<float> expected(a->begin(), a->end());
+            auto b = all->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(b.has_value());
+            CHECK(max_abs_diff(*b, expected) == 0.0f);  // index_topk >= context is dense, bit for bit
+            auto c = sparse->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(c.has_value());
+            const std::vector<float> batched(c->begin(), c->end());
+            CHECK(max_abs_diff(*c, expected) > 0.0f);  // the sparse selection actually runs
+            sparse->reset();
+            if (form == LatentForm::Absorbed) {
+                std::vector<float> decoded;
+                for (const int32_t token : tokens) {
+                    auto row = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                    REQUIRE(row.has_value());
+                    decoded.insert(decoded.end(), row->begin(), row->end());
+                }
+                CHECK(max_abs_diff(decoded, batched) == 0.0f);
+            } else {
+                REQUIRE(sparse->forward(tokens, Transformer::Logits::None, route, pool).has_value());
+            }
+            std::stringstream image(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(sparse->write_state(image).is_ok());
+            auto restored = load_transformer(sparse_path, options);
+            REQUIRE(restored != nullptr);
+            REQUIRE(restored->read_state(image).is_ok());
+            for (const int32_t token : {71, 5, 250}) {
+                auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                REQUIRE(left.has_value() && right.has_value());
+                CHECK(left->size() == right->size());
+                CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+            }
+            REQUIRE(sparse->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            REQUIRE(restored->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            const int32_t token = 42;
+            auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(left.has_value() && right.has_value());
+            CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+        }
+    }
+}
+
 TEST_CASE("Expanded latent attention over many tiles: every split the same bits, close to the absorbed form") {
     test::TinyModelSpec spec = latent_spec(64);
     spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
@@ -1821,6 +1894,27 @@ TEST_CASE("Expanded latent attention over many tiles: every split the same bits,
         CHECK(err_expanded <= std::max(1e-3, 1.25 * err_absorbed));
         CHECK(flips_expanded <= std::max<size_t>(flips_absorbed, tokens.size() / 100));
     }
+}
+
+TEST_CASE("Sparse latent form calibration uses valid index keys and leaves an empty context") {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    auto model = load_transformer(model_path("indexed_calibration", spec));
+    REQUIRE(model != nullptr);
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    auto ratio = model->calibrate_latent_form(route, pool);
+    REQUIRE(ratio.has_value());
+    CHECK(*ratio >= LatentFormChooser::kMinRatio && *ratio <= LatentFormChooser::kMaxRatio);
+    CHECK(model->latent_chooser().ratio() == *ratio);
+    CHECK(model->n_past() == 0);
+    const std::vector<int32_t> tokens = {1, 3, 7, 9};
+    auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(logits.has_value());
+    for (const float value : *logits) CHECK(std::isfinite(value));
 }
 
 // The automatic choice: work counted per form, and a threshold set by one
@@ -3458,6 +3552,61 @@ uint64_t dir_bytes(const std::string& dir) {
 }
 
 }  // namespace
+
+TEST_CASE("Sparse index keys survive storage prefix reuse and an engine restart in every KV format") {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    spec.index_full = {true, false};
+    const std::string path = model_path("indexed_prefix", spec);
+    std::string a, b;
+    for (int i = 0; i < 200; ++i) {
+        a += i % 3 ? " hello" : " world";
+        b += i % 2 ? " world" : " hello world";
+    }
+    auto run = [](Engine& engine, const std::string& prompt, GenerationStats* stats = nullptr) {
+        std::string text;
+        auto result = engine.generate(prompt, greedy(6), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        CHECK(result.has_value());
+        if (result && stats != nullptr) *stats = *result;
+        return text;
+    };
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        config.kv_cache_type = type;
+        auto reference = Engine::create(config);
+        REQUIRE(reference.has_value());
+        const std::string expected = run(*reference.value(), a);
+        const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) +
+                                "_indexed_prefix_" + std::to_string(static_cast<int>(type));
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_dir = dir;
+        config.prefix_cache_disk_mb = 4;
+        config.prefix_cache_lossy = true;  // F32 index images must use the exact raw fallback
+        {
+            auto cached = Engine::create(config);
+            REQUIRE(cached.has_value());
+            CHECK(run(*cached.value(), a) == expected);
+            run(*cached.value(), b);
+            GenerationStats restored{};
+            CHECK(run(*cached.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        {
+            auto restarted = Engine::create(config);
+            REQUIRE(restarted.has_value());
+            GenerationStats restored{};
+            CHECK(run(*restarted.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
 
 TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later engines too") {
     test::TinyModelSpec spec;
@@ -5276,6 +5425,13 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         s.n_expert_used = 2;
         s.identical_experts = false;
         cases.push_back({"tree_moe", s});
+    }
+    {
+        auto s = latent_spec(64);
+        s.arch = "glm-dsa";
+        s.index_dim = 64;
+        s.index_topk = 4;
+        cases.push_back({"tree_dsa", s});
     }
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
