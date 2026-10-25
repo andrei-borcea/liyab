@@ -2218,6 +2218,7 @@ and omit learned sinks; they do not establish full DeepSeek-V4 support. Projecti
 route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
 AVX2 and scalar). Component projection tests cover all 26 storage formats and attention widths different
 from the residual width, using amplitude-balanced encoded block fixtures for formats without a writer.
+The Android regression runner includes `test_compression` when that executable is built.
 Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
 every position in every block, including nonclosing positions; memory planning includes that cost.
 

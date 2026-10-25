@@ -419,6 +419,7 @@ The shared test writer tiles encoded reference blocks for reader-only formats; t
 multiplies decoded weights and Q8-rounded activations directly, without calling the backend's dot kernels.
 Their attention norms balance the encoded blocks' measured RMS against the fixture's ordinary weight scale;
 output/FFN norms, the eight writable-format controls and the logit error bound remain unchanged.
+The Android regression runner includes this suite and supplies its encoded quantization fixtures.
 `tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
 
 | Component fixture | Tokens | Mean / max KL | Top-1 | CSA top-2 selections |
