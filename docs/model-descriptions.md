@@ -159,7 +159,10 @@ splits the projection into separate GGUF tensors. A requested remote slow tokeni
 Python class, with explicit trust required; a library silently selecting a fast class is an error.
 InternLM2's original slow tokenizer matches 575, 989 and 190 IDs on the three gate texts. Its tiny checkpoint gives
 identical 512 reference IDs, mean KL 0.00000 and 100% top-1, and proposes the registered row exactly. Its real-model
-gate remains pending; dynamic RoPE growth beyond the original context remains a reported missing part.
+gate remains pending; dynamic RoPE growth beyond the original context remains a reported limitation.
+The teacher-forced reference selects `AutoModelForImageTextToText` when a multimodal checkpoint has no
+`AutoModelForCausalLM` class. Its tokenizer IDs are passed directly to the model without images or an image
+processor, so this measures the text-only route of the authors' original implementation.
 
 ## The conformance gate
 

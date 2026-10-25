@@ -168,7 +168,9 @@ Reference tracing also observes legacy eager attention's paired matrix products,
 only after recomputing the full softmax probabilities from the recorded queries and keys.
 Packed GQA projections are matched to their observed per-group Q/K/V rows; the file may split those projections.
 InternLM2's tiny checkpoint matches all three tokenizer texts with the original slow implementation and gives
-mean KL 0.00000 and 100% top-1. Dynamic RoPE beyond its original context is still refused by the description tool.
+mean KL 0.00000 and 100% top-1. The description tool reports that dynamic RoPE growth beyond the original
+context is not implemented. For multimodal checkpoints such as Ministral 3, the reference tool selects
+transformers' image/text model class and runs the same text-only prompt, without images or added image tokens.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the

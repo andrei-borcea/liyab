@@ -41,6 +41,8 @@ buffers are not preserved by transformers' meta-device pretrained loader.
 The model's forward implementation and checkpoint tensors are unchanged.
 --slow-tokenizer selects the authors' slow tokenizer when a newer fast
 conversion does not preserve their SentencePiece model's segmentation.
+For a multimodal checkpoint, the library's image/text model class runs the
+same text-only input, without images or image tokens added by the tool.
 
 --lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
 a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
@@ -97,11 +99,16 @@ def main():
     for field, value in json.loads(args.config or "{}").items():
         setattr(config, field, value)
     extra = {"attn_implementation": args.attn_implementation} if args.attn_implementation else {}
+    model_class = AutoModelForCausalLM
+    if type(config) not in AutoModelForCausalLM._model_mapping and hasattr(config, "text_config"):
+        from transformers import AutoModelForImageTextToText
+        if type(config) in AutoModelForImageTextToText._model_mapping:
+            model_class = AutoModelForImageTextToText
     if args.state_dict:
         from safetensors.torch import load_file
         if not os.path.isdir(args.model):
             parser.error("--state-dict needs a local checkpoint directory")
-        model = AutoModelForCausalLM.from_config(config, dtype=getattr(torch, args.dtype),
+        model = model_class.from_config(config, dtype=getattr(torch, args.dtype),
                                                 trust_remote_code=args.trust_remote_code, **extra)
         files = sorted(name for name in os.listdir(args.model) if name.endswith(".safetensors"))
         if not files:
@@ -120,7 +127,7 @@ def main():
         if missing:
             parser.error(f"missing checkpoint parameters: {missing}")
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
+        model = model_class.from_pretrained(args.model, revision=args.revision, config=config,
                                                      dtype=getattr(torch, args.dtype),
                                                      trust_remote_code=args.trust_remote_code, **extra)
     if args.lora:
