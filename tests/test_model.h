@@ -169,6 +169,11 @@ struct TinyModelSpec {
     bool attention_sinks = false;
     bool omit_expert_width = false;  // Mixtral: infer the expert width from down projections
     bool separate_attention_gate = false;  // attn_gate instead of a fused [query | gate], with attn_gate true
+    bool head_attention_gate = false;  // one scalar gate per head, with separate_attention_gate
+    bool bare_expert_bias = false;     // selection correction named exp_probs_b without .bias
+    float expert_swiglu_clamp = 0.0f;
+    float shared_swiglu_clamp = 0.0f;
+    int32_t head_dim = 0;  // explicit attention head width, independent of the residual width
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

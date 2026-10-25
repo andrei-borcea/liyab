@@ -70,8 +70,8 @@ const std::string& model_path(const std::string& name, const test::TinyModelSpec
 const std::string& mixed_model() { return model_path("mixed", {}); }
 const std::string& f32_model() { return model_path("f32", f32_spec()); }
 
-std::unique_ptr<Transformer> load_transformer(const std::string& path, TransformerOptions options = {}) {
-    auto file = MmapLoader::open(path);
+std::unique_ptr<Transformer> load_transformer(const std::string& path, TransformerOptions options = {}, LoaderOptions loader = {}) {
+    auto file = MmapLoader::open(path, loader);
     if (!file) return nullptr;
     auto model = Transformer::load(std::move(file).value(), options);
     if (!model) {
@@ -153,7 +153,12 @@ public:
                 const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
                 auto g = matvec(wg, h);
                 const auto u = matvec(wu, h);
-                for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+                float limit = 0.0f;
+                if (const auto* v = f_.metadata("llama.swiglu_clamp_shexp")) std::memcpy(&limit, v->array_data + static_cast<size_t>(l) * 4, 4);
+                for (size_t i = 0; i < g.size(); ++i) {
+                    const float activated = g[i] / (1.0f + std::exp(-g[i]));
+                    g[i] = limit > 0 ? std::min(activated, limit) * std::clamp(u[i], -limit, limit) : activated * u[i];
+                }
                 const auto down = matvec(wd, g);
                 for (int i = 0; i < d_; ++i) x[t][i] += down[i];
             }
@@ -1372,6 +1377,64 @@ TEST_CASE("Mixtral expert width and router normalization follow tensors and arch
     CHECK(model->config().moe_norm_weights);
 }
 
+TEST_CASE("Post-SiLU clamps match the independent float reference and change a saturated FFN") {
+    auto spec = f32_spec();
+    spec.shared_swiglu_clamp = 0.25f;
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto model = load_transformer(model_path("post_silu_clamp", spec), options);
+    REQUIRE(model != nullptr);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(got.has_value());
+    const auto expected = Reference(model->file()).logits(tokens);
+    const size_t vocab = expected.front().size();
+    for (size_t t = 0; t < tokens.size(); ++t) CHECK(max_abs_diff(got->subspan(t * vocab, vocab), expected[t]) < 0.003f);
+    auto plain = load_transformer(f32_model(), options);
+    REQUIRE(plain != nullptr);
+    auto before = plain->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(before.has_value());
+    CHECK(max_abs_diff(*before, *got) > 0.01f);
+}
+
+TEST_CASE("Biased MXFP4 experts and wider attention agree through block streaming") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.head_dim = 64;
+    spec.n_expert = 8;
+    spec.n_expert_used = 3;
+    spec.ffn_type = DType::MXFP4;
+    spec.router_bias = spec.expert_projection_bias = true;
+    spec.attention_sinks = spec.attention_output_bias = true;
+    spec.identical_experts = false;
+    const auto& path = model_path("moe_wider_attention_streaming", spec);
+    TransformerOptions options;
+    options.expert_cache_bytes = 0;
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    LoaderOptions resident, streaming;
+    resident.streaming = false;
+    streaming.streaming = true;
+    auto a = load_transformer(path, options, resident);
+    auto b = load_transformer(path, options, streaming);
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(b->file().streaming());
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto x = a->forward(tokens, Transformer::Logits::All, route, pool);
+    auto y = b->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(x.has_value() && y.has_value());
+    CHECK(max_abs_diff(*x, *y) == 0.0f);
+    const int32_t token = 280;
+    x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+    y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+    REQUIRE(x.has_value() && y.has_value());
+    CHECK(max_abs_diff(*x, *y) == 0.0f);
+}
+
 TEST_CASE("MXFP4 prefill kernels preserve decode bits for odd blocks and partial row tiles") {
     std::mt19937 rng(818);
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -1399,9 +1462,11 @@ TEST_CASE("MXFP4 prefill kernels preserve decode bits for odd blocks and partial
 }
 
 TEST_CASE("Separate attention output gates preserve fused-query gate bits for every KV type") {
+    for (const bool head : {false, true}) {
     test::TinyModelSpec spec;
     spec.arch = "qwen3";
     spec.qk_norm = spec.attn_gate = true;
+    spec.head_attention_gate = head;
     auto split = spec;
     split.separate_attention_gate = true;
     ThreadPool pool(4);
@@ -1411,9 +1476,11 @@ TEST_CASE("Separate attention output gates preserve fused-query gate bits for ev
     for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
         TransformerOptions options;
         options.kv_type = type;
-        auto a = load_transformer(model_path("attention_fused_gate", spec), options);
-        auto b = load_transformer(model_path("attention_separate_gate", split), options);
+        auto a = load_transformer(model_path("attention_fused_gate" + std::to_string(head), spec), options);
+        auto b = load_transformer(model_path("attention_separate_gate" + std::to_string(head), split), options);
         REQUIRE(a != nullptr && b != nullptr);
+        CHECK(a->file().tensor("blk.0.attn_gate.weight") == nullptr);
+        REQUIRE(b->file().tensor("blk.0.attn_gate.weight") != nullptr);
         auto x = a->forward(tokens, Transformer::Logits::All, route, pool);
         auto y = b->forward(tokens, Transformer::Logits::All, route, pool);
         REQUIRE(x.has_value() && y.has_value());
@@ -1423,6 +1490,7 @@ TEST_CASE("Separate attention output gates preserve fused-query gate bits for ev
         y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
         REQUIRE(x.has_value() && y.has_value());
         CHECK(max_abs_diff(*x, *y) == 0.0f);
+    }
     }
 }
 

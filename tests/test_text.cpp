@@ -470,6 +470,33 @@ TEST_CASE("GLM4 pre-tokenization keeps three-digit groups, contractions and Unic
     CHECK(pieces == expected);
 }
 
+TEST_CASE("AFMoE aligns decimal groups on the right, including Unicode and long runs") {
+    auto pre = PreTokenizer::for_name("afmoe");
+    REQUIRE(pre.has_value());
+    const std::string text = "1234 １２３４ abc 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"1", "234", " ", "１", "２３４", " abc", " ", "世界"};
+    CHECK(pieces == expected);
+    const std::string digits(1021, '1');
+    pieces.clear();
+    pre->split(digits, pieces);
+    REQUIRE(pieces.size() == 341);
+    CHECK(pieces.front().size() == 1);
+    for (size_t i = 1; i < pieces.size(); ++i) CHECK(pieces[i].size() == 3);
+}
+
+TEST_CASE("EXAONE-MoE keeps spaces inside word runs and splits individual digits") {
+    auto pre = PreTokenizer::for_name("exaone-moe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "ab cd ef\n12/ 34";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"ab cd ef", "\n", "1", "2", "/", " ", "3", "4"};
+    CHECK(pieces == expected);
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------

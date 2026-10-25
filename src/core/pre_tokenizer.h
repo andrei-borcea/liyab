@@ -58,6 +58,7 @@ private:
     std::vector<Step> steps_;
     bool nfc_ = false;
     bool ignore_merges_ = false;
+    bool right_digits3_ = false;  // isolate decimal runs into groups of three aligned at their right end
 };
 
 }  // namespace liyab

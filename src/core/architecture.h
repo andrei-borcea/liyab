@@ -147,6 +147,10 @@ struct BlockPlan {
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+    // Optional per-block post-SiLU gate / symmetric up clamps from GGUF.
+    // Zero disables the clamp. Shared applies to dense FFNs as well.
+    float expert_swiglu_clamp = 0.0f;
+    float shared_swiglu_clamp = 0.0f;
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF

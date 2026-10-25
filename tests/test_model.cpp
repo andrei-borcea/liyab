@@ -244,6 +244,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32(a + ".feed_forward_length", static_cast<uint32_t>(s.n_ff));
     w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
     w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    if (s.head_dim > 0) w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.head_dim));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
@@ -254,6 +255,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
     }
     if (s.dense_lead > 0) w.add_u32(a + ".leading_dense_block_count", static_cast<uint32_t>(s.dense_lead));
+    if (s.expert_swiglu_clamp > 0) w.add_f32_array(a + ".swiglu_clamp_exp", std::vector<float>(static_cast<size_t>(s.n_layers), s.expert_swiglu_clamp));
+    if (s.shared_swiglu_clamp > 0) w.add_f32_array(a + ".swiglu_clamp_shexp", std::vector<float>(static_cast<size_t>(s.n_layers), s.shared_swiglu_clamp));
     if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b
         w.add_u32(a + ".attention.kv_lora_rank", static_cast<uint32_t>(s.mla_kv_rank));
         if (s.mla_q_rank > 0) w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
@@ -334,7 +337,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     };
 
     const int64_t d = s.n_embd;
-    const int64_t hd = d / s.n_head;
+    const int64_t hd = s.head_dim > 0 ? s.head_dim : d / s.n_head;
+    const int64_t q_dim = hd * s.n_head;
     const int64_t kv = hd * s.n_head_kv;
     const std::vector<float> embd = random(d * n_vocab, 0.5f);
     w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, embd);
@@ -414,20 +418,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 w.add_tensor(p + "attn_q_a_norm.weight", {qr}, DType::F32, norm_weights(qr));
                 w.add_tensor(p + "attn_q_b.weight", {qr, q_rows}, s.attn_type, random(qr * q_rows, s.weight_scale));
             } else {
-                const auto query = random(d * q_rows, s.weight_scale);
-                if (s.separate_attention_gate) {
-                    std::vector<float> q, gate;
-                    for (int32_t h = 0; h < s.n_head; ++h) {
-                        const auto at = static_cast<std::ptrdiff_t>(h * 2 * hd * d);
-                        const auto count = static_cast<std::ptrdiff_t>(hd * d);
-                        q.insert(q.end(), query.begin() + at, query.begin() + at + count);
-                        gate.insert(gate.end(), query.begin() + at + count, query.begin() + at + 2 * count);
-                    }
-                    w.add_tensor(p + "attn_q.weight", {d, d}, s.attn_type, q);
-                    w.add_tensor(p + "attn_gate.weight", {d, d}, s.attn_type, gate);
-                } else {
-                    w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, query);
-                }
+                w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
             }
             w.add_tensor(p + "attn_kv_a_mqa.weight", {d, rank + rd}, s.attn_type,
                          random(d * (rank + rd), s.weight_scale));
@@ -444,7 +435,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
         } else {
-            const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
+            const int64_t q_rows = s.attn_gate ? 2 * q_dim : q_dim;  // [q_h | gate_h] per head when gated
             if (s.fused_qkv) {  // the same draws as separate matrices, stacked [q | k | v]
                 std::vector<float> qkv = random(d * q_rows, s.weight_scale);
                 for (int part = 0; part < 2; ++part) {  // k, then v
@@ -453,11 +444,34 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 }
                 w.add_tensor(p + "attn_qkv.weight", {d, q_rows + 2 * kv}, s.attn_type, qkv);
             } else {
-                w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
+                auto query = random(d * q_rows, s.weight_scale);
+                if (s.head_attention_gate) {
+                    for (int32_t h = 0; h < s.n_head; ++h) {
+                        const auto at = static_cast<size_t>((h * 2 * hd + hd) * d);
+                        for (int64_t j = 1; j < hd; ++j) std::copy_n(query.data() + at, d, query.data() + at + static_cast<size_t>(j * d));
+                    }
+                }
+                if (s.separate_attention_gate) {
+                    std::vector<float> q, gate;
+                    for (int32_t h = 0; h < s.n_head; ++h) {
+                        const auto at = static_cast<std::ptrdiff_t>(h * 2 * hd * d);
+                        const auto count = static_cast<std::ptrdiff_t>(hd * d);
+                        q.insert(q.end(), query.begin() + at, query.begin() + at + count);
+                        if (s.head_attention_gate) {
+                            gate.insert(gate.end(), query.begin() + at + count, query.begin() + at + count + d);
+                        } else {
+                            gate.insert(gate.end(), query.begin() + at + count, query.begin() + at + 2 * count);
+                        }
+                    }
+                    w.add_tensor(p + "attn_q.weight", {d, q_dim}, s.attn_type, q);
+                    w.add_tensor(p + "attn_gate.weight", {d, s.head_attention_gate ? s.n_head : q_dim}, s.attn_type, gate);
+                } else {
+                    w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, query);
+                }
                 w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
                 w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             }
-            w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            w.add_tensor(p + "attn_output.weight", {q_dim, d}, s.attn_type, random(d * q_dim, s.weight_scale));
             if (s.qk_norm) {
                 w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
                 std::vector<float> k_norm = norm_weights(hd);
@@ -469,7 +483,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             }
         }
         if (a == "qwen2") {
-            w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
+            w.add_tensor(p + "attn_q.bias", {q_dim}, DType::F32, random(q_dim, 0.1f));
             std::vector<float> k_bias = random(kv, 0.1f);
             // A few large, constant key channels, as Qwen2.5's K bias has
             // (the slowest-turning RoPE pair of each KV head).
@@ -534,7 +548,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));
         for (float& x : router) x = normal(router_rng) * 0.5f;
         w.add_tensor(p + "ffn_gate_inp.weight", {d, s.n_expert}, DType::F32, router);
-        if (s.expert_bias) w.add_tensor(p + "exp_probs_b.bias", {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
+        if (s.expert_bias) w.add_tensor(p + (s.bare_expert_bias ? "exp_probs_b" : "exp_probs_b.bias"), {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
         if (s.n_ff_shared > 0) {
             const int64_t sh = s.n_ff_shared;
             w.add_tensor(p + "ffn_gate_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));

@@ -597,8 +597,11 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     if f["output"] is None and att_out is not None:
         for c in later:
             for gate in linears:
-                if gate is not c and gate.output.numel() == att_out.numel() and close(
-                        c.input, att_out * torch.sigmoid(gate.output.reshape(att_out.shape))):
+                values = gate.output
+                if values.numel() == SEQ * n_q and values.shape[-1] == n_q:
+                    values = values.reshape(1, SEQ, n_q, 1).expand(1, SEQ, n_q, hd_v).reshape(att_out.shape)
+                if gate is not c and values.numel() == att_out.numel() and close(
+                        c.input, att_out * torch.sigmoid(values.reshape(att_out.shape))):
                     f["output"] = c.path
                     f["output_gate"] = "sigmoid of a separate gate projection"
                     break
@@ -618,12 +621,16 @@ def analyze_dense_ffn(ffn_call, block_calls):
         return Facts(kind="dense", unknown=["the FFN's output is not one projection's output"])
     first = [c for c in lin if c is not down and close(c.input, x)]
     d_in = down.input.float()
+    limit = float(getattr(ffn_call.module, "limit", 0.0) or 0.0)
+    limit = limit if math.isfinite(limit) and limit > 0 else 0.0
+    def activate(act, gate, up):
+        return act(gate).clamp(max=limit) * up.clamp(-limit, limit) if limit else act(gate) * up
     for act_name, act in ACTIVATIONS.items():
         for g in first:
             for u in first:
-                if g is not u and close(act(g.output.float()) * u.output.float(), d_in):
+                if g is not u and close(activate(act, g.output.float(), u.output.float()), d_in):
                     return Facts(kind="dense", gated=True, fused_gate_up=False, activation=act_name,
-                                 gate=g.path, up=u.path, down=down.path,
+                                 gate=g.path, up=u.path, down=down.path, clamp=limit,
                                  biases=any(getattr(c.module, "bias", None) is not None for c in (g, u, down)),
                                  unknown=[])
         for c in first:
@@ -631,9 +638,9 @@ def analyze_dense_ffn(ffn_call, block_calls):
             if o.shape[-1] == 2 * d_in.shape[-1]:
                 h = d_in.shape[-1]
                 for order, (gp, up) in (("gate_first", (o[..., :h], o[..., h:])), ("up_first", (o[..., h:], o[..., :h]))):
-                    if close(act(gp) * up, d_in):
+                    if close(activate(act, gp, up), d_in):
                         return Facts(kind="dense", gated=True, fused_gate_up=True, fused_order=order,
-                                     activation=act_name, gate=c.path, up=c.path, down=down.path,
+                                     activation=act_name, gate=c.path, up=c.path, down=down.path, clamp=limit,
                                      biases=any(getattr(m.module, "bias", None) is not None for m in (c, down)),
                                      unknown=[])
             if close(act(o), d_in):
@@ -747,7 +754,10 @@ def analyze_moe(ffn_call, block_calls, cfg):
     if gu is not None and dn is not None and gu.dim() == 3 and dn.dim() == 3:
         x = ecall.input.reshape(n_tokens, -1).float()
         target = ecall.output.reshape(n_tokens, -1).float()
-        acts = {name: (lambda g, u, act=act: act(g) * u) for name, act in ACTIVATIONS.items()}
+        limit = float(getattr(ecall.module, "limit", 0.0) or 0.0)
+        limit = limit if math.isfinite(limit) and limit > 0 and not hasattr(ecall.module, "alpha") else 0.0
+        acts = {name: (lambda g, u, act=act: act(g).clamp(max=limit) * u.clamp(-limit, limit)
+                       if limit else act(g) * u) for name, act in ACTIVATIONS.items()}
         # These constants define SwigluOai; another clamp/alpha needs a new
         # engine contract, so never silently describe it as this activation.
         if getattr(ecall.module, "alpha", None) == 1.702 and getattr(ecall.module, "limit", None) == 7.0:
@@ -776,11 +786,16 @@ def analyze_moe(ffn_call, block_calls, cfg):
                     if close(out, target):
                         f["expert_activation"] = name
                         f["expert_biases"] = gb is not None or db is not None
+                        f["expert_clamp"] = limit
                         break
                 if f["expert_activation"]:
                     break
             if f["expert_activation"]:
                 break
+    if f.get("shared_expert"):
+        shared = next((c for c in inside if c.path == f["shared_expert"]["module"]), None)
+        limit = float(getattr(shared.module, "limit", 0.0) or 0.0) if shared else 0.0
+        f["shared_expert"]["clamp"] = limit if math.isfinite(limit) and limit > 0 else 0.0
     if f["expert_activation"] is None:
         f["unknown"].append("the experts' activation could not be recomputed from their projections")
     return f

@@ -367,7 +367,7 @@ class Engine:
         # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
         # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
         # caps, YaRN) are supported exactly when it reads them.
-        self.file_keys = set(re.findall(r'(?:key|require_int)\(\s*"([^"]+)"', cpp))
+        self.file_keys = set(re.findall(r'(?:key|require_int|block_clamp)\(\s*"([^"]+)"', cpp))
         self.rope_scalings = set(re.findall(r'\*scaling\s*[!=]=\s*"([\w-]+)"', cpp))
         m = re.search(r"kArchitectures\[\]\s*=\s*\{(.*?)\n\};", cpp, re.S)
         if m is None:
@@ -744,7 +744,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["ffn"] = "moe"
             p["shared_expert"] = "ffn_up_shexp.weight" in ts
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
-            p["selection_bias"] = "exp_probs_b.bias" in ts
+            p["selection_bias"] = "exp_probs_b.bias" in ts or "exp_probs_b" in ts
             p["router_bias"] = "ffn_gate_inp.bias" in ts
             p["expert_biases"] = bool({"ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"} & ts)
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
@@ -1217,6 +1217,21 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.file_issues.append(f"block {i}: a shared expert in one of the reference and the file only")
             elif sh and bool(sh.get("gate")) != bool(plan.get("shared_gate")):
                 d.file_issues.append(f"block {i}: the shared expert's gate in one of the reference and the file only")
+    for b in bf:
+        f = b.get("ffn") or {}
+        i = b["index"]
+        expected = {"swiglu_clamp_exp": f.get("expert_clamp", 0.0),
+                    "swiglu_clamp_shexp": (f.get("shared_expert") or {}).get("clamp", 0.0)
+                    if f.get("kind") == "moe" else f.get("clamp", 0.0)}
+        for suffix, ref_limit in expected.items():
+            values = g.key(suffix, 0.0)
+            value = values[i] if isinstance(values, list) and i < len(values) else values
+            if isinstance(value, list) or not isinstance(value, (int, float)):
+                d.file_issues.append(f"block {i}: invalid {suffix}")
+            elif not _close(float(value), float(ref_limit), 1e-5):
+                d.file_issues.append(f"block {i}: {suffix} {value}, reference {ref_limit}")
+            elif ref_limit and suffix not in engine.file_keys:
+                d.missing.append(f"block {i}: post-activation SwiGLU clamp {ref_limit}")
     if len(acts) > 1:
         d.missing.append(f"FFNs with different activations {sorted(acts)} (one activation per architecture)")
     elif acts:

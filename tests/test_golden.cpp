@@ -265,6 +265,19 @@ std::vector<GoldenCase> cases() {
     add("qwen3-fused-attention-gate", s);
     s.separate_attention_gate = true;
     add("qwen3-separate-attention-gate", s);
+    s.head_attention_gate = true;
+    add("qwen3-head-attention-gate", s);
+    s = moe_spec("hy_v3");
+    s.qk_norm = s.expert_bias = s.bare_expert_bias = s.sigmoid_gating = true;
+    add("hy_v3-bare-selection-bias", s);
+    s = moe_spec("qwen3moe");
+    s.expert_swiglu_clamp = 0.125f;
+    s.shared_swiglu_clamp = 0.25f;
+    s.n_ff_shared = 64;
+    add("moe-post-silu-clamps", s);
+    s.fused_gate_up = true;
+    s.ffn_type = DType::MXFP4;
+    add("moe-post-silu-clamps-mxfp4-streamed", s, streamed);
     for (const char* arch : {"qwen2moe", "glm4moe", "dots1", "ernie4_5-moe"}) {
         s = moe_spec(arch);
         s.expert_weights_norm = -1;

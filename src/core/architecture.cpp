@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "liyab/engine.h"
 
@@ -87,6 +88,7 @@ constexpr ArchSpec kArchitectures[] = {
     {"glm4moe", RopeLayout::Halves, "post_attention_norm", true},
     {"dots1", RopeLayout::Halves, "ffn_norm", true},
     {"ernie4_5-moe", RopeLayout::Adjacent, "ffn_norm", true},
+    {"hy_v3", RopeLayout::Halves, "ffn_norm", true},
 };
 
 }  // namespace
@@ -328,8 +330,24 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // makes the FFN a mixture of experts.
     const int64_t q_dim = int64_t{c.n_head} * c.head_dim;
     c.blocks.resize(static_cast<size_t>(c.n_layers));
+    auto block_clamp = [&](const char* suffix, int32_t l, float& out) -> Status {
+        const GgufValue* v = f.metadata(key(suffix));
+        if (v == nullptr) return Status::ok();
+        if (v->type != GgufValue::Type::Array || v->array_type != GgufValue::Type::F32 ||
+            v->array_size < static_cast<uint64_t>(c.n_layers)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+        }
+        std::memcpy(&out, v->array_data + static_cast<size_t>(l) * sizeof(float), sizeof(float));
+        if (!std::isfinite(out) || out < 0.0f) return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+        if (out > 0.0f && c.spec->ffn_activation != FfnActivation::SiLU) {
+            return Status(ErrorCode::Unsupported, "post-activation SwiGLU clamps require SiLU");
+        }
+        return Status::ok();
+    };
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
+        LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_exp", l, b.expert_swiglu_clamp));
+        LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_shexp", l, b.shared_swiglu_clamp));
         if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr) {
             b.mixer = MixerKind::DeltaNet;
         } else {

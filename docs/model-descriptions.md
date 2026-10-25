@@ -289,3 +289,24 @@ the converter's coupled shared-width metadata. Tiny numerical results are record
 The `glm4` table entry is covered by an explicit split/flag test, the 498-token conformance comparison, and
 fourteen reference chat-template renderings. Its normalizer is absent and `ignore_merges` is true, as in the
 published tokenizer JSON.
+
+`hy_v3` stores its expert selection correction as bare `exp_probs_b`; the loader accepts that spelling alongside
+`exp_probs_b.bias` while rejecting a duplicate pair. The trace checks both spellings. The same attention-gate
+part also accepts one scalar per head (broadcast over its value channels).
+
+`swiglu_clamp_exp` and `swiglu_clamp_shexp` are per-block float32 arrays. Their positive finite limits clamp the
+SiLU result, then multiply by the symmetrically clamped up projection. They differ from SwigluOai, whose clamp
+precedes activation. Dense and shared experts use the shared array, routed experts the expert array. Negative,
+nonfinite, short, or wrongly typed arrays are rejected; zero retains the original arithmetic. The reference
+trace recomputes these limits and compares them with the file.
+
+AFMoE's decimal splitter is equivalent to its tokenizer's bounded regex sequence: isolate each decimal run,
+then split in groups of three aligned at the right. A direct linear scan avoids repeated lookaheads on long
+numbers. Script splits and word splits follow it. EXAONE-MoE's own regex and NFC rule have a separate table row.
+AFMoE and EXAONE-MoE still need modern's support for their global blocks without RoPE before an architecture row
+can be admitted.
+The description tool proposes `{"hy_v3", RopeLayout::Halves, "ffn_norm", true}` for `tencent/Hy3-preview`.
+Its tiny checkpoint passes the standard reference gate (498 positions, KL 0.00000, top-1 100.00%), including the
+bare selection-bias tensor. Scalar-head and per-channel attention gates are checked against equivalent fused
+query/gate tensors for F16, Q8_0, Q4_0 and Q4_1 KV. An independent float reference checks the post-SiLU clamp;
+MXFP4 biased experts with attention wider than the residual stream match block-streamed execution exactly.

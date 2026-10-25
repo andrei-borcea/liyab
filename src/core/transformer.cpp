@@ -47,7 +47,11 @@ float gelu_tanh(float x) {
 }
 
 // The gated FFN's elementwise step: out[i] = act(gate[i]) * up[i] (out may be gate).
-void gated_activation(FfnActivation act, const float* gate, const float* up, float* out, size_t n) {
+void gated_activation(FfnActivation act, const float* gate, const float* up, float* out, size_t n, float limit = 0.0f) {
+    if (limit > 0.0f) {  // validated SiLU: clamp the activated gate, unlike SwigluOai's input clamp
+        for (size_t i = 0; i < n; ++i) out[i] = std::min(silu(gate[i]), limit) * std::clamp(up[i], -limit, limit);
+        return;
+    }
     if (act == FfnActivation::GeluTanh) {
         for (size_t i = 0; i < n; ++i) out[i] = gelu_tanh(gate[i]) * up[i];
         return;
@@ -710,7 +714,9 @@ Status Transformer::bind_weights() {
         } else if (plan.mixer == MixerKind::Attention) {
             L.kv_slot = kv_slots++;
             if (f.tensor(block_tensor(l, "attn_gate.weight")) != nullptr) {
-                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_gate.weight"), c.n_embd, q_dim, L.w[kZ]));
+                const int64_t gates = f.tensor(block_tensor(l, "attn_gate.weight"))->rows();
+                if (gates != q_dim && gates != c.n_head) return Status(ErrorCode::InvalidModel, "invalid attention gate width");
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_gate.weight"), c.n_embd, gates, L.w[kZ]));
             }
             if (plan.fused_qkv) {
                 LIYAB_RETURN_IF_ERROR(
@@ -788,7 +794,11 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(experts("ffn_up_exps.weight", c.n_embd, c.n_ff_expert, L.w[kUpExps]));
         }
         LIYAB_RETURN_IF_ERROR(experts("ffn_down_exps.weight", c.n_ff_expert, c.n_embd, L.w[kDownExps]));
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "exp_probs_b.bias"), c.n_expert, false, L.expert_bias));
+        const bool named_bias = f.tensor(block_tensor(l, "exp_probs_b.bias")) != nullptr;
+        const bool bare_bias = f.tensor(block_tensor(l, "exp_probs_b")) != nullptr;
+        if (named_bias && bare_bias) return Status(ErrorCode::InvalidModel, "duplicate expert selection bias in block " + std::to_string(l));
+        LIYAB_RETURN_IF_ERROR(vec(named_bias ? block_tensor(l, "exp_probs_b.bias") : block_tensor(l, "exp_probs_b"),
+                                  c.n_expert, false, L.expert_bias));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_inp.bias"), c.n_expert, false, L.router_bias));
         // Per-expert biases ([rows, n_expert] in the file: expert e's at e * rows).
         const int64_t E = c.n_expert;
@@ -2082,6 +2092,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const bool gated = c.blocks[static_cast<size_t>(layer)].attn_gate;
     const bool fused_gate = gated && L.w[kZ] == nullptr;
+    const bool head_gate = L.w[kZ] != nullptr && L.w[kZ]->rows() == c.n_head;
     const auto un = static_cast<size_t>(n);
     const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
     const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
@@ -2091,7 +2102,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (fused_gate) qg_.resize(un * 2 * q_dim);
-    if (gated) gate_.resize(un * q_dim);
+    if (gated) gate_.resize(un * (head_gate ? static_cast<size_t>(c.n_head) : q_dim));
     if (L.w[kZ] != nullptr) {
         LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kZ], xb_.data(), gate_.data(), n));
     }
@@ -2131,7 +2142,14 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
         }
     }
     attention(L.kv_slot, L.window, n, pool, head_mask, L.sinks.empty() ? nullptr : L.sinks.data());
-    if (gated) {
+    if (head_gate) {
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
+                const float scale = sigmoid(gate_[t * static_cast<size_t>(c.n_head) + h]);
+                for (size_t j = 0; j < hd; ++j) att_[t * q_dim + h * hd + j] *= scale;
+            }
+        }
+    } else if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
     LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
@@ -3013,7 +3031,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kUp], xb_.data(), hb2_.data(), n));
         for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
             const float* gate_up = hb2_.data() + t * 2 * ff;
-            gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff);
+            gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff, c.blocks[static_cast<size_t>(layer)].shared_swiglu_clamp);
         }
         return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
     }
@@ -3025,7 +3043,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
     }
-    gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows);
+    gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows, c.blocks[static_cast<size_t>(layer)].shared_swiglu_clamp);
     return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
 }
 
@@ -3167,7 +3185,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         const TensorView* gate_up[] = {&w[kGateShared], &w[kUpShared]};
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
-        gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), un * sh);
+        gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), un * sh, c.blocks[static_cast<size_t>(layer)].shared_swiglu_clamp);
         shared_out_.resize(un * d);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kDownShared], hb_.data(), shared_out_.data(), n));
         // The gate scale is applied when the output is added (below), in one
@@ -3337,10 +3355,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         if (fused) {  // the same rows as the split matrices give, so the same bits
             for (size_t r = 0; r < rows_total; ++r) {
                 const float* gate_up = eh2_.data() + r * 2 * ff;
-                gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, eh_.data() + r * ff, ff);
+                gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, eh_.data() + r * ff, ff, c.blocks[static_cast<size_t>(layer)].expert_swiglu_clamp);
             }
         } else {
-            gated_activation(c.spec->ffn_activation, eh_.data(), eh2_.data(), eh_.data(), rows_total * ff);
+            gated_activation(c.spec->ffn_activation, eh_.data(), eh2_.data(), eh_.data(), rows_total * ff, c.blocks[static_cast<size_t>(layer)].expert_swiglu_clamp);
         }
         items.clear();
         for (size_t i = 0; i < wave.size(); ++i) {
