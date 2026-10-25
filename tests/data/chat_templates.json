@@ -5529,5 +5529,372 @@
         "output": "<role>SYSTEM</role>\ndetailed thinking off<|role_end|><role>HUMAN</role>What is the capital of Italy?<|role_end|><role>ASSISTANT</role>"
       }
     ]
+  },
+  "glm51": {
+    "template": "[gMASK]<sop>\n{%- if tools -%}\n{%- macro tool_to_json(tool) -%}\n    {%- set ns_tool = namespace(first=true) -%}\n    {{ '{' -}}\n    {%- for k, v in tool.items() -%}\n        {%- if k != 'defer_loading' and k != 'strict' -%}\n            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}\n            {%- set ns_tool.first = false -%}\n            \"{{ k }}\": {{ v | tojson(ensure_ascii=False) }}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- '}' -}}\n{%- endmacro -%}\n<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{% for tool in tools %}\n{%- if 'function' in tool -%}\n    {%- set tool = tool['function'] -%}\n{%- endif -%}\n{% if tool.defer_loading is not defined or not tool.defer_loading %}\n{{ tool_to_json(tool) }}\n{% endif %}\n{% endfor %}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}\n{%- macro visible_text(content) -%}\n    {%- if content is string -%}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- for item in content -%}\n            {%- if item is mapping and item.type == 'text' -%}\n                {{- item.text }}\n            {%- elif item is string -%}\n                {{- item }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {{- content }}\n    {%- endif -%}\n{%- endmacro -%}\n{%- set ns = namespace(last_user_index=-1, thinking_indices='') -%}\n{%- for m in messages %}\n    {%- if m.role == 'user' %}\n        {%- set ns.last_user_index = loop.index0 -%}\n    {%- elif m.role == 'assistant' %}\n        {%- if m.reasoning_content is string %}\n            {%- set ns.thinking_indices = ns.thinking_indices ~ ',' ~ ns.last_user_index ~ ',' -%}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- set ns.has_thinking = false -%}\n{%- for m in messages -%}\n{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}{% set ns.has_thinking = (',' ~ loop.index0 ~ ',') in ns.thinking_indices -%}\n{%- elif m.role == 'assistant' -%}\n<|assistant|>\n{%- set content = visible_text(m.content) %}\n{%- if m.reasoning_content is string %}\n    {%- set reasoning_content = m.reasoning_content %}\n{%- elif '</think>' in content %}\n    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}\n    {%- set content = content.split('</think>')[-1] %}\n{%- elif loop.index0 > ns.last_user_index and not (enable_thinking is defined and not enable_thinking) %}\n    {%- set reasoning_content = '' %}\n{%- elif loop.index0 < ns.last_user_index and ns.has_thinking %}\n    {%- set reasoning_content = '' %}\n{%- endif %}\n{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}\n{{ '<think>' + reasoning_content +  '</think>'}}\n{%- else -%}\n{{ '</think>' }}\n{%- endif -%}\n{%- if content.strip() -%}\n{{ content.strip() }}\n{%- endif -%}\n{% if m.tool_calls %}\n{% for tc in m.tool_calls %}\n{%- if tc.function %}\n    {%- set tc = tc.function %}\n{%- endif %}\n{{- '<tool_call>' + tc.name -}}\n{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}\n{% endif %}\n{%- elif m.role == 'tool' -%}\n{%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n    {{- '<|observation|>' -}}\n{%- endif %}\n{%- if m.content is string -%}\n    {{- '<tool_response>' + m.content + '</tool_response>' -}}\n{%- elif m.content is iterable and m.content is not mapping and m.content and m.content.0.type == \"tool_reference\" -%}\n    {{- '<tool_response><tools>\\n' -}}\n    {% for tr in m.content %}\n        {%- for tool in tools -%}\n            {%- if 'function' in tool -%}\n                {%- set tool = tool['function'] -%}\n            {%- endif -%}\n            {%- if tool.name == tr.name -%}\n                {{- tool_to_json(tool) + '\\n' -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- endfor -%}\n    {{- '</tools></tool_response>' -}}\n{%- else -%}\n    {{- '<tool_response>' + visible_text(m.content) + '</tool_response>' -}}\n{% endif -%}\n{%- elif m.role == 'system' -%}\n<|system|>{{ visible_text(m.content) }}\n{%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    <|assistant|>{{- '</think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}\n{%- endif -%}",
+    "special": {
+      "eos_token": "<|endoftext|>",
+      "pad_token": "<|endoftext|>"
+    },
+    "cases": [
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|user|>What is the capital of Italy?<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "Rome."
+            },
+            {
+              "role": "user",
+              "content": "And of France? Answer in one word."
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>Rome.<|user|>And of France? Answer in one word.<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "Rome."
+            },
+            {
+              "role": "user",
+              "content": "And of France? Answer in one word."
+            }
+          ],
+          "add_generation_prompt": false
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>Rome.<|user|>And of France? Answer in one word."
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "Rome."
+            }
+          ]
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|><think></think>Rome."
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+            },
+            {
+              "role": "user",
+              "content": "And of France? Answer in one word."
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>Rome.<|user|>And of France? Answer in one word.<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "Rome.",
+              "reasoning_content": "Italy's capital is Rome."
+            },
+            {
+              "role": "user",
+              "content": "And of France? Answer in one word."
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>Rome.<|user|>And of France? Answer in one word.<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            }
+          ],
+          "add_generation_prompt": true,
+          "enable_thinking": false
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            }
+          ],
+          "add_generation_prompt": true,
+          "enable_thinking": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            },
+            {
+              "role": "assistant",
+              "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+            },
+            {
+              "role": "user",
+              "content": "And of France? Answer in one word."
+            }
+          ],
+          "add_generation_prompt": true,
+          "preserve_thinking": true
+        },
+        "output": "[gMASK]<sop><|system|>You are a concise assistant.<|user|>What is the capital of Italy?<|assistant|></think>Rome.<|user|>And of France? Answer in one word.<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a concise assistant."
+            },
+            {
+              "role": "user",
+              "content": "Weather in Rome?"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Weather for a city.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "city"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "add",
+                "description": "Adds two numbers.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "a": {
+                      "type": "number"
+                    },
+                    "b": {
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Adds two numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a concise assistant.<|user|>Weather in Rome?<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Weather in Rome?"
+            },
+            {
+              "role": "assistant",
+              "content": "",
+              "tool_calls": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": {
+                      "city": "Rome"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Weather for a city.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "city"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "add",
+                "description": "Adds two numbers.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "a": {
+                      "type": "number"
+                    },
+                    "b": {
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Adds two numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Rome?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>{\"temp\": 21, \"sky\": \"clear\"}</tool_response><|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "  Città: Zürich, 東京 🌍  \n"
+            },
+            {
+              "role": "user",
+              "content": "\n  ¿Qué tal?  \t"
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|>  Città: Zürich, 東京 🌍  \n<|user|>\n  ¿Qué tal?  \t<|assistant|><think>"
+      },
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "system",
+              "content": ""
+            },
+            {
+              "role": "user",
+              "content": "What is the capital of Italy?"
+            }
+          ],
+          "add_generation_prompt": true
+        },
+        "output": "[gMASK]<sop><|system|><|user|>What is the capital of Italy?<|assistant|><think>"
+      }
+    ]
   }
 }

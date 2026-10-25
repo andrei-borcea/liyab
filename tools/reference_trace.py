@@ -5,7 +5,7 @@ A reduced copy of the model is built from its configuration with random weights:
 every kind of block the configuration lists), a small vocabulary, narrow FFNs and few experts. The widths of the
 residual stream and of the attention heads are kept, so every scale, base and multiplier is the model's own. One
 pass over a short sequence is recorded: what every module receives and returns, and, through an attention function
-registered with transformers (or an observed direct PyTorch SDPA call), the queries, keys and values each attention
+registered with transformers (or observed direct PyTorch SDPA / eager operations), the queries, keys and values each attention
 gets with its arguments (scale, window, soft-cap). The facts the engine needs are then established by recomputing
 them, never from class or module names:
 
@@ -15,7 +15,7 @@ them, never from class or module names:
   norms come before or after the rotation, and over how many dimensions those norms reach;
 * the attention scale, window and soft-cap, and whether the attention output is gated;
 * the FFN's form and activation, and a mixture of experts' routing (fused or individually observed experts,
-  probabilities, selection bias, top-k,
+  logits from a module or a direct linear operation, probabilities, selection bias, top-k,
   renormalization, scale, shared expert and its gate);
 * how the embeddings enter the first block and how the logits leave the last one.
 
@@ -372,7 +372,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     _register_attention()
     reduced._attn_implementation = ATTN_IMPL
     torch.manual_seed(0)
-    direct_sdpa = False
+    direct_attention = None
     try:
         model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
                                                  attn_implementation=ATTN_IMPL)
@@ -381,11 +381,22 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
             raise
         # Older remote implementations dispatch through a local table instead
         # of AttentionInterface. Observe their standard PyTorch operation.
-        direct_sdpa = True
+        direct_attention = "sdpa"
         reduced._attn_implementation = "sdpa"
         torch.manual_seed(0)
-        model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
-                                                 attn_implementation="sdpa")
+        try:
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="sdpa")
+        except (KeyError, ValueError) as error:
+            if not ((isinstance(error, KeyError) and error.args == ("sdpa",)) or
+                    (isinstance(error, ValueError) and "does not support an attention implementation through "
+                     "torch.nn.functional.scaled_dot_product_attention" in str(error))):
+                raise
+            direct_attention = "eager"
+            reduced._attn_implementation = "eager"
+            torch.manual_seed(0)
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="eager")
     model.eval()
     _randomize(model)
     layers_path, layers = _decoder_layers(model, keep)
@@ -394,11 +405,13 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     RECORDER.attn.clear()
     handles = []
     stack = []
+    paths = {}
     for path, mod in model.named_modules():
         if mod is model:
             continue
+        paths[mod] = path
 
-        if direct_sdpa:
+        if direct_attention:
             handles.append(mod.register_forward_pre_hook(lambda module, args: stack.append(module)))
 
         def hook(module, args, kwargs, output, path=path):
@@ -406,24 +419,76 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
                                        [a.detach() if torch.is_tensor(a) else a for a in args],
                                        {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
                                        _tensors(output)))
-            if direct_sdpa:
+            if direct_attention:
                 stack.pop()
 
         handles.append(mod.register_forward_hook(hook, with_kwargs=True))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
     original_sdpa = F.scaled_dot_product_attention
+    original_matmul, original_softmax = torch.matmul, F.softmax
+    original_linear = F.linear
+    pending = {}
+
+    def traced_linear(input, weight, bias=None):
+        result = original_linear(input, weight, bias)
+        owner = stack[-1] if stack else None
+        own_weight = getattr(owner, "weight", None)
+        if (owner is not None and not isinstance(owner, nn.Linear) and torch.is_tensor(own_weight) and
+                own_weight.dim() == 2 and torch.equal(weight, own_weight)):
+            # Some routers own a Parameter and call F.linear directly. Record
+            # the actual operation's logits, not an inferred module formula.
+            RECORDER.calls.append(Call(RECORDER.next(), paths[owner], owner, [input.detach()], {},
+                                       [result.detach()]))
+        return result
+
+    def collapse_kv(key, value):
+        kv_heads = getattr(reduced, "num_key_value_heads", key.shape[1])
+        if key.shape[1] > kv_heads and key.shape[1] % kv_heads == 0:
+            groups = key.shape[1] // kv_heads
+            if torch.equal(key, key[:, ::groups].repeat_interleave(groups, dim=1)) and torch.equal(
+                    value, value[:, ::groups].repeat_interleave(groups, dim=1)):
+                return key[:, ::groups], value[:, ::groups]
+        return key, value
+
+    def traced_matmul(left, right, *args, **kwargs):
+        result = original_matmul(left, right, *args, **kwargs)
+        if not stack or left.dim() != 4 or right.dim() != 4:
+            return result
+        owner = stack[-1]
+        item = pending.get(owner)
+        if item is not None and "weights" in item and torch.equal(left, item["weights"]):
+            k, v = collapse_kv(item["key"], right)
+            rec = AttnCall(item["order"], owner, item["query"], k.detach().clone(), v.detach().clone(),
+                           {"scaling": item["scale"], "is_causal": True, "dropout": 0.0})
+            rec.output = result.transpose(1, 2).detach().clone()
+            RECORDER.attn.append(rec)
+            del pending[owner]
+        elif (left.shape[-2] == SEQ and right.shape[-1] == SEQ and
+              left.shape[-1] == right.shape[-2] and left.shape[:-2] == right.shape[:-2]):
+            pending[owner] = {"query": left.detach().clone(), "key": right.transpose(-1, -2).detach().clone(),
+                              "raw": result.detach().clone(), "order": RECORDER.next()}
+        return result
+
+    def traced_softmax(input, *args, **kwargs):
+        result = original_softmax(input, *args, **kwargs)
+        item = pending.get(stack[-1]) if stack else None
+        if item is not None and input.shape == item["raw"].shape:
+            # The trace can describe plain scaled causal attention from its
+            # operations, but must refuse unknown score transforms or masks.
+            visible = torch.ones_like(input, dtype=torch.bool).tril()
+            raw, scores = item["raw"][visible].double(), input[visible].double()
+            scale = (raw * scores).sum() / raw.square().sum()
+            if not (torch.isfinite(scale) and scale > 0 and
+                    close(scores, raw * scale) and torch.all(input[~visible] < -1e20)):
+                raise ValueError("direct eager trace needs verified scaled scores and a full causal mask")
+            item["scale"], item["weights"] = scale.item(), result.detach().clone()
+        return result
 
     def traced_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
         # Remote GQA implementations often repeat KV before calling SDPA.
         # Collapse only exactly repeated heads, preserving the tensors the
         # projections and per-head norms actually produced.
-        kv_heads = getattr(reduced, "num_key_value_heads", key.shape[1])
-        k, v = key, value
-        if key.shape[1] > kv_heads and key.shape[1] % kv_heads == 0:
-            groups = key.shape[1] // kv_heads
-            if torch.equal(key, key[:, ::groups].repeat_interleave(groups, dim=1)) and torch.equal(
-                    value, value[:, ::groups].repeat_interleave(groups, dim=1)):
-                k, v = key[:, ::groups], value[:, ::groups]
+        k, v = collapse_kv(key, value)
         causal = is_causal
         if attn_mask is not None:
             expected = torch.ones_like(attn_mask, dtype=torch.bool).tril()
@@ -441,12 +506,18 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
         return result
 
     try:
-        if direct_sdpa:
+        if direct_attention:
+            F.linear = traced_linear
+        if direct_attention == "sdpa":
             F.scaled_dot_product_attention = traced_sdpa
+        elif direct_attention == "eager":
+            torch.matmul, F.softmax = traced_matmul, traced_softmax
         with torch.no_grad():
             out = model(input_ids=ids, use_cache=False)
     finally:
         F.scaled_dot_product_attention = original_sdpa
+        torch.matmul, F.softmax = original_matmul, original_softmax
+        F.linear = original_linear
         for h in handles:
             h.remove()
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]

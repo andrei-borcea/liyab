@@ -35,8 +35,10 @@ block the configuration lists), the vocabulary is 512 tokens, the FFNs 64 wide a
 random, with norm weights drawn away from 0 and 1 so that a norm multiplying by `w` and one multiplying by `1 + w`
 differ. One pass over 13 tokens is recorded: every module's inputs and outputs (forward hooks), and the queries,
 keys and values each attention receives with its arguments, through an attention function registered with
-transformers. Older remote implementations dispatching directly through PyTorch SDPA are observed at that
-operation instead; only a verified full causal mask is accepted there. Each fact is then recomputed from the
+transformers. Older remote implementations dispatching directly through PyTorch SDPA or eager matmuls/softmax are
+observed at those operations instead; only verified scaled dot products with full causal masks are accepted.
+Direct router linear operations owned by a module are recorded with that module's actual inputs and outputs.
+Each fact is then recomputed from the
 records, never read from a class or module name:
 
 | Fact | How it is established |
@@ -229,8 +231,8 @@ KV projection's rows with the checkpoint before proposing the RoPE pairing. Nume
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
-  leaves the attention facts unknown unless its direct PyTorch SDPA operation can be observed and its causal mask
-  verified.
+  leaves the attention facts unknown unless its direct PyTorch SDPA or eager operations can be observed and its
+  scores and causal mask verified.
 * **A prefix of the blocks is traced.** The shortest prefix holding every kind of block the configuration lists per
   block (`layer_types` and similar lists, the first MoE block, a full-attention interval), at least 2. Which blocks
   attend through a window comes from `layer_types` when the configuration has it; otherwise every traced block
@@ -256,6 +258,8 @@ sum of their best two biased probabilities (one for a one-expert group); without
 Biases affect selection only. `reference_trace.py` tests both group-score formulas against the indices supplied
 to the reference's experts; `describe_model.py` checks the observed geometry and formula against the GGUF.
 A rule it cannot establish still prevents proposing a registry row. No new `ArchSpec` field is needed.
+When `expert_weights_norm` explicitly specifies the behavior, the verified file value wins and an existing
+registry's unused fallback stays unchanged. Such a file cannot establish the default of older files omitting it.
 `tiny_checkpoint.py` removes a published checkpoint's quantization configuration before saving its random F32
 weights, since those tensors are not quantized.
 The group-routing golden cases are pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar; streamed and resident
@@ -309,6 +313,17 @@ GLM-5.2 at revision `cf457fa734ab149ffef225f80893eb38c6ff5cdc` proposes the same
 tiny checkpoint keeps the original latent/index widths and top-k 256, with three full indexers and a shared
 fourth block: 494 identical IDs, 493 positions, mean KL 0.00000, maximum 0.00008, top-1 99.80%. Its own template
 passes 14 reference renders and its tokenizer matches the three tokenizer texts.
+
+GLM-5.1 (`26e1bd6e011feb778d25ae34b09b07074139d92d`) also proposes the same row. Its four-block checkpoint at
+top-k 256 gives 494 identical IDs, mean KL 0.00000, maximum 0.00001, top-1 99.80%, plus all three tokenizer texts
+and 14 template renders matching.
+
+Kimi K2 (`moonshotai/Kimi-K2-Instruct`, revision `fd1984e2b7a3350dbf7305fe73a4ede25c14de50`) uses the existing
+`deepseek2` parts. Its older code's eager attention and direct `F.linear` router are observed and verified. A
+two-block, width-256 checkpoint keeping the original latent widths gives mean KL 0.00000, maximum 0.00016 and
+top-1 99.80% on 502 positions using reference IDs; the reference disables its obsolete cache API. This numerical
+result is not a tokenizer/template gate: the `kimi-k2` pre-tokenizer and tokenizer-side tool sorting are an
+integration dependency. The description correctly refuses support while that pre-tokenizer is absent.
 
 Ling-mini-2.0 (`inclusionAI/Ling-mini-2.0`, revision `a810f6416bc4e1e29c9d7f271dd2fa7e56e71eab`) proposes
 `{"bailingmoe2", RopeLayout::Halves, "ffn_norm", true}`. Individual ModuleList expert calls are verified against

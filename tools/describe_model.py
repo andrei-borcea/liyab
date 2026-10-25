@@ -9,6 +9,8 @@ and plans each block from the tensors present. This tool establishes those facts
 registry row it needs or the precise list of parts Liyab does not implement yet. It never guesses: a fact it cannot
 establish is reported as unknown, and no row is proposed. Where this GGUF disagrees with the reference (other
 weights, a window or BOS rule it does not record), that is reported as a problem of the file, apart from the row.
+An explicit expert_weights_norm value is verified against the router and preserves an existing registry's unused
+fallback: a file overriding that default provides no evidence for changing other files' behavior.
 
 Where the facts come from:
 
@@ -1265,8 +1267,16 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         norms_ = {f.get("norm_topk") for f in moe_facts if "norm_topk" in f}
         if len(norms_) == 1:
             v = norms_.pop()
-            d.set("moe_norm_weights", bool(v), f"the router {'renormalizes' if v else 'does not renormalize'} "
-                                                f"the top-k weights")
+            if g.key("expert_weights_norm") is not None and arch in engine.rows:
+                # This file overrides the fallback. It says nothing about
+                # other files of the same architecture which omit the key.
+                fallback = engine.rows[arch][0]["moe_norm_weights"]
+                d.set("moe_norm_weights", fallback, f"expert_weights_norm in the file specifies "
+                      f"{'renormalization' if v else 'no renormalization'} (verified against the router); "
+                      "the existing registry fallback is not used by this file")
+            else:
+                d.set("moe_norm_weights", bool(v), f"the router {'renormalizes' if v else 'does not renormalize'} "
+                                                    f"the top-k weights")
         if any(f.get("gating") for f in moe_facts):
             f = next(f for f in moe_facts if f.get("gating"))
             d.parts.append(f"MoE: {f['gating']} routing, top {g.key('expert_used_count')} of "

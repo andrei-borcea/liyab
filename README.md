@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `glm-dsa` (GLM-5/5.2 tiny checkpoints), `deepseek32` (DeepSeek-V3.2 tiny checkpoint), `bailingmoe2` (Ling 2.0 tiny checkpoint) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `glm-dsa` (GLM-5/5.1/5.2 tiny checkpoints), `deepseek32` (DeepSeek-V3.2 tiny checkpoint), `bailingmoe2` (Ling 2.0 tiny checkpoint) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -2232,8 +2232,14 @@ Q/K norms, dense and grouped MoE FFNs plus a shared expert: 512 identical IDs, m
 top-1 99.61% with F16 KV. Its older remote code requires transformers-5 compatibility shims, including restoring
 the nonpersistent RoPE buffer from its constructor formula after loading. Its template passes 14 renders.
 GLM-5.2 and Ling tokenizers match all three tokenizer texts. These are tiny-checkpoint results, without real
-weights. The description tool verifies individually observed expert calls and direct causal PyTorch SDPA calls
-when an older remote implementation does not use transformers' attention registry.
+weights. GLM-5.1's four-block checkpoint at top-k 256 gives 494 identical IDs, mean KL 0.00000, maximum 0.00001,
+top-1 99.80%, with all three tokenizer texts and 14 template renders matching.
+The description tool verifies individually observed expert calls, direct router linear operations and causal
+PyTorch SDPA or eager attention when an older implementation does not use transformers' attention registry.
+Eager scoring must match a scaled dot product with a full causal mask; unknown transforms are refused. Explicit
+`expert_weights_norm` metadata overrides the registry fallback, which the tool preserves for older files.
+Kimi K2's tiny numerical check on reference IDs gives mean KL 0.00000 and top-1 99.80%; tokenizer and template
+validation still depend on its `kimi-k2` pre-tokenizer and tokenizer-side tool sorting being integrated.
 
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
