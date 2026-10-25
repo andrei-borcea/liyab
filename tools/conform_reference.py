@@ -39,6 +39,8 @@ computed in one call, so no cache state is needed or reused.
 safetensors. Use it for legacy model classes whose nonpersistent rotary
 buffers are not preserved by transformers' meta-device pretrained loader.
 The model's forward implementation and checkpoint tensors are unchanged.
+--slow-tokenizer selects the authors' slow tokenizer when a newer fast
+conversion does not preserve their SentencePiece model's segmentation.
 
 --lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
 a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
@@ -73,16 +75,18 @@ def main():
     parser.add_argument("--lora", help="PEFT LoRA adapter (directory or id) applied to the model")
     parser.add_argument("--state-dict", action="store_true",
                         help="construct on CPU, then load a local safetensors checkpoint (legacy nonpersistent buffers)")
+    parser.add_argument("--slow-tokenizer", action="store_true", help="use the model's original slow tokenizer")
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from reference_tokenizer import load_tokenizer
 
     # newline="" keeps "\r\n" as written: liyab-kl encodes the file's exact bytes.
     with open(args.text, encoding="utf-8", newline="") as f:
         text = f.read()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision,
-                                              trust_remote_code=args.trust_remote_code)
+    tokenizer = load_tokenizer(args.model, revision=args.revision,
+                               trust_remote_code=args.trust_remote_code, slow=args.slow_tokenizer)
     # add_special_tokens follows the model's own rule for a BOS, as liyab-kl
     # follows tokenizer.ggml.add_bos_token.
     ids = tokenizer(text, add_special_tokens=True)["input_ids"][: args.max_tokens]

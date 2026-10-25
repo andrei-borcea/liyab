@@ -146,6 +146,20 @@ kinds: identical 512 reference IDs, mean KL 0.00000 and top-1 99.61% with F16 KV
 period instead gives mean KL 0.00000 (maximum 0.00005) and top-1 98.83%, below the tiny acceptance threshold. Its
 real-model gate is pending. The original-period file proposes the registered `plamo3` row exactly; the two-block
 file's explicit metadata overrides its period, and the tool proposes period 2 for that reduced configuration.
+`conform_reference.py`, `tokenizer_reference.py --transformers` and `chat_template_reference.py` accept
+`--slow-tokenizer` to use the model authors' original implementation when conversion to a fast tokenizer changes
+its segmentation. `describe_model.py --reference-slow-tokenizer` uses it for settings, the three tokenizer texts
+and the teacher-forced reference, so every part of a gate uses the same tokenizer.
+For legacy eager attention, tracing observes the native `Q Kᵀ` and `probabilities V` matrix products. It retains
+the actual Q/K/V tensors and accepts a standard scale and causal/window mask only after recomputing every softmax
+probability; other score transformations remain unknown. The authors' forward calculation is unchanged.
+Packed GQA source projections are checked against both contiguous and per-group Q/K/V views, and only an exact
+numerical match establishes the layout. Weight comparison reads those measured rows even when the converter
+splits the projection into separate GGUF tensors. A requested remote slow tokenizer is loaded from its declared
+Python class, with explicit trust required; a library silently selecting a fast class is an error.
+InternLM2's original slow tokenizer matches 575, 989 and 190 IDs on the three gate texts. Its tiny checkpoint gives
+identical 512 reference IDs, mean KL 0.00000 and 100% top-1, and proposes the registered row exactly. Its real-model
+gate remains pending; dynamic RoPE growth beyond the original context remains a reported missing part.
 
 ## The conformance gate
 

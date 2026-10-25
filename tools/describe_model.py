@@ -41,6 +41,8 @@ only if every check passes. The gate needs the GGUF as a local file (a BF16/F16 
 error) and downloads the Hugging Face weights.
 For a local legacy checkpoint, --reference-state-dict passes conform_reference.py's --state-dict option through
 the gate, preserving nonpersistent buffers by constructing the model on CPU before loading its safetensors.
+--reference-slow-tokenizer selects the authors' original slow tokenizer consistently for settings, all three
+tokenizer texts and the teacher-forced reference, bypassing incompatible slow-to-fast conversion.
 
 Needs torch, transformers, huggingface_hub, numpy and gguf (for quantized tensors). Run with the toolchain on PATH
 (cmake, ninja) for --gate. --self-test checks the registry parser and printer against architecture.cpp (no network).
@@ -674,7 +676,7 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim
     return inv, _f32(magnitude), qk, ", ".join(how)
 
 
-def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
+def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, slow_tokenizer=False):
     import numpy as np
     import reference_trace
 
@@ -797,9 +799,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             if kind == "attention" and plans[i]["mixer"] != "attention":
                 d.file_issues.append(f"block {i}: the reference attends, the GGUF has a recurrent block")
             if kind == "recurrent" and plans[i]["mixer"] != "deltanet":
-                d.missing.append(f"block {i}: a token mixer that is not softmax attention "
-                                 f"({', '.join(b['mixer'].get('classes', []))}) without the engine's Gated "
-                                 f"DeltaNet tensors")
+                d.unknown.append(f"block {i}: no standard attention calculation was captured for the token mixer "
+                                 f"({', '.join(b['mixer'].get('classes', []))}); its computation is not established")
             if kind in ("none", "linear") and plans[i]["mixer"] != kind:
                 d.file_issues.append(f"block {i}: {kind} mixer in the reference, {plans[i]['mixer']} in the file")
 
@@ -855,8 +856,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             # Two heads tell the row order (and whether the weights are the same); the rest would only cost
             # downloads.
             heads = min(block_kv_heads[i], 2)
-            first = block_heads[i] * head_dim if key["projection_layout"].startswith("fused") else 0
-            hf = ckpt.tensor(hname, first, heads * head_dim)
+            source_rows = key["projection_rows"][:heads * head_dim]
+            # Converters may split a packed source projection. Compare the
+            # measured source rows with the key rows in the file independently.
+            hf = np.concatenate([ckpt.tensor(hname, source_rows[h * head_dim], head_dim)
+                                 for h in range(heads)])
+            first = block_heads[i] * head_dim if gname.endswith("attn_qkv.weight") else 0
             gg = g.values(gname, first, heads * head_dim)
             perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
             if perm is None:
@@ -1162,9 +1167,6 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if bool(gate) != bool(plan.get("attn_gate")):
             d.file_issues.append(f"block {i}: the reference {'gates' if gate else 'does not gate'} the attention "
                                  f"output, the file's attn_q {'is not' if gate else 'is'} twice as tall")
-        key = m.get("key") or {}
-        if key.get("projection_layout", "").startswith("fused") != bool(plan.get("fused_qkv")):
-            d.file_issues.append(f"block {i}: fused QKV in one of the reference and the file only")
     if qk_spans - {head_dim}:
         valid_spans = {head_dim} | {h * head_dim for h in block_heads + block_kv_heads if h > 0}
         bad = qk_spans - valid_spans
@@ -1493,7 +1495,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.missing.append(f"BPE pre-tokenizer '{pre}' (tokenizer.ggml.pre) is not in the pre-tokenizer table")
     else:
         d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" else ""))
-    check_tokenizer_settings(d, g, model, revision, trust_remote_code)
+    check_tokenizer_settings(d, g, model, revision, trust_remote_code, slow_tokenizer)
 
     d.merge_blocks()
     if complete and not d.unknown:
@@ -1515,13 +1517,14 @@ def engine_default(engine, field):
     return next(dflt for n, _, dflt in engine.fields if n == field)
 
 
-def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
+def check_tokenizer_settings(d, g, model, revision, trust_remote_code, slow_tokenizer=False):
     """The GGUF's BOS and space-prefix rules against what the model's own tokenizer does (the engine follows the
     file: tokenizer.ggml.add_bos_token, by default on for SentencePiece only; tokenizer.ggml.add_space_prefix, by
     default on). A file that disagrees encodes every prompt differently from the model's training."""
     try:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
+        from reference_tokenizer import load_tokenizer
+        tok = load_tokenizer(model, revision=revision, trust_remote_code=trust_remote_code,
+                             slow=slow_tokenizer)
     except Exception as e:  # noqa: BLE001 - reported, the gate checks the ids anyway
         d.notes.append(f"the reference tokenizer did not load ({type(e).__name__}); its BOS and space-prefix rules "
                        f"are left to the gate")
@@ -1694,8 +1697,10 @@ def gate(args, d, row_text, arch, engine):
         cmd = [py, os.path.join(tools, "tokenizer_reference.py"), "--model", args.model, "--text", text, "--out", ids]
         if args.revision:
             cmd += ["--revision", args.revision]
-        if not has_tokenizer_json(args.model, args.revision):
+        if args.reference_slow_tokenizer or not has_tokenizer_json(args.model, args.revision):
             cmd += ["--transformers"] + (["--trust-remote-code"] if args.trust_remote_code else [])
+        if args.reference_slow_tokenizer:
+            cmd.append("--slow-tokenizer")
         code, out = run(cmd, log)
         if code == 0:
             code, out = run([os.path.join(build, "liyab-tok"), "-m", args.gguf, "-f", text, "--ids", ids, "--quiet"],
@@ -1715,6 +1720,8 @@ def gate(args, d, row_text, arch, engine):
         cmd.append("--trust-remote-code")
     if args.reference_state_dict:
         cmd.append("--state-dict")
+    if args.reference_slow_tokenizer:
+        cmd.append("--slow-tokenizer")
     # transformers' default attention kernel leaves a soft cap out: the reference then needs the eager one.
     if d.softcap and "--attn-implementation" in open(conform, encoding="utf-8").read():
         cmd += ["--attn-implementation", "eager"]
@@ -1823,6 +1830,8 @@ def main():
                                                             "checks (tokenizer ids, liyab-kl against transformers)")
     parser.add_argument("--reference-state-dict", action="store_true",
                         help="gate: construct a local reference checkpoint on CPU before loading safetensors")
+    parser.add_argument("--reference-slow-tokenizer", action="store_true",
+                        help="use the original slow tokenizer for settings and every gate reference")
     parser.add_argument("--source", default=REPO, help="Liyab source tree (default: this repository)")
     parser.add_argument("--scratch", default=os.path.join(REPO, "build", "describe_model"),
                         help="scratch copy and build for --gate (default: build/describe_model)")
@@ -1842,7 +1851,8 @@ def main():
 
     print(f"Describing {args.model} with {args.gguf}", flush=True)
     try:
-        d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code)
+        d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code,
+                             args.reference_slow_tokenizer)
     except (OSError, FormatError) as e:  # an unreadable or malformed GGUF
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)

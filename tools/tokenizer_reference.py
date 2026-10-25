@@ -29,17 +29,20 @@ def main():
     parser.add_argument("--special", action="store_true", help="add the model's BOS/EOS as its tokenizer does")
     parser.add_argument("--revision", help="model revision (branch, tag or commit)")
     parser.add_argument("--transformers", action="store_true", help="use transformers' AutoTokenizer")
+    parser.add_argument("--slow-tokenizer", action="store_true", help="with --transformers: use the original slow tokenizer")
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="with --transformers: run tokenizer code shipped with the model (trusted repositories only)")
     args = parser.parse_args()
+    if args.slow_tokenizer and not args.transformers:
+        parser.error("--slow-tokenizer requires --transformers")
 
     # newline="" keeps "\r\n" as written: the tokenizer must see the file's exact text.
     with open(args.text, encoding="utf-8", newline="") as f:
         text = f.read()
     if args.transformers:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision,
-                                                  trust_remote_code=args.trust_remote_code)
+        from reference_tokenizer import load_tokenizer
+        tokenizer = load_tokenizer(args.model, revision=args.revision,
+                                   trust_remote_code=args.trust_remote_code, slow=args.slow_tokenizer)
         ids = tokenizer(text, add_special_tokens=args.special)["input_ids"]
     else:
         from tokenizers import Tokenizer

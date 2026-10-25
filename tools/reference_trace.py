@@ -412,12 +412,12 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
         try:
             model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
                                                      attn_implementation="sdpa")
-        except ValueError as unsupported:
-            if "sdpa" not in str(unsupported):
+        except (ValueError, KeyError) as unsupported:
+            if not any(name in str(unsupported) for name in ("sdpa", "scaled_dot_product_attention")):
                 raise
             # Some classes call functional SDPA directly without declaring
             # transformers' backend capability. Their eager path is observed
-            # too; a manual implementation with no SDPA call stays unknown.
+            # too, including paired manual QK and probabilities/V products.
             reduced._attn_implementation = "eager"
             torch.manual_seed(0)
             model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
@@ -445,21 +445,26 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
         handles.append(mod.register_forward_pre_hook(lambda module, args: active.append(module)))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
     sdpa = torch.nn.functional.scaled_dot_product_attention
+    matmul = torch.matmul
+    pending_attention = {}
+    def distinct_kv(module, key, value):
+        heads = getattr(module, "num_key_value_heads", key.shape[1])
+        if isinstance(heads, int) and heads > 0 and key.shape[1] % heads == 0:
+            repeats = key.shape[1] // heads
+            k, v = key[:, ::repeats], value[:, ::repeats]
+            if torch.equal(k.repeat_interleave(repeats, dim=1), key) and torch.equal(v.repeat_interleave(repeats, dim=1), value):
+                return k, v
+        return key, value
+
     def observed_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, *, scale=None,
                       enable_gqa=False):
         module = active[-1]
         # Some custom classes accept an attention backend without using its
         # interface. Observe native calls too, but keep the richer registered
         # record when that interface already captured this module's attention.
-        if any(record.module is module for record in RECORDER.attn):
+        if any(record.module is module and record.output is None for record in RECORDER.attn):
             return sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
-        keys, values = key, value
-        kv_heads = getattr(module, "num_key_value_heads", key.shape[1])
-        if isinstance(kv_heads, int) and kv_heads > 0 and key.shape[1] % kv_heads == 0:
-            repeats = key.shape[1] // kv_heads
-            k, v = key[:, ::repeats], value[:, ::repeats]
-            if torch.equal(k.repeat_interleave(repeats, dim=1), key) and torch.equal(v.repeat_interleave(repeats, dim=1), value):
-                keys, values = k, v
+        keys, values = distinct_kv(module, key, value)
         rec = AttnCall(RECORDER.next(), module, query.detach().clone(), keys.detach().clone(),
                        values.detach().clone(), {"scaling": scale if scale is not None else query.shape[-1] ** -0.5,
                                                  "is_causal": is_causal, "observed_sdpa": True,
@@ -468,12 +473,43 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
         result = sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
         rec.output = result.transpose(1, 2).detach().clone()
         return result
+
+    def observed_matmul(left, right, *args, **kwargs):
+        result = matmul(left, right, *args, **kwargs)
+        if not active or not (torch.is_tensor(left) and torch.is_tensor(right) and left.dim() == right.dim() == 4):
+            return result
+        module = active[-1]
+        if any(record.module is module and record.output is None for record in RECORDER.attn):
+            return result  # a registered attention call already records this computation
+        pending = pending_attention.get(module)
+        if pending is not None and left.shape[-2:] == (SEQ, SEQ) and right.shape[-2] == SEQ:
+            order, query, key = pending_attention.pop(module)
+            scale = getattr(module, "scaling", query.shape[-1] ** -0.5)
+            scale = float(scale) if isinstance(scale, (int, float)) else query.shape[-1] ** -0.5
+            probabilities = left.detach().float()
+            allowed = probabilities > 0
+            scores = matmul(query.float(), key.float().transpose(-1, -2)) * scale
+            expected = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1)
+            keys, values = distinct_kv(module, key, right)
+            rec = AttnCall(order, module, query, keys.detach().clone(), values.detach().clone(),
+                           {"scaling": scale, "is_causal": False, "observed_sdpa": True,
+                            "attention_mask": allowed, "manual_scores_verified": close(expected, probabilities)})
+            rec.output = result.transpose(1, 2).detach().clone()
+            RECORDER.attn.append(rec)
+        elif left.shape[-2] == SEQ and right.shape[-1] == SEQ and left.shape[-1] == right.shape[-2]:
+            # Legacy eager attention uses Q K^T followed by probabilities V.
+            # Keep the actual tensors and verify the entire softmax before
+            # accepting a scale or mask; unrelated matmuls remain unknown.
+            pending_attention[module] = (RECORDER.next(), left.detach().clone(), right.transpose(-1, -2).detach().clone())
+        return result
     try:
         torch.nn.functional.scaled_dot_product_attention = observed_sdpa
+        torch.matmul = observed_matmul
         with torch.no_grad():
             out = model(input_ids=ids, use_cache=False)
     finally:
         torch.nn.functional.scaled_dot_product_attention = sdpa
+        torch.matmul = matmul
         for h in handles:
             h.remove()
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
@@ -558,12 +594,13 @@ def _projection_views(linear_calls, heads, head_dim, total_heads):
 def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
     """How target [b, heads, s, d] (what the attention received) is made from a projection: returns a dict with
     the projection, its layout, the rotation, and where a norm sits (with its formula), or None."""
-    for call, how, raw in raw_views:
+    for call, how, raw, rows in raw_views:
         if raw is None:
             continue
         for rot, r in _rotations(raw, freqs):
             if close(r, target):
-                return {"projection": call.path, "projection_layout": how, **rot, "norm": None}
+                return {"projection": call.path, "projection_layout": how, "projection_rows": rows,
+                        **rot, "norm": None}
         for n in norm_calls:
             nin = n.input
             nout = n.output
@@ -577,13 +614,13 @@ def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
                 normed = _as_heads(nout, heads, head_dim)
                 for rot, r in _rotations(normed, freqs):
                     if close(r, target):
-                        return {"projection": call.path, "projection_layout": how, **rot,
+                        return {"projection": call.path, "projection_layout": how, "projection_rows": rows, **rot,
                                 "norm": {**norm, "order": "before_rope"}}
             # Norm after the rotation: the norm reads the rotated projection and gives the target.
             if close(_as_heads(nout, heads, head_dim), target):
                 for rot, r in _rotations(raw, freqs):
                     if close(r, _as_heads(nin, heads, head_dim)):
-                        return {"projection": call.path, "projection_layout": how, **rot,
+                        return {"projection": call.path, "projection_layout": how, "projection_rows": rows, **rot,
                                 "norm": {**norm, "order": "after_rope"}}
     return None
 
@@ -608,10 +645,23 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
         for call, how, v in _projection_views(linears, heads, hd, fused_total):
             if how == "fused":
                 y = v
-                part = y[..., offset_heads * hd:(offset_heads + heads) * hd]
-                views.append((call, f"fused [q | k | v] at head {offset_heads}", _as_heads(part, heads, hd)))
+                rows = list(range(offset_heads * hd, (offset_heads + heads) * hd))
+                views.append((call, f"fused [q | k | v] at head {offset_heads}",
+                              _as_heads(y[..., rows], heads, hd), rows))
+                if n_q % n_kv == 0:
+                    # Packed GQA stores each KV group's queries, key and value
+                    # together. Verify this view against the actual attention
+                    # tensors, just as for the contiguous Q/K/V candidate.
+                    group = n_q // n_kv
+                    rows = []
+                    for g in range(n_kv):
+                        start = g * (group + 2)
+                        slots = range(start, start + group) if offset_heads == 0 else [start + group + (offset_heads != n_q)]
+                        rows.extend(row for slot in slots for row in range(slot * hd, (slot + 1) * hd))
+                    views.append((call, "fused groups [queries | key | value]",
+                                  _as_heads(y[..., rows], heads, hd), rows))
             else:
-                views.append((call, how, v))
+                views.append((call, how, v, list(range(heads * hd))))
         return views
 
     key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
@@ -627,9 +677,9 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
         f["temperature"] = {"beta": float(beta), "length": int(length)}
     query = _match_rotated(query_target, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
     value = None
-    for call, how, v in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
+    for call, how, v, rows in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
         if close(v, a.value):
-            value = {"projection": call.path, "projection_layout": how}
+            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows}
             break
     f["key"] = key
     f["query"] = query
@@ -648,6 +698,8 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     f["sinks"] = torch.is_tensor(a.kwargs.get("s_aux")) or torch.is_tensor(getattr(a.module, "sinks", None))
     f["causal"] = bool(getattr(a.module, "is_causal", True))
     if a.kwargs.get("observed_sdpa"):
+        if a.kwargs.get("manual_scores_verified") is False:
+            f["unknown"].append("native matmul attention probabilities are not the verified scaled Q/K softmax")
         mask = a.kwargs.get("attention_mask")
         f["causal"] = bool(a.kwargs["is_causal"])
         if mask is not None:

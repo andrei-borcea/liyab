@@ -162,6 +162,13 @@ Unicode. It keeps the authors' boundaries around special spellings, repeated cha
 Norm vectors accept the converter's bare names as well as names ending in `.weight`, including PLaMo3's post norms.
 PLaMo3's two-block tiny case (local/global attention, an eight-token window) gives mean KL 0.00000 and 99.61% top-1.
 Its real-model gate remains pending; the eight-block tiny case gives 98.83% top-1 with F16 KV, below the tiny threshold.
+Reference tools offer `--slow-tokenizer` when a new library's fast conversion changes the authors' SentencePiece
+segmentation; `describe_model.py --reference-slow-tokenizer` applies that choice consistently throughout its gate.
+Reference tracing also observes legacy eager attention's paired matrix products, accepting their scale and mask
+only after recomputing the full softmax probabilities from the recorded queries and keys.
+Packed GQA projections are matched to their observed per-group Q/K/V rows; the file may split those projections.
+InternLM2's tiny checkpoint matches all three tokenizer texts with the original slow implementation and gives
+mean KL 0.00000 and 100% top-1. Dynamic RoPE beyond its original context is still refused by the description tool.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
