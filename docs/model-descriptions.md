@@ -273,3 +273,44 @@ These elementwise operations execute on the CPU with Metal/Vulkan projection rou
 reference; the new norms have scalar, NEON and x86 AVX2 affine paths. Synthetic golden cases cover every added
 part; batching, rollback, speculative trees, sequences, prefix caching, context files and segment reuse exercise
 how those parts compose with existing caches.
+
+The published b11819 StarCoder2 converter omits `attention.sliding_window`. All three official StarCoder2
+configurations (3B, 7B and 15B) declare 4096. The transformers 5.19 configuration class defaults to `None`, so
+a family-wide fallback cannot be inferred from that constructor or from a single customized checkpoint. The registry records this
+as `sliding_window_default`, a generic fallback used only when the file omits the key. Explicit metadata wins,
+including zero for full attention. A custom checkpoint whose window differs must record it: the description
+tool reports a file error when an omitted key would choose a different window. The tool checks a declared
+registry fallback against the observed reference window when the key is absent, and refuses an omitted-window
+file with no established fallback. The 4223-position unpatched-converter check crosses position 4096: KL mean
+0.00000, top-1 99.98%; an explicit 32-position override gives KL 0.00000, top-1 100%.
+
+Some older MoE converters, including DBRX, store an expert's width as `feed_forward_length`. The planner accepts
+that key when `expert_feed_forward_length` is absent; the latter always takes precedence. Expert tensor shapes
+are still checked when weights are bound.
+
+The description tool also observes eager attention implementations that bypass transformers' attention registry:
+score products, softmax inputs and value products must agree numerically. Scaled QK and linear per-head position
+slopes are established from those values. Non-parametric and LayerNorm1P formulas, both parallel residual forms,
+per-head LayerNorm modules, learned positions, embedding norms, projection clamps and xIELU scalars have matching
+rules. Nested attention and expert configuration objects retain their types when tiny checkpoints are reduced or
+overridden with `--config`.
+
+Falcon's pre-tokenizer orders punctuation splitting, ByteLevel, then digit grouping. The steps following
+ByteLevel see its printable byte alphabet, so they can split within an original UTF-8 character. The pre-tokenizer
+returns raw byte views in that case; the BPE encoder uses the shared alphabet to merge them. Existing profiles
+continue to split Unicode text before byte encoding. Command-R and OLMo profiles normalize to NFC before their
+splits; StarCoder/Refact and StableLM 2 keep the input's normalization.
+DBRX follows its declared GPT-4/cl100k tiktoken encoding, with three-digit groups, possessive word matching,
+and whole-piece vocabulary lookup before BPE merges. Its native IDs, including special-token gaps, are retained.
+
+SentencePiece's dummy space after a literal control token is an architecture fact omitted by GGUF.
+`spm_prefix_after_control` preserves the usual behavior by default; Nemotron's Metaspace `first` scheme
+adds it only at the beginning of plain text. Real spaces after controls remain significant. The description
+tool probes the reference tokenizer after literal BOS/EOS controls before proposing the row. Prefix matching
+distinguishes an implicitly added BOS from an explicit control so saved contexts reuse the correct text.
+`spm_add_bos_default` records an absent BOS key's policy independently: Nemotron adds no BOS, while existing
+SentencePiece rows retain their default. Explicit `tokenizer.ggml.add_bos_token` always wins. The tool derives
+this field from encoding with and without special tokens.
+
+The Command-R and Arcee templates are checked byte for byte against their own transformers tokenizers,
+including generation prompts, tool requests, Unicode text and rejected conversations.

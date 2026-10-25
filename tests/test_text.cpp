@@ -472,6 +472,29 @@ TEST_CASE("Classic pre-tokenizers match their published tokenizer splits") {
     }
 }
 
+TEST_CASE("Falcon applies digit grouping after byte encoding, including UTF-8 byte fragments") {
+    // tokenizers' Punctuation -> ByteLevel -> Digits -> three-digit Split.
+    // U+00B2 becomes byte-alphabet letters C2 then B2 (a number), split apart.
+    const std::string text = "\xC2\xB2 1234567 a$+!!\n";
+    const std::vector<std::string> expected = {"\xC2", "\xB2", " ", "123", "456", "7", " a", "$+!!", "\n"};
+    auto pre = PreTokenizer::for_name("falcon");
+    REQUIRE(pre.has_value());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+}
+
+TEST_CASE("DBRX follows cl100k contractions, three-digit groups and trailing whitespace") {
+    const std::string text = "We're 2024!\n\n  ";
+    auto pre = PreTokenizer::for_name("dbrx");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) ==
+          std::vector<std::string>({"We", "'re", " ", "202", "4", "!\n\n", "  "}));
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------

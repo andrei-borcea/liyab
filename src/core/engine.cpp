@@ -439,8 +439,10 @@ struct Engine::Impl {
     // text does not end with the token's.
     bool step_back(std::span<const int32_t> tokens, std::string_view text, size_t& end, size_t i) const {
         const int32_t id = tokens[i];
-        const bool segment_start = i == 0 || tokenizer->is_special(tokens[i - 1]);
-        for (const std::string_view t : {tokenizer->prompt_text(id, segment_start), std::string_view(tokenizer->piece(id))}) {
+        const bool implicit_bos = i == 1 && tokens[0] == tokenizer->bos() &&
+                                  !text.starts_with(tokenizer->token_text(tokens[0]));
+        const int32_t previous = i == 0 || implicit_bos ? -1 : tokens[i - 1];
+        for (const std::string_view t : {tokenizer->prompt_text(id, previous), std::string_view(tokenizer->piece(id))}) {
             if (t.size() <= end && text.substr(end - t.size(), t.size()) == t) {
                 end -= t.size();
                 return true;

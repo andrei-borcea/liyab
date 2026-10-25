@@ -37,7 +37,8 @@ public:
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
     // Encodes `text` that directly follows already-encoded text ending with
     // token `previous` (a prompt that continues the context): no BOS and, for
-    // SentencePiece vocabularies, the space prefix only after a control token,
+    // SentencePiece vocabularies, the space prefix only after a control token
+    // when the architecture's Metaspace policy prepends there,
     // as encode() would place it, so the earlier ids followed by these spell
     // the joined text.
     [[nodiscard]] Result<std::vector<int32_t>> encode_continuation(std::string_view text, int32_t previous) const;
@@ -51,9 +52,11 @@ public:
     // The text that token `id` stands for in a prompt given to encode(): a
     // special token's own text, else its piece, without the space a
     // SentencePiece vocabulary adds at the start of a segment
-    // (`segment_start`: the token starts the text or follows a special one).
+    // (`previous`: the preceding token, or -1 at the start of plain text,
+    // including after an implicitly added BOS). A "first" Metaspace policy
+    // preserves a real leading space after an explicit control token.
     // Used to find which tokens of a context a text still spells.
-    [[nodiscard]] std::string_view prompt_text(int32_t id, bool segment_start) const;
+    [[nodiscard]] std::string_view prompt_text(int32_t id, int32_t previous) const;
 
     // The vocabulary entry of a token as the GGUF stores it (a special
     // token's own text, e.g. "<|begin_of_text|>").
@@ -104,6 +107,7 @@ private:
     int32_t unk_ = -1;
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
+    bool spm_prefix_after_control_ = true;
 };
 
 }  // namespace liyab

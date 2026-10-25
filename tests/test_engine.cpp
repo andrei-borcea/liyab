@@ -1253,6 +1253,43 @@ TEST_CASE("SPM tokenizer merges by score and falls back to bytes") {
     CHECK(templated.value() == expected_ids);
 }
 
+TEST_CASE("Metaspace first: controls preserve real spaces without adding dummy spaces") {
+    auto spec = test::classic_model_spec("nemotron");
+    auto explicit_file = MmapLoader::open(model_path("nemotron_explicit_bos", spec));
+    REQUIRE(explicit_file.has_value());
+    auto explicit_tok = Tokenizer::load(*explicit_file.value());
+    REQUIRE(explicit_tok.has_value());
+    CHECK(explicit_tok->add_bos_default());  // metadata wins over the absent-key default
+    spec.add_bos = -1;
+    auto loader = MmapLoader::open(model_path("nemotron_metaspace", spec));
+    REQUIRE(loader.has_value());
+    auto tok = Tokenizer::load(*loader.value());
+    REQUIRE(tok.has_value());
+    const Tokenizer& t = *tok;
+    CHECK(!t.add_bos_default());
+    const int32_t hello = test::tiny_token("▁hello"), world = test::tiny_token("▁world");
+    auto initial = t.encode("hello world", true);
+    REQUIRE(initial.has_value());
+    CHECK(*initial == std::vector<int32_t>({t.bos(), hello, world}));
+    auto joined = t.encode("hello</s>world", false);
+    auto continuation = t.encode_continuation("world", t.eos());
+    REQUIRE(joined.has_value() && continuation.has_value());
+    std::vector<int32_t> expected = {hello, t.eos()};
+    expected.insert(expected.end(), continuation->begin(), continuation->end());
+    CHECK(*joined == expected);
+    std::string plain;
+    for (const auto id : *continuation) plain += t.piece(id);
+    CHECK(plain == "world");
+    auto spaced = t.encode("hello</s> world", false);
+    REQUIRE(spaced.has_value());
+    CHECK(*spaced == std::vector<int32_t>({hello, t.eos(), world}));
+    CHECK(t.prompt_text(world, -1) == "world");
+    CHECK(t.prompt_text(world, t.eos()) == " world");
+    auto explicit_bos = t.encode("<s> hello", true);
+    REQUIRE(explicit_bos.has_value());
+    CHECK(*explicit_bos == std::vector<int32_t>({t.bos(), hello}));
+}
+
 // ---------------------------------------------------------------------------
 // Transformer
 // ---------------------------------------------------------------------------
@@ -3308,7 +3345,7 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
 }
 
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
-    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r"}) {
+    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r", "nemotron"}) {
         test::TinyModelSpec spec = std::string(arch) == "llama" || std::string(arch) == "qwen35"
                                        ? test::TinyModelSpec{} : test::classic_model_spec(arch);
         spec.arch = arch;
@@ -4210,7 +4247,8 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64)),
                                    model_path("saved_gpt2", test::classic_model_spec("gpt2")),
                                    model_path("saved_bloom", test::classic_model_spec("bloom")),
-                                   model_path("saved_command-r", test::classic_model_spec("command-r"))}) {
+                                   model_path("saved_command-r", test::classic_model_spec("command-r")),
+                                   model_path("saved_nemotron", test::classic_model_spec("nemotron"))}) {
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);

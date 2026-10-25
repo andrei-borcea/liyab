@@ -161,6 +161,7 @@ struct TinyModelSpec {
     // own, so the other weights stay those of the same spec without them.
     int32_t pooling_type = -1;            // >= 0: <arch>.pooling_type
     int32_t add_eos = -1;                 // >= 0: tokenizer.ggml.add_eos_token (nonzero: true)
+    int32_t add_bos = 1;                  // -1: omit metadata; 0/1: explicit tokenizer BOS policy
     std::vector<std::string> cls_labels;  // non-empty: <arch>.classifier.output_labels
     // > 0: a ranking head cls.output.weight of this many rows (in output_type):
     // the output head's rows of the tokens in cls_rows_from when given (its

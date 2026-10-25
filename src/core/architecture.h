@@ -120,6 +120,17 @@ struct ArchSpec {
     // > 0: ALiBi with this maximum bias when the file has no
     // <arch>.attention.max_alibi_bias (the file's value wins; 0 there: none).
     float alibi_bias = 0.0f;
+    // The reference configuration's architecture-wide window when the
+    // published converter omits attention.sliding_window (StarCoder2).
+    // Explicit metadata, including 0 for full attention, always wins.
+    int32_t sliding_window_default = 0;
+    // SentencePiece/Metaspace: prepend a dummy space after a control token,
+    // as well as at the start of text. false: prepend_scheme "first"
+    // (Nemotron); GGUF does not record this distinction. Unused for BPE.
+    bool spm_prefix_after_control = true;
+    // SentencePiece's BOS policy when tokenizer.ggml.add_bos_token is absent.
+    // Explicit metadata wins. Unused for BPE, whose absent-key default is false.
+    bool spm_add_bos_default = true;
 };
 
 // Every architecture Liyab runs, in registry order.

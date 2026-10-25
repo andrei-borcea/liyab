@@ -9,6 +9,7 @@
 #include <queue>
 
 #include "core/log.h"
+#include "core/architecture.h"
 #include "core/unicode.h"
 
 namespace liyab {
@@ -25,10 +26,8 @@ size_t utf8_len(unsigned char lead) noexcept { return unicode::utf8_length(lead)
 const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
     static const std::unordered_map<int32_t, uint8_t> table = [] {
         std::unordered_map<int32_t, uint8_t> m;
-        int32_t extra = 0;
         for (int32_t b = 0; b < 256; ++b) {
-            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-            m[printable ? b : 256 + extra++] = static_cast<uint8_t>(b);
+            m[static_cast<int32_t>(PreTokenizer::byte_codepoint(static_cast<uint8_t>(b)))] = static_cast<uint8_t>(b);
         }
         return m;
     }();
@@ -39,10 +38,8 @@ const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
 const std::array<std::string, 256>& gpt2_byte_encoder() {
     static const std::array<std::string, 256> table = [] {
         std::array<std::string, 256> t;
-        int32_t extra = 0;
         for (int32_t b = 0; b < 256; ++b) {
-            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-            const uint32_t cp = printable ? static_cast<uint32_t>(b) : static_cast<uint32_t>(256 + extra++);
+            const uint32_t cp = PreTokenizer::byte_codepoint(static_cast<uint8_t>(b));
             std::string utf8;
             if (cp < 0x80) {
                 utf8 += static_cast<char>(cp);
@@ -124,15 +121,18 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     tok.bos_ = token_id(model, "tokenizer.ggml.bos_token_id", vocab).value_or(-1);
     tok.eos_ = token_id(model, "tokenizer.ggml.eos_token_id", vocab).value_or(-1);
     tok.unk_ = token_id(model, "tokenizer.ggml.unknown_token_id", vocab).value_or(-1);
+    const auto architecture = model.get_string("general.architecture");
+    const ArchSpec* spec = architecture ? find_architecture(*architecture) : nullptr;
     if (const GgufValue* v = model.metadata("tokenizer.ggml.add_bos_token")) {
         tok.add_bos_ = v->as_bool().value_or(true);
     } else {
-        tok.add_bos_ = tok.kind_ == Kind::Spm;
+        tok.add_bos_ = tok.kind_ == Kind::Spm && (spec == nullptr || spec->spm_add_bos_default);
     }
     if (const GgufValue* v = model.metadata("tokenizer.ggml.add_space_prefix")) {
         tok.add_space_prefix_ = v->as_bool().value_or(true);
     }
     if (tok.bos_ < 0) tok.add_bos_ = false;
+    if (spec != nullptr) tok.spm_prefix_after_control_ = spec->spm_prefix_after_control;
 
     tok.pieces_.resize(n);
     tok.lookup_.reserve(n);
@@ -271,10 +271,11 @@ bool Tokenizer::is_special(int32_t id) const noexcept {
     return id >= 0 && static_cast<size_t>(id) < special_.size() && special_[static_cast<size_t>(id)];
 }
 
-std::string_view Tokenizer::prompt_text(int32_t id, bool segment_start) const {
+std::string_view Tokenizer::prompt_text(int32_t id, int32_t previous) const {
     if (is_special(id)) return texts_[static_cast<size_t>(id)];
     std::string_view text = piece(id);
-    if (segment_start && kind_ == Kind::Spm && add_space_prefix_ && text.starts_with(' ')) text.remove_prefix(1);
+    const bool prefix = previous < 0 || (spm_prefix_after_control_ && is_special(previous));
+    if (prefix && kind_ == Kind::Spm && add_space_prefix_ && text.starts_with(' ')) text.remove_prefix(1);
     return text;
 }
 
@@ -290,7 +291,7 @@ std::string_view Tokenizer::token_text(int32_t id) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode_continuation(std::string_view text, int32_t previous) const {
-    return encode_from(text, false, std::find(control_.begin(), control_.end(), previous) != control_.end());
+    return encode_from(text, false, spm_prefix_after_control_ && is_special(previous));
 }
 
 size_t Tokenizer::find_special(std::string_view text, size_t from, int32_t& id) const {
@@ -320,9 +321,9 @@ Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool 
     if (kind_ == Kind::Gpt2 && !pre_) return pre_error_;
     std::vector<int32_t> out;
     if (add_bos && bos_ >= 0) out.push_back(bos_);
-    // Split around control-token texts; plain segments go through SPM. As in
-    // llama.cpp, a segment gets the space prefix when it starts the text or
-    // follows a control token.
+    // Split around control-token texts. SentencePiece prefixes the first
+    // plain segment; subsequent segments follow the Metaspace policy. Real
+    // whitespace after a control is retained even when no dummy is added.
     bool prev_control = after_control;
     size_t pos = 0;
     while (pos < text.size()) {
@@ -336,7 +337,7 @@ Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool 
         }
         if (best == std::string_view::npos) break;
         out.push_back(best_id);
-        prev_control = true;
+        prev_control = spm_prefix_after_control_;
         pos = best + texts_[static_cast<size_t>(best_id)].size();
         if (rstrip_[static_cast<size_t>(best_id)]) {  // the white space after it is not text
             for (size_t next = pos; pos < text.size() && unicode::is_whitespace(unicode::decode_utf8(text, next));) {

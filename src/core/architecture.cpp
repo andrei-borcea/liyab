@@ -133,7 +133,8 @@ constexpr ArchSpec kArchitectures[] = {
      .moe_norm_weights = false,
      .ffn_activation = FfnActivation::GeluTanh,
      .swa_period = 1,
-     .norm = NormKind::Layer},
+     .norm = NormKind::Layer,
+     .sliding_window_default = 4096},
     // Phi-2: parallel blocks with one shared norm, partial RoPE, a biased LM head.
     {.name = "phi2",
      .rope = RopeLayout::Halves,
@@ -164,7 +165,9 @@ constexpr ArchSpec kArchitectures[] = {
      .ffn_norm = "ffn_norm",
      .moe_norm_weights = false,
      .ffn_activation = FfnActivation::ReluSquared,
-     .norm = NormKind::Layer},
+     .norm = NormKind::Layer,
+     .spm_prefix_after_control = false,
+     .spm_add_bos_default = false},
     // Apertus: Q/K RMSNorms, xIELU with per-block scalars.
     {.name = "apertus",
      .rope = RopeLayout::Halves,
@@ -234,7 +237,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
-        LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
+        // Older MoE converters state the expert width as feed_forward_length
+        // when every FFN is routed (DBRX). Explicit expert metadata wins.
+        LIYAB_RETURN_IF_ERROR(require_int(f.metadata(key("expert_feed_forward_length")) != nullptr
+                                             ? "expert_feed_forward_length" : "feed_forward_length", c.n_ff_expert));
         c.n_ff_shared = static_cast<int32_t>(f.get_int(key("expert_shared_feed_forward_length")).value_or(0));
         const int64_t gating = f.get_int(key("expert_gating_func")).value_or(1);
         if (gating != 1 && gating != 2) {
@@ -364,7 +370,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Sliding-window attention blocks: the architecture's period, or the
     // file's own pattern (a period, or one flag per block).
     std::vector<bool> windowed(static_cast<size_t>(c.n_layers), false);
-    const int64_t window = c.spec->swa_period > 0 ? f.get_int(key("attention.sliding_window")).value_or(0) : 0;
+    const int64_t window = c.spec->swa_period > 0
+                               ? f.get_int(key("attention.sliding_window")).value_or(c.spec->sliding_window_default) : 0;
     if (window < 0 || window > (int64_t{1} << 30)) {
         return Status(ErrorCode::InvalidModel, "invalid " + key("attention.sliding_window"));
     }

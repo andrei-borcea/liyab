@@ -297,7 +297,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32("tokenizer.ggml.unknown_token_id", 0);
     w.add_u32("tokenizer.ggml.bos_token_id", 1);
     w.add_u32("tokenizer.ggml.eos_token_id", 2);
-    w.add_bool("tokenizer.ggml.add_bos_token", true);
+    if (s.add_bos >= 0) w.add_bool("tokenizer.ggml.add_bos_token", s.add_bos != 0);
     if (s.pooling_type >= 0) w.add_u32(a + ".pooling_type", static_cast<uint32_t>(s.pooling_type));
     if (s.add_eos >= 0) w.add_bool("tokenizer.ggml.add_eos_token", s.add_eos != 0);
     if (!s.cls_labels.empty()) w.add_string_array(a + ".classifier.output_labels", s.cls_labels);

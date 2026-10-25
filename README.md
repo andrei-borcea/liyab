@@ -485,7 +485,7 @@ What the port does differently from the POSIX platforms:
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
     asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan, Tekken). Rows:
     `default` / `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`,
-    `bloom`, `starcoder`, `gpt-neox`, `mpt`,
+    `bloom`, `starcoder` / `refact`, `olmo` (NFC), `stablelm2`, `falcon`, `command-r` (NFC), `dbrx` (cl100k),
     `hunyuan`, `hunyuan-dense` / `deepseek-v3`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
     digit alone, then GPT-2's split), `tekken` (Mistral-Nemo) and `youtu` (Youtu-LLM: Hangul, CJK punctuation,
     Bopomofo and Han/kana runs first; its `\p{Hangul}` is written out as the script's code-point ranges, since the
@@ -500,6 +500,9 @@ What the port does differently from the POSIX platforms:
   * **Special tokens** written in the text map to their ids, found in one pass over the text. Those of the Phi-3
     family (Phi-3/3.5, Phi-4-mini) swallow the white space after them, as their Hugging Face tokenizer does. A
     byte a vocabulary lacks (Hunyuan's dense models have no `\r`) is left out before merging, as there.
+    Nemotron's Metaspace `first` policy adds a dummy space only at the start of plain text; real spaces after
+    literal controls remain significant, including when matching saved contexts. Its absent BOS metadata
+    defaults to no BOS; an explicit file setting always wins.
   * **Checked token for token** against each model's Hugging Face tokenizer, special tokens, contractions,
     digits, white-space runs, composed and decomposed accents, CJK, emoji and right-to-left text included
     ([Correctness](#correctness)).
