@@ -482,7 +482,8 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
                     "ssm_conv1d.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight"}
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
-                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "indexer_rope", "latent_norm_eps")
+                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "indexer_rope", "latent_norm_eps",
+                  "shared_kv")
 
 
 def _close(a, b, rel=1e-5):
@@ -817,6 +818,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     else:
         d.set("indexer_rope", "Halves", "no lightning indexer (its RoPE pairing does not apply)")
     latent_eps = {b["mixer"]["latent"]["norm_eps"] for b in att_blocks if b["mixer"].get("latent")}
+    if any(b["mixer"].get("shared_key_value") for b in att_blocks):
+        d.unknown.append("shared K=V was observed, but its unweighted query-head norm, trailing RoPE, inverse output "
+                         "rotation and grouped projection have not all been reconstructed; no shared_kv row is proposed")
+    elif att_blocks:
+        d.set("shared_kv", False, "observed attention reads distinct key and value tensors")
+    else:
+        d.unknown.append("shared_kv cannot be established without an observed attention block")
     if not latent_rank:
         d.set("latent_norm_eps", 0.0, "no latent projections")
     elif len(latent_eps) == 1:

@@ -273,6 +273,10 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
         KvCacheType kv;
     };
     std::vector<Spec> specs;
+    specs.push_back({"compressed-q8", test::compressed_spec(), KvCacheType::Q8_0});
+    specs.push_back({"compressed-f16", test::compressed_spec(), KvCacheType::F16});
+    specs.push_back({"compressed-q4", test::compressed_spec(), KvCacheType::Q4_0});
+    specs.push_back({"compressed-q4-1", test::compressed_spec(), KvCacheType::Q4_1});
     specs.push_back({"llama-q8", {}, KvCacheType::Q8_0});
     {
         test::TinyModelSpec s;

@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "liyab/engine.h"
 
@@ -72,6 +73,8 @@ constexpr ArchSpec kArchitectures[] = {
     {.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
      .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f},
     {"bailingmoe2", RopeLayout::Halves, "ffn_norm", true},
+    {.name = "deepseek4", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+     .swa_period = 1, .shared_kv = true},
 };
 
 }  // namespace
@@ -125,6 +128,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
+        if (c.spec->shared_kv) {
+            return Status(ErrorCode::Unsupported,
+                          "shared K=V MoE needs hash/sqrtsoftplus routing, clipped SwiGLU and learned sinks (MoE integration)");
+        }
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
         c.n_ff_shared = static_cast<int32_t>(f.get_int(key("expert_shared_feed_forward_length")).value_or(0));
@@ -163,6 +170,20 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.value_dim = c.head_dim;
     c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
     const auto value_length = f.get_int(key("attention.value_length"));
+    if (c.spec->shared_kv) {
+        LIYAB_RETURN_IF_ERROR(require_int("attention.q_lora_rank", c.shared_q_rank));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.output_group_count", c.output_groups));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.output_lora_rank", c.output_rank));
+        if (c.n_head_kv != 1 || c.output_groups > c.n_head || c.n_head % c.output_groups != 0 ||
+            value_length.value_or(c.head_dim) != c.head_dim ||
+            f.get_int(key("attention.kv_lora_rank")).value_or(0) != 0) {
+            return Status(ErrorCode::InvalidModel, "shared K=V needs one KV head and whole output head groups");
+        }
+        c.compress_rope_base = static_cast<float>(f.get_float(key("attention.compress_rope_freq_base")).value_or(0.0));
+        if (!(c.compress_rope_base > 0.0f) || !std::isfinite(c.compress_rope_base)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.compress_rope_freq_base"));
+        }
+    }
     if (const auto kv_rank = f.get_int(key("attention.kv_lora_rank")); kv_rank && *kv_rank > 0) {
         // Multi-head latent attention. The converter states the absorbed
         // geometry (one KV head of [k_pe | latent], values the latent) and
@@ -207,7 +228,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.head_count", c.index_heads));
         LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.key_length", c.index_dim));
         LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.top_k", c.index_topk));
-        if (c.mla.q_rank <= 0 || c.index_dim < c.rope_dim) {
+        if ((c.mla.q_rank <= 0 && c.shared_q_rank <= 0) || c.index_dim < c.rope_dim) {
             return Status(ErrorCode::InvalidModel, "DSA needs low-rank queries and index keys at least rope.dimension_count wide");
         }
         if (f.get_int(key("attention.indexer.kpool")).value_or(1) > 1) {
@@ -216,6 +237,14 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
+    if (f.tensor("output_hc_fn.weight") != nullptr) {
+        LIYAB_RETURN_IF_ERROR(require_int("hyper_connection.count", c.hc_count));
+        LIYAB_RETURN_IF_ERROR(require_int("hyper_connection.sinkhorn_iterations", c.hc_iterations));
+        c.hc_eps = static_cast<float>(f.get_float(key("hyper_connection.epsilon")).value_or(0.0));
+        if (c.hc_count > 64 || c.hc_iterations > 1024 || !(c.hc_eps > 0.0f) || !std::isfinite(c.hc_eps)) {
+            return Status(ErrorCode::InvalidModel, "invalid hyper-connection geometry or epsilon");
+        }
+    }
     c.rope_base = static_cast<float>(f.get_float(key("rope.freq_base")).value_or(10000.0));
     // LongRoPE: frequency factors for short and long contexts (Phi-3), and the
     // attention factor that comes with them.
@@ -262,7 +291,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             const double ln_factor = y.factor > 1.0f ? std::log(static_cast<double>(y.factor)) : 0.0;
             const auto log_mul = f.get_float(key("rope.scaling.yarn_log_multiplier"));
             const auto attn_factor = f.get_float(key("rope.scaling.yarn_attn_factor"));
-            const double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            const double magnitude = attn_factor ? *attn_factor : (log_mul || c.spec->shared_kv) ? 1.0 : 0.1 * ln_factor + 1.0;
             if (log_mul) qk_mscale = 1.0 + *log_mul * ln_factor;
             if (!(magnitude > 0.0) || !(qk_mscale > 0.0)) {
                 return Status(ErrorCode::InvalidModel, "invalid YaRN attention factor (" + key("rope.scaling.*") + ")");
@@ -367,7 +396,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             if (b.indexed && (!b.latent || c.index_heads == 0)) {
                 return Status(ErrorCode::InvalidModel, "indexer tensors need latent attention and attention.indexer metadata");
             }
-            if (c.index_heads > 0) {
+            if (c.index_heads > 0 && !c.spec->shared_kv) {
                 const GgufValue* types = f.metadata(key("attention.indexer.types"));
                 if (types != nullptr) {
                     if (types->type != GgufValue::Type::Array || types->array_type != GgufValue::Type::Bool ||
@@ -385,6 +414,38 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
+            if (c.spec->shared_kv) {
+                if (!b.windowed) {
+                    return Status(ErrorCode::InvalidModel, "shared K=V attention needs a sliding window in every block");
+                }
+                if (f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr || f.tensor(block_tensor(l, "attn_sinks")) != nullptr) {
+                    return Status(ErrorCode::Unsupported, "shared K=V attention needs learned attention sinks (MoE integration)");
+                }
+                const GgufValue* ratios = f.metadata(key("attention.compress_ratios"));
+                if (ratios == nullptr || ratios->type != GgufValue::Type::Array ||
+                    (ratios->array_type != GgufValue::Type::I32 && ratios->array_type != GgufValue::Type::U32) ||
+                    ratios->array_size < static_cast<uint64_t>(c.n_layers)) {
+                    return Status(ErrorCode::InvalidModel, "invalid " + key("attention.compress_ratios"));
+                }
+                uint32_t stride;
+                std::memcpy(&stride, ratios->array_data + static_cast<size_t>(l) * sizeof(stride), sizeof(stride));
+                const TensorView* projection = f.tensor(block_tensor(l, "attn_compressor_kv.weight"));
+                if (stride > (1u << 20) || (stride > 0) != (projection != nullptr)) {
+                    return Status(ErrorCode::InvalidModel, "compressor tensors disagree with attention.compress_ratios");
+                }
+                if (projection != nullptr) {
+                    if (projection->cols() != c.n_embd ||
+                        (projection->rows() != c.head_dim && projection->rows() != 2 * int64_t{c.head_dim})) {
+                        return Status(ErrorCode::InvalidModel, "invalid compressor projected width");
+                    }
+                    b.compression = {c.head_dim, static_cast<int32_t>(stride), projection->rows() != c.head_dim};
+                    b.indexed = f.tensor(block_tensor(l, "indexer_compressor_kv.weight")) != nullptr;
+                    if (b.indexed != b.compression.overlap || (b.indexed && c.index_heads <= 0)) {
+                        return Status(ErrorCode::InvalidModel, "overlapping compression needs its own indexer");
+                    }
+                    ++c.compressed_layers;
+                }
+            }
         }
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             b.fused_gate_up =

@@ -33,6 +33,7 @@
 
 #include "liyab/mmap_loader.h"
 #include "liyab/types.h"
+#include "core/compression.h"
 
 namespace liyab {
 
@@ -92,6 +93,10 @@ struct ArchSpec {
     RopeLayout indexer_rope = RopeLayout::Halves;
     // Query/KV latent RMSNorm epsilon; 0: the file's block norm epsilon.
     float latent_norm_eps = 0.0f;
+    // Shared K=V attention: unweighted query-head RMSNorm, trailing partial
+    // RoPE (unit magnitude, including YaRN) and its inverse on the output
+    // before grouped low-rank projection.
+    bool shared_kv = false;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -148,6 +153,7 @@ struct BlockPlan {
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+    CompressionPlan compression;  // stride 0: no long-range window compressor
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
@@ -232,6 +238,16 @@ struct ModelConfig {
     int32_t index_heads = 0;
     int32_t index_dim = 0;
     int32_t index_topk = 0;
+    // Shared K=V attention's low-rank query and grouped low-rank output.
+    int32_t shared_q_rank = 0;
+    int32_t output_groups = 0;
+    int32_t output_rank = 0;
+    int32_t compressed_layers = 0;
+    float compress_rope_base = 0.0f;
+    // Manifold-constrained residual streams (tensors hc_*_fn/base/scale).
+    int32_t hc_count = 0;
+    int32_t hc_iterations = 0;
+    float hc_eps = 0.0f;
     // Blocks with BlockPlan::windowed see this many positions, the query's
     // own included (0: no windowed block); rope_base_swa > 0 gives them a
     // RoPE table of their own (ArchSpec::rope_base_swa).
@@ -269,7 +285,7 @@ struct ModelConfig {
 
     // True when some block keeps a recurrent state: such models cannot roll
     // back to an arbitrary earlier position (only to 0 or the current one).
-    [[nodiscard]] bool hybrid() const noexcept { return ssm_v_heads > 0; }
+    [[nodiscard]] bool hybrid() const noexcept { return ssm_v_heads > 0 || compressed_layers > 0; }
 };
 
 // Reads the model's hyperparameters and plans its blocks. Errors:

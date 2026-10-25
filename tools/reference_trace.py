@@ -777,6 +777,7 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     n_kv = a.key.shape[1]
     hd_v = a.value.shape[-1]
     f.update(heads=n_q, kv_heads=n_kv, head_dim=hd, value_head_dim=hd_v, unknown=[])
+    f["shared_key_value"] = close(a.key, a.value)
     linears = _linears(block_calls, mixer_path)
     norms = [c for c in block_calls if _is_descendant(c.path, mixer_path) and _norm_like(c)]
     fused_total = n_q + 2 * n_kv

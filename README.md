@@ -119,6 +119,7 @@ These rules decide what goes into the code:
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) laid out per block (windowed blocks keep only their window), with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
 | Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
+| Shared K=V attention components: sliding + overlapping/nonoverlapping gated compression, compressed-key selection, grouped output, manifold-constrained residual streams | 🧪 CPU component checks pass; full DeepSeek-V4 also requires the MoE routing, clipping and learned-sink integration |
 | Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU and Metal backends |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
@@ -2207,6 +2208,17 @@ metadata is normalized to the latent cache layout. A block's key expansion is de
 while its quantized value rows are copied unchanged; these temporary buffers live only while that block runs,
 including during layer streaming, and their peak bytes are reserved before sizing the expert cache.
 
+Shared K=V compression keeps bounded channelwise softmax accumulators and stores completed entries with their
+closing token in paged F32 auxiliary rows. Draft rollback, branch ancestry, sequences and saved prefixes carry
+both together. CPU fixtures cover sliding, overlapping CSA and nonoverlapping HCA attention, inverse output
+RoPE, grouped low-rank output and manifold-constrained residual streams. Against native transformers 5.19,
+the 512-token component stack at the trained head/index widths measures mean KL 0.00000065 and top-1 99.80%;
+an isolated first-layer CSA test matches all 512 top-2 selections. These fixtures explicitly use dense FFNs
+and omit learned sinks; they do not establish full DeepSeek-V4 support. Projections use the normal backend
+route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
+AVX2 and scalar). Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
+every position in every block, including nonclosing positions; memory planning includes that cost.
+
 The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
 precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows: rounding an index score can change its discrete
 top-k selection. Page copies, rollback, context images and the prefix store carry these channels with the main
@@ -2588,6 +2600,11 @@ Benchmarks and tools built with the tests:
   ```bash
   tools/tiny_checkpoint.py --model Qwen/Qwen3-0.6B --out tiny-qwen3
   ```
+* `tools/compression_reference.py PREFIX --out REPORT.json` compares a fixture emitted by
+  `build/test_compression --export-fixture PREFIX [--original-geometry] [--indexer-only]` with native transformers
+  shared-KV, compressor and residual modules. It reports logits and top-k selection agreement. The default
+  fixture retains all three attention kinds; `--indexer-only` isolates first-layer selection. This is component
+  evidence with dense FFNs and disabled sinks, not a full-model gate or a tokenizer check.
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.

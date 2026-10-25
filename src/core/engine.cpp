@@ -2940,12 +2940,16 @@ std::string Engine::describe() const {
     out += "Attention:  " + route.attention->description() + "\n";
     out += "FFN:        " + route.ffn->description() + "\n";
     if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
-    if (c.hybrid()) {
+    if (c.ssm_v_heads > 0) {
         char mix[160];
         std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
                       c.n_attn_layers, c.n_layers - c.n_attn_layers,
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
+    }
+    if (c.compressed_layers > 0) {
+        out += "Compression: " + std::to_string(c.compressed_layers) + " attention blocks, bounded recurrent window state, " +
+               std::to_string(impl_->target->recurrent_state_bytes()) + " bytes\n";
     }
     if (kv.has_windowed_layers()) {  // per-block KV: windowed blocks keep their window only
         int32_t every = 0;

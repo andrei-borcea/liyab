@@ -93,12 +93,16 @@ struct KvCacheConfig {
     // comment). A window that holds every position of the context should be
     // given as 0: it would only cost the bookkeeping of a windowed group.
     std::vector<int32_t> layer_windows;
-    // Auxiliary key channels following each key row (DSA's index keys), in
+    // Auxiliary key channels following each key row (DSA's index keys or
+    // shared-KV attention's completed compressed keys and index keys), in
     // F32, independent of the main cache's format: rounding a score can
     // change a discrete top-k selection. 0: none. Requires values_in_keys.
     // These channels are carried by every page/image,
     // copied and released with its main row, but are never attention values
-    // or scaled by scale_keys().
+    // or scaled by scale_keys(). A window compressor writes a completed
+    // entry at its closing source position; unused auxiliary rows remain
+    // zero and consume the same configured space. Window/rollback/release
+    // policies must retain the source position while that entry is visible.
     int32_t auxiliary_dim = 0;
 };
 

@@ -771,6 +771,9 @@ private:
         kQa, kQb, kKvA, kKb, kVb,
         kIndexQ, kIndexK, kIndexWeights,  // DSA indexer projections
         kKvB,  // older MLA files: combined per-head [key | value] expansion
+        kSharedKv, kOutputA, kOutputB,
+        kCompressKv, kCompressGate, kIndexCompressKv, kIndexCompressGate,
+        kHcAttn, kHcFfn,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
@@ -790,8 +793,12 @@ private:
         std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
+        std::vector<float> compress_bias, compress_norm, index_compress_bias, index_compress_norm;
+        std::vector<float> hc_attn_base, hc_attn_scale, hc_ffn_base, hc_ffn_scale;
     };
-    // Recurrent memory of one DeltaNet block.
+    // Recurrent memory of one stateful block. Compression uses conv for
+    // bounded softmax accumulators, ssm empty; the same snapshots, checkpoint
+    // ring and saved-context images carry both kinds without special cases.
     struct RecurrentState {
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
         std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
@@ -879,6 +886,12 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                           const uint8_t* head_mask);
+    Status hyper_collapse(const TensorView& projection, const std::vector<float>& base,
+                          const std::vector<float>& scale, int32_t n, const Route& route);
+    void hyper_add(int32_t n);
+    Status hyper_head(int32_t n, const Route& route);
     // Multi-head latent attention (ModelConfig::mla), in the form forward()
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
@@ -1020,6 +1033,8 @@ private:
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
     std::vector<float> output_norm_;
+    const TensorView* hc_head_ = nullptr;
+    std::vector<float> hc_head_base_, hc_head_scale_;
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
@@ -1092,6 +1107,9 @@ private:
     bool latent_expanded_ = false;  // the current pass's form
     double latent_ms_ = 0.0;        // the current pass's form-dependent time, every latent block
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
+    std::vector<float> compress_kv_, compress_gate_, index_compress_kv_, index_compress_gate_;
+    std::vector<float> compression_scratch_;
+    std::vector<float> hc_streams_, hc_normalized_, hc_coefficients_, hc_post_, hc_comb_, hc_next_;
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch

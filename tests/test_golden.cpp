@@ -307,6 +307,14 @@ std::vector<GoldenCase> cases() {
     s.mla_legacy = true;
     add("deepseek2-combined-mla", s, absorbed);
     add("deepseek2-combined-mla-expanded", s, expanded);
+    s = test::compressed_spec();
+    s.hc_count = 0;
+    add("shared-kv-compression", s);
+    s.hc_count = 4;
+    add("shared-kv-compression-mhc", s);
+    s.yarn_factor = 16;
+    s.yarn_ctx = 32;
+    add("shared-kv-compression-mhc-yarn", s);
     return out;
 }
 

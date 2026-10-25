@@ -370,3 +370,57 @@ estimate. Routed expert parameters are `75 × 256 × 3 × 6144 × 2048`; a cold 
 84/110/144/176/210 bytes per 256 parameters. Actual GGUF sizes depend on their mixed tensor formats and whether
 they include unexecuted MTP tensors. The current uniform cache layout reserves auxiliary channels in shared
 blocks too; the estimate includes that allocation rather than assuming only full indexers consume key memory.
+
+### Shared K=V compression components
+
+The `deepseek4` component row records shared K=V, unweighted query-head RMSNorm, trailing adjacent-pair partial
+RoPE and inverse output RoPE. `attention.q_lora_rank`, `output_group_count`, `output_lora_rank`,
+`compress_rope_freq_base` and per-block `compress_ratios` describe geometry. Compressor tensor widths select
+one series or two overlapping series; overlapping blocks require their own compressed-key indexer. No tensor
+or metadata rule depends on a model's name. Learned sinks and the full V4 MoE variant are refused precisely
+until their separately owned operations are integrated; this row is not a full V4 support claim.
+
+Compression keeps channelwise stable-softmax maxima, denominators and weighted sums, not historical source
+projections. Nonoverlapping state uses `3 * head_dim` floats; overlapping state uses `9 * head_dim` plus
+`9 * index_dim` for its independent indexer. Existing recurrent snapshots/checkpoints carry these bounded
+arrays through rollback, draft trees, sequences and context images. A closed window's normalized/rotated
+entry follows its closing source token in the paged auxiliary-key image. Tree queries resolve that token
+through their ancestry before reading the entry. Index head weights remain signed; only query/key dot scores
+are rectified.
+
+This first layout retains raw shared-KV rows for the finite context, applying the model's sliding mask during
+attention. It reserves `head_dim + index_dim` F32 auxiliary channels in each attention block at every position,
+including unused nonclosing positions. Memory planning includes those bytes; this is not a compact strided
+allocation or a physically bounded sliding cache. An engine-level sliding window and segment relocation are
+refused because they would discard entries or change compressor phase. Key-only scaling is inapplicable to
+shared K=V values and is not calibrated. Projections use the ordinary Metal/Vulkan/CPU routing; normalization,
+attention, index scoring, residual mixing and grouped output slices use existing CPU kernels. The compressor
+recurrence has NEON, runtime-dispatched AVX2 and scalar channelwise arithmetic.
+
+The manifold-constrained residual path infers coefficients from normalized parallel streams, applies sigmoid
+pre/post weights and the file's Sinkhorn iteration count, consumes the mixing matrix transposed and collapses
+the final streams before output normalization. Expert lookahead is disabled for these streams: the collapsed
+input is not a prediction of the next block's parallel residuals. Component fixtures keep dense FFNs and omit
+sinks explicitly; they cannot establish full V4 conformance.
+The description tool observes shared key/value tensors but refuses a row until it also reconstructs all four
+shared-attention facts; it does not infer them from the family name. Its ordinary Q/K/V trace does not yet
+decompose the compressors, grouped output or mHC. Consequently it cannot independently validate the new
+`q_lora_rank`, output group/rank, compression ratio/base or hyper-connection count/iteration/epsilon metadata
+against that trace. The component runner below supplies those dimensions directly to native modules and
+does not substitute for that full-model description gate.
+
+`test_compression` independently recomputes whole windows and dense attention (including F16 main-cache
+rounding), exercises eight writable weight formats, and checks decode splits, rollback and saved images in
+all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
+`tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
+
+| Component fixture | Tokens | Mean / max KL | Top-1 | CSA top-2 selections |
+|---|---:|---:|---:|---:|
+| Three kinds + mHC, head/index 32 | 83 | 0.000000219 / 0.00000573 | 100% | 79/83 |
+| Three kinds + mHC + YaRN, trained head/index widths 512/128 | 512 | 0.000000647 / 0.00029766 | 99.80% | 511/512 |
+| Isolated first CSA block, trained widths | 512 | 0.000000054 / 0.00000037 | 100% | 512/512 |
+
+The isolated selection test excludes changes to the source hidden state caused by earlier layers' F16 main
+cache. The complete component fixture retains sliding, CSA and HCA blocks; none is removed to claim a model
+gate. Three synthetic golden cases pin compression with and without mHC and with YaRN on NEON, AVX2 and
+scalar. Every previously pinned case remains unchanged.

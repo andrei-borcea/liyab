@@ -3733,12 +3733,14 @@ uint64_t dir_bytes(const std::string& dir) {
 }  // namespace
 
 TEST_CASE("Sparse index keys survive storage prefix reuse and an engine restart in every KV format") {
+    for (const bool compressed : {false, true}) {
     auto spec = latent_spec(64);
     spec.arch = "glm-dsa";
     spec.index_dim = 64;
     spec.index_topk = 8;
     spec.index_full = {true, false};
-    const std::string path = model_path("indexed_prefix", spec);
+    if (compressed) spec = test::compressed_spec();
+    const std::string path = model_path(compressed ? "compressed_prefix" : "indexed_prefix", spec);
     std::string a, b;
     for (int i = 0; i < 200; ++i) {
         a += i % 3 ? " hello" : " world";
@@ -3784,6 +3786,7 @@ TEST_CASE("Sparse index keys survive storage prefix reuse and an engine restart 
             CHECK(restored.cached_prefix_tokens >= 128);
         }
         std::filesystem::remove_all(dir);
+    }
     }
 }
 
@@ -4567,7 +4570,8 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     const std::string dir = test::temp_dir();
     // ... also with latent attention: its cache pages hold key rows only, values inside them.
     for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64)),
-                                   model_path("latent_combined_state", latent_spec(64, true))}) {
+                                   model_path("latent_combined_state", latent_spec(64, true)),
+                                   model_path("compressed_state", test::compressed_spec())}) {
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);
@@ -5591,7 +5595,7 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
     };
     std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")},
                                {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)},
-                               {"latent_combined", latent_spec(64, true)}};
+                               {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";
@@ -5765,7 +5769,7 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
         test::TinyModelSpec spec;
     };
     std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)},
-                              {"latent_combined", latent_spec(64, true)}};
+                              {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";

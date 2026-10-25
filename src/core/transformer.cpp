@@ -423,9 +423,13 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     kv.type = options.kv_type;
     // Latent attention: one row [k_pe | latent] per position and block, its
     // latent channels serving as the values (ModelConfig::mla).
-    kv.values_in_keys = c.mla.kv_rank > 0;
-    kv.value_offset = kv.values_in_keys ? c.rope_dim : 0;
-    kv.auxiliary_dim = c.index_dim;
+    kv.values_in_keys = c.mla.kv_rank > 0 || c.spec->shared_kv;
+    kv.value_offset = c.mla.kv_rank > 0 ? c.rope_dim : 0;
+    // A completed compressed entry belongs to its closing source token. It
+    // follows that token through page images, branches and prefix reuse;
+    // unfinished windows live only in bounded recurrent accumulators. Keep
+    // precise F32 compressed/index keys independent of the main KV format.
+    kv.auxiliary_dim = c.spec->shared_kv ? (c.compressed_layers > 0 ? c.head_dim + c.index_dim : 0) : c.index_dim;
     model->max_batch_ = std::max(1, options.max_batch);
     // Per-block layout: a windowed block (Gemma 2 / 3, Phi-3) keeps only the
     // rows its window still shows, so it costs a bounded amount whatever the
@@ -437,7 +441,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         const Layer& L = model->layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
         if (L.kv_slot >= 0 && plan.mixer == MixerKind::Attention && plan.windowed && c.sliding_window > 0 &&
-            !options.keep_windowed_rows) {
+            !options.keep_windowed_rows && !c.spec->shared_kv) {
             windows[static_cast<size_t>(L.kv_slot)] = c.sliding_window;
         }
     }
@@ -476,12 +480,15 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // A window holding the whole context keeps every position anyway: such
     // blocks stay with the others (a windowed group would only add bookkeeping).
     for (int32_t& w : windows) {
-        if (w >= model->context_length_) w = 0;
+        if (w >= model->context_length_ || c.spec->shared_kv) w = 0;
     }
     if (std::any_of(windows.begin(), windows.end(), [](int32_t w) { return w > 0; })) kv.layer_windows = windows;
     kv.max_positions = model->context_length_;
     kv.window = options.sliding_window > 0 && options.sliding_window < model->context_length_ ? options.sliding_window : 0;
     kv.sink_tokens = std::clamp(options.sink_tokens, 0, kv.page_tokens);
+    if (c.spec->shared_kv && kv.window > 0) {
+        return Status(ErrorCode::Unsupported, "shared K=V attention requires the model's own sliding window and compressed entries");
+    }
     if (kv.type != KvCacheType::F16 && (c.head_dim % quant::kBlock != 0 || kv.value_offset % quant::kBlock != 0)) {
         LIYAB_LOG_WARN("head_dim %d (values from channel %d) is not in whole blocks of %d; using an F16 KV cache",
                        c.head_dim, kv.value_offset, quant::kBlock);
@@ -554,12 +561,24 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (c.rope_base_swa > 0.0f) {
         model->rope_tables_.push_back(table(c.rope_base_swa, 1.0f, std::vector<float>(factors.size(), 1.0f), nullptr));
     }
+    int32_t compression_table = 0;
+    if (c.spec->shared_kv) {
+        compression_table = static_cast<int32_t>(model->rope_tables_.size());
+        auto compressed = table(c.compress_rope_base, c.rope_scale, factors,
+                                c.yarn.factor > 0.0f ? &c.yarn : nullptr);
+        compressed.magnitude = c.rope_magnitude;
+        model->rope_tables_.push_back(std::move(compressed));
+        // The main, sliding-only stream has plain RoPE even when compressed
+        // layers use YaRN. No table is changed for existing architectures.
+        model->rope_tables_[0] = table(c.rope_base, 1.0f, std::vector<float>(factors.size(), 1.0f), nullptr);
+    }
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = model->layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
         if (plan.mixer != MixerKind::Attention || !plan.windowed) continue;
         L.window = c.sliding_window;
         if (c.rope_base_swa > 0.0f) L.rope_table = 1;
+        if (c.spec->shared_kv) L.rope_table = plan.compression.stride > 0 ? compression_table : 0;
     }
 
     if (c.n_expert > 0) {
@@ -590,7 +609,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.mla.kv_rank, c.rope_dim, c.n_head, c.mla.nope_dim, c.rope_dim, c.mla.v_dim,
                        c.mla.q_rank > 0 ? ", low-rank queries" : "");
     }
-    if (c.hybrid()) {
+    if (c.ssm_v_heads > 0) {
         LIYAB_LOG_INFO("DeltaNet: %d recurrent blocks, %d/%d heads x %d, conv %d, state %.1f MiB", c.n_layers - c.n_attn_layers,
                        c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
                        static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
@@ -613,6 +632,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                 [&](const TensorView& t) {
                     return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
                            t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
+                           !t.name.ends_with(".attn_output_a.weight") &&
                            !model->file_->converted(t);
                 },
                 r.to);
@@ -649,6 +669,12 @@ Status Transformer::bind_weights() {
         quant::dequantize_row(t->type, t->data, out.data(), n);
         return Status::ok();
     };
+    auto position_bias = [&](const std::string& name, int64_t width, int64_t stride, std::vector<float>& out) -> Status {
+        const TensorView* tensor = nullptr;
+        LIYAB_RETURN_IF_ERROR(matrix(name, width, stride, tensor));
+        if (tensor->n_dims != 2) return Status(ErrorCode::InvalidModel, "position bias must have two dimensions: " + name);
+        return vec(name, width * stride, true, out);
+    };
 
     token_embd_ = f.tensor("token_embd.weight");  // shape checked by describe_model()
     if (f.tensor("output.weight") != nullptr) {
@@ -657,6 +683,11 @@ Status Transformer::bind_weights() {
         output_ = token_embd_;  // tied embeddings
     }
     LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, true, output_norm_));
+    if (c.hc_count > 0) {
+        LIYAB_RETURN_IF_ERROR(matrix("output_hc_fn.weight", int64_t{c.hc_count} * c.n_embd, c.hc_count, hc_head_));
+        LIYAB_RETURN_IF_ERROR(vec("output_hc_base.weight", c.hc_count, true, hc_head_base_));
+        LIYAB_RETURN_IF_ERROR(vec("output_hc_scale.weight", 1, true, hc_head_scale_));
+    }
 
     const int64_t dn_key = int64_t{c.ssm_k_heads} * c.ssm_head_dim;
     const int64_t dn_value = int64_t{c.ssm_v_heads} * c.ssm_head_dim;
@@ -669,7 +700,51 @@ Status Transformer::bind_weights() {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
-        if (plan.mixer == MixerKind::Attention && plan.latent) {
+        if (c.hc_count > 0) {
+            const int64_t width = int64_t{c.hc_count} * (2 + c.hc_count);
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "hc_attn_fn.weight"), int64_t{c.hc_count} * c.n_embd, width, L.w[kHcAttn]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "hc_ffn_fn.weight"), int64_t{c.hc_count} * c.n_embd, width, L.w[kHcFfn]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "hc_attn_base.weight"), width, true, L.hc_attn_base));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "hc_ffn_base.weight"), width, true, L.hc_ffn_base));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "hc_attn_scale.weight"), 3, true, L.hc_attn_scale));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "hc_ffn_scale.weight"), 3, true, L.hc_ffn_scale));
+        }
+        if (plan.mixer == MixerKind::Attention && c.spec->shared_kv) {
+            L.kv_slot = kv_slots++;
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q_a.weight"), c.n_embd, c.shared_q_rank, L.w[kQa]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_a_norm.weight"), c.shared_q_rank, true, L.q_a_norm));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q_b.weight"), c.shared_q_rank,
+                                         int64_t{c.n_head} * c.head_dim, L.w[kQb]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_kv.weight"), c.n_embd, c.head_dim, L.w[kSharedKv]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_kv_a_norm.weight"), c.head_dim, true, L.kv_a_norm));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output_a.weight"), int64_t{c.n_head} * c.head_dim / c.output_groups,
+                                         int64_t{c.output_groups} * c.output_rank, L.w[kOutputA]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output_b.weight"), int64_t{c.output_groups} * c.output_rank,
+                                         c.n_embd, L.w[kOutputB]));
+            // Sinks and hash/sqrtsoftplus/clipped routing are wave-owned by
+            // the MoE part. Refuse the dependent variant until integrated.
+            if (f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_sinks")) != nullptr) {
+                return Status(ErrorCode::Unsupported, "shared K=V attention needs learned attention sinks (MoE integration)");
+            }
+            if (plan.compression.stride > 0) {
+                L.state_slot = state_slots++;
+                const int64_t projected = int64_t{c.head_dim} * (plan.compression.overlap ? 2 : 1);
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_compressor_kv.weight"), c.n_embd, projected, L.w[kCompressKv]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_compressor_gate.weight"), c.n_embd, projected, L.w[kCompressGate]));
+                LIYAB_RETURN_IF_ERROR(position_bias(block_tensor(l, "attn_compressor_ape.weight"), projected, plan.compression.stride, L.compress_bias));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_compressor_norm.weight"), c.head_dim, true, L.compress_norm));
+                if (plan.indexed) {
+                    LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer_compressor_kv.weight"), c.n_embd, 2 * int64_t{c.index_dim}, L.w[kIndexCompressKv]));
+                    LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer_compressor_gate.weight"), c.n_embd, 2 * int64_t{c.index_dim}, L.w[kIndexCompressGate]));
+                    LIYAB_RETURN_IF_ERROR(position_bias(block_tensor(l, "indexer_compressor_ape.weight"), 2 * int64_t{c.index_dim}, plan.compression.stride, L.index_compress_bias));
+                    LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "indexer_compressor_norm.weight"), c.index_dim, true, L.index_compress_norm));
+                    LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer.attn_q_b.weight"), c.shared_q_rank,
+                                                 int64_t{c.index_heads} * c.index_dim, L.w[kIndexQ]));
+                    LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "indexer.proj.weight"), c.n_embd, c.index_heads, L.w[kIndexWeights]));
+                }
+            }
+        } else if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
             const int64_t q_rows = int64_t{c.n_head} * (m.nope_dim + c.rope_dim);  // per head [q_nope | q_pe]
@@ -802,7 +877,16 @@ Status Transformer::bind_weights() {
     }
 
     states_.resize(static_cast<size_t>(state_slots));
-    for (RecurrentState& st : states_) {
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        const Layer& L = layers_[static_cast<size_t>(l)];
+        if (L.state_slot < 0) continue;
+        RecurrentState& st = states_[static_cast<size_t>(L.state_slot)];
+        const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
+        if (plan.compression.stride > 0) {
+            const size_t index = plan.indexed ? CompressionPlan{c.index_dim, plan.compression.stride, true}.state_floats() : 0;
+            st.conv.assign(plan.compression.state_floats() + index, 0.0f);
+            continue;
+        }
         st.conv.assign(static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1), 0.0f);
         st.ssm.assign(static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) *
                           static_cast<size_t>(c.ssm_head_dim),
@@ -2004,6 +2088,9 @@ void Transformer::scale_keys(int32_t kv_slot, float* q, float* k) const {
 
 Status Transformer::calibrate_keys(std::span<const int32_t> tokens, const Route& route, ThreadPool& pool) {
     key_scale_.clear();
+    // Shared K=V must preserve value channels; the ordinary key-only scaling
+    // transformation is not applicable to that cache geometry.
+    if (config_.spec->shared_kv) return Status::ok();
     if (!quant::is_block_quantized(kv_->dtype()) || config_.n_attn_layers == 0) return Status::ok();
     if (tokens.empty()) return Status(ErrorCode::InvalidArgument, "key calibration needs tokens");
     reset();
@@ -2048,6 +2135,7 @@ Status Transformer::set_key_scales(std::span<const float> scales) {
         key_scale_.clear();
         return Status::ok();
     }
+    if (config_.spec->shared_kv) return Status(ErrorCode::Unsupported, "key-only scaling cannot preserve shared K=V values");
     if (!quant::is_block_quantized(kv_->dtype())) {
         return Status(ErrorCode::InvalidArgument, "key scales apply to quantized KV caches only");
     }
@@ -2810,6 +2898,207 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
 // all tokens (both are independent across their tasks, sequential in time).
 // Token by token, a batch of n cost 2 n thread-pool rounds per block and ran
 // the convolution, SiLU and L2 norms on one thread.
+Status Transformer::shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                   ThreadPool& pool, const uint8_t* head_mask) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const BlockPlan& block = c.blocks[static_cast<size_t>(layer)];
+    const CompressionPlan& compressor = block.compression;
+    const auto un = static_cast<size_t>(n), d = static_cast<size_t>(c.n_embd);
+    const auto hd = static_cast<size_t>(c.head_dim), heads = static_cast<size_t>(c.n_head);
+    const auto qr = static_cast<size_t>(c.shared_q_rank), id = static_cast<size_t>(c.index_dim);
+    const auto ih = static_cast<size_t>(c.index_heads);
+    const RopeTable& table = rope_tables_[static_cast<size_t>(L.rope_table)];
+    mla_qa_.resize(un * qr);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kQa], xb_.data(), mla_qa_.data(), n));
+    for (size_t t = 0; t < un; ++t) {
+        rmsnorm(mla_qa_.data() + t * qr, L.q_a_norm.data(), mla_qa_.data() + t * qr, c.shared_q_rank, c.rms_eps);
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kQb], mla_qa_.data(), q_.data(), n));
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSharedKv], xb_.data(), k_.data(), n));
+    if (compressor.stride > 0) {
+        const size_t width = hd * (compressor.overlap ? 2 : 1);
+        compress_kv_.resize(un * width);
+        compress_gate_.resize(un * width);
+        const TensorView* projections[] = {&w[kCompressKv], &w[kCompressGate]};
+        float* outputs[] = {compress_kv_.data(), compress_gate_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, projections, xb_.data(), outputs, n));
+        if (block.indexed) {
+            index_compress_kv_.resize(un * 2 * id);
+            index_compress_gate_.resize(un * 2 * id);
+            index_q_.resize(un * ih * id);
+            index_weights_.resize(un * ih);
+            const TensorView* ip[] = {&w[kIndexCompressKv], &w[kIndexCompressGate], &w[kIndexWeights]};
+            float* io[] = {index_compress_kv_.data(), index_compress_gate_.data(), index_weights_.data()};
+            LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, ip, xb_.data(), io, n));
+            LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kIndexQ], mla_qa_.data(), index_q_.data(), n));
+        }
+    }
+    // Main shared K=V rows first. A row's auxiliary channels are cleared by
+    // store(); a completed compressor writes them below at its closing token.
+    for (const Segment& s : segs_) {
+        for (int32_t t = s.first; t < s.first + s.n; ++t) {
+            const int32_t pos = pos_of(s, t);
+            float* query = q_.data() + static_cast<size_t>(t) * heads * hd;
+            for (size_t h = 0; h < heads; ++h) {
+                float* q = query + h * hd;
+                const float scale = rms_scale(q, c.head_dim, c.rms_eps);
+                for (size_t j = 0; j < hd; ++j) q[j] *= scale;
+            }
+            rope(query + hd - static_cast<size_t>(c.rope_dim), c.n_head, hd, pos, table);
+            float* key = k_.data() + static_cast<size_t>(t) * hd;
+            rmsnorm(key, L.kv_a_norm.data(), key, c.head_dim, c.rms_eps);
+            rope(key + hd - static_cast<size_t>(c.rope_dim), 1, hd, pos, table);
+            s.kv->store(L.kv_slot, row_of(s, t), key, nullptr);
+            if (block.indexed) {
+                rope(index_q_.data() + static_cast<size_t>(t) * ih * id + id - static_cast<size_t>(c.rope_dim),
+                     c.index_heads, id, pos, table);
+            }
+        }
+    }
+    if (compressor.stride > 0) {
+        const size_t width = hd * (compressor.overlap ? 2 : 1);
+        const CompressionPlan index_compressor{c.index_dim, compressor.stride, true};
+        compression_scratch_.resize(2 * std::max(hd, id));
+        std::vector<float> emitted(hd + id, 0.0f);
+        for (const Segment& s : segs_) {
+            RecurrentState& state = (*s.states)[static_cast<size_t>(L.state_slot)];
+            auto checkpoint = [&](int32_t i) {
+                return state.checkpoints.data() + static_cast<size_t>((s.n_past + i) % s.rollback) * state.conv.size();
+            };
+            for (int32_t i = 0; i < s.n; ++i) {
+                const int32_t t = s.first + i, pos = pos_of(s, t);
+                if (!tree_depth_.empty() && i > 0 && tree_parent_[static_cast<size_t>(i)] != i - 1) {
+                    std::copy_n(checkpoint(tree_parent_[static_cast<size_t>(i)]), state.conv.size(), state.conv.begin());
+                }
+                const auto phase = static_cast<size_t>(pos % compressor.stride);
+                const bool closed = compressor.step(std::span<float>(state.conv).first(compressor.state_floats()),
+                    compress_kv_.data() + static_cast<size_t>(t) * width,
+                    compress_gate_.data() + static_cast<size_t>(t) * width,
+                    L.compress_bias.data() + phase * width, pos, emitted.data(), compression_scratch_);
+                if (block.indexed) {
+                    index_compressor.step(std::span<float>(state.conv).subspan(compressor.state_floats()),
+                        index_compress_kv_.data() + static_cast<size_t>(t) * 2 * id,
+                        index_compress_gate_.data() + static_cast<size_t>(t) * 2 * id,
+                        L.index_compress_bias.data() + phase * 2 * id, pos, emitted.data() + hd, compression_scratch_);
+                }
+                if (closed) {
+                    rmsnorm(emitted.data(), L.compress_norm.data(), emitted.data(), c.head_dim, c.rms_eps);
+                    const int32_t start = pos + 1 - compressor.stride;
+                    rope(emitted.data() + hd - static_cast<size_t>(c.rope_dim), 1, hd, start, table);
+                    if (block.indexed) {
+                        rmsnorm(emitted.data() + hd, L.index_compress_norm.data(), emitted.data() + hd, c.index_dim, c.rms_eps);
+                        rope(emitted.data() + hd + id - static_cast<size_t>(c.rope_dim), 1, id, start, table);
+                    }
+                    s.kv->store_auxiliary(L.kv_slot, row_of(s, t), emitted.data());
+                }
+                if (s.checkpoint && i + s.rollback >= s.n) {
+                    std::copy(state.conv.begin(), state.conv.end(), checkpoint(i));
+                }
+            }
+        }
+    }
+    // Translate a branch's logical position through its ancestry. The emitted
+    // compressed entry is carried by the closing token's own row, so sibling
+    // branches never share an incomplete or freshly closed window.
+    auto physical = [&](const Segment& s, int32_t t, int32_t pos) {
+        if (tree_depth_.empty() || pos < s.n_past) return pos;
+        return s.n_past + tree_ancestors_[static_cast<size_t>(t - s.first) * static_cast<size_t>(tree_stride_) +
+                                         static_cast<size_t>(pos - s.n_past)];
+    };
+    index_positions_.assign(un, {});
+    if (compressor.stride > 0) {
+        for (const Segment& s : segs_) {
+            for (int32_t t = s.first; t < s.first + s.n; ++t) {
+                const int32_t ready = (pos_of(s, t) + 1) / compressor.stride;
+                std::vector<std::pair<float, int32_t>> scores;
+                std::vector<float> key(id);
+                for (int32_t entry = 0; entry < ready; ++entry) {
+                    const int32_t row = physical(s, t, (entry + 1) * compressor.stride - 1);
+                    float score = 0.0f;
+                    if (block.indexed) {
+                        std::memcpy(key.data(), s.kv->auxiliary_key(L.kv_slot, row, 0) + hd * sizeof(float), id * sizeof(float));
+                        for (size_t h = 0; h < ih; ++h) {
+                            const float dot = quant::dot_f32(index_q_.data() + (static_cast<size_t>(t) * ih + h) * id,
+                                                             key.data(), c.index_dim);
+                            score += std::max(dot, 0.0f) / std::sqrt(static_cast<float>(id)) *
+                                     (index_weights_[static_cast<size_t>(t) * ih + h] / std::sqrt(static_cast<float>(ih)));
+                        }
+                    }
+                    scores.emplace_back(score, row);
+                }
+                const auto count = block.indexed ? std::min(scores.size(), static_cast<size_t>(c.index_topk)) : scores.size();
+                if (count < scores.size()) {
+                    std::partial_sort(scores.begin(), scores.begin() + static_cast<std::ptrdiff_t>(count), scores.end(),
+                        [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+                }
+                auto& selected = index_positions_[static_cast<size_t>(t)];
+                for (size_t i = 0; i < count; ++i) selected.push_back(scores[i].second);
+                std::sort(selected.begin(), selected.end());
+            }
+        }
+    }
+    // Existing F32 dot/dequantize kernels provide NEON, AVX2 and scalar
+    // paths for every main KV type. Compressed and index channels remain F32.
+    pool.parallel_for(static_cast<int64_t>(un * heads), [&](int64_t begin, int64_t end) {
+        thread_local std::vector<float> key, scores, values;
+        key.resize(hd);
+        for (int64_t job = begin; job < end; ++job) {
+            const auto t = static_cast<int32_t>(static_cast<size_t>(job) / heads);
+            const auto h = static_cast<size_t>(job) % heads;
+            float* out = att_.data() + static_cast<size_t>(job) * hd;
+            std::fill_n(out, hd, 0.0f);
+            if (head_mask != nullptr && head_mask[h] == 0) continue;
+            const Segment& s = segs_[segment_of(t)];
+            const int32_t pos = pos_of(s, t);
+            const int32_t first = L.window > 0 ? std::max(0, pos - L.window + 1) : 0;
+            const auto& compressed = index_positions_[static_cast<size_t>(t)];
+            const size_t raw = static_cast<size_t>(pos - first + 1), count = raw + compressed.size();
+            values.resize(count * hd);
+            scores.resize(count);
+            const float* query = q_.data() + static_cast<size_t>(job) * hd;
+            float maximum = -INFINITY;
+            for (size_t j = 0; j < count; ++j) {
+                float* value = values.data() + j * hd;
+                if (j < raw) {
+                    quant::dequantize_row(s.kv->dtype(), s.kv->k_row(L.kv_slot, physical(s, t, first + static_cast<int32_t>(j)), 0),
+                                          value, c.head_dim);
+                } else {
+                    std::memcpy(value, s.kv->auxiliary_key(L.kv_slot, compressed[j - raw], 0), hd * sizeof(float));
+                }
+                float score = quant::dot_f32(query, value, c.head_dim) * c.attn_scale;
+                if (c.attn_softcap > 0.0f) score = c.attn_softcap * portable_tanh(score / c.attn_softcap);
+                scores[j] = score;
+                maximum = std::max(maximum, score);
+            }
+            float sum = 0.0f;
+            for (size_t j = 0; j < count; ++j) {
+                scores[j] = std::exp(scores[j] - maximum);
+                sum += scores[j];
+            }
+            for (size_t j = 0; j < count; ++j) {
+                quant::axpy_row(DType::F32, values.data() + j * hd, scores[j] / sum, out, c.head_dim);
+            }
+            rope(out + hd - static_cast<size_t>(c.rope_dim), 1, hd, -pos, table);
+        }
+    });
+    const auto groups = static_cast<size_t>(c.output_groups), rank = static_cast<size_t>(c.output_rank);
+    const size_t cols = heads * hd / groups;
+    mla_heads_in_.resize(un * cols);
+    mla_heads_out_.resize(un * rank);
+    mla_kv_.resize(un * groups * rank);
+    for (size_t group = 0; group < groups; ++group) {
+        for (size_t t = 0; t < un; ++t) std::copy_n(att_.data() + t * heads * hd + group * cols, cols, mla_heads_in_.data() + t * cols);
+        TensorView projection = w[kOutputA];
+        projection.data = projection.row(static_cast<int64_t>(group * rank));
+        projection.ne[1] = c.output_rank;
+        projection.nbytes = rank * projection.row_bytes();
+        LIYAB_RETURN_IF_ERROR(route.cpu->matmul(projection, mla_heads_in_.data(), mla_heads_out_.data(), n));
+        for (size_t t = 0; t < un; ++t) std::copy_n(mla_heads_out_.data() + t * rank, rank, mla_kv_.data() + (t * groups + group) * rank);
+    }
+    return matmul(route, route.attention, w[kOutputB], mla_kv_.data(), xb_.data(), n);
+}
+
 Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                     ThreadPool& pool) {
     const ModelConfig& c = config_;
@@ -3075,6 +3364,7 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
 }
 
 void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) {
+    if (config_.hc_count > 0) return;  // a collapsed stream is not the next block's residual streams
     if (expert_store_ == nullptr || layer >= config_.n_layers) return;
     const ModelConfig& c = config_;
     if (c.blocks[static_cast<size_t>(layer)].ffn != FfnKind::Moe) return;
@@ -3564,6 +3854,108 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     return Status::ok();
 }
 
+Status Transformer::hyper_collapse(const TensorView& projection, const std::vector<float>& base,
+                                   const std::vector<float>& scales, int32_t n, const Route& route) {
+    const ModelConfig& c = config_;
+    const auto streams = static_cast<size_t>(c.hc_count), d = static_cast<size_t>(c.n_embd);
+    const auto un = static_cast<size_t>(n), width = streams * (2 + streams);
+    hc_normalized_.resize(un * streams * d);
+    hc_coefficients_.resize(un * width);
+    hc_post_.resize(un * streams);
+    hc_comb_.resize(un * streams * streams);
+    for (size_t t = 0; t < un; ++t) {
+        const float* input = hc_streams_.data() + t * streams * d;
+        const float scale = rms_scale(input, c.hc_count * c.n_embd, c.rms_eps);
+        for (size_t i = 0; i < streams * d; ++i) hc_normalized_[(t * streams * d) + i] = input[i] * scale;
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.cpu, projection, hc_normalized_.data(), hc_coefficients_.data(), n));
+    for (size_t t = 0; t < un; ++t) {
+        const float* coefficients = hc_coefficients_.data() + t * width;
+        float* post = hc_post_.data() + t * streams;
+        float* comb = hc_comb_.data() + t * streams * streams;
+        float* collapsed = x_.data() + t * d;
+        const float* input = hc_streams_.data() + t * streams * d;
+        std::fill_n(collapsed, d, 0.0f);
+        for (size_t h = 0; h < streams; ++h) {
+            const float pre = sigmoid(coefficients[h] * scales[0] + base[h]) + c.hc_eps;
+            post[h] = 2.0f * sigmoid(coefficients[streams + h] * scales[1] + base[streams + h]);
+            for (size_t j = 0; j < d; ++j) collapsed[j] += pre * input[h * d + j];
+            float maximum = -INFINITY;
+            for (size_t k = 0; k < streams; ++k) {
+                const size_t at = 2 * streams + h * streams + k;
+                comb[h * streams + k] = coefficients[at] * scales[2] + base[at];
+                maximum = std::max(maximum, comb[h * streams + k]);
+            }
+            float sum = 0.0f;
+            for (size_t k = 0; k < streams; ++k) {
+                float& value = comb[h * streams + k];
+                value = std::exp(value - maximum);
+                sum += value;
+            }
+            for (size_t k = 0; k < streams; ++k) comb[h * streams + k] = comb[h * streams + k] / sum + c.hc_eps;
+        }
+        // Softmax already normalized rows. Normalize columns first, then
+        // alternate rows/columns, always with the reference's epsilon.
+        for (int32_t iteration = 0; iteration < c.hc_iterations; ++iteration) {
+            if (iteration > 0) {
+                for (size_t h = 0; h < streams; ++h) {
+                    float sum = c.hc_eps;
+                    for (size_t k = 0; k < streams; ++k) sum += comb[h * streams + k];
+                    for (size_t k = 0; k < streams; ++k) comb[h * streams + k] /= sum;
+                }
+            }
+            for (size_t k = 0; k < streams; ++k) {
+                float sum = c.hc_eps;
+                for (size_t h = 0; h < streams; ++h) sum += comb[h * streams + k];
+                for (size_t h = 0; h < streams; ++h) comb[h * streams + k] /= sum;
+            }
+        }
+    }
+    return Status::ok();
+}
+
+void Transformer::hyper_add(int32_t n) {
+    const size_t streams = static_cast<size_t>(config_.hc_count), d = static_cast<size_t>(config_.n_embd);
+    hc_next_.resize(hc_streams_.size());
+    for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
+        for (size_t h = 0; h < streams; ++h) {
+            float* out = hc_next_.data() + (t * streams + h) * d;
+            const float post = hc_post_[t * streams + h];
+            for (size_t j = 0; j < d; ++j) {
+                float residual = 0.0f;
+                // comb is consumed transposed: input stream k -> output h.
+                for (size_t k = 0; k < streams; ++k) {
+                    residual += hc_comb_[(t * streams + k) * streams + h] * hc_streams_[(t * streams + k) * d + j];
+                }
+                out[j] = post * xb_[t * d + j] + residual;
+            }
+        }
+    }
+    hc_streams_.swap(hc_next_);
+}
+
+Status Transformer::hyper_head(int32_t n, const Route& route) {
+    const auto streams = static_cast<size_t>(config_.hc_count), d = static_cast<size_t>(config_.n_embd);
+    const auto un = static_cast<size_t>(n);
+    hc_normalized_.resize(un * streams * d);
+    hc_coefficients_.resize(un * streams);
+    for (size_t t = 0; t < un; ++t) {
+        const float* input = hc_streams_.data() + t * streams * d;
+        const float scale = rms_scale(input, config_.hc_count * config_.n_embd, config_.rms_eps);
+        for (size_t i = 0; i < streams * d; ++i) hc_normalized_[t * streams * d + i] = input[i] * scale;
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.cpu, *hc_head_, hc_normalized_.data(), hc_coefficients_.data(), n));
+    for (size_t t = 0; t < un; ++t) {
+        float* out = x_.data() + t * d;
+        std::fill_n(out, d, 0.0f);
+        for (size_t h = 0; h < streams; ++h) {
+            const float pre = sigmoid(hc_coefficients_[t * streams + h] * hc_head_scale_[0] + hc_head_base_[h]) + config_.hc_eps;
+            for (size_t j = 0; j < d; ++j) out[j] += pre * hc_streams_[(t * streams + h) * d + j];
+        }
+    }
+    return Status::ok();
+}
+
 void Transformer::size_batch(int32_t n) {
     const ModelConfig& c = config_;
     const size_t d = static_cast<size_t>(c.n_embd);
@@ -3602,6 +3994,18 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     const bool moe = plan.ffn == FfnKind::Moe;
     const Route cpu_route{route.cpu, route.cpu, route.cpu};
     const Route& block_route = w.streamed() ? cpu_route : route;
+    const bool hyper = c.hc_count > 0;
+    if (hyper) {
+        if (l == 0) {
+            hc_streams_.resize(un * static_cast<size_t>(c.hc_count) * d);
+            for (size_t t = 0; t < un; ++t) {
+                for (int32_t h = 0; h < c.hc_count; ++h) {
+                    std::copy_n(x_.data() + t * d, d, hc_streams_.data() + (t * static_cast<size_t>(c.hc_count) + static_cast<size_t>(h)) * d);
+                }
+            }
+        }
+        LIYAB_RETURN_IF_ERROR(hyper_collapse(w[kHcAttn], L.hc_attn_base, L.hc_attn_scale, n, block_route));
+    }
     // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
     auto post_norm = [&](const std::vector<float>& weight) {
         if (weight.empty()) return;
@@ -3623,6 +4027,9 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     if (plan.mixer == MixerKind::DeltaNet) {
         const PhaseTimer timer(phases_.delta_net);
         LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
+    } else if (c.spec->shared_kv) {
+        const PhaseTimer timer(phases_.attention);
+        LIYAB_RETURN_IF_ERROR(shared_kv_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
     } else if (plan.latent) {
         const PhaseTimer timer(phases_.attention);
         LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,
@@ -3633,7 +4040,12 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
             attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
     }
     post_norm(L.post_mixer_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    if (hyper) {
+        hyper_add(n);
+        LIYAB_RETURN_IF_ERROR(hyper_collapse(w[kHcFfn], L.hc_ffn_base, L.hc_ffn_scale, n, block_route));
+    } else {
+        for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    }
     // A MoE block predicts the next one once its own experts are queued (moe_ffn).
     if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
 
@@ -3641,7 +4053,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
         ++last_ffn_skips_;
         if (expert_store_ != nullptr && moe) predict_experts(l + 1, n, route);
-        return Status::ok();
+        return hyper && l + 1 == c.n_layers ? hyper_head(n, block_route) : Status::ok();
     }
     for (size_t t = 0; t < un; ++t) {
         rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
@@ -3653,7 +4065,12 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
     }
     post_norm(L.post_ffn_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    if (hyper) {
+        hyper_add(n);
+        if (l + 1 == c.n_layers) return hyper_head(n, block_route);
+    } else {
+        for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    }
     return Status::ok();
 }
 
@@ -3696,6 +4113,9 @@ Status Transformer::run_block_at(int32_t layer, std::span<const int32_t> positio
 }
 
 Status Transformer::reuse_support() const {
+    if (config_.spec->shared_kv || config_.hc_count > 0) {
+        return Status(ErrorCode::Unsupported, "segment relocation does not preserve compressed windows or residual streams");
+    }
     if (config_.index_heads > 0) {
         return Status(ErrorCode::Unsupported, "segment reuse with position-dependent sparse index keys is not supported");
     }
@@ -3892,7 +4312,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     }
     // Early exit would leave the skipped blocks' recurrent states behind: attention-only stacks.
     EarlyExitHook* early_exit =
-        hooks != nullptr && n == 1 && logits == Logits::Last && !c.hybrid() ? hooks->early_exit : nullptr;
+        hooks != nullptr && n == 1 && logits == Logits::Last && !c.hybrid() && c.hc_count == 0 ? hooks->early_exit : nullptr;
     const HeadMaskHook* head_mask = hooks != nullptr ? hooks->head_mask : nullptr;
     const std::atomic<bool>* cancel = hooks != nullptr ? hooks->cancel : nullptr;
     FfnSkipHook* ffn_skip = hooks != nullptr && n == 1 ? hooks->ffn_skip : nullptr;

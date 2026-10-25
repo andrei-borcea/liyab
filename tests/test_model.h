@@ -172,6 +172,15 @@ struct TinyModelSpec {
     int32_t index_heads = 2;
     int32_t index_topk = 4;
     std::vector<bool> index_full;  // empty: every indexed block has its own projections
+    // Shared K=V attention fixtures: the converter's grouped output layout,
+    // sliding-only (0), nonoverlapping and overlapping compressed blocks.
+    int32_t shared_output_groups = 2;
+    int32_t shared_output_rank = 32;
+    std::vector<int32_t> compression_strides;
+    std::vector<bool> compression_overlap;
+    int32_t hc_count = 0;
+    float rms_eps = 1e-5f;
+    float compress_rope_base = 12345.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
@@ -180,6 +189,10 @@ std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
+// Component fixture with sliding, CSA and HCA blocks plus four residual
+// streams. Dense FFNs and no learned sinks: it does not stand in for a full
+// V4 conformance checkpoint, whose MoE/sink parts are integrated separately.
+TinyModelSpec compressed_spec();
 
 }  // namespace liyab::test
 
