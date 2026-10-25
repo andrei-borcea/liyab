@@ -67,7 +67,7 @@ def main():
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     # newline="" keeps "\r\n" as written: liyab-kl encodes the file's exact bytes.
     with open(args.text, encoding="utf-8", newline="") as f:
@@ -84,7 +84,11 @@ def main():
     for field, value in json.loads(args.config or "{}").items():
         setattr(config, field, value)
     extra = {"attn_implementation": args.attn_implementation} if args.attn_implementation else {}
-    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
+    # Multimodal checkpoints can expose the same text-only logits through
+    # the image/text auto class. Use their registered implementation with
+    # text inputs only; no model-family names or weight remapping needed.
+    factory = AutoModelForCausalLM if type(config) in AutoModelForCausalLM._model_mapping else AutoModelForImageTextToText
+    model = factory.from_pretrained(args.model, revision=args.revision, config=config,
                                                  dtype=getattr(torch, args.dtype),
                                                  trust_remote_code=args.trust_remote_code, **extra)
     if args.lora:

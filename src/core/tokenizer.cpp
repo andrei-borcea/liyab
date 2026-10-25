@@ -93,7 +93,7 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     Tokenizer tok;
     const auto kind = model.get_string("tokenizer.ggml.model");
     if (!kind) return Status(ErrorCode::InvalidModel, "missing tokenizer.ggml.model");
-    if (*kind == "llama") tok.kind_ = Kind::Spm;
+    if (*kind == "llama" || *kind == "gemma4") tok.kind_ = Kind::Spm;
     else if (*kind == "gpt2") tok.kind_ = Kind::Gpt2;
     else return Status(ErrorCode::Unsupported, "tokenizer type '" + std::string(*kind) + "' is not supported");
 

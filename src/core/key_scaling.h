@@ -97,7 +97,9 @@ class KeyRanges {
 public:
     explicit KeyRanges(KeyScalingShape shape);
     // One token of attention block `block`, before RoPE: q [n_head * head_dim]
-    // and k [n_head_kv * head_dim]. `q_gain` / `k_gain` (head_dim each,
+    // and k [n_head_kv * head_dim]; either may be nullptr to leave that
+    // side's ranges unchanged (shared-KV blocks contribute queries only).
+    // `q_gain` / `k_gain` (head_dim each,
     // shared by every head; nullptr: none) multiply each channel after the
     // rotation: the weights of Q/K norms applied after RoPE, for which the
     // caller passes q and k already multiplied by their heads' RMS factors.

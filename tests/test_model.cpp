@@ -292,6 +292,19 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (s.add_eos >= 0) w.add_bool("tokenizer.ggml.add_eos_token", s.add_eos != 0);
     if (!s.cls_labels.empty()) w.add_string_array(a + ".classifier.output_labels", s.cls_labels);
     if (!s.rerank_template.empty()) w.add_string("tokenizer.chat_template.rerank", s.rerank_template);
+    if (s.altup_streams > 1) {
+        w.add_u32(a + ".altup.num_inputs", static_cast<uint32_t>(s.altup_streams));
+        w.add_u32(a + ".altup.active_idx", 0);
+    }
+    if (s.ple_dim > 0) w.add_u32(a + ".embedding_length_per_layer_input", static_cast<uint32_t>(s.ple_dim));
+    if (s.shared_kv_layers > 0) w.add_u32(a + ".attention.shared_kv_layers", static_cast<uint32_t>(s.shared_kv_layers));
+    if (!s.sparsity_scale.empty()) w.add_f32_array(a + ".activation_sparsity_scale", s.sparsity_scale);
+    if (s.causal >= 0) w.add_bool(a + ".attention.causal", s.causal != 0);
+    for (size_t i = 0; i < s.dense_widths.size(); ++i) {  // as the converter states them
+        const std::string dense = i == 0 ? "dense_2" : "dense_3";
+        w.add_u32(a + "." + dense + "_feat_in", static_cast<uint32_t>(i == 0 ? s.n_embd : s.dense_widths[i - 1]));
+        w.add_u32(a + "." + dense + "_feat_out", static_cast<uint32_t>(s.dense_widths[i]));
+    }
 
     std::mt19937_64 rng(s.seed);
     std::mt19937_64 router_rng(s.seed ^ 0x5eed);
@@ -414,9 +427,15 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 }
                 w.add_tensor(p + "attn_qkv.weight", {d, q_rows + 2 * kv}, s.attn_type, qkv);
             } else {
+                // KV sharing: the last shared_kv_layers blocks have queries only;
+                // values_from_keys: the global blocks have no attn_v.
+                const bool shared = l >= s.n_layers - s.shared_kv_layers;
+                const bool global = !s.swa_layers.empty() && !s.swa_layers[static_cast<size_t>(l)];
                 w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
-                w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
-                w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+                if (!shared) w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+                if (!shared && !(s.values_from_keys && global)) {
+                    w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
+                }
             }
             w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
             if (s.qk_norm) {
@@ -426,7 +445,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                     k_norm[static_cast<size_t>(hd / 2 - 1)] = s.k_norm_outlier;
                     k_norm[static_cast<size_t>(hd - 3)] = s.k_norm_outlier;
                 }
-                w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, k_norm);
+                if (l < s.n_layers - s.shared_kv_layers) w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, k_norm);
             }
         }
         if (a == "qwen2") {
@@ -503,6 +522,60 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ffn_down_shexp.weight", {sh, d}, s.ffn_type, random(sh * d, s.weight_scale));
             if (s.shared_gate) w.add_tensor(p + "ffn_gate_inp_shexp.weight", {d}, DType::F32, random(d, s.weight_scale));
         }
+    }
+    // Gemma 3n / 4 parts and dense pooling projections: a generator of
+    // their own, so the weights above stay those of the spec without them.
+    std::mt19937_64 extra_rng(s.seed ^ 0x3e3e);
+    std::normal_distribution<float> extra_normal(0.0f, 1.0f);
+    auto extra = [&](int64_t count, float scale, float offset = 0.0f) {
+        std::vector<float> v(static_cast<size_t>(count));
+        for (float& x : v) x = offset + extra_normal(extra_rng) * scale;
+        return v;
+    };
+    if (s.altup_streams > 1) {
+        const int64_t k = s.altup_streams;
+        w.add_tensor("altup_proj.weight", {d, d, k - 1}, DType::F32, extra(d * d * (k - 1), 0.09f));
+        w.add_tensor("altup_unembd_proj.weight", {d, d, k - 1}, DType::F32, extra(d * d * (k - 1), 0.09f));
+    }
+    if (s.ple_dim > 0) {
+        const int64_t width = int64_t{s.n_layers} * s.ple_dim;
+        w.add_tensor("per_layer_token_embd.weight", {width, n_vocab}, s.embd_type, extra(width * n_vocab, 0.5f));
+        w.add_tensor("per_layer_model_proj.weight", {d, width}, s.attn_type, extra(d * width, s.weight_scale));
+        w.add_tensor("per_layer_proj_norm.weight", {s.ple_dim}, DType::F32, extra(s.ple_dim, 0.05f, 1.0f));
+    }
+    for (int32_t l = 0; l < s.n_layers; ++l) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        if (s.altup_streams > 1) {
+            const int64_t k = s.altup_streams;
+            w.add_tensor(p + "altup_router.weight", {d, k}, DType::F32, extra(d * k, 1.0f));
+            w.add_tensor(p + "altup_router_norm.weight", {d}, DType::F32, extra(d, 0.05f, 1.0f));
+            w.add_tensor(p + "altup_predict_coef.weight", {k, k * k}, DType::F32, extra(k * k * k, 0.3f));
+            w.add_tensor(p + "altup_correct_coef.weight", {k, k}, DType::F32, extra(k * k, 0.3f));
+            if (s.altup_correct_scale) w.add_tensor(p + "altup_correct_scale.weight", {d}, DType::F32, extra(d, 0.2f, 1.0f));
+        }
+        if (s.laurel_rank > 0) {
+            const int64_t r = s.laurel_rank;
+            w.add_tensor(p + "laurel_l.weight", {d, r}, s.attn_type, extra(d * r, s.weight_scale));
+            w.add_tensor(p + "laurel_r.weight", {r, d}, s.attn_type, extra(r * d, s.weight_scale * 2.0f));
+            w.add_tensor(p + "laurel_post_norm.weight", {d}, DType::F32, extra(d, 0.05f, 1.0f));
+        }
+        if (s.ple_dim > 0) {
+            const int64_t pd = s.ple_dim;
+            w.add_tensor(p + "inp_gate.weight", {d, pd}, s.ffn_type, extra(d * pd, s.weight_scale));
+            w.add_tensor(p + "proj.weight", {pd, d}, s.ffn_type, extra(pd * d, s.weight_scale));
+            w.add_tensor(p + "post_norm.weight", {d}, DType::F32, extra(d, 0.05f, 1.0f));
+        }
+        if (s.layer_output_scale > 0.0f) {
+            w.add_tensor(p + "layer_output_scale.weight", {1}, DType::F32,
+                         {s.layer_output_scale * (1.0f + 0.25f * static_cast<float>(l % 3))});
+        }
+    }
+    int64_t in = d;
+    for (size_t i = 0; i < s.dense_widths.size(); ++i) {
+        const int64_t out = s.dense_widths[i];
+        w.add_tensor(i == 0 ? "dense_2.weight" : "dense_3.weight", {in, out}, DType::F32,
+                     extra(in * out, 1.0f / std::sqrt(static_cast<float>(in))));
+        in = out;
     }
     w.write(path);
 }

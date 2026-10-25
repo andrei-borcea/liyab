@@ -44,6 +44,13 @@ struct PoolingModel {
     std::vector<std::string> labels;  // <arch>.classifier.output_labels (may be empty)
     Status head_error;                // why there is no usable head (ok when the file simply has none)
     std::string rerank_template;      // tokenizer.chat_template.rerank (empty: none)
+    // Dense projections of the pooled vector, applied in order before the
+    // normalization (sentence-transformers' Dense modules, as the converter
+    // writes them: dense_2.weight then dense_3.weight, no bias, identity
+    // activation; EmbeddingGemma 768 -> 3072 -> 768). Empty: none.
+    // embedding_width is what the last one returns (n_embd without them).
+    std::vector<const TensorView*> dense;
+    int32_t embedding_width = 0;
 };
 
 // Whether `file` declares a pooling model (<arch>.pooling_type mean, cls,
@@ -85,7 +92,9 @@ struct PooledRun {
 // as far as the model can rewind (any position on attention-only models;
 // hybrid ones start over, their recurrent states cannot rewind to an
 // arbitrary point), and processes only the rest, in passes of at most
-// `chunk` tokens. Mean pooling needs every row of a sequence, so its
+// `chunk` tokens. A bidirectional model (ModelConfig::causal false) reads
+// each sequence whole in one pass and never shares: every row depends on
+// the tokens after it. Mean pooling needs every row of a sequence, so its
 // sequences never share. On the CPU backend a row's result does not depend
 // on the pass it is computed in, so sharing changes no bit. `hooks` (may be
 // nullptr) is passed to every pass (its cancel flag stops the run:
@@ -100,6 +109,12 @@ Result<PooledRun> run_pooled(Transformer& model, std::span<const std::vector<int
 // the result. A zero vector stays zero.
 std::vector<std::vector<float>> finish_embeddings(std::span<const float> values, size_t size, int32_t dimensions,
                                                   bool normalize);
+
+// The model's dense projections (PoolingModel::dense) applied to pooled
+// vectors (`pooled`: n_embd floats each), on `cpu`: embedding_width floats
+// per vector. Without projections, `pooled` as it is.
+Result<std::vector<float>> project_pooled(const PoolingModel& model, Backend& cpu, std::span<const float> pooled,
+                                          int32_t n_embd);
 
 // Scores of pooled last-token states (`hidden`, n_embd floats each) under the
 // model's ranking head, computed on `cpu` (whatever layout the head has):

@@ -18,6 +18,7 @@
 // note, so a new CPU target never fails before its hashes are recorded.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -255,6 +256,48 @@ std::vector<GoldenCase> cases() {
     s.longrope_ctx = 32;  // shorter: the long factors
     s.rope_dim = 16;      // partial rotation (Phi-4-mini)
     add("phi3-longrope-partial", s);
+
+    s = {};
+    s.arch = "gemma3n";
+    s.n_layers = 4;
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false, true, false};
+    s.altup_streams = 4;
+    s.laurel_rank = 32;
+    s.ple_dim = 32;
+    s.shared_kv_layers = 2;
+    s.sparsity_scale = {1.6448536f, 1.6448536f, -INFINITY, -INFINITY};
+    add("gemma3n-altup-laurel-ple-shared-sparse", s, f16_kv);
+    add("gemma3n-q8kv", s);
+    s.k_norm_outlier = 60.0f;
+    add("gemma3n-shared-keyscaled", s, {}, true);
+    s.altup_correct_scale = false;
+    add("gemma3n-unscaled-correction", s, f16_kv);
+
+    s = {};
+    s.arch = "gemma4";
+    s.n_layers = 4;
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false, true, false};
+    s.ple_dim = 32;
+    s.shared_kv_layers = 2;
+    s.values_from_keys = true;
+    s.layer_output_scale = 0.8f;
+    add("gemma4-ple-shared-k-equals-v-scale", s, f16_kv);
+    s.ple_dim = 0;
+    add("gemma4-no-ple", s);
+
+    s = {};
+    s.arch = "gemma-embedding";
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false};
+    add("embeddinggemma-bidirectional", s, f16_kv);
     return out;
 }
 
@@ -317,6 +360,7 @@ bool run_case(const GoldenCase& c, uint64_t& hash) {
         return false;
     }
     hash_floats(hash, *prefill);
+    if (!model->config().causal) return true;  // a bidirectional input is one complete pass
     for (size_t t = 20; t < tokens.size(); ++t) {
         auto step = model->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
         if (!step) {
@@ -388,6 +432,90 @@ TEST_CASE("Every architecture's logits match the hashes pinned for this platform
                         it->second.c_str());
             CHECK(false);
         }
+    }
+}
+
+TEST_CASE("AltUp and shared KV agree across prefill, decode, rollback, tree drafts and parked sequences") {
+    for (const auto type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4_0}) {
+        test::TinyModelSpec s;
+        s.arch = "gemma3n";
+        s.n_layers = 4;
+        s.qk_norm = s.post_norms = true;
+        s.altup_streams = 4;
+        s.laurel_rank = 32;
+        s.ple_dim = 32;
+        s.shared_kv_layers = 2;
+        s.sparsity_scale = {1.6448536f, -INFINITY, 0.0f, -INFINITY};
+        s.swa_layers = {true, false, true, false};
+        s.sliding_window = 8;
+        s.attn_type = s.ffn_type = s.embd_type = s.output_type = type;
+        const std::string path = test::temp_dir() + "/liyab_gemma_parts_" + std::to_string(test::process_id()) + ".gguf";
+        test::write_tiny_model(path, s);
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            auto file = MmapLoader::open(path);
+            REQUIRE(file.has_value());
+            TransformerOptions options;
+            options.context_length = 64;
+            options.kv_type = kv;
+            options.keep_windowed_rows = true;
+            auto loaded = Transformer::load(std::move(file).value(), options);
+            REQUIRE(loaded.has_value());
+            auto& model = **loaded;
+            CHECK(model.config().n_kv_layers == 2);
+            CHECK(model.kv_cache().config().n_layers == 2);
+            ThreadPool pool(2);
+            auto cpu = make_cpu_backend(pool);
+            Route route{cpu.get(), cpu.get(), cpu.get()};
+            const std::vector<int32_t> tokens = {1, 7, 11, 23, 14, 18, 19, 40, 55, 12, 17, 33};
+            auto all = model.forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(all.has_value());
+            const std::vector<float> expected(all->begin(), all->end());
+            const size_t v = static_cast<size_t>(model.config().n_vocab);
+            model.reset();
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                auto row = model.forward(std::span(tokens).subspan(i, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(row.has_value());
+                CHECK(std::equal(row->begin(), row->end(), expected.begin() + i * v));
+            }
+            REQUIRE(model.truncate(7).is_ok());
+            auto again = model.forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+            REQUIRE(again.has_value());
+            CHECK(std::equal(again->begin(), again->end(), expected.begin() + 7 * v));
+            std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(model.write_state(saved).is_ok());
+            model.reset();
+            saved.seekg(0);
+            REQUIRE(model.read_state(saved).is_ok());
+            REQUIRE(model.truncate(7).is_ok());
+            auto parked = model.make_context();
+            REQUIRE(parked.has_value());
+            model.swap_context(**parked);
+            auto separate = model.forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(separate.has_value());
+            CHECK(std::equal(separate->begin(), separate->end(), expected.begin()));
+            model.swap_context(**parked);
+            const std::vector<int32_t> draft = {tokens[7], 88, tokens[8], tokens[9]};
+            const std::vector<int32_t> parents = {-1, 0, 0, 2};
+            auto tree = model.forward_tree(draft, parents, route, pool);
+            REQUIRE(tree.has_value());
+            const std::vector<int32_t> keep = {0, 2, 3};
+            REQUIRE(model.keep_path(keep).is_ok());
+            auto rest = model.forward(std::span(tokens).subspan(10), Transformer::Logits::All, route, pool);
+            REQUIRE(rest.has_value());
+            CHECK(std::equal(rest->begin(), rest->end(), expected.begin() + 10 * v));
+            model.reset();
+            auto other = model.make_context();
+            REQUIRE(other.has_value());
+            const Transformer::BatchItem items[] = {
+                {nullptr, tokens, Transformer::Logits::All, false},
+                {other->get(), tokens, Transformer::Logits::All, false},
+            };
+            std::vector<std::span<const float>> rows;
+            REQUIRE(model.forward_batch(items, route, pool, rows).is_ok());
+            REQUIRE(rows.size() == 2);
+            for (auto row : rows) CHECK(std::equal(row.begin(), row.end(), expected.begin()));
+        }
+        std::remove(path.c_str());
     }
 }
 

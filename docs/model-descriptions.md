@@ -223,6 +223,39 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 
 ## Limits
 
+### Gemma residual and embedding parts
+
+`gemma3n` plans AltUp from `altup_proj` and its stream-count/active-index metadata, Laurel from each block's
+`laurel_l`, per-layer token inputs from `embedding_length_per_layer_input` and `per_layer_token_embd`, and gate
+sparsity from the converter's per-block Gaussian standard-deviation multipliers. `attention.shared_kv_layers`
+maps each final block to the last non-sharing block with the same window kind. Only source blocks allocate KV
+slots; sharing blocks contribute their query ranges to those slots during quantized-cache calibration.
+Per-layer tables remain in the file mapping; each pass materializes only its token rows and projected inputs.
+
+`gemma4` also plans absent value projections as values from the key projection, before normalization and RoPE,
+and binds optional `layer_output_scale`. Different local/global head geometry and different per-block FFN widths
+are explicitly rejected pending their generic implementation; the row does not assert support for such files.
+
+`gemma-embedding` uses bidirectional attention. Pooling runs an entire input in one pass and shares no prefix
+because every hidden state depends on later tokens. Windowed blocks see half the stored window on each side.
+Incremental continuation, causal tree drafts and rolling caches are refused; calibration of quantized keys reads
+the complete calibration input in one pass too.
+The pooling layer validates and applies optional `dense_2.weight` and `dense_3.weight` in order before truncation
+and normalization; `Engine::embedding_size()` reports the projected width. Biases on these dense layers are
+explicitly refused. No real-model conformance claim is made until a measured run is recorded.
+
+The description tool establishes direction from the traced attention contract, unscaled scores from the actual
+attention scale, and value normalization by matching projected values with and without unweighted RMS norm.
+The trace reconstructs AltUp predictions from the coefficient projections, checks the corrected stream outputs
+and per-layer residual additions, identifies Laurel in the mixer residual, and matches shared KV to an earlier
+attention call. A topology it cannot establish is reported as unknown and no row is proposed.
+
+The four-block Gemma 3n tiny check exercises all these paths: 512 identical token IDs, mean KL 0.00000,
+maximum KL 0.00001 and top-1 agreement 99.41% with F32 weights/F16 KV. EmbeddingGemma's BF16 conversion matches
+all 39 pooling-case tokenizations on CPU and Metal (minimum cosine 0.99992651 against float32); the independent
+reference matches sentence-transformers at minimum cosine 0.9999998. Full Gemma 3n real-model validation and
+Gemma 4's heterogeneous geometry remain pending; the latter belongs to the generic per-block geometry work.
+
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
   leaves the attention facts unknown.

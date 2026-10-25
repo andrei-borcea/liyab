@@ -161,6 +161,20 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+
+    // Gemma 3n / Gemma 4 / EmbeddingGemma parts, off by default; their
+    // tensors are drawn from a generator of their own after the others.
+    int32_t altup_streams = 0;     // > 1: AltUp (altup.*, altup_proj, altup_unembd_proj, per-block router and coefficients)
+    bool altup_correct_scale = true;  // AltUp: altup_correct_scale per block
+    int32_t laurel_rank = 0;       // > 0: Laurel (laurel_l, laurel_r, laurel_post_norm) in every block
+    int32_t ple_dim = 0;           // > 0: per-layer embeddings of this width per block
+    // > 0: attention.shared_kv_layers; those last blocks get no attn_k, attn_v or attn_k_norm.
+    int32_t shared_kv_layers = 0;
+    std::vector<float> sparsity_scale;  // non-empty: activation_sparsity_scale (one per block, -inf: none)
+    bool values_from_keys = false;  // the global (non-windowed) blocks have no attn_v
+    float layer_output_scale = 0.0f;  // > 0: layer_output_scale.weight in every block (varied per block)
+    int32_t causal = -1;            // >= 0: attention.causal
+    std::vector<int32_t> dense_widths;  // pooling: dense_2 (and dense_3) projections of these output widths
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

@@ -140,6 +140,18 @@ These rules decide what goes into the code:
 
 ## Quick start
 
+The model planner also recognizes Gemma 3n's AltUp residual streams, Laurel low-rank branches, per-layer token
+embeddings, Gaussian gate sparsity and shared keys/values. These compose with Gemma's existing GeGLU and sandwich
+norms. Gemma 4 adds optional key-as-value projections and block output scales; files with different local/global
+head geometry or different FFN widths are currently refused with an explicit reason. These new registry rows are
+under conformance validation; their presence alone is not a real-model support claim.
+The per-layer table stays memory-mapped and is read by token row; scratch holds only the current batch's per-layer
+inputs and residual streams. Dense projections use the existing CPU/Metal/Vulkan routing and CPU fallback; the
+small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional attention over each complete
+input, mean pooling, the GGUF's `dense_2`/`dense_3` projections, then optional truncation and L2 normalization.
+Bidirectional models reject incremental continuation, tree drafts and rolling caches; quantized-key calibration
+also reads its complete text in one pass. Shared key-as-value projections include their projection bias.
+
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
 iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,
 Android SDK platform 36, JDK 17.
@@ -1167,6 +1179,14 @@ step, and speed-ups over plain decoding of 2.02× / 2.10×, 1.17× / 1.11×, 1.4
 ---
 
 ## Embeddings and reranking
+
+EmbeddingGemma (`gemma-embedding`, 300M) adds bidirectional attention and mean pooling with the model's two
+bias-free dense projections (768 → 3072 → 768). On the CPU, a BF16 conversion of `unsloth/embeddinggemma-300m`
+matched all tokenizer IDs in the 39 pooling cases and reached cosine ≥ 0.99992651 against the float32 reference;
+all 39 vectors were bit-identical alone and in the batch. The independent reference agreed with
+sentence-transformers at cosine ≥ 0.9999998. Include the model card's task prefix in the input text.
+`tools/pooling_reference.py` reads mean-pooling and identity Dense modules from `modules.json`;
+`tools/tiny_checkpoint.py --base-model` saves embedding transformers without adding an LM head.
 
 Local memory and retrieval need two more kinds of model next to the generative one: an embedding model, which turns
 a text into a vector so similar texts lie close together, and a reranker, which scores how well a document answers a

@@ -38,6 +38,7 @@ Needs torch and transformers (pip install torch transformers).
 
 import argparse
 import json
+from pathlib import Path
 
 # Qwen3-Reranker's model card: the prompt around each formatted pair.
 RERANK_PREFIX = ("<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the "
@@ -47,6 +48,34 @@ RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that 
 MAX_LENGTH = 8192  # the cards' max_length
 
 
+def embedding_modules(model_id):
+    """Read the declared pooling and identity Dense modules, independently of the engine."""
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    def path(name):
+        return str(Path(model_id) / name) if Path(model_id).is_dir() else hf_hub_download(model_id, name)
+
+    try:
+        modules = json.loads(Path(path("modules.json")).read_text())
+    except (OSError, ValueError):
+        return False, []
+    mean, dense = False, []
+    for module in modules:
+        kind = module["type"].rsplit(".", 1)[-1]
+        prefix = module["path"]
+        if kind == "Pooling":
+            config = json.loads(Path(path(f"{prefix}/config.json")).read_text())
+            mean = config.get("pooling_mode_mean_tokens", False)
+        elif kind == "Dense":
+            config = json.loads(Path(path(f"{prefix}/config.json")).read_text())
+            if config.get("bias", False) or not config.get("activation_function", "").endswith(".Identity"):
+                raise ValueError("reference supports only bias-free identity Dense modules")
+            dense.append(load_file(path(f"{prefix}/model.safetensors"))["linear.weight"].to(torch.float32))
+    return mean, dense
+
+
 def embeddings(model_id, texts, dtype, check_batched, sentence_transformers):
     import torch
     import torch.nn.functional as F
@@ -54,20 +83,33 @@ def embeddings(model_id, texts, dtype, check_batched, sentence_transformers):
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
     model = AutoModel.from_pretrained(model_id, dtype=getattr(torch, dtype)).eval()
+    mean_pooling, dense = embedding_modules(model_id)
+
+    def project(vector):
+        for weight in dense:
+            vector = F.linear(vector, weight)
+        return vector
     out = {"embedding_model": model_id, "embed_ids": [], "embed": [], "embed_mean": [], "embed_last_raw": []}
     with torch.no_grad():
         for text in texts:
             batch = tokenizer([text], truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
             hidden = model(**batch).last_hidden_state[0].float()  # [tokens, n_embd]
             out["embed_ids"].append(batch["input_ids"][0].tolist())
-            last = hidden[-1]
+            last = project(hidden[-1])
+            mean = project(hidden.mean(dim=0))
             out["embed_last_raw"].append(last.tolist())
-            out["embed"].append(F.normalize(last, p=2, dim=0).tolist())
-            out["embed_mean"].append(F.normalize(hidden.mean(dim=0), p=2, dim=0).tolist())
+            out["embed"].append(F.normalize(mean if mean_pooling else last, p=2, dim=0).tolist())
+            out["embed_mean"].append(F.normalize(mean, p=2, dim=0).tolist())
         if check_batched:
             # The card's own form: one left-padded batch, last position pooled.
             batch = tokenizer(texts, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
-            batched = F.normalize(model(**batch).last_hidden_state[:, -1].float(), p=2, dim=1)
+            hidden = model(**batch).last_hidden_state.float()
+            if mean_pooling:
+                mask = batch["attention_mask"].unsqueeze(-1)
+                hidden = (hidden * mask).sum(1) / mask.sum(1)
+            else:
+                hidden = hidden[:, -1]
+            batched = F.normalize(project(hidden), p=2, dim=1)
             single = torch.tensor(out["embed"])
             cos = (batched * single).sum(dim=1)
             print(f"batched (left padding) vs one at a time: min cosine {cos.min().item():.7f}")
