@@ -112,8 +112,7 @@ constexpr ArchSpec kArchitectures[] = {
      .rope = RopeLayout::Adjacent,
      .ffn_norm = "ffn_norm",
      .moe_norm_weights = true,
-     .attention_rope = false,
-     .chat_sort_tools = true},
+     .attention_rope = false},
 };
 
 }  // namespace

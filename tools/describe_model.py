@@ -387,6 +387,8 @@ class Engine:
         for names in re.findall(r'\{\{("[^"]+"(?:\s*,\s*"[^"]+")*)\}', table.group(1) if table else ""):
             self.pre_tokenizers += re.findall(r'"([^"]+)"', names)
         self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', read("src/core/tokenizer.cpp"))
+        sorting = re.search(r'kChatSortToolsTokenizers\[\]\s*=\s*\{(.*?)\}', read("src/core/tokenizer.cpp"), re.S)
+        self.chat_sort_tools_tokenizers = re.findall(r'"([^"]+)"', sorting.group(1)) if sorting else []
 
     @staticmethod
     def _entries(text):
@@ -481,7 +483,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa",
-                  "output_norm", "ssm_grouped_heads", "attention_rope", "chat_sort_tools")
+                  "output_norm", "ssm_grouped_heads", "attention_rope")
 
 
 def _close(a, b, rel=1e-5):
@@ -1396,9 +1398,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         from transformers import AutoTokenizer
         from chat_template_reference import tool_sorting
         tokenizer = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
-        d.set("chat_sort_tools", tool_sorting(tokenizer),
-              "tokenizer.apply_chat_template compared with base rendering of original and recursively sorted tool keys")
-        row["chat_sort_tools"] = d.fields["chat_sort_tools"][0]
+        sorts_tools = tool_sorting(tokenizer)
+        expected = kind == "gpt2" and pre in engine.chat_sort_tools_tokenizers
+        if sorts_tools != expected:
+            d.missing.append(f"tokenizer '{pre}' tool-key sorting: reference {sorts_tools}, engine {expected}")
+        else:
+            d.notes.append("tokenizer.apply_chat_template tool-key preprocessing matches the tokenizer family: "
+                           + ("recursive sorting" if sorts_tools else "insertion order"))
     except Exception as e:
         d.unknown.append(f"chat tool-key preprocessing could not be established: {type(e).__name__}: {e}")
     complete = all(n in row for n, _, _ in engine.fields)

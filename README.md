@@ -2821,9 +2821,16 @@ its case-aware words. `chat_template_reference.py --trust-remote-code` loads off
 LFM2 uses `token_embd_norm` after the last block. See the measured scope and tool limitations in
 [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts).
 
-Kimi's tokenizer sorts nested tool-object keys before chat rendering. `ArchSpec::chat_sort_tools` records this
-behavior; only the tools value is ordered, and the original template and other request values keep their order.
+Kimi's tokenizer sorts nested tool-object keys before chat rendering. `Tokenizer::chat_sort_tools()` selects this
+behavior from `tokenizer.ggml.pre`, including Kimi K2 and Kimi-Linear independently of their architecture;
+only the tools value is ordered, and the original template and other request values keep their order.
 The reference-template tool probes this preprocessing separately from the Jinja renderer.
+
+Fresh tiny F32 LFM2, LFM2-MoE, Qwen3-Next and Kimi-Linear checkpoints each measure mean KL 0.00000 and top-1
+100% against transformers. Real LFM2-350M, 700M and 1.2B BF16 files pass the description gate with matching
+tokenizer IDs, mean KL 0.00000 and top-1 100%, 99.80% and 99.80%, respectively. Their chat templates match
+transformers; [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts) records the scope,
+perplexities and converter compatibility details.
 
 The recurrent regression cases exercise all four KV types, independent sequences, draft rollback, alternative
 tree branches, bounded prefix images restored by another engine, and CPU/GPU projection routing. A KDA check

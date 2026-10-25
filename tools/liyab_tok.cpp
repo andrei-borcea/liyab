@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "the model has no %s\n", tok ? "chat template" : "tokenizer");
             return 2;
         }
-        auto tmpl = liyab::ChatTemplate::parse(*source);
+        auto tmpl = liyab::ChatTemplate::parse(*source, tok->chat_sort_tools());
         if (!tmpl) {
             std::fprintf(stderr, "%s\n", tmpl.status().message().c_str());
             return 1;

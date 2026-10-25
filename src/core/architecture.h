@@ -106,10 +106,6 @@ struct ArchSpec {
     // rotation (Kimi-Linear's latent attention leaves its RoPE channels
     // unrotated). The unrotated channels still participate in attention.
     bool attention_rope = true;
-    // The reference tokenizer recursively sorts tool-object keys before
-    // rendering its chat template (Kimi). Other request values keep their
-    // insertion order; this changes neither tokenization nor the template.
-    bool chat_sort_tools = false;
 };
 
 // Every architecture Liyab runs, in registry order.

@@ -259,12 +259,25 @@ It refuses a row if it cannot establish a fact: latent-attention decomposition a
 not yet numerically described by this tool. DeltaNet's converter head order is checked against the output projection's columns. Engine
 conformance is measured separately; a registry entry alone is not a conformance result.
 
-Inherited tiny F32 checkpoints measured on the 512-token conformance text: LFM2, LFM2-MoE and Qwen3-Next each
-have identical tokenizer IDs, mean KL 0.00000 and top-1 100.00%. Kimi's full hybrid tiny model also has mean KL 0.00000 and top-1 100.00% on 503 reference token IDs. Its tokenizer is checked separately.
+Fresh tiny F32 checkpoints regenerated from pinned public revisions measure mean KL 0.00000 and top-1 100.00%:
+LFM2, LFM2-MoE and Qwen3-Next each run 512 identical reference token IDs; Kimi's full hybrid model runs 503.
+The three tokenizer texts match at 535 / 937 / 198 IDs for LFM2 and LFM2-MoE, 524 / 804 / 179 for Qwen3-Next,
+and 503 / 798 / 201 for Kimi. Kimi also matches 172 IDs on an additional rare-Han edge text.
 
 The real LiquidAI/LFM2-350M checkpoint, converted with b11819 to BF16, passes the description gate: exactly the
 registered row, identical IDs on all three texts (535 / 937 / 198), mean KL 0.00000 and top-1 100.00% on 512 tokens.
-Its chat template matches transformers on fourteen conversations. LFM2-700M BF16 also passes: the same three tokenizer counts, mean KL 0.00000, top-1 99.80%, perplexity 28.968 → 28.970. All three LFM2 sizes ship the same chat template (SHA-1 283ce60a51b5e134bf6abcea2b1d71c13244a45a). The 1.2B gate is recorded separately.
+Its perplexity is 36.473 → 36.471 (reference → engine). LFM2-700M BF16 also passes: the same three tokenizer
+counts, mean KL 0.00000, top-1 99.80%, perplexity 28.968 → 28.970. LFM2-1.2B BF16 passes the same gate with
+mean KL 0.00000, top-1 99.80%, perplexity 28.375 → 28.379. All three gates propose exactly the registered row.
+Their identical chat template (SHA-1 283ce60a51b5e134bf6abcea2b1d71c13244a45a) matches transformers on fourteen
+conversations, as do the LFM2-MoE, Qwen3-Next and Kimi templates.
+
+Qwen3-Next conversion uses b11819's `--no-mtp`. For Kimi with transformers 5.19, the tiny checkpoint preparation
+renames the leading dense FFN's `.block_sparse_moe.{gate,up,down}_proj` keys to the official `.mlp.*` names,
+without changing values. A local Python-only b11819 converter copy memoizes transformers' pure 256-byte
+`bytes_to_unicode()` map: the unmodified converter exceeded 900 seconds repeatedly rebuilding that map.
+The cached conversion preserves its tensor and vocabulary algorithms; the resulting F32 hybrid passes the
+independent reference comparison above. Kimi uses the official tokenizer implementation for reference checks.
 
 ShortConv state is `embedding_length * (l_cache - 1)` floats per convolution block. KDA state is
 `3 * heads * head_dim * (conv_kernel - 1) + heads * head_dim * head_dim` floats per KDA block. Rollback rings and
@@ -276,9 +289,11 @@ keeps decoding arithmetic (including rollback and tree paths) bit-identical acro
 recurrent scan, not an algebraically reassociated parallel scan. Decode holds one fixed-size matrix per head; its
 work and state do not grow with context length. All reduction kernels have NEON, AVX2/FMA and scalar paths.
 
-`chat_sort_tools` records tokenizer-side recursive ordering of tool-object keys (Kimi). Both description and chat
+`Tokenizer::chat_sort_tools()` records tokenizer-side recursive ordering of tool-object keys, selected by the
+`kimi-k2` tokenizer family for both Kimi K2 and Kimi-Linear rather than by architecture. Both description and chat
 fixture tools probe `apply_chat_template` against the base renderer with unsorted and sorted tools, refusing
-unrecognized preprocessing. The engine passes this fact when loading the model's unmodified template.
+unrecognized preprocessing. The description tool checks this behavior against the engine's tokenizer-family
+table. The engine and tokenizer CLI pass this fact when loading the model's unmodified template.
 
 The synthetic KDA row-partition test runs the same prefill, rollback, branched verification and retained path
 with one and eight workers, requiring identical logits. The prefix-image tests use prompts above the store's

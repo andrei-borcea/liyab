@@ -2200,7 +2200,7 @@ struct Engine::Impl {
         special("eos_token", id_of("tokenizer.ggml.eos_token_id"));
         special("unk_token", id_of("tokenizer.ggml.unknown_token_id"));
         special("pad_token", id_of("tokenizer.ggml.padding_token_id"));
-        auto parsed = ChatTemplate::parse(*source, target->config().spec->chat_sort_tools);
+        auto parsed = ChatTemplate::parse(*source, tokenizer->chat_sort_tools());
         if (!parsed) {
             chat_template_error = parsed.status();
             LIYAB_LOG_WARN("%s", parsed.status().message().c_str());

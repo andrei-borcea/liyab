@@ -494,6 +494,25 @@ TEST_CASE("Byte-level BPE: merges by rank, NFC per family, ignore_merges, specia
     }
 }
 
+TEST_CASE("Chat tool preprocessing follows the tokenizer family across architectures") {
+    const BpeVocab v = bpe_vocab(false);
+    const char* request = R"({"messages":[],"tools":[{"z":{"y":1,"a":2},"a":3}],"extra":{"z":1,"a":2}})";
+    for (const char* arch : {"kimi-linear", "deepseek2", "qwen2"}) {
+        for (const char* pre : {"kimi-k2", "qwen2"}) {
+            BpeTokenizer t(std::string("chat_sort_") + arch + pre, v, pre, arch);
+            REQUIRE(t.tok.has_value());
+            const bool sorted = std::string_view(pre) == "kimi-k2";
+            CHECK(t.tok->chat_sort_tools() == sorted);
+            auto chat = ChatTemplate::parse("{{ tools | tojson }}|{{ extra | tojson }}", t.tok->chat_sort_tools());
+            REQUIRE(chat.has_value());
+            auto text = chat->render_chat(request, jinja::Value::object());
+            REQUIRE(text.has_value());
+            CHECK(*text == (sorted ? R"([{"a": 3, "z": {"a": 2, "y": 1}}]|{"z": 1, "a": 2})"
+                                   : R"([{"z": {"y": 1, "a": 2}, "a": 3}]|{"z": 1, "a": 2})"));
+        }
+    }
+}
+
 TEST_CASE("Byte-level BPE: a byte the vocabulary lacks is left out before merging") {
     const BpeVocab v = bpe_vocab(true);  // no "\r"
     BpeTokenizer t("no_cr", v, "qwen2");

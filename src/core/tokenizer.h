@@ -64,6 +64,10 @@ public:
     [[nodiscard]] int32_t bos() const noexcept { return bos_; }
     [[nodiscard]] int32_t eos() const noexcept { return eos_; }
     [[nodiscard]] bool add_bos_default() const noexcept { return add_bos_; }
+    // The tokenizer family recursively sorts tool-object keys before chat
+    // rendering. Other request values retain insertion order. This belongs
+    // to the tokenizer, independently of the model's architecture or template.
+    [[nodiscard]] bool chat_sort_tools() const noexcept { return chat_sort_tools_; }
     [[nodiscard]] bool is_end_of_generation(int32_t id) const;
 
 private:
@@ -104,6 +108,7 @@ private:
     int32_t unk_ = -1;
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
+    bool chat_sort_tools_ = false;
 };
 
 }  // namespace liyab

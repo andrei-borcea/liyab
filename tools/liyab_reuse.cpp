@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
     ReusePromptStyle style;
     if (!plain) {
         if (const auto source = model->file().get_string("tokenizer.chat_template")) {
-            if (auto parsed = ChatTemplate::parse(*source)) {
+            if (auto parsed = ChatTemplate::parse(*source, tokenizer->chat_sort_tools())) {
                 chat.emplace(std::move(parsed).value());
                 style.chat = &*chat;
                 auto special = [&](const char* name, const char* key) {
