@@ -248,6 +248,12 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     }
 
     // End-of-generation set: EOS/EOT ids plus well-known chat terminators.
+    // A declared return token marks a channelized turn: <|end|> closes one
+    // message (e.g. analysis), while <|return|> completes the assistant turn.
+    // <|call|> hands control to a tool. Detect the protocol from vocabulary
+    // and EOS metadata, so other formats that finish at <|end|> keep doing so.
+    const bool channel_turn = tok.eos_ >= 0 && tok.types_[static_cast<size_t>(tok.eos_)] == kControl &&
+                              tok.texts_[static_cast<size_t>(tok.eos_)] == "<|return|>";
     auto add_eog = [&](int32_t id) {
         if (id >= 0 && std::find(tok.end_of_generation_.begin(), tok.end_of_generation_.end(), id) ==
                            tok.end_of_generation_.end()) {
@@ -258,8 +264,13 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     add_eog(token_id(model, "tokenizer.ggml.eot_token_id", vocab).value_or(-1));
     add_eog(token_id(model, "tokenizer.ggml.eom_token_id", vocab).value_or(-1));
     for (const char* text : {"<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>"}) {
+        if (channel_turn && std::string_view(text) == "<|end|>") continue;
         const auto it = tok.lookup_.find(text);
         if (it != tok.lookup_.end() && tok.types_[static_cast<size_t>(it->second)] == kControl) add_eog(it->second);
+    }
+    if (channel_turn) {
+        const auto call = tok.lookup_.find("<|call|>");
+        if (call != tok.lookup_.end() && tok.types_[static_cast<size_t>(call->second)] == kControl) add_eog(call->second);
     }
     return tok;
 }

@@ -353,3 +353,13 @@ Mixtral-8x7B-Instruct-v0.1's author template has a dedicated fourteen-case fixtu
 `eba92302a2861cdc0098cc54bc9f17cb2c47eb61` with `tools/chat_template_reference.py`. Thirteen conversations match
 transformers byte for byte, including the optional system message and BOS/INST/EOS framing; the tool-result
 conversation is refused for its nonalternating roles. Native, AVX2 and scalar text suites check the same fixture.
+
+Generation stops also follow the file's chat protocol. When a control token `<|return|>` is declared EOS,
+`<|end|>` ends a message within that turn, and must allow the next channel to run; `<|call|>` hands off to a tool.
+The tokenizer identifies this from vocabulary and EOS metadata rather than an architecture name; explicit
+EOS/EOT/EOM overrides remain authoritative. A synthetic
+vocabulary checks both channelized and ordinary stops, token encoding, and tool handoff. The earlier GPT-OSS
+smokes stopped after coherent analysis because the generic `<|end|>` fallback was premature. Corrected resident
+F16 and block-streamed Q8_0 runs now complete the final answer in 32 generated tokens. A token trace passes
+through `<|end|>` into the final channel and stops at `<|return|>`; the export’s complete stop set equals the
+author’s generation_config.json: return, end-of-text and tool handoff.

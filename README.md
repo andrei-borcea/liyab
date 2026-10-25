@@ -2875,3 +2875,8 @@ Mixtral's own chat template is checked against fourteen transformers reference c
 byte, and a tool-result conversation is refused because the template requires alternating user/assistant turns.
 The fixture covers its optional initial system message, BOS, `[INST]` framing and assistant EOS on native,
 x86 AVX2 and x86 scalar builds.
+
+Channelized chat vocabularies that declare `<|return|>` as EOS disable the generic `<|end|>` stop fallback,
+so reasoning can continue into a final message. `<|return|>` completes the turn and `<|call|>` stops
+for a tool handoff. This is selected from token vocabulary and EOS metadata; formats whose EOS is `<|end|>`
+retain their existing stop behavior. Explicit EOS/EOT/EOM metadata remains authoritative.

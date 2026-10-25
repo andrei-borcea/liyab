@@ -891,3 +891,38 @@ TEST_CASE("Unicode ranked BPE replaces spaces, merges by rank and falls back aft
     CHECK(t.encode("é") == std::vector<int32_t>({v.id("é")}));
     CHECK(t.tok->piece(v.id("é")) == "é");
 }
+
+TEST_CASE("Channelized turns continue after a message and stop on return or tool handoff") {
+    for (const bool channel_turn : {false, true}) {
+        for (const bool explicit_message_stop : {false, true}) {
+            auto v = bpe_vocab(false);
+            for (const char* token : {"<|end|>", "<|return|>", "<|call|>"}) {
+                v.tokens.emplace_back(token);
+                v.types.push_back(3);
+            }
+            const std::string path = test::temp_dir() + "/liyab_channel_stops_" + std::to_string(channel_turn) + std::to_string(explicit_message_stop) + ".gguf";
+            test::GgufWriter w;
+            w.add_string("tokenizer.ggml.model", "gpt2");
+            w.add_string("tokenizer.ggml.pre", "default");
+            w.add_string_array("tokenizer.ggml.tokens", v.tokens);
+            w.add_i32_array("tokenizer.ggml.token_type", v.types);
+            w.add_string_array("tokenizer.ggml.merges", v.merges);
+            w.add_u32("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(v.id(channel_turn ? "<|return|>" : "<|end|>")));
+            if (explicit_message_stop) w.add_u32("tokenizer.ggml.eot_token_id", static_cast<uint32_t>(v.id("<|end|>")));
+            w.write(path);
+            auto file = MmapLoader::open(path);
+            REQUIRE(file.has_value());
+            auto tok = Tokenizer::load(**file);
+            REQUIRE(tok.has_value());
+            CHECK(tok->is_end_of_generation(v.id("<|end|>")) == (!channel_turn || explicit_message_stop));
+            CHECK(tok->is_end_of_generation(v.id("<|return|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|call|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|im_end|>")));
+            CHECK(tok->piece(v.id("<|end|>")).empty());
+            auto ids = tok->encode("hello<|end|>hello<|return|>", false);
+            REQUIRE(ids.has_value());
+            CHECK(*ids == std::vector<int32_t>({v.id("hello"), v.id("<|end|>"), v.id("hello"), v.id("<|return|>")}));
+            std::remove(path.c_str());
+        }
+    }
+}

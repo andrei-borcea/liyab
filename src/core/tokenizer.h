@@ -64,6 +64,10 @@ public:
     [[nodiscard]] int32_t bos() const noexcept { return bos_; }
     [[nodiscard]] int32_t eos() const noexcept { return eos_; }
     [[nodiscard]] bool add_bos_default() const noexcept { return add_bos_; }
+    // EOS/EOT/EOM metadata and protocol terminators. A declared <|return|>
+    // completes a channelized turn; its <|end|> continues to the next message,
+    // and <|call|> stops for a tool handoff. Explicit metadata stays authoritative;
+    // other formats keep their existing stop fallbacks.
     [[nodiscard]] bool is_end_of_generation(int32_t id) const;
 
 private:
