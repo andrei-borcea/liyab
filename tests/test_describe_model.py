@@ -26,7 +26,7 @@ class CheckpointTest(unittest.TestCase):
             safe.mkdir()
             binary.mkdir()
             state = {
-                "model.norm.weight": torch.tensor([1.0, -0.0, 0.25]),
+                "model.norm.weight": torch.tensor([1.0, -0.0, 0.25], requires_grad=True),
                 "model.layers.0.k_proj.weight": torch.arange(35).reshape(7, 5).to(torch.bfloat16) / 8,
                 "model.layers.0.scalar": torch.tensor(0.125, dtype=torch.float16),
             }

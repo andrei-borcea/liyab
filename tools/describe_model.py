@@ -326,7 +326,7 @@ class Checkpoint:
             rows = value.shape[0] - first_row if rows is None else rows
             if first_row < 0 or rows < 0 or first_row + rows > value.shape[0]:
                 raise FormatError(f"{name}: tensor row range is outside its shape")
-            values = value[first_row:first_row + rows].float().numpy()
+            values = value[first_row:first_row + rows].detach().float().numpy()
             return values.reshape(()) if scalar and rows == 1 else values
         header, _ = self._header(shard)
         src, _, start = self.files[shard]

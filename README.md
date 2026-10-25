@@ -2495,7 +2495,7 @@ Benchmarks and tools built with the tests:
   Optional attention-output bias follows both ordinary and latent attention projections, in either latent form.
   Local PyTorch `.bin` checkpoints, including indexed shards, use `weights_only` memory maps for tensor inspection;
   remote inspection requires safetensors. `python tests/test_describe_model.py` checks both local readers with
-  the reference environment, including row bounds and lazy shard loading.
+  the reference environment, including row bounds, saved gradient flags and lazy shard loading.
 
   ```bash
   tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp

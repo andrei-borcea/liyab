@@ -366,7 +366,7 @@ Local PyTorch `.bin` checkpoints and their indexed shards can supply the referen
 `torch.load(weights_only=True, mmap=True)`, maps each shard only when requested, and materializes only the rows
 needed for matching. Remote checkpoint inspection still requires safetensors. Run
 `python tests/test_describe_model.py` in the reference environment to compare both readers, scalar and partial
-rows, invalid row ranges, missing/malformed checkpoints and lazy loading of PyTorch shards.
+rows, saved gradient flags, invalid row ranges, missing/malformed checkpoints and lazy loading of PyTorch shards.
 
 ### Classic conformance
 
