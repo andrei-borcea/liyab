@@ -460,7 +460,7 @@ public:
         int32_t n = 0;
         std::function<const uint8_t*(int32_t page)> page;
         std::function<const uint8_t*(int32_t page)> window_page;  // windowed blocks only
-        std::span<const float> state;  // empty without recurrent blocks
+        std::span<const float> state;  // recurrent_state_bytes() / sizeof(float), possibly zero
         std::vector<SnapshotImage> snapshots;
     };
     // Writes `image` in write_state()'s format, as if it were the context
@@ -502,6 +502,7 @@ public:
     // state image in order ([conv | ssm] of each recurrent block; one part
     // for a snapshot), read in place: written to storage without a copy.
     // Valid until the context changes; empty for another position.
+    // Empty components are omitted, including a stateless one-tap mixer.
     [[nodiscard]] std::vector<std::span<const float>> kept_state_parts(int32_t pos) const;
 
     // Float storage for recurrent-state images that is not zero-filled when
@@ -537,6 +538,7 @@ public:
     // for one snapshot image (a kept one, else a new one, not zero-filled).
     // adopt_context() then makes positions [0, n) the context.
     void begin_restore();
+    // Empty components are omitted: every returned span is safe to copy.
     [[nodiscard]] std::vector<std::span<float>> recurrent_parts();
     [[nodiscard]] StateBuffer take_snapshot_buffer();
     struct OwnedSnapshot {

@@ -489,3 +489,67 @@ TEST_CASE("KDA chunked prefill keeps its bits when value rows are split across w
     REQUIRE(a && b);
     CHECK(std::equal(a->begin(), a->end(), b->begin()));
 }
+
+TEST_CASE("ShortConv state images omit empty fragments and preserve zero-length fields") {
+    for (const int32_t taps : {1, 3}) {
+        test::TinyModelSpec spec;
+        spec.arch = "lfm2";
+        spec.short_conv_interval = 3;  // both blocks are convolutions
+        spec.shortconv_taps = taps;
+        const auto path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_shortconv_state.gguf";
+        test::write_tiny_model(path, spec);
+        struct Remove {
+            const std::string& path;
+            ~Remove() { std::remove(path.c_str()); }
+        } remove{path};
+        auto load = [&]() -> std::unique_ptr<Transformer> {
+            auto file = MmapLoader::open(path);
+            if (!file) return nullptr;
+            auto result = Transformer::load(std::move(*file), {});
+            return result ? std::move(*result) : nullptr;
+        };
+        auto model = load(), restored = load();
+        REQUIRE(model && restored);
+        ThreadPool pool(3);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+        model->set_rollback_window(4);
+        REQUIRE(model->forward(std::span(tokens).first(4), Transformer::Logits::None, route, pool));
+        model->snapshot_state(true);
+        REQUIRE(model->forward(std::span(tokens).subspan(4), Transformer::Logits::None, route, pool));
+        std::vector<float> live, snapshot;
+        for (auto part : model->recurrent_parts()) {
+            CHECK(!part.empty());
+            live.insert(live.end(), part.begin(), part.end());
+        }
+        for (auto part : model->kept_state_parts(4)) {
+            CHECK(!part.empty());
+            snapshot.insert(snapshot.end(), part.begin(), part.end());
+        }
+        CHECK(live.size() * sizeof(float) == model->recurrent_state_bytes());
+        CHECK((taps == 1) == live.empty());
+        Transformer::ContextImage image;
+        image.n = model->n_past();
+        image.state = live;
+        image.snapshots.push_back({4, true, snapshot});
+        auto& kv = model->kv_cache();
+        std::vector<uint8_t> scratch(kv.page_bytes());
+        image.page = [&](int32_t page) -> const uint8_t* {
+            if (const auto* data = kv.page_data(page)) return data;
+            return kv.read_rows(page, kv.config().page_tokens, scratch.data()).is_ok() ? scratch.data() : nullptr;
+        };
+        std::stringstream current(std::ios::in | std::ios::out | std::ios::binary);
+        std::stringstream external(std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(model->write_state(current).is_ok());
+        REQUIRE(model->write_state(external, image).is_ok());
+        CHECK(current.str() == external.str());
+        REQUIRE(restored->read_state(external).is_ok());
+        REQUIRE(model->truncate(4).is_ok());  // the rollback ring
+        REQUIRE(restored->truncate(4).is_ok());  // the snapshot read from storage
+        auto a = model->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        auto b = restored->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        REQUIRE(a && b);
+        CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    }
+}

@@ -2826,3 +2826,6 @@ The reference-template tool probes this preprocessing separately from the Jinja 
 The recurrent regression cases exercise all four KV types, independent sequences, draft rollback, alternative
 tree branches, bounded prefix images restored by another engine, and CPU/GPU projection routing. A KDA check
 compares one worker with eight workers, including rollback and tree retention, to cover value-row partitioning.
+
+Recurrent-state fragments omit empty components before storage copies. ShortConv therefore stores no matrix
+fragment, and a one-tap convolution stores no history; state files retain the same zero-length fields and format.

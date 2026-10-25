@@ -283,3 +283,7 @@ unrecognized preprocessing. The engine passes this fact when loading the model's
 The synthetic KDA row-partition test runs the same prefill, rollback, branched verification and retained path
 with one and eight workers, requiring identical logits. The prefix-image tests use prompts above the store's
 existing 128-token minimum so that reuse is actually exercised.
+
+ShortConv's empty matrix state, and a one-tap convolution's empty history, are omitted from the fragment views
+used by prefix storage. Snapshot, rollback and file I/O skip empty buffers while retaining their zero lengths
+in the existing file format. This avoids null-buffer copies without changing serialized bytes.

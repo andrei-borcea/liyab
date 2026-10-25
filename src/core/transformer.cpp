@@ -1098,8 +1098,8 @@ void Transformer::snapshot_state(bool pin) {
     snap.data.resize(recurrent_state_bytes() / sizeof(float));
     float* out = snap.data.data();
     for (const RecurrentState& st : states_) {
-        out = std::copy(st.conv.begin(), st.conv.end(), out);
-        out = std::copy(st.ssm.begin(), st.ssm.end(), out);
+        if (!st.conv.empty()) out = std::copy(st.conv.begin(), st.conv.end(), out);
+        if (!st.ssm.empty()) out = std::copy(st.ssm.begin(), st.ssm.end(), out);
     }
     snapshots_.push_back(std::move(snap));
     pin_snapshots();
@@ -1173,13 +1173,13 @@ std::vector<std::span<const float>> Transformer::kept_state_parts(int32_t pos) c
     if (states_.empty()) return parts;
     if (pos == n_past_) {
         for (const RecurrentState& st : states_) {
-            parts.emplace_back(st.conv);
-            parts.emplace_back(st.ssm);
+            if (!st.conv.empty()) parts.emplace_back(st.conv);
+            if (!st.ssm.empty()) parts.emplace_back(st.ssm);
         }
         return parts;
     }
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos == pos) parts.emplace_back(snap.data);
+        if (snap.pos == pos && !snap.data.empty()) parts.emplace_back(snap.data);
     }
     return parts;
 }
@@ -1198,8 +1198,8 @@ void Transformer::begin_restore() {
 std::vector<std::span<float>> Transformer::recurrent_parts() {
     std::vector<std::span<float>> parts;
     for (RecurrentState& st : states_) {
-        parts.emplace_back(st.conv);
-        parts.emplace_back(st.ssm);
+        if (!st.conv.empty()) parts.emplace_back(st.conv);
+        if (!st.ssm.empty()) parts.emplace_back(st.ssm);
     }
     return parts;
 }
@@ -1287,19 +1287,28 @@ Status Transformer::write_image(std::ostream& out, int32_t n, const std::functio
     for (const RecurrentState& st : states_) {
         put(out, static_cast<uint64_t>(st.conv.size()));
         put(out, static_cast<uint64_t>(st.ssm.size()));
-        const float* conv = live ? st.conv.data() : from;
-        const float* ssm = live ? st.ssm.data() : from + st.conv.size();
-        out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
-        out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
-        if (!live) from += st.conv.size() + st.ssm.size();
+        // ShortConv has no matrix state; a one-tap convolution has no
+        // history either. Keep their zero lengths in the format without
+        // passing null buffers to streams or doing pointer arithmetic on them.
+        if (!st.conv.empty()) {
+            const float* conv = live ? st.conv.data() : from;
+            out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
+        }
+        if (!st.ssm.empty()) {
+            const float* ssm = live ? st.ssm.data() : from + st.conv.size();
+            out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
+        }
+        if (!live && (!st.conv.empty() || !st.ssm.empty())) from += st.conv.size() + st.ssm.size();
     }
     put(out, static_cast<int32_t>(snapshots.size()));
     for (const SnapshotImage& snap : snapshots) {
         put(out, snap.pos);
         put(out, static_cast<uint8_t>(snap.pinned));
         put(out, static_cast<uint64_t>(snap.data.size()));
-        out.write(reinterpret_cast<const char*>(snap.data.data()),
-                  static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
+        if (!snap.data.empty()) {
+            out.write(reinterpret_cast<const char*>(snap.data.data()),
+                      static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
+        }
     }
     // Windowed blocks: every page of the window before the end and before
     // each snapshot kept, whole (out of the live pages, or the image's window
@@ -1396,8 +1405,8 @@ Status Transformer::read_state(std::istream& in) {
     for (RecurrentState& st : states_) {
         uint64_t conv = 0, ssm = 0;
         if (!get(in, conv) || !get(in, ssm) || conv != st.conv.size() || ssm != st.ssm.size() ||
-            !in.read(reinterpret_cast<char*>(st.conv.data()), static_cast<std::streamsize>(conv * sizeof(float))) ||
-            !in.read(reinterpret_cast<char*>(st.ssm.data()), static_cast<std::streamsize>(ssm * sizeof(float)))) {
+            (conv > 0 && !in.read(reinterpret_cast<char*>(st.conv.data()), static_cast<std::streamsize>(conv * sizeof(float)))) ||
+            (ssm > 0 && !in.read(reinterpret_cast<char*>(st.ssm.data()), static_cast<std::streamsize>(ssm * sizeof(float))))) {
             return fail(ErrorCode::IoError, "the state's recurrent states are truncated");
         }
     }
@@ -1417,7 +1426,7 @@ Status Transformer::read_state(std::istream& in) {
         }
         snap.pinned = pinned != 0;
         snap.data.resize(floats);
-        if (!in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
+        if (size > 0 && !in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
             return fail(ErrorCode::IoError, "the state's snapshots are truncated");
         }
         if (convert) {
@@ -4257,7 +4266,7 @@ Status Transformer::keep_path(std::span<const int32_t> path) {
         const auto to_slot = static_cast<size_t>(to % rollback_window_);
         for (RecurrentState& st : states_) {
             const size_t per_state = st.conv.size() + st.ssm.size();
-            if (from_slot != to_slot) {
+            if (per_state > 0 && from_slot != to_slot) {
                 std::copy_n(st.checkpoints.data() + from_slot * per_state, per_state,
                             st.checkpoints.data() + to_slot * per_state);
             }
@@ -4338,9 +4347,9 @@ Status Transformer::abandon_pass() {
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n_past_));
     const float* saved = snap->data.data();
     for (RecurrentState& st : states_) {
-        std::copy_n(saved, st.conv.size(), st.conv.begin());
-        std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
-        saved += st.conv.size() + st.ssm.size();
+        if (!st.conv.empty()) std::copy_n(saved, st.conv.size(), st.conv.begin());
+        if (!st.ssm.empty()) std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+        if (!st.conv.empty() || !st.ssm.empty()) saved += st.conv.size() + st.ssm.size();
     }
     return Status::ok();
 }
@@ -4370,9 +4379,10 @@ Status Transformer::truncate(int32_t n) {
         LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
         const float* saved = in_ring ? nullptr : snap->data.data();
         for (RecurrentState& st : states_) {
+            if (st.conv.empty() && st.ssm.empty()) continue;
             if (in_ring) saved = st.checkpoints.data() + static_cast<size_t>(slot) * (st.conv.size() + st.ssm.size());
-            std::copy_n(saved, st.conv.size(), st.conv.begin());
-            std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+            if (!st.conv.empty()) std::copy_n(saved, st.conv.size(), st.conv.begin());
+            if (!st.ssm.empty()) std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
             if (!in_ring) saved += st.conv.size() + st.ssm.size();
         }
         // Checkpoints and snapshots of the discarded positions describe a
