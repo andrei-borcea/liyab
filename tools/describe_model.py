@@ -1193,6 +1193,15 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                                      f"(expert_gating_func)")
             if bool(f.get("selection_bias")) != bool(plan.get("selection_bias")):
                 d.file_issues.append(f"block {i}: an expert selection bias in one of the reference and the file only")
+            groups = int(g.key("expert_group_count", 1) or 1)
+            used = int(g.key("expert_group_used_count", groups) or groups)
+            actual = (groups, used) if used < groups else (1, 1)
+            if actual != (f.get("groups", 1), f.get("groups_used", 1)):
+                d.file_issues.append(f"block {i}: expert groups {actual} from the file, "
+                                     f"{f.get('groups', 1), f.get('groups_used', 1)} observed in the reference")
+            if f.get("group_score") and f["group_score"] != ("top2" if f.get("selection_bias") else "max"):
+                d.missing.append(f"block {i}: group score {f['group_score']} with "
+                                 f"{'a' if f.get('selection_bias') else 'no'} selection bias")
             fnorm = g.key("expert_weights_norm")
             if fnorm is not None and bool(fnorm) != bool(f["norm_topk"]):
                 d.file_issues.append(f"block {i}: expert_weights_norm {fnorm} in the file, the reference "
@@ -1226,6 +1235,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             f = next(f for f in moe_facts if f.get("gating"))
             d.parts.append(f"MoE: {f['gating']} routing, top {g.key('expert_used_count')} of "
                            f"{g.key('expert_count')} experts" + (", selection bias" if f.get("selection_bias") else "")
+                           + (f", {f['groups_used']} of {f['groups']} groups ({f['group_score']})"
+                              if f.get("groups", 1) > 1 else "")
                            + (f", weights scaled by {f['scale']:g}" if not _close(f['scale'], 1.0) else "")
                            + (", a shared expert" + (" with a sigmoid gate" if f["shared_expert"].get("gate") else "")
                               if f.get("shared_expert") else ""))

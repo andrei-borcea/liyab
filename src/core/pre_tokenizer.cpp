@@ -78,7 +78,9 @@ const std::array<Row, 11>& table() {
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},
-        {{"deepseek-v3", "hunyuan-dense"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
+        // "joyai-llm": the name the converter gives DeepSeek-V3's own tokenizer under transformers 5 (the same
+        // pre_tokenizer, normalizer and merges as DeepSeek-V3's tokenizer.json; JoyAI-LLM reuses it).
+        {{"deepseek-v3", "hunyuan-dense", "joyai-llm"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
         {{"deepseek-llm"},
          {{kNewline, true}, {kDeepSeekLetters, true}, {kDeepSeekPunct, true}, {kTrailingSpace, true},
           {kDeepSeekCjk, true}, {kEachDigit, true}},

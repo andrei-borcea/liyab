@@ -161,6 +161,11 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+
+    // MoE: group-limited expert selection (DeepSeek-V3, Ling 2.0): > 0 writes
+    // expert_group_count and expert_group_used_count. Metadata only.
+    int32_t n_expert_groups = 0;
+    int32_t n_expert_groups_used = 0;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

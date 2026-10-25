@@ -226,6 +226,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.expert_weights_norm >= 0) w.add_bool(a + ".expert_weights_norm", s.expert_weights_norm != 0);
         if (s.n_ff_shared > 0) w.add_u32(a + ".expert_shared_feed_forward_length", static_cast<uint32_t>(s.n_ff_shared));
         if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
+        if (s.n_expert_groups > 0) {
+            w.add_u32(a + ".expert_group_count", static_cast<uint32_t>(s.n_expert_groups));
+            w.add_u32(a + ".expert_group_used_count", static_cast<uint32_t>(s.n_expert_groups_used));
+        }
     }
     if (s.dense_lead > 0) w.add_u32(a + ".leading_dense_block_count", static_cast<uint32_t>(s.dense_lead));
     if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b

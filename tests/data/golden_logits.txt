@@ -35,6 +35,9 @@ arm64-neon-dotprod qwen35moe ff112dcc4a0eef3b
 arm64-neon-dotprod qwen3moe 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-fused-gate-up 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
+arm64-neon-dotprod qwen3moe-grouped-sigmoid-bias 6e8e32732c024191
+arm64-neon-dotprod qwen3moe-grouped-sigmoid-bias-streamed 6e8e32732c024191
+arm64-neon-dotprod qwen3moe-grouped-softmax c49d47814684b380
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
 x86_64-avx2 deepseek2-mla 191166464f5adf1d

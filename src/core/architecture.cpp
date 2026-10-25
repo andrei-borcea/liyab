@@ -134,13 +134,21 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.moe_weights_scale = static_cast<float>(f.get_float(key("expert_weights_scale")).value_or(1.0));
         if (c.moe_weights_scale == 0.0f) c.moe_weights_scale = 1.0f;
         if (c.n_expert_used > c.n_expert) return Status(ErrorCode::InvalidModel, "expert_used_count > expert_count");
-        // Group-limited routing (DeepSeek-V3: top-k only among the best
-        // groups of experts) is not implemented: plain top-k would choose
-        // other experts.
+        // Group-limited selection (ModelConfig::n_expert_groups): the top-k
+        // among the experts of the best groups only. Every group used means
+        // plain top-k.
         const int64_t groups = f.get_int(key("expert_group_count")).value_or(1);
-        if (groups > 1 && f.get_int(key("expert_group_used_count")).value_or(groups) < groups) {
-            return Status(ErrorCode::Unsupported, "group-limited expert routing (" + key("expert_group_count") +
-                                                      " " + std::to_string(groups) + ") is not supported yet");
+        const int64_t used = f.get_int(key("expert_group_used_count")).value_or(groups);
+        if (groups < 1 || groups > c.n_expert || c.n_expert % groups != 0 || used < 1 || used > groups ||
+            used * (c.n_expert / groups) < c.n_expert_used) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("expert_group_count") + " / " +
+                                                       key("expert_group_used_count") + " for " +
+                                                       std::to_string(c.n_expert) + " experts, top-" +
+                                                       std::to_string(c.n_expert_used));
+        }
+        if (used < groups) {
+            c.n_expert_groups = static_cast<int32_t>(groups);
+            c.n_expert_groups_used = static_cast<int32_t>(used);
         }
     }
     c.n_ff = static_cast<int32_t>(f.get_int(key("feed_forward_length")).value_or(0));

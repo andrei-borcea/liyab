@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "core/draft_budget.h"
+#include "core/moe_routing.h"
 #include "core/quant.h"
 #include "core/sampling.h"
 #include "core/suffix_drafter.h"
@@ -2257,6 +2258,77 @@ TEST_CASE("A model whose text cannot be encoded loads with a quantized KV cache,
     CHECK(with_scales.value()->describe().find("Keys:") == std::string::npos);
     CHECK(!std::filesystem::is_empty(dir));
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Group-limited routing scores groups before selecting experts") {
+    // Max scoring chooses group 0; the sum of the top two chooses group 1.
+    // Negative biased scores stay eligible: masking by multiplication would
+    // incorrectly prefer a zero from a group that was excluded.
+    const float scores[] = {-0.1f, -0.9f, -0.3f, -0.4f, -0.8f, -0.8f, -0.8f, -0.8f};
+    std::vector<uint8_t> allowed;
+    select_expert_groups(scores, 8, 4, 1, false, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 1, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{0, 1, 0, 0}));
+    select_expert_groups(scores, 8, 4, 3, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 0}));  // tied groups: lower first
+    select_expert_groups(scores, 8, 8, 2, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 1, 0, 0, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 4, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 1}));
+}
+
+TEST_CASE("Group-limited routing validates metadata and streamed experts keep its logits") {
+    test::TinyModelSpec s;
+    s.arch = "deepseek2";
+    s.n_expert = 8;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    for (int mode = 0; mode < 2; ++mode) {
+        s.sigmoid_gating = mode != 0;
+        s.expert_bias = mode != 0;
+        const std::string path = model_path("grouped_" + std::to_string(mode), s);
+        TransformerOptions opts;
+        auto a = load_transformer(path, opts);
+        opts.expert_cache_bytes = 1;
+        auto b = load_transformer(path, opts);
+        REQUIRE(a != nullptr && b != nullptr);
+        CHECK(a->config().n_expert_groups == 4);
+        CHECK(a->config().n_expert_groups_used == 2);
+        ThreadPool pool(2);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+        auto first = a->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(first.has_value());
+        const std::vector<float> expected(first->begin(), first->end());
+        auto second = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(second.has_value());
+        CHECK(max_abs_diff(*second, expected) == 0.0f);
+        a->reset();
+        b->reset();
+        for (const int32_t token : tokens) {
+            auto la = a->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto lb = b->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(la.has_value() && lb.has_value());
+            CHECK(la->size() == lb->size());
+            CHECK(std::memcmp(la->data(), lb->data(), la->size_bytes()) == 0);
+        }
+    }
+    const std::pair<int32_t, int32_t> invalid[] = {{3, 1}, {4, 0}, {4, 5}, {16, 1}, {8, 1}};
+    for (const auto [groups, used] : invalid) {
+        s.n_expert_groups = groups;
+        s.n_expert_groups_used = used;
+        auto file = MmapLoader::open(model_path("bad_groups_" + std::to_string(groups) + "_" +
+                                              std::to_string(used), s));
+        REQUIRE(file.has_value());
+        auto result = describe_model(**file);
+        REQUIRE(!result.has_value());
+        CHECK(result.status().code() == ErrorCode::InvalidModel);
+        CHECK(result.status().to_string().find("expert_group") != std::string::npos);
+    }
 }
 
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {

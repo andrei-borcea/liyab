@@ -397,7 +397,7 @@ What the port does differently from the POSIX platforms:
     tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gguf \
         --bool tokenizer.ggml.add_bos_token=false --bool tokenizer.ggml.add_space_prefix=false
     ```
-  * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with one expert group, and the models converted to
+  * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with group-limited expert routing, and the models converted to
     their architecture, such as Youtu-LLM-2B): multi-head latent attention, queries from one projection or a
     low-rank pair with its norm, dense FFNs in the leading blocks and MoE with shared experts in the others (from
     the tensors), YaRN with its log multiplier. The cache holds one row per position and block, `[k_pe | latent]`
@@ -431,9 +431,12 @@ What the port does differently from the POSIX platforms:
     `TransformerOptions::latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled for the
     per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the absorbed form
     multiplies the attention output back, the expanded one the latents before it expands them. Files converted
-    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
-    and so is group-limited expert routing
-    (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
+    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again.
+    Group-limited routing reads `expert_group_count` and `expert_group_used_count`: groups score their maximum
+    probability without a selection bias (V2), or the sum of their two best biased probabilities with one (V3/R1).
+    Experts compete only inside the chosen groups; their weights still use the unbiased probabilities, the file's
+    renormalization rule and routed scale. CPU selection is shared by in-place and streamed experts, with the same
+    rule in the streaming predictor; matmuls retain their CPU/Metal/Vulkan routes.
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -484,7 +487,7 @@ What the port does differently from the POSIX platforms:
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
     asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan, Tekken). Rows:
     `default` / `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`,
-    `hunyuan`, `hunyuan-dense` / `deepseek-v3`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
+    `hunyuan`, `hunyuan-dense` / `deepseek-v3` / `joyai-llm`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
     digit alone, then GPT-2's split), `tekken` (Mistral-Nemo) and `youtu` (Youtu-LLM: Hangul, CJK punctuation,
     Bopomofo and Han/kana runs first; its `\p{Hangul}` is written out as the script's code-point ranges, since the
     regex engine has categories, not scripts). A GGUF without the key uses `default`. Any other value is an error
@@ -2576,7 +2579,7 @@ Implemented features are described above. These are next, in order:
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
    Youtu-LLM). A model's row is established from its Hugging Face implementation and a GGUF and verified by the
    conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
-   * group-limited expert routing (DeepSeek-V3);
+   * sparse indexed latent attention (DeepSeek-V3.2 and GLM-5);
    * later, multimodal and classification models, and encoder-only embedding models (BERT, XLM-R: bidirectional
      attention, learned positions, LayerNorm with bias, WordPiece and Unigram vocabularies).
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
@@ -2657,8 +2660,8 @@ Implemented features are described above. These are next, in order:
     locked in RAM;
   * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
     of their own, such as a temporary directory under a user name with accents.
-* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
-  expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
+* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V3.2 and V4.
+  Group routing for V2/V3/R1 is implemented; their full-model validation remains pending. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
   its keys unscaled (the key scales are measured on a text it cannot encode).
   `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see

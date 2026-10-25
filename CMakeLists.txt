@@ -138,6 +138,7 @@ add_library(liyab_core OBJECT
   src/core/grammar.cpp
   src/core/grammar_text.cpp
   src/core/json_schema.cpp
+  src/core/moe_routing.cpp
   src/core/architecture.cpp
   src/core/key_scaling.cpp
   src/core/portable_math.cpp

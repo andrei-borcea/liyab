@@ -158,6 +158,10 @@ def main():
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
     keep, n = reduce(cfg, args.heads, args.kv_heads, args.width, args.ffn, args.experts)
+    # The weights are random float32 tensors: a quantization scheme of the published checkpoint (DeepSeek's FP8
+    # blocks) describes none of them, and loading the checkpoint with it would ask for quantized tensors.
+    if getattr(cfg, "quantization_config", None) is not None:
+        delattr(cfg, "quantization_config")
     for field, value in json.loads(args.config or "{}").items():
         setattr(cfg, field, value)
 

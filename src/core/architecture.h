@@ -240,6 +240,17 @@ struct ModelConfig {
     MoeGating moe_gating = MoeGating::Softmax;
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
     float moe_weights_scale = 1.0f;
+    // Group-limited expert selection (DeepSeek-V2/V3, Ling 2.0): the experts
+    // form n_expert_groups equal groups of consecutive experts, each group is
+    // scored, and the top-k is taken only among the experts of the
+    // n_expert_groups_used best groups (both 1: plain top-k). A group's score
+    // is the sum of its two best selection scores (probability plus the
+    // block's selection bias) when the block has a selection bias
+    // (exp_probs_b: DeepSeek-V3's noaux_tc, Ling 2.0), else its best
+    // probability (DeepSeek-V2's group_limited_greedy). Ties go to the lower
+    // group, as they go to the lower expert in the top-k.
+    int32_t n_expert_groups = 1;       // <arch>.expert_group_count
+    int32_t n_expert_groups_used = 1;  // <arch>.expert_group_used_count
 
     // True when some block keeps a recurrent state: such models cannot roll
     // back to an arbitrary earlier position (only to 0 or the current one).

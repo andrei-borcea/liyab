@@ -255,6 +255,20 @@ std::vector<GoldenCase> cases() {
     s.longrope_ctx = 32;  // shorter: the long factors
     s.rope_dim = 16;      // partial rotation (Phi-4-mini)
     add("phi3-longrope-partial", s);
+
+    // Group-limited expert selection: 8 experts in 4 groups, top-2 within the
+    // 2 best groups. With a selection bias a group scores its two best biased
+    // scores (DeepSeek-V3, Ling 2.0), without one its best probability
+    // (DeepSeek-V2); streamed experts follow the same choice.
+    s = moe_spec("qwen3moe");
+    s.n_expert = 8;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    add("qwen3moe-grouped-softmax", s);
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    add("qwen3moe-grouped-sigmoid-bias", s);
+    add("qwen3moe-grouped-sigmoid-bias-streamed", s, streamed);
     return out;
 }
 

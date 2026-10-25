@@ -11,6 +11,7 @@
 #include <random>
 
 #include "core/log.h"
+#include "core/moe_routing.h"
 #include "core/portable_math.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
@@ -2890,16 +2891,37 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     std::vector<int32_t> best_rank(E, -1);
     const bool cut = expert_mass_ < 1.0f || (max_experts_ > 0 && max_experts_ < c.n_expert_used);
     std::vector<float> probs(cut ? E : 0);
+    // Group-limited selection: the guess keeps to the groups the router will
+    // allow, scored on the router's own selection scores.
+    const bool grouped = c.n_expert_groups_used < c.n_expert_groups;
+    const size_t per_group = E / static_cast<size_t>(c.n_expert_groups);
+    std::vector<float> group_sel(grouped ? E : 0);
+    std::vector<uint8_t> group_ok;
     for (size_t t = 0; t < un; ++t) {
         const float* logits = pred_logits_.data() + t * E;
+        if (grouped) {
+            float mx = -INFINITY, sum = 0.0f;
+            if (c.moe_gating == MoeGating::Softmax) {
+                for (size_t e = 0; e < E; ++e) mx = std::max(mx, logits[e]);
+                for (size_t e = 0; e < E; ++e) sum += group_sel[e] = std::exp(logits[e] - mx);
+            }
+            for (size_t e = 0; e < E; ++e) {
+                const float p = c.moe_gating == MoeGating::Softmax ? group_sel[e] / sum : sigmoid(logits[e]);
+                group_sel[e] = p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[e]);
+            }
+            select_expert_groups(group_sel.data(), E, c.n_expert_groups, c.n_expert_groups_used, !L.expert_bias.empty(),
+                          group_ok);
+        }
         auto score = [&](int32_t e) {  // softmax and sigmoid are monotonic; the selection bias is added on top
+            if (grouped && group_ok[static_cast<size_t>(e) / per_group] == 0) return -INFINITY;
+            if (grouped) return group_sel[static_cast<size_t>(e)];
             const float p = c.moe_gating == MoeGating::Softmax ? logits[e] : sigmoid(logits[e]);
             return p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
         };
         for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
         const auto k = static_cast<std::ptrdiff_t>(c.n_expert_used);
         std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                          [&](int32_t a, int32_t b) { return score(a) > score(b); });
+                          [&](int32_t a, int32_t b) { return score(a) > score(b) || (score(a) == score(b) && a < b); });
         size_t kept = static_cast<size_t>(k);
         if (cut) {  // guess only the experts the router would keep (unnormalized: ratios suffice)
             float sum = 0.0f;
@@ -3027,6 +3049,10 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     std::vector<int32_t> order(E);
     experts_kept_.assign(un, static_cast<int32_t>(K));
     std::vector<float> token_weight(un, 0.0f);  // per token: the weights of its kept experts (for skip_slow_)
+    const bool grouped = c.n_expert_groups_used < c.n_expert_groups;
+    const size_t per_group = E / static_cast<size_t>(c.n_expert_groups);
+    std::vector<float> group_sel(grouped ? E : 0);
+    std::vector<uint8_t> group_ok;
     for (size_t t = 0; t < un; ++t) {
         const float* logits = router_.data() + t * E;
         if (c.moe_gating == MoeGating::Softmax) {
@@ -3037,7 +3063,15 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         } else {
             for (size_t e = 0; e < E; ++e) probs[e] = sigmoid(logits[e]);
         }
+        // Group-limited selection: only the best groups' experts compete
+        // (select_expert_groups); the others are out of the top-k.
+        if (grouped) {
+            for (size_t e = 0; e < E; ++e) group_sel[e] = probs[e] + (L.expert_bias.empty() ? 0.0f : L.expert_bias[e]);
+            select_expert_groups(group_sel.data(), E, c.n_expert_groups, c.n_expert_groups_used, !L.expert_bias.empty(),
+                          group_ok);
+        }
         auto selection = [&](int32_t e) {
+            if (grouped && group_ok[static_cast<size_t>(e) / per_group] == 0) return -INFINITY;
             return probs[static_cast<size_t>(e)] + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
         };
         for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);

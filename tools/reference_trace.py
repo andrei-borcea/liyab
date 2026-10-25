@@ -659,18 +659,36 @@ def analyze_moe(ffn_call, block_calls, cfg):
     found = None
     for gating in ("softmax", "sigmoid"):
         probs = torch.softmax(logits, -1) if gating == "softmax" else torch.sigmoid(logits)
-        for bias_name, bias in [(None, None)] + biases:
+        for bias_name, bias in biases + [(None, None)]:
             sel = probs + (bias if bias is not None else 0.0)
-            top = torch.topk(sel, k, dim=-1).indices
-            if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
-                continue
-            chosen = torch.gather(probs, -1, idx.long())
-            for norm in (False, True):
-                w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
-                ratio = (wts.float() / w)
-                scale = float(ratio.mean())
-                if close(w * scale, wts.float()):
-                    found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale}
+            groups = getattr(cfg, "n_group", 1) or 1
+            used = getattr(cfg, "topk_group", groups) or groups
+            # Test the grouping rule against the expert indices actually
+            # observed. Configuration supplies geometry, never the rule.
+            candidates = [(1, 1, None, sel)]
+            if 1 <= used < groups and n_exp % groups == 0:
+                grouped = sel.reshape(n_tokens, groups, n_exp // groups)
+                for rule in ("max", "top2"):
+                    scores = (grouped.max(-1).values if rule == "max" else
+                              grouped.topk(min(2, n_exp // groups), dim=-1).values.sum(-1))
+                    keep = scores.topk(used, dim=-1).indices
+                    mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, keep, True)
+                    candidates.append((groups, used, rule,
+                                       sel.masked_fill(~mask.repeat_interleave(n_exp // groups, -1), -torch.inf)))
+            for groups_, used_, rule, selection in candidates:
+                top = torch.topk(selection, k, dim=-1).indices
+                if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
+                    continue
+                chosen = torch.gather(probs, -1, idx.long())
+                for norm in (False, True):
+                    w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
+                    ratio = (wts.float() / w)
+                    scale = float(ratio.mean())
+                    if close(w * scale, wts.float()):
+                        found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale,
+                                 "groups": groups_, "groups_used": used_, "group_score": rule}
+                        break
+                if found:
                     break
             if found:
                 break
@@ -678,7 +696,7 @@ def analyze_moe(ffn_call, block_calls, cfg):
             break
     if found is None:
         f["unknown"].append("routing is not top-k over softmax or sigmoid probabilities (with an optional "
-                            "selection bias, renormalization and scale), e.g. group-limited routing")
+                            "selection bias, group maximum or top-two sum, renormalization and scale)")
         return f
     f.update(found)
     # Shared expert: a sub-module reading the block input whose output is added (gated or not) to the experts'.

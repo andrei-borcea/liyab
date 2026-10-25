@@ -45,7 +45,7 @@ transformers. Each fact is then recomputed from the records, never read from a c
 | Q/K norms | A norm reading the projection and feeding the rotation sits before RoPE; one reading the rotated projection and giving the keys sits after it. Its weight's size says whether it spans one head or all of them. |
 | Attention | The `scaling`, `sliding_window`, `softcap` and sink arguments the attention receives; whether the output projection reads the attention output or `output * sigmoid(gate)` with the gate taken from `[q | gate]` heads. |
 | FFN | Which of `silu`, `gelu` (tanh or erf), `relu`, `relu²`, quick GELU makes `act(gate) * up` equal the down projection's input, for separate or fused `[gate | up]` projections; `act(up)` is a non-gated FFN. |
-| MoE routing | The router's logits and the indices and weights the experts receive: top-k over softmax or sigmoid probabilities, with or without a selection bias, renormalization and a scale; a shared expert, with or without a sigmoid gate, from how the block output is composed; the experts' activation from their weights. |
+| MoE routing | The router's logits and the indices and weights the experts receive: top-k over softmax or sigmoid probabilities, with or without a selection bias, group-limited selection (group maximum or sum of the best two selection scores, recomputed against the observed expert indices), renormalization and a scale; a shared expert, with or without a sigmoid gate, from how the block output is composed; the experts' activation from their weights. |
 | Embeddings, logits | Block 0's input against the embedding table's rows (a scale of 1 or √d); the logits against the output projection's output (a scale or a soft-cap); whether the output matrix is the embedding table. |
 
 **The GGUF.** Its metadata and tensor names and shapes give the hyperparameters, how the file encodes RoPE (base,
@@ -241,3 +241,14 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
+
+### Group-limited expert routing
+
+The engine reads `expert_group_count` and `expert_group_used_count`, validates equal group sizes and enough
+eligible experts for top-k, then limits expert selection to those groups. With a selection bias, groups score the
+sum of their best two biased probabilities (one for a one-expert group); without it, the maximum probability.
+Biases affect selection only. `reference_trace.py` tests both group-score formulas against the indices supplied
+to the reference's experts; `describe_model.py` checks the observed geometry and formula against the GGUF.
+A rule it cannot establish still prevents proposing a registry row. No new `ArchSpec` field is needed.
+`tiny_checkpoint.py` removes a published checkpoint's quantization configuration before saving its random F32
+weights, since those tensors are not quantized.
