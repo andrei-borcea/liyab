@@ -502,6 +502,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": latent attention tensors and " +
                                                            key("attention.kv_lora_rank") + " disagree");
             }
+            if (b.latent && (b.n_head != c.n_head || b.n_head_kv != 1)) {
+                return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                                                          ": per-block latent attention head counts are not supported");
+            }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;

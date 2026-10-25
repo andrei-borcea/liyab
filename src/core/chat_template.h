@@ -63,6 +63,8 @@ public:
     Value(int i) : Value(static_cast<int64_t>(i)) {}  // NOLINT(google-explicit-constructor)
     Value(double f);               // NOLINT(google-explicit-constructor)
     Value(std::string s);          // NOLINT(google-explicit-constructor)
+    // String views are copied: the value never borrows the caller's bytes.
+    Value(std::string_view s) : Value(std::string(s)) {}  // NOLINT(google-explicit-constructor)
     Value(const char* s) : Value(std::string(s)) {}  // NOLINT(google-explicit-constructor)
     static Value array(Array items = {});
     static Value object();

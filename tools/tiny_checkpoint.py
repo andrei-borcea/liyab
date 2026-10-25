@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--width", type=int, help="residual width (default heads x the model's head size)")
     parser.add_argument("--ffn", type=int, default=128, help="FFN and expert widths (default 128)")
     parser.add_argument("--experts", type=int, default=16, help="routed experts (default 16)")
-    parser.add_argument("--config", help="JSON object of configuration fields to set after the reduction")
+    parser.add_argument("--config", help="JSON fields applied after reduction through the configuration constructor")
     parser.add_argument("--seed", type=int, default=1234, help="seed of the random weights (default 1234)")
     args = parser.parse_args()
 
@@ -158,8 +158,12 @@ def main():
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
     keep, n = reduce(cfg, args.heads, args.kv_heads, args.width, args.ffn, args.experts)
-    for field, value in json.loads(args.config or "{}").items():
-        setattr(cfg, field, value)
+    overrides = json.loads(args.config or "{}")
+    if overrides:
+        # Configuration constructors own coupled fields and nested block
+        # descriptions (for example a NAS config's dataclass instances).
+        cfg = type(cfg).from_dict({**cfg.to_dict(), **overrides})
+        _, keep = _layer_count(cfg)
 
     torch.manual_seed(args.seed)
     model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)

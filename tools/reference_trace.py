@@ -5,11 +5,12 @@ A reduced copy of the model is built from its configuration with random weights:
 every kind of block the configuration lists), a small vocabulary, narrow FFNs and few experts. The widths of the
 residual stream and of the attention heads are kept, so every scale, base and multiplier is the model's own. One
 pass over a short sequence is recorded: what every module receives and returns, and, through an attention function
-registered with transformers, the queries, keys and values each attention gets with its arguments (scale, window,
-soft-cap). The facts the engine needs are then established by recomputing them, never from class or module names:
+registered with transformers (or by observing native SDPA in older classes), the queries, keys and values each
+attention gets with its arguments (scale, window, soft-cap). The facts the engine needs are then established by
+recomputing them, never from class or module names:
 
 * the order of norms, token mixer and FFN in a block and how the residual adds combine them;
-* each norm's formula (RMSNorm multiplying by w or by 1 + w, LayerNorm);
+* each norm's formula (RMSNorm multiplying by w plus a measured scalar offset, LayerNorm);
 * how keys and queries are rotated (which dimensions are paired, how many, with which frequencies), whether their
   norms come before or after the rotation, and over how many dimensions those norms reach;
 * the attention scale, window and soft-cap, and whether the attention output is gated;
@@ -62,6 +63,10 @@ class Call:
         for key in ("hidden_states", "x", "input", "inputs_embeds"):
             if torch.is_tensor(self.kwargs.get(key)):
                 return self.kwargs[key]
+        for a in self.args:
+            nested = _tensors(a)
+            if nested:
+                return nested[0]
         for v in self.kwargs.values():
             if torch.is_tensor(v):
                 return v
@@ -158,7 +163,12 @@ def blocks_to_trace(cfg):
     """The shortest prefix of blocks that holds every kind of block the configuration lists per block, at least 2."""
     _, n = _layer_count(cfg)
     want = min(n, 2)
-    for key, value in vars(cfg).items():
+    fields = dict(vars(cfg))
+    for key in ("layer_types", "interleaved_sliding_window"):
+        value = getattr(cfg, key, None)
+        if isinstance(value, (list, tuple)):
+            fields[key] = value
+    for key, value in fields.items():
         if isinstance(value, (list, tuple)) and len(value) == n and n > 1:
             seen = set()
             for i, v in enumerate(value):
@@ -276,8 +286,19 @@ def _eps_of(module, fallback):
     return fallback
 
 
+def rms_offset(call, eps):
+    """A measured scalar offset to the weight; accepted only if the entire RMSNorm output agrees."""
+    x, y = call.input.float(), call.output.float()
+    rms = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    valid = rms.abs() > 1e-4
+    if not valid.any():
+        return None
+    offset = float((y / torch.where(valid, rms, torch.ones_like(rms)) - call.module.weight.detach().float())[valid].median())
+    return offset if math.isfinite(offset) and close(rms * (call.module.weight.detach().float() + offset), y) else None
+
+
 def norm_formula(call, eps_fallback):
-    """How a norm module maps its input to its output: ("rms" | "rms_1p" | "layer" | "rms_noweight", eps), or None."""
+    """How a norm maps input to output: (rms | rms_1p | rms_offset | layer | rms_noweight, eps), or None."""
     x, y = call.input, call.output
     if x is None or y is None or x.shape != y.shape:
         return None
@@ -292,6 +313,8 @@ def norm_formula(call, eps_fallback):
             return "rms", eps
         if close(rms * (1.0 + wf), y):
             return "rms_1p", eps
+        if rms_offset(call, eps) is not None:
+            return "rms_offset", eps
         mean = xf.mean(-1, keepdim=True)
         var = (xf - mean).pow(2).mean(-1, keepdim=True)
         ln = (xf - mean) * torch.rsqrt(var + eps) * wf
@@ -302,6 +325,16 @@ def norm_formula(call, eps_fallback):
     elif w is None and close(rms, y):
         return "rms_noweight", eps
     return None
+
+
+def norm_fact(call, eps):
+    form = norm_formula(call, eps)
+    fact = {"module": call.path, "formula": form[0] if form else None, "eps": form[1] if form else None}
+    if form and form[0] in ("rms", "rms_1p", "rms_offset"):
+        fact["weight_offset"] = {"rms": 0.0, "rms_1p": 1.0}.get(form[0])
+        if fact["weight_offset"] is None:
+            fact["weight_offset"] = rms_offset(call, form[1])
+    return fact
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -365,10 +398,30 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     reduced, keep, n = reduced_config(config)
     _register_attention()
-    reduced._attn_implementation = ATTN_IMPL
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
-                                             attn_implementation=ATTN_IMPL)
+    try:
+        model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                 attn_implementation=ATTN_IMPL)
+    except (ValueError, KeyError) as error:
+        if ATTN_IMPL not in str(error):
+            raise
+        # Older official classes predate AttentionInterface. Observe their
+        # native SDPA call without replacing any forward computation.
+        reduced._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        try:
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="sdpa")
+        except ValueError as unsupported:
+            if "sdpa" not in str(unsupported):
+                raise
+            # Some classes call functional SDPA directly without declaring
+            # transformers' backend capability. Their eager path is observed
+            # too; a manual implementation with no SDPA call stays unknown.
+            reduced._attn_implementation = "eager"
+            torch.manual_seed(0)
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="eager")
     model.eval()
     _randomize(model)
     layers_path, layers = _decoder_layers(model, keep)
@@ -376,6 +429,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     RECORDER.calls.clear()
     RECORDER.attn.clear()
     handles = []
+    active = []
     for path, mod in model.named_modules():
         if mod is model:
             continue
@@ -385,13 +439,43 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
                                        [a.detach() if torch.is_tensor(a) else a for a in args],
                                        {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
                                        _tensors(output)))
+            active.pop()
 
         handles.append(mod.register_forward_hook(hook, with_kwargs=True))
+        handles.append(mod.register_forward_pre_hook(lambda module, args: active.append(module)))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
-    with torch.no_grad():
-        out = model(input_ids=ids, use_cache=False)
-    for h in handles:
-        h.remove()
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    def observed_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, *, scale=None,
+                      enable_gqa=False):
+        module = active[-1]
+        # Some custom classes accept an attention backend without using its
+        # interface. Observe native calls too, but keep the richer registered
+        # record when that interface already captured this module's attention.
+        if any(record.module is module for record in RECORDER.attn):
+            return sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
+        keys, values = key, value
+        kv_heads = getattr(module, "num_key_value_heads", key.shape[1])
+        if isinstance(kv_heads, int) and kv_heads > 0 and key.shape[1] % kv_heads == 0:
+            repeats = key.shape[1] // kv_heads
+            k, v = key[:, ::repeats], value[:, ::repeats]
+            if torch.equal(k.repeat_interleave(repeats, dim=1), key) and torch.equal(v.repeat_interleave(repeats, dim=1), value):
+                keys, values = k, v
+        rec = AttnCall(RECORDER.next(), module, query.detach().clone(), keys.detach().clone(),
+                       values.detach().clone(), {"scaling": scale if scale is not None else query.shape[-1] ** -0.5,
+                                                 "is_causal": is_causal, "observed_sdpa": True,
+                                                 "attention_mask": attn_mask.detach().clone() if attn_mask is not None else None})
+        RECORDER.attn.append(rec)
+        result = sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
+        rec.output = result.transpose(1, 2).detach().clone()
+        return result
+    try:
+        torch.nn.functional.scaled_dot_product_attention = observed_sdpa
+        with torch.no_grad():
+            out = model(input_ids=ids, use_cache=False)
+    finally:
+        torch.nn.functional.scaled_dot_product_attention = sdpa
+        for h in handles:
+            h.remove()
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
     return Trace(text, reduced, n, keep, model, layers_path, layers, list(RECORDER.calls), list(RECORDER.attn), ids,
                  logits, type(model).__name__)
@@ -434,7 +518,7 @@ def _inv_freqs(model):
         for bname, buf in mod.named_buffers(recurse=False):
             if bname.endswith("inv_freq") and "original" not in bname:
                 prefix = bname[: -len("inv_freq")]
-                scaling = getattr(mod, prefix + "attention_scaling", None)
+                scaling = getattr(mod, prefix + "attention_scaling", getattr(mod, "concentration", None))
                 if not isinstance(scaling, (int, float)):
                     scaling = 1.0
                 out.append((f"{path}.{bname}" if path else bname, buf.detach().float().clone(), float(scaling)))
@@ -487,9 +571,7 @@ def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
                 continue
             w = getattr(n.module, "weight", None)
             span = int(w.numel()) if w is not None else None
-            form = norm_formula(n, eps)
-            norm = {"module": n.path, "span": span, "formula": form[0] if form else None,
-                    "eps": form[1] if form else None}
+            norm = {**norm_fact(n, eps), "span": span}
             # Norm before the rotation: the norm reads the projection, the rotation reads the norm.
             if close(_as_heads(nin, heads, head_dim), raw):
                 normed = _as_heads(nout, heads, head_dim)
@@ -565,6 +647,32 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     f["softcap"] = float(softcap) if isinstance(softcap, (int, float)) and softcap else None
     f["sinks"] = torch.is_tensor(a.kwargs.get("s_aux")) or torch.is_tensor(getattr(a.module, "sinks", None))
     f["causal"] = bool(getattr(a.module, "is_causal", True))
+    if a.kwargs.get("observed_sdpa"):
+        mask = a.kwargs.get("attention_mask")
+        f["causal"] = bool(a.kwargs["is_causal"])
+        if mask is not None:
+            if mask.shape[-2:] != (s, s):
+                f["unknown"].append("native SDPA mask does not span the traced sequence")
+            else:
+                if mask.dtype == torch.bool:
+                    allowed = mask
+                else:
+                    blocked = torch.isneginf(mask) | (mask == torch.finfo(mask.dtype).min)
+                    if not torch.all((mask == 0) | blocked):
+                        f["unknown"].append("native SDPA uses an additive score bias beyond a causal mask")
+                    allowed = ~blocked
+                masks = allowed.reshape(-1, s, s)
+                positions = torch.arange(s, device=mask.device)
+                causal = positions[None, :] <= positions[:, None]
+                if a.kwargs["is_causal"]:
+                    masks = masks & causal
+                window = int(masks[0, -1].count_nonzero())
+                expected = causal & (positions[None, :] > positions[:, None] - window)
+                if window > 0 and torch.all(masks == expected):
+                    f["causal"] = True
+                    f["window"] = window if window < s else None
+                else:
+                    f["unknown"].append("native SDPA mask is not causal or a fixed causal window")
     # Output: o_proj reads the attention output, possibly gated by sigmoid of the second half of [q | gate].
     att_out = a.output.reshape(1, SEQ, n_q * hd_v) if a.output is not None else None
     later = [c for c in linears if c.order > a.order]
@@ -782,9 +890,7 @@ def analyze(trace):
     final_norm = next((c for c in after if _norm_like(c) and close(c.input, last.output)), None)
     facts["final_norm"] = None
     if final_norm is not None:
-        form = norm_formula(final_norm, eps)
-        facts["final_norm"] = {"module": final_norm.path, "formula": form[0] if form else None,
-                               "eps": form[1] if form else None}
+        facts["final_norm"] = norm_fact(final_norm, eps)
     else:
         facts["unknown"].append("no norm between the last block and the output projection")
     facts["logits"] = None
@@ -834,10 +940,8 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
               if not (not any(True for _ in c.module.parameters()) and close(c.input, c.output))]
     norms = [c for c in direct if _norm_like(c)]
     others = [c for c in direct if not _norm_like(c)]
-    def norm_fact(c):
-        form = norm_formula(c, eps)
-        return {"module": c.path, "formula": form[0] if form else None, "eps": form[1] if form else None,
-                "size": int(c.module.weight.numel())}
+    def branch_norm(c):
+        return {**norm_fact(c, eps), "size": int(c.module.weight.numel())}
 
     if not others and not norms and close(h_in, h_out):
         return Facts(index=index, unknown=[], absent=[], mixer={"kind": "none"}, ffn={"kind": "none"},
@@ -867,10 +971,10 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
                     b["unknown"].append("the only branch does not add to the input residual")
             b.update(mixer={"kind": "none"} if is_ffn else mixer_facts,
                      ffn=ffn_facts if is_ffn else {"kind": "none"},
-                     norm_before_mixer=None if is_ffn or before is None else norm_fact(before),
-                     norm_after_mixer=None if is_ffn or after is None else norm_fact(after),
-                     norm_before_ffn=norm_fact(before) if is_ffn and before else None,
-                     norm_after_ffn=norm_fact(after) if is_ffn and after else None)
+                     norm_before_mixer=None if is_ffn or before is None else branch_norm(before),
+                     norm_after_mixer=None if is_ffn or after is None else branch_norm(after),
+                     norm_before_ffn=branch_norm(before) if is_ffn and before else None,
+                     norm_after_ffn=branch_norm(after) if is_ffn and after else None)
             return b
     if len(others) != 2:
         b["unknown"].append(f"the block runs {len(others)} sub-modules besides its norms "
@@ -881,14 +985,14 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     b["ffn_module"] = ffn.path
 
     pre_mixer = next((n for n in norms if close(n.input, h_in) and close(n.output, mixer.input)), None)
-    b["norm_before_mixer"] = norm_fact(pre_mixer) if pre_mixer else None
+    b["norm_before_mixer"] = branch_norm(pre_mixer) if pre_mixer else None
     if pre_mixer is None:
         if close(mixer.input, h_in):
             b["absent"].append("no norm before the token mixer (it reads the residual stream directly)")
         else:
             b["unknown"].append("the token mixer does not read the block input or a norm of it")
     post_mixer = next((n for n in norms if n.order > mixer.order and close(n.input, mixer.output)), None)
-    b["norm_after_mixer"] = norm_fact(post_mixer) if post_mixer else None
+    b["norm_after_mixer"] = branch_norm(post_mixer) if post_mixer else None
     m_out = post_mixer.output if post_mixer else mixer.output
     h_mid = h_in.float() + m_out.float()
     pre_ffn = next((n for n in norms if n.order < ffn.order and n is not pre_mixer and close(n.output, ffn.input)),
@@ -909,14 +1013,14 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
             h_mid = h_in.float() + r * m_out.float()
         else:
             b["unknown"].append("the FFN's norm does not read the block input plus the mixer's output")
-    b["norm_before_ffn"] = norm_fact(pre_ffn) if pre_ffn else None
+    b["norm_before_ffn"] = branch_norm(pre_ffn) if pre_ffn else None
     if pre_ffn is None and not b["parallel"]:
         if close(ffn.input, h_mid):
             b["absent"].append("no norm before the FFN (it reads the residual stream directly)")
         else:
             b["unknown"].append("the FFN does not read the residual stream or a norm of it")
     post_ffn = next((n for n in norms if n.order > ffn.order and close(n.input, ffn.output)), None)
-    b["norm_after_ffn"] = norm_fact(post_ffn) if post_ffn else None
+    b["norm_after_ffn"] = branch_norm(post_ffn) if post_ffn else None
     f_out = (post_ffn.output if post_ffn else ffn.output).float()
     extra = [n for n in norms if n not in (pre_mixer, post_mixer, pre_ffn, post_ffn)]
     if extra:
@@ -960,6 +1064,10 @@ def describe_reference(model_id, revision=None, trust_remote_code=False):
     facts = analyze(trace)
     cfg = trace.config
     facts["config"] = {k: v for k, v in cfg.to_dict().items() if not k.startswith("_") or k == "_sliding_window_pattern"}
+    for key in ("layer_types", "interleaved_sliding_window"):
+        value = getattr(cfg, key, None)
+        if isinstance(value, (list, tuple)):
+            facts["config"][key] = list(value)
     facts["model_type"] = getattr(cfg, "model_type", None)
     return facts
 

@@ -1655,6 +1655,17 @@ test::TinyModelSpec latent_spec(int32_t q_rank) {
 
 }  // namespace
 
+TEST_CASE("Per-block latent head counts are refused before the uniform latent path can run") {
+    test::TinyModelSpec spec = latent_spec(64);
+    spec.block_heads = {2, 4};
+    auto file = MmapLoader::open(model_path("latent_varying_heads", spec));
+    REQUIRE(file.has_value());
+    auto config = describe_model(**file);
+    REQUIRE(!config.has_value());
+    CHECK(config.status().code() == ErrorCode::Unsupported);
+    CHECK(config.status().message().find("per-block latent attention head counts") != std::string::npos);
+}
+
 // Latent attention attends with absorbed queries over the cached [k_pe |
 // latent] rows; the model was trained with per-head keys and values
 // expanded from the latent. Both forms must give the same logits, the cache

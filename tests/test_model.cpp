@@ -231,7 +231,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     else w.add_i32_array(a + ".attention.head_count", s.block_heads);
     if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
     else w.add_i32_array(a + ".attention.head_count_kv", s.block_kv_heads);
-    if (!s.block_heads.empty()) w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
+    if (!s.block_heads.empty() && s.mla_kv_rank == 0) {
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
+    }
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));

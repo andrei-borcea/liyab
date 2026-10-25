@@ -39,6 +39,8 @@ must find the file's own encoding of the text, BOS included, equal to the refere
 afterwards, so the scratch tree stays a pristine copy and later runs rebuild only what changed. The row is accepted
 only if every check passes. The gate needs the GGUF as a local file (a BF16/F16 one: lower bit widths add their own
 error) and downloads the Hugging Face weights.
+For a local legacy checkpoint, --reference-state-dict passes conform_reference.py's --state-dict option through
+the gate, preserving nonpersistent buffers by constructing the model on CPU before loading its safetensors.
 
 Needs torch, transformers, huggingface_hub, numpy and gguf (for quantized tensors). Run with the toolchain on PATH
 (cmake, ninja) for --gate. --self-test checks the registry parser and printer against architecture.cpp (no network).
@@ -1186,7 +1188,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if facts.get("final_norm"):
         formulas.add(facts["final_norm"]["formula"])
     if None in formulas:
-        d.unknown.append("a norm whose formula is not RMSNorm (x w or x (1 + w)) or LayerNorm")
+        d.unknown.append("a norm whose formula is not RMSNorm with a scalar weight offset or LayerNorm")
     if "layer" in formulas:
         d.missing.append("LayerNorm (mean-centred, with a bias): the engine's norms are RMSNorms")
     if "rms_noweight" in formulas:
@@ -1222,7 +1224,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.unknown.append(f"no reference weights for {info['module']}")
                 continue
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if info["formula"] == "rms_1p" else w
+            want = w + info.get("weight_offset", 1.0 if info["formula"] == "rms_1p" else 0.0)
             hits = [s for s, v in candidates.items() if v.shape == want.shape and _rel_err(v, want) < 1e-2]
             if len(hits) == 1:
                 norm_names[r] = hits[0][: -len(".weight")]
@@ -1261,7 +1263,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             norm = (b["mixer"].get(side) or {}).get("norm")
             if not norm:
                 continue
-            if norm.get("formula") not in ("rms", "rms_1p"):
+            if norm.get("formula") not in ("rms", "rms_1p", "rms_offset"):
                 d.unknown.append(f"block {b['index']}: the {side} norm is not an RMSNorm (x w or x (1 + w))")
                 continue
             gname = f"blk.{b['index']}.{gsuffix}"
@@ -1270,7 +1272,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.file_issues.append(f"the reference normalizes {side}s, the GGUF has no {gname}")
             elif hname is not None:
                 w = ckpt.tensor(hname).reshape(-1)
-                want = w + 1.0 if norm["formula"] == "rms_1p" else w
+                want = w + norm.get("weight_offset", 1.0 if norm["formula"] == "rms_1p" else 0.0)
                 have = g.values(gname).reshape(-1)
                 if have.shape != want.shape or _rel_err(have, want) > 1e-2:
                     d.file_issues.append(f"{gname} does not hold the reference's {hname}"
@@ -1280,7 +1282,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         hname = ckpt.find(fn["module"].split(".", 1)[-1] + ".weight") or ckpt.find(fn["module"] + ".weight")
         if hname is not None:
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if fn["formula"] == "rms_1p" else w
+            want = w + fn.get("weight_offset", 1.0 if fn["formula"] == "rms_1p" else 0.0)
             if _rel_err(g.values("output_norm.weight").reshape(-1), want) > 1e-2:
                 d.file_issues.append(f"output_norm.weight does not hold the reference's {hname}"
                                      + (" as 1 + w" if fn["formula"] == "rms_1p" else ""))
@@ -1694,6 +1696,8 @@ def gate(args, d, row_text, arch, engine):
         cmd += ["--revision", args.revision]
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
+    if args.reference_state_dict:
+        cmd.append("--state-dict")
     # transformers' default attention kernel leaves a soft cap out: the reference then needs the eager one.
     if d.softcap and "--attn-implementation" in open(conform, encoding="utf-8").read():
         cmd += ["--attn-implementation", "eager"]
@@ -1800,6 +1804,8 @@ def main():
                         help="run modeling code shipped with the model (only for repositories you trust)")
     parser.add_argument("--gate", action="store_true", help="verify the row: build with it and run the conformance "
                                                             "checks (tokenizer ids, liyab-kl against transformers)")
+    parser.add_argument("--reference-state-dict", action="store_true",
+                        help="gate: construct a local reference checkpoint on CPU before loading safetensors")
     parser.add_argument("--source", default=REPO, help="Liyab source tree (default: this repository)")
     parser.add_argument("--scratch", default=os.path.join(REPO, "build", "describe_model"),
                         help="scratch copy and build for --gate (default: build/describe_model)")

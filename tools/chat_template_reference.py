@@ -68,6 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", action="append", required=True, help="NAME=TOKENIZER[:TEMPLATE]")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="run tokenizer code from trusted official model repositories")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -76,7 +78,7 @@ def main():
     for spec in args.model:
         name, rest = spec.split("=", 1)
         source, _, template_file = rest.partition(":")
-        tok = AutoTokenizer.from_pretrained(source)
+        tok = AutoTokenizer.from_pretrained(source, trust_remote_code=args.trust_remote_code)
         template = open(template_file, encoding="utf-8").read() if template_file else tok.chat_template
         if isinstance(template, dict):
             template = template.get("default")

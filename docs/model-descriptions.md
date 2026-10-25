@@ -96,6 +96,8 @@ The planner distinguishes softmax attention, a single linear residual projection
 FFNs are absent. Only softmax-attention blocks own KV slots. Scratch buffers and cache images use the maximum
 dimensions, with inactive KV heads stored as zeros; projections, normalization, grouped-query attention, key
 calibration and relocation use the active dimensions of the block.
+Latent attention still uses uniform head geometry; a file varying latent head counts is refused before loading
+the uniform projection path.
 Saved states include the file fingerprint when these arrays or modern scalar/rotation-pattern keys are present;
 models with different geometry or scales cannot exchange states just because their dimensions and file sizes match.
 For quantized KV caches, key calibration includes a conservative query-temperature gain over its covered context;
@@ -109,6 +111,17 @@ The tokenizer accepts the converter's integer Tekken scores as numeric values. T
 Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS, including Seed-OSS's integer dictionary keys and thinking-budget
 boundaries. `conform_reference.py` disables the unused generation cache during its single teacher-forced pass;
 this also avoids generation-cache API differences in older official model implementations.
+Its `--state-dict` option constructs a local model on CPU before loading safetensors and checks all parameters,
+including tied aliases. This retains the authors' nonpersistent rotary buffers when newer transformers pretrained
+loading does not. The trace observes native SDPA for classes that predate `AttentionInterface`, verifies repeated
+KV heads before collapsing them for analysis, and leaves the attention computation unchanged. Tiny-checkpoint JSON
+overrides run through the configuration constructor so nested block descriptions retain their required types.
+`describe_model.py --gate --reference-state-dict` passes the local CPU loader through to the gate's reference run.
+For RMSNorm weights with a scalar offset, the trace measures that offset against the full output and the tool
+checks the converter's folded weights. Native SDPA observation also verifies the actual causal/window mask;
+additional additive score biases remain unknown.
+`chat_template_reference.py --trust-remote-code` enables official custom tokenizer code when recording templates;
+the default still loads tokenizers without executing remote code.
 
 ## The conformance gate
 

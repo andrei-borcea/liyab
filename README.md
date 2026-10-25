@@ -146,6 +146,14 @@ The tokenizer also reads the integer scores the converter writes for Tekken. The
 GLM-4, Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS; scalar dictionary keys retain their Python types,
 including Seed-OSS's integer thinking-budget lookup. The reference tool disables the unused generation cache
 for its single teacher-forced pass.
+For old model classes with nonpersistent rotary buffers, `conform_reference.py --state-dict` constructs the local
+model on CPU and loads its safetensors directly, checking every parameter (including tied weights). Reference
+tracing can observe older models' native PyTorch SDPA calls when they predate transformers' attention interface.
+`describe_model.py --gate --reference-state-dict` uses that loader for a local checkpoint's conformance gate.
+Tiny-checkpoint JSON overrides pass through the configuration constructor, preserving nested block descriptions.
+The description tool measures scalar offsets in RMSNorm weights and verifies that conversion folds them into
+the stored weights. Native SDPA traces check causal/window masks and report additional score biases as unknown.
+`chat_template_reference.py --trust-remote-code` can record templates from trusted official custom tokenizers.
 
 The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
 Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
@@ -158,6 +166,7 @@ Per-block head counts and FFN widths can be scalar metadata or integer arrays. Z
 linear mixer projection (positive query heads) or no mixer (zero query heads); a zero FFN width omits that branch.
 Attention uses each block's own grouping. The existing KV image layout reserves the maximum KV-head count for
 each attention block and zero-pads unused heads, preserving the same sequence, rollback and saved-context paths.
+Latent attention retains uniform head geometry; files that vary its head counts are refused with a precise reason.
 Saved states of models with per-block geometry or explicit modern scalars also check the model-file fingerprint,
 so equal dimensions cannot mix contexts computed with different layouts or scales. Empty blocks create no streaming I/O items.
 

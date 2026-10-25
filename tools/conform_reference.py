@@ -35,6 +35,10 @@ metadata is compared with the model run with the same RoPE parameters, e.g.
 "eager", the default kernel leaves its attention soft cap out.
 The teacher-forced pass disables the generation cache: every position is
 computed in one call, so no cache state is needed or reused.
+--state-dict constructs a local checkpoint on CPU before loading its
+safetensors. Use it for legacy model classes whose nonpersistent rotary
+buffers are not preserved by transformers' meta-device pretrained loader.
+The model's forward implementation and checkpoint tensors are unchanged.
 
 --lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
 a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
@@ -44,6 +48,7 @@ convert the same adapter to GGUF and pass it to liyab-kl --lora. Needs peft
 
 import argparse
 import json
+import os
 import struct
 import sys
 
@@ -66,6 +71,8 @@ def main():
     parser.add_argument("--config", help="JSON object of configuration fields to set before the model is built")
     parser.add_argument("--attn-implementation", help='transformers attention kernel, e.g. "eager"')
     parser.add_argument("--lora", help="PEFT LoRA adapter (directory or id) applied to the model")
+    parser.add_argument("--state-dict", action="store_true",
+                        help="construct on CPU, then load a local safetensors checkpoint (legacy nonpersistent buffers)")
     args = parser.parse_args()
 
     import torch
@@ -86,9 +93,32 @@ def main():
     for field, value in json.loads(args.config or "{}").items():
         setattr(config, field, value)
     extra = {"attn_implementation": args.attn_implementation} if args.attn_implementation else {}
-    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
-                                                 dtype=getattr(torch, args.dtype),
-                                                 trust_remote_code=args.trust_remote_code, **extra)
+    if args.state_dict:
+        from safetensors.torch import load_file
+        if not os.path.isdir(args.model):
+            parser.error("--state-dict needs a local checkpoint directory")
+        model = AutoModelForCausalLM.from_config(config, dtype=getattr(torch, args.dtype),
+                                                trust_remote_code=args.trust_remote_code, **extra)
+        files = sorted(name for name in os.listdir(args.model) if name.endswith(".safetensors"))
+        if not files:
+            parser.error("--state-dict found no safetensors checkpoint")
+        loaded = set()
+        for name in files:
+            state = load_file(os.path.join(args.model, name))
+            _, unexpected = model.load_state_dict(state, strict=False)
+            if unexpected:
+                parser.error(f"unexpected checkpoint tensors: {unexpected}")
+            loaded.update(state)
+            del state
+        named = dict(model.named_parameters(remove_duplicate=False))
+        parameters = {id(named[name]) for name in loaded if name in named}
+        missing = [name for name, parameter in model.named_parameters() if id(parameter) not in parameters]
+        if missing:
+            parser.error(f"missing checkpoint parameters: {missing}")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, config=config,
+                                                     dtype=getattr(torch, args.dtype),
+                                                     trust_remote_code=args.trust_remote_code, **extra)
     if args.lora:
         from peft import PeftModel
 
