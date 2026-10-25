@@ -25,6 +25,11 @@ public:
     void add_bool_array(const std::string& key, const std::vector<bool>& v);
     // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
     void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
+    // Supplies valid encoded blocks for matrix tensors of one type that has
+    // no encoder. add_tensor() distributes these blocks by tensor and row, instead
+    // of quantizing values. Copies the bytes; other types and vectors keep
+    // their ordinary values. Empty or incomplete blocks abort the fixture.
+    void set_tensor_block_pattern(DType type, const std::vector<uint8_t>& blocks);
     // Writes the file; aborts the test binary on I/O failure.
     void write(const std::string& path) const;
 
@@ -38,6 +43,8 @@ private:
     std::vector<uint8_t> kv_;
     uint64_t n_kv_ = 0;
     std::vector<Tensor> tensors_;
+    DType block_pattern_type_ = DType::F32;
+    std::vector<uint8_t> block_pattern_;
 };
 
 struct TinyModelSpec {
@@ -182,6 +189,13 @@ struct TinyModelSpec {
     int32_t hc_count = 0;
     float rms_eps = 1e-5f;
     float compress_rope_base = 12345.0f;
+    // Optional encoded block pattern for attn_type matrices; supports reader
+    // formats without a quantizer. Empty preserves all existing fixtures.
+    std::vector<uint8_t> attention_block_pattern;
+    // Shared-KV fixtures: scale the input, query-latent and key/compressor
+    // norms to balance reader-only blocks against ordinary weight amplitude.
+    // Output/FFN norms stay unchanged. One preserves existing fixture bytes.
+    float attention_norm_scale = 1.0f;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
@@ -194,6 +208,17 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
 // streams. Dense FFNs and no learned sinks: it does not stand in for a full
 // V4 conformance checkpoint, whose MoE/sink parts are integrated separately.
 TinyModelSpec compressed_spec();
+
+// Encoded blocks and independent reference-decoder values from
+// tests/data/quant_vectors.bin (LIYAB_TEST_DATA overrides its directory).
+struct QuantVector {
+    DType type{};
+    int64_t n = 0;
+    std::vector<uint8_t> blocks;
+    std::vector<float> expected;
+};
+// False when absent; malformed fixture data also records a test failure.
+bool load_quant_vectors(std::vector<QuantVector>& out);
 
 }  // namespace liyab::test
 

@@ -412,9 +412,13 @@ against that trace. The component runner below supplies those dimensions directl
 does not substitute for that full-model description gate.
 
 `test_compression` independently recomputes whole windows and dense attention (including F16 main-cache
-rounding), exercises eight writable weight formats with attention and residual widths independent, and checks
+rounding), exercises all 26 storage formats with attention and residual widths independent, and checks
 decode splits, rollback and saved images in
 all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
+The shared test writer tiles encoded reference blocks for reader-only formats; their projection reference
+multiplies decoded weights and Q8-rounded activations directly, without calling the backend's dot kernels.
+Their attention norms balance the encoded blocks' measured RMS against the fixture's ordinary weight scale;
+output/FFN norms, the eight writable-format controls and the logit error bound remain unchanged.
 `tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
 
 | Component fixture | Tokens | Mean / max KL | Top-1 | CSA top-2 selections |

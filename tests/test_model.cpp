@@ -9,6 +9,7 @@
 #include <set>
 
 #include "core/quant.h"
+#include "test_util.h"
 
 namespace liyab::test {
 
@@ -114,6 +115,26 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
     const auto rows = static_cast<int64_t>(values.size()) / row;
     const size_t row_bytes = dtype_row_bytes(type, row);
     t.data.resize(row_bytes * static_cast<size_t>(rows));
+    if (!block_pattern_.empty() && type == block_pattern_type_ && t.ne.size() > 1) {
+        const auto traits = dtype_traits(type);
+        if (row % traits.block_size != 0) std::abort();
+        const size_t blocks = block_pattern_.size() / static_cast<size_t>(traits.block_bytes);
+        const size_t per_row = static_cast<size_t>(row / traits.block_size);
+        // A short cyclic pattern repeats at head/group boundaries and could
+        // hide an incorrect grouped-output slice. Vary blocks independently
+        // across rows and projections, deterministically from the tensor name.
+        std::seed_seq seed(name.begin(), name.end());
+        std::mt19937_64 pattern_rng(seed);
+        for (size_t r = 0; r < static_cast<size_t>(rows); ++r) {
+            for (size_t b = 0; b < per_row; ++b) {
+                std::memcpy(t.data.data() + (r * per_row + b) * static_cast<size_t>(traits.block_bytes),
+                            block_pattern_.data() + pattern_rng() % blocks * static_cast<size_t>(traits.block_bytes),
+                            static_cast<size_t>(traits.block_bytes));
+            }
+        }
+        tensors_.push_back(std::move(t));
+        return;
+    }
     if (type == DType::BF16) {  // quant::quantize_row has no BF16: the upper half, rounded to nearest even
         for (size_t i = 0; i < values.size(); ++i) {
             uint32_t bits = 0;
@@ -128,6 +149,13 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
         quant::quantize_row(type, values.data() + r * row, t.data.data() + static_cast<size_t>(r) * row_bytes, row);
     }
     tensors_.push_back(std::move(t));
+}
+
+void GgufWriter::set_tensor_block_pattern(DType type, const std::vector<uint8_t>& blocks) {
+    const auto traits = dtype_traits(type);
+    if (blocks.empty() || blocks.size() % static_cast<size_t>(traits.block_bytes) != 0) std::abort();
+    block_pattern_type_ = type;
+    block_pattern_ = blocks;
 }
 
 void GgufWriter::write(const std::string& path) const {
@@ -210,6 +238,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
 
     GgufWriter w;
+    if (!s.attention_block_pattern.empty()) w.set_tensor_block_pattern(s.attn_type, s.attention_block_pattern);
     const std::string& a = s.arch;
     w.add_string("general.architecture", a);
     w.add_string("general.name", "liyab-tiny-test");
@@ -329,6 +358,11 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         for (float& x : v) x += 1.0f;
         return v;
     };
+    auto attention_norm_weights = [&](int64_t n) {
+        auto v = norm_weights(n);
+        for (float& x : v) x *= s.attention_norm_scale;
+        return v;
+    };
 
     const int64_t d = s.n_embd;
     const int64_t hd = a == "deepseek4" && s.shared_head_dim > 0 ? s.shared_head_dim : d / s.n_head;
@@ -392,7 +426,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
+        w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, attention_norm_weights(d));
         if (s.hc_count > 0) {
             const int64_t h = s.hc_count, width = h * (2 + h);
             for (const char* part : {"hc_attn", "hc_ffn"}) {
@@ -420,10 +454,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         } else if (a == "deepseek4") {
             const int64_t qr = s.mla_q_rank, groups = s.shared_output_groups, rank = s.shared_output_rank;
             w.add_tensor(p + "attn_q_a.weight", {d, qr}, s.attn_type, random(d * qr, s.weight_scale));
-            w.add_tensor(p + "attn_q_a_norm.weight", {qr}, DType::F32, norm_weights(qr));
+            w.add_tensor(p + "attn_q_a_norm.weight", {qr}, DType::F32, attention_norm_weights(qr));
             w.add_tensor(p + "attn_q_b.weight", {qr, s.n_head * hd}, s.attn_type, random(qr * s.n_head * hd, s.weight_scale));
             w.add_tensor(p + "attn_kv.weight", {d, hd}, s.attn_type, random(d * hd, s.weight_scale));
-            w.add_tensor(p + "attn_kv_a_norm.weight", {hd}, DType::F32, norm_weights(hd));
+            w.add_tensor(p + "attn_kv_a_norm.weight", {hd}, DType::F32, attention_norm_weights(hd));
             w.add_tensor(p + "attn_output_a.weight", {s.n_head * hd / groups, groups * rank}, s.attn_type,
                          random(s.n_head * hd * rank, s.weight_scale));
             w.add_tensor(p + "attn_output_b.weight", {groups * rank, d}, s.attn_type, random(groups * rank * d, s.weight_scale));
@@ -434,13 +468,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 w.add_tensor(p + "attn_compressor_kv.weight", {d, width}, s.attn_type, random(d * width, s.weight_scale));
                 w.add_tensor(p + "attn_compressor_gate.weight", {d, width}, s.attn_type, random(d * width, s.weight_scale));
                 w.add_tensor(p + "attn_compressor_ape.weight", {width, stride}, DType::F32, random(width * stride, 0.1f));
-                w.add_tensor(p + "attn_compressor_norm.weight", {hd}, DType::F32, norm_weights(hd));
+                w.add_tensor(p + "attn_compressor_norm.weight", {hd}, DType::F32, attention_norm_weights(hd));
                 if (overlap) {
                     const int64_t id = s.index_dim;
                     w.add_tensor(p + "indexer_compressor_kv.weight", {d, 2 * id}, s.attn_type, random(d * 2 * id, s.weight_scale));
                     w.add_tensor(p + "indexer_compressor_gate.weight", {d, 2 * id}, s.attn_type, random(d * 2 * id, s.weight_scale));
                     w.add_tensor(p + "indexer_compressor_ape.weight", {2 * id, stride}, DType::F32, random(2 * id * stride, 0.1f));
-                    w.add_tensor(p + "indexer_compressor_norm.weight", {id}, DType::F32, norm_weights(id));
+                    w.add_tensor(p + "indexer_compressor_norm.weight", {id}, DType::F32, attention_norm_weights(id));
                     w.add_tensor(p + "indexer.attn_q_b.weight", {qr, s.index_heads * id}, s.attn_type,
                                  random(qr * s.index_heads * id, s.weight_scale));
                     w.add_tensor(p + "indexer.proj.weight", {d, s.index_heads}, s.attn_type, random(d * s.index_heads, s.weight_scale));
@@ -626,5 +660,57 @@ TinyModelSpec compressed_spec() {
     s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
     return s;
 }
+
+bool load_quant_vectors(std::vector<QuantVector>& out) {
+    std::string dir = LIYAB_TEST_DATA_DIR;
+    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
+    std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
+    if (f == nullptr) {
+        std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
+        return false;
+    }
+    std::vector<uint8_t> file;
+    uint8_t chunk[4096];
+    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
+    std::fclose(f);
+    const bool header = file.size() >= 12 && std::memcmp(file.data(), "LYQV\1\0\0\0", 8) == 0;
+    CHECK(header);
+    if (!header) return false;
+    size_t pos = 12;
+    auto take = [&](void* dst, size_t bytes) {
+        if (bytes > file.size() - pos) { CHECK(false); return false; }
+        std::memcpy(dst, file.data() + pos, bytes);
+        pos += bytes;
+        return true;
+    };
+    uint32_t count = 0;
+    std::memcpy(&count, file.data() + 8, 4);
+    for (uint32_t e = 0; e < count; ++e) {
+        uint32_t ggml = 0, n_blocks = 0;
+        if (!take(&ggml, 4) || !take(&n_blocks, 4)) return false;
+        CHECK(n_blocks > 0);
+        if (n_blocks == 0) return false;
+        QuantVector v;
+        const bool known = dtype_from_ggml(ggml, v.type);
+        CHECK(known);
+        if (!known) return false;
+        const DTypeTraits t = dtype_traits(v.type);
+        v.n = static_cast<int64_t>(n_blocks) * t.block_size;
+        const size_t block_bytes = static_cast<size_t>(n_blocks) * t.block_bytes;
+        const size_t expected_bytes = static_cast<size_t>(v.n) * sizeof(float);
+        if (block_bytes > file.size() - pos || expected_bytes > file.size() - pos - block_bytes) {
+            CHECK(false); return false;
+        }
+        v.blocks.resize(block_bytes);
+        if (!take(v.blocks.data(), block_bytes)) return false;
+        v.expected.resize(static_cast<size_t>(v.n));
+        if (!take(v.expected.data(), expected_bytes)) return false;
+        out.push_back(std::move(v));
+    }
+    CHECK(pos == file.size());
+    if (pos != file.size()) return false;
+    return true;
+}
+
 
 }  // namespace liyab::test

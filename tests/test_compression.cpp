@@ -90,7 +90,8 @@ Row compress(const Rows& kv, const Rows& gate, const Row& bias, int end, int str
 
 class Reference {
 public:
-    Reference(const MmapLoader& file, test::TinyModelSpec spec) : file_(file), spec_(std::move(spec)) {}
+    Reference(const MmapLoader& file, test::TinyModelSpec spec, bool quantized_inputs = false)
+        : file_(file), spec_(std::move(spec)), quantized_inputs_(quantized_inputs) {}
     Rows logits(const std::vector<int32_t>& tokens) const {
         const auto d = static_cast<size_t>(spec_.n_embd), heads = static_cast<size_t>(spec_.n_head);
         const size_t hd = spec_.shared_head_dim > 0 ? static_cast<size_t>(spec_.shared_head_dim) : d / heads;
@@ -111,15 +112,15 @@ public:
             const float base = stride > 0 ? spec_.compress_rope_base : spec_.rope_base;
             for (size_t t = 0; t < tokens.size(); ++t) {
                 input[t] = norm(x[t], weights(p + "attn_norm.weight"));
-                latent[t] = norm(linear(weights(p + "attn_q_a.weight"), input[t]), weights(p + "attn_q_a_norm.weight"));
-                q[t] = linear(weights(p + "attn_q_b.weight"), latent[t]);
+                latent[t] = norm(project(p + "attn_q_a.weight", input[t]), weights(p + "attn_q_a_norm.weight"));
+                q[t] = project(p + "attn_q_b.weight", latent[t]);
                 for (size_t h = 0; h < heads; ++h) {
                     Row head(q[t].begin() + static_cast<int64_t>(h * hd), q[t].begin() + static_cast<int64_t>((h + 1) * hd));
                     head = norm(head);
                     std::copy(head.begin(), head.end(), q[t].begin() + static_cast<int64_t>(h * hd));
                 }
                 rotate(q[t], spec_.n_head, spec_.rope_dim, static_cast<int>(t), base);
-                k[t] = norm(linear(weights(p + "attn_kv.weight"), input[t]), weights(p + "attn_kv_a_norm.weight"));
+                k[t] = norm(project(p + "attn_kv.weight", input[t]), weights(p + "attn_kv_a_norm.weight"));
                 rotate(k[t], 1, spec_.rope_dim, static_cast<int>(t), base);
                 for (float& value : k[t]) value = quant::fp16_to_fp32(quant::fp32_to_fp16(value));
             }
@@ -127,14 +128,14 @@ public:
             if (stride > 0) {
                 Rows kv(tokens.size()), gate(tokens.size()), ikv(tokens.size()), igate(tokens.size());
                 for (size_t t = 0; t < tokens.size(); ++t) {
-                    kv[t] = linear(weights(p + "attn_compressor_kv.weight"), input[t]);
-                    gate[t] = linear(weights(p + "attn_compressor_gate.weight"), input[t]);
+                    kv[t] = project(p + "attn_compressor_kv.weight", input[t]);
+                    gate[t] = project(p + "attn_compressor_gate.weight", input[t]);
                     if (overlap) {
-                        ikv[t] = linear(weights(p + "indexer_compressor_kv.weight"), input[t]);
-                        igate[t] = linear(weights(p + "indexer_compressor_gate.weight"), input[t]);
-                        index_queries[t] = linear(weights(p + "indexer.attn_q_b.weight"), latent[t]);
+                        ikv[t] = project(p + "indexer_compressor_kv.weight", input[t]);
+                        igate[t] = project(p + "indexer_compressor_gate.weight", input[t]);
+                        index_queries[t] = project(p + "indexer.attn_q_b.weight", latent[t]);
                         rotate(index_queries[t], spec_.index_heads, spec_.rope_dim, static_cast<int>(t), base);
-                        index_weights[t] = linear(weights(p + "indexer.proj.weight"), input[t]);
+                        index_weights[t] = project(p + "indexer.proj.weight", input[t]);
                     }
                 }
                 for (int end = stride; end <= static_cast<int>(tokens.size()); end += stride) {
@@ -199,10 +200,11 @@ public:
                 const Row wa = weights(p + "attn_output_a.weight");
                 for (size_t group = 0; group < groups; ++group) {
                     Row part = linear(Row(wa.begin() + static_cast<int64_t>(group * rank * cols), wa.begin() + static_cast<int64_t>((group + 1) * rank * cols)),
-                                      Row(attended.begin() + static_cast<int64_t>(group * cols), attended.begin() + static_cast<int64_t>((group + 1) * cols)));
+                                      projection_input(file_.tensor(p + "attn_output_a.weight")->type,
+                                          Row(attended.begin() + static_cast<int64_t>(group * cols), attended.begin() + static_cast<int64_t>((group + 1) * cols))));
                     grouped.insert(grouped.end(), part.begin(), part.end());
                 }
-                output[t] = linear(weights(p + "attn_output_b.weight"), grouped);
+                output[t] = project(p + "attn_output_b.weight", grouped);
             }
             if (hc > 0) {
                 mix(streams, output, post, comb);
@@ -212,9 +214,9 @@ public:
             }
             for (size_t t = 0; t < x.size(); ++t) {
                 Row normalized = norm(x[t], weights(p + "ffn_norm.weight"));
-                Row gate = linear(weights(p + "ffn_gate.weight"), normalized), up = linear(weights(p + "ffn_up.weight"), normalized);
+                Row gate = project(p + "ffn_gate.weight", normalized), up = project(p + "ffn_up.weight", normalized);
                 for (size_t j = 0; j < gate.size(); ++j) gate[j] = gate[j] / (1 + std::exp(-gate[j])) * up[j];
-                output[t] = linear(weights(p + "ffn_down.weight"), gate);
+                output[t] = project(p + "ffn_down.weight", gate);
             }
             if (hc > 0) mix(streams, output, post, comb);
             else for (size_t t = 0; t < x.size(); ++t) for (size_t j = 0; j < d; ++j) x[t][j] += output[t][j];
@@ -230,11 +232,36 @@ public:
                 }
             }
         }
-        for (Row& row : x) row = linear(weights("output.weight"), norm(row, weights("output_norm.weight")));
+        for (Row& row : x) row = project("output.weight", norm(row, weights("output_norm.weight")));
         return x;
     }
 
 private:
+    // Independently multiply decoded weights and the actual activation
+    // values. Raw encoded fixtures can have a much wider range than trained
+    // weights; include the backend's documented Q8 activation rounding, not
+    // its dot kernels, so the bound measures projection/index/compression
+    // correctness rather than quantization error between different inputs.
+    Row projection_input(DType type, const Row& input) const {
+        if (!quantized_inputs_ || !quant::is_block_quantized(type)) return input;
+        Row decoded(input.size());
+        const auto n = static_cast<int64_t>(input.size());
+        if (quant::uses_q8_K(type) && n % quant::kSuperBlock == 0) {
+            std::vector<quant::BlockQ8_K> blocks(input.size() / quant::kSuperBlock);
+            quant::quantize_row_q8_K(input.data(), blocks.data(), n);
+            for (size_t b = 0; b < blocks.size(); ++b) for (size_t j = 0; j < quant::kSuperBlock; ++j) {
+                decoded[b * quant::kSuperBlock + j] = blocks[b].d * blocks[b].qs[j];
+            }
+        } else {
+            std::vector<quant::BlockQ8_0> blocks(input.size() / quant::kBlock);
+            quant::quantize_row_q8_0(input.data(), blocks.data(), n);
+            quant::dequantize_row(DType::Q8_0, blocks.data(), decoded.data(), n);
+        }
+        return decoded;
+    }
+    Row project(const std::string& name, const Row& input) const {
+        return linear(weights(name), projection_input(file_.tensor(name)->type, input));
+    }
     Row weights(const std::string& name) const {
         const TensorView* tensor = file_.tensor(name);
         Row out(static_cast<size_t>(tensor->elements()));
@@ -283,6 +310,7 @@ private:
     }
     const MmapLoader& file_;
     test::TinyModelSpec spec_;
+    bool quantized_inputs_ = false;
 };
 }  // namespace
 
@@ -366,20 +394,54 @@ TEST_CASE("Compressed windows survive decode splits, rollback and context images
 }
 
 TEST_CASE("Shared-KV quantized projections match independent dequantized computation") {
-    for (const DType type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4_0,
-                            DType::Q4_1, DType::Q4_K, DType::Q5_K}) {
+    std::vector<test::QuantVector> formats;
+    REQUIRE(test::load_quant_vectors(formats));
+    for (const DType type : {DType::F32, DType::F16}) {
+        test::QuantVector fixture;
+        fixture.type = type;
+        formats.push_back(std::move(fixture));
+    }
+    size_t checked = 0;
+    std::vector<DType> seen;
+    for (const auto& fixture : formats) {
+        const DType type = fixture.type;
+        REQUIRE(std::find(seen.begin(), seen.end(), type) == seen.end());
+        seen.push_back(type);
         auto spec = test::compressed_spec();
         spec.n_embd = 512;
         spec.shared_head_dim = 256;  // attention width 1024 differs from residual width 512
         spec.n_ff = 256;
         spec.mla_q_rank = spec.shared_output_rank = 256;
         spec.index_dim = 128;
-        spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = type;
+        const bool writable = type == DType::F32 || type == DType::F16 || type == DType::BF16 ||
+            type == DType::Q8_0 || type == DType::Q4_0 || type == DType::Q4_1 ||
+            type == DType::Q4_K || type == DType::Q5_K;
+        spec.attn_type = type;
+        if (writable) {
+            spec.ffn_type = spec.embd_type = spec.output_type = type;
+        } else {
+            // Existing independent decoder fixtures supply valid payloads for
+            // reader-only formats. Keep unrelated FFN/head/embedding weights
+            // F32; every attention/compressor/indexer/grouped-output matrix
+            // runs in the format being checked.
+            spec.attention_block_pattern = fixture.blocks;
+            // Decoder stress blocks have order-one weights, unlike this
+            // fixture's 0.02-scale projections. Balance attention's weighted
+            // norms by the measured block RMS, keeping output/FFN norms and
+            // the logit error bound unchanged. Otherwise float summation
+            // differences cascade through Q8 rounding into large changes.
+            double variance = 0;
+            for (float value : fixture.expected) variance += double{value} * value;
+            REQUIRE(variance > 0 && std::isfinite(variance));
+            spec.attention_norm_scale = spec.weight_scale /
+                static_cast<float>(std::sqrt(variance / fixture.expected.size()));
+            spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        }
         test::write_tiny_model(path(), spec);
         auto file = MmapLoader::open(path()), reference_file = MmapLoader::open(path());
         REQUIRE(file); REQUIRE(reference_file);
         const std::vector<int32_t> tokens{3, 23, 47, 67, 89, 101, 123, 149, 157, 181, 199, 211, 229};
-        const Rows expected = Reference(*reference_file.value(), spec).logits(tokens);
+        const Rows expected = Reference(*reference_file.value(), spec, !writable).logits(tokens);
         TransformerOptions options; options.kv_type = KvCacheType::F16;
         options.repack_cpu = quant::repack_kernels_available();
         auto model = Transformer::load(std::move(file).value(), options); REQUIRE(model);
@@ -387,11 +449,15 @@ TEST_CASE("Shared-KV quantized projections match independent dequantized computa
         auto actual = model.value()->forward(tokens, Transformer::Logits::All, route, pool); REQUIRE(actual);
         double error = 0;
         for (size_t t = 0; t < expected.size(); ++t) for (size_t j = 0; j < expected[t].size(); ++j) {
+            REQUIRE(std::isfinite(expected[t][j]));
+            REQUIRE(std::isfinite((*actual)[t * expected[t].size() + j]));
             error = std::max(error, std::fabs(double{(*actual)[t * expected[t].size() + j]} - expected[t][j]));
         }
         std::printf("  shared-KV %s max logit error %.9g\n", std::string(dtype_traits(type).name).c_str(), error);
         CHECK(error < 0.03);
+        ++checked;
     }
+    CHECK(checked == 26);
     std::remove(path().c_str());
 }
 

@@ -2216,7 +2216,8 @@ the 512-token component stack at the trained head/index widths measures mean KL 
 an isolated first-layer CSA test matches all 512 top-2 selections. These fixtures explicitly use dense FFNs
 and omit learned sinks; they do not establish full DeepSeek-V4 support. Projections use the normal backend
 route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
-AVX2 and scalar). Quantized component tests also cover attention widths different from the residual width.
+AVX2 and scalar). Component projection tests cover all 26 storage formats and attention widths different
+from the residual width, using amplitude-balanced encoded block fixtures for formats without a writer.
 Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
 every position in every block, including nonclosing positions; memory planning includes that cost.
 

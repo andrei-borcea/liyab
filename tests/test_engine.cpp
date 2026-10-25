@@ -516,53 +516,8 @@ TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") 
     }
 }
 
-// One entry of tests/data/quant_vectors.bin (written by tools/gen_quant_vectors.py):
-// encoded blocks of a GGML format and the values llama.cpp's reference decodes.
-struct QuantVector {
-    DType type{};
-    int64_t n = 0;  // values
-    std::vector<uint8_t> blocks;
-    std::vector<float> expected;
-};
-
-// Reads every entry; false (with a "skipped" note) when the file is absent.
-bool load_quant_vectors(std::vector<QuantVector>& out) {
-    std::string dir = LIYAB_TEST_DATA_DIR;
-    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
-    std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
-    if (f == nullptr) {
-        std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
-        return false;
-    }
-    std::vector<uint8_t> file;
-    uint8_t chunk[4096];
-    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
-    std::fclose(f);
-    CHECK(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
-    if (file.size() <= 12) return false;
-    size_t pos = 12;
-    uint32_t count = 0;
-    std::memcpy(&count, file.data() + 8, 4);
-    for (uint32_t e = 0; e < count; ++e) {
-        uint32_t ggml = 0, n_blocks = 0;
-        std::memcpy(&ggml, file.data() + pos, 4);
-        std::memcpy(&n_blocks, file.data() + pos + 4, 4);
-        pos += 8;
-        QuantVector v;
-        const bool known = dtype_from_ggml(ggml, v.type);
-        CHECK(known);
-        if (!known) return false;
-        const DTypeTraits t = dtype_traits(v.type);
-        v.n = static_cast<int64_t>(n_blocks) * t.block_size;
-        v.blocks.assign(file.data() + pos, file.data() + pos + static_cast<size_t>(n_blocks) * t.block_bytes);
-        pos += v.blocks.size();
-        v.expected.resize(static_cast<size_t>(v.n));
-        std::memcpy(v.expected.data(), file.data() + pos, v.expected.size() * 4);
-        pos += v.expected.size() * 4;
-        out.push_back(std::move(v));
-    }
-    return true;
-}
+using test::QuantVector;
+using test::load_quant_vectors;
 
 TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
     std::vector<QuantVector> vectors;
