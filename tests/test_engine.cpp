@@ -1220,6 +1220,53 @@ TEST_CASE("GPU backends (Metal / Vulkan) agree with the CPU backend") {
   }
 }
 
+TEST_CASE("Classic CPU operations compose with GPU projections through prefill, decode and rollback") {
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        for (const std::string arch : {"gpt2", "falcon", "bloom", "apertus"}) {
+            auto spec = test::classic_model_spec(arch);
+            spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F16;
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            const auto path = model_path("classic_gpu_" + arch, spec);
+            auto reference = load_transformer(path, options), accelerated = load_transformer(path, options);
+            REQUIRE(reference != nullptr && accelerated != nullptr);
+            // Destroy the accelerator before the models whose mapped weights
+            // it borrows, even when its buffer cache retains registrations.
+            auto accelerator = make();
+            if (!accelerator) {
+                std::printf("  skipped: %s\n", accelerator.status().to_string().c_str());
+                break;
+            }
+            ThreadPool pool(4);
+            auto cpu = make_cpu_backend(pool);
+            const Route plain{cpu.get(), cpu.get(), cpu.get()};
+            const Route mixed{cpu.get(), accelerator.value().get(), accelerator.value().get()};
+            auto compare = [&](const std::vector<int32_t>& ids) {
+                auto a = reference->forward(ids, Transformer::Logits::All, plain, pool);
+                auto b = accelerated->forward(ids, Transformer::Logits::All, mixed, pool);
+                if (!a || !b) {
+                    std::printf("  %s: CPU %s; accelerator %s\n", arch.c_str(),
+                                a ? "ok" : a.status().to_string().c_str(), b ? "ok" : b.status().to_string().c_str());
+                    return false;
+                }
+                if (a->size() != b->size()) return false;
+                double scale = 1.0, error = 0.0;
+                for (size_t i = 0; i < a->size(); ++i) {
+                    if (!std::isfinite((*a)[i]) || !std::isfinite((*b)[i])) return false;
+                    scale = std::max(scale, std::fabs(static_cast<double>((*a)[i])));
+                    error = std::max(error, std::fabs(static_cast<double>((*a)[i]) - (*b)[i]));
+                }
+                if (error > 1e-3 * scale) std::printf("  %s: relative GPU error %.6g\n", arch.c_str(), error / scale);
+                return error <= 1e-3 * scale;
+            };
+            REQUIRE(compare({1, 270, 280, 290, 300, 271}));
+            REQUIRE(compare({280}));
+            REQUIRE(reference->truncate(3).is_ok() && accelerated->truncate(3).is_ok());
+            REQUIRE(compare({272, 273}));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
@@ -1567,6 +1614,17 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         const double m = 1.0 + static_cast<double>(0.0707f) * std::log(4.0);
         CHECK(d.attn_scale == static_cast<float>(1.0f / std::sqrt(32.0f) * m * m));
     }
+}
+
+TEST_CASE("describe_model refuses a gated xIELU variant instead of choosing another activation") {
+    auto spec = test::classic_model_spec("apertus");
+    spec.ungated = false;
+    auto file = MmapLoader::open(model_path("gated_xielu", spec));
+    REQUIRE(file.has_value());
+    auto described = describe_model(**file);
+    REQUIRE(!described.has_value());
+    CHECK(described.status().code() == ErrorCode::Unsupported);
+    CHECK(described.status().message().find("gated xIELU FFN in block 0") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -2740,10 +2798,15 @@ TEST_CASE("Classic models: batching and rollback preserve every logit on every K
     for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = 3 + static_cast<int32_t>((i * 37) % 280);
     for (const std::string arch : {"gpt2", "gptneox", "falcon", "bloom", "mpt", "starcoder", "starcoder2", "phi2",
                                   "stablelm", "orion", "olmo", "command-r", "nemotron", "apertus", "arcee", "dbrx"}) {
+        auto spec = test::classic_model_spec(arch);
+        if (arch == "arcee") {
+            spec.n_ff = 67;  // batch/decode boundaries put different values in SIMD tails
+            spec.ffn_type = DType::F32;
+        }
         for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
             TransformerOptions options;
             options.kv_type = kv;
-            const auto& path = model_path("classic_batch_" + arch, test::classic_model_spec(arch));
+            const auto& path = model_path("classic_batch_" + arch, spec);
             auto batch = load_transformer(path, options), step = load_transformer(path, options);
             REQUIRE(batch && step);
             auto all = batch->forward(tokens, Transformer::Logits::All, route, pool);
@@ -2759,6 +2822,33 @@ TEST_CASE("Classic models: batching and rollback preserve every logit on every K
             auto replay = batch->forward(std::span(tokens).subspan(65), Transformer::Logits::All, route, pool);
             REQUIRE(replay.has_value());
             CHECK(std::memcmp(replay->data(), saved.data() + 65 * vocab, replay->size_bytes()) == 0);
+        }
+    }
+}
+
+TEST_CASE("Gated ReLU squared: fused and split biased projections agree across SIMD tails") {
+    auto spec = test::classic_model_spec("arcee");
+    spec.ungated = false;
+    spec.projection_bias = true;
+    spec.n_ff = 67;
+    spec.ffn_type = DType::F32;
+    const auto split_path = model_path("relu2_split_tail", spec);
+    spec.fused_gate_up = true;
+    const auto fused_path = model_path("relu2_fused_tail", spec);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = kv;
+        auto split = load_transformer(split_path, options), fused = load_transformer(fused_path, options);
+        REQUIRE(split && fused);
+        for (const std::vector<int32_t> ids : {std::vector<int32_t>{1, 270, 280, 290, 300, 271, 272, 273},
+                                              std::vector<int32_t>{274}}) {
+            auto a = split->forward(ids, Transformer::Logits::All, route, pool);
+            auto b = fused->forward(ids, Transformer::Logits::All, route, pool);
+            REQUIRE(a && b && a->size() == b->size());
+            CHECK(std::memcmp(a->data(), b->data(), a->size_bytes()) == 0);
         }
     }
 }

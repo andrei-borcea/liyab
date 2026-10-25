@@ -92,6 +92,7 @@ class Recorder:
     counter: int = 0
     clamps: list = field(default_factory=list)
     norm_eps: dict = field(default_factory=dict)
+    gelu_modes: list = field(default_factory=list)
 
     def next(self):
         self.counter += 1
@@ -389,7 +390,13 @@ class NativeAttentionTrace(TorchFunctionMode):
         if any(rec.module is module for rec in RECORDER.attn):
             return out  # AttentionInterface already recorded this invocation.
         name = func.__name__
-        if name == "layer_norm":
+        if name == "gelu":
+            approximate = kwargs.get("approximate", args[1] if len(args) > 1 else "none")
+            if approximate in ("none", "tanh"):
+                source = args[0] if args else kwargs["input"]
+                RECORDER.gelu_modes.append((module, "gelu" if approximate == "none" else "gelu_tanh",
+                                           source.detach().clone(), out.detach().clone()))
+        elif name == "layer_norm":
             RECORDER.norm_eps[module] = float(kwargs.get("eps", args[4] if len(args) > 4 else 1e-5))
         elif name in ("clamp", "clamp_"):
             lo = kwargs.get("min", args[1] if len(args) > 1 else None)
@@ -474,6 +481,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     RECORDER.attn.clear()
     RECORDER.clamps.clear()
     RECORDER.norm_eps.clear()
+    RECORDER.gelu_modes.clear()
     handles = []
     stack = []
     for path, mod in model.named_modules():
@@ -504,7 +512,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
             # Observe their eager operations through the same numerical trace.
             model.set_attn_implementation("eager")
             stack.clear()
-            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear(); RECORDER.norm_eps.clear()
+            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear(); RECORDER.norm_eps.clear(); RECORDER.gelu_modes.clear()
             with torch.no_grad(), NativeAttentionTrace(stack):
                 out = model(input_ids=ids, use_cache=False)
     finally:
@@ -654,6 +662,20 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     f = Facts(kind="attention")
     _, n_q, s, hd = a.query.shape
     n_kv = a.key.shape[1]
+    key_states, value_states = a.key, a.value
+    # Eager implementations may expand GQA keys/values before the observed
+    # score product. Recover their logical groups only when every repeated
+    # key AND value agrees bit for bit; projection matching then proves it.
+    if a.value.shape[1] == n_kv:
+        for groups in range(1, n_kv):
+            if n_kv % groups:
+                continue
+            keys = a.key.reshape(a.key.shape[0], groups, n_kv // groups, s, hd)
+            values = a.value.reshape(a.value.shape[0], groups, n_kv // groups, s, a.value.shape[-1])
+            if torch.equal(keys, keys[:, :, :1].expand_as(keys)) and torch.equal(values, values[:, :, :1].expand_as(values)):
+                key_states, value_states = keys[:, :, 0], values[:, :, 0]
+                n_kv = groups
+                break
     hd_v = a.value.shape[-1]
     f.update(heads=n_q, kv_heads=n_kv, head_dim=hd, value_head_dim=hd_v, unknown=[])
     linears = _linears(block_calls, mixer_path)
@@ -680,11 +702,11 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                 views.append((call, how, v.clamp(-cap, cap) if cap else v))
         return views
 
-    key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
+    key = _match_rotated(key_states, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
     query = _match_rotated(a.query, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
     value = None
     for call, how, v in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
-        if close(v, a.value):
+        if close(v, value_states):
             value = {"projection": call.path, "projection_layout": how}
             break
     f["key"] = key
@@ -738,6 +760,20 @@ def analyze_dense_ffn(ffn_call, block_calls):
         return Facts(kind="dense", unknown=["the FFN's output is not one projection's output"])
     first = [c for c in lin if c is not down and close(c.input, x)]
     d_in = down.input.float()
+    modules = {ffn_call.module} | {c.module for c in block_calls if _is_descendant(c.path, ffn_call.path)}
+
+    def activation_allowed(name, source, multiply=None):
+        # Tiny norm scales can make erf/tanh GELU numerically indistinguishable.
+        # An observed GELU call linked exactly to the down input establishes
+        # its mode independently of that approximation tolerance.
+        modes = set()
+        for module, mode, x, y in RECORDER.gelu_modes:
+            if module not in modules or not torch.equal(x.float(), source.float()):
+                continue
+            linked = y.float() if multiply is None else y.float() * multiply.float()
+            if torch.equal(linked, d_in):
+                modes.add(mode)
+        return not modes or name in modes
     for c in first:
         for activation in block_calls:
             m = activation.module
@@ -757,7 +793,7 @@ def analyze_dense_ffn(ffn_call, block_calls):
     for act_name, act in ACTIVATIONS.items():
         for g in first:
             for u in first:
-                if g is not u and close(act(g.output.float()) * u.output.float(), d_in):
+                if g is not u and activation_allowed(act_name, g.output, u.output) and close(act(g.output.float()) * u.output.float(), d_in):
                     return Facts(kind="dense", gated=True, fused_gate_up=False, activation=act_name,
                                  gate=g.path, up=u.path, down=down.path,
                                  biases=any(getattr(c.module, "bias", None) is not None for c in (g, u, down)),
@@ -767,12 +803,12 @@ def analyze_dense_ffn(ffn_call, block_calls):
             if o.shape[-1] == 2 * d_in.shape[-1]:
                 h = d_in.shape[-1]
                 for order, (gp, up) in (("gate_first", (o[..., :h], o[..., h:])), ("up_first", (o[..., h:], o[..., :h]))):
-                    if close(act(gp) * up, d_in):
+                    if activation_allowed(act_name, gp, up) and close(act(gp) * up, d_in):
                         return Facts(kind="dense", gated=True, fused_gate_up=True, fused_order=order,
                                      activation=act_name, gate=c.path, up=c.path, down=down.path,
                                      biases=any(getattr(m.module, "bias", None) is not None for m in (c, down)),
                                      unknown=[])
-            if close(act(o), d_in):
+            if activation_allowed(act_name, o) and close(act(o), d_in):
                 return Facts(kind="dense", gated=False, activation=act_name, up=c.path, down=down.path, unknown=[])
     return Facts(kind="dense", unknown=["the FFN is not down(act(gate) * up) or down(act(up)) for a known activation"])
 

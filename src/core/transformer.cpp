@@ -127,6 +127,47 @@ float xielu(float x, const XIeluScalars& p) {
     return (em1 - x) * p.alpha_n + p.beta * x;
 }
 
+#if defined(LIYAB_USE_AVX2)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma,f16c")))
+#endif
+size_t relu_avx2(const float* x, const float* up, float* out, size_t n, bool squared) {
+    const __m256 zero = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 input = _mm256_loadu_ps(x + i);
+        // Comparison/select preserves std::max(x, 0)'s signed zero and NaN.
+        __m256 value = _mm256_blendv_ps(input, zero, _mm256_cmp_ps(input, zero, _CMP_LT_OQ));
+        if (squared) value = _mm256_mul_ps(value, value);
+        if (up != nullptr) value = _mm256_mul_ps(value, _mm256_loadu_ps(up + i));
+        _mm256_storeu_ps(out + i, value);
+    }
+    return i;
+}
+#endif
+
+// ReLU / ReLU², optionally times an up projection. out may equal x.
+void relu_activation(const float* x, const float* up, float* out, size_t n, bool squared) {
+    size_t i = 0;
+#if defined(LIYAB_USE_AVX2)
+    if (quant::x86::avx2_enabled()) i = relu_avx2(x, up, out, n, squared);
+#elif defined(__ARM_NEON)
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t input = vld1q_f32(x + i);
+        float32x4_t value = vbslq_f32(vcltq_f32(input, zero), zero, input);
+        if (squared) value = vmulq_f32(value, value);
+        if (up != nullptr) value = vmulq_f32(value, vld1q_f32(up + i));
+        vst1q_f32(out + i, value);
+    }
+#endif
+    for (; i < n; ++i) {
+        float value = std::max(x[i], 0.0f);
+        if (squared) value *= value;
+        out[i] = up != nullptr ? value * up[i] : value;
+    }
+}
+
 // An ungated FFN's activation, in place over n values: act(x).
 void ungated_activation(FfnActivation act, const XIeluScalars* scalars, float* x, size_t n) {
     switch (act) {
@@ -137,13 +178,8 @@ void ungated_activation(FfnActivation act, const XIeluScalars* scalars, float* x
             for (size_t i = 0; i < n; ++i) x[i] = gelu_erf(x[i]);
             return;
         case FfnActivation::Relu:
-            for (size_t i = 0; i < n; ++i) x[i] = std::max(x[i], 0.0f);
-            return;
         case FfnActivation::ReluSquared:
-            for (size_t i = 0; i < n; ++i) {
-                const float r = std::max(x[i], 0.0f);
-                x[i] = r * r;
-            }
+            relu_activation(x, nullptr, x, n, act == FfnActivation::ReluSquared);
             return;
         case FfnActivation::XIelu:
             for (size_t i = 0; i < n; ++i) x[i] = xielu(x[i], *scalars);
@@ -159,7 +195,11 @@ void gated_activation(FfnActivation act, const float* gate, const float* up, flo
         for (size_t i = 0; i < n; ++i) out[i] = gelu_tanh(gate[i]) * up[i];
         return;
     }
-    if (act == FfnActivation::Gelu || act == FfnActivation::Relu || act == FfnActivation::ReluSquared) {
+    if (act == FfnActivation::Relu || act == FfnActivation::ReluSquared) {
+        relu_activation(gate, up, out, n, act == FfnActivation::ReluSquared);
+        return;
+    }
+    if (act == FfnActivation::Gelu) {
         for (size_t i = 0; i < n; ++i) {
             float g = gate[i];
             ungated_activation(act, nullptr, &g, 1);
@@ -821,8 +861,14 @@ Status Transformer::bind_weights() {
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, norm_weights, L.attn_norm));
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.bias"), c.n_embd, false, L.attn_norm_b));
+        auto has_norm = [&](std::string_view name) {
+            return f.tensor(block_tensor(l, std::string(name) + ".weight")) != nullptr ||
+                   f.tensor(block_tensor(l, std::string(name) + ".bias")) != nullptr;
+        };
+        const std::string_view attn_norm = plan.parallel && !has_norm(c.spec->attn_norm) && has_norm(c.spec->ffn_norm)
+                                               ? c.spec->ffn_norm : c.spec->attn_norm;
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".weight"), c.n_embd, norm_weights, L.attn_norm));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".bias"), c.n_embd, false, L.attn_norm_b));
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -897,9 +943,11 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
         }
         // A parallel block may have no FFN norm of its own: its FFN reads the mixer's normed input.
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd,
-                                  norm_weights && !plan.parallel, L.ffn_norm));
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
+        if (!plan.parallel || attn_norm != c.spec->ffn_norm) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd,
+                                      norm_weights && !plan.parallel, L.ffn_norm));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
+        }
         if (!c.spec->post_mixer_norm.empty()) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
                                       false, L.post_mixer_norm));

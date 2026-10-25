@@ -486,7 +486,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm")
 
 
 def _close(a, b, rel=1e-5):
@@ -1167,8 +1167,18 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.unknown.append(f"several tensors of block {i} hold the reference's {hname}: {hits}")
     elif b0 is not None:
         d.unknown.append("cannot tell which GGUF tensor holds which norm without the reference weights")
-    if placement.get("norm_before_mixer") and norm_names.get("norm_before_mixer") not in (None, "attn_norm"):
-        d.missing.append(f"the norm before the mixer is {norm_names['norm_before_mixer']}, the engine binds attn_norm")
+    observed_mixer_norm = norm_names.get("norm_before_mixer")
+    existing_norms = engine.rows.get(g.arch, ({},))[0]
+    mixer_norm = observed_mixer_norm or "attn_norm"
+    registered_mixer = existing_norms.get("attn_norm", "attn_norm")
+    shared_fallback = b0 and b0.get("parallel") and not placement.get("norm_before_ffn") and \
+        observed_mixer_norm == existing_norms.get("ffn_norm") and not any(
+            f"{registered_mixer}{suffix}" in ts for ts in blocks.values() for suffix in (".weight", ".bias"))
+    if shared_fallback:
+        mixer_norm = registered_mixer
+    d.set("attn_norm", mixer_norm, "shared parallel norm: the registered alternate mixer tensor is absent" if shared_fallback
+          else "the mixer's norm tensor matched to the reference" if observed_mixer_norm
+          else "the mixer's norm has no parameters; its optional tensor name is unused")
     if placement.get("norm_before_ffn"):
         if "norm_before_ffn" in norm_names:
             d.set("ffn_norm", norm_names["norm_before_ffn"],
@@ -1181,10 +1191,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         # An absent FFN norm has no name to establish. Keep the registered
         # optional name if it is absent from the file, else use ffn_norm.
         name = existing[0].get("ffn_norm") if existing else "ffn_norm"
-        if any(f"{name}.weight" in ts or f"{name}.bias" in ts for ts in blocks.values()):
+        if name != observed_mixer_norm and any(f"{name}.weight" in ts or f"{name}.bias" in ts for ts in blocks.values()):
             d.file_issues.append(f"the FFN shares its attention norm, but the file has an extra {name}")
         else:
-            d.set("ffn_norm", name, "the parallel FFN shares the mixer's norm (no FFN norm tensors)")
+            d.set("ffn_norm", name, "the parallel FFN shares the mixer's norm (no separate FFN norm tensors)")
     parallels = {bool(b.get("parallel")) for b in bf if "mixer" in b}
     if len(parallels) == 1:
         parallel = next(iter(parallels))
@@ -1388,7 +1398,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.unknown.append(f"{n}: not established")
 
     # --- every tensor must be bound (the norms' names come from the row, so only once they are known) ---
-    norm_fields = ("ffn_norm", "post_mixer_norm", "post_ffn_norm")
+    norm_fields = ("attn_norm", "ffn_norm", "post_mixer_norm", "post_ffn_norm")
     if no_ffn_norm:
         pass  # the block's structure is already not the engine's
     elif all(f in d.fields for f in norm_fields):

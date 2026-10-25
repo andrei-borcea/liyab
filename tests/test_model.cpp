@@ -405,8 +405,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        if (!s.no_norm_weights) w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
-        bias(p + "attn_norm.bias", d, s.norm_bias);
+        const std::string attn_norm = a == "falcon" && !s.shared_parallel_norm ? "attn_norm_2" : "attn_norm";
+        if (!s.no_norm_weights) w.add_tensor(p + attn_norm + ".weight", {d}, DType::F32, norm_weights(d));
+        bias(p + attn_norm + ".bias", d, s.norm_bias);
         if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
@@ -508,7 +509,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
         const bool post_attention = a == "qwen35" || a == "qwen35moe";
-        const std::string ffn_norm = a == "falcon" ? "attn_norm_2" : a == "dbrx" ? "attn_output_norm" :
+        const std::string ffn_norm = a == "falcon" ? "attn_norm" : a == "dbrx" ? "attn_output_norm" :
                                      post_attention ? "post_attention_norm" : "ffn_norm";
         if (!s.shared_parallel_norm) {
             if (!s.no_norm_weights) w.add_tensor(p + ffn_norm + ".weight", {d}, DType::F32, norm_weights(d));

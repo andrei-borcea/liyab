@@ -135,14 +135,13 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     const ArchSpec* spec = architecture ? find_architecture(*architecture) : nullptr;
     tok.add_space_prefix_ = spec == nullptr || spec->spm_add_space_prefix_default;
     std::span<const uint8_t> charsmap = spec == nullptr ? std::span<const uint8_t>() : SpmNormalizer::registered_map(spec->spm_charsmap);
-    if (spec != nullptr && !spec->spm_charsmap.empty() && charsmap.empty()) {
-        return Status(ErrorCode::Unsupported, "unregistered SentencePiece character map");
-    }
     if (const GgufValue* map = model.metadata("tokenizer.ggml.precompiled_charsmap")) {
         if (map->type != GgufValue::Type::Array || map->array_type != GgufValue::Type::U8) {
             return Status(ErrorCode::InvalidModel, "tokenizer.ggml.precompiled_charsmap must be a byte array");
         }
         charsmap = {map->array_data, static_cast<size_t>(map->array_size)};
+    } else if (spec != nullptr && !spec->spm_charsmap.empty() && charsmap.empty()) {
+        return Status(ErrorCode::Unsupported, "unregistered SentencePiece character map");
     }
     auto normalizer = SpmNormalizer::load(charsmap);
     if (!normalizer) return normalizer.status();

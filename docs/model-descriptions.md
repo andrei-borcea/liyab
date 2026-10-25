@@ -336,3 +336,22 @@ implementations that require a materialized mask (such as MPT) to expose their s
 LayerNorm epsilon is taken from the observed function call when the reference supplies it there, including
 parameterless OLMo norms whose modules have no epsilon attribute.
 Scalar checkpoint tensors are read as scalars too, so per-block xIELU parameters are verified against the file.
+
+`ArchSpec::attn_norm` names the mixer's norm independently of `ffn_norm`. A parallel block whose mixer norm
+is absent uses the FFN norm as its shared input norm; otherwise each branch normalizes the block input with its
+own tensor. This reads the published Falcon layouts: `ln_attn` is stored as `attn_norm_2`, and `ln_mlp` as
+`attn_norm`, while Falcon-7B stores one shared `attn_norm`. The description tool matches each tensor to its
+reference norm's weights and verifies both roles. The unused alternate name of a shared-norm checkpoint remains
+the registered default until a two-norm checkpoint establishes it.
+When eager attention expands grouped keys/values before the score product, the trace recovers logical KV
+groups only after both repeated keys and values agree bit for bit, then matches them to their projections.
+An observed GELU function's mode is authoritative when its input and output link exactly to the FFN projections;
+small activations can otherwise make erf and tanh approximations indistinguishable at the trace's tolerance.
+The xIELU path is the ungated FFN described above; files requesting a gated xIELU FFN are refused explicitly.
+Synthetic F16 GPT-2, Falcon, BLOOM and Apertus models compare CPU execution with GPU projections plus CPU
+operations through prefill, decode and rollback; available Metal/Vulkan backends use the existing operation routing.
+ReLU and ReLU² have NEON and runtime-dispatched AVX2 kernels with scalar tails, for ungated and gated FFNs.
+Comparison/select retains the scalar signed-zero and NaN behavior. Their arithmetic order stays unchanged;
+GELU and xIELU keep scalar libm for the transcendental functions so pinned rounded results remain portable.
+Odd FFN widths check ReLU² scalar tails against different batch boundaries and compare fused/split biased
+gated projections on every KV type.

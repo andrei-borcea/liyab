@@ -90,15 +90,16 @@ constexpr ArchSpec kArchitectures[] = {
      .ffn_activation = FfnActivation::Gelu,
      .norm = NormKind::Layer,
      .parallel_residual = true},
-    // Falcon: parallel blocks, one shared norm (7B) or ln_mlp as attn_norm_2
-    // (40B and later), multi-query attention, exact GELU.
+    // Falcon: parallel blocks, one shared norm (7B), or ln_attn stored as
+    // attn_norm_2 and ln_mlp as attn_norm (40B); exact GELU.
     {.name = "falcon",
      .rope = RopeLayout::Halves,
-     .ffn_norm = "attn_norm_2",
+     .ffn_norm = "attn_norm",
      .moe_norm_weights = false,
      .ffn_activation = FfnActivation::Gelu,
      .norm = NormKind::Layer,
-     .parallel_residual = true},
+     .parallel_residual = true,
+     .attn_norm = "attn_norm_2"},
     // BLOOM: ALiBi (maximum bias 8), a LayerNorm on the embeddings, GELU (tanh).
     {.name = "bloom",
      .rope = RopeLayout::Adjacent,
@@ -534,6 +535,9 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
                               f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
+        }
+        if (c.spec->ffn_activation == FfnActivation::XIelu && b.ffn != FfnKind::Ungated) {
+            return Status(ErrorCode::Unsupported, "gated xIELU FFN in block " + std::to_string(l) + " is not implemented");
         }
     }
     if (c.n_attn_layers < c.n_layers) {

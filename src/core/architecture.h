@@ -140,6 +140,10 @@ struct ArchSpec {
     // token types along with the omitted character map; empty, or explicit
     // character-map metadata: the GGUF's types fully describe them.
     std::string_view spm_user_defined = "";
+    // Norm before the mixer. A parallel block with this tensor absent uses
+    // ffn_norm as its shared input norm; two present tensors keep their own
+    // roles (Falcon stores ln_attn as attn_norm_2 and ln_mlp as attn_norm).
+    std::string_view attn_norm = "attn_norm";
 };
 
 // Every architecture Liyab runs, in registry order.

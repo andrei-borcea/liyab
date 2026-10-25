@@ -2481,6 +2481,14 @@ Benchmarks and tools built with the tests:
   Architecture traces use explicit causal masks so eager score implementations can be observed alongside
   transformers' attention registry, observe the actual LayerNorm epsilon when it is a function argument,
   and check scalar activation parameters against the checkpoint and GGUF.
+  Parallel blocks bind mixer and FFN norms independently, with a shared input norm when one tensor is absent.
+  Attention traces recognize repeated GQA keys and values before matching their source projections.
+  Observed GELU modes distinguish exact erf from tanh even when tiny inputs make their outputs nearly equal.
+  Classic host operations are checked with GPU projections through prefill, decode and rollback as well.
+  LayerNorm affine steps and ReLU/ReLU² have NEON, dispatched AVX2 and scalar paths; GELU/xIELU retain scalar
+  libm for their rounded transcendental functions.
+  Odd FFN widths exercise SIMD tails across batching and fused/split projections on every KV type.
+  Unsupported gated xIELU FFNs are refused when describing the file.
 
   ```bash
   tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
