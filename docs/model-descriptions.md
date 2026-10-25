@@ -281,6 +281,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| SmolLM3-3B (F16, b11819 conversion of revision `a07cc9a`) | registry's `smollm3`, exact | 498 / 797 / 165, identical | 497 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 
@@ -290,7 +291,10 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 | :--- | :--- |
 | OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
 | Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
-| SmolLM3 3B (`smollm3`) | blocks without RoPE (block 3 of the 4 traced; the configuration's `no_rope_layers` lists every 4th); the `smaug-bpe` pre-tokenizer |
+
+SmolLM3 moved out of this table after adding its unrotated blocks and `smaug-bpe` pre-tokenizer. The tool now
+proposes its registered row exactly and its full F16 checkpoint passes the gate above; its 14 chat-template
+fixtures also render byte for byte like transformers.
 
 Gemma 2 and DeepSeek-V2 were in this table until the engine gained what the tool listed for them: logit
 soft-capping (Gemma 2), and multi-head latent attention, YaRN and the file's attention scale (DeepSeek-V2). The

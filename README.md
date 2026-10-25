@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -437,6 +437,9 @@ What the port does differently from the POSIX platforms:
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already, for Gemma 2 too;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE;
+  * `smollm3` (SmolLM3-3B): every fourth block leaves Q/K unrotated; its `smaug-bpe` tokenizer and own chat
+    template match transformers. The real F16 checkpoint passes `describe_model.py --gate` with identical
+    498 prompt IDs, mean KL 0.00000 and 100% top-1 agreement; projections use the existing CPU/Metal/Vulkan routes;
   * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
     proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
     The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
@@ -2714,7 +2717,7 @@ Implemented features are described above. These are next, in order:
   expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
   its keys unscaled (the key scales are measured on a text it cannot encode).
-  `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see
+  `tools/describe_model.py` lists what each model lacks; for OLMo 2 and Granite, see
   [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
 * **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long
   prompt's attention differently (each repeats its own bits run after run). A pass's form also follows its
