@@ -300,14 +300,18 @@ class Checkpoint:
         info = header[name]
         dtype, size = self.DTYPES[info["dtype"]]
         begin, end = info["data_offsets"]
-        shape = list(info["shape"])
+        scalar = not info["shape"]
+        shape = list(info["shape"]) or [1]
         row_bytes = (end - begin) // max(shape[0], 1)
         rows = shape[0] - first_row if rows is None else rows
+        if first_row < 0 or rows < 0 or first_row + rows > shape[0]:
+            raise FormatError(f"{name}: tensor row range is outside its shape")
         raw = src.read_at(start + begin + first_row * row_bytes, rows * row_bytes)
         arr = np.frombuffer(raw, dtype=dtype)
         if info["dtype"] == "BF16":
             arr = (arr.astype(np.uint32) << 16).view(np.float32)
-        return arr.astype(np.float32).reshape([rows] + shape[1:])
+        values = arr.astype(np.float32).reshape([rows] + shape[1:])
+        return values.reshape(()) if scalar and rows == 1 else values
 
 
 # ----------------------------------------------------------------------------------------------------------------

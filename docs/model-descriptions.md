@@ -331,3 +331,8 @@ normalization and remain indivisible during BPE; this is what preserves tabs, ne
 Files carrying an explicit character map use their own token types instead of the fallback.
 SentencePiece byte fallback follows BYTE token types, not token spelling. Without them, consecutive unknown
 characters form one unknown token; normal vocabulary entries spelled `<0xXX>` decode literally.
+The trace registers an explicit eager causal mask while evaluating captured attention with SDPA, allowing
+implementations that require a materialized mask (such as MPT) to expose their score operations too.
+LayerNorm epsilon is taken from the observed function call when the reference supplies it there, including
+parameterless OLMo norms whose modules have no epsilon attribute.
+Scalar checkpoint tensors are read as scalars too, so per-block xIELU parameters are verified against the file.

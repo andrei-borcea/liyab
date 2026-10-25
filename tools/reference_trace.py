@@ -91,6 +91,7 @@ class Recorder:
     attn: list = field(default_factory=list)
     counter: int = 0
     clamps: list = field(default_factory=list)
+    norm_eps: dict = field(default_factory=dict)
 
     def next(self):
         self.counter += 1
@@ -122,7 +123,7 @@ def _register_attention():
     """Registers ATTN_IMPL: records the attention's inputs and arguments, then runs transformers' SDPA path."""
     from transformers import AttentionInterface
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
-    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, eager_mask
 
     def traced(module, query, key, value, attention_mask, **kwargs):
         rec = AttnCall(RECORDER.next(), module, query.detach().clone(), key.detach().clone(),
@@ -136,7 +137,10 @@ def _register_attention():
         return out, weights
 
     AttentionInterface.register(ATTN_IMPL, traced)
-    ALL_MASK_ATTENTION_FUNCTIONS.register(ATTN_IMPL, sdpa_mask)
+    # An explicit mask also works for eager implementations that cast it to
+    # bool. SDPA's optional None fast path would make those fail before the
+    # observed score operations; the trace itself still runs SDPA.
+    ALL_MASK_ATTENTION_FUNCTIONS.register(ATTN_IMPL, eager_mask)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -271,6 +275,8 @@ ACTIVATIONS = {
 
 
 def _eps_of(module, fallback):
+    if module in RECORDER.norm_eps:
+        return RECORDER.norm_eps[module]
     for k in ("variance_epsilon", "eps", "epsilon"):
         v = getattr(module, k, None)
         if isinstance(v, float):
@@ -383,7 +389,9 @@ class NativeAttentionTrace(TorchFunctionMode):
         if any(rec.module is module for rec in RECORDER.attn):
             return out  # AttentionInterface already recorded this invocation.
         name = func.__name__
-        if name in ("clamp", "clamp_"):
+        if name == "layer_norm":
+            RECORDER.norm_eps[module] = float(kwargs.get("eps", args[4] if len(args) > 4 else 1e-5))
+        elif name in ("clamp", "clamp_"):
             lo = kwargs.get("min", args[1] if len(args) > 1 else None)
             hi = kwargs.get("max", args[2] if len(args) > 2 else None)
             if isinstance(lo, (float, int)) and isinstance(hi, (float, int)) and hi > 0 and lo == -hi:
@@ -465,6 +473,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     RECORDER.calls.clear()
     RECORDER.attn.clear()
     RECORDER.clamps.clear()
+    RECORDER.norm_eps.clear()
     handles = []
     stack = []
     for path, mod in model.named_modules():
@@ -495,7 +504,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
             # Observe their eager operations through the same numerical trace.
             model.set_attn_implementation("eager")
             stack.clear()
-            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear()
+            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear(); RECORDER.norm_eps.clear()
             with torch.no_grad(), NativeAttentionTrace(stack):
                 out = model(input_ids=ids, use_cache=False)
     finally:

@@ -2478,6 +2478,9 @@ Benchmarks and tools built with the tests:
   gives the model's own ids on three texts and `liyab-kl --kv f16` passes against transformers. How each fact is
   established and what the tool said about the supported architectures and others:
   [docs/model-descriptions.md](docs/model-descriptions.md).
+  Architecture traces use explicit causal masks so eager score implementations can be observed alongside
+  transformers' attention registry, observe the actual LayerNorm epsilon when it is a function argument,
+  and check scalar activation parameters against the checkpoint and GGUF.
 
   ```bash
   tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
