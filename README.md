@@ -2488,6 +2488,7 @@ Benchmarks and tools built with the tests:
   LayerNorm affine steps and ReLU/ReLU² have NEON, dispatched AVX2 and scalar paths; GELU/xIELU retain scalar
   libm for their rounded transcendental functions.
   Odd FFN widths exercise SIMD tails across batching and fused/split projections on every KV type.
+  Reference traces also bound typed child FFN/expert configurations, keeping original residual/head dimensions.
   Unsupported gated xIELU FFNs are refused when describing the file.
 
   ```bash

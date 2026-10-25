@@ -218,6 +218,23 @@ def reduced_config(config):
             count = max(EXPERTS, top_k + 1)
             count = ((count + groups - 1) // groups) * groups
             setattr(cfg, k, min(v, count))
+    # Typed child configurations can own expert widths/counts too (DBRX).
+    # Keep the residual width for matching the original file, but bound the
+    # randomly constructed FFNs just as the top-level ones are bounded.
+    for child in vars(cfg).values():
+        if not hasattr(child, "to_dict"):
+            continue
+        child_top_k = max([getattr(child, key) for key in TOP_K_KEYS
+                           if isinstance(getattr(child, key, None), int)] or [top_k])
+        for key, value in list(vars(child).items()):
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if value > FFN and ("intermediate_size" in key or key in ("n_inner", "ffn_hidden_size", "ffn_dim", "d_ff")):
+                setattr(child, key, FFN)
+            elif key in EXPERT_COUNT_KEYS and value > EXPERTS:
+                groups = getattr(child, "n_group", None) or 1
+                count = max(EXPERTS, child_top_k + 1)
+                setattr(child, key, min(value, ((count + groups - 1) // groups) * groups))
     return cfg, keep, n
 
 

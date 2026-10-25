@@ -355,3 +355,6 @@ Comparison/select retains the scalar signed-zero and NaN behavior. Their arithme
 GELU and xIELU keep scalar libm for the transcendental functions so pinned rounded results remain portable.
 Odd FFN widths check ReLU² scalar tails against different batch boundaries and compare fused/split biased
 gated projections on every KV type.
+The reference trace reduces FFN widths and expert counts in typed child configurations too. Original residual
+and head dimensions remain intact for matching file geometry; nested DBRX FFNs no longer allocate the full
+expert widths while describing an architecture without its weights.
