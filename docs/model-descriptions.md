@@ -363,3 +363,39 @@ smokes stopped after coherent analysis because the generic `<|end|>` fallback wa
 F16 and block-streamed Q8_0 runs now complete the final answer in 32 generated tokens. A token trace passes
 through `<|end|>` into the final channel and stops at `<|return|>`; the export’s complete stop set equals the
 author’s generation_config.json: return, end-of-text and tool handoff.
+
+The final post-Harmony performance gate compares fixed main/branch binaries with a separate warmup followed by
+six balanced AB/BA pairs per configuration, four CPU threads and greedy generation. All 84 measured pairs
+(14 configurations, 26 metrics) pass ±3%; every CLI run produces 128 tokens with identical reply bytes,
+prompt/generated/forced/prefix counts, and the same reply across trials. Raw output is kept as bytes, with
+reversible UTF-8 decoding. Binary SHA256s and modification times are checked before and after the matrix.
+The coordinated CPU/GPU slot permitted one background HTTP download capped at 819200 bytes/s, plus checksums;
+these measurements do not claim zero concurrent downloads. No configuration required a rerun.
+BF16 under the Metal route retains CPU matrix fallback; the shared F16 files confirm actual Metal attention
+and FFN routing. CPU `liyab-bench` uses 512 synthetic tokens, Q8_0 KV and the best of three repeats; CLI uses
+F16 KV, the fixed conformance text and the separately retained ordinary-question prompt. The table gives
+medians of throughput, while each Δ is the median of the six paired percentage changes, not their ratio.
+
+| Model | Weights / route / prompt | Prefill main → branch (tok/s) | Paired Δ | Decode main → branch (tok/s) | Paired Δ |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | BF16 / CPU / synthetic512, Q8_0 KV | 85.500 → 85.500 | +0.000% | — | — |
+| Qwen3-0.6B | BF16 / CPU / conform, F16 KV | 88.017 → 88.000 | -0.086% | 52.414 → 52.251 | -0.011% |
+| Qwen3-0.6B | BF16 / CPU matrix fallback under Metal route / conform, F16 KV | 88.066 → 87.952 | -0.178% | 52.439 → 51.859 | -0.472% |
+| Qwen3-0.6B | F16 / true Metal / conform, F16 KV | 248.417 → 246.855 | -0.514% | 26.297 → 26.370 | -0.428% |
+| Qwen3-0.6B | BF16 / CPU / question, F16 KV | 93.151 → 93.086 | -0.170% | 59.566 → 59.041 | -0.699% |
+| Qwen3-0.6B | BF16 / CPU matrix fallback under Metal route / question, F16 KV | 93.035 → 92.801 | -0.039% | 59.181 → 59.522 | +0.814% |
+| Qwen3-0.6B | F16 / true Metal / question, F16 KV | 289.386 → 288.349 | -0.157% | 31.505 → 31.410 | -0.446% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / synthetic512, Q8_0 KV | 36.800 → 36.750 | -0.272% | — | — |
+| Llama-3.2-1B-Instruct | BF16 / CPU / conform, F16 KV | 37.521 → 37.416 | -0.169% | 27.774 → 27.679 | -0.191% |
+| Llama-3.2-1B-Instruct | BF16 / CPU matrix fallback under Metal route / conform, F16 KV | 37.435 → 37.419 | -0.096% | 27.670 → 27.657 | -0.027% |
+| Llama-3.2-1B-Instruct | F16 / true Metal / conform, F16 KV | 149.573 → 148.955 | -0.398% | 32.608 → 32.383 | -0.751% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / question, F16 KV | 37.971 → 37.919 | -0.093% | 28.483 → 28.404 | -0.276% |
+| Llama-3.2-1B-Instruct | BF16 / CPU matrix fallback under Metal route / question, F16 KV | 37.973 → 37.897 | -0.194% | 28.463 → 28.453 | -0.035% |
+| Llama-3.2-1B-Instruct | F16 / true Metal / question, F16 KV | 154.698 → 153.843 | -0.425% | 33.078 → 33.073 | -0.210% |
+
+MXFP4 component measurements run sequentially after the model pairs, with a separate warmup and six balanced
+pairs of 100000 iterations at width 4096 and four activation rows. Shared prefill preserves every output bit
+of the four independent decode dots. NEON's paired median speedup is 1.652249× (47.222 → 28.575 ms), AVX2 under
+Rosetta 1.196605× (683.064 → 570.839 ms), and scalar under Rosetta 1.001263× (1241.818 → 1239.361 ms). Scalar
+retains its single-row implementation; no scalar speedup or whole-model GPT-OSS speedup is inferred. Earlier
+noisy trials and pre-Harmony-fix measurements are retained separately and are not used for this final gate.
