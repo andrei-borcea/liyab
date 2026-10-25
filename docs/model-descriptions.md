@@ -341,3 +341,10 @@ converter supplies BOS 6 while tokenizer.json inserts BOS 2. No `bailingmoe2` ro
 same-token gate fails on the first ID. Its old weight-alias list and nonpersistent RoPE buffer also need
 local transformers 5 reference compatibility repairs, preserved with the report. This is independent of
 the stage-2 group-limited Ling 2.0 family.
+
+Final validation includes the published GPT-OSS-20B MXFP4 file, using its official Harmony rendering: resident
+F16 KV and forced triple-buffered Q8_0 KV return the same coherent greedy reply. Its numerical gate remains the
+representative F32 tiny checkpoint; no real-model KL result is inferred from that smoke. Sixty golden cases
+pass on NEON-dotprod, AVX2 and scalar without moving previous entries. All fourteen native and both x86 test
+targets pass; the Android experimental build also passes. The saved reproduction recipe was rerun from pinned
+upstream revisions for both GPT-OSS and DeepSeek-MoE v1, reproducing their stated conformance and tokenizer results.

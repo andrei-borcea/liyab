@@ -2864,3 +2864,9 @@ byte-level BPE. Its parts are implemented, but Sarvam is not added to the archit
 BOS ID 6 while the author's tokenizer.json postprocessor inserts ID 2. A diagnostic reference-token comparison
 passes KL 0.00000/top-1 100.00%; it does not pass the required identical-token gate. The converter/tokenizer
 metadata conflict must be resolved before claiming support.
+
+The published ggml-org GPT-OSS-20B MXFP4 GGUF also produces the same coherent greedy reply through its own
+Harmony template with resident F16 KV and forced block streaming with Q8_0 KV. This is a real-model smoke check;
+the numerical conformance table above uses the random-weight F32 checkpoints. Sixty golden cases are pinned for
+NEON-dotprod, x86 AVX2 and x86 scalar, preserving every earlier hash. The final native and both x86 test suites
+pass all fourteen targets, including sequence and KV-store reuse, and the Android experimental build passes.
