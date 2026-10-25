@@ -77,11 +77,12 @@ struct Row {
     std::initializer_list<StepSpec> steps;
     bool nfc;
     bool ignore_merges;
+    bool metaspace_bpe = false;  // ranked Unicode BPE, spaces mapped to U+2581
     bool right_digits3 = false;  // decimal runs grouped in threes from their right end
 };
 
-const std::array<Row, 15>& table() {
-    static const std::array<Row, 15> rows = {{
+const std::array<Row, 16>& table() {
+    static const std::array<Row, 16> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -99,8 +100,9 @@ const std::array<Row, 15>& table() {
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
         {{"glm4"}, {{kLlama3, true}}, false, true},
         {{"exaone-moe"}, {{kExaoneMoe, true}}, true, false},
-        {{"afmoe"}, {{kAfmoeScripts, true}, {kDeepSeekV3Words, true}}, false, false, true},
+        {{"afmoe"}, {{kAfmoeScripts, true}, {kDeepSeekV3Words, true}}, false, false, false, true},
         {{"bailingmoe"}, {{kBailingMoe, true}}, true, false},
+        {{"sarvam-moe"}, {}, false, false, true},
     }};
     return rows;
 }
@@ -135,6 +137,7 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
         pre.right_digits3_ = row.right_digits3;
+        pre.metaspace_bpe_ = row.metaspace_bpe;
         for (const StepSpec& step : row.steps) {
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());

@@ -2857,3 +2857,10 @@ Their old remote code needs local transformers 5 compatibility repairs for saved
 RoPE buffers. The automatic description tool refuses these legacy references because their hard-coded
 attention-class tables do not expose its registered attention function; these two rows are verified by
 converter tensor permutations, source inspection and end-to-end conformance instead.
+
+The `sarvam-moe` tokenizer uses Unicode-symbol ranked BPE, replaces spaces with `▁` without adding a prefix,
+and falls back to `<0xXX>` bytes for missing characters after merging. This shares the ranked merge engine with
+byte-level BPE. Its parts are implemented, but Sarvam is not added to the architecture registry: b11819 writes
+BOS ID 6 while the author's tokenizer.json postprocessor inserts ID 2. A diagnostic reference-token comparison
+passes KL 0.00000/top-1 100.00%; it does not pass the required identical-token gate. The converter/tokenizer
+metadata conflict must be resolved before claiming support.

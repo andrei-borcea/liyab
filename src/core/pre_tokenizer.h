@@ -44,6 +44,9 @@ public:
     // piece unless a step drops what lies between its matches.
     void split(std::string_view text, std::vector<std::string_view>& pieces) const;
 
+    // Unicode-symbol ranked BPE: spaces become U+2581, with no initial prefix;
+    // absent characters fall back to <0xXX> bytes after merging.
+    [[nodiscard]] bool metaspace_bpe() const noexcept { return metaspace_bpe_; }
     [[nodiscard]] bool nfc() const noexcept { return nfc_; }
     [[nodiscard]] bool ignore_merges() const noexcept { return ignore_merges_; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
@@ -58,6 +61,7 @@ private:
     std::vector<Step> steps_;
     bool nfc_ = false;
     bool ignore_merges_ = false;
+    bool metaspace_bpe_ = false;
     bool right_digits3_ = false;  // isolate decimal runs into groups of three aligned at their right end
 };
 

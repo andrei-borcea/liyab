@@ -134,6 +134,19 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     }
     if (tok.bos_ < 0) tok.add_bos_ = false;
 
+    if (tok.kind_ == Kind::Gpt2) {
+        // A GGUF without tokenizer.ggml.pre predates the key: GPT-2's scheme, as the format defines.
+        const auto pre = model.get_string("tokenizer.ggml.pre");
+        auto scheme = PreTokenizer::for_name(pre ? *pre : std::string_view("default"));
+        if (scheme) {
+            tok.pre_.emplace(std::move(scheme).value());
+        } else {
+            tok.pre_error_ = scheme.status();
+            LIYAB_LOG_WARN("%s: text cannot be encoded, token ids only", tok.pre_error_.message().c_str());
+        }
+    }
+    const bool metaspace_bpe = tok.pre_ && tok.pre_->metaspace_bpe();
+
     tok.pieces_.resize(n);
     tok.lookup_.reserve(n);
     const auto& byte_decoder = gpt2_byte_decoder();
@@ -145,7 +158,7 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         if (type == kControl || type == kUnused) continue;
 
         uint8_t byte = 0;
-        if (tok.kind_ == Kind::Spm) {
+        if (tok.kind_ == Kind::Spm || (metaspace_bpe && type != kUserDefined)) {
             if ((type == kByte || type == kNormal) && parse_byte_token(text, byte)) {
                 piece.assign(1, static_cast<char>(byte));
                 continue;
@@ -178,15 +191,6 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         }
     }
     if (tok.kind_ == Kind::Gpt2) {
-        // A GGUF without tokenizer.ggml.pre predates the key: GPT-2's scheme, as the format defines.
-        const auto pre = model.get_string("tokenizer.ggml.pre");
-        auto scheme = PreTokenizer::for_name(pre ? *pre : std::string_view("default"));
-        if (scheme) {
-            tok.pre_.emplace(std::move(scheme).value());
-        } else {
-            tok.pre_error_ = scheme.status();
-            LIYAB_LOG_WARN("%s: text cannot be encoded, token ids only", tok.pre_error_.message().c_str());
-        }
         const GgufValue* merges = model.metadata("tokenizer.ggml.merges");
         if (merges == nullptr || merges->array_type != GgufValue::Type::String) {
             return Status(ErrorCode::InvalidModel, "BPE vocabulary without tokenizer.ggml.merges");
@@ -209,7 +213,9 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         }
         const auto& encoder = gpt2_byte_encoder();
         for (size_t b = 0; b < 256; ++b) {
-            const auto it = tok.lookup_.find(encoder[b]);
+            char fallback[8];
+            std::snprintf(fallback, sizeof fallback, "<0x%02X>", static_cast<unsigned>(b));
+            const auto it = tok.lookup_.find(metaspace_bpe ? std::string_view(fallback) : std::string_view(encoder[b]));
             tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
         }
     }
@@ -434,6 +440,13 @@ void Tokenizer::encode_bpe(std::string_view text, std::vector<int32_t>& out) con
     // Normalize, cut into pieces with the family's patterns, then merge each
     // piece on its own (core/pre_tokenizer.h).
     std::string normalized;
+    if (pre_->metaspace_bpe()) {
+        for (const char c : text) {
+            if (c == ' ') normalized += kSpmSpace;
+            else normalized += c;
+        }
+        text = normalized;
+    }
     if (pre_->nfc() && !unicode::nfc_quick_check(text)) {
         normalized = unicode::to_nfc(text);
         text = normalized;
@@ -466,17 +479,30 @@ void Tokenizer::bpe_word(std::string_view word, std::vector<int32_t>& out) const
     };
     thread_local std::vector<Symbol> symbols;
     symbols.clear();
-    for (const char c : word) {
-        int32_t id = byte_token_[static_cast<unsigned char>(c)];
-        if (id < 0) {
-            // A byte the vocabulary lacks (Hunyuan's dense models have no "\r")
-            // is <unk>, or left out before merging when there is none, as the
-            // Hugging Face tokenizer does: its neighbours then merge together.
-            if (unk_ < 0) continue;
-            id = unk_;
+    if (pre_->metaspace_bpe()) {
+        for (size_t pos = 0; pos < word.size();) {
+            const size_t len = std::min(utf8_len(static_cast<unsigned char>(word[pos])), word.size() - pos);
+            const auto it = lookup_.find(word.substr(pos, len));
+            // Unknown Unicode symbols stay unmergeable until byte fallback.
+            // Encode their byte offset as a negative id, distinct from -1.
+            const int32_t id = it == lookup_.end() ? -2 - static_cast<int32_t>(pos) : it->second;
+            const auto index = static_cast<int32_t>(symbols.size());
+            symbols.push_back({id, index - 1, index + 1});
+            pos += len;
         }
-        const auto index = static_cast<int32_t>(symbols.size());
-        symbols.push_back({id, index - 1, index + 1});
+    } else {
+        for (const char c : word) {
+            int32_t id = byte_token_[static_cast<unsigned char>(c)];
+            if (id < 0) {
+                // A byte the vocabulary lacks (Hunyuan's dense models have no "\r")
+                // is <unk>, or left out before merging when there is none, as the
+                // Hugging Face tokenizer does: its neighbours then merge together.
+                if (unk_ < 0) continue;
+                id = unk_;
+            }
+            const auto index = static_cast<int32_t>(symbols.size());
+            symbols.push_back({id, index - 1, index + 1});
+        }
     }
     if (symbols.empty()) return;
     symbols.back().next = -1;
@@ -496,6 +522,7 @@ void Tokenizer::bpe_word(std::string_view word, std::vector<int32_t>& out) const
         const int32_t right = symbols[static_cast<size_t>(left)].next;
         if (right < 0) return;
         const int32_t a = symbols[static_cast<size_t>(left)].id, b = symbols[static_cast<size_t>(right)].id;
+        if (a < 0 || b < 0) return;
         const auto it = merges_.find(merge_key(a, b));
         if (it == merges_.end()) return;
         heap.push_back({it->second.rank, left, a, b, it->second.id});
@@ -517,7 +544,19 @@ void Tokenizer::bpe_word(std::string_view word, std::vector<int32_t>& out) const
         consider(left.prev);
         consider(c.left);
     }
-    for (int32_t i = 0; i >= 0; i = symbols[static_cast<size_t>(i)].next) out.push_back(symbols[static_cast<size_t>(i)].id);
+    for (int32_t i = 0; i >= 0; i = symbols[static_cast<size_t>(i)].next) {
+        const int32_t id = symbols[static_cast<size_t>(i)].id;
+        if (id >= 0) {
+            out.push_back(id);
+            continue;
+        }
+        const size_t pos = static_cast<size_t>(-2 - id);
+        const size_t len = std::min(utf8_len(static_cast<unsigned char>(word[pos])), word.size() - pos);
+        for (size_t b = 0; b < len; ++b) {
+            const int32_t byte = byte_token_[static_cast<unsigned char>(word[pos + b])];
+            out.push_back(byte >= 0 ? byte : unk_);
+        }
+    }
 }
 
 }  // namespace liyab

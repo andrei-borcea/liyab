@@ -859,3 +859,35 @@ TEST_CASE("Ling pre-tokenization preserves contractions, NFC and individual digi
                                                      "1", "2", "3", "4", " 世界"};
     CHECK(pieces == expected);
 }
+
+TEST_CASE("Unicode ranked BPE replaces spaces, merges by rank and falls back after whole characters") {
+    BpeVocab v;
+    v.tokens = {"a", "b", "c", "é", "▁", "ab", "bc", "▁é", "ab▁é"};
+    v.types.assign(v.tokens.size(), 1);
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        char name[8];
+        std::snprintf(name, sizeof name, "<0x%02X>", byte);
+        v.tokens.emplace_back(name);
+        v.types.push_back(6);
+    }
+    v.merges = {"a b", "b c", "▁ é", "ab ▁é"};
+    BpeTokenizer t("unicode_ranked", v, "sarvam-moe");
+    REQUIRE(t.tok.has_value());
+    CHECK(t.encode("abc") == std::vector<int32_t>({v.id("ab"), v.id("c")}));
+    CHECK(t.encode("ab é") == std::vector<int32_t>({v.id("ab▁é")}));
+    CHECK(t.encode(" é") == std::vector<int32_t>({v.id("▁é")}));
+    CHECK(t.encode("a  b") == std::vector<int32_t>({v.id("a"), v.id("▁"), v.id("▁"), v.id("b")}));
+    CHECK(t.encode("").empty());
+    const std::string text = "a🙂b";
+    const auto ids = t.encode(text);
+    REQUIRE(ids.size() == 6);
+    CHECK(ids == std::vector<int32_t>({v.id("a"), v.id("<0xF0>"), v.id("<0x9F>"),
+                                      v.id("<0x99>"), v.id("<0x82>"), v.id("b")}));
+    std::string decoded;
+    for (const auto id : ids) decoded += t.tok->piece(id);
+    CHECK(decoded == text);
+    CHECK(t.tok->piece(v.id("ab▁é")) == "ab é");
+    // No implicit leading space and no byte-level reinterpretation of é.
+    CHECK(t.encode("é") == std::vector<int32_t>({v.id("é")}));
+    CHECK(t.tok->piece(v.id("é")) == "é");
+}

@@ -60,6 +60,8 @@ arm64-neon-dotprod qwen3moe-fused-gate-up 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 arm64-neon-dotprod qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 arm64-neon-dotprod qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-avx2 bailingmoe 48aef888a72fc513
+x86_64-avx2 deepseek e06b56c5abec5215
 x86_64-avx2 deepseek2-mla 191166464f5adf1d
 x86_64-avx2 deepseek2-mla-expanded 38ed3ca545816896
 x86_64-avx2 deepseek2-mla-expanded-f16kv 19fb32cd2d9cca9c
@@ -86,6 +88,8 @@ x86_64-avx2 gpt-oss-mxfp4-streamed 72b7b26847265718
 x86_64-avx2 gpt-oss-sinks-f16kv 208604d6baa0fc7b
 x86_64-avx2 gpt-oss-sinks-q4_0kv 27a50249152e44a6
 x86_64-avx2 gpt-oss-sinks-q4_1kv 19b52bccc42710a0
+x86_64-avx2 gpt-oss-yarn-default 432ae5aa399db165
+x86_64-avx2 gpt-oss-yarn-explicit-fractional 432ae5aa399db165
 x86_64-avx2 hunyuan-dense bf9bc86f774ab834
 x86_64-avx2 hunyuan-dense-keyscaled a889566447085eaa
 x86_64-avx2 hy_v3-bare-selection-bias cec77ca30b464365
@@ -116,6 +120,8 @@ x86_64-avx2 qwen3moe-fused-gate-up 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-fused-gate-up-streamed 8b289d59d6c99ad7
 x86_64-avx2 qwen3moe-sigmoid-bias-shared aeb04f3b565de1de
 x86_64-avx2 qwen3moe-streamed 8b289d59d6c99ad7
+x86_64-scalar bailingmoe c6fe3124017b1c11
+x86_64-scalar deepseek 59f16cc801e291c4
 x86_64-scalar deepseek2-mla e5ed5527b3ed36da
 x86_64-scalar deepseek2-mla-expanded 3ed966c7eb7877ca
 x86_64-scalar deepseek2-mla-expanded-f16kv e2777a2c65681852
@@ -142,6 +148,8 @@ x86_64-scalar gpt-oss-mxfp4-streamed 258145cbee84f3bc
 x86_64-scalar gpt-oss-sinks-f16kv b80e0790eae065ef
 x86_64-scalar gpt-oss-sinks-q4_0kv 29332afad00cd80c
 x86_64-scalar gpt-oss-sinks-q4_1kv 90f8b5dd4fc917f7
+x86_64-scalar gpt-oss-yarn-default 8a04ff05497a3442
+x86_64-scalar gpt-oss-yarn-explicit-fractional 8a04ff05497a3442
 x86_64-scalar hunyuan-dense 8316ac25a723b24c
 x86_64-scalar hunyuan-dense-keyscaled d2dc774617009eb5
 x86_64-scalar hy_v3-bare-selection-bias a4a8babacc75db55

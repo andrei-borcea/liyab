@@ -331,3 +331,13 @@ establish these rows. Local reference-only compatibility patches restore constru
 transformers 5's meta loading and adapt removed serialization APIs; the attention and FFN math is unchanged.
 The DeepSeek tokenizer is loaded from its supplied tokenizer.json, avoiding transformers 5's incompatible
 SentencePiece reconstruction. Reproduction recipes and compatibility diffs accompany the validation report.
+
+`sarvam-moe` supplies a Unicode-symbol ranked-BPE mode: ASCII spaces become U+2581 without a prefix,
+Unicode characters initialize the ranked-merge heap, and absent characters remain unmergeable until byte
+fallback. Decoding reverses the space replacement and fallback. A synthetic vocabulary checks rank ordering,
+multibyte tokens, repeated spaces, no implicit prefix and an absent emoji. Sarvam's generic attention and
+sigmoid routing match a reference (diagnostic provisional row, KL 0.00000, top-1 100.00%), but the published
+converter supplies BOS 6 while tokenizer.json inserts BOS 2. No `bailingmoe2` row is admitted: the required
+same-token gate fails on the first ID. Its old weight-alias list and nonpersistent RoPE buffer also need
+local transformers 5 reference compatibility repairs, preserved with the report. This is independent of
+the stage-2 group-limited Ling 2.0 family.
