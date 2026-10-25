@@ -567,7 +567,8 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
     if (!data) return;
     size_t rendered = 0, refused = 0;
     for (const auto& [name, entry] : data->fields().entries) {
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
         if (!tmpl) std::printf("  %s: %s\n", name.c_str(), tmpl.status().message().c_str());
         REQUIRE(tmpl.has_value());
         const jinja::Value& special = *entry.fields().find("special");
@@ -599,7 +600,8 @@ TEST_CASE("Chat templates: prefix stability and the layout of turns") {
     if (!data) return;
     auto format = [&](const char* name, const char* probe) {
         const jinja::Value& entry = *data->fields().find(name);
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
         auto f = tmpl->format(probe, *entry.fields().find("special"));
         if (!f) std::printf("  %s: %s\n", name, f.status().message().c_str());
         return f.has_value() ? *f : ChatFormat{};

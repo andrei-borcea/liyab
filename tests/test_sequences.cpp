@@ -1597,3 +1597,15 @@ TEST_CASE("C API: sequences open, generate together as alone, cancel and close")
 }
 
 TEST_MAIN()
+
+TEST_CASE("ShortConv, KDA and grouped DeltaNet continue independent sequences and rollback states") {
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("recurrent_" + spec.arch, spec);
+        for (auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            options.expert_cache_bytes = spec.n_expert > 0 ? 1 : 0;
+            CHECK(check_schedule(spec.arch, path, options, mixed_plans(), 4));
+        }
+    }
+}

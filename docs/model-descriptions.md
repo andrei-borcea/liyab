@@ -241,3 +241,45 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
+
+## Additional recurrent layouts
+
+The registry adds `lfm2`, `lfm2moe`, `qwen3next` and `kimi-linear`. Blocks are planned from the file's tensors:
+`shortconv.conv` selects LFM2's gated depthwise convolution; `ssm_conv1d_q` selects Kimi Delta Attention;
+`ssm_conv1d` retains Gated DeltaNet. The metadata supplies `shortconv.l_cache`, `ssm.conv_kernel`, and `kda.head_dim`;
+KDA heads come from its query projection. Per-block `attention.head_count_kv` arrays may contain zero in recurrent
+blocks; attention blocks must share one cache layout. Kimi's expanded head count is normalized to the one shared
+latent row in the absorbed cache.
+
+New architecture facts are `output_norm` (the tensor holding the final RMSNorm), `ssm_grouped_heads` (whether
+consecutive DeltaNet value heads share keys) and `attention_rope` (whether positional channels rotate). The trace
+recomputes the ShortConv formula and records delta-rule operands to establish head sharing. The description tool
+compares the final norm's weights with global tensors and recognizes per-block KV counts and the new mixers.
+It refuses a row if it cannot establish a fact: latent-attention decomposition and KDA's complete recurrence are
+not yet numerically described by this tool. DeltaNet's converter head order is checked against the output projection's columns. Engine
+conformance is measured separately; a registry entry alone is not a conformance result.
+
+Inherited tiny F32 checkpoints measured on the 512-token conformance text: LFM2, LFM2-MoE and Qwen3-Next each
+have identical tokenizer IDs, mean KL 0.00000 and top-1 100.00%. Kimi's full hybrid tiny model also has mean KL 0.00000 and top-1 100.00% on 503 reference token IDs. Its tokenizer is checked separately.
+
+The real LiquidAI/LFM2-350M checkpoint, converted with b11819 to BF16, passes the description gate: exactly the
+registered row, identical IDs on all three texts (535 / 937 / 198), mean KL 0.00000 and top-1 100.00% on 512 tokens.
+Its chat template matches transformers on fourteen conversations. LFM2-700M BF16 also passes: the same three tokenizer counts, mean KL 0.00000, top-1 99.80%, perplexity 28.968 → 28.970. All three LFM2 sizes ship the same chat template (SHA-1 283ce60a51b5e134bf6abcea2b1d71c13244a45a). The 1.2B gate is recorded separately.
+
+ShortConv state is `embedding_length * (l_cache - 1)` floats per convolution block. KDA state is
+`3 * heads * head_dim * (conv_kernel - 1) + heads * head_dim * head_dim` floats per KDA block. Rollback rings and
+snapshots multiply those sizes just as they do for DeltaNet; the memory plan and lazy sequence allocation take
+these actual per-block sizes. On-disk state/prefix storage retains its existing bounds and eviction policy.
+
+KDA prefill splits independent value rows across the active pool and scans token chunks in causal order. This
+keeps decoding arithmetic (including rollback and tree paths) bit-identical across batch sizes. It is a chunked
+recurrent scan, not an algebraically reassociated parallel scan. Decode holds one fixed-size matrix per head; its
+work and state do not grow with context length. All reduction kernels have NEON, AVX2/FMA and scalar paths.
+
+`chat_sort_tools` records tokenizer-side recursive ordering of tool-object keys (Kimi). Both description and chat
+fixture tools probe `apply_chat_template` against the base renderer with unsorted and sorted tools, refusing
+unrecognized preprocessing. The engine passes this fact when loading the model's unmodified template.
+
+The synthetic KDA row-partition test runs the same prefill, rollback, branched verification and retained path
+with one and eight workers, requiring identical logits. The prefix-image tests use prompts above the store's
+existing 128-token minimum so that reuse is actually exercised.

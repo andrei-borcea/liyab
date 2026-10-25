@@ -2200,7 +2200,7 @@ struct Engine::Impl {
         special("eos_token", id_of("tokenizer.ggml.eos_token_id"));
         special("unk_token", id_of("tokenizer.ggml.unknown_token_id"));
         special("pad_token", id_of("tokenizer.ggml.padding_token_id"));
-        auto parsed = ChatTemplate::parse(*source);
+        auto parsed = ChatTemplate::parse(*source, target->config().spec->chat_sort_tools);
         if (!parsed) {
             chat_template_error = parsed.status();
             LIYAB_LOG_WARN("%s", parsed.status().message().c_str());
@@ -2942,8 +2942,8 @@ std::string Engine::describe() const {
     if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
     if (c.hybrid()) {
         char mix[160];
-        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
-                      c.n_attn_layers, c.n_layers - c.n_attn_layers,
+        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d recurrent blocks, recurrent state %.1f MiB\n",
+                      c.n_attn_layers, c.n_recurrent_layers,
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
     }

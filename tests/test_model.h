@@ -70,6 +70,15 @@ struct TinyModelSpec {
     // block is attention and the others are Gated DeltaNet (2 key heads, 4
     // value heads of 16, convolution kernel 4).
     int32_t delta_net_interval = 0;
+    // ShortConv / KDA in every block except each interval-th attention block.
+    // The tensors and metadata follow the published GGUF converter layout.
+    int32_t short_conv_interval = 0;
+    int32_t kda_interval = 0;
+    int32_t kda_head_dim = 32;
+    int32_t shortconv_taps = 3;
+    bool shortconv_bias = false;
+    bool fused_ssm_ba = false;  // Qwen3-Next's per-key-head [beta | alpha]
+
 
     // Optional features, each one a separate path of the forward pass. Off by
     // default, and drawn from the generator only when on, so every model
@@ -167,6 +176,9 @@ struct TinyModelSpec {
 // lowercase letters, and every substring of "▁hello" / "▁world".
 std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
+
+// The new recurrent layouts, reused by state, sequence and tree tests.
+std::vector<TinyModelSpec> recurrent_model_specs();
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
 

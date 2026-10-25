@@ -9,12 +9,15 @@
 // bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
 // optional sliding window, optional soft cap), multi-head latent attention
 // (absorbed queries over one cached [RoPE key | latent] row per position,
-// see LatentAttention) or a Gated DeltaNet linear-attention recurrence —
+// see LatentAttention), a Gated DeltaNet linear-attention recurrence, LFM2's
+// gated short convolution or Kimi Delta Attention (a delta rule with a decay
+// per key channel) —
 // followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and
 // up projections) or a mixture of experts (router + top-k routed experts +
 // optional gated shared expert), each optionally followed by its own norm
-// before the residual add. So hybrid models (Qwen3.5: three DeltaNet blocks
-// per attention block), models that alternate windowed and global attention
+// before the residual add. So hybrid models (Qwen3.5 and Qwen3-Next: three
+// DeltaNet blocks per attention block; LFM2: short convolutions and
+// attention), models that alternate windowed and global attention
 // (Gemma 2 and 3), models with fused projections (Phi-3), latent attention
 // (DeepSeek) and plain transformers (Llama, Mistral, Qwen2/3) share one
 // forward pass. Tensor precision is per
@@ -301,7 +304,7 @@ public:
     static constexpr int32_t kLatentTileMin = 16;
     static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
-    // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
+    // Bytes held by the recurrent (DeltaNet, ShortConv, Kda) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     // The most a context made now (make_context()) holds besides its KV
     // pages, which it maps as it uses them: its recurrent states, its
@@ -327,7 +330,7 @@ public:
     // block, a few hundred per token: noise next to the matmuls they time.
     struct PhaseTimes {
         double attention = 0.0;      // softmax-attention mixers, projections included
-        double delta_net = 0.0;      // Gated DeltaNet mixers, projections included
+        double delta_net = 0.0;      // recurrent mixers (Gated DeltaNet, ShortConv, Kda), projections included
         double router = 0.0;         // MoE routers, top-k selection and expert prediction
         double experts = 0.0;        // routed experts, waits for streamed ones included
         double shared_expert = 0.0;  // MoE shared expert
@@ -742,6 +745,14 @@ private:
         // attn_q_a / attn_q_b, attn_kv_a_mqa [n_embd x (kv_rank + rope_dim)], and per head
         // attn_k_b [nope_dim -> kv_rank] (absorbs a query) and attn_v_b [kv_rank -> v_dim] (expands a value)
         kQa, kQb, kKvA, kKb, kVb,
+        // LFM2 short convolution: shortconv.in_proj [d -> 3d: B | C | x] and shortconv.out_proj
+        kConvIn, kConvOut,
+        // Qwen3-Next DeltaNet: ssm_ba [d -> 2 x value heads], beta and alpha interleaved per key head
+        kBa,
+        // Kimi Delta Attention (kQ, kK, kV its projections, kBeta the write strength, kSsmOut attn_output):
+        // the low-rank projections of the per-channel decay (ssm_f_a, ssm_f_b) and of the output gate
+        // (ssm_g_a, ssm_g_b)
+        kFa, kFb, kGa, kGb,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
@@ -754,17 +765,21 @@ private:
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
         std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
-        std::vector<float> conv1d;   // [channel][kernel] taps
+        std::vector<float> conv1d;   // [channel][kernel] taps (Kda: q, k then v channels)
         std::vector<float> ssm_a;    // per value head: -exp(A_log)
-        std::vector<float> ssm_dt;   // per value head: decay bias
+        std::vector<float> ssm_dt;   // per value head: decay bias (Kda: per key channel)
+        std::vector<float> conv_bias, in_bias, out_bias;  // ShortConv: optional biases of conv, in_proj, out_proj
         std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
     };
-    // Recurrent memory of one DeltaNet block.
+    // Recurrent memory of one recurrent block: DeltaNet, ShortConv (conv
+    // only) or Kda. Every operation on states (snapshots, checkpoints,
+    // images, sequences) treats a state as the floats [conv | ssm], so the
+    // mixers differ only in their sizes.
     struct RecurrentState {
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
-        std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
+        std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix; empty for ShortConv
         // Rollback ring: slot s holds [conv | ssm] after the token at the
         // position checkpoint_pos_[s] (slot = position % rollback window).
         std::vector<float> checkpoints;
@@ -843,6 +858,12 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // LFM2's gated short convolution (MixerKind::ShortConv) and Kimi Delta
+    // Attention (MixerKind::Kda): recurrent mixers that continue each
+    // segment's state, record its checkpoints and start tree branches from
+    // their parents' as delta_net_mixer() does.
+    Status short_conv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status kda_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
     // Multi-head latent attention (ModelConfig::mla), in the form forward()
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
@@ -1055,7 +1076,8 @@ private:
     LatentStats latent_stats_;
     bool latent_expanded_ = false;  // the current pass's form
     double latent_ms_ = 0.0;        // the current pass's form-dependent time, every latent block
-    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
+    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output (also ShortConv, Kda)
+    std::vector<float> ba_, low_a_, low_b_;  // Qwen3-Next's [beta | alpha] rows; Kda's low-rank decay and gate
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
