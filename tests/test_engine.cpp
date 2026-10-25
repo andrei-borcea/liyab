@@ -1377,6 +1377,34 @@ TEST_CASE("Mixtral expert width and router normalization follow tensors and arch
     CHECK(model->config().moe_norm_weights);
 }
 
+TEST_CASE("YaRN endpoint rounding follows architecture defaults and explicit file overrides") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.n_expert = 4;
+    spec.n_expert_used = 2;
+    spec.yarn_factor = 4.0f;
+    spec.yarn_ctx = 32;
+    auto implicit = load_transformer(model_path("gpt_yarn_implicit", spec));
+    REQUIRE(implicit != nullptr);
+    CHECK(!implicit->config().yarn.truncate);
+    spec.yarn_truncate = 0;
+    auto fractional = load_transformer(model_path("gpt_yarn_fractional", spec));
+    REQUIRE(fractional != nullptr);
+    CHECK(!fractional->config().yarn.truncate);
+    spec.yarn_truncate = 1;
+    auto rounded = load_transformer(model_path("gpt_yarn_rounded", spec));
+    REQUIRE(rounded != nullptr);
+    CHECK(rounded->config().yarn.truncate);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto a = implicit->forward(tokens, Transformer::Logits::All, route, pool);
+    auto b = fractional->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(a.has_value() && b.has_value());
+    CHECK(max_abs_diff(*a, *b) == 0.0f);
+}
+
 TEST_CASE("Post-SiLU clamps match the independent float reference and change a saturated FFN") {
     auto spec = f32_spec();
     spec.shared_swiglu_clamp = 0.25f;

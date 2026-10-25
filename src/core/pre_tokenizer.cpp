@@ -68,6 +68,10 @@ constexpr const char* kAfmoeScripts = R"pre((?:[\x{4E00}-\x{9FFF}\x{3040}-\x{309
 
 constexpr const char* kExaoneMoe = R"pre((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+)pre";
 
+// Ling-lite 1.5: possessive Qwen-like words, including the 'm contraction.
+constexpr const char* kBailingMoe =
+    R"pre('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)pre";
+
 struct Row {
     std::initializer_list<std::string_view> names;  // tokenizer.ggml.pre values
     std::initializer_list<StepSpec> steps;
@@ -76,8 +80,8 @@ struct Row {
     bool right_digits3 = false;  // decimal runs grouped in threes from their right end
 };
 
-const std::array<Row, 14>& table() {
-    static const std::array<Row, 14> rows = {{
+const std::array<Row, 15>& table() {
+    static const std::array<Row, 15> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -96,6 +100,7 @@ const std::array<Row, 14>& table() {
         {{"glm4"}, {{kLlama3, true}}, false, true},
         {{"exaone-moe"}, {{kExaoneMoe, true}}, true, false},
         {{"afmoe"}, {{kAfmoeScripts, true}, {kDeepSeekV3Words, true}}, false, false, true},
+        {{"bailingmoe"}, {{kBailingMoe, true}}, true, false},
     }};
     return rows;
 }

@@ -847,3 +847,15 @@ TEST_CASE("Engine and C API: the model's chat template renders, describes its tu
 }
 
 TEST_MAIN()
+
+TEST_CASE("Ling pre-tokenization preserves contractions, NFC and individual digits") {
+    auto pre = PreTokenizer::for_name("bailingmoe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "I'm can't WE'RE\n\n abc 1234 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"I", "'m", " can", "'t", " WE", "'RE", "\n\n", " abc", " ",
+                                                     "1", "2", "3", "4", " 世界"};
+    CHECK(pieces == expected);
+}

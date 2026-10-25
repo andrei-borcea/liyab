@@ -83,12 +83,15 @@ constexpr ArchSpec kArchitectures[] = {
      .ffn_norm = "post_attention_norm",
      .moe_norm_weights = true,
      .ffn_activation = FfnActivation::SwigluOai,
-     .swa_period = 2},
+     .swa_period = 2,
+     .yarn_truncate = false},
     {"qwen2moe", RopeLayout::Halves, "ffn_norm", false},
     {"glm4moe", RopeLayout::Halves, "post_attention_norm", true},
     {"dots1", RopeLayout::Halves, "ffn_norm", true},
     {"ernie4_5-moe", RopeLayout::Adjacent, "ffn_norm", true},
     {"hy_v3", RopeLayout::Halves, "ffn_norm", true},
+    {"deepseek", RopeLayout::Adjacent, "ffn_norm", false},
+    {"bailingmoe", RopeLayout::Adjacent, "ffn_norm", true},
 };
 
 }  // namespace
@@ -235,7 +238,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             if (truncate != nullptr && !truncate->as_bool()) {
                 return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.yarn_truncate"));
             }
-            y.truncate = truncate == nullptr || *truncate->as_bool();
+            y.truncate = truncate == nullptr ? c.spec->yarn_truncate : *truncate->as_bool();
             if (!(y.factor > 0.0f) || !std::isfinite(y.factor) || y.ctx_orig <= 0 || !(y.beta_fast > 0.0f) ||
                 !(y.beta_slow > 0.0f) || !(y.ext_factor >= 0.0f) || !std::isfinite(y.ext_factor)) {
                 return Status(ErrorCode::InvalidModel, "invalid YaRN parameters (" + key("rope.scaling.*") + ")");

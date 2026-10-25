@@ -480,7 +480,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
                     "ssm_conv1d.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight"}
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
-                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa")
+                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "yarn_truncate")
 
 
 def _close(a, b, rel=1e-5):
@@ -604,7 +604,7 @@ def _f32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
+def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, yarn_truncate=True):
     """RoPE frequencies and magnitude the engine computes from the file (Transformer::load and describe_model()):
     base^(-2i/r) divided by the file's frequency factors, blended by YaRN when the file asks for it, over the
     linear position scale. Returns (inv_freq / scale list, magnitude, q.k factor, how)."""
@@ -636,7 +636,7 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
         fast = float(g.key("rope.scaling.yarn_beta_fast", 32.0))
         slow = float(g.key("rope.scaling.yarn_beta_slow", 1.0))
         ext = float(g.key("rope.scaling.yarn_ext_factor", 1.0))
-        truncate = bool(g.key("rope.scaling.yarn_truncate", True))
+        truncate = bool(g.key("rope.scaling.yarn_truncate", yarn_truncate))
         # The correction range: the (fractional) pairs that turn beta_fast and beta_slow times over the
         # original context.
         turning = lambda turns: rope_dim * math.log(ctx / (turns * 2.0 * math.pi)) / (2.0 * math.log(base))
@@ -683,6 +683,15 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         return d, None, g
     cfg = facts["config"]
     d.set("name", arch, "general.architecture of the GGUF")
+    registered = engine.rows.get(arch, ({}, ""))[0]
+    params = cfg.get("rope_parameters") or cfg.get("rope_scaling") or {}
+    if g.key("rope.scaling.type") != "yarn" or g.key("rope.scaling.yarn_truncate") is not None:
+        truncate_default = registered.get("yarn_truncate", True)
+        evidence = "inactive or overridden by file metadata; preserve the registered YaRN default"
+    else:
+        truncate_default = bool(params.get("truncate", True))
+        evidence = "reference YaRN truncate parameter (default true); frequencies checked against the observed table"
+    d.set("yarn_truncate", truncate_default, evidence)
     d.notes.append(f"reference: {facts['model_class']} ({facts.get('model_type')}), {facts['traced_blocks']} of "
                    f"{facts['blocks']} blocks traced")
     unknown_fields = [n for n, _, _ in engine.fields if n not in DERIVED_FIELDS]
@@ -861,7 +870,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if scaling_type not in (None, "none") and scaling_type not in engine.rope_scalings:
         d.missing.append(f"{'YaRN' if scaling_type == 'yarn' else repr(scaling_type)} RoPE scaling "
                          f"(rope.scaling.type {scaling_type})")
-    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0), yarn_truncate=truncate_default)
     rope_dims = {b["mixer"]["key"]["rope"]["dims"] for b in att_blocks
                  if b["mixer"].get("key") and b["mixer"]["key"].get("rope")}
     if rope_dims and rope_dims != {rope_dim}:
@@ -874,7 +883,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         t = rope_tables[tname]
         ref = t["inv_freq"]
         if rope_base is None:
-            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0), yarn_truncate=truncate_default)
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"

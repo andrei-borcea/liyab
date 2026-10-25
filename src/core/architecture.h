@@ -97,6 +97,9 @@ struct ArchSpec {
     // windowed blocks, 1M, linearly scaled on the larger models, in global
     // ones). 0: windowed blocks rotate like the others.
     float rope_base_swa = 0.0f;
+    // YaRN correction-range rounding when the GGUF omits yarn_truncate.
+    // gpt-oss uses fractional endpoints; explicit file metadata overrides it.
+    bool yarn_truncate = true;
 };
 
 // Every architecture Liyab runs, in registry order.

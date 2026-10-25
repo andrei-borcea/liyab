@@ -310,3 +310,24 @@ Its tiny checkpoint passes the standard reference gate (498 positions, KL 0.0000
 bare selection-bias tensor. Scalar-head and per-channel attention gates are checked against equivalent fused
 query/gate tensors for F16, Q8_0, Q4_0 and Q4_1 KV. An independent float reference checks the post-SiLU clamp;
 MXFP4 biased experts with attention wider than the residual stream match block-streamed execution exactly.
+
+The `ArchSpec::yarn_truncate` fact supplies the YaRN endpoint-rounding default when the file omits it. GPT-OSS
+uses fractional endpoints (`false`), as its reference config states; the published ggml-org MXFP4 GGUF omits the
+key. Explicit metadata overrides the row. The tool derives this default from the reference's YaRN parameters
+and checks the resulting frequencies numerically; when inactive or overridden it preserves the registered
+family default and labels it so. Every other existing row retains `true`, preserving its hashes.
+
+The `bailingmoe` tokenizer uses the author’s possessive word pattern, including the `'m` contraction,
+individual digits and NFC. It is checked independently against tokenizer.json splitting.
+
+DeepSeek-MoE v1 and Ling-lite 1.5 add `{deepseek, Adjacent, ffn_norm, false}` and
+`{bailingmoe, Adjacent, ffn_norm, true}` respectively. Their converters interleave the half-layout Q/K weights;
+the router defaults differ in selected-weight renormalization. Leading dense blocks and shared experts are
+planned from tensors. Each standard-reference tiny passes 511 positions (512 matching IDs), KL 0.00000,
+top-1 99.61%, with fourteen template cases. Their legacy remote implementations index private eager/SDPA
+class tables, rejecting the trace tool's `liyab_trace` attention function. Consequently the tool reports
+that precise failure and proposes neither row; source and converter inspection plus numerical conformance
+establish these rows. Local reference-only compatibility patches restore constructor RoPE buffers after
+transformers 5's meta loading and adapt removed serialization APIs; the attention and FFN math is unchanged.
+The DeepSeek tokenizer is loaded from its supplied tokenizer.json, avoiding transformers 5's incompatible
+SentencePiece reconstruction. Reproduction recipes and compatibility diffs accompany the validation report.

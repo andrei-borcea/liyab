@@ -295,6 +295,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.yarn_beta_fast > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_fast", s.yarn_beta_fast);
         if (s.yarn_beta_slow > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_slow", s.yarn_beta_slow);
         if (s.yarn_log_mul != 0.0f) w.add_f32(a + ".rope.scaling.yarn_log_multiplier", s.yarn_log_mul);
+        if (s.yarn_truncate >= 0) w.add_bool(a + ".rope.scaling.yarn_truncate", s.yarn_truncate != 0);
     }
     if (s.attn_softcap > 0.0f) w.add_f32(a + ".attn_logit_softcapping", s.attn_softcap);
     if (s.final_softcap > 0.0f) w.add_f32(a + ".final_logit_softcapping", s.final_softcap);

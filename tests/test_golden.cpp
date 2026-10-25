@@ -278,7 +278,7 @@ std::vector<GoldenCase> cases() {
     s.fused_gate_up = true;
     s.ffn_type = DType::MXFP4;
     add("moe-post-silu-clamps-mxfp4-streamed", s, streamed);
-    for (const char* arch : {"qwen2moe", "glm4moe", "dots1", "ernie4_5-moe"}) {
+    for (const char* arch : {"qwen2moe", "glm4moe", "dots1", "ernie4_5-moe", "deepseek", "bailingmoe"}) {
         s = moe_spec(arch);
         s.expert_weights_norm = -1;
         s.n_ff_shared = 64;
@@ -297,6 +297,12 @@ std::vector<GoldenCase> cases() {
     mxfp4.ffn_type = DType::MXFP4;
     add("gpt-oss-mxfp4", mxfp4);
     add("gpt-oss-mxfp4-streamed", mxfp4, streamed);
+    auto yarn = s;
+    yarn.yarn_factor = 4.0f;
+    yarn.yarn_ctx = 32;
+    add("gpt-oss-yarn-default", yarn);
+    yarn.yarn_truncate = 0;
+    add("gpt-oss-yarn-explicit-fractional", yarn);
     for (const auto type : {KvCacheType::F16, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
         TransformerOptions kv = streamed;
         kv.kv_type = type;

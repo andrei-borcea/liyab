@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `gpt-oss`, `qwen2moe`, `glm4moe`, `dots1`, `ernie4_5-moe`, `hy_v3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `gpt-oss`, `qwen2moe`, `glm4moe`, `dots1`, `ernie4_5-moe`, `hy_v3`, `deepseek`, `bailingmoe` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -2844,3 +2844,16 @@ in a linear scan, and the `exaone-moe` pre-tokenizer preserves spaces inside wor
 HY3 (`hy_v3`) tiny conformance uses its sigmoid router, nonzero selection correction, shared expert and dense
 leading block: 498 positions, identical 499 token IDs, mean KL 0.00000 and top-1 100.00%. Its registry row is
 proposed exactly by the description tool.
+The gpt-oss row supplies fractional YaRN correction endpoints when older GGUFs omit `yarn_truncate` (the
+published ggml-org MXFP4 file does). Explicit file metadata overrides that architecture default; existing
+architectures keep rounded endpoints. Synthetic default/explicit cases must produce identical bits.
+
+The `bailingmoe` pre-tokenizer preserves Ling’s contractions and individual digits, with NFC normalization.
+
+DeepSeek-MoE v1 (`deepseek`) and Ling-lite 1.5 (`bailingmoe`) use ordinary attention, leading dense blocks and
+shared experts. Their F32 tiny checkpoints pass the standard F32 reference with F16 KV: 511 positions each,
+512 identical token IDs, mean KL 0.00000 and top-1 99.61%. Fourteen template cases per family match transformers.
+Their old remote code needs local transformers 5 compatibility repairs for saved-weight aliases and unsaved
+RoPE buffers. The automatic description tool refuses these legacy references because their hard-coded
+attention-class tables do not expose its registered attention function; these two rows are verified by
+converter tensor permutations, source inspection and end-to-end conformance instead.

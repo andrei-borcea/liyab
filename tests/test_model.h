@@ -174,6 +174,7 @@ struct TinyModelSpec {
     float expert_swiglu_clamp = 0.0f;
     float shared_swiglu_clamp = 0.0f;
     int32_t head_dim = 0;  // explicit attention head width, independent of the residual width
+    int32_t yarn_truncate = -1;  // -1: absent, 0/1: explicit YaRN endpoint rounding
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
