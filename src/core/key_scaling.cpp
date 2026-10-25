@@ -33,7 +33,7 @@ KeyRanges::KeyRanges(KeyScalingShape shape)
                  0.0f) {}
 
 void KeyRanges::update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
-                       const float* gain) const {
+                       const float* gain, double row_scale) const {
     const auto hd = static_cast<size_t>(shape_.head_dim);
     const int32_t half = shape_.rope_dim / 2;
     const double last = std::max(shape_.positions - 1, 0);
@@ -47,14 +47,15 @@ void KeyRanges::update(const float* rows, int32_t heads, float* max, const float
         for (int32_t i = 0; i < half; ++i) {
             const int32_t a = shape_.rope == RopeLayout::Halves ? i : 2 * i;
             const int32_t b = shape_.rope == RopeLayout::Halves ? i + half : 2 * i + 1;
-            const double r = std::hypot(static_cast<double>(x[a]), static_cast<double>(x[b])) * magnitude;
+            const double r = std::hypot(static_cast<double>(x[a]), static_cast<double>(x[b])) * magnitude * row_scale;
             const double phi = std::atan2(static_cast<double>(x[b]), static_cast<double>(x[a]));
             const double sweep = static_cast<double>(speed[i]) * last;
             m[a] = std::max(m[a], static_cast<float>(g(a) * r * max_abs_cos(phi, sweep)));
             m[b] = std::max(m[b], static_cast<float>(g(b) * r * max_abs_cos(phi - std::numbers::pi / 2, sweep)));
         }
         for (size_t i = static_cast<size_t>(shape_.rope_dim); i < hd; ++i) {
-            m[i] = std::max(m[i], gain == nullptr ? std::fabs(x[i]) : std::fabs(x[i] * gain[i]));
+            const float value = gain == nullptr ? std::fabs(x[i]) : std::fabs(x[i] * gain[i]);
+            m[i] = std::max(m[i], static_cast<float>(value * row_scale));
         }
     }
 }
@@ -64,10 +65,12 @@ void KeyRanges::add(int32_t block, const float* q, const float* k, const float* 
     const auto b = static_cast<size_t>(block);
     const float* speed = shape_.pair_speed.data() + b * static_cast<size_t>(shape_.rope_dim / 2);
     const double magnitude = shape_.rope_magnitude.empty() ? 1.0 : shape_.rope_magnitude[b];
-    update(k, shape_.n_head_kv, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, magnitude,
+    const int32_t kv_heads = shape_.kv_heads.empty() ? shape_.n_head_kv : shape_.kv_heads[b];
+    const int32_t query_heads = shape_.query_heads.empty() ? shape_.n_head : shape_.query_heads[b];
+    update(k, kv_heads, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, magnitude,
            k_gain);
-    update(q, shape_.n_head, query_max_.data() + b * static_cast<size_t>(shape_.n_head) * hd, speed, magnitude,
-           q_gain);
+    update(q, query_heads, query_max_.data() + b * static_cast<size_t>(shape_.n_head) * hd, speed, magnitude,
+           q_gain, shape_.query_scale);
 }
 
 float KeyRanges::outlier_ratio() const {
@@ -85,7 +88,6 @@ float KeyRanges::outlier_ratio() const {
 
 std::vector<float> KeyRanges::factors() const {
     const auto hd = static_cast<size_t>(shape_.head_dim);
-    const auto group = static_cast<size_t>(shape_.n_head / shape_.n_head_kv);
     std::vector<float> out(shape_.factors(), 1.0f);
     if (outlier_ratio() < kOutlierRatio) return out;  // nothing for the scaling to fix
     std::vector<float> keys(hd), queries(hd), sorted(hd);
@@ -97,7 +99,10 @@ std::vector<float> KeyRanges::factors() const {
         for (float& r : range) r = std::max(r, floor);
     };
     for (size_t b = 0; b < static_cast<size_t>(shape_.blocks); ++b) {
-        for (size_t g = 0; g < static_cast<size_t>(shape_.n_head_kv); ++g) {
+        const int32_t kv_heads = shape_.kv_heads.empty() ? shape_.n_head_kv : shape_.kv_heads[b];
+        const int32_t query_heads = shape_.query_heads.empty() ? shape_.n_head : shape_.query_heads[b];
+        const auto group = static_cast<size_t>(query_heads / kv_heads);
+        for (size_t g = 0; g < static_cast<size_t>(kv_heads); ++g) {
             const float* km = key_max_.data() + (b * static_cast<size_t>(shape_.n_head_kv) + g) * hd;
             std::copy(km, km + hd, keys.begin());
             std::fill(queries.begin(), queries.end(), 0.0f);

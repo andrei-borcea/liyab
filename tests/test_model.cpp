@@ -196,6 +196,16 @@ int32_t tiny_token(const std::string& text) {
     return it == vocab.end() ? -1 : static_cast<int32_t>(it - vocab.begin());
 }
 
+TinyModelSpec nas_spec() {
+    TinyModelSpec s;
+    s.arch = "deci";
+    s.n_layers = 5;
+    s.block_heads = {4, 4, 2, 0, 4};
+    s.block_kv_heads = {2, 1, 1, 0, 0};
+    s.block_ff = {256, 128, 192, 0, 256};
+    return s;
+}
+
 void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     const std::vector<std::string> vocab = tiny_vocab();
     const auto n_vocab = static_cast<int64_t>(vocab.size());
@@ -215,9 +225,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_string("general.name", "liyab-tiny-test");
     w.add_u32(a + ".block_count", static_cast<uint32_t>(s.n_layers));
     w.add_u32(a + ".embedding_length", static_cast<uint32_t>(s.n_embd));
-    w.add_u32(a + ".feed_forward_length", static_cast<uint32_t>(s.n_ff));
-    w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
-    w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    if (s.block_ff.empty()) w.add_u32(a + ".feed_forward_length", static_cast<uint32_t>(s.n_ff));
+    else w.add_i32_array(a + ".feed_forward_length", s.block_ff);
+    if (s.block_heads.empty()) w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
+    else w.add_i32_array(a + ".attention.head_count", s.block_heads);
+    if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    else w.add_i32_array(a + ".attention.head_count_kv", s.block_kv_heads);
+    if (!s.block_heads.empty()) w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
@@ -248,6 +262,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
     w.add_f32(a + ".rope.freq_base", s.rope_base);
+    if (!s.rope_layers.empty()) w.add_bool_array(a + ".attention.rope_pattern", s.rope_layers);
+    if (s.embedding_scale != 0.0f) w.add_f32(a + ".embedding_scale", s.embedding_scale);
+    if (s.residual_scale != 0.0f) w.add_f32(a + ".residual_scale", s.residual_scale);
+    if (s.logit_scale != 0.0f) w.add_f32(a + ".logit_scale", s.logit_scale);
+    if (s.attn_temp_scale != 0.0f) w.add_f32(a + ".attention.temperature_scale", s.attn_temp_scale);
+    if (s.attn_temp_length != 0) w.add_u32(a + ".attention.temperature_length", static_cast<uint32_t>(s.attn_temp_length));
     if (s.sliding_window > 0) w.add_u32(a + ".attention.sliding_window", static_cast<uint32_t>(s.sliding_window));
     if (!s.swa_layers.empty()) {
         w.add_bool_array(a + ".attention.sliding_window_pattern", s.swa_layers);
@@ -363,7 +383,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
+        const int64_t heads = s.block_heads.empty() ? s.n_head : s.block_heads[static_cast<size_t>(l)];
+        const int64_t kv_heads = s.block_kv_heads.empty() ? s.n_head_kv : s.block_kv_heads[static_cast<size_t>(l)];
+        const int64_t kv = kv_heads * hd;
+        const int64_t ff = s.block_ff.empty() ? s.n_ff : s.block_ff[static_cast<size_t>(l)];
+        if (!s.post_only_norms && (heads > 0 || kv_heads > 0)) {
+            w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
+        }
         if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
@@ -404,8 +430,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                          random(rank * s.mla_v * heads, s.weight_scale));
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
-        } else {
-            const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
+        } else if (kv_heads > 0) {
+            const int64_t q_dim = heads * hd;
+            const int64_t q_rows = s.attn_gate ? 2 * q_dim : q_dim;  // [q_h | gate_h] per head when gated
             if (s.fused_qkv) {  // the same draws as separate matrices, stacked [q | k | v]
                 std::vector<float> qkv = random(d * q_rows, s.weight_scale);
                 for (int part = 0; part < 2; ++part) {  // k, then v
@@ -418,16 +445,19 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
                 w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             }
-            w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            w.add_tensor(p + "attn_output.weight", {q_dim, d}, s.attn_type, random(q_dim * d, s.weight_scale));
             if (s.qk_norm) {
-                w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
-                std::vector<float> k_norm = norm_weights(hd);
+                const int64_t qn = s.qk_norm_whole ? q_dim : hd, kn = s.qk_norm_whole ? kv : hd;
+                w.add_tensor(p + "attn_q_norm.weight", {qn}, DType::F32, norm_weights(qn));
+                std::vector<float> k_norm = norm_weights(kn);
                 if (s.k_norm_outlier > 0.0f) {
                     k_norm[static_cast<size_t>(hd / 2 - 1)] = s.k_norm_outlier;
                     k_norm[static_cast<size_t>(hd - 3)] = s.k_norm_outlier;
                 }
-                w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, k_norm);
+                w.add_tensor(p + "attn_k_norm.weight", {kn}, DType::F32, k_norm);
             }
+        } else if (heads > 0) {
+            w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
         }
         if (a == "qwen2") {
             w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
@@ -442,27 +472,32 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
-        const bool post_attention = a == "qwen35" || a == "qwen35moe";
-        w.add_tensor(p + (post_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), {d}, DType::F32,
-                     norm_weights(d));
-        if (s.post_norms) {  // Gemma: post_attention_norm is the norm after the attention, not before the FFN
-            w.add_tensor(p + "post_attention_norm.weight", {d}, DType::F32, norm_weights(d));
-            w.add_tensor(p + "post_ffw_norm.weight", {d}, DType::F32, norm_weights(d));
+        const bool post_attention = a == "qwen35" || a == "qwen35moe" || a == "seed_oss";
+        if (!s.post_only_norms && (ff > 0 || s.n_expert > 0)) {
+            w.add_tensor(p + (post_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), {d}, DType::F32,
+                         norm_weights(d));
         }
-        const std::vector<float> gate = random(d * s.n_ff, s.weight_scale);
-        const std::vector<float> up = random(d * s.n_ff, s.weight_scale);
-        const std::vector<float> down = random(s.n_ff * d, s.weight_scale);
+        if (s.post_norms || s.post_only_norms) {  // Gemma / OLMo: norms after both residual branches
+            if (heads > 0 || kv_heads > 0) {
+                w.add_tensor(p + "post_attention_norm.weight", {d}, DType::F32, norm_weights(d));
+            }
+            if (ff > 0 || s.n_expert > 0) w.add_tensor(p + "post_ffw_norm.weight", {d}, DType::F32, norm_weights(d));
+        }
+        if (ff == 0 && s.n_expert == 0) continue;
+        const std::vector<float> gate = random(d * ff, s.weight_scale);
+        const std::vector<float> up = random(d * ff, s.weight_scale);
+        const std::vector<float> down = random(ff * d, s.weight_scale);
         if (s.n_expert == 0 && s.fused_gate_up) {
             std::vector<float> gate_up = gate;
             gate_up.insert(gate_up.end(), up.begin(), up.end());
-            w.add_tensor(p + "ffn_up.weight", {d, 2 * s.n_ff}, s.ffn_type, gate_up);
-            w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);
+            w.add_tensor(p + "ffn_up.weight", {d, 2 * ff}, s.ffn_type, gate_up);
+            w.add_tensor(p + "ffn_down.weight", {ff, d}, s.ffn_type, down);
             continue;
         }
         if (s.n_expert == 0 || l < s.dense_lead) {
-            w.add_tensor(p + "ffn_gate.weight", {d, s.n_ff}, s.ffn_type, gate);
-            w.add_tensor(p + "ffn_up.weight", {d, s.n_ff}, s.ffn_type, up);
-            w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);
+            w.add_tensor(p + "ffn_gate.weight", {d, ff}, s.ffn_type, gate);
+            w.add_tensor(p + "ffn_up.weight", {d, ff}, s.ffn_type, up);
+            w.add_tensor(p + "ffn_down.weight", {ff, d}, s.ffn_type, down);
             continue;
         }
         auto stacked = [&](const std::vector<float>& one) {
@@ -480,17 +515,17 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         const std::vector<float> up_exps = stacked(up);
         if (s.fused_gate_up) {  // each expert's [gate | up] rows: the same draws as the split tensors
             std::vector<float> gate_up;
-            const auto per_expert = static_cast<std::ptrdiff_t>(d * s.n_ff);
+            const auto per_expert = static_cast<std::ptrdiff_t>(d * ff);
             for (std::ptrdiff_t e = 0; e < s.n_expert; ++e) {
                 gate_up.insert(gate_up.end(), gate_exps.begin() + e * per_expert, gate_exps.begin() + (e + 1) * per_expert);
                 gate_up.insert(gate_up.end(), up_exps.begin() + e * per_expert, up_exps.begin() + (e + 1) * per_expert);
             }
-            w.add_tensor(p + "ffn_gate_up_exps.weight", {d, 2 * s.n_ff, s.n_expert}, s.ffn_type, gate_up);
+            w.add_tensor(p + "ffn_gate_up_exps.weight", {d, 2 * ff, s.n_expert}, s.ffn_type, gate_up);
         } else {
-            w.add_tensor(p + "ffn_gate_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, gate_exps);
-            w.add_tensor(p + "ffn_up_exps.weight", {d, s.n_ff, s.n_expert}, s.ffn_type, up_exps);
+            w.add_tensor(p + "ffn_gate_exps.weight", {d, ff, s.n_expert}, s.ffn_type, gate_exps);
+            w.add_tensor(p + "ffn_up_exps.weight", {d, ff, s.n_expert}, s.ffn_type, up_exps);
         }
-        w.add_tensor(p + "ffn_down_exps.weight", {s.n_ff, d, s.n_expert}, s.ffn_type, stacked(down));
+        w.add_tensor(p + "ffn_down_exps.weight", {ff, d, s.n_expert}, s.ffn_type, stacked(down));
         // The router uses its own generator so every other weight matches the dense twin.
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));
         for (float& x : router) x = normal(router_rng) * 0.5f;

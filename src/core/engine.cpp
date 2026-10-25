@@ -2420,6 +2420,7 @@ struct Engine::Impl {
             block_total += end - begin;
         }
         const size_t largest = *std::max_element(bytes.begin(), bytes.end());
+        if (largest == 0) return Status::ok(); // a stack of identity blocks has no block weights to stream
         int32_t streamed = c.n_layers;
         if (!all) {
             const uint64_t available = usable_memory_bytes(
@@ -2431,7 +2432,7 @@ struct Engine::Impl {
             // pipeline slots and 1 GiB for KV cache, activations and the app.
             const size_t fixed = file.file_size() - block_total + 3 * largest + (size_t{1} << 30);
             const size_t budget = available > fixed ? static_cast<size_t>(available) - fixed : 0;
-            const size_t average = block_total / static_cast<size_t>(c.n_layers);
+            const size_t average = std::max<size_t>(block_total / static_cast<size_t>(c.n_layers), 1);
             const auto resident = static_cast<int32_t>(std::min<size_t>(budget / average, static_cast<size_t>(c.n_layers)));
             streamed = c.n_layers - resident;
             if (streamed == 0) return Status::ok();
@@ -2441,11 +2442,14 @@ struct Engine::Impl {
         for (int32_t l = 0; l < c.n_layers; ++l) {
             // Evenly spaced: block l streams when floor((l+1)s/n) > floor(ls/n).
             if ((int64_t{l} + 1) * streamed / c.n_layers > int64_t{l} * streamed / c.n_layers) {
-                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
                 const auto [begin, end] = file.layer_range(l);
+                if (end == begin) continue; // absent NAS blocks need no I/O item
+                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
                 ranges.push_back({begin, end - begin});
             }
         }
+        if (ranges.empty()) return Status::ok();
+        streamed = static_cast<int32_t>(ranges.size()); // empty NAS blocks do not count as streamed weights
         auto reader = DirectFile::open(file.file().path());
         if (!reader) return reader.status();
         direct_file = std::move(reader).value();

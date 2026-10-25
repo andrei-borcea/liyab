@@ -533,7 +533,17 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
         return views
 
     key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
-    query = _match_rotated(a.query, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
+    query_target = a.query
+    params = getattr(trace.reduced, "rope_parameters", None) or {}
+    beta, length = params.get("llama_4_scaling_beta"), params.get("original_max_position_embeddings")
+    if beta is not None and length:
+        # A position-dependent query temperature is separate from the rotary transform. Remove precisely
+        # the configuration's factor before matching the projection/norm/rotation, so a mismatch still fails.
+        positions = torch.arange(s, device=query_target.device)
+        temperature = 1.0 + float(beta) * torch.log1p(torch.floor(positions / int(length)))
+        query_target = query_target / temperature[None, None, :, None]
+        f["temperature"] = {"beta": float(beta), "length": int(length)}
+    query = _match_rotated(query_target, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
     value = None
     for call, how, v in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
         if close(v, a.value):
@@ -779,9 +789,19 @@ def analyze(trace):
         facts["unknown"].append("no norm between the last block and the output projection")
     facts["logits"] = None
     if head is not None:
+        input_scale = 1.0
         if final_norm is not None and not close(head.input, final_norm.output):
-            facts["unknown"].append("the output projection does not read the final norm's output")
-        lm = head.output.float()
+            source = final_norm.output.float()
+            nonzero = source.abs() > 1e-6
+            input_scale = float((head.input.float()[nonzero] / source[nonzero]).median())
+            if (not math.isfinite(input_scale) or input_scale <= 0 or
+                    not close(head.input, source * input_scale) or getattr(head_mod, "bias", None) is not None):
+                facts["unknown"].append("the output projection does not read the final norm's output or a "
+                                        "constant multiple of it without a bias")
+                input_scale = 1.0
+        # Scaling a bias-free projection's input is the same linear scale
+        # as scaling its output. Canonicalize both conventions for the row.
+        lm = head.output.float() / input_scale
         lg = trace.logits.float()
         if close(lm, lg):
             facts["logits"] = {"transform": None}
@@ -814,6 +834,44 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
               if not (not any(True for _ in c.module.parameters()) and close(c.input, c.output))]
     norms = [c for c in direct if _norm_like(c)]
     others = [c for c in direct if not _norm_like(c)]
+    def norm_fact(c):
+        form = norm_formula(c, eps)
+        return {"module": c.path, "formula": form[0] if form else None, "eps": form[1] if form else None,
+                "size": int(c.module.weight.numel())}
+
+    if not others and not norms and close(h_in, h_out):
+        return Facts(index=index, unknown=[], absent=[], mixer={"kind": "none"}, ffn={"kind": "none"},
+                     residual="sequential", norm_before_mixer=None, norm_after_mixer=None,
+                     norm_before_ffn=None, norm_after_ffn=None)
+    if len(others) == 1:
+        branch = others[0]
+        ffn_facts = analyze_dense_ffn(branch, block_calls)
+        mixer_facts = analyze_attention(trace, branch.path, block_calls, freqs, eps)
+        is_ffn = not ffn_facts.get("unknown")
+        if is_ffn or mixer_facts is not None:
+            before = next((c for c in norms if close(c.input, h_in) and close(c.output, branch.input)), None)
+            after = next((c for c in norms if c.order > branch.order and close(c.input, branch.output)), None)
+            if before is None and not close(branch.input, h_in):
+                b["unknown"].append("the only branch does not read the residual or its norm")
+            if any(c is not before and c is not after for c in norms):
+                b["unknown"].append("an extra norm outside the only residual branch")
+            value = after.output if after is not None else branch.output
+            delta = h_out.float() - h_in.float()
+            b["residual"] = "sequential"
+            if not close(h_in.float() + value.float(), h_out):
+                nonzero = value.abs() > 1e-6
+                r = float((delta[nonzero] / value.float()[nonzero]).median()) if nonzero.any() else 1.0
+                if close(h_in.float() + r * value.float(), h_out):
+                    b["residual"] = {"multiplier": r}
+                else:
+                    b["unknown"].append("the only branch does not add to the input residual")
+            b.update(mixer={"kind": "none"} if is_ffn else mixer_facts,
+                     ffn=ffn_facts if is_ffn else {"kind": "none"},
+                     norm_before_mixer=None if is_ffn or before is None else norm_fact(before),
+                     norm_after_mixer=None if is_ffn or after is None else norm_fact(after),
+                     norm_before_ffn=norm_fact(before) if is_ffn and before else None,
+                     norm_after_ffn=norm_fact(after) if is_ffn and after else None)
+            return b
     if len(others) != 2:
         b["unknown"].append(f"the block runs {len(others)} sub-modules besides its norms "
                             f"({', '.join(c.path.rsplit('.', 1)[-1] for c in others)}), not a mixer and an FFN")
@@ -821,11 +879,6 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     mixer, ffn = others
     b["mixer_module"] = mixer.path
     b["ffn_module"] = ffn.path
-
-    def norm_fact(c):
-        form = norm_formula(c, eps)
-        return {"module": c.path, "formula": form[0] if form else None, "eps": form[1] if form else None,
-                "size": int(c.module.weight.numel())}
 
     pre_mixer = next((n for n in norms if close(n.input, h_in) and close(n.output, mixer.input)), None)
     b["norm_before_mixer"] = norm_fact(pre_mixer) if pre_mixer else None
@@ -885,9 +938,14 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
 
     mixer_facts = analyze_attention(trace, mixer.path, block_calls, freqs, eps)
     if mixer_facts is None:
-        mixer_facts = Facts(kind="recurrent", unknown=[],
-                            classes=sorted({type(c.module).__name__ for c in block_calls
-                                            if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))
+        projections = [c for c in _linears(block_calls, mixer.path)
+                       if close(c.input, mixer.input) and close(c.output, mixer.output)]
+        if len(projections) == 1:
+            mixer_facts = Facts(kind="linear", projection=projections[0].path, unknown=[])
+        else:
+            mixer_facts = Facts(kind="recurrent", unknown=[],
+                                classes=sorted({type(c.module).__name__ for c in block_calls
+                                                if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)

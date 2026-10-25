@@ -142,6 +142,20 @@ normalizes NFC and splits punctuation separately from following newlines. These 
 their Hugging Face token IDs on prose, edge cases and chat text. SmolLM3's own chat template is pinned in the
 template fixture, with 14 byte-identical reference renders.
 
+The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
+Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
+file's whole-dimension magnitude convention, and queries can take a position-dependent attention temperature.
+These operations run on the CPU on every backend; matrix projections retain the existing Metal/Vulkan routing.
+Quantized-key calibration bounds query ranges with the largest attention temperature in the covered context.
+Synthetic tests cover prefill, decode, rollback, sequences and KV reuse. The description tool checks these facts
+against the reference and file; candidate registry rows alone do not establish model conformance.
+Per-block head counts and FFN widths can be scalar metadata or integer arrays. Zero KV heads select a single
+linear mixer projection (positive query heads) or no mixer (zero query heads); a zero FFN width omits that branch.
+Attention uses each block's own grouping. The existing KV image layout reserves the maximum KV-head count for
+each attention block and zero-pads unused heads, preserving the same sequence, rollback and saved-context paths.
+Saved states of models with per-block geometry or explicit modern scalars also check the model-file fingerprint,
+so equal dimensions cannot mix contexts computed with different layouts or scales. Empty blocks create no streaming I/O items.
+
 ---
 
 ## Quick start

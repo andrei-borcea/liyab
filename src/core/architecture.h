@@ -92,7 +92,7 @@ struct ArchSpec {
     // not rotated), for files that do not list them in
     // <arch>.attention.rope_pattern (one bool per block, true = rotated, which
     // overrides both rules). nope_period N > 0: blocks N-1, 2N-1, ... (SmolLM3:
-    // every 4th). nope_global: when some blocks attend through a window, the
+    // every 4th). nope_global: when the file sets an attention window, the
     // blocks attending globally (EXAONE 4: the windowed ones carry the
     // positions, the global ones see every position unrotated).
     int32_t nope_period = 0;
@@ -127,12 +127,15 @@ enum class MoeGating : uint8_t { Softmax, Sigmoid };
 enum class MixerKind : uint8_t {
     Attention,  // softmax attention over the KV cache
     DeltaNet,   // Gated DeltaNet: causal conv + delta-rule recurrent state, no KV cache
+    None,       // no mixer branch (zero query and KV heads in per-block metadata)
+    Linear,     // one normalized residual projection, no attention or KV rows
 };
 
 // Feed-forward network of one block.
 enum class FfnKind : uint8_t {
     Dense,  // gated: down(act(gate) * up), act = ArchSpec::ffn_activation
     Moe,    // router + top-k routed gated experts
+    None,   // no FFN branch (zero per-block feed_forward_length)
 };
 
 // The structure of one block, from the tensors present.
@@ -173,6 +176,12 @@ struct BlockPlan {
     // projection (n_head x head_dim, n_head_kv x head_dim: OLMo 2) instead of
     // one per head (head_dim, shared by every head: Qwen3).
     bool qk_norm_whole = false;
+    // This block's geometry, from scalar or per-block metadata. ModelConfig's
+    // dimensions are the maxima used for scratch buffers and the fixed KV
+    // image layout; an attention block uses only its first n_head_kv heads.
+    int32_t n_head = 0;
+    int32_t n_head_kv = 0;
+    int32_t n_ff = 0;
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
@@ -220,9 +229,9 @@ struct ModelConfig {
     int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
     int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention (they own the KV cache)
     int32_t n_embd = 0;
-    int32_t n_ff = 0;
-    int32_t n_head = 0;
-    int32_t n_head_kv = 0;
+    int32_t n_ff = 0;       // maximum block FFN width (individual widths in blocks)
+    int32_t n_head = 0;     // maximum query heads, at least one for scratch sizing
+    int32_t n_head_kv = 0;  // maximum KV heads, at least one for the fixed cache layout
     int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
     int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
     int32_t rope_dim = 0;

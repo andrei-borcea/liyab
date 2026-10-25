@@ -50,6 +50,10 @@ struct TinyModelSpec {
     int32_t n_ff = 256;
     int32_t n_head = 4;
     int32_t n_head_kv = 2;
+    // Optional NAS metadata, one entry per block. Zero KV/query heads omit
+    // the mixer, positive query heads with zero KV heads write a linear
+    // projection; zero FFN width omits the FFN. Head size stays n_embd/n_head.
+    std::vector<int32_t> block_heads, block_kv_heads, block_ff;
     int32_t context_length = 512;
     // Mixed precision by default: Q8_0 attention, Q4_0 FFN, F16 embeddings.
     DType attn_type = DType::Q8_0;
@@ -75,6 +79,14 @@ struct TinyModelSpec {
     // default, and drawn from the generator only when on, so every model
     // written before these existed keeps its exact weights.
     bool qk_norm = false;        // per-head RMSNorm of Q and K (attn_q_norm / attn_k_norm)
+    bool qk_norm_whole = false;  // one Q/K RMSNorm over all heads (requires qk_norm)
+    bool post_only_norms = false; // norms after mixer/FFN, with no norms before either (OLMo 2)
+    std::vector<bool> rope_layers; // attention.rope_pattern: true rotates, false leaves Q/K unchanged
+    float embedding_scale = 0.0f; // > 0: explicit embedding/residual/logit metadata (no weight changes)
+    float residual_scale = 0.0f;
+    float logit_scale = 0.0f;
+    float attn_temp_scale = 0.0f; // attention.temperature_scale / _length (Ministral 3)
+    int32_t attn_temp_length = 0;
     bool attn_gate = false;      // attention output gated per head: attn_q is [q | gate], twice as tall
     int32_t rope_dim = 0;        // rotated dimensions per head (partial RoPE); 0: the whole head
     bool rope_freqs = false;     // per-pair RoPE frequency factors (rope_freqs.weight, Llama 3.x)
@@ -167,6 +179,11 @@ struct TinyModelSpec {
 // lowercase letters, and every substring of "▁hello" / "▁world".
 std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
+
+// NAS geometry covering two GQA ratios, differing query and FFN widths,
+// an absent block, and a linear mixer. A single spec keeps every path test
+// on the same geometry; optional norms/scales can be added by the caller.
+TinyModelSpec nas_spec();
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
 

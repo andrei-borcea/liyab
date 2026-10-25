@@ -367,7 +367,7 @@ class Engine:
         # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
         # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
         # caps, YaRN) are supported exactly when it reads them.
-        self.file_keys = set(re.findall(r'(?:key|require_int)\(\s*"([^"]+)"', cpp))
+        self.file_keys = set(re.findall(r'(?:key|require_int|block_values)\(\s*"([^"]+)"', cpp))
         self.rope_scalings = set(re.findall(r'\*scaling\s*[!=]=\s*"([\w-]+)"', cpp))
         m = re.search(r"kArchitectures\[\]\s*=\s*\{(.*?)\n\};", cpp, re.S)
         if m is None:
@@ -480,7 +480,8 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
                     "ssm_conv1d.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight"}
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
-                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa")
+                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "nope_period",
+                  "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim")
 
 
 def _close(a, b, rel=1e-5):
@@ -604,7 +605,7 @@ def _f32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
+def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim=False):
     """RoPE frequencies and magnitude the engine computes from the file (Transformer::load and describe_model()):
     base^(-2i/r) divided by the file's frequency factors, blended by YaRN when the file asks for it, over the
     linear position scale. Returns (inv_freq / scale list, magnitude, q.k factor, how)."""
@@ -650,8 +651,11 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
         ln = math.log(factor) if factor > 1.0 else 0.0
         log_mul = g.key("rope.scaling.yarn_log_multiplier")
         attn = g.key("rope.scaling.yarn_attn_factor")
-        magnitude *= float(attn) if attn is not None else (1.0 if log_mul is not None else 0.1 * ln + 1.0)
-        if log_mul is not None:
+        if mscale_all_dim and log_mul is not None:
+            magnitude *= float(attn) if attn is not None else (1.0 + 0.1 * ln) / (1.0 + 0.1 * float(log_mul) * ln)
+        else:
+            magnitude *= float(attn) if attn is not None else (1.0 if log_mul is not None else 0.1 * ln + 1.0)
+        if log_mul is not None and not mscale_all_dim:
             qk = 1.0 + float(log_mul) * ln
         how.append(f"YaRN factor {factor:g} over {ctx:g} positions")
     inv = []
@@ -683,6 +687,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         return d, None, g
     cfg = facts["config"]
     d.set("name", arch, "general.architecture of the GGUF")
+    def inactive(field, why):
+        # An inactive switch cannot be inferred from this file. Keeping its registered value is safe only
+        # after proving its activation condition absent; it preserves a family's row across its variants.
+        registered = engine.rows.get(arch, ({}, ""))[0]
+        d.set(field, registered.get(field, engine_default(engine, field)),
+              why + "; this switch is inactive (registered value, or the engine default for a new row)")
     d.notes.append(f"reference: {facts['model_class']} ({facts.get('model_type')}), {facts['traced_blocks']} of "
                    f"{facts['blocks']} blocks traced")
     unknown_fields = [n for n, _, _ in engine.fields if n not in DERIVED_FIELDS]
@@ -694,11 +704,19 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     # --- hyperparameters from the file, as describe_model() reads them ---
     n_layers = int(g.key("block_count", 0)) - int(g.key("nextn_predict_layers", 0) or 0)
     n_embd = int(g.key("embedding_length", 0))
-    n_head = int(g.key("attention.head_count", 0) or 0)
-    n_head_kv = int(g.key("attention.head_count_kv", n_head) or n_head)
+    def per_block(value, label):
+        values = [int(v) for v in value] if isinstance(value, list) else [int(value or 0)] * n_layers
+        if len(values) < n_layers or any(v < 0 for v in values):
+            raise FormatError(f"invalid per-block {label}")
+        return values[:n_layers]
+    block_heads = per_block(g.key("attention.head_count", 0), "attention.head_count")
+    block_kv_heads = per_block(g.key("attention.head_count_kv", block_heads), "attention.head_count_kv")
+    block_ff = per_block(g.key("feed_forward_length", 0), "feed_forward_length")
+    n_head = max(max(block_heads, default=0), 1)
+    n_head_kv = max(max(block_kv_heads, default=0), 1)
     head_dim = int(g.key("attention.key_length", n_embd // max(n_head, 1)))
     rope_dim = int(g.key("rope.dimension_count", head_dim))
-    n_ff = int(g.key("feed_forward_length", 0) or 0)
+    n_ff = max(block_ff, default=0)
     eps = float(g.key("attention.layer_norm_rms_epsilon", 1e-5))
     if n_layers != facts["blocks"]:
         d.file_issues.append(f"the GGUF has {n_layers} blocks, the reference {facts['blocks']}")
@@ -731,12 +749,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     plans = []
     for b in range(n_layers):
         ts = blocks.get(b, set())
-        p = {}
+        p = {"n_head": block_heads[b], "n_head_kv": block_kv_heads[b], "n_ff": block_ff[b]}
         if "ssm_conv1d.weight" in ts:
             p["mixer"] = "deltanet"
+        elif block_kv_heads[b] == 0:
+            p["mixer"] = "none" if block_heads[b] == 0 else "linear"
         else:
             p["mixer"] = "attention"
-            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * q_dim
+            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * block_heads[b] * head_dim
             p["fused_qkv"] = "attn_q.weight" not in ts and "attn_qkv.weight" in ts
             p["qkv_bias"] = bool({"attn_q.bias", "attn_qkv.bias"} & ts)
             p["qk_norm"] = "attn_k_norm.weight" in ts
@@ -746,9 +766,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
             p["selection_bias"] = "exp_probs_b.bias" in ts
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
+        elif block_ff[b] == 0 and "ffn_up.weight" not in ts:
+            p["ffn"] = "none"
         else:
             p["ffn"] = "dense"
-            p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * n_ff
+            p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * block_ff[b]
         plans.append(p)
 
     # --- the reference, block by block ---
@@ -759,7 +781,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         for u in b.get("unknown", []):
             d.unknown.append(f"block {b['index']}: {u}")
         for a in b.get("absent", []):
-            d.missing.append(f"block {b['index']}: {a}")
+            post_only = ((a.startswith("no norm before the token mixer") and b.get("norm_after_mixer")) or
+                         (a.startswith("no norm before the FFN") and b.get("norm_after_ffn")))
+            if post_only:
+                d.parts.append(f"block {b['index']}: {a}; its branch has a norm after it")
+            else:
+                d.missing.append(f"block {b['index']}: {a}")
         i = b["index"]
         if i < len(plans):
             kind = b.get("mixer", {}).get("kind")
@@ -769,6 +796,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.missing.append(f"block {i}: a token mixer that is not softmax attention "
                                  f"({', '.join(b['mixer'].get('classes', []))}) without the engine's Gated "
                                  f"DeltaNet tensors")
+            if kind in ("none", "linear") and plans[i]["mixer"] != kind:
+                d.file_issues.append(f"block {i}: {kind} mixer in the reference, {plans[i]['mixer']} in the file")
 
     # Unknown mixers: say what the file holds, e.g. latent attention.
     for b in att_blocks:
@@ -794,10 +823,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             info = m.get(side)
             if info is None:
                 continue
-            if info["rope"] is None:
-                d.missing.append(f"block {b['index']}: {'keys' if side == 'key' else 'queries'} are not rotated "
-                                 f"(no position embedding in this block)")
-            else:
+            if info["rope"] is not None:
                 layouts.add(info["rope"]["layout"])
     ref_layout = layouts.pop() if len(layouts) == 1 else None
     if len(layouts) > 0:
@@ -824,8 +850,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if gname in g.tensors and hname is not None:
             # Two heads tell the row order (and whether the weights are the same); the rest would only cost
             # downloads.
-            heads = min(n_head_kv, 2)
-            first = q_dim if key["projection_layout"].startswith("fused") else 0
+            heads = min(block_kv_heads[i], 2)
+            first = block_heads[i] * head_dim if key["projection_layout"].startswith("fused") else 0
             hf = ckpt.tensor(hname, first, heads * head_dim)
             gg = g.values(gname, first, heads * head_dim)
             perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
@@ -859,7 +885,32 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if scaling_type not in (None, "none") and scaling_type not in engine.rope_scalings:
         d.missing.append(f"{'YaRN' if scaling_type == 'yarn' else repr(scaling_type)} RoPE scaling "
                          f"(rope.scaling.type {scaling_type})")
-    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+    mscale_all_dim = False
+    log_mul = g.key("rope.scaling.yarn_log_multiplier")
+    if scaling_type == "yarn" and log_mul is not None:
+        main = global_tables or window_tables
+        matches = []
+        for convention in (False, True):
+            _, mag, qk, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                           mscale_all_dim=convention)
+            scales = [b["mixer"]["scale"] for b in att_blocks]
+            want_scale = float(g.key("attention.scale", head_dim ** -0.5)) * qk ** 2
+            if (all(_close(rope_tables[t]["magnitude"], mag, 1e-5) for t in main) and
+                    all(_close(s, want_scale, 1e-5) for s in scales)):
+                matches.append(convention)
+        if len(matches) == 1:
+            mscale_all_dim = matches[0]
+            d.set("yarn_mscale_all_dim", mscale_all_dim,
+                  "YaRN rotation magnitude and attention scale establish the file's log-multiplier convention")
+        elif len(matches) == 2:
+            inactive("yarn_mscale_all_dim", "both conventions give the same magnitude and attention scale")
+            mscale_all_dim = d.fields["yarn_mscale_all_dim"][0]
+        else:
+            d.unknown.append("neither YaRN log-multiplier convention matches the reference")
+    else:
+        inactive("yarn_mscale_all_dim", "no YaRN log multiplier in this file")
+    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                       mscale_all_dim=mscale_all_dim)
     rope_dims = {b["mixer"]["key"]["rope"]["dims"] for b in att_blocks
                  if b["mixer"].get("key") and b["mixer"]["key"].get("rope")}
     if rope_dims and rope_dims != {rope_dim}:
@@ -872,7 +923,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         t = rope_tables[tname]
         ref = t["inv_freq"]
         if rope_base is None:
-            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                              mscale_all_dim=mscale_all_dim)
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"
@@ -973,7 +1025,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             why = "the file's sliding_window_pattern lists the windowed blocks"
         else:
             why = f"blocks {period - 1}, {2 * period - 1}, ... attend globally, the others through the window"
-        d.set("swa_period", period, why)
+        if not win:
+            inactive("swa_period", why)
+        else:
+            d.set("swa_period", period, why)
         # Windowed blocks with their own RoPE table: an unscaled base of their own.
         base_swa = 0.0
         if win and global_tables and window_tables and window_tables != global_tables:
@@ -992,9 +1047,55 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                         fb = g.key("rope.freq_base_swa")
                         if fb is not None and not _close(float(fb), base):
                             d.file_issues.append(f"rope.freq_base_swa {fb} in the file, {base:g} in the reference")
-        d.set("rope_base_swa", base_swa,
+        unscaled = bool(base_swa and _close(base_swa, float(g.key("rope.freq_base", 10000.0)), 1e-5))
+        if base_swa:
+            d.set("swa_rope_unscaled", unscaled, "windowed blocks' frequencies compared with the global base")
+        else:
+            inactive("swa_rope_unscaled", "no separate unscaled windowed RoPE table")
+        d.set("rope_base_swa", 0.0 if unscaled else base_swa,
               f"windowed blocks rotate unscaled with base {base_swa:g}" if base_swa else
               "windowed blocks rotate like the others" if win else "no windowed block")
+
+    # NoPE is planned from the file's bool list, or from the row's periodic/global rule. Establish the rule
+    # from observed Q/K and the configuration's list, and verify every traced block against the plan.
+    rotation = {}
+    for b in att_blocks:
+        info = b["mixer"]
+        q, k = info.get("query"), info.get("key")
+        if q is not None and k is not None:
+            if bool(q.get("rope")) != bool(k.get("rope")):
+                d.unknown.append(f"block {b['index']}: only one of Q and K is rotated")
+            else:
+                rotation[b["index"]] = bool(k.get("rope"))
+    configured = cfg.get("no_rope_layers")
+    full_rotation = [bool(v) for v in configured] if isinstance(configured, list) and len(configured) == n_layers else None
+    if full_rotation is not None and any(full_rotation[i] != v for i, v in rotation.items()):
+        d.unknown.append("the configuration's no_rope_layers flags disagree with observed Q/K rotation")
+    no_rotation = [i for i, v in rotation.items() if not v]
+    global_nope = bool(no_rotation and flags and g.key("attention.sliding_window", 0) and
+                       all(v == bool(flags[i]) for i, v in rotation.items()))
+    if no_rotation:
+        d.set("nope_global", global_nope, "only windowed blocks rotate" if global_nope else
+              "NoPE blocks are independent of attention windows")
+        period = 0
+        if not global_nope:
+            source = dict(enumerate(full_rotation)) if full_rotation is not None else rotation
+            period = next((p for p in range(1, n_layers + 1)
+                           if all(v == ((i + 1) % p != 0) for i, v in source.items())), 0)
+        d.set("nope_period", period, "period established by Q/K rotation and the configuration's flags" if period else
+              "rotation is selected by the global-block rule or the file's explicit list")
+        pattern = g.key("attention.rope_pattern")
+        for i, v in rotation.items():
+            planned = (bool(pattern[i]) if isinstance(pattern, list) and i < len(pattern) else
+                       not ((period and (i + 1) % period == 0) or (global_nope and not flags[i])))
+            if v != planned:
+                d.file_issues.append(f"block {i}: the file and row do not select the observed Q/K rotation")
+        if not period and not global_nope and not isinstance(pattern, list):
+            d.missing.append("irregular NoPE blocks without attention.rope_pattern metadata")
+        d.parts.append(f"NoPE blocks {_ranges(no_rotation)} (Q and K are not rotated)")
+    else:
+        inactive("nope_period", "every traced attention block rotates")
+        inactive("nope_global", "no observed global NoPE block")
 
     # --- attention arguments ---
     qk_orders, qk_spans = set(), set()
@@ -1006,6 +1107,17 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for b in att_blocks:
         m = b["mixer"]
         i = b["index"]
+        temperature = m.get("temperature")
+        beta = float(g.key("attention.temperature_scale", 0.0))
+        if temperature:
+            length = int(g.key("attention.temperature_length",
+                               g.key("rope.scaling.original_context_length", 0)))
+            if not _close(beta, temperature["beta"]) or length != temperature["length"]:
+                d.file_issues.append(f"block {i}: query temperature {temperature}, file beta {beta:g}, length {length}")
+            else:
+                d.parts.append(f"query temperature 1 + {beta:g} ln(1 + floor(pos / {length})) from the file")
+        elif beta != 0.0:
+            d.file_issues.append(f"block {i}: file query temperature beta {beta:g}, absent in the reference")
         if not _close(m["scale"], engine_scale, 1e-5):
             if "attention.scale" in engine.file_keys:
                 d.file_issues.append(f"block {i}: attention scale {m['scale']:.6g} in the reference, "
@@ -1030,9 +1142,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
         if not m.get("causal", True):
             d.missing.append(f"block {i}: non-causal attention")
-        if m["head_dim"] != head_dim or m["heads"] != n_head or m["kv_heads"] != n_head_kv:
+        if m["head_dim"] != head_dim or m["heads"] != block_heads[i] or m["kv_heads"] != block_kv_heads[i]:
             d.file_issues.append(f"block {i}: {m['heads']}/{m['kv_heads']} heads of {m['head_dim']} in the "
-                                 f"reference, {n_head}/{n_head_kv} of {head_dim} in the file")
+                                 f"reference, {block_heads[i]}/{block_kv_heads[i]} of {head_dim} in the file")
         for side in ("key", "query"):
             info = m.get(side) or {}
             if info.get("norm"):
@@ -1047,8 +1159,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if key.get("projection_layout", "").startswith("fused") != bool(plan.get("fused_qkv")):
             d.file_issues.append(f"block {i}: fused QKV in one of the reference and the file only")
     if qk_spans - {head_dim}:
-        d.missing.append(f"Q/K norms over {sorted(qk_spans - {head_dim})} dimensions (all heads together), "
-                         f"not each head's {head_dim}")
+        valid_spans = {head_dim} | {h * head_dim for h in block_heads + block_kv_heads if h > 0}
+        bad = qk_spans - valid_spans
+        if bad:
+            d.missing.append(f"Q/K norms span unsupported dimensions {sorted(bad)}")
+        else:
+            d.parts.append("Q/K RMSNorm over the whole projection, planned from the norm tensor's length")
     if len(qk_orders) > 1:
         d.unknown.append("Q/K norms sit before RoPE in some blocks and after it in others")
     elif qk_orders:
@@ -1061,7 +1177,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     roles = ("norm_before_mixer", "norm_after_mixer", "norm_before_ffn", "norm_after_ffn")
     placement = {}
     for r in roles:
-        present = {b.get(r) is not None for b in bf if "mixer" in b}
+        branch = "mixer" if "mixer" in r else "ffn"
+        present = {b.get(r) is not None for b in bf if b.get(branch, {}).get("kind") not in (None, "none")}
         if len(present) > 1:
             d.unknown.append(f"{r.replace('_', ' ')} exists in some blocks only")
         placement[r] = present == {True}
@@ -1079,11 +1196,18 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.file_issues.append(f"norm epsilon {sorted(eps_ref)} in the reference, {eps} in the file")
     if any(isinstance(b.get("residual"), dict) for b in bf):
         mults = sorted({round(b["residual"]["multiplier"], 6) for b in bf if isinstance(b.get("residual"), dict)})
-        d.missing.append(f"residual multiplier {mults}: the block's mixer and FFN outputs are scaled before "
-                         f"they are added")
+        if any(b.get("residual", {}).get("only_ffn") for b in bf if isinstance(b.get("residual"), dict)):
+            d.missing.append("residual multiplier on the FFN only")
+        elif len(mults) != 1 or not _close(mults[0], float(g.key("residual_scale", 1.0)), 1e-5):
+            d.file_issues.append(f"residual multipliers {mults}, file residual_scale {g.key('residual_scale', 1.0)}")
+        else:
+            d.parts.append(f"residual branches multiplied by {mults[0]:g} (residual_scale)")
+    elif not _close(float(g.key("residual_scale", 1.0)), 1.0):
+        d.file_issues.append("file residual_scale differs from the reference's unscaled residual branches")
 
     norm_names = {}
-    b0 = next((b for b in bf if "mixer" in b and b["index"] < n_layers), None)
+    b0 = next((b for b in bf if b.get("mixer", {}).get("kind") not in (None, "none") and
+               b.get("ffn", {}).get("kind") not in (None, "none") and b["index"] < n_layers), None)
     if b0 is not None and ckpt is not None:
         i = b0["index"]
         candidates = {s: g.values(f"blk.{i}.{s}").reshape(-1) for s in blocks.get(i, set())
@@ -1120,6 +1244,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.set("ffn_norm", norm_names["norm_before_ffn"],
                   f"{b0['norm_before_ffn']['module'].rsplit('.', 1)[-1]} normalizes the residual stream before the "
                   f"FFN; the GGUF holds its weights as blk.N.{norm_names['norm_before_ffn']}")
+    elif placement.get("norm_after_ffn"):
+        d.set("ffn_norm", "ffn_norm", "no norm before the FFN; the conventional absent tensor name is unused")
+    elif all(b.get("ffn", {}).get("kind") == "none" for b in bf):
+        d.set("ffn_norm", "ffn_norm", "no FFN branch; its conventional norm name is inactive")
     for r, field in (("norm_after_mixer", "post_mixer_norm"), ("norm_after_ffn", "post_ffn_norm")):
         if not placement.get(r):
             d.set(field, "", f"no norm after the {'mixer' if 'mixer' in r else 'FFN'}")
@@ -1177,6 +1305,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.file_issues.append(f"block {i}: dense FFN in the reference, MoE in the file")
             elif plan and bool(f.get("fused_gate_up")) != bool(plan.get("fused_gate_up")):
                 d.file_issues.append(f"block {i}: fused gate/up projection in one of the reference and the file only")
+        elif f.get("kind") == "none":
+            if plan and plan.get("ffn") != "none":
+                d.file_issues.append(f"block {i}: no FFN in the reference, but the file has one")
         elif f.get("kind") == "moe":
             if f.get("expert_activation"):
                 acts.add(f["expert_activation"])
@@ -1236,18 +1367,37 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     es = facts.get("embedding_scale")
     if es is None:
         pass  # reported as unknown by the trace
+    elif g.key("embedding_scale") is not None:
+        if not _close(es, float(g.key("embedding_scale")), 1e-5):
+            d.file_issues.append(f"embedding scale {es:g}, file embedding_scale {g.key('embedding_scale')}")
+        d.set("scale_embeddings", False, "explicit embedding_scale metadata overrides the sqrt(d) switch")
+        d.parts.append(f"embeddings multiplied by {es:g} (embedding_scale)")
     elif _close(es, 1.0, 1e-6):
         d.set("scale_embeddings", False, "block 0 receives the embedding rows as they are")
     elif _close(es, float(np.float32(math.sqrt(n_embd))), 1e-5):
         d.set("scale_embeddings", True, f"block 0 receives the embedding rows times sqrt({n_embd}) = {es:.6g}")
     else:
-        d.missing.append(f"embeddings multiplied by {es:g} (the engine scales by sqrt(n_embd) = "
-                         f"{math.sqrt(n_embd):.6g} or not at all)")
+        d.set("scale_embeddings", False, "a non-sqrt(d) multiplier requires explicit embedding_scale metadata")
+        d.file_issues.append(f"embeddings multiplied by {es:g}, but the file has no embedding_scale metadata")
     lg = facts.get("logits") or {}
     final_cap = lg["value"] if lg.get("transform") == "softcap" else 0.0
-    if lg.get("transform") == "scale":
-        d.missing.append(f"logits multiplied by {lg['value']:.6g} after the output projection")
-    elif "final_logit_softcapping" not in engine.file_keys:
+    if g.key("logit_scale") is not None:
+        stored = float(g.key("logit_scale"))
+        actual = float(lg["value"]) if lg.get("transform") == "scale" else 1.0
+        matches = [divides for divides in (False, True)
+                   if stored > 0 and _close(actual, 1.0 / stored if divides else stored, 1e-5)]
+        if len(matches) == 1:
+            d.set("logit_scale_divides", matches[0], "output projection compared with logits and file logit_scale")
+        elif len(matches) == 2:
+            inactive("logit_scale_divides", "unit logit scale has identical multiplier and divisor semantics")
+        else:
+            d.file_issues.append(f"logits multiplied by {actual:g}, incompatible file logit_scale {stored:g}")
+        d.parts.append(f"logits multiplied by {actual:g} (logit_scale)")
+    else:
+        inactive("logit_scale_divides", "no logit_scale metadata")
+        if lg.get("transform") == "scale":
+            d.file_issues.append(f"logits multiplied by {lg['value']:.6g}, file has no logit_scale")
+    if "final_logit_softcapping" not in engine.file_keys:
         if final_cap:
             d.missing.append(f"final logit soft-capping at {final_cap:g}")
     elif not _close(float(g.key("final_logit_softcapping", 0.0) or 0.0), final_cap, 1e-6):
@@ -1308,6 +1458,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for i, p in enumerate(plans):
         if p["mixer"] == "deltanet":
             mix = "Gated DeltaNet"
+        elif p["mixer"] == "none":
+            mix = "no mixer"
+        elif p["mixer"] == "linear":
+            mix = "linear mixer (one residual projection)"
         else:
             mix = "attention" + ("".join(f", {t}" for t, on in (("fused QKV", p["fused_qkv"]),
                                                                 ("QKV biases", p["qkv_bias"]),
@@ -1315,6 +1469,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                                                                 ("gated output", p["attn_gate"])) if on))
         if p["ffn"] == "moe":
             ffn = "MoE FFN" + (" + shared expert" if p["shared_expert"] else "")
+        elif p["ffn"] == "none":
+            ffn = "no FFN"
         else:
             ffn = "dense FFN" + (" (fused gate/up)" if p["fused_gate_up"] else "")
         groups.setdefault(f"{mix}; {ffn}", []).append(i)
@@ -1619,6 +1775,10 @@ def print_description(d, engine, arch):
 
 def self_test(engine):
     """Every registry row parsed and printed back as architecture.cpp writes it."""
+    unknown = [name for name, _, _ in engine.fields if name not in DERIVED_FIELDS]
+    if unknown:
+        print("ArchSpec fields without derivation rules: " + ", ".join(unknown))
+        return False
     failures = 0
     for name, (values, text) in engine.rows.items():
         printed = engine.format_row(values)

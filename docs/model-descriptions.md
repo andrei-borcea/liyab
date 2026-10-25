@@ -83,6 +83,24 @@ trip), the tensors the forward pass binds from `transformer.cpp`, the pre-tokeni
 `pre_tokenizer.cpp` and `tokenizer.cpp`. An `ArchSpec` field the tool has no rule for makes it refuse to propose
 rows until the rule is added.
 
+The tool also checks blocks without rotation (the file's `attention.rope_pattern`, a periodic pattern, or global
+blocks beside windowed ones), post-only branch norms, whole-projection Q/K RMSNorm, and embedding/residual/logit
+scales against the reference. A file's logit scale is tested as both a multiplier and a divisor. YaRN's two
+log-multiplier conventions are distinguished by the reference's rotation magnitude and attention scale. Windowed
+blocks' unscaled rotary table can use the global base. A switch whose activation condition is absent cannot be
+established from that checkpoint: the tool explicitly reports it as inactive and retains its registered value
+(the engine default for a new row). It never uses a registered value to decide an active behavior.
+
+Per-block `attention.head_count`, `attention.head_count_kv` and `feed_forward_length` arrays describe NAS geometry.
+The planner distinguishes softmax attention, a single linear residual projection, and an absent mixer; zero-width
+FFNs are absent. Only softmax-attention blocks own KV slots. Scratch buffers and cache images use the maximum
+dimensions, with inactive KV heads stored as zeros; projections, normalization, grouped-query attention, key
+calibration and relocation use the active dimensions of the block.
+Saved states include the file fingerprint when these arrays or modern scalar/rotation-pattern keys are present;
+models with different geometry or scales cannot exchange states just because their dimensions and file sizes match.
+For quantized KV caches, key calibration includes a conservative query-temperature gain over its covered context;
+the measured channel bounds remain valid beyond the first temperature boundary.
+
 The modern model tokenizer rules (`smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`) are validated on all
 three gate texts. SmolLM3's chat template is also recorded in `tests/data/chat_templates.json`; its 14 cases render
 exactly as transformers does. An OLMo 2 base checkpoint has no chat template to render.
