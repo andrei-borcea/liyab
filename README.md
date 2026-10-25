@@ -574,6 +574,29 @@ available memory or of `memory_budget_mb`.
   With `requant_bits = -1` (the app's default), resident Q8_0 matrices are converted to Q5_K or Q4_K at load **only**
   when the expert cache would otherwise hold under 10% of the experts. That is the point where nearly every token
   would wait on storage.
+
+**GLM-5.2 laptop sizing.** Its official configuration (`cf457fa734ab149ffef225f80893eb38c6ff5cdc`) has 78 trunk
+blocks, 75 MoE blocks, 256 routed experts per MoE block and eight experts selected per token. The trunk contains
+724.776 billion routed-expert parameters and 18.600 billion other matrix parameters. These uniform-format
+tensor-payload estimates exclude MTP blocks, GGUF metadata/alignment and mixed-quantization choices:
+
+| Matrix format | Trunk file payload (GiB) | Resident weights (GiB) | Expert reads per cold decode token (GiB) | 3% expert cache (GiB) |
+| :--- | ---: | ---: | ---: | ---: |
+| BF16 / F16 | 1384.65 | 34.65 | 42.19 | 40.50 |
+| Q8_0 | 735.60 | 18.41 | 22.41 | 21.52 |
+| Q6_K | 567.93 | 14.21 | 17.30 | 16.61 |
+| Q5_K | 475.98 | 11.91 | 14.50 | 13.92 |
+| Q4_K | 389.44 | 9.75 | 11.87 | 11.39 |
+| Q3_K | 297.49 | 7.45 | 9.06 | 8.70 |
+| Q2_K | 227.17 | 5.69 | 6.92 | 6.64 |
+
+Cold reads are `75 × 8 × 3 × 6144 × 2048` parameters per decode token; cache hits reduce them, speculative
+prefetch can add reads. Main F16 latent keys plus F32 index keys currently reserve 129,792 bytes per position
+across all 78 blocks, including shared-indexer blocks: 0.25 GiB at 2,048 positions and 15.84 GiB at 131,072.
+Thus Q4_K with a 3% cache starts at about 21.4 GiB for weights/cache/a short context, or 37.0 GiB at 128K,
+before activations, allocator overhead and the OS. A 15% Q4_K expert cache alone takes 56.95 GiB. These are
+capacity estimates, not measured GLM-5.2 throughput or a full-model conformance result.
+
 * **Optional lossy trade-offs**, all measured with `liyab-kl` (see [results](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)):
   * `requant_bits` 4/5: fewer resident bytes;
   * `moe_expert_mass`: run only the top experts covering a share of the router weight;

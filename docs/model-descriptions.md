@@ -291,3 +291,13 @@ The standard F32 reference gate uses the original latent/indexer geometry, four 
 diagnostics fail top-1 and remain numerical limitations, as recorded in the README; a rounded-KV diagnostic is
 kept separate from the standard reference gate. No registry row is proposed when the latent decomposition or
 indexer pairing cannot be established.
+
+The README's GLM-5.2 capacity estimates use the official configuration revision
+`cf457fa734ab149ffef225f80893eb38c6ff5cdc`, without downloading its weights. There are 21 full indexers and
+57 shared-indexer blocks. Matrix counts include untied embedding/output matrices, MLA projections, dense FFNs,
+shared experts, routers and full indexer projections. Norms and router selection biases remain F32 in the
+estimate. Routed expert parameters are `75 × 256 × 3 × 6144 × 2048`; a cold decode token reads eight of the
+256 experts per MoE block. Format byte rates are F16/BF16 2, Q8_0 34/32, and Q2_K/Q3_K/Q4_K/Q5_K/Q6_K
+84/110/144/176/210 bytes per 256 parameters. Actual GGUF sizes depend on their mixed tensor formats and whether
+they include unexecuted MTP tensors. The current uniform cache layout reserves auxiliary channels in shared
+blocks too; the estimate includes that allocation rather than assuming only full indexers consume key memory.
