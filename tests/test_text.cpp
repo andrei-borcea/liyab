@@ -6,11 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <memory>
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -726,6 +728,24 @@ std::string first_difference(const std::string& got, const std::string& want) {
            "\n    want " + jinja::Value(want.substr(from, 100)).repr();
 }
 
+// Keep reference fixtures independent of the day and host time zone. Reuse
+// the interpreter's callable context rather than changing its runtime clock.
+jinja::Value chat_special(const jinja::Value& entry) {
+    auto special = jinja::Value::object();
+    special.fields().entries = entry.fields().find("special")->fields().entries;
+    if (const auto* clock = entry.fields().find("clock_utc")) {
+        const auto epoch = static_cast<std::time_t>(clock->as_int());
+        std::tm fixed{};
+        if (!gmtime_r(&epoch, &fixed)) throw std::runtime_error("invalid fixture clock_utc");
+        special.fields().set("strftime_now", jinja::Value::callable("strftime_now", [fixed](jinja::Array& args, jinja::Kwargs&) {
+            char buffer[256];
+            const size_t n = std::strftime(buffer, sizeof buffer, args.empty() ? "%Y-%m-%d" : args[0].str().c_str(), &fixed);
+            return jinja::Value(std::string(buffer, n));
+        }));
+    }
+    return special;
+}
+
 }  // namespace
 
 TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_template") {
@@ -736,7 +756,7 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
         auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
         if (!tmpl) std::printf("  %s: %s\n", name.as_string().c_str(), tmpl.status().message().c_str());
         REQUIRE(tmpl.has_value());
-        const jinja::Value& special = *entry.fields().find("special");
+        const jinja::Value special = chat_special(entry);
         size_t index = 0;
         for (const jinja::Value& c : entry.fields().find("cases")->items()) {
             const std::string request = c.fields().find("request")->to_json();
@@ -766,7 +786,7 @@ TEST_CASE("Chat templates: prefix stability and the layout of turns") {
     auto format = [&](const char* name, const char* probe) {
         const jinja::Value& entry = *data->fields().find(name);
         auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
-        auto f = tmpl->format(probe, *entry.fields().find("special"));
+        auto f = tmpl->format(probe, chat_special(entry));
         if (!f) std::printf("  %s: %s\n", name, f.status().message().c_str());
         return f.has_value() ? *f : ChatFormat{};
     };

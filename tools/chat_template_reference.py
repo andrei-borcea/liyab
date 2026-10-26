@@ -17,7 +17,8 @@ a system message, replies carrying reasoning (inline <think> blocks and reasonin
 and tool results, thinking on and off (enable_thinking, preserve_thinking), with and without a generation
 prompt, non-ASCII and white space at the edges of messages. A template that refuses a conversation
 (raise_exception, an error in the sandbox) is recorded as an error, which Liyab must also report. Templates that
-read the clock (strftime_now) get a fixed date_string so the outputs stay reproducible.
+read the clock (strftime_now) use 2024-07-26 12:00:00 as their UTC clock and a fixed date_string.
+Their fixture stores clock_utc outside the request so the C++ test can supply the same clock.
 
 The output is one JSON file: {name: {"template", "special", "cases": [{"request", "output" | "error"}]}}, where a
 request is what Engine::render_chat takes.
@@ -26,7 +27,11 @@ Needs transformers (pip install transformers jinja2).
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
+
+FIXED_CLOCK = datetime(2024, 7, 26, 12, 0, 0)
+CLOCK_UTC = int(FIXED_CLOCK.replace(tzinfo=timezone.utc).timestamp())
 
 TOOLS = [
     {"type": "function", "function": {"name": "get_weather", "description": "Weather for a city.",
@@ -95,6 +100,8 @@ def main():
             if "strftime_now" in template:
                 request["date_string"] = "26 Jul 2024"
             kwargs = {k: v for k, v in request.items() if k not in ("messages", "tools", "add_generation_prompt")}
+            if "strftime_now" in template:
+                kwargs["strftime_now"] = FIXED_CLOCK.strftime
             try:
                 if template_file:
                     from transformers.utils.chat_template_utils import render_jinja_template
@@ -110,6 +117,8 @@ def main():
             except Exception as e:  # the template refuses the conversation: Liyab must refuse it too
                 cases.append({"request": request, "error": f"{type(e).__name__}: {e}"})
         out[name] = {"template": template, "special": special, "cases": cases}
+        if "strftime_now" in template:
+            out[name]["clock_utc"] = CLOCK_UTC
         print(f"{name}: {sum('output' in c for c in cases)} rendered, {sum('error' in c for c in cases)} refused")
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)

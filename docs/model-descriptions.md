@@ -108,6 +108,8 @@ the measured channel bounds remain valid beyond the first temperature boundary.
 The modern model tokenizer rules (`smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`) are validated on all
 three gate texts. SmolLM3's chat template is also recorded in `tests/data/chat_templates.json`; its 14 cases render
 exactly as transformers does. An OLMo 2 base checkpoint has no chat template to render.
+Clock-reading template fixtures store a fixed `clock_utc` instant; both reference generation and the C++ test
+override `strftime_now` through their existing template context, independently of the current day and time zone.
 GLM-4's `glm4` name selects the Llama-3 split and whole-piece lookup, without Unicode normalization.
 The tokenizer accepts the converter's integer Tekken scores as numeric values. Template fixtures cover GLM-4,
 Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS, including Seed-OSS's integer dictionary keys and thinking-budget

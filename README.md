@@ -602,6 +602,7 @@ What the port does differently from the POSIX platforms:
     Hunyuan-0.5B, Hunyuan-A13B and DeepSeek V3.1: 165 renders identical, and the 3 conversations transformers
     refuses refused too (`tests/data/chat_templates.json`, written by `tools/chat_template_reference.py`). The
     templates the GGUFs themselves carry gave the same 168 results.
+    Clock-reading fixtures pin a UTC instant and supply it to both renderers, so their expected date is reproducible.
 * **Prompts are used as given** by `generate()` and `prefill()`: render them with the template first (the app does).
 
 ---
