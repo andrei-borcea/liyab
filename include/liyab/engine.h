@@ -419,10 +419,12 @@ struct PromptSegment {
 //  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each
 //    matrix's own rank; alpha 0 or absent: s = scale), as PEFT computes it.
 //  * Dense matrices of every block (attention, DeltaNet, FFN, the shared
-//    expert, the router, latent attention's whole projections) and the LM
+//    expert, the router, latent attention's whole projections, compression,
+//    indexer and residual-stream projections) and the LM
 //    head; a mixture of experts' per-expert stacks (each expert its slice).
 //    Refused: adapters of the token embeddings, of latent attention's
-//    per-head attn_k_b / attn_v_b, activated LoRA, other adapter types.
+//    per-head attn_k_b / attn_v_b or combined attn_kv_b, shared-KV's grouped
+//    attn_output_a, activated LoRA, other adapter types.
 //  * Contexts are kept apart by adapter (and scale): one computed with
 //    adapter X is never continued with Y or without it. Selecting another
 //    adapter sets the live context aside in the prefix cache under X (when

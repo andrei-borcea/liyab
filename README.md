@@ -1314,9 +1314,11 @@ without one runs exactly as before.
   when the adapter is selected, 1 meaning as trained.
 * **Where it applies**: every matrix the forward pass multiplies whole: attention, DeltaNet and FFN projections
   (separate or fused), a mixture of experts' router, shared expert and routed experts (each expert its own slice, for
-  the tokens routed to it), latent attention's whole projections, and the LM head. Refused when loaded, naming the
+  the tokens routed to it), latent attention's whole projections, compression/indexer and residual-stream
+  projections, and the LM head. Refused when loaded, naming the
   tensor: adapters of the token embeddings (they change a lookup, not a matmul), of latent attention's per-head
-  `attn_k_b` / `attn_v_b`, activated LoRA (`adapter.alora.*`), and any matrix whose name or shape the model does not
+  `attn_k_b` / `attn_v_b` or combined `attn_kv_b`, shared-KV's grouped `attn_output_a`, activated LoRA
+  (`adapter.alora.*`), and any matrix whose name or shape the model does not
   have.
 * **How it is computed**: t = A·x is a matmul of `rank` rows, run by the CPU backend's kernels in the same parallel
   pass as the base matmuls sharing its input (Q/K/V, gate/up, one wave of experts), so it costs no fork/join of its
@@ -2721,7 +2723,8 @@ Implemented features are described above. These are next, in order:
    for every sequence's KV cache, so a sequence's pages go back to the others when its context shrinks.
 6. **LoRA adapters, next.** [Adapters](#lora-adapters) for dense and MoE layers switched per request are in place.
    Next: the update computed on the GPU next to the base product (today the CPU adds it after an accelerator's
-   matmul), adapters of the token embeddings and of latent attention's per-head matrices, and a lower fixed cost per
+   matmul), adapters of the token embeddings, latent attention's separate/combined per-head matrices and
+   shared-KV's grouped first output projection, and a lower fixed cost per
    adapted matmul at low rank.
 7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
@@ -2822,7 +2825,8 @@ Implemented features are described above. These are next, in order:
   multiply row by row on the CPU (no tiled float kernel yet), which makes their files several times slower to embed
   with than Q8_0 ones.
 * **LoRA adapters:** the update runs on the CPU, also when the base matmuls run on a GPU. Refused: adapters of the
-  token embeddings, of latent attention's per-head `attn_k_b` / `attn_v_b`, and activated LoRA. Segment reuse is off
+  token embeddings, of latent attention's per-head `attn_k_b` / `attn_v_b` or combined `attn_kv_b`, of shared-KV's
+  grouped `attn_output_a`, and activated LoRA. Segment reuse is off
   while an adapter is selected. A draft model drafts without the adapter. On small models the update's fixed cost
   per matmul shows at low rank (+6% per token at rank 8 on a 0.5B model, see [LoRA adapters](#lora-adapters)).
 * **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as

@@ -420,6 +420,11 @@ multiplies decoded weights and Q8-rounded activations directly, without calling 
 Their attention norms balance the encoded blocks' measured RMS against the fixture's ordinary weight scale;
 output/FFN norms, the eight writable-format controls and the logit error bound remain unchanged.
 The Android regression runner includes this suite and supplies its encoded quantization fixtures.
+LoRA targets for whole compression, indexer and residual-stream projections, including the final stream
+collapse, use the normal adapter-aware matmul path. The grouped first output projection and legacy combined
+latent expansion return `Unsupported` when selected as adapter targets, naming the tensor; their slices do
+not share one input row. Tests compare supported F32/F16/BF16/Q8_0 adapters with merged weights through
+prefill, decode, tree verification and rollback, and check explicit refusal on F32 and Q8_0 base matrices.
 `tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
 
 | Component fixture | Tokens | Mean / max KL | Top-1 | CSA top-2 selections |

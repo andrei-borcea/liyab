@@ -549,6 +549,61 @@ TEST_CASE("lora: latent attention's whole matrices give the merged model's logit
     check_merged("mla", mla, per_block(2, {"attn_q_a", "attn_q_b", "attn_kv_a_mqa", "attn_output"}));
 }
 
+TEST_CASE("lora: combined latent and grouped output targets are refused") {
+    for (const DType type : {DType::F32, DType::Q8_0}) {
+        for (const bool legacy : {false, true}) {
+            auto spec = legacy ? f32_spec("deepseek2") : test::compressed_spec();
+            if (legacy) {
+                spec.n_head_kv = 1;
+                spec.rope_dim = 32;
+                spec.mla_kv_rank = 64;
+                spec.mla_legacy = true;
+            }
+            spec.attn_type = type;
+            const std::string base_path = temp_path("refused_sliced.gguf");
+            const std::string adapter_path = temp_path("refused_sliced_adapter.gguf");
+            const std::string target = legacy ? "blk.0.attn_kv_b.weight" : "blk.0.attn_output_a.weight";
+            test::write_tiny_model(base_path, spec);
+            auto model = load_model(base_path);
+            REQUIRE(model != nullptr);
+            const auto plain = logits_of(*model);
+            REQUIRE(!plain.empty());
+            const auto pairs = random_pairs(base_path, {target}, 4, DType::F32, 5);
+            REQUIRE(pairs.size() == 1);
+            write_adapter(adapter_path, pairs, 8.0f, DType::F32);
+            auto adapter = LoraAdapter::load(adapter_path);
+            REQUIRE(adapter);
+            const auto status = model->model->set_adapter(adapter->get());
+            CHECK(status.code() == ErrorCode::Unsupported);
+            CHECK(status.to_string().find(target) != std::string::npos);
+            CHECK(model->model->adapter() == nullptr);
+            CHECK(logits_of(*model) == plain);
+            model.reset();
+            std::remove(adapter_path.c_str());
+            std::remove(base_path.c_str());
+        }
+    }
+}
+
+TEST_CASE("lora: shared-KV compression and residual projections match merged weights") {
+    const auto spec = test::compressed_spec();
+    auto targets = per_block(spec.n_layers, {"attn_q_a", "attn_q_b", "attn_kv", "attn_output_b", "hc_attn_fn", "hc_ffn_fn"});
+    for (int32_t l = 0; l < spec.n_layers; ++l) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        if (spec.compression_strides[static_cast<size_t>(l)] == 0) continue;
+        for (const char* part : {"attn_compressor_kv", "attn_compressor_gate"}) targets.push_back(p + part + ".weight");
+        if (!spec.compression_overlap[static_cast<size_t>(l)]) continue;
+        for (const char* part : {"indexer_compressor_kv", "indexer_compressor_gate", "indexer.attn_q_b", "indexer.proj"}) {
+            targets.push_back(p + part + ".weight");
+        }
+    }
+    targets.push_back("output_hc_fn.weight");
+    for (const DType type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0}) {
+        // Q8_0 B rows must contain a whole 32-value block.
+        check_merged("shared_kv", spec, targets, type, type == DType::Q8_0 ? 32 : 4);
+    }
+}
+
 // ---- The engine's adapters --------------------------------------------------
 
 namespace {

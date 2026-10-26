@@ -1872,16 +1872,18 @@ Status Transformer::set_adapter(const LoraAdapter* adapter, float scale, ThreadP
     if (!std::isfinite(scale)) return Status(ErrorCode::InvalidArgument, "adapter scale must be finite");
     // The matrices the forward pass multiplies as a whole (an adapter's
     // update is added to such a product), by name: every block role but
-    // latent attention's per-head attn_k_b / attn_v_b, and the LM head unless
-    // it is the token embeddings (tied).
+    // latent attention's separate/combined per-head expansions and shared
+    // K=V's grouped first output projection. Those slices do not have one
+    // common input row. The LM head is separate unless tied to embeddings.
     std::unordered_map<std::string_view, const TensorView*> applied;
     for (const Layer& L : layers_) {
         for (size_t role = 0; role < kWeightRoles; ++role) {
-            if (role == kKb || role == kVb || L.w[role] == nullptr) continue;
+            if (role == kKb || role == kVb || role == kKvB || role == kOutputA || L.w[role] == nullptr) continue;
             applied.emplace(L.w[role]->name, L.w[role]);
         }
     }
     if (output_ != nullptr && output_ != token_embd_) applied.emplace(output_->name, output_);
+    if (hc_head_ != nullptr) applied.emplace(hc_head_->name, hc_head_);
     std::unordered_map<std::string_view, BoundAdapter> bound;
     for (const LoraTarget& t : adapter->targets()) {
         const auto it = applied.find(t.base);
