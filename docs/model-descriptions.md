@@ -200,6 +200,10 @@ use `_set_vocab_sentencepiece()` when the source includes `tokenizer.model`, ret
 of `LlamaHfVocab`'s constant scores. The tensor conversion remains unchanged (all 30 payload hashes identical).
 Transformers 5 also needs the concrete remote causal class's `config_class = DeciLMConfig`; this registration
 compatibility change does not alter its forward pass. The strict gate remains within the declared context.
+The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` (revision `85252935bfc9acb3ee93dcea4b793fb87a0b43e8`) proposes the exact `minicpm` row.
+It gives mean/max KL 0.00000/0.00002, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (631/1049/248). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
@@ -327,6 +331,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | PLaMo-3-610m-fin-instruct (F16, b11819 conversion of revision `a000b59`) | registry's `plamo3`, exact | 521 / 950 / 251, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
 | OLMo-2-0425-1B (F16, b11819 conversion of revision `a1847df`) | registry's `olmo2`, exact | 544 / 882 / 187, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted |
 | EXAONE-4.0-1.2B (F16, b11819 conversion of revision `3abf281`) | registry's `exaone4`, exact | 618 / 993 / 254, identical | 511 positions, mean KL 0.00001, maximum 0.00018, top-1 100.00% | accepted |
+| openbmb/MiniCPM-1B-sft-bf16 (F16, b11819 conversion of revision `8525293`) | registry's `minicpm`, exact | 631 / 1049 / 248, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
 
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean
