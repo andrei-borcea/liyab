@@ -204,6 +204,12 @@ The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` (revision `85252935bfc9acb3e
 It gives mean/max KL 0.00000/0.00002, top-1 100.00%, 512 BOS-inclusive IDs identical,
 and three full tokenizer texts identical (631/1049/248). The source and GGUF chat templates and
 special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+For this reference run under transformers 5, a local copy of the legacy Python class treats normalized
+`rope_type=default` as the original unscaled branch and declares
+`_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}`. These two API adaptations leave its forward
+equations unchanged. The source's 470 tensors retain their exact dtypes and values when transcoded to safetensors;
+the unpatched b11819 converter then writes the F16 GGUF. The full 52-layer residual multiplier is verified as
+`1.4 / sqrt(52)`, with embedding multiplier 12 and logit multiplier 1/6.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`

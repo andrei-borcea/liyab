@@ -196,6 +196,9 @@ The separate eight-block Nemotron-NAS tiny case covers varied query heads, absen
 The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` passes with mean KL 0.00000, top-1 100.00%,
 identical tokenizer IDs on all three texts (631/1049/248), and 512 BOS-inclusive conformance IDs.
 Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The legacy MiniCPM reference needs two local transformers 5 API adaptations: recognize its normalized default
+RoPE configuration as unscaled, and express its tied-weight declaration as a mapping. Its forward equations and
+checkpoint tensors are unchanged; the b11819 GGUF conversion is unmodified.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
