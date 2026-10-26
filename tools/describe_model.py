@@ -1539,10 +1539,52 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, slow_toke
         tok = load_tokenizer(model, revision=revision, trust_remote_code=trust_remote_code,
                              slow=slow_tokenizer)
     except Exception as e:  # noqa: BLE001 - reported, the gate checks the ids anyway
+        if g.metadata.get("tokenizer.ggml.pre") in ("spm-greedy", "gpt2-nfkc-digits"):
+            d.unknown.append(f"tokenizer mode {g.metadata['tokenizer.ggml.pre']} cannot be verified: "
+                             f"the reference tokenizer did not load ({type(e).__name__})")
+            return
         d.notes.append(f"the reference tokenizer did not load ({type(e).__name__}); its BOS and space-prefix rules "
                        f"are left to the gate")
         return
     kind = g.metadata.get("tokenizer.ggml.model")
+    if kind == "gpt2":
+        nfkc_mode = g.metadata.get("tokenizer.ggml.pre") == "gpt2-nfkc-digits"
+        try:
+            path = os.path.join(model, "tokenizer.json")
+            if not os.path.isfile(path):
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(model, "tokenizer.json", revision=revision)
+            with open(path, encoding="utf-8") as source:
+                source_tokenizer = json.load(source)
+        except Exception as error:  # an active mode needs the original pipeline, not an inferred backend
+            if nfkc_mode:
+                d.unknown.append("gpt2-nfkc-digits cannot be verified: source tokenizer.json could not be read "
+                                 f"({type(error).__name__})")
+        else:
+            normalization = source_tokenizer.get("normalizer") or {}
+            pre = source_tokenizer.get("pre_tokenizer") or {}
+            steps = pre.get("pretokenizers", []) if pre.get("type") == "Sequence" else []
+            requires_nfkc = (normalization.get("type") == "NFKC" and len(steps) == 2 and
+                             steps[0].get("type") == "Digits" and steps[0].get("individual_digits") is True and
+                             steps[1].get("type") == "ByteLevel" and steps[1].get("add_prefix_space") is False and
+                             steps[1].get("use_regex", True) is True)
+            if requires_nfkc and not nfkc_mode:
+                d.file_issues.append("the source normalizes NFKC, splits individual digits and applies ByteLevel; "
+                                     "the file needs tokenizer.ggml.pre=gpt2-nfkc-digits")
+            elif nfkc_mode and not requires_nfkc:
+                d.file_issues.append("gpt2-nfkc-digits requires source NFKC followed by individual Digits and "
+                                     "ByteLevel without a space prefix")
+            elif nfkc_mode:
+                # tokenizers' alignment normalizer uses Unicode 9. A newer
+                # normalizer has different IDs for newly assigned characters.
+                backend = getattr(tok, "backend_tokenizer", None)
+                normalizer = getattr(backend, "normalizer", None)
+                probe = "ＡＢＣ１２３，ÅK ﬃ Ⅳ ½ ²㋿\U0001e030\U000105d2\u0307A\U0001e4ec\u0301"
+                expected = "ABC123,ÅK ffi IV 1⁄2 2㋿\U0001e030\U000105d2\u0307A\U0001e4ec\u0301"
+                if normalizer is None or normalizer.normalize_str(probe) != expected:
+                    d.unknown.append("gpt2-nfkc-digits requires the source Unicode 9 NFKC normalizer")
+                else:
+                    d.parts.append("Unicode 9 NFKC, individual digits and ByteLevel, verified from source tokenizer.json")
     if kind == "llama":
         greedy = g.metadata.get("tokenizer.ggml.pre") == "spm-greedy"
         processor = getattr(tok, "sp_model", None)

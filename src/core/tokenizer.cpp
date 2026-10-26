@@ -637,7 +637,10 @@ void Tokenizer::encode_bpe(std::string_view text, std::vector<int32_t>& out) con
     // Normalize, cut into pieces with the family's patterns, then merge each
     // piece on its own (core/pre_tokenizer.h).
     std::string normalized;
-    if (pre_->nfc() && !unicode::nfc_quick_check(text)) {
+    if (pre_->nfkc()) {
+        normalized = unicode::to_nfkc(text);
+        text = normalized;
+    } else if (pre_->nfc() && !unicode::nfc_quick_check(text)) {
         normalized = unicode::to_nfc(text);
         text = normalized;
     }

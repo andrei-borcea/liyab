@@ -985,7 +985,9 @@ private:
     bool layer_shared_ = false;
     // New geometry/scalar metadata can change a model without changing its
     // global dimensions or file size. Its file fingerprint protects saved
-    // states from that mismatch; legacy layouts without these keys keep 0.
+    // states from that mismatch. Corrected tokenizer modes hash their full
+    // first header, so raw-text saved contexts and KV keys cannot cross modes
+    // or flags beyond the first MiB. Other legacy layouts keep 0.
     uint64_t variant_fingerprint_ = 0;
 
     const TensorView* token_embd_ = nullptr;

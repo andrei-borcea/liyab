@@ -413,6 +413,19 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
             break;
         }
     }
+    const auto tokenizer_pre = f.get_string("tokenizer.ggml.pre");
+    if (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits")) {
+        // Saved engine contexts include raw text. Tokenizer flags and vocabulary
+        // can be beyond the first MiB, and equal-sized edits must invalidate
+        // that text as well as persistent KV keys. Hash the complete first
+        // header before weights are bound or relocated. Legacy modes keep
+        // their previous state compatibility.
+        size_t header = f.file().size();
+        for (const TensorView& tensor : f.tensors()) {
+            if (tensor.shard == 0) header = std::min(header, static_cast<size_t>(tensor.file_offset));
+        }
+        model->variant_fingerprint_ = xxhash64(f.file().data(), header, model_fingerprint(f.file()));
+    }
     model->expert_mass_ = options.expert_mass;
     model->max_experts_ = options.max_experts;
     model->skip_slow_ = options.skip_slow;
@@ -982,7 +995,8 @@ bool get(std::istream& in, T& v) {
 // and shape) and how the KV cache stores rows. A LongRoPE model whose context
 // picked the long factors rotates its keys otherwise than with the short
 // ones, so that choice marks the first field. New per-block and scalar
-// metadata also adds the file fingerprint; older layouts keep their state
+// metadata also adds the file fingerprint; corrected tokenizer modes hash
+// the complete header, including vocabulary and flags. Older layouts keep their state
 // compatibility and bytes unchanged.
 std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
     const KvCacheConfig& kv = kv_->config();

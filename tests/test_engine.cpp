@@ -2833,6 +2833,46 @@ TEST_CASE("Saved states reject different residual scales with the same dimension
     CHECK(second->n_past() == 0);
 }
 
+TEST_CASE("Corrected tokenizer modes isolate saved contexts and KV keys beyond the first MiB") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    for (const bool hybrid : {false, true}) {
+        for (const bool greedy : {false, true}) {
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                test::TinyModelSpec spec;
+                spec.arch = hybrid ? "qwen35" : "llama";
+                spec.tokenizer_padding = (size_t{1} << 20) + 64;
+                if (greedy) spec.spm_pre = "spm-greedy";
+                else spec.bpe_pre = "gpt2-nfkc-digits";
+                spec.space_prefix = 0;
+                TransformerOptions options;
+                options.kv_type = kv;
+                const std::string label = std::string(hybrid ? "hybrid" : "attn") + (greedy ? "greedy" : "nfkc") +
+                                          std::to_string(static_cast<int>(kv));
+                auto first = load_transformer(model_path("tokenizer_state_a_" + label, spec), options);
+                auto same = load_transformer(model_path("tokenizer_state_same_" + label, spec), options);
+                spec.space_prefix = 1;
+                auto other = load_transformer(model_path("tokenizer_state_b_" + label, spec), options);
+                REQUIRE(first && same && other);
+                // The standard first-MiB fingerprint cannot see the changed flag.
+                CHECK(first->file().file_size() == other->file().file_size());
+                CHECK(model_fingerprint(first->file().file()) == model_fingerprint(other->file().file()));
+                CHECK(first->context_fingerprint() != other->context_fingerprint());
+                REQUIRE(first->forward(tokens, Transformer::Logits::Last, route, pool).has_value());
+                std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+                REQUIRE(first->write_state(saved).is_ok());
+                REQUIRE(same->read_state(saved).is_ok());
+                CHECK(same->n_past() == 3);
+                saved.clear(); saved.seekg(0);
+                CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
+                CHECK(other->n_past() == 0);
+            }
+        }
+    }
+}
+
 TEST_CASE("Modern block plans preserve batching and rollback for every KV format") {
     ThreadPool pool(4);
     auto cpu = make_cpu_backend(pool);

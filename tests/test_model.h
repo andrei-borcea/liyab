@@ -175,6 +175,11 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+    // Optional SentencePiece selection and prefix flag, metadata only.
+    std::string spm_pre;
+    int32_t space_prefix = -1;
+    // Optional ignored metadata before the tokenizer, to test large headers.
+    size_t tokenizer_padding = 0;
 };
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,

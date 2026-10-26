@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates tests/data/text_cases.txt, the expectations tests/test_text.cpp checks the regex engine, the
-pre-tokenizer table and NFC normalization against:
+pre-tokenizer table and NFC / NFKC normalization against:
 
 * regex splits: Python's `regex` module, cross-checked against the Hugging Face tokenizers' own Split
   (Oniguruma), which is what models are tokenized with. Where the two disagree (`^` and `$` match at line
@@ -8,10 +8,11 @@ pre-tokenizer table and NFC normalization against:
 * pre-tokenizer splits: a tokenizers Sequence of Split pre-tokenizers built from PRE_TOKENIZERS, which mirrors
   the table in src/core/pre_tokenizer.cpp (the conformance runs of liyab-tok against each model's own
   tokenizer.json check that the table is right; this file checks that the engine runs it);
-* NFC: Python's unicodedata.
+* NFC: Python's unicodedata; NFKC: the source tokenizers Unicode 9 normalizer, including every changed scalar.
 
     pip install regex tokenizers
     python3 tools/gen_text_tests.py > tests/data/text_cases.txt
+    python3 tools/gen_text_tests.py --nfkc-only  # only the additive NFKC section
 
 Format, one record per line, fields separated by tabs, text escaped as \\\\ \\t and \\u{HEX} (any non-printable or
 non-ASCII code point):
@@ -22,14 +23,16 @@ non-ASCII code point):
     E pattern                         a pattern that must fail to compile
     S pre_name text_id spans          a pre-tokenizer split of the text (NFC-normalized first when the row says so)
     N input expected                  NFC normalization
+    K input expected                  NFKC normalization
 """
+import argparse
 import os
 import random
 import sys
 import unicodedata
 
 import regex
-from tokenizers import Regex, pre_tokenizers
+from tokenizers import Regex, normalizers, pre_tokenizers
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -184,6 +187,43 @@ def spans_text(spans):
     return " ".join(out)
 
 
+def nfkc_records(edge, conform):
+    """Source Unicode 9 expectations and the Digits -> ByteLevel pipeline."""
+    rows = [f"# NFKC expectations (tokenizers Unicode 9); gpt2-nfkc-digits splits"]
+    def escaped(text):
+        return esc(text).replace(" ", r"\u{20}")
+    changed = []
+    for cp in range(0x110000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        text = chr(cp)
+        normalized = normalizers.NFKC().normalize_str(text)
+        if text != normalized:
+            rows.append(f"K\t{escaped(text)}\t{escaped(normalized)}")
+            changed.append(text)
+    mixed = ["", "plain ASCII 123", "ＡＢＣ１２３，", "ÅK ﬃ Ⅳ ½ ²", "ㄱㅏᆨ", "ｶﾞ", "\uFDFA",
+             "A\u030A\u0323", "\u00A8\u0301", "\u212B\u0323"]
+    rng = random.Random(2048)
+    pool = changed + ["A", "e", "\u030A", "\u0301", "\u0323", "\u1100", "\u1161", "\u11A8"]
+    for _ in range(256):
+        mixed.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 8))))
+    for text in mixed:
+        if text:
+            rows.append(f"K\t{escaped(text)}\t{escaped(normalizers.NFKC().normalize_str(text))}")
+    source = pre_tokenizers.Sequence([pre_tokenizers.Digits(individual_digits=True),
+                                     pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)])
+    normalization = normalizers.NFKC()
+    for i, text in enumerate(edge.splitlines(keepends=True) + [conform[:600]] + mixed[:10]):
+        if not text:
+            continue
+        normalized = normalizers.NFKC().normalize_str(text)
+        assert normalization.normalize_str(text) == normalized
+        rows.append(f"T\tnfkc_{i}\t{escaped(normalized)}")
+        spans = [span for _, span in source.pre_tokenize_str(normalized)]
+        rows.append(f"S\tgpt2-nfkc-digits\tnfkc_{i}\t{spans_text(spans)}")
+    return rows
+
+
 def main():
     edge = open(os.path.join(ROOT, "tests/data/tokenizer_edge.txt"), encoding="utf-8", newline="").read()
     conform = open(os.path.join(ROOT, "tests/data/conform_text.txt"), encoding="utf-8", newline="").read()
@@ -239,10 +279,19 @@ def main():
         cases.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 8))))
     for s in cases:
         out.append(f"N\t{esc(s)}\t{esc(unicodedata.normalize('NFC', s))}")
+    out.extend(nfkc_records(edge, conform))
     print("\n".join(out))
     print(f"{disagreements} split(s) where Python's regex and the tokenizers differ (tokenizers kept)",
           file=sys.stderr)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--nfkc-only", action="store_true", help="write only the additive NFKC and source-split records")
+    args = parser.parse_args()
+    if args.nfkc_only:
+        edge = open(os.path.join(ROOT, "tests/data/tokenizer_edge.txt"), encoding="utf-8", newline="").read()
+        conform = open(os.path.join(ROOT, "tests/data/conform_text.txt"), encoding="utf-8", newline="").read()
+        print("\n".join(nfkc_records(edge, conform)))
+    else:
+        main()

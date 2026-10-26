@@ -181,6 +181,30 @@ For configurations with `scale_depth`, both residual branches must numerically m
 An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
 the teacher-forced reference continues to run the original checkpoint and configuration.
 Blocks without either the mixer or the FFN cannot establish a two-branch depth rule and leave it unknown.
+The `gpt2-nfkc-digits` scheme applies Unicode 9 NFKC before individual-digit splitting and GPT-2 ByteLevel.
+Compatibility decompositions and Unicode 9 assignment ranges are appended to the existing Unicode tables;
+canonical decomposition, ordering and composition are shared with NFC. Newer characters remain inert, matching
+the reference normalization dependency. Unicode 16 normalization differs on newer characters and is not used
+for this tokenizer mode. The description tool verifies this exact source JSON pipeline and reports a
+wrong file tag, incompatible source, or unavailable source proof. Active corrected tokenizer modes also remain
+unknown when the reference tokenizer itself cannot load. Neither rule depends on a model name.
+Normalization preserves malformed bytes while still composing valid characters after them.
+Corrected `spm-greedy` and `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts and
+KV-store keys. Equal-sized changes to vocabulary or tokenizer flags beyond the first MiB therefore invalidate
+raw-text saved contexts; existing tokenizer modes retain their prior state compatibility.
+If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
+reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
+configuration and chat template are retained; a class that discards the supplied pipeline is refused.
+EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after correcting the converter's
+`tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
+and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
+its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
+its existing plain ByteLevel rule. The full EXAONE 3.5 checkpoint gate remains pending.
+The explicit original slow-tokenizer path is unchanged.
+`python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
+
+`tools/gen_text_tests.py --nfkc-only` generates the additive NFKC expectations and source pipeline splits in
+`tests/data/text_cases.txt`; the default generator includes these after all existing records.
 When a legacy model does not implement its input-embedding accessor, the trace identifies a unique observed
 `Embedding` call on the actual token IDs, before any first-block child runs and with the first block's input shape.
 Repeated calls to the same table count once; different candidate tables remain unknown. The existing full-tensor

@@ -297,13 +297,16 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".rope.scaling.original_context_length", static_cast<uint32_t>(s.longrope_ctx));
         w.add_f32(a + ".rope.scaling.attn_factor", 1.19f);
     }
+    if (s.tokenizer_padding > 0) w.add_string("liyab.test.padding", std::string(s.tokenizer_padding, 'x'));
     if (s.bpe_pre.empty()) {
         w.add_string("tokenizer.ggml.model", "llama");
+        if (!s.spm_pre.empty()) w.add_string("tokenizer.ggml.pre", s.spm_pre);
     } else {
         w.add_string("tokenizer.ggml.model", "gpt2");
         w.add_string("tokenizer.ggml.pre", s.bpe_pre);
         w.add_string_array("tokenizer.ggml.merges", {"h e"});
     }
+    if (s.space_prefix >= 0) w.add_bool("tokenizer.ggml.add_space_prefix", s.space_prefix != 0);
     w.add_string_array("tokenizer.ggml.tokens", vocab);
     w.add_f32_array("tokenizer.ggml.scores", scores);
     w.add_i32_array("tokenizer.ggml.token_type", types);

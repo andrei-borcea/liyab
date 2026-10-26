@@ -179,6 +179,25 @@ verifies the actual mask there and reports the original configured size. Full co
 For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
 count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
 Both residual branches must be present and verified before this correction is applied.
+`gpt2-nfkc-digits` normalizes Unicode 9 NFKC, isolates every numeric character and then applies GPT-2 ByteLevel.
+It uses the existing canonical ordering/composition and additive Unicode 9 compatibility tables; existing NFC
+tables are unchanged. A converter that labels this source pipeline as plain ByteLevel needs a metadata-corrected
+copy. The description tool verifies the source JSON pipeline and refuses incompatible or unverified uses.
+Normalization and tokenization run on the CPU for every backend.
+Corrected `spm-greedy` and `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts and
+KV-store keys. Equal-sized changes to vocabulary or tokenizer flags beyond the first MiB therefore invalidate
+raw-text saved contexts; existing tokenizer modes retain their prior state compatibility.
+If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
+reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
+configuration and chat template are retained; a class that discards the supplied pipeline is refused.
+EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after correcting the converter's
+`tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
+and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
+its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
+its existing plain ByteLevel rule. The full EXAONE 3.5 checkpoint gate remains pending.
+The explicit original slow-tokenizer path is unchanged.
+`python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
+
 If a legacy reference omits its input-embedding accessor, the trace can use a unique embedding lookup observed
 on the actual token IDs before the first block. Ambiguous lookups remain unknown; the measured embedding scale
 must still explain the entire input to that block.

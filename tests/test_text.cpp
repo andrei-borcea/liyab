@@ -87,7 +87,7 @@ Spans parse_spans(const std::string& s) {
 
 struct Cases {
     std::unordered_map<std::string, std::string> texts, patterns;
-    std::vector<std::vector<std::string>> rows;  // R, E, S and N records
+    std::vector<std::vector<std::string>> rows;  // R, E, S, N and K records
     bool found = false;
 };
 
@@ -411,6 +411,37 @@ TEST_CASE("NFC normalization matches Python's unicodedata") {
     CHECK(unicode::nfc_quick_check("plain ASCII, caf\xC3\xA9"));
 }
 
+TEST_CASE("NFKC compatibility normalization matches the source Unicode 9 tokenizer") {
+    if (!cases().found) return;
+    size_t checked = 0;
+    for (const auto& row : cases().rows) {
+        if (row[0] != "K") continue;
+        const std::string input = unescape(row[1]), want = unescape(row.size() > 2 ? row[2] : "");
+        const auto got = unicode::to_nfkc(input);
+        if (got != want) std::printf("  NFKC(%s) differs\n", row[1].c_str());
+        CHECK(got == want);
+        ++checked;
+    }
+    CHECK(checked > 4800);
+    CHECK(unicode::to_nfkc("").empty());
+    for (const std::string& malformed : {std::string("\xE2(\xA1"), std::string("\xC0\xAF"),
+                                        std::string("\xED\xA0\x80"), std::string("\xF4\x90\x80\x80"),
+                                        std::string("\xE2\x82")}) {
+        CHECK(unicode::to_nfkc(malformed + "A\xCC\x8A") == malformed + "\xC3\x85");
+        CHECK(unicode::to_nfc(malformed + "A\xCC\x8A") == malformed + "\xC3\x85");
+    }
+    CHECK(!unicode::nfc_quick_check("\xE2" "A\xCC\x81"));
+    CHECK(unicode::to_nfc("\xE2" "A\xCC\x81") == "\xE2\xC3\x81");
+    const auto pre = PreTokenizer::for_name("gpt2-nfkc-digits");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfkc() && !pre->nfc() && !pre->ignore_merges());
+    CHECK(!PreTokenizer::for_name("exaone4")->nfkc());
+    // The alignment normalizer is Unicode 9: newer characters stay inert,
+    // including new compatibility letters, compositions and combining marks.
+    CHECK(unicode::to_nfkc("㋿\U0001e030") == "㋿\U0001e030");
+    CHECK(unicode::to_nfkc("\U000105d2\u0307A\U0001e4ec\u0301") == "\U000105d2\u0307A\U0001e4ec\u0301");
+}
+
 // ---------------------------------------------------------------------------
 // Pre-tokenizer table
 // ---------------------------------------------------------------------------
@@ -526,6 +557,25 @@ TEST_CASE("Byte-level BPE: merges by rank, NFC per family, ignore_merges, specia
         REQUIRE(t.tok.has_value());
         CHECK(t.encode("hello world") == (std::vector<int32_t>{v.id("hello"), v.id(G + "world")}));
     }
+}
+
+TEST_CASE("NFKC byte-level BPE normalizes ordinary text, preserves specials and supports continuations") {
+    const BpeVocab v = bpe_vocab(false);
+    BpeTokenizer normalized("nfkc_digits", v, "gpt2-nfkc-digits");
+    BpeTokenizer plain("nfkc_expected", v, "default");
+    REQUIRE(normalized.tok && plain.tok);
+    const std::string source = "ｈｅｌｌｏ ｗｏｒｌｄ１２３, ﬃ e\u0301";
+    const std::string expected = "hello world123, ffi é";
+    CHECK(normalized.encode(source) == plain.encode(expected));
+    const std::string special = "ｈｅｌｌｏ<|im_end|>ｗｏｒｌｄ";
+    CHECK(normalized.encode(special) == plain.encode("hello<|im_end|>world"));
+    CHECK(normalized.tok->encode_continuation(source, 0).value() == normalized.encode(source));
+    std::vector<int32_t> ids;
+    std::vector<TokenSegment> segments;
+    const size_t cut = special.find('>') + 1;
+    REQUIRE(encode_segmented(*normalized.tok, special, 0,
+                            std::vector<PromptSegment>{{0, cut}, {cut, special.size()}}, false, ids, segments).is_ok());
+    CHECK(ids == normalized.encode(special));
 }
 
 TEST_CASE("Byte-level BPE: a byte the vocabulary lacks is left out before merging") {

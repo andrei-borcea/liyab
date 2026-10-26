@@ -7,12 +7,16 @@
 * the code points that may change under NFC, so text made only of others skips normalization;
 * the non-ASCII code points whose simple case folding is an ASCII letter (case-insensitive groups such as
   (?i:'s) also match "'ſ"), which is all case folding the pre-tokenizer patterns need.
+* Unicode 9 compatibility decompositions and assigned ranges for the tokenizers NFKC contract,
+  composed through the existing canonical tables; older normalization leaves newer characters inert.
 
 The data comes from the Python interpreter's unicodedata module; the header records its Unicode version.
 Regenerate when updating Unicode (with a Python whose unicodedata has that version):
 
     python3 tools/gen_unicode_tables.py > src/core/unicode_tables.inc
 """
+import argparse
+from pathlib import Path
 import unicodedata
 
 # Order matters: src/core/unicode.h enum Category lists the same names in the same order.
@@ -94,6 +98,29 @@ def main():
             fold_extras += [cp, ord(f)]
     emit_words("kAsciiFoldExtras", fold_extras, "non-ASCII code point, the ASCII letter it folds to", 4)
 
+    # Normalization is stable for assigned characters. An explicit Unicode 9 assignment
+    # mask preserves the reference dependency's version without changing the NFC tables.
+    assigned = set()
+    for line in (Path(__file__).parent / "data/unicode9-assigned.txt").read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        first, last = (int(value, 16) for value in line.split(".."))
+        assigned.update(range(first, last + 1))
+    emit_words("kNfkcAssignedRuns", [(cp << 8) | flag for cp, flag in runs(lambda cp: int(cp in assigned))],
+               "Unicode 9 assigned runs, (first << 8) | flag; tools/data/unicode9-assigned.txt")
+    compatibility, parts = [], []
+    for cp in range(MAX):
+        decomposition = unicodedata.decomposition(chr(cp))
+        if cp not in assigned or not decomposition.startswith("<"):
+            continue
+        values = [int(value, 16) for value in decomposition.split()[1:]]
+        compatibility += [cp, len(parts), len(values)]
+        parts.extend(values)
+    emit_words("kCompatibilityDecompositions", compatibility,
+               "compatibility decompositions, triples {code point, offset in parts, count}", 6)
+    emit_words("kCompatibilityParts", parts, "compatibility decomposition parts")
+
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     main()

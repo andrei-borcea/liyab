@@ -72,10 +72,11 @@ struct Row {
     std::initializer_list<StepSpec> steps;
     bool nfc;
     bool ignore_merges;
+    bool nfkc = false;
 };
 
-const std::array<Row, 13>& table() {
-    static const std::array<Row, 13> rows = {{
+const std::array<Row, 14>& table() {
+    static const std::array<Row, 14> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -94,6 +95,7 @@ const std::array<Row, 13>& table() {
         // OLMo 2 / 3 (dbrx): Llama 3's regex, ordinary merge ranks and no normalization.
         {{"dbrx"}, {{kLlama3, false}}, false, false},
         {{"seed-coder"}, {{kSeedCoder, true}}, true, false},
+        {{"gpt2-nfkc-digits"}, {{kEachDigit, true}, {kGpt2, true}}, false, false, true},
     }};
     return rows;
 }
@@ -127,6 +129,7 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.name_ = std::string(name);
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
+        pre.nfkc_ = row.nfkc;
         for (const StepSpec& step : row.steps) {
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
