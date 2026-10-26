@@ -1128,7 +1128,9 @@ def restore_depth_scale(facts, config, traced_layers, full_layers):
         facts["unknown"].append("scale_depth is not a finite positive scalar")
         return
     expected = float(depth) / math.sqrt(traced_layers)
-    if (not blocks or any(not isinstance(b.get("residual"), dict)
+    if (not blocks or any(b.get("mixer", {}).get("kind") in (None, "none")
+                                 or b.get("ffn", {}).get("kind") in (None, "none")
+                                 or not isinstance(b.get("residual"), dict)
                                  or b["residual"].get("only_ffn")
                                  or not math.isclose(b["residual"]["multiplier"], expected, rel_tol=1e-5, abs_tol=1e-6)
                                  for b in blocks)):

@@ -177,6 +177,7 @@ For configurations with `scale_depth`, both residual branches must numerically m
 `scale_depth / sqrt(traced_layer_count)` before the tool maps that multiplier to the original layer count.
 An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
 the teacher-forced reference continues to run the original checkpoint and configuration.
+Blocks without either the mixer or the FFN cannot establish a two-branch depth rule and leave it unknown.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
