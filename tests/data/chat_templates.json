@@ -10418,5 +10418,373 @@
     "output": "<s><|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
    }
   ]
+ },
+ "decilm": {
+  "template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '### User:\n' + message['content'] }}\n{% elif message['role'] == 'system' %}\n{{ '### System:\n' + message['content'] }}\n{% elif message['role'] == 'assistant' %}\n{{ '### Assistant:\n'  + message['content'] }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '### Assistant:' }}\n{% endif %}\n{% endfor %}",
+  "special": {
+   "bos_token": "<s>",
+   "eos_token": "</s>",
+   "unk_token": "<unk>"
+  },
+  "cases": [
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### User:\nWhat is the capital of Italy?\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\nRome.\n### User:\nAnd of France? Answer in one word.\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": false
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\nRome.\n### User:\nAnd of France? Answer in one word.\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      }
+     ]
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\nRome.\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\n<think>\nThe user asks about Italy.\n</think>\n\nRome.\n### User:\nAnd of France? Answer in one word.\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome.",
+       "reasoning_content": "Italy's capital is Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\nRome.\n### User:\nAnd of France? Answer in one word.\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": false
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true,
+     "preserve_thinking": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWhat is the capital of Italy?\n### Assistant:\n<think>\nThe user asks about Italy.\n</think>\n\nRome.\n### User:\nAnd of France? Answer in one word.\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\nYou are a concise assistant.\n### User:\nWeather in Rome?\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      },
+      {
+       "role": "assistant",
+       "content": "",
+       "tool_calls": [
+        {
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": {
+           "city": "Rome"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### User:\nWeather in Rome?\n### Assistant:\n\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "  Città: Zürich, 東京 🌍  \n"
+      },
+      {
+       "role": "user",
+       "content": "\n  ¿Qué tal?  \t"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\n  Città: Zürich, 東京 🌍  \n\n### User:\n\n  ¿Qué tal?  \t\n### Assistant:\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": ""
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "### System:\n\n### User:\nWhat is the capital of Italy?\n### Assistant:\n"
+   }
+  ]
  }
 }

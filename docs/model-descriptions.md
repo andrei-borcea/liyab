@@ -192,6 +192,13 @@ InternLM3's two-block F32 checkpoint uses the existing `llama` row. With `spm-gr
 through the author's original slow tokenizer; all 14 chat-template cases render identically. The metadata copy
 preserves all 21 tensor payloads byte for byte. This validates the declared 32,768-position context only:
 the reference's dynamic-NTK recomputation beyond that limit is reported separately and is not implemented.
+The `deci` row also passes a three-block DeciLM-7B F32 tiny gate with 2/1/4 KV heads: mean/max KL 0.00000,
+top-1 100%, 512 BOS-inclusive IDs identical, and all three full tokenizer texts identical (629/1,032/279 IDs).
+Its 14 template cases match transformers. The b11819 Python converter needs a local vocabulary override:
+use `_set_vocab_sentencepiece()` when the source includes `tokenizer.model`, retaining its actual scores instead
+of `LlamaHfVocab`'s constant scores. The tensor conversion remains unchanged (all 30 payload hashes identical).
+Transformers 5 also needs the concrete remote causal class's `config_class = DeciLMConfig`; this registration
+compatibility change does not alter its forward pass. The strict gate remains within the declared context.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`

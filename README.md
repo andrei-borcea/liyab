@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -188,6 +188,11 @@ InternLM3's F32 tiny checkpoint passes with `spm-greedy` and `add_space_prefix=f
 top-1 100%, all three tokenizer texts identical (606/1,007/205 IDs), and 14 template renders identical.
 The original slow tokenizer is the reference. All 21 tensor payloads remain byte-identical after the metadata
 correction. This check stays within the declared 32,768-token context; dynamic-NTK extrapolation remains unsupported.
+DeciLM's three-block F32 tiny checkpoint (2/1/4 KV heads) passes the strict gate with mean/max KL 0.00000,
+top-1 100%, three tokenizer texts identical (629/1,032/279 IDs) and 14 template renders identical.
+For DeciLM-7B, b11819's `LlamaHfVocab` drops SentencePiece scores; a local converter override must use its native
+SentencePiece reader when `tokenizer.model` is present. All 30 tensor payloads are unchanged by that override.
+The separate eight-block Nemotron-NAS tiny case covers varied query heads, absent attention and FFN widths.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
