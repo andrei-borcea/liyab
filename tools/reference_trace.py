@@ -548,6 +548,29 @@ def _linears(calls, parent):
     return [c for c in calls if _is_descendant(c.path, parent) and isinstance(c.module, nn.Linear)]
 
 
+def analyze_linear_mixer(call):
+    """A unique Linear must explain the entire mixer output, including its bias.
+
+    Explicit child.forward(x) calls bypass module hooks. Enumerating parameters
+    and recomputing the full observed output also covers those implementations;
+    unused duplicate candidates, extra transformations and shape changes remain
+    unknown. No class name or parameter spelling decides the computation.
+    """
+    if call.input is None or call.output is None or call.input.dim() == 0:
+        return None
+    matches = []
+    for name, module in call.module.named_modules():
+        if not isinstance(module, nn.Linear) or module.in_features != call.input.shape[-1]:
+            continue
+        bias = module.bias.detach().float() if module.bias is not None else None
+        expected = torch.nn.functional.linear(call.input.float(), module.weight.detach().float(), bias)
+        if expected.shape == call.output.shape and close(expected, call.output):
+            matches.append(call.path + ("." + name if name else ""))
+    if len(matches) == 1:
+        return Facts(kind="linear", projection=matches[0], unknown=[])
+    return None
+
+
 def _norm_like(call):
     w = getattr(call.module, "weight", None)
     return (w is not None and torch.is_tensor(w) and w.dim() == 1 and call.input is not None
@@ -1045,6 +1068,8 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
         branch = others[0]
         ffn_facts = analyze_dense_ffn(branch, block_calls)
         mixer_facts = analyze_attention(trace, branch.path, block_calls, freqs, eps)
+        if mixer_facts is None:
+            mixer_facts = analyze_linear_mixer(branch)
         is_ffn = not ffn_facts.get("unknown")
         if is_ffn or mixer_facts is not None:
             before = next((c for c in norms if close(c.input, h_in) and close(c.output, branch.input)), None)
@@ -1136,11 +1161,8 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
 
     mixer_facts = analyze_attention(trace, mixer.path, block_calls, freqs, eps)
     if mixer_facts is None:
-        projections = [c for c in _linears(block_calls, mixer.path)
-                       if close(c.input, mixer.input) and close(c.output, mixer.output)]
-        if len(projections) == 1:
-            mixer_facts = Facts(kind="linear", projection=projections[0].path, unknown=[])
-        else:
+        mixer_facts = analyze_linear_mixer(mixer)
+        if mixer_facts is None:
             mixer_facts = Facts(kind="recurrent", unknown=[],
                                 classes=sorted({type(c.module).__name__ for c in block_calls
                                                 if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))

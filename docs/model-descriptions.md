@@ -105,6 +105,15 @@ models with different geometry or scales cannot exchange states just because the
 For quantized KV caches, key calibration includes a conservative query-temperature gain over its covered context;
 the measured channel bounds remain valid beyond the first temperature boundary.
 
+A five-block Nemotron-NAS tiny case exercises two GQA ratios, a linear mixer, absent attention, a fully empty
+block and different FFN widths. Its exact registry row passes the strict F32 gate: mean/max KL 0.00000,
+top-1 99.80%, 499 conformance IDs and three tokenizer texts identical (498/797/202). The 14 template
+cases match the existing fixture. Regeneration from the original configuration produces identical tensor bytes;
+the official forward source is unchanged. The existing NAS golden case covers these numerical paths.
+A linear mixer is established by recomputing its entire observed output from a unique linear projection,
+including any bias. This also covers direct child `forward` calls that bypass module hooks. Ambiguous projections,
+additional transformations and shape changes remain unknown; both one-branch and two-branch blocks use this rule.
+`tests/test_reference_trace.py` checks these positive and negative cases with PyTorch and no model weights.
 The modern model tokenizer rules (`smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`) are validated on all
 three gate texts. SmolLM3's chat template is also recorded in `tests/data/chat_templates.json`; its 14 cases render
 exactly as transformers does. An OLMo 2 base checkpoint has no chat template to render.

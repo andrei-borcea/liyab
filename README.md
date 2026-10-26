@@ -243,6 +243,15 @@ These operations run on the CPU on every backend; matrix projections retain the 
 Quantized-key calibration bounds query ranges with the largest attention temperature in the covered context.
 Synthetic tests cover prefill, decode, rollback, sequences and KV reuse. The description tool checks these facts
 against the reference and file; candidate registry rows alone do not establish model conformance.
+A five-block Nemotron-NAS tiny case exercises two GQA ratios, a linear mixer, absent attention, a fully empty
+block and different FFN widths. Its exact registry row passes the strict F32 gate: mean/max KL 0.00000,
+top-1 99.80%, 499 conformance IDs and three tokenizer texts identical (498/797/202). The 14 template
+cases match the existing fixture. Regeneration from the original configuration produces identical tensor bytes;
+the official forward source is unchanged. The existing NAS golden case covers these numerical paths.
+A linear mixer is established by recomputing its entire observed output from a unique linear projection,
+including any bias. This also covers direct child `forward` calls that bypass module hooks. Ambiguous projections,
+additional transformations and shape changes remain unknown; both one-branch and two-branch blocks use this rule.
+`tests/test_reference_trace.py` checks these positive and negative cases with PyTorch and no model weights.
 Per-block head counts and FFN widths can be scalar metadata or integer arrays. Zero KV heads select a single
 linear mixer projection (positive query heads) or no mixer (zero query heads); a zero FFN width omits that branch.
 Attention uses each block's own grouping. The existing KV image layout reserves the maximum KV-head count for
