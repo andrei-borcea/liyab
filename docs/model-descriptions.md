@@ -269,6 +269,12 @@ The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` (revision `707f574c6
 It gives mean/max KL 0.00000/0.00004, top-1 100.00%, 512 BOS-inclusive IDs identical,
 and three full tokenizer texts identical (625/971/247). The source and GGUF chat templates and
 special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` (revision `b6d637bef2393152b3da2b2fde72eecdee30557e`) proposes the exact `mistral3` row.
+It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (517/879/235). Actual GGUF template renders and
+special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The unmodified b11819 HF-format path selects a different Devstral community template and fails author-output comparisons. Its native tekken vocabulary reader is selected by temporarily hiding the own tokenizer.json and restoring it before references. This gate changes only the template metadata slot to the official author Jinja, lexer-minified with the same AST and all 14 rendered outputs; all 236 tensor descriptors and the entire tensor data section are unchanged (SHA256 0ee6f18db9635f745dcc81d6904048ebcc66fc004d17247df1ea54f17e0c72c8). The private generic converter shim instead prefers a local author Jinja file after the existing vocabulary method, with no tensor changes. The older Ministral fixture remains supplementary community-template coverage; ministral3-real is the official author fixture.
+The native tokenizer exposes no Jinja attribute. Template proof uses the checkpoint's own `chat_template.jinja` explicitly with transformers Jinja, rather than asserting equivalence to the separate native tokenizer chat formatter.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
@@ -400,6 +406,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | internlm/internlm2_5-1_8b-chat (F16, b11819 with EOS/EOT metadata correction, revision `57dcbc5`) | registry's `internlm2`, exact | 575 / 989 / 190, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted corrected metadata |
 | unsloth/gemma-1.1-2b-it (F16, b11819 conversion of revision `619e546`) | registry's `gemma`, exact | 513 / 786 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00000, top-1 100.00% | accepted |
 | ibm-granite/granite-3.3-2b-instruct (F16, b11819 conversion of revision `707f574`) | registry's `granite`, exact | 625 / 971 / 247, identical | 511 positions, mean KL 0.00000, maximum 0.00004, top-1 100.00% | accepted |
+| mistralai/Ministral-3-3B-Instruct-2512-BF16 (F16, b11819 with author-template metadata correction, revision `b6d637b`) | registry's `mistral3`, exact | 517 / 879 / 235, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted corrected template; original community template differs |
 
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean

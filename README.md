@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -237,6 +237,11 @@ Its own template matches all 14 reference cases (1 rendered, 13 correctly refuse
 The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` passes with mean KL 0.00000, top-1 100.00%,
 identical tokenizer IDs on all three texts (625/971/247), and 512 BOS-inclusive conformance IDs.
 Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (517/879/235), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+This corrected-file gate preserves the official authored template: b11819 otherwise selects a Devstral community fallback. The metadata-only correction leaves all 236 tensor descriptors and the entire tensor data section unchanged. Future conversion uses the native tekken vocabulary reader and the generic author-file precedence shim.
+The tokenizer exposes no Jinja template attribute; its shipped `chat_template.jinja` is rendered explicitly through transformers, matching the actual GGUF rendered bytes. Comments/code whitespace may differ; the Jinja AST is equivalent. This does not assert equivalence to its separate native chat formatter.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
