@@ -610,6 +610,24 @@ cache hits, 16,606,912,512 bytes read (633.5 MiB per processed token) and 2,315.
 These are aggregate prompt/decode counters from one short smoke run, not decode-only bandwidth measurements;
 the CLI labels the stall fraction as prefill plus decode. The file declares `deepseek2`; MTP blocks are skipped.
 
+DeepSeek-V2-Lite-Chat Q8_0 also runs through the legacy combined-MLA layout. On the same host, four CPU threads,
+F16 KV and no requantization, resident execution and two streamed-cache sizes gave byte-identical replies and
+counts (46 prompt tokens, 64 generated tokens). The published 16,702,518,016-byte file has 15,294,529,536 bytes
+of routed experts; the cache's minimum slot count raised the requested 256 MiB to 349,741,056 bytes (2.29%).
+
+| Expert cache | Decode (tok/s) | Ready hits | Bytes read per processed token (MiB) | Expert stalls (ms) | Peak RSS (MiB) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Resident | 6.237 | — | 0 | 0 | 11,679.9 |
+| 2.29% | 15.071 | 74.48% | 1,135.3 | 904.228 | 2,610.3 |
+| 10.47% | 13.794 | 86.55% | 845.7 | 256.222 | 3,954.9 |
+
+Reads and stalls aggregate prompt plus decode; ready hits include predictions that arrived before use.
+These are individual observations under shared-host activity, with the file already read and no OS-cache
+flush, not controlled speed comparisons or physical flash bandwidth. The smaller cache read 130,950,414,336
+bytes and evicted 3,439 loaded experts unused; the larger read 97,550,143,488 bytes and evicted 1,442 unused.
+Neither run skipped slow experts. The larger cache reduced read bytes by 25.5% and stalls by 71.7%; no
+expert-store correctness failure was observed, and these measurements do not establish full GLM-5 throughput.
+
 * **Optional lossy trade-offs**, all measured with `liyab-kl` (see [results](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)):
   * `requant_bits` 4/5: fewer resident bytes;
   * `moe_expert_mass`: run only the top experts covering a share of the router weight;
@@ -2180,8 +2198,8 @@ same build and an F16 cache, where the BF16 conversion measures 0.00000.
 
 The fused Huihui copy (written by `tools/gguf_fuse_experts.py`: the converter's `--fuse-gate-up-exps` does not
 cover `qwen3moe`), its experts streamed through a 128 MB cache, gave the split file's distributions exactly (KL 0,
-top-1 100%). DeepSeek-V2-Lite's own weights (31 GB) were not run: small random models built by transformers' own
-DeepSeek code with its structures, converted by llama.cpp's converter to F32, were compared instead (F16 KV, 511
+top-1 100%). Small random models built by transformers' own DeepSeek code with its structures, converted by
+llama.cpp's converter to F32, were also compared (F16 KV, 511
 positions; weights drawn wide, so attention and outputs are sharp and a wrong part shows):
 
 * DeepSeek-V2-Lite's structure (latent attention without low-rank queries, YaRN with factor 40 and its mscale, a
@@ -2203,7 +2221,12 @@ single query projection: 512 identical token IDs, 511 positions, mean KL 0.00000
 weights and F16 KV. DeepSeek-V3 (`e815299b0bcbac849fa540c768ef21845365c9eb`) includes three dense blocks and
 one grouped MoE block, selecting four of eight groups before eight of sixteen experts: 485 identical IDs,
 484 positions, mean KL 0.00000 and top-1 99.38%. Both propose the existing `deepseek2` row and match all three
-tokenizer texts. These checks use random weights; the required real V2-Lite regression remains unmeasured.
+tokenizer texts. These checks use random weights. Separately, the published
+`mradermacher/DeepSeek-V2-Lite-Chat-GGUF` Q8_0 file at revision `9ee9f1f8f39f673e1022e176d586aef4228f630d`
+passed a coherent 64-token real smoke run and exact resident/streamed reply and count checks at both cache
+sizes reported above. Its tokenizer matches 617/1,013/241 IDs and its template matches all 14 reference
+renders. An earlier revision explicitly refuses its legacy combined layout, so this supplies real execution
+and mode-equivalence evidence without an earlier real-weight logit reference or a real KL claim.
 
 Older latent-attention files with combined `attn_kv_b` tensors use the same forward paths. Their expanded-head
 metadata is normalized to the latent cache layout. A block's key expansion is decoded and transposed to F32

@@ -279,7 +279,16 @@ sixteen experts in eight groups, four selected groups and eight selected experts
 484 positions, mean KL 0.00000 and top-1 99.38%. Both tokenizers match all three texts (617/1,013/241 IDs for V2,
 485/783/217 for V3). The b11819 converter needs a local exact-fingerprint registration for the older V2 tokenizer;
 the existing `deepseek-llm` pre-tokenizer then reproduces its IDs. No reference forward implementation is patched.
-These are random-weight checks, without a real V2-Lite regression result.
+These are random-weight numerical checks. The published `DeepSeek-V2-Lite-Chat.Q8_0.gguf` from
+`mradermacher/DeepSeek-V2-Lite-Chat-GGUF` at revision `9ee9f1f8f39f673e1022e176d586aef4228f630d` separately
+passed real execution and resident/streamed mode equivalence: 46 prompt tokens and 64 generated tokens, with
+byte-identical replies and counts for resident, 2.29% and 10.47% expert caches, F16 KV and no requantization.
+The 16,702,518,016-byte source verifies SHA256
+`78a1a180db56416782f71cd7e019ea3d7227cf11a918de9ca1d50f038caba0ec`; its tokenizer matches 617/1,013/241 IDs
+and its template all 14 reference renders. The saved earlier revision explicitly refuses the missing split-MLA
+metadata, so it cannot provide an earlier real-weight comparison. No real HF logit reference or KL gate is
+claimed for this file. README records the observed cache/read/stall counters and their timing limits; used
+weights were removed after preserving the evidence.
 
 Files predating split MLA projections describe the expanded head with `attention.key_length`, `value_length`
 and one KV head per query head. `describe_model()` normalizes those dimensions to the cached latent and plans
