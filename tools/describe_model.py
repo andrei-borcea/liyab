@@ -392,7 +392,9 @@ class Engine:
         self.pre_tokenizers = []
         for names in re.findall(r'\{\{("[^"]+"(?:\s*,\s*"[^"]+")*)\}', table.group(1) if table else ""):
             self.pre_tokenizers += re.findall(r'"([^"]+)"', names)
-        self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', read("src/core/tokenizer.cpp"))
+        tokenizer = read("src/core/tokenizer.cpp")
+        self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', tokenizer)
+        self.spm_greedy = bool(re.search(r'\*spm_pre\s*==\s*"spm-greedy"', _strip_comments(tokenizer)))
 
     @staticmethod
     def _entries(text):
@@ -1502,8 +1504,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         d.missing.append(f"tokenizer type '{kind}' (the engine reads {engine.tokenizer_kinds})")
     elif kind == "gpt2" and pre not in engine.pre_tokenizers:
         d.missing.append(f"BPE pre-tokenizer '{pre}' (tokenizer.ggml.pre) is not in the pre-tokenizer table")
+    elif kind == "llama" and pre == "spm-greedy" and not engine.spm_greedy:
+        d.missing.append("greedy SentencePiece matching (tokenizer.ggml.pre=spm-greedy)")
     else:
-        d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" else ""))
+        d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" or pre == "spm-greedy" else ""))
     check_tokenizer_settings(d, g, model, revision, trust_remote_code, slow_tokenizer)
 
     d.merge_blocks()
@@ -1539,6 +1543,40 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, slow_toke
                        f"are left to the gate")
         return
     kind = g.metadata.get("tokenizer.ggml.model")
+    if kind == "llama":
+        greedy = g.metadata.get("tokenizer.ggml.pre") == "spm-greedy"
+        processor = getattr(tok, "sp_model", None)
+        if greedy and processor is None:
+            d.unknown.append("spm-greedy cannot be verified: the reference exposes no SentencePiece processor")
+        if processor is not None:
+            try:
+                from sentencepiece import sentencepiece_model_pb2 as spm_proto
+                proto = spm_proto.ModelProto()
+                proto.ParseFromString(processor.serialized_model_proto())
+            except (ImportError, AttributeError, ValueError) as error:
+                detail = f"SentencePiece piece flags could not be read ({type(error).__name__}); install protobuf"
+                (d.unknown if greedy else d.notes).append(detail)
+            else:
+                piece = spm_proto.ModelProto.SentencePiece
+                ordinary = [p for p in proto.pieces if p.type not in
+                            (piece.UNKNOWN, piece.CONTROL, piece.BYTE, piece.UNUSED)]
+                requires_greedy = (proto.trainer_spec.model_type == spm_proto.TrainerSpec.BPE
+                                   and bool(ordinary) and all(p.type == piece.USER_DEFINED for p in ordinary))
+                if requires_greedy and not greedy:
+                    d.file_issues.append("all ordinary SentencePiece pieces are USER_DEFINED; the file needs "
+                                         "tokenizer.ggml.pre=spm-greedy (the converter loses these piece flags)")
+                elif greedy and not requires_greedy:
+                    d.file_issues.append("spm-greedy requires a SentencePiece BPE reference whose ordinary pieces "
+                                         "are all USER_DEFINED")
+                elif greedy:
+                    norm = proto.normalizer_spec
+                    if (norm.name not in ("", "identity") or norm.precompiled_charsmap or
+                            norm.remove_extra_whitespaces or not norm.escape_whitespaces):
+                        d.missing.append("the greedy SentencePiece reference's normalization: this mode requires "
+                                         "identity normalization, escaped spaces and preserved whitespace")
+                    if not proto.trainer_spec.byte_fallback:
+                        d.missing.append("greedy SentencePiece without byte fallback")
+                    d.parts.append("SentencePiece USER_DEFINED longest-prefix matching, verified from the source model")
     if kind == "plamo3":
         for field, expected in (("break_around_consecutive_spaces_threshold", 2),
                                 ("break_around_repeated_chars_threshold", 4)):

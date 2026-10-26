@@ -1,4 +1,4 @@
-// Liyab — GGUF vocabulary: SentencePiece-BPE, byte-level BPE and unigram encoding,
+// Liyab — GGUF vocabulary: SentencePiece BPE/greedy, byte-level BPE and unigram encoding,
 // decoding (internal). Byte-level BPE pre-tokenizers come from a table keyed
 // by tokenizer.ggml.pre (core/pre_tokenizer.h).
 #ifndef LIYAB_CORE_TOKENIZER_H
@@ -24,6 +24,8 @@ public:
 
     // Loads vocabulary metadata. Scores may be F32 or the converter's I32
     // Tekken ranks; lengths and element types must match the vocabulary.
+    // For SentencePiece, tokenizer.ggml.pre=spm-greedy selects longest-prefix
+    // matching after space escaping; it requires all 256 byte fallback tokens.
     static Result<Tokenizer> load(const MmapLoader& model);
 
     // Text → token ids, as the model's Hugging Face tokenizer encodes them.
@@ -112,6 +114,8 @@ private:
         int32_t child = -1, next = -1, token = -1;
         unsigned char byte = 0;
     };
+    // Both unigram segmentation and greedy SentencePiece use this byte trie;
+    // only unigram uses scores and dynamic programming.
     std::vector<UnigramNode> unigram_trie_;
     std::vector<int32_t> unigram_scores_;
     void encode_bpe(std::string_view text, std::vector<int32_t>& out) const;
@@ -121,6 +125,7 @@ private:
     int32_t unk_ = -1;
     bool add_bos_ = true;
     bool add_space_prefix_ = true;
+    bool spm_greedy_ = false;
     std::vector<int32_t> initial_tokens_;
     std::string initial_text_;  // their literal spelling, when all are special
 };

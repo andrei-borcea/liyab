@@ -180,6 +180,18 @@ For configurations with `scale_depth`, both residual branches must numerically m
 An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
 the teacher-forced reference continues to run the original checkpoint and configuration.
 Blocks without either the mixer or the FFN cannot establish a two-branch depth rule and leave it unknown.
+For SentencePiece references, the tool reads the source model's piece flags with `sentencepiece` and `protobuf`.
+If every ordinary BPE piece is `USER_DEFINED`, SentencePiece freezes the longest match rather than applying merge
+ranks. The corresponding file mode is `tokenizer.ggml.pre=spm-greedy`, with all byte fallback tokens, identity
+normalization, escaped spaces and preserved whitespace. The tool rejects an incompatible reference or leaves the
+rule unknown if its source flags cannot be read. A converter that drops those flags needs a corrected metadata
+copy; the tensor data does not change. Tokenization runs on the CPU with every backend.
+InternLM3's two-block F32 checkpoint uses the existing `llama` row. With `spm-greedy` and
+`tokenizer.ggml.add_space_prefix=false`, the strict tiny gate gives mean/max KL 0.00000 and top-1 100% over
+511 positions, with 512 BOS-inclusive IDs identical. The three full tokenizer texts match 606/1,007/205 IDs
+through the author's original slow tokenizer; all 14 chat-template cases render identically. The metadata copy
+preserves all 21 tensor payloads byte for byte. This validates the declared 32,768-position context only:
+the reference's dynamic-NTK recomputation beyond that limit is reported separately and is not implemented.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`

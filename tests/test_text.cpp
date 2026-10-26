@@ -619,6 +619,69 @@ TEST_CASE("SentencePiece scheme prefixes stay outside reusable segments and are 
     }
 }
 
+TEST_CASE("Greedy SentencePiece matches longest prefixes independently of ranks and preserves byte fallback") {
+    for (const bool prefix : {false, true}) for (const bool scores : {false, true}) for (const bool missing : {false, true}) {
+        GgufWriter w;
+        std::vector<std::string> tokens = {"<unk>", "<c>"};
+        std::vector<int32_t> types = {2, 3};
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+            types.push_back(missing && b == 255 ? 5 : 6);
+        }
+        auto add = [&](std::string text) {
+            tokens.push_back(std::move(text)); types.push_back(1);
+            return static_cast<int32_t>(tokens.size() - 1);
+        };
+        const int32_t a = add("a"), b = add("b"), c = add("c"), ab = add("ab"), bc = add("bc");
+        const int32_t space = add("▁"), repeated = add("▁▁a"), word = add("abcdef");
+        add("abc<c>bc");  // a raw control token still splits the surrounding text
+        w.string("tokenizer.ggml.model", "llama");
+        w.string("tokenizer.ggml.pre", "spm-greedy");
+        w.boolean("tokenizer.ggml.add_space_prefix", prefix);
+        w.strings("tokenizer.ggml.tokens", tokens);
+        w.ints("tokenizer.ggml.token_type", types);
+        if (scores) {
+            std::vector<int32_t> ranks(tokens.size(), -2000000000);
+            ranks[static_cast<size_t>(bc)] = 2000000000;
+            w.ints("tokenizer.ggml.scores", ranks);
+        }
+        const std::string path = test::temp_dir() + "/liyab_spm_greedy.gguf";
+        REQUIRE(w.write(path));
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        if (missing) {
+            REQUIRE(!tok.has_value());
+            CHECK(tok.status().message().find("byte fallback") != std::string::npos);
+        } else {
+            REQUIRE(tok.has_value());
+            const std::vector<int32_t> start = prefix ? std::vector<int32_t>{space} : std::vector<int32_t>{};
+            auto expected = [&](std::initializer_list<int32_t> body) {
+                auto result = start; result.insert(result.end(), body); return result;
+            };
+            CHECK(tok->encode("abc", false).value() == expected({ab, c}));
+            CHECK(tok->encode("abcdef", false).value() == expected({word}));
+            CHECK(tok->encode("a🌍c", false).value() == expected({a, 2 + 0xf0, 2 + 0x9f, 2 + 0x8c, 2 + 0x8d, c}));
+            CHECK(tok->encode(prefix ? " a" : "  a", false).value() == (std::vector<int32_t>{repeated}));
+            auto joined = expected({ab, c, 1});
+            joined.insert(joined.end(), start.begin(), start.end()); joined.push_back(bc);
+            CHECK(tok->encode("abc<c>bc", false).value() == joined);
+            CHECK(tok->encode_continuation("bc", b).value() == (std::vector<int32_t>{bc}));
+            CHECK(tok->encode_continuation("bc", 1).value() == expected({bc}));
+            CHECK(tok->piece(space) == " ");
+            std::vector<int32_t> ids;
+            std::vector<TokenSegment> segments;
+            REQUIRE(encode_segmented(*tok, "abc<c>bc", 0, std::vector<PromptSegment>{{0, 3}, {6, 8}}, false,
+                                     ids, segments).is_ok());
+            CHECK(ids == joined);
+            CHECK(segments.size() == 2);
+        }
+        std::remove(path.c_str());
+    }
+}
+
 TEST_CASE("Unigram segmentation minimizes integer costs, keeps hard boundaries and falls back by byte") {
     for (const bool tie : {false, true}) {
         test::GgufWriter w;

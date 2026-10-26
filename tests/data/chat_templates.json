@@ -10049,5 +10049,374 @@
     "output": "<s>[SYSTEM_PROMPT][/SYSTEM_PROMPT][INST]What is the capital of Italy?[/INST]"
    }
   ]
+ },
+ "internlm3": {
+  "template": "{{ bos_token }}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+  "special": {
+   "bos_token": "<s>",
+   "eos_token": "</s>",
+   "unk_token": "<unk>",
+   "pad_token": "</s>"
+  },
+  "cases": [
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": false
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      }
+     ]
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user asks about Italy.\n</think>\n\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome.",
+       "reasoning_content": "Italy's capital is Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": false
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true,
+     "preserve_thinking": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user asks about Italy.\n</think>\n\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWeather in Rome?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      },
+      {
+       "role": "assistant",
+       "content": "",
+       "tool_calls": [
+        {
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": {
+           "city": "Rome"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>user\nWeather in Rome?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>tool\n{\"temp\": 21, \"sky\": \"clear\"}<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "  Città: Zürich, 東京 🌍  \n"
+      },
+      {
+       "role": "user",
+       "content": "\n  ¿Qué tal?  \t"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\n  Città: Zürich, 東京 🌍  \n<|im_end|>\n<|im_start|>user\n\n  ¿Qué tal?  \t<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": ""
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<s><|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   }
+  ]
  }
 }

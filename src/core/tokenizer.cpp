@@ -99,6 +99,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     else if (*kind == "gpt2") tok.kind_ = Kind::Gpt2;
     else if (*kind == "plamo3") tok.kind_ = Kind::Unigram;
     else return Status(ErrorCode::Unsupported, "tokenizer type '" + std::string(*kind) + "' is not supported");
+    const auto spm_pre = model.get_string("tokenizer.ggml.pre");
+    tok.spm_greedy_ = tok.kind_ == Kind::Spm && spm_pre && *spm_pre == "spm-greedy";
 
     const GgufValue* tokens = model.metadata("tokenizer.ggml.tokens");
     if (!tokens || tokens->type != GgufValue::Type::Array || tokens->array_type != GgufValue::Type::String ||
@@ -231,26 +233,29 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
         }
     }
-    if (tok.kind_ == Kind::Unigram) {
-        if (model.metadata("tokenizer.ggml.scores") == nullptr) {
+    if (tok.kind_ == Kind::Unigram || tok.spm_greedy_) {
+        if (tok.kind_ == Kind::Unigram && model.metadata("tokenizer.ggml.scores") == nullptr) {
             return Status(ErrorCode::InvalidModel, "unigram vocabulary without tokenizer.ggml.scores");
         }
         tok.byte_token_.fill(-1);
-        tok.unigram_scores_.resize(n);
+        if (tok.kind_ == Kind::Unigram) tok.unigram_scores_.resize(n);
         tok.unigram_trie_.emplace_back();
         for (size_t i = 0; i < n; ++i) {
-            const double score = std::nearbyint(static_cast<double>(tok.scores_[i]) * 10000.0);
-            if (!std::isfinite(score) || score < std::numeric_limits<int32_t>::min() ||
-                score > std::numeric_limits<int32_t>::max()) {
-                return Status(ErrorCode::InvalidModel, "unigram token score is outside its integer range");
+            if (tok.kind_ == Kind::Unigram) {
+                const double score = std::nearbyint(static_cast<double>(tok.scores_[i]) * 10000.0);
+                if (!std::isfinite(score) || score < std::numeric_limits<int32_t>::min() ||
+                    score > std::numeric_limits<int32_t>::max()) {
+                    return Status(ErrorCode::InvalidModel, "unigram token score is outside its integer range");
+                }
+                tok.unigram_scores_[i] = static_cast<int32_t>(score);
             }
-            tok.unigram_scores_[i] = static_cast<int32_t>(score);
             uint8_t byte = 0;
             if (tok.types_[i] == kByte && parse_byte_token(tok.texts_[i], byte)) {
                 tok.byte_token_[byte] = static_cast<int32_t>(i);
                 continue;
             }
             if (tok.types_[i] == kUnused) continue;
+            if (tok.spm_greedy_ && (tok.types_[i] == kControl || tok.types_[i] == kUserDefined)) continue;
             int32_t node = 0;
             for (const unsigned char c : tok.texts_[i]) {
                 int32_t child = tok.unigram_trie_[static_cast<size_t>(node)].child;
@@ -259,7 +264,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
                 }
                 if (child < 0) {
                     if (tok.unigram_trie_.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-                        return Status(ErrorCode::InvalidModel, "unigram vocabulary trie is too large");
+                        return Status(ErrorCode::InvalidModel, tok.spm_greedy_ ? "greedy SentencePiece vocabulary trie is too large"
+                                                                             : "unigram vocabulary trie is too large");
                     }
                     child = static_cast<int32_t>(tok.unigram_trie_.size());
                     UnigramNode entry;
@@ -273,7 +279,8 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             tok.unigram_trie_[static_cast<size_t>(node)].token = static_cast<int32_t>(i);
         }
         if (std::find(tok.byte_token_.begin(), tok.byte_token_.end(), -1) != tok.byte_token_.end()) {
-            return Status(ErrorCode::InvalidModel, "unigram vocabulary lacks byte fallback tokens");
+            return Status(ErrorCode::InvalidModel, tok.spm_greedy_ ? "greedy SentencePiece vocabulary lacks byte fallback tokens"
+                                                                 : "unigram vocabulary lacks byte fallback tokens");
         }
     }
     tok.special_.assign(n, false);
@@ -443,6 +450,35 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
     for (const char c : text) {
         if (c == ' ') normalized += kSpmSpace;
         else normalized += c;
+    }
+
+    if (spm_greedy_) {
+        // SentencePiece freezes the longest USER_DEFINED match before BPE.
+        // A vocabulary whose ordinary pieces are all USER_DEFINED therefore
+        // uses greedy matching. The file states this mode because converters
+        // may discard those piece flags; merge ranks cannot establish it.
+        for (size_t pos = 0; pos < normalized.size();) {
+            int32_t node = 0, best = -1;
+            size_t after = pos;
+            for (size_t at = pos; at < normalized.size(); ++at) {
+                int32_t child = unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && unigram_trie_[static_cast<size_t>(child)].byte != static_cast<unsigned char>(normalized[at])) {
+                    child = unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) break;
+                node = child;
+                const int32_t id = unigram_trie_[static_cast<size_t>(node)].token;
+                if (id >= 0) { best = id; after = at + 1; }
+            }
+            if (best >= 0) {
+                out.push_back(best);
+                pos = after;
+            } else {
+                const size_t end = std::min(normalized.size(), pos + utf8_len(static_cast<unsigned char>(normalized[pos])));
+                while (pos < end) out.push_back(byte_token_[static_cast<unsigned char>(normalized[pos++])]);
+            }
+        }
+        return;
     }
 
     // SentencePiece BPE: start from UTF-8 characters and repeatedly merge the

@@ -179,6 +179,15 @@ verifies the actual mask there and reports the original configured size. Full co
 For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
 count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
 Both residual branches must be present and verified before this correction is applied.
+SentencePiece files can select `tokenizer.ggml.pre=spm-greedy`: identity text normalization, escaped spaces and
+longest-prefix matching with byte fallback. This represents a source vocabulary whose ordinary pieces are all
+`USER_DEFINED`; the description tool verifies those flags through `sentencepiece` and `protobuf` before accepting
+the mode. The converter can discard the flags and incorrectly declare ordinary BPE; its space-prefix declaration
+can also disagree with the source model. `tools/gguf_set_keys.py` can correct those metadata keys in a copy.
+InternLM3's F32 tiny checkpoint passes with `spm-greedy` and `add_space_prefix=false`: mean KL 0.00000,
+top-1 100%, all three tokenizer texts identical (606/1,007/205 IDs), and 14 template renders identical.
+The original slow tokenizer is the reference. All 21 tensor payloads remain byte-identical after the metadata
+correction. This check stays within the declared 32,768-token context; dynamic-NTK extrapolation remains unsupported.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
