@@ -222,6 +222,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     GgufWriter w;
     const std::string& a = s.arch;
     w.add_string("general.architecture", a);
+    if (s.tokenizer_padding > 0) w.add_string("liyab.test.padding", std::string(s.tokenizer_padding, 'x'));
     w.add_string("general.name", "liyab-tiny-test");
     w.add_u32(a + ".block_count", static_cast<uint32_t>(s.n_layers));
     w.add_u32(a + ".embedding_length", static_cast<uint32_t>(s.n_embd));
@@ -297,7 +298,6 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".rope.scaling.original_context_length", static_cast<uint32_t>(s.longrope_ctx));
         w.add_f32(a + ".rope.scaling.attn_factor", 1.19f);
     }
-    if (s.tokenizer_padding > 0) w.add_string("liyab.test.padding", std::string(s.tokenizer_padding, 'x'));
     if (s.bpe_pre.empty()) {
         w.add_string("tokenizer.ggml.model", "llama");
         if (!s.spm_pre.empty()) w.add_string("tokenizer.ggml.pre", s.spm_pre);

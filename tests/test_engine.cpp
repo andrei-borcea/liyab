@@ -2738,6 +2738,7 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
 
 TEST_CASE("Per-block geometry matches an independent float reference") {
     test::TinyModelSpec spec = test::nas_spec();
+    spec.tokenizer_padding = (size_t{1} << 20) + 64;
     spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
     TransformerOptions options;
     options.kv_type = KvCacheType::F16;
@@ -2787,6 +2788,8 @@ TEST_CASE("Per-block geometry matches an independent float reference") {
     auto other = load_transformer(model_path("nas_other_geometry", spec), options);
     REQUIRE(other != nullptr);
     CHECK(model->file().file_size() == other->file().file_size());
+    CHECK(model_fingerprint(model->file().file()) == model_fingerprint(other->file().file()));
+    CHECK(model->context_fingerprint() != other->context_fingerprint());
     CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
     CHECK(other->n_past() == 0);
 }
@@ -2813,15 +2816,28 @@ TEST_CASE("Absent first blocks and stacks with no FFN load and run") {
     }
 }
 
-TEST_CASE("Saved states reject different residual scales with the same dimensions and file size") {
+TEST_CASE("Saved states and calibration reject residual-scale changes beyond the first MiB") {
     test::TinyModelSpec s;
     s.arch = "granite";
+    s.tokenizer_padding = (size_t{1} << 20) + 64;
     s.residual_scale = 0.22f;
-    auto first = load_transformer(model_path("modern_state_scale_a", s));
+    const std::string& first_path = model_path("modern_state_scale_a", s);
+    auto first = load_transformer(first_path);
     s.residual_scale = 0.44f;
-    auto second = load_transformer(model_path("modern_state_scale_b", s));
+    const std::string& second_path = model_path("modern_state_scale_b", s);
+    auto second = load_transformer(second_path);
     REQUIRE(first && second);
     CHECK(first->file().file_size() == second->file().file_size());
+    CHECK(model_fingerprint(first->file().file()) == model_fingerprint(second->file().file()));
+    CHECK(first->context_fingerprint() != second->context_fingerprint());
+    CHECK(first->file_fingerprint() != second->file_fingerprint());
+    for (const std::string arch : {"llama", "qwen35", "gemma2"}) {
+        test::TinyModelSpec legacy;
+        legacy.arch = arch;
+        auto model = load_transformer(model_path("legacy_header_identity_" + arch, legacy));
+        REQUIRE(model != nullptr);
+        CHECK(model->file_fingerprint() == model_fingerprint(model->file().file()));
+    }
     ThreadPool pool(3);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -2831,6 +2847,23 @@ TEST_CASE("Saved states reject different residual scales with the same dimension
     REQUIRE(first->write_state(saved).is_ok());
     CHECK(second->read_state(saved).code() == ErrorCode::InvalidArgument);
     CHECK(second->n_past() == 0);
+    const std::string dir = temp_path("modern_scale_keys");
+    std::filesystem::remove_all(dir);
+    EngineConfig config = engine_config(first_path);
+    config.backend = BackendKind::Cpu;
+    config.kv_cache_type = KvCacheType::Q8_0;
+    config.cache_dir = dir;
+    for (const std::string* path : {&first_path, &second_path, &first_path}) {
+        config.model_path = *path;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+    }
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().starts_with("keys-")) ++files;
+    }
+    CHECK(files == 2);  // distinct models, then a repeat that reuses its own calibration
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("Corrected tokenizer modes isolate saved contexts and KV keys beyond the first MiB") {

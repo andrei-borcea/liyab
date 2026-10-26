@@ -64,7 +64,7 @@ constexpr char kKeyScalesMagic[4] = {'L', 'Y', 'K', 'S'};
 constexpr size_t kKeptKeyScales = 16;  // files in cache_dir at most, least recently used out first
 
 uint64_t key_scales_id(const Transformer& model) {
-    const uint64_t parts[] = {model_fingerprint(model.file().file()), kKeyScalingVersion,
+    const uint64_t parts[] = {model.file_fingerprint(), kKeyScalingVersion,
                               static_cast<uint64_t>(model.kv_cache().dtype())};
     const std::string_view isa = quant::kernel_isa();
     return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
@@ -151,7 +151,7 @@ constexpr uint32_t kLatentRatioVersion = 1;
 constexpr size_t kKeptLatentRatios = 16;  // files in cache_dir at most, least recently used out first
 
 uint64_t latent_ratio_id(const Transformer& model) {
-    const uint64_t parts[] = {model_fingerprint(model.file().file()), kLatentRatioVersion,
+    const uint64_t parts[] = {model.file_fingerprint(), kLatentRatioVersion,
                               static_cast<uint64_t>(model.kv_cache().dtype())};
     const std::string_view isa = quant::kernel_isa();
     return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
@@ -828,7 +828,7 @@ struct Engine::Impl {
         const Route route = normal_route();
         const ExperimentalConfig& x = config.experimental;
         const uint64_t parts[] = {kStoreSeedVersion,
-                                  model_fingerprint(target->file().file()),
+                                  target->file_fingerprint(),
                                   target->context_fingerprint(),
                                   hash(quant::kernel_isa()),
                                   kind(route.attention),
@@ -2039,7 +2039,7 @@ struct Engine::Impl {
     [[nodiscard]] uint64_t reuse_calibration_id() const {
         uint32_t target_bits = 0;
         std::memcpy(&target_bits, &config.segment_reuse_max_kl, sizeof target_bits);
-        const uint64_t parts[] = {model_fingerprint(target->file().file()),
+        const uint64_t parts[] = {target->file_fingerprint(),
                                   target->context_fingerprint(),
                                   kReuseCalibrationVersion,
                                   target_bits,

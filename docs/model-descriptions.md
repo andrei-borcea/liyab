@@ -198,9 +198,10 @@ for this tokenizer mode. The description tool verifies this exact source JSON pi
 wrong file tag, incompatible source, or unavailable source proof. Active corrected tokenizer modes also remain
 unknown when the reference tokenizer itself cannot load. Neither rule depends on a model name.
 Normalization preserves malformed bytes while still composing valid characters after them.
-Corrected `spm-greedy` and `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts and
-KV-store keys. Equal-sized changes to vocabulary or tokenizer flags beyond the first MiB therefore invalidate
-raw-text saved contexts; existing tokenizer modes retain their prior state compatibility.
+Modern per-block geometry, scalar/rotation metadata, NoPE, post-only and whole-projection norm plans, and
+corrected `spm-greedy` / `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts,
+key-scale/latent-form calibration and KV-store keys. Equal-sized metadata or tokenizer changes beyond the first MiB therefore invalidate incompatible contexts
+and derived calibrations. Legacy plans without these features retain their prior identities and state compatibility.
 If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
 reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
 configuration and chat template are retained; a class that discards the supplied pipeline is refused.

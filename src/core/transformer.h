@@ -187,6 +187,12 @@ public:
 
     [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
     [[nodiscard]] const MmapLoader& file() const noexcept { return *file_; }
+    // Stable model identity for derived calibration and cache files. New plan
+    // features hash the complete first GGUF header; legacy plans retain the
+    // size/first-MiB identity. Constant after load, safe for concurrent reads.
+    [[nodiscard]] uint64_t file_fingerprint() const noexcept {
+        return variant_fingerprint_ != 0 ? variant_fingerprint_ : model_fingerprint(file_->file());
+    }
     [[nodiscard]] MmapLoader& mutable_file() noexcept { return *file_; }
     [[nodiscard]] const KvCache& kv_cache() const noexcept { return *kv_; }
     [[nodiscard]] int32_t context_length() const noexcept { return context_length_; }
@@ -983,11 +989,10 @@ private:
     TripleBufferLoader* layer_source_ = nullptr;
     std::vector<int32_t> layer_items_;
     bool layer_shared_ = false;
-    // New geometry/scalar metadata can change a model without changing its
-    // global dimensions or file size. Its file fingerprint protects saved
-    // states from that mismatch. Corrected tokenizer modes hash their full
-    // first header, so raw-text saved contexts and KV keys cannot cross modes
-    // or flags beyond the first MiB. Other legacy layouts keep 0.
+    // New geometry/scalar metadata and plan features can change a model
+    // without changing global dimensions, file size or the first MiB.
+    // A complete first-header fingerprint protects states, raw text and
+    // all derived cache keys; other legacy layouts keep 0.
     uint64_t variant_fingerprint_ = 0;
 
     const TensorView* token_embd_ = nullptr;

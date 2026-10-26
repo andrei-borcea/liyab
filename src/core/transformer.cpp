@@ -399,27 +399,34 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!described) return described.status();
     model->config_ = std::move(described).value();
     const ModelConfig& c = model->config_;
+    bool extended_identity = c.spec->nope_period > 0 || c.spec->nope_global;
+    for (const BlockPlan& block : c.blocks) {
+        extended_identity = extended_identity || (block.qk_norm_whole && block.n_head > 1) ||
+                            (block.mixer != MixerKind::None && !block.norm_before_mixer) ||
+                            (block.ffn != FfnKind::None && !block.norm_before_ffn);
+    }
     for (const char* suffix : {"attention.head_count", "attention.head_count_kv", "feed_forward_length"}) {
         const GgufValue* value = f.metadata(c.arch + "." + suffix);
         if (value != nullptr && value->type == GgufValue::Type::Array) {
-            model->variant_fingerprint_ = model_fingerprint(f.file());
+            extended_identity = true;
             break;
         }
     }
     for (const char* suffix : {"embedding_scale", "residual_scale", "logit_scale", "attention.rope_pattern",
                                "attention.temperature_scale", "attention.temperature_length"}) {
         if (f.metadata(c.arch + "." + suffix) != nullptr) {
-            model->variant_fingerprint_ = model_fingerprint(f.file());
+            extended_identity = true;
             break;
         }
     }
     const auto tokenizer_pre = f.get_string("tokenizer.ggml.pre");
-    if (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits")) {
-        // Saved engine contexts include raw text. Tokenizer flags and vocabulary
-        // can be beyond the first MiB, and equal-sized edits must invalidate
-        // that text as well as persistent KV keys. Hash the complete first
-        // header before weights are bound or relocated. Legacy modes keep
-        // their previous state compatibility.
+    extended_identity = extended_identity ||
+                        (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits"));
+    if (extended_identity) {
+        // Geometry, scalars, norm placement and tokenizer flags can be beyond
+        // the first MiB. Equal-sized edits must invalidate states and every
+        // derived calibration/cache key. Hash the complete first header before
+        // binding or relocation; legacy plans retain their previous identity.
         size_t header = f.file().size();
         for (const TensorView& tensor : f.tensors()) {
             if (tensor.shard == 0) header = std::min(header, static_cast<size_t>(tensor.file_offset));
