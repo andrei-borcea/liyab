@@ -799,7 +799,11 @@ jinja::Value chat_special(const jinja::Value& entry) {
     if (const auto* clock = entry.fields().find("clock_utc")) {
         const auto epoch = static_cast<std::time_t>(clock->as_int());
         std::tm fixed{};
+#ifdef _WIN32
+        if (gmtime_s(&fixed, &epoch) != 0) throw std::runtime_error("invalid fixture clock_utc");
+#else
         if (!gmtime_r(&epoch, &fixed)) throw std::runtime_error("invalid fixture clock_utc");
+#endif
         special.fields().set("strftime_now", jinja::Value::callable("strftime_now", [fixed](jinja::Array& args, jinja::Kwargs&) {
             char buffer[256];
             const size_t n = std::strftime(buffer, sizeof buffer, args.empty() ? "%Y-%m-%d" : args[0].str().c_str(), &fixed);

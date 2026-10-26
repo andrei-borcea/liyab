@@ -617,6 +617,7 @@ What the port does differently from the POSIX platforms:
     refuses refused too (`tests/data/chat_templates.json`, written by `tools/chat_template_reference.py`). The
     templates the GGUFs themselves carry gave the same 168 results.
     Clock-reading fixtures pin a UTC instant and supply it to both renderers, so their expected date is reproducible.
+    The C++ fixture helper uses the platform's thread-safe UTC conversion (`gmtime_s` on Windows).
 * **Prompts are used as given** by `generate()` and `prefill()`: render them with the template first (the app does).
 
 ---
