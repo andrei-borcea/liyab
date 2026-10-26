@@ -247,7 +247,10 @@ The full F16 gate for `internlm/internlm2_5-1_8b-chat` (revision `57dcbc5455bf05
 It gives mean/max KL 0.00000/0.00001, top-1 100.00%, 512 BOS-inclusive IDs identical,
 and three full tokenizer texts identical (575/989/190). The source and GGUF chat templates and
 special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
-A metadata-only copy restores source EOS2 and unknown0 and preserves chat EOS92542 as EOT, matching the source generation stop set[2,92542]. b11819 otherwise replaces EOS2 with92542 and omits unknown0. The unmodified file passes numerical/three-text checks but differs in template context and misses the original EOS stop. All219 tensor payload hashes are unchanged.
+A metadata-only copy restores source EOS 2 and unknown token 0 and preserves chat EOS 92542 as EOT, matching
+the source generation stop set [2, 92542]. b11819 otherwise replaces EOS 2 with 92542 and omits unknown token 0.
+The unmodified file passes numerical and three-text checks but differs in template context and misses the
+original EOS stop. All 219 tensor payload hashes are unchanged.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
