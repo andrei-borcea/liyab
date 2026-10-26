@@ -1118,11 +1118,38 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     return b
 
 
+def restore_depth_scale(facts, config, traced_layers, full_layers):
+    """Map a verified scale_depth/sqrt(layer_count) branch scale to the full configuration."""
+    depth = getattr(config, "scale_depth", None)
+    if depth is None or traced_layers == full_layers:
+        return
+    blocks = facts["block_facts"]
+    if not isinstance(depth, (int, float)) or isinstance(depth, bool) or not math.isfinite(depth) or depth <= 0:
+        facts["unknown"].append("scale_depth is not a finite positive scalar")
+        return
+    expected = float(depth) / math.sqrt(traced_layers)
+    if (not blocks or any(not isinstance(b.get("residual"), dict)
+                                 or b["residual"].get("only_ffn")
+                                 or not math.isclose(b["residual"]["multiplier"], expected, rel_tol=1e-5, abs_tol=1e-6)
+                                 for b in blocks)):
+        facts["unknown"].append("scale_depth is not the verified scale_depth/sqrt(traced layer count) "
+                                "on both residual branches")
+        return
+    original = float(depth) / math.sqrt(full_layers)
+    for block in blocks:
+        block["residual"]["traced_multiplier"] = block["residual"]["multiplier"]
+        block["residual"]["multiplier"] = original
+    facts["depth_scale_probe"] = {"scale_depth": depth, "traced_layers": traced_layers,
+                                  "original_layers": full_layers, "traced_multiplier": expected,
+                                  "original_multiplier": original}
+
+
 def describe_reference(model_id, revision=None, trust_remote_code=False):
     """Traces the model's reference implementation and returns its facts (a JSON-able dict)."""
     trace = run_trace(model_id, revision, trust_remote_code)
     facts = analyze(trace)
     cfg = trace.config
+    restore_depth_scale(facts, cfg, trace.keep, trace.n_layers)
     original_windows = {getattr(cfg, k, None) for k in ("sliding_window", "window_size")
                         if isinstance(getattr(cfg, k, None), int) and getattr(cfg, k) > 0}
     reduced_windows = {getattr(trace.reduced, k, None) for k in ("sliding_window", "window_size")

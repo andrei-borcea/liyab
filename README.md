@@ -176,6 +176,8 @@ InternLM2 and Ministral 3 each have 14 template fixtures. An explicit template f
 transformers' Jinja renderer, including for tokenizers whose own chat formatter does not use Jinja.
 Reference tracing shortens a uniform configured attention window so its boundary occurs within the probe,
 verifies the actual mask there and reports the original configured size. Full conformance uses the original size.
+For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
+count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 

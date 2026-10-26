@@ -1207,6 +1207,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     eps_ref = {(b.get(r) or {}).get("eps") for b in bf for r in roles if b.get(r)} - {None}
     if eps_ref and not all(_close(e, eps, 1e-3) for e in eps_ref):
         d.file_issues.append(f"norm epsilon {sorted(eps_ref)} in the reference, {eps} in the file")
+    if facts.get("depth_scale_probe"):
+        probe = facts["depth_scale_probe"]
+        d.notes.append(f"residual scale verified as scale_depth/sqrt(layers) with {probe['traced_layers']} traced "
+                       f"layers; the original {probe['original_layers']}-layer configuration uses "
+                       f"{probe['original_multiplier']:.6g}")
     if any(isinstance(b.get("residual"), dict) for b in bf):
         mults = sorted({round(b["residual"]["multiplier"], 6) for b in bf if isinstance(b.get("residual"), dict)})
         if any(b.get("residual", {}).get("only_ffn") for b in bf if isinstance(b.get("residual"), dict)):

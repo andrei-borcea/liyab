@@ -173,6 +173,10 @@ back to the original configured size. This keeps local/global blocks distinguish
 is thousands of tokens. It changes only the tracing configuration; the teacher-forced reference and engine gate
 run the checkpoint's original window. An OLMo 3 regression verifies three local blocks and a global block; the
 real PLaMo 3 description now derives its exact local-base/period row instead of conflating short causal masks.
+For configurations with `scale_depth`, both residual branches must numerically match
+`scale_depth / sqrt(traced_layer_count)` before the tool maps that multiplier to the original layer count.
+An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
+the teacher-forced reference continues to run the original checkpoint and configuration.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
