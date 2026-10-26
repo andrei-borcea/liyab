@@ -290,6 +290,15 @@ metadata, so it cannot provide an earlier real-weight comparison. No real HF log
 claimed for this file. README records the observed cache/read/stall counters and their timing limits; used
 weights were removed after preserving the evidence.
 
+The final unchanged-output performance check uses Qwen3-0.6B, Llama-3.2-1B-Instruct and the recurrent
+Qwen3.5-0.8B on an M4 Pro: original BF16 CPU and Metal/CPU-matrix-fallback routes, F16 actual Metal routes,
+and 512-token CPU `liyab-bench` prefill. One warmup precedes six balanced pairs per configuration. All 108
+measured CLI turns generated 128 tokens, with byte-identical replies and all four token counts equal in
+each pair. All 21 median paired speed ratios across 12 configurations and 72 pairs fall in
+0.993247–1.011333, passing the unchanged ±3% gate with frozen executables/libraries and no competing jobs.
+README records the three CPU prefill medians. These baseline-model timings are distinct from architecture
+conformance and from the individual real V2 streaming observations above.
+
 Files predating split MLA projections describe the expanded head with `attention.key_length`, `value_length`
 and one KV head per query head. `describe_model()` normalizes those dimensions to the cached latent and plans
 `BlockPlan::latent_combined` from `attn_kv_b.weight`; ambiguous combined/split tensors are refused. The description

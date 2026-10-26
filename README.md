@@ -2249,6 +2249,22 @@ The Android regression runner includes `test_compression` when that executable i
 Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
 every position in every block, including nonclosing positions; memory planning includes that cost.
 
+The final M4 Pro regression check used four CPU threads, F16 KV, one warmup and six balanced, back-to-back
+baseline/branch pairs per configuration. The 512-token CPU `liyab-bench` prefill medians were:
+
+| Original BF16 model | Saved baseline (tok/s) | Branch (tok/s) |
+| :--- | ---: | ---: |
+| Qwen3-0.6B | 87.95 | 88.00 |
+| Llama-3.2-1B-Instruct | 36.95 | 37.00 |
+| Qwen3.5-0.8B | 83.40 | 83.65 |
+
+CLI prefill/decode pairs also covered CPU, the BF16 Metal route with CPU matrix fallback, and actual Metal
+routes using F16 derivatives. An ordinary request rendered through each model's own template produced 128
+generated tokens in every measured turn; all 54 reply-byte/count pairs matched. Across 12 configurations,
+72 balanced pairs and 21 metrics, median paired speed ratios ranged from 0.993247 to 1.011333, within the
+unchanged ±3% gate. The six executable/library hashes stayed fixed, with no pacing, cancellation or thermal
+rerouting. Other model, build, test and download jobs were stopped for these measurements.
+
 GLM-4.7-Flash remains a real-model streaming smoke result, not a conformance claim. Its two-block F32 tiny
 checkpoint converted with b11819 matches 494 token IDs but fails numerically (mean KL 0.00019, top-1 58.22%).
 The export omits sigmoid `expert_gating_func`, and its `deepseek2` label does not distinguish the reference's
