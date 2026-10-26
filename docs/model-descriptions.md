@@ -406,6 +406,7 @@ registry row and all three tokenizer texts. These results do not stand in for pe
 | `allenai/OLMo-1B-hf` | Q8_0 | 0.00089 | 97.26% |
 | `microsoft/phi-2` | F16 | 0.00009 | 98.83% |
 | `bigcode/starcoder2-3b` | F16 | 0.00000 | 100.00% |
+| `nvidia/Minitron-4B-Base` | F16 | 0.00000 | 100.00% |
 
 The same Phi-2 checkpoint converted to Q8_0 gives mean KL 0.00573 and top-1 agreement 94.91%, below the
 97% gate. Its registry row and token IDs match; the passing Phi-2 result above establishes F16 conformance.
@@ -416,6 +417,6 @@ The unmodified b11819 converter rejects a reduced official `tiiuae/falcon-rw-1b`
 `transformer.h.0.post_attention_layernorm.bias` (unmapped tensor). Its full weights were not downloaded;
 Falcon evidence above covers the 7B configuration and its separate-norm variant.
 
-The Minitron-4B real gate remains pending. The larger configurations above have
-tiny conformance only. Command-R and Arcee chat templates are checked byte for byte against transformers;
+The configurations above without a real-checkpoint row have tiny conformance only.
+Command-R and Arcee chat templates are checked byte for byte against transformers;
 the other selected base tokenizers do not provide a chat template.
