@@ -909,6 +909,36 @@ def analyze_moe(ffn_call, block_calls, cfg):
     return f
 
 
+def _input_embedding(trace, first_block):
+    """Use the public accessor, or one unambiguous token lookup observed before the first block."""
+    try:
+        embedding = trace.model.get_input_embeddings()
+    except (AttributeError, NotImplementedError):
+        embedding = None
+    if embedding is not None:
+        return embedding
+    boundary = min(c.order for c in trace.calls if c.path == first_block.path or
+                   c.path.startswith(first_block.path + "."))
+    candidates = {id(c.module): c.module for c in trace.calls
+                  if c.order < boundary and isinstance(c.module, nn.Embedding) and
+                  c.input is not None and torch.equal(c.input, trace.ids) and c.output is not None and
+                  first_block.input is not None and c.output.shape == first_block.input.shape}
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
+def _output_projection(trace, last_block):
+    """Use the public accessor, or a unique linear call after the blocks with the logits' shape."""
+    try:
+        projection = trace.model.get_output_embeddings()
+    except (AttributeError, NotImplementedError):
+        projection = None
+    if projection is not None:
+        return next((c for c in trace.calls if c.module is projection), None)
+    candidates = [c for c in trace.calls if c.order > last_block.order and isinstance(c.module, nn.Linear) and
+                  c.output is not None and c.output.shape == trace.logits.shape]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def analyze(trace):
     """All facts from a trace (see the module docstring)."""
     calls = trace.calls
@@ -928,9 +958,11 @@ def analyze(trace):
 
     # Embeddings into block 0, against the rows of the embedding table (what a GGUF stores as token_embd): an
     # embedding module may scale its own output.
-    emb_mod = trace.model.get_input_embeddings()
+    emb_mod = _input_embedding(trace, layer_calls[0])
     h0 = layer_calls[0].input
     facts["embedding_scale"] = None
+    if emb_mod is None:
+        facts["unknown"].append("the reference's input embedding table cannot be identified uniquely from its calls")
     if emb_mod is not None and h0 is not None:
         e = emb_mod.weight.detach()[trace.ids[0]].float().reshape(h0.shape)
         if close(e, h0):
@@ -944,8 +976,8 @@ def analyze(trace):
                                         "(position embeddings or another input are added)")
     # Output: final norm, then the output projection, then the logits.
     last = layer_calls[-1]
-    head_mod = trace.model.get_output_embeddings()
-    head = next((c for c in calls if c.module is head_mod), None)
+    head = _output_projection(trace, last)
+    head_mod = head.module if head is not None else None
     after = [c for c in calls if c.order > last.order and not _is_descendant(c.path, trace.layers_path)]
     final_norm = next((c for c in after if _norm_like(c) and close(c.input, last.output)), None)
     facts["final_norm"] = None
@@ -954,6 +986,8 @@ def analyze(trace):
     else:
         facts["unknown"].append("no norm between the last block and the output projection")
     facts["logits"] = None
+    if head is None:
+        facts["unknown"].append("the reference's output projection cannot be identified uniquely from its calls")
     if head is not None:
         input_scale = 1.0
         if final_norm is not None and not close(head.input, final_norm.output):

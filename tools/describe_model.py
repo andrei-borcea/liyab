@@ -1638,7 +1638,8 @@ def run(cmd, log, cwd=None, env=None):
     with open(log, "a") as out:
         out.write("$ " + " ".join(cmd) + "\n")
         out.flush()
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           errors="backslashreplace")
         out.write(p.stdout)
     return p.returncode, p.stdout
 

@@ -179,6 +179,12 @@ verifies the actual mask there and reports the original configured size. Full co
 For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
 count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
 Both residual branches must be present and verified before this correction is applied.
+If a legacy reference omits its input-embedding accessor, the trace can use a unique embedding lookup observed
+on the actual token IDs before the first block. Ambiguous lookups remain unknown; the measured embedding scale
+must still explain the entire input to that block.
+The same rule applies to a missing output accessor: one observed linear projection after the blocks must have
+the logits' shape, and its input and full output must pass the norm and logit-transform checks.
+Gate logs escape invalid UTF-8 in byte-token mismatch diagnostics and preserve the failed check's exit status.
 SentencePiece files can select `tokenizer.ggml.pre=spm-greedy`: identity text normalization, escaped spaces and
 longest-prefix matching with byte fallback. This represents a source vocabulary whose ordinary pieces are all
 `USER_DEFINED`; the description tool verifies those flags through `sentencepiece` and `protobuf` before accepting

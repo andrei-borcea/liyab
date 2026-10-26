@@ -181,6 +181,15 @@ For configurations with `scale_depth`, both residual branches must numerically m
 An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
 the teacher-forced reference continues to run the original checkpoint and configuration.
 Blocks without either the mixer or the FFN cannot establish a two-branch depth rule and leave it unknown.
+When a legacy model does not implement its input-embedding accessor, the trace identifies a unique observed
+`Embedding` call on the actual token IDs, before any first-block child runs and with the first block's input shape.
+Repeated calls to the same table count once; different candidate tables remain unknown. The existing full-tensor
+embedding-scale check still applies, so positional additions or other input transformations cannot be hidden.
+An unavailable output accessor similarly requires exactly one observed linear projection after the last block,
+with the logits' shape. Its norm input, possible input multiplier, bias and entire logit transform are still
+verified numerically. Multiple candidate calls remain unknown, including repeated calls to the same head.
+Byte-token mismatch diagnostics may contain individual UTF-8 bytes. Gate subprocess output escapes those bytes
+when decoding its log, preserving the actual failed check instead of aborting with a Unicode decoding error.
 For SentencePiece references, the tool reads the source model's piece flags with `sentencepiece` and `protobuf`.
 If every ordinary BPE piece is `USER_DEFINED`, SentencePiece freezes the longest match rather than applying merge
 ranks. The corresponding file mode is `tokenizer.ggml.pre=spm-greedy`, with all byte fallback tokens, identity
