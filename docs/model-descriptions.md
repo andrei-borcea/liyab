@@ -420,3 +420,43 @@ Falcon evidence above covers the 7B configuration and its separate-norm variant.
 The configurations above without a real-checkpoint row have tiny conformance only.
 Command-R and Arcee chat templates are checked byte for byte against transformers;
 the other selected base tokenizers do not provide a chat template.
+
+### Classic performance regression check
+
+On the M4 Pro, the controlled main/branch comparison passes all 14 metrics below within ±3%.
+Each of eight configurations has one warmup pair followed by six balanced AB/BA measured pairs:
+48 measured pairs in total. Rates are cohort medians; changes are medians of the six paired branch/main
+ratios, so they need not equal the ratio of the displayed rates. Both cohorts use four threads and F16 KV.
+
+| Model | Weights / route / workload | Main → branch prefill tok/s | Paired change | Main → branch decode tok/s | Paired change |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | BF16 / CPU / `liyab-bench` | 87.85 → 87.85 | −0.06% | N/A | N/A |
+| Qwen3-0.6B | BF16 / CPU / CLI | 93.98 → 94.06 | +0.01% | 61.91 → 61.66 | −0.42% |
+| Qwen3-0.6B | BF16 / Metal route, CPU matrix fallback / CLI | 95.66 → 94.85 | −0.23% | 61.60 → 62.00 | +0.96% |
+| Qwen3-0.6B | F16 / actual Metal / CLI | 262.63 → 260.29 | −0.34% | 32.47 → 32.41 | −0.08% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / `liyab-bench` | 36.70 → 36.70 | +0.14% | N/A | N/A |
+| Llama-3.2-1B-Instruct | BF16 / CPU / CLI | 38.12 → 38.08 | −0.24% | 28.46 → 28.15 | −1.08% |
+| Llama-3.2-1B-Instruct | BF16 / Metal route, CPU matrix fallback / CLI | 37.61 → 37.56 | −0.17% | 27.96 → 27.85 | −0.24% |
+| Llama-3.2-1B-Instruct | F16 / actual Metal / CLI | 126.02 → 126.36 | +0.37% | 29.60 → 29.63 | −0.17% |
+
+The standalone CPU benchmark uses 512 tokens, batch 512 and three internal repeats. CLI timing uses one
+fixed ordinary question per model and a maximum of 128 generated tokens; every run naturally generated
+128 with zero forced tokens. Main/branch UTF-8 reply bytes and all four counts (`prompt_tokens`,
+`cached_prefix_tokens`, `generated_tokens`, `forced_tokens`) match. Actual Metal attention is checked on
+both Metal routes, and F16 additionally requires Metal FFNs. No cancellation, thermal rerouting or pacing
+was accepted. Conformance text and tokenizer gates remain separate from timing.
+
+The protocol was declared before measurement. Exact original executable/library bytes are copied before
+each run to the same neutral tool paths for both cohorts, with identical arguments, environment and CWD.
+Each CLI's loaded library path and source UUID are verified; standalone benchmarks load no shared Liyab
+library. All six original SHA-256s match before and after the matrix. Both loader preflights and all 112
+model processes have AC checks before and after: all 228 power stamps show AC, with no other model/build/test
+jobs allowed. The AC confirmation reuses the original neutral runner; only its results directory changes.
+
+Earlier results remain part of the evidence: the original separate-path matrix passed 13/14 metrics but
+Qwen3 CPU 512-token prefill failed at −8.11%; its fully quiet control failed at −8.12%. An unchanged-byte
+same-path diagnostic supported an execution-context confound without identifying its precise cause.
+The first full neutral-path attempt passed 10/14 while the host discharged from 13% to 3% on battery;
+that attempt remains a failure. The table reports the subsequent complete, prospectively approved AC
+confirmation with unchanged binaries, runner, prompts, flags and ±3% threshold. This establishes the
+controlled harness comparison; no engine or kernel source performance fix is claimed.

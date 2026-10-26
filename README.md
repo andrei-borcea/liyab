@@ -2113,6 +2113,12 @@ weights, the file's layouts and the repacked ones, batched and token-by-token pr
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
+The classic transformer extension passes 20 tiny cases across 16 families and nine full-checkpoint gates.
+Its controlled main/branch comparison on the M4 Pro passes all 14 prefill/decode metrics within ±3%, using
+48 balanced pairs on AC power. BF16 Metal-route measurements include CPU matrix fallback; F16 measurements
+verify actual Metal attention and FFNs. [Classic validation](docs/model-descriptions.md#classic-performance-regression-check)
+records the method, measured rates and earlier failed attempts. No engine performance fix is claimed.
+
 **Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
 float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every supported tokenizer
 gave the reference's ids for the whole text. The Hunyuan models were measured on the reference's ids
