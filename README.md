@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -457,6 +457,10 @@ What the port does differently from the POSIX platforms:
   * `olmo2` (OLMo-2-0425-1B): RMSNorm after each residual branch, Q/K RMSNorm over the entire projection,
     and the `dbrx` pre-tokenizer. Its real F16 checkpoint passes the gate with identical 512 prompt IDs,
     mean KL 0.00000, maximum 0.00003 and 100% top-1. Norms run on the CPU; projections retain CPU/Metal/Vulkan routing;
+  * `exaone4` (EXAONE-4.0-1.2B): post-only branch norms, per-head Q/K RMSNorm and Llama 3 rotary frequency factors.
+    Its real F16 checkpoint passes the gate with identical 512 prompt IDs, mean KL 0.00001, maximum 0.00018
+    and 100% top-1. A separate four-block tiny case checks windowed rotary/global unrotated attention at a 64-token
+    window (99.80% top-1). Norms and rotation run on the CPU; projections retain CPU/Metal/Vulkan routing;
   * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
     proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
     The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
