@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -230,6 +230,9 @@ Its own template matches all 14 reference cases (14 rendered, 0 correctly refuse
 This gate restores source EOS 2 and unknown token 0 in metadata, preserving the converter's chat terminator
 92542 as EOT. The original converter replaces EOS and omits unknown; all 219 tensor payloads are unchanged.
 
+The full F16 gate for `unsloth/gemma-1.1-2b-it` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (513/786/211), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (1 rendered, 13 correctly refused).
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 

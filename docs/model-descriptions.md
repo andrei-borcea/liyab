@@ -251,6 +251,10 @@ A metadata-only copy restores source EOS 2 and unknown token 0 and preserves cha
 the source generation stop set [2, 92542]. b11819 otherwise replaces EOS 2 with 92542 and omits unknown token 0.
 The unmodified file passes numerical and three-text checks but differs in template context and misses the
 original EOS stop. All 219 tensor payload hashes are unchanged.
+The full F16 gate for `unsloth/gemma-1.1-2b-it` (revision `619e546640669a280738627cc623f4bd74a7b069`) proposes the exact `gemma` row.
+It gives mean/max KL 0.00000/0.00000, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (513/786/211). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (1 rendered, 13 correctly refused).
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
@@ -380,6 +384,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | EXAONE-4.0-1.2B (F16, b11819 conversion of revision `3abf281`) | registry's `exaone4`, exact | 618 / 993 / 254, identical | 511 positions, mean KL 0.00001, maximum 0.00018, top-1 100.00% | accepted |
 | openbmb/MiniCPM-1B-sft-bf16 (F16, b11819 conversion of revision `8525293`) | registry's `minicpm`, exact | 631 / 1049 / 248, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
 | internlm/internlm2_5-1_8b-chat (F16, b11819 with EOS/EOT metadata correction, revision `57dcbc5`) | registry's `internlm2`, exact | 575 / 989 / 190, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted corrected metadata |
+| unsloth/gemma-1.1-2b-it (F16, b11819 conversion of revision `619e546`) | registry's `gemma`, exact | 513 / 786 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00000, top-1 100.00% | accepted |
 
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean
