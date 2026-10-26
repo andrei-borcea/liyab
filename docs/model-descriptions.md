@@ -141,6 +141,9 @@ The tokenizer resolves these control tokens from the vocabulary, refuses an inco
 once; segmented encoding keeps an automatic prefix before the reusable text. The description tool compares the
 scheme's prefix with the official tokenizer's actual special-token output.
 ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder templates have 14 reference cases each.
+Seed-OSS and GLM-4-9B-0414 have F32 tiny-checkpoint conformance: mean KL 0.00000, top-1 100.00% and 99.80%,
+respectively, with 512 and 498 identical conformance IDs and all three tokenizer texts matching. Their template
+fixtures cover 19 and 14 requests. No full-weight checkpoint was measured for these families or for Deci/Nemotron-NAS.
 ChatGLM3's tiny forward pass matches after adding its prefix, but the published converter also renames the
 SentencePiece BOS/EOS strings and marks more literal spellings as control tokens than its official tokenizer
 recognizes by default. Its three-text tokenizer gate therefore remains incomplete.
@@ -274,7 +277,7 @@ The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` (revision `b
 It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
 and three full tokenizer texts identical (517/879/235). Actual GGUF template renders and
 special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
-The unmodified b11819 HF-format path selects a different Devstral community template and fails author-output comparisons. Its native tekken vocabulary reader is selected by temporarily hiding the own tokenizer.json and restoring it before references. This gate changes only the template metadata slot to the official author Jinja, lexer-minified with the same AST and all 14 rendered outputs; all 236 tensor descriptors and the entire tensor data section are unchanged (SHA256 0ee6f18db9635f745dcc81d6904048ebcc66fc004d17247df1ea54f17e0c72c8). The private generic converter shim instead prefers a local author Jinja file after the existing vocabulary method, with no tensor changes. The older Ministral fixture remains supplementary community-template coverage; ministral3-real is the official author fixture.
+The unmodified b11819 HF-format path selects a different Devstral community template and fails author-output comparisons. Its native tekken vocabulary reader is selected by temporarily hiding the own tokenizer.json and restoring it before references. This gate changes only the template metadata slot to the official author Jinja, lexer-minified with the same AST and all 14 rendered outputs; all 236 tensor descriptors and the entire tensor data section are unchanged (SHA256 0ee6f18db9635f745dcc81d6904048ebcc66fc004d17247df1ea54f17e0c72c8). The private generic converter shim instead prefers a local author Jinja file after the existing vocabulary method, with no tensor changes. The existing `ministral3` fixture holds the full 11912-byte official author template (SHA256 0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b). The `ministral3-real` fixture tests the compact equivalent stored in the corrected GGUF. The Devstral fallback remains a separately recorded failed-export comparison.
 The native tokenizer exposes no Jinja attribute. Template proof uses the checkpoint's own `chat_template.jinja` explicitly with transformers Jinja, rather than asserting equivalence to the separate native tokenizer chat formatter.
 The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` (revision `ccce25bd39c141fe053e0bc75818a8f5fe962802`) proposes the exact `exaone` row.
 It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
