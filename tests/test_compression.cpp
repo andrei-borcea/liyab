@@ -352,14 +352,29 @@ TEST_CASE("Shared-KV compression and residual streams match independent dense re
         TransformerOptions options; options.kv_type = KvCacheType::F16;
         auto model = Transformer::load(std::move(file).value(), options); REQUIRE(model);
         ThreadPool pool(4); auto backend = make_cpu_backend(pool); REQUIRE(backend);
-        const Route route{backend.get(), backend.get(), backend.get()};
-        auto got = model.value()->forward(tokens, Transformer::Logits::All, route, pool); REQUIRE(got);
-        double maximum = 0;
-        for (size_t t = 0; t < expected.size(); ++t) for (size_t j = 0; j < expected[t].size(); ++j) {
-            maximum = std::max(maximum, std::fabs(double{(*got)[t * expected[t].size() + j]} - expected[t][j]));
+        auto check_route = [&](Backend* projections) {
+            model.value()->reset();
+            const Route route{projections, projections, backend.get()};
+            auto got = model.value()->forward(tokens, Transformer::Logits::All, route, pool); REQUIRE(got);
+            double maximum = 0;
+            for (size_t t = 0; t < expected.size(); ++t) for (size_t j = 0; j < expected[t].size(); ++j) {
+                maximum = std::max(maximum, std::fabs(double{(*got)[t * expected[t].size() + j]} - expected[t][j]));
+            }
+            std::printf("  %s hc=%d max logit error %.9g\n", projections->description().c_str(), hc, maximum);
+            CHECK(maximum < 2e-4);
+        };
+        check_route(backend.get());
+        for (auto make : {make_metal_backend, make_vulkan_backend}) {
+            auto device = make();
+            if (!device) {
+                std::printf("  skipped: %s\n", device.status().to_string().c_str());
+                continue;
+            }
+            const TensorView& projection = *reference_file.value()->tensor("blk.1.attn_compressor_kv.weight");
+            Row input(static_cast<size_t>(projection.cols()), 0.125f), output(static_cast<size_t>(projection.rows()));
+            REQUIRE(device.value()->matmul(projection, input.data(), output.data(), 1).is_ok());
+            check_route(device.value().get());
         }
-        std::printf("  hc=%d max logit error %.9g\n", hc, maximum);
-        CHECK(maximum < 2e-4);
         std::remove(path().c_str());
     }
 }

@@ -415,6 +415,8 @@ does not substitute for that full-model description gate.
 rounding), exercises all 26 storage formats with attention and residual widths independent, and checks
 decode splits, rollback and saved images in
 all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
+The F32 whole-component reference also checks available Metal/Vulkan projection routes with and without
+parallel residual streams, keeping the CPU fallback for other operations and the same logit error bound.
 The shared test writer tiles encoded reference blocks for reader-only formats; their projection reference
 multiplies decoded weights and Q8-rounded activations directly, without calling the backend's dot kernels.
 Their attention norms balance the encoded blocks' measured RMS against the fixture's ordinary weight scale;
