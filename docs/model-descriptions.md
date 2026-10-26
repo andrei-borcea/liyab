@@ -302,6 +302,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | SmolLM3-3B (F16, b11819 conversion of revision `a07cc9a`) | registry's `smollm3`, exact | 498 / 797 / 165, identical | 497 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
 | PLaMo-3-610m-fin-instruct (F16, b11819 conversion of revision `a000b59`) | registry's `plamo3`, exact | 521 / 950 / 251, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
+| OLMo-2-0425-1B (F16, b11819 conversion of revision `a1847df`) | registry's `olmo2`, exact | 544 / 882 / 187, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 
@@ -309,12 +310,15 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
-| OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
 | Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
 
 SmolLM3 moved out of this table after adding its unrotated blocks and `smaug-bpe` pre-tokenizer. The tool now
 proposes its registered row exactly and its full F16 checkpoint passes the gate above; its 14 chat-template
 fixtures also render byte for byte like transformers.
+
+OLMo 2 moved out after adding post-only branch norms, whole-projection Q/K norms and the `dbrx` pre-tokenizer.
+The real OLMo-2-0425-1B F16 checkpoint reproduces the registered row exactly and passes the gate above. This base
+checkpoint has no chat template. OLMo 3's local/global window pattern is covered separately by tiny conformance.
 
 Gemma 2 and DeepSeek-V2 were in this table until the engine gained what the tool listed for them: logit
 soft-capping (Gemma 2), and multi-head latent attention, YaRN and the file's attention scale (DeepSeek-V2). The
