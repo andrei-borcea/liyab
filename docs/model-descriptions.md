@@ -265,6 +265,10 @@ The full F16 gate for `unsloth/gemma-1.1-2b-it` (revision `619e546640669a2807386
 It gives mean/max KL 0.00000/0.00000, top-1 100.00%, 512 BOS-inclusive IDs identical,
 and three full tokenizer texts identical (513/786/211). The source and GGUF chat templates and
 special strings match; all 14 fixture cases agree (1 rendered, 13 correctly refused).
+The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` (revision `707f574c62054322f6b5b04b6d075f0a8f05e0f0`) proposes the exact `granite` row.
+It gives mean/max KL 0.00000/0.00004, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (625/971/247). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
@@ -395,6 +399,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | openbmb/MiniCPM-1B-sft-bf16 (F16, b11819 conversion of revision `8525293`) | registry's `minicpm`, exact | 631 / 1049 / 248, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
 | internlm/internlm2_5-1_8b-chat (F16, b11819 with EOS/EOT metadata correction, revision `57dcbc5`) | registry's `internlm2`, exact | 575 / 989 / 190, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted corrected metadata |
 | unsloth/gemma-1.1-2b-it (F16, b11819 conversion of revision `619e546`) | registry's `gemma`, exact | 513 / 786 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00000, top-1 100.00% | accepted |
+| ibm-granite/granite-3.3-2b-instruct (F16, b11819 conversion of revision `707f574`) | registry's `granite`, exact | 625 / 971 / 247, identical | 511 positions, mean KL 0.00000, maximum 0.00004, top-1 100.00% | accepted |
 
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean
@@ -406,7 +411,10 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
-| Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
+| ChatGLM3 (b11819 export) | Raw control spellings and recognition differ from the original tokenizer; its three-text gate remains incomplete. |
+| IQuest-Coder (b11819 export) | The source added-token `single_word` boundaries are absent in the file; its tokenizer gate remains incomplete. |
+
+Granite's former entry required metadata attention scaling, embedding/residual/logit multipliers and the `refact` pre-tokenizer. These generic parts now pass the full Granite 3.3-2B gate above; Granite 3.1 itself was not separately gated.
 
 SmolLM3 moved out of this table after adding its unrotated blocks and `smaug-bpe` pre-tokenizer. The tool now
 proposes its registered row exactly and its full F16 checkpoint passes the gate above; its 14 chat-template
