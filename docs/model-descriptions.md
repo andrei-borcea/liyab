@@ -210,7 +210,7 @@ EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after corr
 `tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
 and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
 its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
-its existing plain ByteLevel rule. The full EXAONE 3.5 checkpoint gate remains pending.
+its existing plain ByteLevel rule. The full corrected-file result is recorded below.
 The explicit original slow-tokenizer path is unchanged.
 `python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
 
@@ -276,6 +276,13 @@ and three full tokenizer texts identical (517/879/235). Actual GGUF template ren
 special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
 The unmodified b11819 HF-format path selects a different Devstral community template and fails author-output comparisons. Its native tekken vocabulary reader is selected by temporarily hiding the own tokenizer.json and restoring it before references. This gate changes only the template metadata slot to the official author Jinja, lexer-minified with the same AST and all 14 rendered outputs; all 236 tensor descriptors and the entire tensor data section are unchanged (SHA256 0ee6f18db9635f745dcc81d6904048ebcc66fc004d17247df1ea54f17e0c72c8). The private generic converter shim instead prefers a local author Jinja file after the existing vocabulary method, with no tensor changes. The older Ministral fixture remains supplementary community-template coverage; ministral3-real is the official author fixture.
 The native tokenizer exposes no Jinja attribute. Template proof uses the checkpoint's own `chat_template.jinja` explicitly with transformers Jinja, rather than asserting equivalence to the separate native tokenizer chat formatter.
+The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` (revision `ccce25bd39c141fe053e0bc75818a8f5fe962802`) proposes the exact `exaone` row.
+It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (615/917/243). Actual GGUF template renders and
+special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The standard b11819 tag `exaone4` loses the source NFKC/individual-digit pipeline. This real gate uses the metadata-only converter override `modern-nfkc-converter.py`, writing `gpt2-nfkc-digits` directly to avoid a duplicate full GGUF. The tiny direct override is byte-identical to the independently corrected unmodified export; all21 tensor payloads are unchanged. The unmodified real export was not separately gated and is not claimed to pass.
+For transformers 5 API compatibility, the private converter keeps the original AutoTokenizer factory but explicitly trusts the pinned official LGAI-EXAONE configuration. b11819 otherwise falls back to a generic configuration that cannot initialize legacy rope_scaling before max_position_embeddings exists. No source configuration, forward function or tensor conversion code is patched.
+The model has 80 channels per head. The existing Transformer loader selects F16 KV when a requested block-quantized KV row is not a multiple of 32. Q8_0, Q4_0 and Q4_1 requests each reproduce the F16 gate metrics and 512 source IDs; this is F16 fallback coverage, not native 80-channel quantized-KV support.
 GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
 allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
 registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
@@ -408,6 +415,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | unsloth/gemma-1.1-2b-it (F16, b11819 conversion of revision `619e546`) | registry's `gemma`, exact | 513 / 786 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00000, top-1 100.00% | accepted |
 | ibm-granite/granite-3.3-2b-instruct (F16, b11819 conversion of revision `707f574`) | registry's `granite`, exact | 625 / 971 / 247, identical | 511 positions, mean KL 0.00000, maximum 0.00004, top-1 100.00% | accepted |
 | mistralai/Ministral-3-3B-Instruct-2512-BF16 (F16, b11819 with author-template metadata correction, revision `b6d637b`) | registry's `mistral3`, exact | 517 / 879 / 235, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted corrected template; original community template differs |
+| LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct (F16, b11819 with NFKC metadata correction, revision `ccce25b`) | registry's `exaone`, exact | 615 / 917 / 243, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted corrected file; original tag incompatible |
 
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean

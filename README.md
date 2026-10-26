@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3`, `exaone` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -195,7 +195,7 @@ EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after corr
 `tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
 and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
 its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
-its existing plain ByteLevel rule. The full EXAONE 3.5 checkpoint gate remains pending.
+its existing plain ByteLevel rule. The full corrected-file result is recorded below.
 The explicit original slow-tokenizer path is unchanged.
 `python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
 
@@ -243,6 +243,12 @@ Its own template matches all 14 reference cases (14 rendered, 0 correctly refuse
 This corrected-file gate preserves the official authored template: b11819 otherwise selects a Devstral community fallback. The metadata-only correction leaves all 236 tensor descriptors and the entire tensor data section unchanged. Future conversion uses the native tekken vocabulary reader and the generic author-file precedence shim.
 The tokenizer exposes no Jinja template attribute; its shipped `chat_template.jinja` is rendered explicitly through transformers, matching the actual GGUF rendered bytes. Comments/code whitespace may differ; the Jinja AST is equivalent. This does not assert equivalence to its separate native chat formatter.
 The official author-template fixture is separate from the older converter-selected community-template fixture.
+The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (615/917/243), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The b11819 tokenizer metadata needs the source-pipeline correction `gpt2-nfkc-digits`; this is a corrected-file gate, not a plug-and-play unmodified export. The metadata-only converter shim retains all tensor conversion code.
+Under transformers 5, the validation converter explicitly permits the pinned official configuration class during tokenizer loading; the generic configuration fallback cannot initialize its legacy RoPE fields. The source configuration and tensor conversion code are unchanged.
+Its 80-channel heads use the existing F16 KV fallback for Q8_0, Q4_0 and Q4_1 requests; all three produce the same full conformance result as the F16 request.
 GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
 in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
 
