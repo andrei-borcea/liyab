@@ -876,6 +876,106 @@ TEST_CASE("AltUp and shared KV agree across prefill, decode, rollback, tree draf
     }
 }
 
+
+TEST_CASE("Mapped per-layer embeddings match independent decoded tables in every reader and KV format") {
+    std::vector<test::QuantVector> formats;
+    REQUIRE(test::load_quant_vectors(formats, "ssm_quant_vectors.bin"));
+    for (const auto type : {DType::F32, DType::F16}) {
+        test::QuantVector f;
+        f.type = type;
+        f.n = 256;
+        f.expected.resize(256);
+        // Exactly representable in both formats; no reference decoder needed.
+        for (size_t i = 0; i < f.expected.size(); ++i) f.expected[i] = (static_cast<int>(i % 31) - 15) / 128.0f;
+        f.blocks.resize(dtype_row_bytes(type, f.n));
+        quant::quantize_row(type, f.expected.data(), f.blocks.data(), f.n);
+        formats.push_back(std::move(f));
+    }
+    REQUIRE(formats.size() == 26);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const auto stem = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ple_reader";
+    const std::string encoded = stem + ".gguf", decoded = stem + "_f32.gguf", zero = stem + "_zero.gguf";
+    struct Cleanup {
+        std::vector<std::string> paths;
+        ~Cleanup() { for (const auto& path : paths) std::remove(path.c_str()); }
+    } cleanup{{encoded, decoded, zero}};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    double maximum_error = 0.0, minimum_ablation = INFINITY;
+    size_t checked = 0;
+    for (const auto& f : formats) {
+        REQUIRE(!f.blocks.empty() && !f.expected.empty());
+        test::TinyModelSpec s;
+        s.arch = "gemma4";
+        s.n_layers = 4;
+        s.ple_dim = 64;  // 256 table columns: valid for every reader's block size
+        s.qk_norm = s.post_norms = true;
+        s.swa_layers = {true, false, true, false};
+        s.sliding_window = 8;
+        s.shared_kv_layers = 2;
+        s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
+        const size_t table_values = static_cast<size_t>(s.n_layers * s.ple_dim) * test::tiny_vocab().size();
+        s.ple_values.resize(table_values);
+        for (size_t i = 0; i < table_values; ++i) s.ple_values[i] = f.expected[i % f.expected.size()];
+        s.ple_type = f.type;
+        s.ple_block_pattern = f.blocks;
+        test::write_tiny_model(encoded, s);
+        {
+            auto file = MmapLoader::open(encoded);
+            REQUIRE(file);
+            const auto* table = (*file)->tensor("per_layer_token_embd.weight");
+            REQUIRE(table && table->type == f.type && table->cols() == 256);
+            REQUIRE(std::any_of(table->data, table->data + table->nbytes, [](uint8_t x) { return x != 0; }));
+        }
+        s.ple_type = DType::F32;
+        s.ple_block_pattern.clear();
+        test::write_tiny_model(decoded, s);  // independently decoded fixture values, same complete graph
+        std::fill(s.ple_values.begin(), s.ple_values.end(), 0.0f);
+        test::write_tiny_model(zero, s);
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            auto load = [&](const std::string& path) {
+                TransformerOptions options;
+                options.context_length = 64;
+                options.keep_windowed_rows = true;
+                options.kv_type = kv;
+                return Transformer::load(std::move(MmapLoader::open(path)).value(), options);
+            };
+            auto quantized = load(encoded), reference = load(decoded), ablated = load(zero);
+            REQUIRE(quantized && reference && ablated);
+            auto q = (*quantized)->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(q);
+            const std::vector<float> expected(q->begin(), q->end());
+            auto r = (*reference)->forward(tokens, Transformer::Logits::All, route, pool);
+            auto z = (*ablated)->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(r && z);
+            REQUIRE(r->size() == expected.size() && z->size() == expected.size());
+            double error = 0.0, contribution = 0.0;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                REQUIRE(std::isfinite(expected[i]) && std::isfinite((*r)[i]) && std::isfinite((*z)[i]));
+                error = std::max(error, std::fabs(double{expected[i]} - (*r)[i]));
+                contribution = std::max(contribution, std::fabs(double{expected[i]} - (*z)[i]));
+            }
+            std::printf("  PLE %s KV %d: independent error %.9g, table ablation %.9g\n",
+                        std::string(dtype_traits(f.type).name).c_str(), static_cast<int>(kv), error, contribution);
+            CHECK(error < 2e-4);
+            CHECK(contribution > 1e-6);
+            maximum_error = std::max(maximum_error, error);
+            minimum_ablation = std::min(minimum_ablation, contribution);
+            // Re-reading mapped token rows after rollback must keep exactly the same logits.
+            REQUIRE((*quantized)->truncate(4).is_ok());
+            auto replay = (*quantized)->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+            REQUIRE(replay);
+            const size_t offset = 4 * static_cast<size_t>((*quantized)->config().n_vocab);
+            CHECK(std::equal(replay->begin(), replay->end(), expected.begin() + offset));
+            ++checked;
+        }
+    }
+    CHECK(checked == 104);
+    std::printf("  %zu mapped PLE format/KV cases; maximum independent error %.9g, minimum table ablation %.9g\n",
+                checked, maximum_error, minimum_ablation);
+}
+
 TEST_MAIN()
 
 TEST_CASE("KDA chunked prefill keeps its bits when value rows are split across workers") {

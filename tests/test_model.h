@@ -5,6 +5,7 @@
 #define LIYAB_TESTS_TEST_MODEL_H
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -191,7 +192,12 @@ struct TinyModelSpec {
     bool mamba_bias = false;
     bool mamba_topology = false;
     bool mamba_parallel = false;  // invalid variant: attention and SSM in one block, for rejection tests
-    // Explicit encoded blocks for SSM projections only. Empty keeps the
+    // Recurrent fixture geometry: defaults preserve every original random stream.
+    // Wider heads make every projection row valid for 256-value reader formats.
+    int32_t ssm_head_dim = 16;
+    int32_t ssm_key_heads = 2;
+    int32_t ssm_value_heads = 4;
+    // Explicit encoded blocks for recurrent projections only. Empty keeps the
     // original random encoder path and every existing golden unchanged.
     std::vector<uint8_t> ssm_block_pattern;
 
@@ -255,6 +261,11 @@ struct TinyModelSpec {
     int32_t altup_streams = 0;     // > 1: AltUp (altup.*, altup_proj, altup_unembd_proj, per-block router and coefficients)
     bool altup_correct_scale = true;  // AltUp: altup_correct_scale per block
     int32_t laurel_rank = 0;       // > 0: Laurel (laurel_l, laurel_r, laurel_post_norm) in every block
+    // Optional mapped-table-only overrides, independent of all matrix and
+    // token-embedding formats. Empty payloads retain ordinary random weights.
+    std::optional<DType> ple_type;
+    std::vector<uint8_t> ple_block_pattern;
+    std::vector<float> ple_values;
     int32_t ple_dim = 0;           // > 0: per-layer embeddings of this width per block
     // > 0: attention.shared_kv_layers; those last blocks get no attn_k, attn_v or attn_k_norm.
     int32_t shared_kv_layers = 0;

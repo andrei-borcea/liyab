@@ -36,11 +36,11 @@ class ProjectionProbe final : public Backend {
 public:
     explicit ProjectionProbe(Backend& cpu) : cpu_(cpu) {}
     BackendKind kind() const noexcept override { return BackendKind::Cpu; }
-    std::string description() const override { return "SSM projection probe"; }
+    std::string description() const override { return "Recurrent projection probe"; }
     bool supports(DType type) const noexcept override { return cpu_.supports(type); }
     Status matmul(const TensorView& w, const float* x, float* y, int32_t n) override {
         LIYAB_RETURN_IF_ERROR(cpu_.matmul(w, x, y, n));
-        if (w.name.starts_with("blk.0.ssm_")) {
+        if (w.name.starts_with("blk.0.")) {
             const auto values = std::span(y, static_cast<size_t>(n * w.rows()));
             outputs[std::string(w.name)] += energy(values);
             if (w.name == ablate) std::fill(values.begin(), values.end(), 0.0f);
@@ -167,7 +167,7 @@ TEST_CASE("Mamba random writable projections retain prefill, decode and rollback
     }
 }
 
-TEST_CASE("Nonzero encoded SSM projections and states contribute across every format and KV type") {
+TEST_CASE("Nonzero encoded recurrent projections and states contribute across every format and KV type") {
     std::vector<test::QuantVector> vectors;
     REQUIRE(test::load_quant_vectors(vectors, "ssm_quant_vectors.bin"));
     REQUIRE(vectors.size() == 24);
@@ -190,7 +190,7 @@ TEST_CASE("Nonzero encoded SSM projections and states contribute across every fo
     double minimum_scan_energy = std::numeric_limits<double>::infinity();
     double maximum_logit_error = 0, maximum_state_error = 0;
     size_t checked = 0;
-    for (const char* arch : {"mamba", "mamba2"}) {
+    for (const char* arch : {"mamba", "mamba2", "lfm2", "kimi-linear", "qwen3next"}) {
         for (const auto& qv : vectors) {
             std::printf("  nonzero %s %s\n", arch, std::string(dtype_traits(qv.type).name).c_str());
             test::TinyModelSpec s;
@@ -199,12 +199,23 @@ TEST_CASE("Nonzero encoded SSM projections and states contribute across every fo
             s.n_layers = 1;
             s.attn_type = qv.type;
             s.ssm_block_pattern = qv.blocks;
+            if (s.arch == "lfm2") s.short_conv_interval = 2;
+            if (s.arch == "kimi-linear") s.kda_interval = 2;
+            if (s.arch == "qwen3next") {
+                s.delta_net_interval = 2;
+                s.fused_ssm_ba = true;
+            }
+            s.ssm_head_dim = s.kda_head_dim = 256;
+            s.ssm_key_heads = s.ssm_value_heads = 1;
             // A float output head keeps projection roundoff separate from
             // discontinuous activation rounding when comparing full graphs.
             s.embd_type = s.output_type = DType::F32;
             const std::vector<std::string> roles = s.arch == "mamba"
                 ? std::vector<std::string>{"ssm_in", "ssm_x", "ssm_dt", "ssm_out"}
-                : std::vector<std::string>{"ssm_in", "ssm_out"};
+                : s.arch == "mamba2" ? std::vector<std::string>{"ssm_in", "ssm_out"}
+                : s.arch == "lfm2" ? std::vector<std::string>{"shortconv.in_proj", "shortconv.out_proj"}
+                : s.arch == "kimi-linear" ? std::vector<std::string>{"attn_q", "attn_k", "attn_v", "ssm_f_a", "ssm_g_a", "attn_output"}
+                : std::vector<std::string>{"attn_qkv", "attn_gate", "ssm_out"};
             test::write_tiny_model(path, s);
             auto file = MmapLoader::open(path);
             REQUIRE(file);
@@ -248,10 +259,10 @@ TEST_CASE("Nonzero encoded SSM projections and states contribute across every fo
                 REQUIRE(energy(expected) > 0);
                 const auto state = state_image(**batched);
                 const auto parts = (*batched)->recurrent_parts();
-                REQUIRE(parts.size() == 2);
+                REQUIRE(parts.size() == (s.arch == "lfm2" ? 1 : 2));
                 REQUIRE(energy(parts[0]) > 0);
-                REQUIRE(energy(parts[1]) > 0);
-                minimum_scan_energy = std::min(minimum_scan_energy, energy(parts[1]));
+                REQUIRE(energy(parts.back()) > 0);
+                minimum_scan_energy = std::min(minimum_scan_energy, energy(parts.back()));
                 for (const auto& role : roles) REQUIRE(probe.outputs["blk.0." + role + ".weight"] > 0);
                 const size_t vocab = static_cast<size_t>((*batched)->config().n_vocab);
                 for (size_t t = 0; t < ids.size(); ++t) {
@@ -289,14 +300,14 @@ TEST_CASE("Nonzero encoded SSM projections and states contribute across every fo
                     minimum_projection_delta = std::min(minimum_projection_delta, difference);
                     CHECK(difference > 1e-6);
                 }
-                // Preserve convolution history but remove the scan state:
-                // it too must contribute to the following token's logits.
+                // Remove the carried scan state, or the sole convolution history
+                // of ShortConv: it must contribute to the following token.
                 auto forget = load();
                 REQUIRE(forget);
                 REQUIRE((*forget)->forward(std::span(ids).first(ids.size() - 1), Transformer::Logits::Last, route, pool));
                 auto scan = (*forget)->recurrent_parts();
-                REQUIRE(scan.size() == 2 && energy(scan[1]) > 0);
-                std::fill(scan[1].begin(), scan[1].end(), 0.0f);
+                REQUIRE(!scan.empty() && energy(scan.back()) > 0);
+                std::fill(scan.back().begin(), scan.back().end(), 0.0f);
                 auto last = (*forget)->forward(std::span(ids).last(1), Transformer::Logits::Last, route, pool);
                 REQUIRE(last);
                 const double difference = max_difference(*last, std::span(expected).last(vocab));
@@ -306,7 +317,7 @@ TEST_CASE("Nonzero encoded SSM projections and states contribute across every fo
             }
         }
     }
-    CHECK(checked == 208);
+    CHECK(checked == 520);
     std::printf("  %zu nonzero mixer/format/KV cases; minimum projection ablation %.9g, carried-state ablation %.9g, "
                 "scan energy %.9g; maximum logit error %.9g, state error %.9g\n", checked,
                 minimum_projection_delta, minimum_carried_delta, minimum_scan_energy,

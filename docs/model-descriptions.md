@@ -1443,3 +1443,7 @@ and fourteen chat-template cases render exactly. A diagnostic GGUF copy adding s
 tool's scratch-only latent-epsilon row gives mean/max KL 0.00000 and top-1 100%. It uses the same unmodified
 native F32 reference. This isolates the missing export facts; it is not a standard converter gate, and no
 name-based engine exception or global change to existing DeepSeek normalization is made.
+
+The merged recurrent-format test reuses `ssm_quant_vectors.bin` for all five mixer layouts (26 formats × five mixers × four KV types). Test-only head geometry aligns projection rows to the formats' 256-value blocks; all ordinary fixture defaults and random streams are preserved. Nonzero projection and carried-state ablations prevent zero weights or unused bindings from counting as coverage.
+
+Mapped PLE validation varies only the token table's dtype. Independent `gguf-py` fixture values form an F32 table in a second otherwise identical graph, and a zero-table control verifies that the table contributes. All four KV types and rollback are covered; no new format encoder is introduced.

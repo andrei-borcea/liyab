@@ -477,7 +477,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".hyper_connection.sinkhorn_iterations", 20);
         w.add_f32(a + ".hyper_connection.epsilon", 1e-6f);
     }
-    const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
+    const int64_t ssm_hd = s.ssm_head_dim, ssm_hk = s.ssm_key_heads, ssm_hv = s.ssm_value_heads, ssm_kernel = 4;
     if (mamba > 0) {
         w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(s.mamba_kernel));
         w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(2 * s.n_embd));
@@ -749,8 +749,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         } else if (s.mamba_topology && l % 3 == 2) {
             // No mixer tensors: the block below is an FFN alone.
         } else if (s.short_conv_interval > 0 && (l + 1) % s.short_conv_interval != 0) {
-            w.add_tensor(p + "shortconv.in_proj.weight", {d, 3 * d}, s.attn_type, random(3 * d * d, s.weight_scale));
-            w.add_tensor(p + "shortconv.out_proj.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            w.add_tensor(p + "shortconv.in_proj.weight", {d, 3 * d}, s.attn_type, random(3 * d * d, s.weight_scale), s.ssm_block_pattern);
+            w.add_tensor(p + "shortconv.out_proj.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale), s.ssm_block_pattern);
             w.add_tensor(p + "shortconv.conv.weight", {s.shortconv_taps, d}, DType::F32,
                          random(s.shortconv_taps * d, 0.3f));
             if (s.shortconv_bias) {
@@ -761,13 +761,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         } else if (s.kda_interval > 0 && (l + 1) % s.kda_interval != 0) {
             const int64_t channels = ssm_hv * s.kda_head_dim;
             for (const char* part : {"q", "k", "v"}) {
-                w.add_tensor(p + "attn_" + part + ".weight", {d, channels}, s.attn_type, random(d * channels, s.weight_scale));
+                w.add_tensor(p + "attn_" + part + ".weight", {d, channels}, s.attn_type, random(d * channels, s.weight_scale), s.ssm_block_pattern);
                 w.add_tensor(p + "ssm_conv1d_" + part + ".weight", {ssm_kernel, channels}, DType::F32,
                              random(ssm_kernel * channels, 0.3f));
             }
             w.add_tensor(p + "ssm_beta.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
             for (const char* part : {"f", "g"}) {
-                w.add_tensor(p + "ssm_" + part + "_a.weight", {d, s.kda_head_dim}, s.attn_type, random(d * s.kda_head_dim, s.weight_scale));
+                w.add_tensor(p + "ssm_" + part + "_a.weight", {d, s.kda_head_dim}, s.attn_type, random(d * s.kda_head_dim, s.weight_scale), s.ssm_block_pattern);
                 w.add_tensor(p + "ssm_" + part + "_b.weight", {s.kda_head_dim, channels}, DType::F32, random(s.kda_head_dim * channels, s.weight_scale));
             }
             auto a_neg = random(ssm_hv, 0.5f);
@@ -775,19 +775,19 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ssm_a", {ssm_hv}, DType::F32, a_neg);
             w.add_tensor(p + "ssm_dt.bias", {channels}, DType::F32, random(channels, 0.5f));
             w.add_tensor(p + "ssm_norm.weight", {s.kda_head_dim}, DType::F32, norm_weights(s.kda_head_dim));
-            w.add_tensor(p + "attn_output.weight", {channels, d}, s.attn_type, random(channels * d, s.weight_scale));
+            w.add_tensor(p + "attn_output.weight", {channels, d}, s.attn_type, random(channels * d, s.weight_scale), s.ssm_block_pattern);
         } else if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
-            w.add_tensor(p + "attn_qkv.weight", {d, conv_dim}, s.attn_type, random(d * conv_dim, s.weight_scale));
-            w.add_tensor(p + "attn_gate.weight", {d, value_dim}, s.attn_type, random(d * value_dim, s.weight_scale));
+            w.add_tensor(p + "attn_qkv.weight", {d, conv_dim}, s.attn_type, random(d * conv_dim, s.weight_scale), s.ssm_block_pattern);
+            w.add_tensor(p + "attn_gate.weight", {d, value_dim}, s.attn_type, random(d * value_dim, s.weight_scale), s.ssm_block_pattern);
             if (s.fused_ssm_ba) {
                 w.add_tensor(p + "ssm_ba.weight", {d, 2 * ssm_hv}, DType::F32, random(d * 2 * ssm_hv, s.weight_scale));
             } else {
             w.add_tensor(p + "ssm_alpha.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
             w.add_tensor(p + "ssm_beta.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
             }
-            w.add_tensor(p + "ssm_out.weight", {value_dim, d}, s.attn_type, random(value_dim * d, s.weight_scale));
+            w.add_tensor(p + "ssm_out.weight", {value_dim, d}, s.attn_type, random(value_dim * d, s.weight_scale), s.ssm_block_pattern);
             w.add_tensor(p + "ssm_conv1d.weight", {ssm_kernel, conv_dim}, DType::F32,
                          random(ssm_kernel * conv_dim, 0.3f));
             std::vector<float> a_neg = random(ssm_hv, 0.5f);
@@ -1080,7 +1080,13 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     if (s.ple_dim > 0) {
         const int64_t width = int64_t{s.n_layers} * s.ple_dim;
-        w.add_tensor("per_layer_token_embd.weight", {width, n_vocab}, s.embd_type, gemma_extra(width * n_vocab, 0.5f));
+        auto table = gemma_extra(width * n_vocab, 0.5f);  // preserve the independent random stream
+        if (!s.ple_values.empty()) {
+            if (s.ple_values.size() != table.size()) std::abort();
+            table = s.ple_values;
+        }
+        w.add_tensor("per_layer_token_embd.weight", {width, n_vocab}, s.ple_type.value_or(s.embd_type), table,
+                     s.ple_block_pattern);
         w.add_tensor("per_layer_model_proj.weight", {d, width}, s.attn_type, gemma_extra(d * width, s.weight_scale));
         w.add_tensor("per_layer_proj_norm.weight", {s.ple_dim}, DType::F32, gemma_extra(s.ple_dim, 0.05f, 1.0f));
     }

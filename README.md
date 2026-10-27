@@ -3403,3 +3403,7 @@ Quiet main/branch measurements of Qwen3-0.6B, Llama-3.2-1B and Qwen3.5-0.8B pass
 CPU and the Metal route; 33 paired CLI replies retain identical bytes. Metal's BF16 matrices fall back to the
 CPU in both revisions, so separate F16 files establish actual GPU projection timings. The protocols, warmed
 balanced followups and before/after numbers are recorded in [model descriptions](docs/model-descriptions.md#host-throughput-and-validation).
+
+Recurrent reader-format validation uses independent nonzero encoded blocks for Mamba, Mamba-2, ShortConv, KDA and Qwen3-Next projection bindings across all 26 weight formats and all four KV types. It checks decoded rows, projection and carried-state ablations, decode/prefill agreement and rollback, without changing pinned golden hashes.
+
+Mapped per-layer embedding tables are also checked in all 26 reader formats and four KV types against independent decoded F32 tables in otherwise identical complete models. A zero-table control verifies their contribution; rollback must reproduce identical logits.
