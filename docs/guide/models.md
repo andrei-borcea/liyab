@@ -32,7 +32,8 @@ and top-1 ≥ 97%, plus source-tokenizer and template checks. Smoke replies and 
 | Gemma text/pooling: `gemma3n`, `gemma-embedding` | Gemma 3n E2B trained BF16 and tiny gates; EmbeddingGemma-300M checked on 39 inputs against independent pooling/sentence-transformers references |
 | `gemma4` | Stage-1 uniform fixtures plus heterogeneous text and parallel MoE checkpoints pass; see [liyab-compat](../liyab-compat.md). Trained quality and multimodal inputs remain unverified |
 | Sparse/grouped: `deepseek2` (V2/V3), `glm-dsa` (GLM-5/5.1/5.2), `deepseek32`, `bailingmoe2` | Canonical tiny gates, including genuinely sparse selections. V2-Lite has real streaming evidence; GLM-4.7-Flash has smoke evidence but fails the standard numerical gate |
-| `chatglm`, `deepseek4`, other proposed architectures | Partial/component coverage or failed conformance; registry entries and diagnostic successes do not establish model support |
+| `deepseek4` | Full text composition passes a generated upstream checkpoint: hash/top-k MoE, clipped SwiGLU, sinks, CSA/HCA and mHC; [scope and limits](../liyab-compat.md). Production exports and trained quality remain unverified |
+| `chatglm`, other proposed architectures | Partial/component coverage or failed conformance; registry entries and diagnostic successes do not establish model support |
 
 InternLM 3 exports as `llama`; Nemotron-NAS as `deci`. MiniCPM3 and architectures absent from this table are not
 implicitly covered by a related name. The detailed family tables, pinned revisions, failed controls and converter

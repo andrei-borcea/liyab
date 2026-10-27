@@ -1366,8 +1366,9 @@ The `deepseek4` component row records shared K=V, unweighted query-head RMSNorm,
 RoPE and inverse output RoPE. `attention.q_lora_rank`, `output_group_count`, `output_lora_rank`,
 `compress_rope_freq_base` and per-block `compress_ratios` describe geometry. Compressor tensor widths select
 one series or two overlapping series; overlapping blocks require their own compressed-key indexer. No tensor
-or metadata rule depends on a model's name. Learned sinks and the full V4 MoE variant are refused precisely
-until their separately owned operations are integrated; this row is not a full V4 support claim.
+or metadata rule depends on a model's name. Subsequent [liyab-compat integration](liyab-compat.md) adds learned
+sinks, hash routing, sqrt-softplus scores and pre-activation SwiGLU clipping. The full text composition now
+passes a generated upstream checkpoint; this does not establish trained quality or production-export fidelity.
 
 Compression keeps channelwise stable-softmax maxima, denominators and weighted sums, not historical source
 projections. Nonoverlapping state uses `3 * head_dim` floats; overlapping state uses `9 * head_dim` plus

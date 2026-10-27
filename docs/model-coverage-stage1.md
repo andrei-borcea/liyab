@@ -95,8 +95,9 @@ Llama 4, Cohere2/Command-A/R7B, Jamba, Falcon-H1, Granite hybrids/MoE, Nemotron-
 Grok and encoder models each need independent composition/operation coverage. Existing Mamba or LayerNorm parts
 alone do not establish those architectures. Subsequent [liyab-compat work](liyab-compat.md) adds Gemma 4
 heterogeneous head widths and parallel MoE norms/scales, with small upstream text conformance gates.
-A trained Gemma 4 gate remains pending. Full DeepSeek-V4 lacks hash/tid2eid routing,
-sqrt-softplus/clipped SwiGLU and shared-attention sink integration despite passing compression/mHC components.
+A trained Gemma 4 gate remains pending. The same compatibility-layer work integrates DeepSeek-V4 hash/tid2eid,
+sqrt-softplus, pre-activation clipping and shared-attention sinks, with a full synthetic text gate.
+Trained DeepSeek-V4 quality and production tokenizer/export checks remain pending.
 Sarvam has an unresolved converter/source BOS mismatch. MiniCPM3 and other unmeasured variants remain deferred.
 
 The remaining integration work is more specific than reimplementing those primitives:
@@ -114,7 +115,7 @@ The remaining integration work is more specific than reimplementing those primit
 | Granite 4 / Nemotron-H and H-MoE | Full hybrid/expert composition gates; scalars, ReLU-squared FFNs, per-block head counts, grouped scan norms and group routing are available |
 | PLaMo2 | Distinct headwise B/C, dt/B/C normalization/projection and recurrent-state layout |
 | Gemma 4 | Heterogeneous text and parallel MoE now pass synthetic upstream gates in liyab-compat; trained-model quality and multimodal inputs remain unverified |
-| DeepSeek-V4 | Hash/tid2eid routing, sqrt-softplus/clipped SwiGLU, shared-attention sinks, native source/export and full-model gate |
+| DeepSeek-V4 | Synthetic full-text gate passes after liyab-compat integration; trained quality, production tokenizer/export and multimodal/MTP paths remain unverified |
 | Kimi K2 | Tokenizer/tool-order primitives are integrated; complete cross-branch numerical/tokenizer/template gate remains pending |
 | GLM-4.7-Flash / Sarvam | Source/export gating and latent-epsilon distinction / BOS-ID conflict; corrected diagnostics do not establish standard-export support |
 

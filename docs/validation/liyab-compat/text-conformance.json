@@ -1,0 +1,584 @@
+{
+  "date": "2026-10-27",
+  "scope": "Generated upstream text decoders; no trained weights, production tokenizer or phone gate",
+  "environment": {
+    "transformers": "5.19.0",
+    "torch": "2.14.1",
+    "gguf_writer": "0.19.0",
+    "native": "Apple M4 Pro, Release, experimental"
+  },
+  "downloads": 0,
+  "thresholds": {
+    "max_mean_kl": 0.0001,
+    "min_top1_percent": 99
+  },
+  "cases": [
+    {
+      "name": "gemma4-canonical",
+      "config": {
+        "architectures": [
+          "Gemma4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attention_k_eq_v": true,
+        "bos_token_id": 2,
+        "dtype": "float32",
+        "enable_moe_block": false,
+        "eos_token_id": 1,
+        "final_logit_softcapping": null,
+        "head_dim": 256,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 64,
+        "hidden_size_per_layer_input": 16,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+          "sliding_attention",
+          "full_attention",
+          "sliding_attention",
+          "full_attention"
+        ],
+        "max_position_embeddings": 512,
+        "model_type": "gemma4_text",
+        "moe_intermediate_size": null,
+        "num_attention_heads": 2,
+        "num_experts": null,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 1,
+        "num_kv_shared_layers": 2,
+        "pad_token_id": 0,
+        "per_layer_config": {
+          "1": {
+            "head_dim": 512
+          },
+          "3": {
+            "head_dim": 512
+          }
+        },
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "full_attention": {
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+            "rope_type": "proportional"
+          },
+          "sliding_attention": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "sliding_window": 8,
+        "tie_word_embeddings": true,
+        "top_k_experts": null,
+        "transformers_version": "5.19.0",
+        "use_bidirectional_attention": null,
+        "use_cache": true,
+        "use_double_wide_mlp": true,
+        "vocab_size": 332,
+        "vocab_size_per_layer_input": 332
+      },
+      "batch": 64,
+      "expert_cache_mib": 0,
+      "kv": "F16",
+      "weights": "F32",
+      "input_tokens": 512,
+      "positions": 511,
+      "result": "511 positions | KL mean 0.00001, median 0.00000, p99 0.00015, max 0.00047 | top-1 agreement 99.80% | perplexity 583.432 -> 583.395",
+      "passed": true,
+      "gguf_bytes": 2672384,
+      "weights_sha256": "cd179e981e1dcd95b4634202ca47e09977e9a3324900beebd076dffbad9f7cc6",
+      "gguf_sha256": "9b6c63a98e8728920183d23cb622aca309b32ed395f52e42b45213521b8eff79",
+      "audit": {
+        "seed": 1234,
+        "routed_experts": {}
+      },
+      "backend": "CPU"
+    },
+    {
+      "name": "gemma4-moe-canonical",
+      "config": {
+        "architectures": [
+          "Gemma4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attention_k_eq_v": true,
+        "bos_token_id": 2,
+        "dtype": "float32",
+        "enable_moe_block": true,
+        "eos_token_id": 1,
+        "final_logit_softcapping": null,
+        "head_dim": 256,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 64,
+        "hidden_size_per_layer_input": 16,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+          "sliding_attention",
+          "full_attention",
+          "sliding_attention",
+          "full_attention"
+        ],
+        "max_position_embeddings": 512,
+        "model_type": "gemma4_text",
+        "moe_intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_experts": 4,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 1,
+        "num_kv_shared_layers": 2,
+        "pad_token_id": 0,
+        "per_layer_config": {
+          "1": {
+            "head_dim": 512
+          },
+          "3": {
+            "head_dim": 512
+          }
+        },
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "full_attention": {
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+            "rope_type": "proportional"
+          },
+          "sliding_attention": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "sliding_window": 8,
+        "tie_word_embeddings": true,
+        "top_k_experts": 2,
+        "transformers_version": "5.19.0",
+        "use_bidirectional_attention": null,
+        "use_cache": true,
+        "use_double_wide_mlp": true,
+        "vocab_size": 332,
+        "vocab_size_per_layer_input": 332
+      },
+      "batch": 1,
+      "expert_cache_mib": 1,
+      "kv": "F16",
+      "weights": "F32",
+      "input_tokens": 512,
+      "positions": 511,
+      "result": "511 positions | KL mean 0.00000, median 0.00000, p99 0.00005, max 0.00107 | top-1 agreement 99.80% | perplexity 567.731 -> 567.765",
+      "passed": true,
+      "gguf_bytes": 3469312,
+      "weights_sha256": "5cd1461065059d07af0a45833f22df6c6c1a1c4c4720e7bcc593982430d3d9a7",
+      "gguf_sha256": "ad083ee0a1037d8cf9f4ddf11a406aa9b671aeffb76718c8fa1aa272cdd56749",
+      "audit": {
+        "seed": 1234,
+        "routed_experts": {
+          "model.layers.0.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.1.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.2.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.3.router": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "backend": "CPU"
+    },
+    {
+      "name": "deepseek4-canonical",
+      "config": {
+        "architectures": [
+          "DeepseekV4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 0,
+        "compress_rates": {
+          "compressed_sparse_attention": 4,
+          "heavily_compressed_attention": 8
+        },
+        "compress_rope_theta": 160000.0,
+        "dtype": "float32",
+        "eos_token_id": 1,
+        "hc_eps": 1e-06,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 6,
+        "head_dim": 512,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 2,
+        "initializer_range": 0.02,
+        "layer_types": [
+          "sliding_attention",
+          "compressed_sparse_attention",
+          "heavily_compressed_attention"
+        ],
+        "max_position_embeddings": 512,
+        "mlp_bias": false,
+        "mlp_layer_types": [
+          "hash_moe",
+          "moe",
+          "moe"
+        ],
+        "model_type": "deepseek_v4",
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "norm_topk_prob": true,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 3,
+        "num_key_value_heads": 1,
+        "num_nextn_predict_layers": 0,
+        "o_groups": 2,
+        "o_lora_rank": 32,
+        "output_router_logits": false,
+        "pad_token_id": null,
+        "partial_rotary_factor": 0.125,
+        "q_lora_rank": 32,
+        "qk_rope_head_dim": 64,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "compress": {
+            "partial_rotary_factor": 0.125,
+            "rope_theta": 160000.0,
+            "rope_type": "default"
+          },
+          "main": {
+            "partial_rotary_factor": 0.125,
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "rope_theta": 10000.0,
+        "routed_scaling_factor": 1.5,
+        "router_aux_loss_coef": 0.001,
+        "router_jitter_noise": 0.0,
+        "scoring_func": "sqrtsoftplus",
+        "sliding_window": 8,
+        "swiglu_limit": 0.3,
+        "tie_word_embeddings": false,
+        "transformers_version": "5.19.0",
+        "use_cache": true,
+        "vocab_size": 332
+      },
+      "batch": 64,
+      "expert_cache_mib": 0,
+      "kv": "F16",
+      "weights": "F32",
+      "input_tokens": 512,
+      "positions": 511,
+      "result": "511 positions | KL mean 0.00004, median 0.00000, p99 0.00021, max 0.01330 | top-1 agreement 99.61% | perplexity 516.595 -> 517.112",
+      "passed": true,
+      "gguf_bytes": 5152320,
+      "weights_sha256": "fb64657b84ea72fff4b2b2c132e8edbeb3d3c67c2298a33b0f712c9b01e39548",
+      "gguf_sha256": "55e9e9cd9e3801680d9a0aedc8681ca138add0d860ff7c079d39ffb48285fd34",
+      "audit": {
+        "seed": 1234,
+        "routed_experts": {
+          "model.layers.0.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.1.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.2.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "hash_differs_from_learned_topk": 100,
+        "gate_clipped": 9802,
+        "up_clipped": 18798,
+        "index_cutoff_ties": 0,
+        "index_min_cutoff_margin": 0.002008676528930664
+      },
+      "backend": "CPU"
+    },
+    {
+      "name": "deepseek4-canonical",
+      "config": {
+        "architectures": [
+          "DeepseekV4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 0,
+        "compress_rates": {
+          "compressed_sparse_attention": 4,
+          "heavily_compressed_attention": 8
+        },
+        "compress_rope_theta": 160000.0,
+        "dtype": "float32",
+        "eos_token_id": 1,
+        "hc_eps": 1e-06,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 6,
+        "head_dim": 512,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 2,
+        "initializer_range": 0.02,
+        "layer_types": [
+          "sliding_attention",
+          "compressed_sparse_attention",
+          "heavily_compressed_attention"
+        ],
+        "max_position_embeddings": 512,
+        "mlp_bias": false,
+        "mlp_layer_types": [
+          "hash_moe",
+          "moe",
+          "moe"
+        ],
+        "model_type": "deepseek_v4",
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "norm_topk_prob": true,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 3,
+        "num_key_value_heads": 1,
+        "num_nextn_predict_layers": 0,
+        "o_groups": 2,
+        "o_lora_rank": 32,
+        "output_router_logits": false,
+        "pad_token_id": null,
+        "partial_rotary_factor": 0.125,
+        "q_lora_rank": 32,
+        "qk_rope_head_dim": 64,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "compress": {
+            "partial_rotary_factor": 0.125,
+            "rope_theta": 160000.0,
+            "rope_type": "default"
+          },
+          "main": {
+            "partial_rotary_factor": 0.125,
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "rope_theta": 10000.0,
+        "routed_scaling_factor": 1.5,
+        "router_aux_loss_coef": 0.001,
+        "router_jitter_noise": 0.0,
+        "scoring_func": "sqrtsoftplus",
+        "sliding_window": 8,
+        "swiglu_limit": 0.3,
+        "tie_word_embeddings": false,
+        "transformers_version": "5.19.0",
+        "use_cache": true,
+        "vocab_size": 332
+      },
+      "batch": 1,
+      "expert_cache_mib": 1,
+      "kv": "F16",
+      "weights": "F32",
+      "input_tokens": 512,
+      "positions": 511,
+      "result": "511 positions | KL mean 0.00004, median 0.00000, p99 0.00021, max 0.01330 | top-1 agreement 99.61% | perplexity 516.595 -> 517.112",
+      "passed": true,
+      "gguf_bytes": 5152320,
+      "weights_sha256": "fb64657b84ea72fff4b2b2c132e8edbeb3d3c67c2298a33b0f712c9b01e39548",
+      "gguf_sha256": "55e9e9cd9e3801680d9a0aedc8681ca138add0d860ff7c079d39ffb48285fd34",
+      "audit": {
+        "seed": 1234,
+        "routed_experts": {
+          "model.layers.0.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.1.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.2.mlp.gate": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "hash_differs_from_learned_topk": 100,
+        "gate_clipped": 9802,
+        "up_clipped": 18798,
+        "index_cutoff_ties": 0,
+        "index_min_cutoff_margin": 0.002008676528930664
+      },
+      "backend": "CPU"
+    }
+  ],
+  "diagnostic_controls": [
+    {
+      "name": "two-index-head CSA diagnostic",
+      "passed": false,
+      "result": [
+        "127 positions | KL mean 0.00283, median 0.00000, p99 0.03463, max 0.08543 | top-1 agreement 92.13% | perplexity 546.698 -> 547.252",
+        "FAIL: mean KL 0.00283 above 0.00010",
+        "FAIL: top-1 agreement 92.13% below 99.00%"
+      ],
+      "tie_audit": {
+        "input_ids": 128,
+        "index_heads": 2,
+        "cutoff_ties": 27,
+        "queries_with_ambiguous_selected_set": 21
+      },
+      "config": {
+        "architectures": [
+          "DeepseekV4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 0,
+        "compress_rates": {
+          "compressed_sparse_attention": 4,
+          "heavily_compressed_attention": 8
+        },
+        "compress_rope_theta": 160000.0,
+        "dtype": "float32",
+        "eos_token_id": 1,
+        "hc_eps": 1e-06,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 6,
+        "head_dim": 32,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "index_head_dim": 32,
+        "index_n_heads": 2,
+        "index_topk": 2,
+        "initializer_range": 0.02,
+        "layer_types": [
+          "sliding_attention",
+          "compressed_sparse_attention"
+        ],
+        "max_position_embeddings": 512,
+        "mlp_bias": false,
+        "mlp_layer_types": [
+          "hash_moe",
+          "moe"
+        ],
+        "model_type": "deepseek_v4",
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "norm_topk_prob": true,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 1,
+        "num_nextn_predict_layers": 0,
+        "o_groups": 2,
+        "o_lora_rank": 32,
+        "output_router_logits": false,
+        "pad_token_id": null,
+        "partial_rotary_factor": 0.5,
+        "q_lora_rank": 32,
+        "qk_rope_head_dim": 16,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "compress": {
+            "partial_rotary_factor": 0.5,
+            "rope_theta": 160000.0,
+            "rope_type": "default"
+          },
+          "main": {
+            "partial_rotary_factor": 0.5,
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "rope_theta": 10000.0,
+        "routed_scaling_factor": 1.5,
+        "router_aux_loss_coef": 0.001,
+        "router_jitter_noise": 0.0,
+        "scoring_func": "sqrtsoftplus",
+        "sliding_window": 8,
+        "swiglu_limit": 0.3,
+        "tie_word_embeddings": false,
+        "transformers_version": "5.19.0",
+        "use_cache": true,
+        "vocab_size": 332
+      }
+    },
+    {
+      "name": "canonical 128-token prefix",
+      "passed": false,
+      "result": [
+        "127 positions | KL mean 0.00013, median 0.00000, p99 0.00044, max 0.01330 | top-1 agreement 98.43% | perplexity 641.961 -> 643.844",
+        "FAIL: mean KL 0.00013 above 0.00010",
+        "FAIL: top-1 agreement 98.43% below 99.00%"
+      ]
+    }
+  ],
+  "verification": {
+    "native_suite": [
+      "100% tests passed out of 16",
+      "Total Test time (real) = 151.66 sec"
+    ],
+    "x86_avx2_engine_golden": [
+      "100% tests passed out of 2",
+      "Total Test time (real) =  37.09 sec"
+    ],
+    "x86_scalar_engine_golden": [
+      "100% tests passed out of 2",
+      "Total Test time (real) =  34.29 sec"
+    ],
+    "android": "library and CLI cross-build; device check waived",
+    "goldens": "existing pins unchanged",
+    "trained_performance": "not measured"
+  },
+  "source_sha256": {
+    "fixture": "b1d2f4a349866850c1f7358002a501e7ebffecac08c56573d8fec4682a047302",
+    "deepseek_fixture": "b44a821f9adb99477a1813dfe7b4102c6461c954d80e8c372a97af599f9ff08d",
+    "reference": "f98db15702dfb06d2070fd5039f89a2f82611ac72a036a86d1b83e3cb1a69586",
+    "gemma4_model": "edc123ab83fbb25548ec65536eaecee998c088653adf683be3ef69d62e2bfea9",
+    "deepseek_v4_model": "56d621e6f45b85e2964c0a297945e1c175536dd899fc17c02c321602a2fcb929",
+    "gemma_converter": "7656867687fb8d747938754310d20e2f15bfc3a84d1d87785968a09bc2ae4125"
+  },
+  "cleanup": {
+    "temporary_test_gguf_files_removed": 610,
+    "temporary_test_gguf_bytes_removed": 1172512520,
+    "generated_fixtures_removed": true,
+    "temporary_reference_environment_and_converter_removed": true,
+    "native_build_retained": true,
+    "scope": "Dead-process temporary test GGUF files and this task's generated fixtures/tooling. Owner downloads untouched.",
+    "free_disk_gib": 88.9
+  }
+}

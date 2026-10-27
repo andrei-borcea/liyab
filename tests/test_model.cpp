@@ -118,6 +118,12 @@ void GgufWriter::add_bool_array(const std::string& key, const std::vector<bool>&
     ++n_kv_;
 }
 
+void GgufWriter::add_i32_tensor(const std::string& name, std::vector<int64_t> ne, const std::vector<int32_t>& values) {
+    Tensor tensor{name, std::move(ne), DType::I32, {}};
+    for (int32_t value : values) put(tensor.data, value);
+    tensors_.push_back(std::move(tensor));
+}
+
 void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DType type,
                             const std::vector<float>& values, std::span<const uint8_t> block_pattern) {
     Tensor t{name, std::move(ne), type, {}};
@@ -440,6 +446,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (s.head_dim > 0 && s.block_heads.empty()) w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.head_dim));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
+        if (s.hash_layers > 0) w.add_u32(a + ".hash_layer_count", static_cast<uint32_t>(s.hash_layers));
+        if (s.sqrtsoftplus_gating) w.add_u32(a + ".expert_gating_func", 4);
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
         w.add_u32(a + ".expert_used_count", static_cast<uint32_t>(s.n_expert_used));
         if (!s.omit_expert_width) w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
@@ -1054,6 +1062,15 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));
         for (float& x : router) x = normal(router_rng) * 0.5f;
         w.add_tensor(p + "ffn_gate_inp.weight", {d, s.n_expert}, DType::F32, router);
+        if (l < s.hash_layers) {
+            std::vector<int32_t> routes(static_cast<size_t>(n_vocab) * static_cast<size_t>(s.n_expert_used));
+            for (int32_t token = 0; token < n_vocab; ++token) {
+                for (int32_t rank = 0; rank < s.n_expert_used; ++rank) {
+                    routes[static_cast<size_t>(token * s.n_expert_used + rank)] = (3 * token + rank) % s.n_expert;
+                }
+            }
+            w.add_i32_tensor(p + "ffn_gate_tid2eid.weight", {s.n_expert_used, n_vocab}, routes);
+        }
         if (s.expert_bias) w.add_tensor(p + (s.bare_expert_bias ? "exp_probs_b" : "exp_probs_b.bias"), {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
         if (s.n_ff_shared > 0) {
             const int64_t sh = s.n_ff_shared;
@@ -1209,6 +1226,23 @@ TinyModelSpec compressed_spec() {
     s.hc_count = 4;
     s.weight_scale = 0.02f;
     s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
+    return s;
+}
+
+TinyModelSpec deepseek4_spec() {
+    TinyModelSpec s = compressed_spec();
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.hash_layers = 1;
+    s.sqrtsoftplus_gating = true;
+    s.attention_sinks = true;
+    s.n_ff_shared = 128;
+    s.expert_bias = true;
+    s.expert_swiglu_clamp = s.shared_swiglu_clamp = 0.3f;
+    s.attn_type = s.output_type = DType::Q8_0;
+    s.ffn_type = DType::Q4_0;
+    s.embd_type = DType::F16;
     return s;
 }
 

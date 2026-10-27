@@ -432,6 +432,15 @@ void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept {
     // group) and the token embeddings: the same values as the scalar decode.
     if (x86::avx2_enabled()) {
         switch (type) {
+        case DType::I32: {
+            const auto* bytes = static_cast<const uint8_t*>(src);
+            for (int64_t i = 0; i < n; ++i) {
+                int32_t value;
+                std::memcpy(&value, bytes + static_cast<size_t>(i) * sizeof(value), sizeof(value));
+                y[i] = static_cast<float>(value);
+            }
+            break;
+        }
             case DType::F16: return x86::fp16_to_fp32_row(static_cast<const uint16_t*>(src), y, n);
             case DType::BF16: return x86::bf16_to_fp32_row(static_cast<const uint16_t*>(src), y, n);
             case DType::Q8_0: return x86::dequantize_q8_0(static_cast<const BlockQ8_0*>(src), y, n);

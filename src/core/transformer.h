@@ -814,6 +814,7 @@ private:
         // the softmax's denominator (attention()).
         std::vector<float> sinks;
         std::vector<float> router_scale, expert_scale;
+        std::vector<int32_t> hash_experts;  // [original token ID][top-k rank], validated by compat
         std::vector<float> expert_norm, dense_post_norm, expert_post_norm;
         std::vector<float> router_bias;   // optional: ffn_gate_inp.bias, added to the router's logits
         // Optional per-expert biases of the experts' projections, [expert][rows]
@@ -1091,6 +1092,7 @@ private:
     std::vector<Segment> segs_;
     std::vector<int32_t> seg_of_;
     std::vector<int32_t> batch_tokens_;
+    std::vector<int32_t> routing_tokens_;  // original IDs in pass order, including batched sequences/tree drafts
     // forward_batch()'s logits pass: per segment with an adapter, its rows
     // among the logits rows ({first, count, adapter}); empty otherwise.
     struct AdapterRows {

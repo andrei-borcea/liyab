@@ -66,6 +66,7 @@ enum class FfnActivation : uint8_t {
     Relu,         // max(x, 0)
     ReluSquared,  // max(x, 0)^2: Nemotron, AFM (ungated)
     SwigluOai,  // clamped gate * sigmoid(1.702 gate) * (clamp(up, -7, 7) + 1)
+    SiLUInputClamp, // SiLU(min(gate, limit)) * clamp(up, -limit, limit), DeepSeek-V4
     XIelu,        // xIELU with per-block scalars (ModelConfig::xielu): Apertus (ungated)
 };
 
@@ -241,7 +242,7 @@ std::string block_tensor(int32_t block, std::string_view suffix);
 std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string_view suffix);
 
 // How a mixture-of-experts router turns logits into expert probabilities.
-enum class MoeGating : uint8_t { Softmax, Sigmoid };
+enum class MoeGating : uint8_t { Softmax, Sigmoid, SqrtSoftplus };
 
 // Token mixer of one block.
 enum class MixerKind : uint8_t {
@@ -286,6 +287,7 @@ struct BlockPlan {
     // Learned ffn_gate_inp.scale: an independent unweighted residual RMS
     // norm, channel scale and hidden_size^-0.5 before the router projection.
     bool router_input_rms = false;
+    bool hash_routing = false;  // expert IDs come from original token IDs, not learned top-k
 
     MixerKind mixer = MixerKind::Attention;
     // Attention: multi-head latent attention (attn_kv_a_mqa present, see
@@ -561,6 +563,7 @@ struct ModelConfig {
     int32_t n_ff_expert = 0;
     int32_t n_ff_shared = 0;     // hidden size of the shared expert (0: from its tensors)
     MoeGating moe_gating = MoeGating::Softmax;
+    bool moe_norm_additive = false;  // divide by sum + 1e-20 instead of flooring sum
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
     float moe_weights_scale = 1.0f;
     // Group-limited expert selection (DeepSeek-V2/V3, Ling 2.0): the experts

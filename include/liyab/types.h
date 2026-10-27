@@ -128,6 +128,7 @@ enum class DType : uint32_t {
     IQ3_S = 21,
     IQ2_S = 22,
     IQ4_XS = 23,
+    I32 = 26,     // signed auxiliary indices; not a numeric weight format
     IQ1_M = 29,
     BF16 = 30,    // bfloat16
     TQ1_0 = 34,   // ternary {-1, 0, 1}, 1.69 bits/weight
@@ -150,7 +151,10 @@ struct DTypeTraits {
     int32_t block_bytes;   // bytes per block
 };
 
-// Returns false for type ids Liyab cannot execute (e.g. K-quants, IQ-quants).
+// Recognizes mapped weight formats and I32 auxiliary indices. Returns false
+// for unknown IDs, leaving out unchanged. Recognition does not imply a
+// backend can multiply that type; I32 routing tables contain indices only.
+// No ownership transfer or shared mutable state; safe for concurrent calls.
 LIYAB_API bool dtype_from_ggml(uint32_t ggml_type, DType& out) noexcept;
 LIYAB_API DTypeTraits dtype_traits(DType type) noexcept;
 LIYAB_API std::string_view ggml_type_name(uint32_t ggml_type) noexcept;

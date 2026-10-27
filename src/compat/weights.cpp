@@ -1,5 +1,6 @@
 #include "compat/weights.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -14,7 +15,7 @@ Status CombinedLatentWeights::bind(const TensorView& source, const LatentAttenti
         return Status(ErrorCode::InvalidModel, "combined latent expansion has inconsistent dimensions");
     }
     DType type;
-    if (!dtype_from_ggml(static_cast<uint32_t>(source.type), type) ||
+    if (!dtype_from_ggml(static_cast<uint32_t>(source.type), type) || type == DType::I32 ||
         m.kv_rank % dtype_traits(type).block_size != 0) {
         return Status(ErrorCode::Unsupported, "combined latent expansion needs ordinary on-disk weight rows");
     }
@@ -52,6 +53,43 @@ Status CombinedLatentWeights::bind(const TensorView& source, const LatentAttenti
     value_.data = values_.data();
     value_.nbytes = values_.size();
     return Status::ok();
+}
+
+uint64_t compatibility_fingerprint(const MmapLoader& file, const ModelConfig& config) noexcept {
+    if (!config.full_header_identity) return 0;
+    size_t header = file.file().size();
+    for (const TensorView& tensor : file.tensors()) {
+        if (tensor.shard == 0) header = std::min(header, static_cast<size_t>(tensor.file_offset));
+    }
+    uint64_t identity = xxhash64(file.file().data(), header, model_fingerprint(file.file()));
+    // Route tables define model behavior despite being stored as tensors.
+    // Equal-sized changes beyond the first MiB must invalidate saved states.
+    for (const TensorView& tensor : file.tensors()) {
+        if (tensor.type == DType::I32) identity = xxhash64(tensor.data, tensor.nbytes, identity);
+    }
+    return identity;
+}
+
+Result<std::vector<int32_t>> adapt_expert_routes(const TensorView& source, int32_t vocab, int32_t top_k, int32_t experts) {
+    if (source.type != DType::I32) return Status(ErrorCode::Unsupported, "hash expert routes require I32 indices");
+    if (vocab <= 0 || top_k <= 0 || experts <= 0 || source.n_dims != 2 ||
+        source.ne != std::array<int64_t, 4>{top_k, vocab, 1, 1}) {
+        return Status(ErrorCode::InvalidModel, "invalid hash expert routing table shape");
+    }
+    if (static_cast<size_t>(vocab) > std::numeric_limits<size_t>::max() / static_cast<size_t>(top_k)) {
+        return Status(ErrorCode::InvalidModel, "hash expert routing table is too large");
+    }
+    const size_t count = static_cast<size_t>(vocab) * static_cast<size_t>(top_k);
+    if (count > std::numeric_limits<size_t>::max() / sizeof(int32_t) || source.data == nullptr ||
+        source.nbytes != count * sizeof(int32_t)) {
+        return Status(ErrorCode::InvalidModel, "invalid hash expert routing table payload");
+    }
+    std::vector<int32_t> routes(count);
+    std::memcpy(routes.data(), source.data, source.nbytes);
+    for (const int32_t expert : routes) {
+        if (expert < 0 || expert >= experts) return Status(ErrorCode::InvalidModel, "hash route selects an out-of-range expert");
+    }
+    return routes;
 }
 
 }  // namespace liyab

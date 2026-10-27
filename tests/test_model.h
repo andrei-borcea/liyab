@@ -32,6 +32,9 @@ public:
     // quantize_row deliberately has no encoder for those weight-only types.
     void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values,
                     std::span<const uint8_t> block_pattern = {});
+    // Auxiliary index tensors keep integer bytes; floating conversion would
+    // lose large IDs and would not test the on-disk I32 loader path.
+    void add_i32_tensor(const std::string& name, std::vector<int64_t> ne, const std::vector<int32_t>& values);
     // Replaces an existing tensor with repeated whole encoded blocks. Returns
     // false for a missing tensor or an empty/incomplete block pattern. Opt-in:
     // the ordinary writer and every existing golden fixture stay unchanged.
@@ -122,6 +125,8 @@ struct TinyModelSpec {
     int32_t n_ff_shared = 0;     // MoE: shared expert of this hidden size (0: none)
     bool shared_gate = false;    // MoE: sigmoid gate of the shared expert (ffn_gate_inp_shexp)
     bool expert_bias = false;    // MoE: selection bias added to the router probabilities (exp_probs_b)
+    bool sqrtsoftplus_gating = false;
+    int32_t hash_layers = 0;  // leading MoE blocks use original-token routing tables
     bool sigmoid_gating = false; // MoE: sigmoid instead of softmax router (expert_gating_func = 2)
     // MoE: expert_weights_norm metadata: 1 true, 0 false, -1 absent (the
     // architecture's default applies).
@@ -330,6 +335,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
 // streams. Dense FFNs and no learned sinks: it does not stand in for a full
 // V4 conformance checkpoint, whose MoE/sink parts are integrated separately.
 TinyModelSpec compressed_spec();
+// Text decoder composition: shared K=V, CSA/HCA, mHC, sinks, routed/shared
+// FFNs, sqrt-softplus, hash routes and nonzero quantized projections.
+TinyModelSpec deepseek4_spec();
 
 // Encoded GGML blocks and independently decoded values from gguf-py. Reads
 // tests/data/quant_vectors.bin (LIYAB_TEST_DATA overrides the directory).

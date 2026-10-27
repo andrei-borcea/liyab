@@ -188,6 +188,7 @@ void relu_activation(const float* x, const float* up, float* out, size_t n, bool
 // An ungated FFN's activation, in place over n values: act(x).
 void ungated_activation(FfnActivation act, const XIeluScalars* scalars, float* x, size_t n) {
     switch (act) {
+        case FfnActivation::SiLUInputClamp:
         case FfnActivation::SiLU:
             for (size_t i = 0; i < n; ++i) x[i] = silu(x[i]);
             return;
@@ -208,6 +209,10 @@ void ungated_activation(FfnActivation act, const XIeluScalars* scalars, float* x
 }
 // The gated FFN's elementwise step: out[i] = act(gate[i]) * up[i] (out may be gate).
 void gated_activation(FfnActivation act, const float* gate, const float* up, float* out, size_t n, float limit = 0.0f) {
+    if (limit > 0.0f && act == FfnActivation::SiLUInputClamp) {
+        for (size_t i = 0; i < n; ++i) out[i] = silu(std::min(gate[i], limit)) * std::clamp(up[i], -limit, limit);
+        return;
+    }
     if (limit > 0.0f) {  // validated SiLU: clamp the activated gate, unlike SwigluOai's input clamp
         for (size_t i = 0; i < n; ++i) out[i] = std::min(silu(gate[i]), limit) * std::clamp(up[i], -limit, limit);
         return;
@@ -243,6 +248,13 @@ void gated_activation(FfnActivation act, const float* gate, const float* up, flo
 }
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }  // ggml's threshold
+
+// Non-softmax router scores; softplus uses the upstream threshold to avoid
+// overflow, and sqrt keeps these positive without a normalization over E.
+float positive_router_score(MoeGating gating, float x) {
+    if (gating == MoeGating::SqrtSoftplus) return std::sqrt(softplus(x));
+    return sigmoid(x);
+}
 
 // x / sqrt(sum(x^2) + eps): the L2 normalization of DeltaNet queries and keys.
 void l2norm(float* x, int32_t n, float eps) {
@@ -703,17 +715,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!described) return described.status();
     model->config_ = std::move(described).value();
     const ModelConfig& c = model->config_;
-    if (c.full_header_identity) {
-        // Geometry, scalars, norm placement and tokenizer flags can be beyond
-        // the first MiB. Equal-sized edits must invalidate states and every
-        // derived calibration/cache key. Hash the complete first header before
-        // binding or relocation; legacy plans retain their previous identity.
-        size_t header = f.file().size();
-        for (const TensorView& tensor : f.tensors()) {
-            if (tensor.shard == 0) header = std::min(header, static_cast<size_t>(tensor.file_offset));
-        }
-        model->variant_fingerprint_ = xxhash64(f.file().data(), header, model_fingerprint(f.file()));
-    }
+    model->variant_fingerprint_ = compatibility_fingerprint(f, c);
     model->expert_mass_ = options.expert_mass;
     model->max_experts_ = options.max_experts;
     model->skip_slow_ = options.skip_slow;
@@ -733,7 +735,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                                                   [](const BlockPlan& b) { return keeps_state(b.mixer); })));
     if (c.n_expert > 0) {
         LIYAB_LOG_INFO("MoE: %d experts, top-%d, expert ff %d, shared ff %d, %s gating%s", c.n_expert, c.n_expert_used,
-                       c.n_ff_expert, c.n_ff_shared, c.moe_gating == MoeGating::Softmax ? "softmax" : "sigmoid",
+                       c.n_ff_expert, c.n_ff_shared, c.moe_gating == MoeGating::Softmax ? "softmax" : c.moe_gating == MoeGating::Sigmoid ? "sigmoid" : "sqrtsoftplus",
                        c.moe_norm_weights ? ", renormalized" : "");
     }
 
@@ -1080,12 +1082,7 @@ Status Transformer::bind_weights() {
                                          int64_t{c.output_groups} * c.output_rank, L.w[kOutputA]));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output_b.weight"), int64_t{c.output_groups} * c.output_rank,
                                          c.n_embd, L.w[kOutputB]));
-            // Sinks and hash/sqrtsoftplus/clipped routing are wave-owned by
-            // the MoE part. Refuse the dependent variant until integrated.
-            if (f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr ||
-                f.tensor(block_tensor(l, "attn_sinks")) != nullptr) {
-                return Status(ErrorCode::Unsupported, "shared K=V attention needs learned attention sinks (MoE integration)");
-            }
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, "attn_sinks"), plan.n_head, false, L.sinks));
             if (plan.compression.stride > 0) {
                 const size_t index_state = plan.indexed
                     ? CompressionPlan{c.index_dim, plan.compression.stride, true}.state_floats() : 0;
@@ -1385,6 +1382,12 @@ Status Transformer::bind_weights() {
         }
         if (plan.ffn == FfnKind::None) continue;
         LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate_inp.weight"), c.n_embd, c.n_expert, L.w[kRouter]));
+        if (plan.hash_routing) {
+            auto routes = adapt_expert_routes(*f.tensor(block_tensor(l, "ffn_gate_tid2eid.weight")),
+                                               c.n_vocab, c.n_expert_used, c.n_expert);
+            if (!routes) return routes.status();
+            L.hash_experts = std::move(routes).value();
+        }
         if (plan.router_input_rms) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_inp.scale"), c.n_embd, true, L.router_scale));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down_exps.scale"), c.n_expert, true, L.expert_scale));
@@ -3778,7 +3781,8 @@ Status Transformer::shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_
             values.resize(count * hd);
             scores.resize(count);
             const float* query = q_.data() + static_cast<size_t>(job) * hd;
-            float maximum = -INFINITY;
+            const float sink = L.sinks.empty() ? -INFINITY : L.sinks[h];
+            float maximum = sink;
             for (size_t j = 0; j < count; ++j) {
                 float* value = values.data() + j * hd;
                 if (j < raw) {
@@ -3792,7 +3796,7 @@ Status Transformer::shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_
                 scores[j] = score;
                 maximum = std::max(maximum, score);
             }
-            float sum = 0.0f;
+            float sum = L.sinks.empty() ? 0.0f : std::exp(sink - maximum);
             for (size_t j = 0; j < count; ++j) {
                 scores[j] = std::exp(scores[j] - maximum);
                 sum += scores[j];
@@ -4654,7 +4658,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
                 for (size_t e = 0; e < E; ++e) sum += group_sel[e] = std::exp(logits[e] - mx);
             }
             for (size_t e = 0; e < E; ++e) {
-                const float p = c.moe_gating == MoeGating::Softmax ? group_sel[e] / sum : sigmoid(logits[e]);
+                const float p = c.moe_gating == MoeGating::Softmax ? group_sel[e] / sum : positive_router_score(c.moe_gating, logits[e]);
                 group_sel[e] = p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[e]);
             }
             select_expert_groups(group_sel.data(), E, c.n_expert_groups, c.n_expert_groups_used, !L.expert_bias.empty(),
@@ -4664,20 +4668,30 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
             if (grouped && group_ok[static_cast<size_t>(e) / per_group] == 0) return -INFINITY;
             if (grouped) return group_sel[static_cast<size_t>(e)];
             const float p = biased_softmax ? probs[static_cast<size_t>(e)] :
-                            c.moe_gating == MoeGating::Softmax ? logits[e] : sigmoid(logits[e]);
+                            c.moe_gating == MoeGating::Softmax ? logits[e] : positive_router_score(c.moe_gating, logits[e]);
             return p + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
         };
         for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
         const auto k = static_cast<std::ptrdiff_t>(c.n_expert_used);
-        std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                          [&](int32_t a, int32_t b) { return score(a) > score(b) || (score(a) == score(b) && a < b); });
+        if (!L.hash_experts.empty()) {
+            if (routing_tokens_.size() != un) return;
+            const int32_t token = routing_tokens_[t];
+            if (token < 0 || token >= c.n_vocab) return;
+            std::copy_n(L.hash_experts.data() + static_cast<size_t>(token) * static_cast<size_t>(k), k, order.begin());
+        } else {
+            std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                              [&](int32_t a, int32_t b) { return score(a) > score(b) || (score(a) == score(b) && a < b); });
+        }
         size_t kept = static_cast<size_t>(k);
         if (cut) {  // guess only the experts the router would keep (unnormalized: ratios suffice)
             float sum = 0.0f;
-            const float top = logits[order[0]];
+            float top = logits[order[0]];
+            if (!L.hash_experts.empty()) {
+                for (std::ptrdiff_t i = 1; i < k; ++i) top = std::max(top, logits[order[static_cast<size_t>(i)]]);
+            }
             for (std::ptrdiff_t i = 0; i < k; ++i) {
                 const auto e = static_cast<size_t>(order[static_cast<size_t>(i)]);
-                sum += probs[e] = c.moe_gating == MoeGating::Softmax ? std::exp(logits[e] - top) : sigmoid(logits[e]);
+                sum += probs[e] = c.moe_gating == MoeGating::Softmax ? std::exp(logits[e] - top) : positive_router_score(c.moe_gating, logits[e]);
             }
             kept = experts_to_run(probs, order, sum);
         }
@@ -4870,7 +4884,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             for (size_t e = 0; e < E; ++e) sum += probs[e] = std::exp(logits[e] - mx);
             for (float& p : probs) p /= sum;
         } else {
-            for (size_t e = 0; e < E; ++e) probs[e] = sigmoid(logits[e]);
+            for (size_t e = 0; e < E; ++e) probs[e] = positive_router_score(c.moe_gating, logits[e]);
         }
         // Group-limited selection: only the best groups' experts compete
         // (select_expert_groups); the others are out of the top-k.
@@ -4883,9 +4897,16 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             if (grouped && group_ok[static_cast<size_t>(e) / per_group] == 0) return -INFINITY;
             return probs[static_cast<size_t>(e)] + (L.expert_bias.empty() ? 0.0f : L.expert_bias[static_cast<size_t>(e)]);
         };
-        for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
-        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(K), order.end(),
-                          [&](int32_t a, int32_t b) { return selection(a) > selection(b) || (selection(a) == selection(b) && a < b); });
+        if (!L.hash_experts.empty()) {
+            if (routing_tokens_.size() != un) return Status(ErrorCode::Internal, "hash routing lost original token IDs");
+            const int32_t token = routing_tokens_[t];
+            if (token < 0 || token >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "hash routing token out of range");
+            std::copy_n(L.hash_experts.data() + static_cast<size_t>(token) * K, K, order.begin());
+        } else {
+            for (size_t e = 0; e < E; ++e) order[e] = static_cast<int32_t>(e);
+            std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(K), order.end(),
+                              [&](int32_t a, int32_t b) { return selection(a) > selection(b) || (selection(a) == selection(b) && a < b); });
+        }
         float sum = 0.0f;
         for (size_t k = 0; k < K; ++k) sum += probs[static_cast<size_t>(order[k])];
         const size_t kept = experts_to_run(probs, order, sum);
@@ -4894,7 +4915,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
             sum = 0.0f;
             for (size_t k = 0; k < kept; ++k) sum += probs[static_cast<size_t>(order[k])];
         }
-        const float norm = c.moe_norm_weights ? 1.0f / std::max(sum, 6.103515625e-5f) : 1.0f;
+        const float norm = c.moe_norm_weights ? 1.0f / (c.moe_norm_additive ? sum + 1e-20f : std::max(sum, 6.103515625e-5f)) : 1.0f;
         for (size_t k = 0; k < kept; ++k) {
             const auto e = static_cast<size_t>(order[k]);
             assigned[e].push_back(
@@ -5666,6 +5687,7 @@ float rms(const float* x, int32_t d) {
 }  // namespace
 
 Status Transformer::enter_blocks(std::span<const int32_t> tokens, const Route& route) {
+    routing_tokens_.assign(tokens.begin(), tokens.end());
     const ModelConfig& c = config_;
     const auto d = static_cast<size_t>(c.n_embd);
     const auto n = static_cast<int32_t>(tokens.size());

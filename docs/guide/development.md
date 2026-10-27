@@ -411,9 +411,9 @@ Implemented features are described above. These are next, in order:
     locked in RAM;
   * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
     of their own, such as a temporary directory under a user name with accents.
-* **Architecture limits:** registry presence is not a full-model conformance claim. Gemma 4 text has
-  [heterogeneous dense/MoE synthetic gates](../liyab-compat.md), without a trained-quality gate. DeepSeek-V4, ChatGLM 3, IQuest-Coder, Sarvam-MoE and cross-family stage-2 compositions remain unverified or
-  incomplete; see [the coverage tiers](models.md#architecture-coverage-and-validation). Group routing, Gemma 3n and Phi-2
+* **Architecture limits:** registry presence is not a full-model conformance claim. Gemma 4 and DeepSeek-V4 text have
+  [synthetic composition gates](../liyab-compat.md), without trained-quality or production-export gates.
+  ChatGLM 3, IQuest-Coder, Sarvam-MoE and cross-family stage-2 compositions remain unverified or incomplete; see [the coverage tiers](models.md#architecture-coverage-and-validation). Group routing, Gemma 3n and Phi-2
   are implemented and have the evidence recorded above. Exported tokenizer and chat metadata can still be wrong:
   the engine follows the file, and `tools/describe_model.py --gate` checks it against the source.
 * **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long

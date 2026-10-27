@@ -404,6 +404,7 @@ constexpr ArchSpec kArchitectures[] = {
      .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f},
     {"bailingmoe2", RopeLayout::Halves, "ffn_norm", true},
     {.name = "deepseek4", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+     .ffn_activation = FfnActivation::SiLUInputClamp,
      .swa_period = 1, .shared_kv = true},
 };
 
@@ -631,10 +632,6 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
-        if (c.spec->shared_kv) {
-            return Status(ErrorCode::Unsupported,
-                          "shared K=V MoE needs hash/sqrtsoftplus routing, clipped SwiGLU and learned sinks (MoE integration)");
-        }
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         // Absent (Mixtral, written by the llama converter): from the experts' tensors, below.
         if (f.get_int(key("expert_feed_forward_length"))) {
@@ -642,10 +639,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
         c.n_ff_shared = static_cast<int32_t>(f.get_int(key("expert_shared_feed_forward_length")).value_or(0));
         const int64_t gating = f.get_int(key("expert_gating_func")).value_or(1);
-        if (gating != 1 && gating != 2) {
+        if (gating != 1 && gating != 2 && gating != 4) {
             return Status(ErrorCode::Unsupported, "MoE gating function " + std::to_string(gating) + " is not supported");
         }
-        c.moe_gating = gating == 2 ? MoeGating::Sigmoid : MoeGating::Softmax;
+        c.moe_gating = gating == 4 ? MoeGating::SqrtSoftplus : gating == 2 ? MoeGating::Sigmoid : MoeGating::Softmax;
+        // The shared-K=V profile's routed FFNs use an additive tiny epsilon.
+        // Keep the established floor for older softmax/sigmoid profiles.
+        c.moe_norm_additive = c.spec->shared_kv || gating == 4;
         const GgufValue* norm = f.metadata(key("expert_weights_norm"));
         c.moe_norm_weights = norm != nullptr && norm->as_bool() ? *norm->as_bool() : c.spec->moe_norm_weights;
         c.moe_weights_scale = static_cast<float>(f.get_float(key("expert_weights_scale")).value_or(1.0));
@@ -1073,7 +1073,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
         std::memcpy(&out, v->array_data + static_cast<size_t>(l) * sizeof(float), sizeof(float));
         if (!std::isfinite(out) || out < 0.0f) return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
-        if (out > 0.0f && c.spec->ffn_activation != FfnActivation::SiLU) {
+        if (out > 0.0f && c.spec->ffn_activation != FfnActivation::SiLU &&
+            c.spec->ffn_activation != FfnActivation::SiLUInputClamp) {
             return Status(ErrorCode::Unsupported, "post-activation SwiGLU clamps require SiLU");
         }
         return Status::ok();
@@ -1202,9 +1203,6 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 if (!b.windowed) {
                     return Status(ErrorCode::InvalidModel, "shared K=V attention needs a sliding window in every block");
                 }
-                if (f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr || f.tensor(block_tensor(l, "attn_sinks")) != nullptr) {
-                    return Status(ErrorCode::Unsupported, "shared K=V attention needs learned attention sinks (MoE integration)");
-                }
                 const GgufValue* ratios = f.metadata(key("attention.compress_ratios"));
                 if (ratios == nullptr || ratios->type != GgufValue::Type::Array ||
                     (ratios->array_type != GgufValue::Type::I32 && ratios->array_type != GgufValue::Type::U32) ||
@@ -1261,6 +1259,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
             b.ffn = FfnKind::Moe;
+            if (const TensorView* routes = f.tensor(block_tensor(l, "ffn_gate_tid2eid.weight"))) {
+                if (routes->type != DType::I32 || routes->n_dims != 2 || routes->ne[0] != c.n_expert_used ||
+                    routes->ne[1] != c.n_vocab) {
+                    return Status(ErrorCode::InvalidModel, "invalid hash expert routing table in block " + std::to_string(l));
+                }
+                b.hash_routing = true;
+            }
             b.parallel_ffn = f.tensor(block_tensor(l, "ffn_up.weight")) != nullptr;
             b.dense_fused_gate_up = b.fused_gate_up;
             const bool branch_norms = f.tensor(block_tensor(l, "pre_ffw_norm_2.weight")) != nullptr ||
@@ -1343,6 +1348,24 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (b.latent && f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr) {
             return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
                                                       ": attention sinks with latent attention are not supported");
+        }
+    }
+    for (const TensorView& tensor : f.tensors()) {
+        if (tensor.type != DType::I32) continue;
+        bool auxiliary = false;
+        for (int32_t l = 0; l < c.n_layers && !auxiliary; ++l) {
+            auxiliary = c.blocks[static_cast<size_t>(l)].hash_routing &&
+                        tensor.name == block_tensor(l, "ffn_gate_tid2eid.weight");
+        }
+        if (!auxiliary) return Status(ErrorCode::Unsupported, "I32 is only supported for hash expert routing: " + std::string(tensor.name));
+    }
+    if (f.metadata(key("hash_layer_count")) != nullptr) {
+        const auto count = f.get_int(key("hash_layer_count"));
+        if (!count || *count < 0 || *count > c.n_layers) return Status(ErrorCode::InvalidModel, "invalid hash_layer_count");
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            if (c.blocks[static_cast<size_t>(l)].hash_routing != (l < *count)) {
+                return Status(ErrorCode::InvalidModel, "hash_layer_count disagrees with routing tables");
+            }
         }
     }
     LIYAB_RETURN_IF_ERROR(describe_gemma_parts(f, c, key));
@@ -1429,7 +1452,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     c.full_header_identity = c.spec->nope_period > 0 || c.spec->nope_global;
     for (const BlockPlan& block : c.blocks) {
-        c.full_header_identity = c.full_header_identity || block.parallel_ffn || block.router_input_rms ||
+        c.full_header_identity = c.full_header_identity || block.parallel_ffn || block.router_input_rms || block.hash_routing ||
                             block.head_dim != c.head_dim || block.rope_dim != c.rope_dim ||
                             (block.qk_norm_whole && block.n_head > 1) ||
                             (block.mixer != MixerKind::None && !block.norm_before_mixer) ||

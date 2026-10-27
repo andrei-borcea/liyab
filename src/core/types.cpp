@@ -46,6 +46,7 @@ bool dtype_from_ggml(uint32_t ggml_type, DType& out) noexcept {
         case 21: out = DType::IQ3_S; return true;
         case 22: out = DType::IQ2_S; return true;
         case 23: out = DType::IQ4_XS; return true;
+        case 26: out = DType::I32; return true;
         case 29: out = DType::IQ1_M; return true;
         case 30: out = DType::BF16; return true;
         case 34: out = DType::TQ1_0; return true;
@@ -58,6 +59,7 @@ bool dtype_from_ggml(uint32_t ggml_type, DType& out) noexcept {
 
 DTypeTraits dtype_traits(DType type) noexcept {
     switch (type) {
+        case DType::I32: return {"i32", 1, 4};
         case DType::F32: return {"f32", 1, 4};
         case DType::F16: return {"f16", 1, 2};
         case DType::Q4_0: return {"q4_0", 32, 18};
