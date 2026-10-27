@@ -104,10 +104,11 @@ public:
 
     Reference(const MmapLoader& f, const test::TinyModelSpec& spec)
         : f_(f), d_(spec.n_embd), n_head_(spec.n_head), n_kv_(spec.n_head_kv), n_layers_(spec.n_layers),
-          hd_(spec.n_embd / spec.n_head), block_heads_(spec.block_heads), block_kv_(spec.block_kv_heads),
-          block_ff_(spec.block_ff) {}
+          hd_(spec.head_dim > 0 ? spec.head_dim : spec.n_embd / spec.n_head), block_heads_(spec.block_heads), block_kv_(spec.block_kv_heads),
+          block_ff_(spec.block_ff), local_(spec.swa_layers), local_head_(spec.swa_head_dim),
+          local_rope_(spec.swa_rope_dim), rotary_(spec.rope_dim), local_window_(spec.sliding_window) {}
 
-    std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens, int window = 0, int sinks = 0) const {
+    std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens, int window = 0, int sinks = 0, DType cache_type = DType::F32) const {
         const int n = static_cast<int>(tokens.size());
         std::vector<std::vector<float>> x(static_cast<size_t>(n));
         const auto emb = weights("token_embd.weight");
@@ -119,6 +120,10 @@ public:
             const std::string p = "blk." + std::to_string(l) + ".";
             const int heads = block_heads_.empty() ? n_head_ : block_heads_[static_cast<size_t>(l)];
             const int kv_heads = block_kv_.empty() ? n_kv_ : block_kv_[static_cast<size_t>(l)];
+            const bool local = !local_.empty() && local_[static_cast<size_t>(l)];
+            const int hd = local && local_head_ > 0 ? local_head_ : hd_;
+            const int rd = local && local_rope_ > 0 ? local_rope_ : rotary_ > 0 ? rotary_ : hd;
+            const int visible_window = local ? local_window_ : window;
             const bool has_ffn = block_ff_.empty() || block_ff_[static_cast<size_t>(l)] > 0;
             if (kv_heads == 0) {
                 if (heads > 0) {
@@ -141,14 +146,28 @@ public:
                 q[t] = matvec(wq, h);
                 k[t] = matvec(wk, h);
                 v[t] = matvec(wv, h);
-                rope(q[t], t);
-                rope(k[t], t);
+                rope(q[t], t, hd, rd);
+                rope(k[t], t, hd, rd);
+                // Independently round compact heads to the configured cache
+                // precision; padded channels cannot alter these blocks.
+                auto round = [&](std::vector<float>& row, DType type) {
+                    std::vector<uint8_t> encoded(dtype_row_bytes(type, hd));
+                    for (size_t at = 0; at < row.size(); at += static_cast<size_t>(hd)) {
+                        quant::quantize_row(type, row.data() + at, encoded.data(), hd);
+                        quant::dequantize_row(type, encoded.data(), row.data() + at, hd);
+                    }
+                };
+                if (cache_type != DType::F32) {
+                    round(k[t], cache_type);
+                    round(v[t], cache_type);
+                    if (quant::is_block_quantized(cache_type)) round(q[t], DType::Q8_0);
+                }
             }
             for (int t = 0; t < n; ++t) {
-                std::vector<float> att(static_cast<size_t>(heads * hd_), 0.0f);
+                std::vector<float> att(static_cast<size_t>(heads * hd), 0.0f);
                 for (int h = 0; h < heads; ++h) {
                     const int g = h / (heads / kv_heads);
-                    const int first = window > 0 ? std::max(0, t - window + 1) : 0;
+                    const int first = visible_window > 0 ? std::max(0, t - visible_window + 1) : 0;
                     const int sink_end = std::min(sinks, first);  // attention sinks before the window
                     std::vector<int> visible;
                     for (int j = 0; j < sink_end; ++j) visible.push_back(j);
@@ -157,16 +176,16 @@ public:
                     double mx = -1e30;
                     for (const int j : visible) {
                         double dot = 0;
-                        for (int i = 0; i < hd_; ++i) dot += q[t][h * hd_ + i] * k[j][g * hd_ + i];
-                        s.push_back(dot / std::sqrt(static_cast<double>(hd_)));
+                        for (int i = 0; i < hd; ++i) dot += q[t][h * hd + i] * k[j][g * hd + i];
+                        s.push_back(dot / std::sqrt(static_cast<double>(hd)));
                         mx = std::max(mx, s.back());
                     }
                     if (!sink_logits.empty()) mx = std::max(mx, static_cast<double>(sink_logits[h]));
                     double sum = sink_logits.empty() ? 0.0 : std::exp(sink_logits[h] - mx);
                     for (double& e : s) sum += (e = std::exp(e - mx));
                     for (size_t idx = 0; idx < visible.size(); ++idx) {
-                        for (int i = 0; i < hd_; ++i) {
-                            att[h * hd_ + i] += static_cast<float>(s[idx] / sum * v[visible[idx]][g * hd_ + i]);
+                        for (int i = 0; i < hd; ++i) {
+                            att[h * hd + i] += static_cast<float>(s[idx] / sum * v[visible[idx]][g * hd + i]);
                         }
                     }
                 }
@@ -230,12 +249,12 @@ private:
         return y;
     }
     // GGUF llama layout: rotate adjacent pairs (2i, 2i+1) of every head.
-    void rope(std::vector<float>& v, int pos) const {
-        for (size_t h = 0; h < v.size() / static_cast<size_t>(hd_); ++h) {
-            for (int i = 0; i < hd_ / 2; ++i) {
-                const double theta = pos * std::pow(10000.0, -2.0 * i / hd_);
-                float& a = v[h * hd_ + 2 * i];
-                float& b = v[h * hd_ + 2 * i + 1];
+    void rope(std::vector<float>& v, int pos, int hd, int rd) const {
+        for (size_t h = 0; h < v.size() / static_cast<size_t>(hd); ++h) {
+            for (int i = 0; i < rd / 2; ++i) {
+                const double theta = pos * std::pow(10000.0, -2.0 * i / rd);
+                float& a = v[h * hd + 2 * i];
+                float& b = v[h * hd + 2 * i + 1];
                 const float a0 = a, b0 = b;
                 a = static_cast<float>(a0 * std::cos(theta) - b0 * std::sin(theta));
                 b = static_cast<float>(a0 * std::sin(theta) + b0 * std::cos(theta));
@@ -246,6 +265,8 @@ private:
     const MmapLoader& f_;
     int d_, n_head_, n_kv_, n_layers_, hd_;
     std::vector<int32_t> block_heads_, block_kv_, block_ff_;
+    std::vector<bool> local_;
+    int local_head_ = 0, local_rope_ = 0, rotary_ = 0, local_window_ = 0;
 };
 
 // Independent float reference of a deepseek2 model with multi-head latent
@@ -6827,5 +6848,152 @@ TEST_CASE("New recurrent mixers route projections to available GPU backends with
             REQUIRE(actual);
             CHECK(max_abs_diff(*actual, rows) < 1e-3);
         }
+    }
+}
+
+
+TEST_CASE("Compatibility plans heterogeneous local widths without padded-channel math") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    for (const int local_width : {32, 64, 24}) {
+        test::TinyModelSpec spec;
+        spec.n_layers = 4;
+        spec.head_dim = 64;
+        spec.rope_dim = 16;
+        spec.swa_head_dim = local_width;
+        spec.swa_rope_dim = local_width;
+        spec.swa_layers = {true, false, true, false};
+        spec.sliding_window = 3;
+        spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            auto model = load_transformer(model_path("compat_geometry_" + std::to_string(local_width), spec), options);
+            REQUIRE(model != nullptr);
+            CHECK(model->config().blocks[0].head_dim == local_width);
+            CHECK(model->config().blocks[1].head_dim == 64);
+            CHECK(model->config().blocks[0].rope_dim == local_width);
+            CHECK(model->config().blocks[1].rope_dim == 16);
+            const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+            auto result = model->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(result.has_value());
+            const std::vector<float> batched(result->begin(), result->end());
+            const auto expected = Reference(model->file(), spec).logits(tokens, 0, 0, model->kv_cache().dtype());
+            const size_t vocab = static_cast<size_t>(model->config().n_vocab);
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                const auto row = std::span<const float>(batched).subspan(t * vocab, vocab);
+                CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+            }
+            // Streaming uses compact projections but the same padded images.
+            model->reset();
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                auto row = model->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(row.has_value());
+                CHECK(max_abs_diff(*row, std::span<const float>(batched).subspan(t * vocab, vocab)) < 2e-4);
+            }
+            REQUIRE(model->truncate(7).is_ok());
+            auto replay = model->forward(std::span(tokens).last(1), Transformer::Logits::Last, route, pool);
+            REQUIRE(replay.has_value());
+            CHECK(max_abs_diff(*replay, std::span<const float>(batched).last(vocab)) < 2e-4);
+            std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(model->write_state(saved).is_ok());
+            model->reset();
+            REQUIRE(model->read_state(saved).is_ok());
+            CHECK(model->n_past() == static_cast<int32_t>(tokens.size()));
+            std::vector<float> padding(64);
+            quant::dequantize_row(model->kv_cache().dtype(), model->kv_cache().k_row(0, 7, 1), padding.data(), 64);
+            for (size_t i = static_cast<size_t>(local_width); i < padding.size(); ++i) CHECK(padding[i] == 0.0f);
+            if (local_width == 24) CHECK(model->kv_cache().dtype() == DType::F16);
+        }
+    }
+}
+
+
+TEST_CASE("Key calibration excludes inactive channels and uses compact heterogeneous heads") {
+    KeyScalingShape compact;
+    compact.blocks = 1;
+    compact.n_head = 4;
+    compact.n_head_kv = 2;
+    compact.head_dim = 32;
+    compact.rope_dim = 16;
+    compact.positions = 120;
+    compact.pair_speed.assign(8, 0.2f);
+    KeyRanges reference(compact);
+    auto padded = compact;
+    padded.head_dim = 64;
+    padded.rope_dim = 32;
+    padded.pair_speed.resize(16, 0.0f);
+    padded.head_dims = {32};
+    padded.rope_dims = {16};
+    KeyRanges actual(padded);
+    std::mt19937 random(19);
+    std::normal_distribution<float> normal;
+    for (int token = 0; token < 20; ++token) {
+        std::vector<float> q(128), k(64);
+        for (float& v : q) v = normal(random);
+        for (float& v : k) v = normal(random);
+        k[19] = 100.0f;
+        k[32 + 22] = 80.0f;
+        reference.add(0, q.data(), k.data());
+        actual.add(0, q.data(), k.data());
+    }
+    CHECK(actual.outlier_ratio() == reference.outlier_ratio());
+    CHECK(actual.outlier_ratio() > kOutlierRatio);
+    const auto wanted = reference.factors(), got = actual.factors();
+    for (size_t h = 0; h < 2; ++h) {
+        for (size_t i = 0; i < 32; ++i) CHECK(got[h * 64 + i] == wanted[h * 32 + i]);
+        for (size_t i = 32; i < 64; ++i) CHECK(got[h * 64 + i] == 1.0f);
+    }
+}
+
+
+TEST_CASE("Parallel dense/expert plans preserve quantized streaming and rollback with shared heterogeneous KV") {
+    test::TinyModelSpec s;
+    s.arch = "gemma4";
+    s.n_layers = 4;
+    s.head_dim = 64;
+    s.swa_head_dim = 32;
+    s.swa_rope_dim = 32;
+    s.rope_dim = 64;
+    s.sliding_window = 4;
+    s.swa_layers = {true, false, true, false};
+    s.shared_kv_layers = 2;
+    s.values_from_keys = true;
+    s.qk_norm = s.post_norms = true;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.parallel_experts = true;
+    s.identical_experts = false;
+    s.fused_gate_up = true;  // fused experts, separate dense projections
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 17, 99};
+    const auto& path = model_path("compat_parallel_experts", s);
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = type;
+        auto resident = load_transformer(path, options);
+        options.expert_cache_bytes = 1;
+        auto streamed = load_transformer(path, options);
+        REQUIRE(resident && streamed);
+        CHECK(resident->config().blocks[0].parallel_ffn);
+        CHECK(resident->config().blocks[0].router_input_rms);
+        CHECK(resident->config().blocks[0].fused_gate_up);
+        CHECK(!resident->config().blocks[0].dense_fused_gate_up);
+        auto all = resident->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(all.has_value());
+        const std::vector<float> expected(all->begin(), all->end());
+        const size_t vocab = static_cast<size_t>(resident->config().n_vocab);
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            auto row = streamed->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
+            REQUIRE(row.has_value());
+            CHECK(max_abs_diff(*row, std::span<const float>(expected).subspan(t * vocab, vocab)) < 2e-3);
+        }
+        REQUIRE(streamed->truncate(10).is_ok());
+        auto replay = streamed->forward(std::span(tokens).last(1), Transformer::Logits::Last, route, pool);
+        REQUIRE(replay.has_value());
+        CHECK(max_abs_diff(*replay, std::span<const float>(expected).last(vocab)) < 2e-3);
     }
 }

@@ -30,7 +30,7 @@ and top-1 ≥ 97%, plus source-tokenizer and template checks. Smoke replies and 
 | State space: `mamba`, `mamba2` | Five tiny cases including Falcon-Mamba, grouped Mamba-2 and Codestral; trained Mamba-130M/370M and Mamba-2-130M gates |
 | Convolution/delta: `lfm2`, `lfm2moe`, `qwen3next`, `kimi-linear` | Four tiny gates; trained LFM2-350M/700M/1.2B gates. Large MoE/linear checkpoints are not full-weight numerical validations |
 | Gemma text/pooling: `gemma3n`, `gemma-embedding` | Gemma 3n E2B trained BF16 and tiny gates; EmbeddingGemma-300M checked on 39 inputs against independent pooling/sentence-transformers references |
-| `gemma4` | Two uniform-geometry tiny variants pass, including K=V; full heterogeneous-head Gemma 4 and its larger MoE variants remain stage 2 |
+| `gemma4` | Stage-1 uniform fixtures plus heterogeneous text and parallel MoE checkpoints pass; see [liyab-compat](../liyab-compat.md). Trained quality and multimodal inputs remain unverified |
 | Sparse/grouped: `deepseek2` (V2/V3), `glm-dsa` (GLM-5/5.1/5.2), `deepseek32`, `bailingmoe2` | Canonical tiny gates, including genuinely sparse selections. V2-Lite has real streaming evidence; GLM-4.7-Flash has smoke evidence but fails the standard numerical gate |
 | `chatglm`, `deepseek4`, other proposed architectures | Partial/component coverage or failed conformance; registry entries and diagnostic successes do not establish model support |
 
@@ -425,9 +425,9 @@ recorded AC confirmation of its one affected configuration. The original timing 
 The model planner also recognizes Gemma 3n's AltUp residual streams, Laurel low-rank branches, per-layer token
 embeddings, Gaussian gate sparsity and shared keys/values. These compose with Gemma's existing GeGLU and sandwich
 norms. Gemma 4 adds optional key-as-value projections and block output scales; files with different local/global
-head geometry or different FFN widths are currently refused with an explicit reason. Gemma 3n E2B's BF16 conversion
+head geometry and per-block FFN widths now use explicit compatibility plans. Gemma 3n E2B's BF16 conversion
 passes the real-model gate: mean KL 0.00000, top-1 100%, and identical token IDs on all three tokenizer texts.
-Gemma 4 remains limited to tiny checks with uniform geometry.
+Gemma 4 also has [heterogeneous dense/MoE synthetic checks](../liyab-compat.md#offline-gemma-4-check).
 The per-layer table stays memory-mapped and is read by token row; scratch holds only the current batch's per-layer
 inputs and residual streams. Dense projections use the existing CPU/Metal/Vulkan routing and CPU fallback; the
 small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional attention over each complete
@@ -437,7 +437,7 @@ also reads its complete text in one pass. Shared key-as-value projections includ
 The `gemma4` tokenizer uses SentencePiece space normalization with the file's explicit BPE merge priorities,
 which can differ from vocabulary scores. Existing SentencePiece tokenizers keep their score-based merges.
 Gemma 4's four-block test with uniform head geometry matches all 512 token IDs, mean KL 0.00000 and top-1 99.22%;
-the full checkpoints still need the generic per-block geometry work. Converter compatibility details are in
+the newer compatibility-layer checks cover heterogeneous widths and parallel MoE, with trained checkpoints still unmeasured. Converter compatibility details are in
 [model descriptions](../model-descriptions.md#gemma-residual-and-embedding-parts).
 Text conformance of a multimodal checkpoint loads its registered text decoder alone; the reference tool infers
 the decoder namespace from the checkpoint's embedding key, without requiring unused vision/audio packages.

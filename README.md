@@ -181,8 +181,9 @@ gates, tiny checkpoints, smoke runs, failed controls and incomplete variants.
 
 **Export caveats:** OLMo, StarCoder, EXAONE 3.5, InternLM 3 and Ministral have documented tokenizer/template
 metadata conflicts. Check the [source/export notes](docs/guide/models.md) before choosing a file.
-Full heterogeneous Gemma 4, DeepSeek-V4 and the [stage-2 combinations](docs/model-coverage-stage1.md#stage-2-and-later-work)
-remain incomplete.
+[`liyab-compat`](docs/liyab-compat.md) adds heterogeneous Gemma 4 text attention and parallel dense/MoE FFNs,
+checked against small upstream checkpoints. Trained Gemma 4 quality, full DeepSeek-V4 and the
+[remaining combinations](docs/model-coverage-stage1.md#stage-2-and-later-work) need further validation.
 
 <a id="architecture"></a>
 
@@ -348,7 +349,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 
 | Area | Current limit |
 | :--- | :--- |
-| Model coverage | Full heterogeneous Gemma 4, DeepSeek-V4 and several stage-2 compositions remain incomplete |
+| Model coverage | Gemma 4 text has synthetic conformance; trained quality, full DeepSeek-V4 and other stage-2 combinations remain unverified |
 | Export metadata | Some published tokenizer / template metadata needs a corrected copy |
 | GPU behavior | Thermal CPU rerouting can change rounding; BF16 Metal matrix work falls back to CPU |
 | Vulkan | Per-token prefill matvec; resident tensors copied to GPU memory; MoE experts on CPU |

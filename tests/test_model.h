@@ -88,6 +88,7 @@ struct TinyModelSpec {
     int32_t n_expert_used = 0;
     // false: every expert gets its own random weights (no dense twin).
     bool identical_experts = true;
+    bool parallel_experts = false;  // independent dense/expert FFN branches and normalized router
     // > 0 (arch "qwen35"): a hybrid stack in which every delta_net_interval-th
     // block is attention and the others are Gated DeltaNet (2 key heads, 4
     // value heads of 16, convolution kernel 4).
@@ -146,6 +147,10 @@ struct TinyModelSpec {
     int32_t longrope_ctx = 0;
     // attention.sliding_window_pattern: > 0 writes it as a period; a
     // non-empty swa_layers writes one flag per block (true: windowed) instead.
+    // Optional local projection/rotation widths; global widths keep their
+    // ordinary metadata. Zero leaves the original fixture byte-for-byte.
+    int32_t swa_head_dim = 0;
+    int32_t swa_rope_dim = 0;
     int32_t swa_pattern = 0;
     std::vector<bool> swa_layers;
     // > 0: YaRN RoPE scaling (rope.scaling.type "yarn") with this factor;

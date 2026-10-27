@@ -1,0 +1,221 @@
+{
+  "scope": "Gemma 4 text dense/MoE and compatibility-layer ownership; random weights only",
+  "date": "2026-10-27",
+  "environment": {
+    "transformers": "5.19.0",
+    "torch": "2.14.1",
+    "gguf": "0.19.0"
+  },
+  "downloads": 0,
+  "trained_weight_bytes": 0,
+  "phone": "waived by owner",
+  "cases": [
+    {
+      "name": "gemma4",
+      "config": {
+        "architectures": [
+          "Gemma4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attention_k_eq_v": true,
+        "bos_token_id": 2,
+        "dtype": "float32",
+        "enable_moe_block": false,
+        "eos_token_id": 1,
+        "final_logit_softcapping": null,
+        "head_dim": 32,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 64,
+        "hidden_size_per_layer_input": 16,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+          "sliding_attention",
+          "full_attention",
+          "sliding_attention",
+          "full_attention"
+        ],
+        "max_position_embeddings": 512,
+        "model_type": "gemma4_text",
+        "moe_intermediate_size": null,
+        "num_attention_heads": 2,
+        "num_experts": null,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 1,
+        "num_kv_shared_layers": 2,
+        "pad_token_id": 0,
+        "per_layer_config": {
+          "1": {
+            "head_dim": 64
+          },
+          "3": {
+            "head_dim": 64
+          }
+        },
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "full_attention": {
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+            "rope_type": "proportional"
+          },
+          "sliding_attention": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "sliding_window": 8,
+        "tie_word_embeddings": true,
+        "top_k_experts": null,
+        "transformers_version": "5.19.0",
+        "use_bidirectional_attention": null,
+        "use_cache": true,
+        "use_double_wide_mlp": true,
+        "vocab_size": 332,
+        "vocab_size_per_layer_input": 332
+      },
+      "weights_sha256": "d3b2d746705fffbab32fb9ec34860ceb842a12e84c933b88eb604be479c92e73",
+      "token_ids": 128,
+      "positions": 127,
+      "weight_type": "F32",
+      "kv_type": "F16",
+      "batch": 64,
+      "threads": 4,
+      "max_mean_kl": 0.0001,
+      "min_top1_percent": 99,
+      "engine_log": [
+        "64 / 127 positions",
+        "127 / 127 positions",
+        "tokens: 128, identical to the reference",
+        "127 positions | KL mean 0.00000, median 0.00000, p99 0.00000, max 0.00002 | top-1 agreement 100.00% | perplexity 450.891 -> 450.892",
+        "PASS"
+      ]
+    },
+    {
+      "name": "gemma4-moe",
+      "config": {
+        "architectures": [
+          "Gemma4ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attention_k_eq_v": true,
+        "bos_token_id": 2,
+        "dtype": "float32",
+        "enable_moe_block": true,
+        "eos_token_id": 1,
+        "final_logit_softcapping": null,
+        "head_dim": 32,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 64,
+        "hidden_size_per_layer_input": 16,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+          "sliding_attention",
+          "full_attention",
+          "sliding_attention",
+          "full_attention"
+        ],
+        "max_position_embeddings": 512,
+        "model_type": "gemma4_text",
+        "moe_intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_experts": 4,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 1,
+        "num_kv_shared_layers": 2,
+        "pad_token_id": 0,
+        "per_layer_config": {
+          "1": {
+            "head_dim": 64
+          },
+          "3": {
+            "head_dim": 64
+          }
+        },
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+          "full_attention": {
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+            "rope_type": "proportional"
+          },
+          "sliding_attention": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          }
+        },
+        "sliding_window": 8,
+        "tie_word_embeddings": true,
+        "top_k_experts": 2,
+        "transformers_version": "5.19.0",
+        "use_bidirectional_attention": null,
+        "use_cache": true,
+        "use_double_wide_mlp": true,
+        "vocab_size": 332,
+        "vocab_size_per_layer_input": 332
+      },
+      "weights_sha256": "37e9c5cfbe9da717c5fcfbf945c8a96e6dc5c3917b031436f6626c5bc9e3ee8c",
+      "token_ids": 128,
+      "positions": 127,
+      "weight_type": "F32",
+      "kv_type": "F16",
+      "batch": 64,
+      "threads": 4,
+      "max_mean_kl": 0.0001,
+      "min_top1_percent": 99,
+      "engine_log": [
+        "64 / 127 positions",
+        "127 / 127 positions",
+        "tokens: 128, identical to the reference",
+        "127 positions | KL mean 0.00000, median 0.00000, p99 0.00000, max 0.00001 | top-1 agreement 100.00% | perplexity 692.818 -> 692.818",
+        "PASS"
+      ],
+      "expert_cache_mib": 1,
+      "routing_audit": {
+        "seed": 1234,
+        "routed_experts": {
+          "model.layers.0.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.1.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.2.router": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "model.layers.3.router": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      }
+    }
+  ],
+  "source_sha256": {
+    "fixture": "051c5e7c3d86145ff6a3306cdde6576f40d7fcc09d502a0a4dd211e659b5c1c3",
+    "reference": "f98db15702dfb06d2070fd5039f89a2f82611ac72a036a86d1b83e3cb1a69586",
+    "upstream_model": "edc123ab83fbb25548ec65536eaecee998c088653adf683be3ef69d62e2bfea9",
+    "converter": "7656867687fb8d747938754310d20e2f15bfc3a84d1d87785968a09bc2ae4125"
+  },
+  "verification": {
+    "native_release_experimental": "16/16, 192.89 s; golden hashes unchanged",
+    "after_rotary_identity_extraction": "engine, golden, KV reuse, registry 4/4, 83.20 s",
+    "description_tests": "4/4",
+    "registry_roundtrip": "64/64",
+    "android": "library and CLI cross-build; no phone run"
+  }
+}

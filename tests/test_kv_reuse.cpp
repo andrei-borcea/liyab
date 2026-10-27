@@ -150,6 +150,16 @@ std::vector<MoveCase> move_cases() {
     s.rope_scale = 2.0f;
     add("llama-ropefreqs-linear", s);
     s = {};
+    s.head_dim = 64;
+    s.rope_dim = 16;
+    s.swa_head_dim = 32;
+    s.swa_rope_dim = 32;
+    s.swa_layers = {true, false};
+    s.sliding_window = 512;
+    add("local-width-partial-f16", s, f16);
+    add("local-width-partial-q8", s);
+    add("local-width-partial-q4", s, q4);
+    s = {};
     s.arch = "qwen2";  // halves
     s.key_outlier = 60.0f;
     add("qwen2-keyscaled", s, {}, true);

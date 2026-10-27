@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <utility>
 
 #include "liyab/engine.h"
 
@@ -374,7 +375,7 @@ constexpr ArchSpec kArchitectures[] = {
     {.name = "gemma4",
      .rope = RopeLayout::Halves,
      .ffn_norm = "ffn_norm",
-     .moe_norm_weights = false,
+     .moe_norm_weights = true,
      .ffn_activation = FfnActivation::GeluTanh,
      .post_mixer_norm = "post_attention_norm",
      .post_ffn_norm = "post_ffw_norm",
@@ -499,7 +500,8 @@ Status describe_gemma_parts(const MmapLoader& f, ModelConfig& c, const Key& key)
                                                        "earlier block of its kind");
         }
         const BlockPlan& source = c.blocks[static_cast<size_t>(b.kv_source)];
-        if (source.n_head != b.n_head || source.n_head_kv != b.n_head_kv || source.rope != b.rope) {
+        if (source.n_head != b.n_head || source.n_head_kv != b.n_head_kv || source.rope != b.rope ||
+            source.head_dim != b.head_dim || source.value_dim != b.value_dim || source.rope_dim != b.rope_dim) {
             return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
                               " shares keys and values with incompatible head geometry or rotation");
         }
@@ -762,19 +764,25 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     } else if (value_length && *value_length != c.head_dim) {
         return Status(ErrorCode::Unsupported, "key_length != value_length is not supported");
     }
-    // Windowed blocks with heads or a rotation of other sizes than the
-    // global ones (Gemma 4: 256-wide windowed heads, 512-wide global ones)
-    // need per-block geometry.
-    for (const char* swa : {"attention.key_length_swa", "attention.value_length_swa", "rope.dimension_count_swa"}) {
-        const auto v = f.get_int(key(swa));
-        const int32_t global = std::string_view(swa).starts_with("rope") ? static_cast<int32_t>(
-                                                                                 f.get_int(key("rope.dimension_count")).value_or(c.head_dim))
-                                                                         : c.head_dim;
-        if (v && *v != global) {
-            return Status(ErrorCode::Unsupported, "windowed blocks of other head or rotation sizes than the global "
-                                                  "ones (" + key(swa) + " " + std::to_string(*v) + ", global " +
-                                                      std::to_string(global) + ") are not supported yet");
+    int32_t window_head_dim = c.head_dim, window_value_dim = c.value_dim, window_rope_dim = c.rope_dim;
+    auto optional_dimension = [&](const char* suffix, int32_t& out, bool zero = false) -> Status {
+        if (f.metadata(key(suffix)) == nullptr) return Status::ok();
+        const auto value = f.get_int(key(suffix));
+        if (!value || *value < (zero ? 0 : 1) || *value > (int64_t{1} << 20)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
         }
+        out = static_cast<int32_t>(*value);
+        return Status::ok();
+    };
+    LIYAB_RETURN_IF_ERROR(optional_dimension("attention.key_length_swa", window_head_dim));
+    LIYAB_RETURN_IF_ERROR(optional_dimension("attention.value_length_swa", window_value_dim));
+    LIYAB_RETURN_IF_ERROR(optional_dimension("rope.dimension_count_swa", window_rope_dim, true));
+    if (c.mla.kv_rank == 0 && window_head_dim != window_value_dim) {
+        return Status(ErrorCode::Unsupported, "windowed key_length != value_length is not supported");
+    }
+    if ((window_head_dim != c.head_dim || window_rope_dim != c.rope_dim) &&
+        (c.mla.kv_rank > 0 || c.spec->shared_kv)) {
+        return Status(ErrorCode::Unsupported, "heterogeneous latent/shared K=V head geometry is not supported");
     }
     if (f.get_int(key("attention.indexer.head_count")).value_or(0) != 0) {
         LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.head_count", c.index_heads));
@@ -912,8 +920,9 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Sliding-window attention blocks: the architecture's period, or the
     // file's own pattern (a period, or one flag per block).
     std::vector<bool> windowed(static_cast<size_t>(c.n_layers), false);
-    const int64_t window = c.spec->swa_period > 0
-                               ? f.get_int(key("attention.sliding_window")).value_or(c.spec->sliding_window_default) : 0;
+    const bool explicit_window_pattern = f.metadata(key("attention.sliding_window_pattern")) != nullptr;
+    const int64_t window = c.spec->swa_period > 0 || explicit_window_pattern
+        ? f.get_int(key("attention.sliding_window")).value_or(c.spec->sliding_window_default) : 0;
     if (window < 0 || window > (int64_t{1} << 30)) {
         return Status(ErrorCode::InvalidModel, "invalid " + key("attention.sliding_window"));
     }
@@ -921,7 +930,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.sliding_window = static_cast<int32_t>(window);
         c.rope_base_swa = static_cast<float>(f.get_float(key("rope.freq_base_swa")).value_or(c.spec->rope_base_swa));
         if (c.rope_base_swa == 0.0f && c.spec->swa_rope_unscaled) c.rope_base_swa = c.rope_base;
-        int64_t period = c.spec->swa_period;
+        int64_t period = c.spec->swa_period > 0 ? c.spec->swa_period : 1;
         const GgufValue* pattern = f.metadata(key("attention.sliding_window_pattern"));
         if (pattern != nullptr && pattern->type == GgufValue::Type::Array) {
             if (pattern->array_type != GgufValue::Type::Bool || pattern->array_size < static_cast<uint64_t>(c.n_layers)) {
@@ -1074,7 +1083,19 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         b.n_head = block_heads[static_cast<size_t>(l)];
         b.n_head_kv = c.mla.kv_rank > 0 ? 1 : block_kv_heads[static_cast<size_t>(l)];
         b.n_ff = block_ff[static_cast<size_t>(l)];
-        const int64_t q_dim = int64_t{b.n_head} * c.head_dim;
+        b.head_dim = windowed[static_cast<size_t>(l)] ? window_head_dim : c.head_dim;
+        b.value_dim = windowed[static_cast<size_t>(l)] ? window_value_dim : c.value_dim;
+        b.rope_dim = windowed[static_cast<size_t>(l)] ? window_rope_dim : c.rope_dim;
+        if (!c.spec->rotary) b.rope_dim = 0;
+        if (b.rope_dim < 0 || b.rope_dim > b.head_dim || b.rope_dim % 2 != 0) {
+            return Status(ErrorCode::InvalidModel, "invalid rotary width in block " + std::to_string(l));
+        }
+        b.attn_scale = c.attn_scale;
+        if (b.head_dim != c.head_dim && !c.spec->unscaled_scores &&
+            f.metadata(key("attention.scale")) == nullptr) {
+            b.attn_scale *= std::sqrt(static_cast<float>(c.head_dim) / b.head_dim);
+        }
+        const int64_t q_dim = int64_t{b.n_head} * b.head_dim;
         LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_exp", l, b.expert_swiglu_clamp));
         LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_shexp", l, b.shared_swiglu_clamp));
         b.mixer = mixer_of(l);
@@ -1157,16 +1178,16 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             const TensorView* qn = f.tensor(block_tensor(l, "attn_q_norm.weight"));
             const TensorView* kn = f.tensor(block_tensor(l, "attn_k_norm.weight"));
             if (qn != nullptr || kn != nullptr) {
-                const int64_t kv_dim = int64_t{b.n_head_kv} * c.head_dim;
-                const bool q_whole = qn != nullptr && qn->n_dims == 1 && qn->elements() == q_dim && q_dim != c.head_dim;
-                const bool k_whole = kn != nullptr && kn->n_dims == 1 && kn->elements() == kv_dim && kv_dim != c.head_dim;
+                const int64_t kv_dim = int64_t{b.n_head_kv} * b.head_dim;
+                const bool q_whole = qn != nullptr && qn->n_dims == 1 && qn->elements() == q_dim && q_dim != b.head_dim;
+                const bool k_whole = kn != nullptr && kn->n_dims == 1 && kn->elements() == kv_dim && kv_dim != b.head_dim;
                 b.qk_norm_whole = q_whole || k_whole;
                 auto valid_norm = [&](const TensorView* t, int64_t heads) {
                     if (t == nullptr) return true;
-                    const int64_t width = b.qk_norm_whole ? heads * c.head_dim : c.head_dim;
+                    const int64_t width = b.qk_norm_whole ? heads * b.head_dim : b.head_dim;
                     return t->elements() == width || (!b.qk_norm_whole &&
                         c.spec->norm == NormKind::Layer && t->n_dims == 2 &&
-                        t->ne[0] == c.head_dim && t->ne[1] == heads);
+                        t->ne[0] == b.head_dim && t->ne[1] == heads);
                 };
                 if (!valid_norm(qn, b.n_head) || !valid_norm(kn, b.n_head_kv)) {
                     return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
@@ -1240,6 +1261,35 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
             b.ffn = FfnKind::Moe;
+            b.parallel_ffn = f.tensor(block_tensor(l, "ffn_up.weight")) != nullptr;
+            b.dense_fused_gate_up = b.fused_gate_up;
+            const bool branch_norms = f.tensor(block_tensor(l, "pre_ffw_norm_2.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "post_ffw_norm_1.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "post_ffw_norm_2.weight")) != nullptr;
+            if (b.parallel_ffn != branch_norms) {
+                return Status(ErrorCode::Unsupported, "parallel dense/expert branches require independent branch norms");
+            }
+            if (b.parallel_ffn) {
+                for (const char* suffix : {"pre_ffw_norm_2.weight", "post_ffw_norm_1.weight", "post_ffw_norm_2.weight"}) {
+                    const TensorView* norm = f.tensor(block_tensor(l, suffix));
+                    if (norm == nullptr || norm->n_dims != 1 || norm->elements() != c.n_embd) {
+                        return Status(ErrorCode::InvalidModel, "invalid parallel FFN norm '" + block_tensor(l, suffix) + "'");
+                    }
+                }
+                if (b.n_ff <= 0 || c.spec->norm != NormKind::Rms || b.parallel || c.hc_count > 0) {
+                    return Status(ErrorCode::Unsupported, "incompatible parallel dense/expert composition");
+                }
+            }
+            b.router_input_rms = f.tensor(block_tensor(l, "ffn_gate_inp.scale")) != nullptr;
+            if (b.router_input_rms) {
+                for (const auto& entry : {std::pair{"ffn_gate_inp.scale", c.n_embd},
+                                          std::pair{"ffn_down_exps.scale", c.n_expert}}) {
+                    const TensorView* scale = f.tensor(block_tensor(l, entry.first));
+                    if (scale == nullptr || scale->n_dims != 1 || scale->elements() != entry.second) {
+                        return Status(ErrorCode::InvalidModel, "invalid router scale '" + block_tensor(l, entry.first) + "'");
+                    }
+                }
+            }
             // Each expert's gate and up projections as one [gate | up]
             // matrix (a converter option, Granite MoE), instead of two tensors.
             b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
@@ -1369,6 +1419,39 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             return Status(ErrorCode::InvalidModel, "inconsistent DeltaNet (ssm.*) dimensions");
         }
     }
+    // Fixed image strides use maxima; every attention operation reads its
+    // logical dimensions from BlockPlan, including shared-KV consumers.
+    for (const BlockPlan& block : c.blocks) {
+        if (block.mixer == MixerKind::Attention) {
+            c.head_dim = std::max(c.head_dim, block.head_dim);
+            c.value_dim = std::max(c.value_dim, block.value_dim);
+        }
+    }
+    c.full_header_identity = c.spec->nope_period > 0 || c.spec->nope_global;
+    for (const BlockPlan& block : c.blocks) {
+        c.full_header_identity = c.full_header_identity || block.parallel_ffn || block.router_input_rms ||
+                            block.head_dim != c.head_dim || block.rope_dim != c.rope_dim ||
+                            (block.qk_norm_whole && block.n_head > 1) ||
+                            (block.mixer != MixerKind::None && !block.norm_before_mixer) ||
+                            (block.ffn != FfnKind::None && !block.norm_before_ffn);
+    }
+    for (const char* suffix : {"attention.head_count", "attention.head_count_kv", "feed_forward_length"}) {
+        const GgufValue* value = f.metadata(c.arch + "." + suffix);
+        if (value != nullptr && value->type == GgufValue::Type::Array) {
+            c.full_header_identity = true;
+            break;
+        }
+    }
+    for (const char* suffix : {"embedding_scale", "residual_scale", "logit_scale", "attention.rope_pattern",
+                               "attention.temperature_scale", "attention.temperature_length"}) {
+        if (f.metadata(c.arch + "." + suffix) != nullptr) {
+            c.full_header_identity = true;
+            break;
+        }
+    }
+    const auto tokenizer_pre = f.get_string("tokenizer.ggml.pre");
+    c.full_header_identity = c.full_header_identity ||
+                        (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits" || *tokenizer_pre == "llama-bpe-merges"));
     return c;
 }
 

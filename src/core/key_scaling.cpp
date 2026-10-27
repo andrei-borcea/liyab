@@ -33,16 +33,16 @@ KeyRanges::KeyRanges(KeyScalingShape shape)
                  0.0f) {}
 
 void KeyRanges::update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
-                       const float* gain, double row_scale) const {
+                       const float* gain, int32_t head_dim, int32_t rope_dim, double row_scale) const {
     if (rows == nullptr) return;  // shared-KV blocks contribute queries only
-    const auto hd = static_cast<size_t>(shape_.head_dim);
-    const int32_t half = shape_.rope_dim / 2;
+    const auto hd = static_cast<size_t>(head_dim);
+    const int32_t half = rope_dim / 2;
     const double last = std::max(shape_.positions - 1, 0);
     // |gain| of channel i (1 without gains: r * 1.0 keeps r's bits).
     auto g = [&](int32_t i) { return gain == nullptr ? 1.0 : std::fabs(static_cast<double>(gain[i])); };
     for (size_t h = 0; h < static_cast<size_t>(heads); ++h) {
         const float* x = rows + h * hd;
-        float* m = max + h * hd;
+        float* m = max + h * static_cast<size_t>(shape_.head_dim);
         // Rotated pairs: channel a holds r cos(φ + θp), channel b r sin(φ + θp)
         // (Transformer::rope), for p over the whole context.
         for (int32_t i = 0; i < half; ++i) {
@@ -54,7 +54,7 @@ void KeyRanges::update(const float* rows, int32_t heads, float* max, const float
             m[a] = std::max(m[a], static_cast<float>(g(a) * r * max_abs_cos(phi, sweep)));
             m[b] = std::max(m[b], static_cast<float>(g(b) * r * max_abs_cos(phi - std::numbers::pi / 2, sweep)));
         }
-        for (size_t i = static_cast<size_t>(shape_.rope_dim); i < hd; ++i) {
+        for (size_t i = static_cast<size_t>(rope_dim); i < hd; ++i) {
             const float value = gain == nullptr ? std::fabs(x[i]) : std::fabs(x[i] * gain[i]);
             m[i] = std::max(m[i], static_cast<float>(value * row_scale));
         }
@@ -69,21 +69,28 @@ void KeyRanges::add(int32_t block, const float* q, const float* k, const float* 
     const double magnitude = shape_.rope_magnitude.empty() ? 1.0 : shape_.rope_magnitude[b];
     const int32_t kv_heads = shape_.kv_heads.empty() ? shape_.n_head_kv : shape_.kv_heads[b];
     const int32_t query_heads = shape_.query_heads.empty() ? shape_.n_head : shape_.query_heads[b];
+    const int32_t head_dim = shape_.head_dims.empty() ? shape_.head_dim : shape_.head_dims[b];
+    const int32_t rope_dim = shape_.rope_dims.empty() ? shape_.rope_dim : shape_.rope_dims[b];
     update(k, kv_heads, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, magnitude,
-           k_gain);
+           k_gain, head_dim, rope_dim);
     update(q, query_heads, query_max_.data() + b * static_cast<size_t>(shape_.n_head) * hd, speed, magnitude,
-           q_gain, shape_.query_scale);
+           q_gain, head_dim, rope_dim, shape_.query_scale);
 }
 
 float KeyRanges::outlier_ratio() const {
     const auto hd = static_cast<size_t>(shape_.head_dim);
-    std::vector<float> sorted(hd);
+    std::vector<float> sorted;
     float ratio = 0.0f;
-    for (size_t h = 0; h < static_cast<size_t>(shape_.blocks) * static_cast<size_t>(shape_.n_head_kv); ++h) {
-        const float* km = key_max_.data() + h * hd;
-        std::copy(km, km + hd, sorted.begin());
-        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(hd / 2), sorted.end());
-        if (sorted[hd / 2] > 0.0f) ratio = std::max(ratio, *std::max_element(km, km + hd) / sorted[hd / 2]);
+    for (size_t b = 0; b < static_cast<size_t>(shape_.blocks); ++b) {
+        const auto width = static_cast<size_t>(shape_.head_dims.empty() ? shape_.head_dim : shape_.head_dims[b]);
+        const int32_t heads = shape_.kv_heads.empty() ? shape_.n_head_kv : shape_.kv_heads[b];
+        sorted.resize(width);
+        for (size_t h = 0; h < static_cast<size_t>(heads); ++h) {
+            const float* km = key_max_.data() + (b * static_cast<size_t>(shape_.n_head_kv) + h) * hd;
+            std::copy_n(km, width, sorted.begin());
+            std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(width / 2), sorted.end());
+            if (sorted[width / 2] > 0.0f) ratio = std::max(ratio, *std::max_element(km, km + width) / sorted[width / 2]);
+        }
     }
     return ratio;
 }
@@ -92,30 +99,33 @@ std::vector<float> KeyRanges::factors() const {
     const auto hd = static_cast<size_t>(shape_.head_dim);
     std::vector<float> out(shape_.factors(), 1.0f);
     if (outlier_ratio() < kOutlierRatio) return out;  // nothing for the scaling to fix
-    std::vector<float> keys(hd), queries(hd), sorted(hd);
+    std::vector<float> keys, queries, sorted;
     // Floors a head's ranges at a quarter of its median channel.
     auto floor_ranges = [&](std::vector<float>& range) {
         sorted = range;
-        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(hd / 2), sorted.end());
-        const float floor = std::max(sorted[hd / 2] / 4.0f, 1e-20f);
+        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(range.size() / 2), sorted.end());
+        const float floor = std::max(sorted[range.size() / 2] / 4.0f, 1e-20f);
         for (float& r : range) r = std::max(r, floor);
     };
     for (size_t b = 0; b < static_cast<size_t>(shape_.blocks); ++b) {
+        const auto width = static_cast<size_t>(shape_.head_dims.empty() ? shape_.head_dim : shape_.head_dims[b]);
+        keys.resize(width);
+        queries.resize(width);
         const int32_t kv_heads = shape_.kv_heads.empty() ? shape_.n_head_kv : shape_.kv_heads[b];
         const int32_t query_heads = shape_.query_heads.empty() ? shape_.n_head : shape_.query_heads[b];
         const auto group = static_cast<size_t>(query_heads / kv_heads);
         for (size_t g = 0; g < static_cast<size_t>(kv_heads); ++g) {
             const float* km = key_max_.data() + (b * static_cast<size_t>(shape_.n_head_kv) + g) * hd;
-            std::copy(km, km + hd, keys.begin());
+            std::copy(km, km + width, keys.begin());
             std::fill(queries.begin(), queries.end(), 0.0f);
             for (size_t j = 0; j < group; ++j) {  // the query heads sharing KV head g
                 const float* qm = query_max_.data() + (b * static_cast<size_t>(shape_.n_head) + g * group + j) * hd;
-                for (size_t i = 0; i < hd; ++i) queries[i] = std::max(queries[i], qm[i]);
+                for (size_t i = 0; i < width; ++i) queries[i] = std::max(queries[i], qm[i]);
             }
             floor_ranges(keys);
             floor_ranges(queries);
             float* t = out.data() + (b * static_cast<size_t>(shape_.n_head_kv) + g) * hd;
-            for (size_t i = 0; i < hd; ++i) {
+            for (size_t i = 0; i < width; ++i) {
                 t[i] = std::clamp(std::sqrt(keys[i] / queries[i]), 1.0f / kMaxKeyScale, kMaxKeyScale);
             }
         }

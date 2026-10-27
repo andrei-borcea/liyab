@@ -683,8 +683,8 @@ all 39 pooling-case tokenizations on CPU and Metal (minimum cosine 0.99992651 ag
 reference matches sentence-transformers at minimum cosine 0.9999998. Gemma 3n E2B it, converted from unsloth
 revision `c4291af6285b4f90d88bdf6f9a634a8d2f262cc8` to BF16, also passes the real-model gate: the tool proposes
 exactly the registered row, all three tokenizer texts match, and the 512-token float32-reference comparison gives
-mean KL 0.00000, maximum 0.00001 and top-1 100.00%. Gemma 4's heterogeneous geometry remains pending in the
-generic per-block geometry work. The separate K-equals-V/no-per-layer-input Gemma 4 tiny case gives mean KL
+mean KL 0.00000, maximum 0.00001 and top-1 100.00%. Subsequent [liyab-compat checks](liyab-compat.md)
+cover heterogeneous Gemma 4 heads and parallel MoE norms/scales with small upstream checkpoints. The separate K-equals-V/no-per-layer-input Gemma 4 tiny case gives mean KL
 0.00000, maximum 0.00002, top-1 99.02%, and 512 identical IDs.
 The additional Gemma 3n BF16-reference comparison gives mean KL 0.00168, maximum 0.02824 and top-1 98.24%.
 CPU and Metal routes both greedily answer the checked chat prompt with "The capital of France is Paris."

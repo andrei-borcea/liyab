@@ -94,6 +94,10 @@ struct KeyScalingShape {
     // covered context; 1 without it. The rotary maxima times this gain cover
     // every query position even when its temperature changes in steps.
     float query_scale = 1.0f;
+    // Logical widths in KV-slot order; empty means uniform. Input vectors
+    // are compact; factor images and pair speeds keep the maximum strides.
+    std::vector<int32_t> head_dims;
+    std::vector<int32_t> rope_dims;
     // Factors per scaled model: blocks * n_head_kv * head_dim.
     [[nodiscard]] size_t factors() const noexcept {
         return static_cast<size_t>(blocks) * static_cast<size_t>(n_head_kv) * static_cast<size_t>(head_dim);
@@ -127,7 +131,7 @@ private:
     // their per-channel maxima, each channel multiplied by |gain| after the
     // rotation (nullptr: 1).
     void update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
-                const float* gain, double row_scale = 1.0) const;
+                const float* gain, int32_t head_dim, int32_t rope_dim, double row_scale = 1.0) const;
     KeyScalingShape shape_;
     std::vector<float> key_max_;    // [block][kv head][channel]
     std::vector<float> query_max_;  // [block][query head][channel]

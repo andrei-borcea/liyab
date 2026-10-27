@@ -225,6 +225,7 @@ struct ArchSpec {
     // RoPE (unit magnitude, including YaRN) and its inverse on the output
     // before grouped low-rank projection.
     bool shared_kv = false;
+
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -278,6 +279,14 @@ enum class FfnKind : uint8_t {
 
 // The structure of one block, from the tensors present.
 struct BlockPlan {
+    // A dense FFN and routed experts in parallel, with independent input
+    // and output norms, before the block's outer post-FFN norm.
+    bool parallel_ffn = false;
+    bool dense_fused_gate_up = false;
+    // Learned ffn_gate_inp.scale: an independent unweighted residual RMS
+    // norm, channel scale and hidden_size^-0.5 before the router projection.
+    bool router_input_rms = false;
+
     MixerKind mixer = MixerKind::Attention;
     // Attention: multi-head latent attention (attn_kv_a_mqa present, see
     // ModelConfig::mla). Keys and values come from one compressed latent per
@@ -360,6 +369,12 @@ struct BlockPlan {
     int32_t n_head = 0;
     int32_t n_head_kv = 0;
     int32_t n_ff = 0;
+    // Logical projection dimensions. ModelConfig keeps the maxima for scratch
+    // and cache images; padded cache channels never enter this block's math.
+    int32_t head_dim = 0;
+    int32_t value_dim = 0;
+    int32_t rope_dim = 0;
+    float attn_scale = 0.0f;
 };
 
 // xIELU's scalars of one block (Apertus), as the reference computes them
@@ -433,6 +448,10 @@ struct MambaGeometry {
 };
 
 struct ModelConfig {
+    // Metadata beyond the legacy first-MiB fingerprint affects execution or
+    // tokenizer identity; hash the complete header for states/calibration.
+    bool full_header_identity = false;
+
     const ArchSpec* spec = nullptr;  // registry row (static lifetime)
     std::string arch;                // spec->name
     int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
@@ -444,8 +463,8 @@ struct ModelConfig {
     int32_t n_ff = 0;       // maximum block FFN width (individual widths in blocks)
     int32_t n_head = 0;     // maximum query heads, at least one for scratch sizing
     int32_t n_head_kv = 0;  // maximum KV heads, at least one for the fixed cache layout
-    int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
-    int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
+    int32_t head_dim = 0;    // maximum key/query stride; logical widths live in BlockPlan
+    int32_t value_dim = 0;   // maximum value width; mla.kv_rank with latent attention
     int32_t rope_dim = 0;  // rotated channels per head; 0: no rotation (ArchSpec::rotary false)
     int32_t n_vocab = 0;
     int32_t n_ctx_train = 0;

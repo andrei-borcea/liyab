@@ -38,6 +38,8 @@
 #include <vector>
 
 #include "compat/architecture.h"
+#include "compat/weights.h"
+#include "compat/rotary.h"
 #include "core/expert_store.h"
 #include "core/key_scaling.h"
 #include "core/lora.h"
@@ -179,28 +181,6 @@ struct TransformerOptions {
     // Latent attention (DeepSeek-V2/V3 and models converted alike): the
     // form passes attend in. Ignored by other models.
     LatentForm latent_form = LatentForm::Auto;
-};
-
-// Owns the split execution views of one old combined MLA projection.
-// bind() validates [head][nope + value][rank], decodes/transposes only keys
-// to F32 and copies value bytes unchanged. Source bytes are needed only
-// during bind(); its name must outlive these views. Views remain valid
-// until the next bind() or destruction. Single-thread ownership; do not
-// bind while another thread reads its views. InvalidModel for bad shapes,
-// Unsupported for formats that are not ordinary on-disk weight rows.
-class CombinedLatentWeights {
-public:
-    Status bind(const TensorView& source, const LatentAttention& geometry, int32_t heads);
-    [[nodiscard]] const TensorView& key() const noexcept { return key_; }
-    [[nodiscard]] const TensorView& value() const noexcept { return value_; }
-    CombinedLatentWeights() = default;
-    CombinedLatentWeights(const CombinedLatentWeights&) = delete;
-    CombinedLatentWeights& operator=(const CombinedLatentWeights&) = delete;
-
-private:
-    std::vector<float> keys_;
-    std::vector<uint8_t> values_;
-    TensorView key_, value_;
 };
 
 class Transformer {
@@ -833,6 +813,8 @@ private:
         // Optional: attn_sinks, one learned logit per query head that joins
         // the softmax's denominator (attention()).
         std::vector<float> sinks;
+        std::vector<float> router_scale, expert_scale;
+        std::vector<float> expert_norm, dense_post_norm, expert_post_norm;
         std::vector<float> router_bias;   // optional: ffn_gate_inp.bias, added to the router's logits
         // Optional per-expert biases of the experts' projections, [expert][rows]
         // (ffn_gate_exps.bias, ffn_up_exps.bias, ffn_down_exps.bias), each
@@ -866,15 +848,6 @@ private:
     // Weight views of one block, rebased into a triple-buffer slot when a
     // layer source is attached. Releases the slot on destruction.
     class BlockWeights;
-
-    // How one group of blocks rotates queries and keys: pair i turns by
-    // inv_freq[i] / scale radians per position. Most models have one table;
-    // windowed blocks with ModelConfig::rope_base_swa have a second.
-    struct RopeTable {
-        std::vector<float> inv_freq;  // per rotary pair, frequency factors included
-        float scale = 1.0f;           // linear position scaling
-        float magnitude = 1.0f;       // multiplies the rotated dimensions (ModelConfig::rope_magnitude)
-    };
 
     Transformer() = default;
     Status bind_weights();
@@ -1017,6 +990,7 @@ private:
     Status project_fused_qkv(const Layer& layer, const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
+    void normalize_router_input(const Layer& layer, const float* input, float* out, int32_t n) const;
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
     // How many of a token's top-k experts run under expert_mass_ and
     // max_experts_: `order`
@@ -1251,6 +1225,7 @@ private:
     std::vector<float> compress_kv_, compress_gate_, index_compress_kv_, index_compress_gate_;
     std::vector<float> compression_scratch_;
     std::vector<float> hc_streams_, hc_normalized_, hc_coefficients_, hc_post_, hc_comb_, hc_next_;
+    std::vector<float> parallel_ffn_out_, router_input_;
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch

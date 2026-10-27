@@ -113,7 +113,7 @@ endif()
 # --------------------------------------------------------------------------
 # Model/file adaptation is separate from numerical execution. The engine, tests
 # and tools link the same compatibility objects; there is no second registry.
-add_library(liyab-compat OBJECT src/compat/architecture.cpp)
+add_library(liyab-compat OBJECT src/compat/architecture.cpp src/compat/weights.cpp src/compat/rotary.cpp)
 target_include_directories(liyab-compat PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
 
 add_library(liyab_core OBJECT

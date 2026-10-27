@@ -93,8 +93,9 @@ The first composition candidate is Flint: leading dense blocks, shared experts, 
 primitives exist, but their composition still needs its own source-tokenizer/template and numerical gates.
 Llama 4, Cohere2/Command-A/R7B, Jamba, Falcon-H1, Granite hybrids/MoE, Nemotron-H/H-MoE, OLMoE, PhiMoE, MiniMax-M2,
 Grok and encoder models each need independent composition/operation coverage. Existing Mamba or LayerNorm parts
-alone do not establish those architectures. Full Gemma 4 still needs heterogeneous per-block head widths and a
-trained gate; larger variants also need MoE-specific norms/scales. Full DeepSeek-V4 lacks hash/tid2eid routing,
+alone do not establish those architectures. Subsequent [liyab-compat work](liyab-compat.md) adds Gemma 4
+heterogeneous head widths and parallel MoE norms/scales, with small upstream text conformance gates.
+A trained Gemma 4 gate remains pending. Full DeepSeek-V4 lacks hash/tid2eid routing,
 sqrt-softplus/clipped SwiGLU and shared-attention sink integration despite passing compression/mHC components.
 Sarvam has an unresolved converter/source BOS mismatch. MiniCPM3 and other unmeasured variants remain deferred.
 
@@ -112,7 +113,7 @@ The remaining integration work is more specific than reimplementing those primit
 | Falcon-H1 | Parallel attention and SSM, partial SSM widths, D layouts and baked multipliers |
 | Granite 4 / Nemotron-H and H-MoE | Full hybrid/expert composition gates; scalars, ReLU-squared FFNs, per-block head counts, grouped scan norms and group routing are available |
 | PLaMo2 | Distinct headwise B/C, dt/B/C normalization/projection and recurrent-state layout |
-| Gemma 4 | Distinct per-block head/value widths; larger MoE variants additionally need router-input and expert/parallel-branch norms/scales |
+| Gemma 4 | Heterogeneous text and parallel MoE now pass synthetic upstream gates in liyab-compat; trained-model quality and multimodal inputs remain unverified |
 | DeepSeek-V4 | Hash/tid2eid routing, sqrt-softplus/clipped SwiGLU, shared-attention sinks, native source/export and full-model gate |
 | Kimi K2 | Tokenizer/tool-order primitives are integrated; complete cross-branch numerical/tokenizer/template gate remains pending |
 | GLM-4.7-Flash / Sarvam | Source/export gating and latent-epsilon distinction / BOS-ID conflict; corrected diagnostics do not establish standard-export support |

@@ -703,30 +703,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!described) return described.status();
     model->config_ = std::move(described).value();
     const ModelConfig& c = model->config_;
-    bool extended_identity = c.spec->nope_period > 0 || c.spec->nope_global;
-    for (const BlockPlan& block : c.blocks) {
-        extended_identity = extended_identity || (block.qk_norm_whole && block.n_head > 1) ||
-                            (block.mixer != MixerKind::None && !block.norm_before_mixer) ||
-                            (block.ffn != FfnKind::None && !block.norm_before_ffn);
-    }
-    for (const char* suffix : {"attention.head_count", "attention.head_count_kv", "feed_forward_length"}) {
-        const GgufValue* value = f.metadata(c.arch + "." + suffix);
-        if (value != nullptr && value->type == GgufValue::Type::Array) {
-            extended_identity = true;
-            break;
-        }
-    }
-    for (const char* suffix : {"embedding_scale", "residual_scale", "logit_scale", "attention.rope_pattern",
-                               "attention.temperature_scale", "attention.temperature_length"}) {
-        if (f.metadata(c.arch + "." + suffix) != nullptr) {
-            extended_identity = true;
-            break;
-        }
-    }
-    const auto tokenizer_pre = f.get_string("tokenizer.ggml.pre");
-    extended_identity = extended_identity ||
-                        (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits" || *tokenizer_pre == "llama-bpe-merges"));
-    if (extended_identity) {
+    if (c.full_header_identity) {
         // Geometry, scalars, norm placement and tokenizer flags can be beyond
         // the first MiB. Equal-sized edits must invalidate states and every
         // derived calibration/cache key. Hash the complete first header before
@@ -865,7 +842,10 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (c.spec->shared_kv && kv.window > 0) {
         return Status(ErrorCode::Unsupported, "shared K=V attention requires the model's own sliding window and compressed entries");
     }
-    if (kv.type != KvCacheType::F16 && (c.head_dim % quant::kBlock != 0 || kv.value_offset % quant::kBlock != 0)) {
+    if (kv.type != KvCacheType::F16 && (c.head_dim % quant::kBlock != 0 || kv.value_offset % quant::kBlock != 0 ||
+        std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) {
+            return b.mixer == MixerKind::Attention && b.head_dim % quant::kBlock != 0;
+        }))) {
         LIYAB_LOG_WARN("head_dim %d (values from channel %d) is not in whole blocks of %d; using an F16 KV cache",
                        c.head_dim, kv.value_offset, quant::kBlock);
         kv.type = KvCacheType::F16;
@@ -874,87 +854,14 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!cache) return cache.status();
     model->kv_ = std::move(cache).value();
 
-    // RoPE inverse frequencies, with optional per-pair factors: Llama 3.x's
-    // rope_freqs, or LongRoPE's (Phi-3), whose long factors apply when the
-    // context is longer than the original one. The reference picks them by
-    // the sequence's length instead; with one table for the whole context,
-    // keys never need rotating again (a context up to the original length
-    // matches the reference exactly).
-    std::vector<float> factors(static_cast<size_t>(c.rope_dim / 2), 1.0f);
-    const char* factor_tensor = c.rope_ctx_orig == 0                         ? "rope_freqs.weight"
-                                : model->context_length_ > c.rope_ctx_orig ? "rope_factors_long.weight"
-                                                                           : "rope_factors_short.weight";
-    if (const TensorView* rf = f.tensor(factor_tensor)) {
-        if (rf->elements() != c.rope_dim / 2 || rf->type != DType::F32) {
-            return Status(ErrorCode::InvalidModel, std::string(factor_tensor) + " has an unexpected shape");
-        }
-        quant::dequantize_row(DType::F32, rf->data, factors.data(), rf->elements());
-    }
-    auto table = [&](float base, float scale, const std::vector<float>& divisors, const YarnRope* yarn) {
-        RopeTable t;
-        t.scale = scale;
-        t.inv_freq.resize(divisors.size());
-        // YaRN: pair i keeps the share e(i) of its own frequency and takes
-        // 1 - e(i) of it divided by the factor; e falls linearly from 1 to 0
-        // between the pairs that turn beta_fast and beta_slow times over the
-        // original context (the reference's correction range), times
-        // ext_factor. One table for every position: keys never need
-        // rotating again, and the result does not depend on the context.
-        double low = 0.0, high = 0.0;
-        if (yarn != nullptr) {
-            const double dims = c.rope_dim;
-            auto pair_turning = [&](double turns) {  // the (fractional) pair that turns `turns` times
-                return dims * std::log(yarn->ctx_orig / (turns * 2.0 * std::numbers::pi)) /
-                       (2.0 * std::log(static_cast<double>(base)));
-            };
-            low = pair_turning(yarn->beta_fast);
-            high = pair_turning(yarn->beta_slow);
-            if (yarn->truncate) {
-                low = std::floor(low);
-                high = std::ceil(high);
-            }
-            low = std::max(low, 0.0);
-            high = std::min(high, dims - 1.0);
-            if (high == low) high += 0.001;  // as the reference: no division by zero
-        }
-        for (size_t i = 0; i < divisors.size(); ++i) {
-            const double freq = std::pow(static_cast<double>(base), -2.0 * static_cast<double>(i) / c.rope_dim);
-            if (yarn == nullptr) {
-                t.inv_freq[i] = static_cast<float>(freq / divisors[i]);
-                continue;
-            }
-            const double ramp = std::clamp((static_cast<double>(i) - low) / (high - low), 0.0, 1.0);
-            const double extrapolated = (1.0 - ramp) * yarn->ext_factor;
-            const double original = freq / divisors[i];
-            t.inv_freq[i] = static_cast<float>(original / yarn->factor * (1.0 - extrapolated) + original * extrapolated);
-        }
-        return t;
-    };
-    model->rope_tables_.push_back(table(c.rope_base, c.rope_scale, factors, c.yarn.factor > 0.0f ? &c.yarn : nullptr));
-    model->rope_tables_.back().magnitude = c.rope_magnitude;
-    // Windowed blocks with a base of their own rotate unscaled, without the
-    // global frequency factors (Gemma 3's local RoPE).
-    if (c.rope_base_swa > 0.0f) {
-        model->rope_tables_.push_back(table(c.rope_base_swa, 1.0f, std::vector<float>(factors.size(), 1.0f), nullptr));
-    }
-    int32_t compression_table = 0;
-    if (c.spec->shared_kv) {
-        compression_table = static_cast<int32_t>(model->rope_tables_.size());
-        auto compressed = table(c.compress_rope_base, c.rope_scale, factors,
-                                c.yarn.factor > 0.0f ? &c.yarn : nullptr);
-        compressed.magnitude = c.rope_magnitude;
-        model->rope_tables_.push_back(std::move(compressed));
-        // The main, sliding-only stream has plain RoPE even when compressed
-        // layers use YaRN. No table is changed for existing architectures.
-        model->rope_tables_[0] = table(c.rope_base, 1.0f, std::vector<float>(factors.size(), 1.0f), nullptr);
-    }
+    auto rotary = make_rotary_plan(f, c, model->context_length_);
+    if (!rotary) return rotary.status();
+    model->rope_tables_ = std::move(rotary->tables);
     for (int32_t l = 0; l < c.n_layers; ++l) {
-        Layer& L = model->layers_[static_cast<size_t>(l)];
+        Layer& layer = model->layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
-        if (plan.mixer != MixerKind::Attention || !plan.windowed) continue;
-        L.window = c.sliding_window;
-        if (c.rope_base_swa > 0.0f) L.rope_table = 1;
-        if (c.spec->shared_kv) L.rope_table = plan.compression.stride > 0 ? compression_table : 0;
+        layer.rope_table = rotary->block_tables[static_cast<size_t>(l)];
+        if (plan.mixer == MixerKind::Attention && plan.windowed) layer.window = c.sliding_window;
     }
 
     if (c.n_expert > 0) {
@@ -1107,13 +1014,13 @@ Status Transformer::bind_weights() {
     if (c.n_positions > 0) position_embd_ = f.tensor("position_embd.weight");  // shape checked by describe_model()
     // Per-head Q/K norms: one weight shared by every head, or one row per
     // head (a [head_dim, heads] tensor: StableLM 2 12B, Command-R+).
-    auto qk_vec = [&](const std::string& name, int64_t heads, std::vector<float>& out) -> Status {
+    auto qk_vec = [&](const std::string& name, int64_t heads, int32_t head_dim, std::vector<float>& out) -> Status {
         const TensorView* t = f.tensor(name);
         if (t == nullptr) return Status::ok();
-        const bool per_head = t->n_dims == 2 && t->ne[0] == c.head_dim && t->ne[1] == heads && heads > 1;
-        if (t->elements() != c.head_dim && !per_head) {
+        const bool per_head = t->n_dims == 2 && t->ne[0] == head_dim && t->ne[1] == heads && heads > 1;
+        if (t->elements() != head_dim && !per_head) {
             return Status(ErrorCode::Unsupported, "tensor '" + name + "' is not a per-head norm of " +
-                                                      std::to_string(c.head_dim) + " (norms over all heads together "
+                                                      std::to_string(head_dim) + " (norms over all heads together "
                                                       "are not supported)");
         }
         return vec(name, t->elements(), true, out);
@@ -1150,8 +1057,8 @@ Status Transformer::bind_weights() {
         if (plan.mixer == MixerKind::Attention) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
         }
-        const int64_t q_dim = int64_t{plan.n_head} * c.head_dim;
-        const int64_t kv_dim = int64_t{plan.n_head_kv} * c.head_dim;
+        const int64_t q_dim = int64_t{plan.n_head} * plan.head_dim;
+        const int64_t kv_dim = int64_t{plan.n_head_kv} * plan.head_dim;
         if (c.hc_count > 0) {
             const int64_t width = int64_t{c.hc_count} * (2 + c.hc_count);
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "hc_attn_fn.weight"), int64_t{c.hc_count} * c.n_embd, width, L.w[kHcAttn]));
@@ -1286,11 +1193,11 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), q_dim, false, L.q_norm));
                 if (own_kv) LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), kv_dim, false, L.k_norm));
             } else {
-            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), plan.n_head, L.q_norm));
-            if (own_kv) LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), plan.n_head_kv, L.k_norm));
+            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), plan.n_head, plan.head_dim, L.q_norm));
+            if (own_kv) LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), plan.n_head_kv, plan.head_dim, L.k_norm));
             if (c.spec->norm == NormKind::Layer) {
-                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), plan.n_head, L.q_norm_b));
-                if (own_kv) LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), plan.n_head_kv, L.k_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), plan.n_head, plan.head_dim, L.q_norm_b));
+                if (own_kv) LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), plan.n_head_kv, plan.head_dim, L.k_norm_b));
             }
             }
         } else if (plan.mixer == MixerKind::Mamba || plan.mixer == MixerKind::Mamba2) {
@@ -1449,13 +1356,18 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
             continue;
         }
-        if (plan.ffn == FfnKind::Dense) {
+        if (plan.parallel_ffn) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "pre_ffw_norm_2.weight"), c.n_embd, true, L.expert_norm));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "post_ffw_norm_1.weight"), c.n_embd, true, L.dense_post_norm));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "post_ffw_norm_2.weight"), c.n_embd, true, L.expert_post_norm));
+        }
+        if (plan.ffn == FfnKind::Dense || plan.parallel_ffn) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
-            if (!plan.fused_gate_up) {
+            if (!(plan.parallel_ffn ? plan.dense_fused_gate_up : plan.fused_gate_up)) {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate.bias"), plan.n_ff, false, L.b_gate));
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), plan.n_ff, false, L.b_up));
             }
-            if (plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
+            if (plan.parallel_ffn ? plan.dense_fused_gate_up : plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
                 LIYAB_RETURN_IF_ERROR(
                     matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{plan.n_ff}, L.w[kUp]));
                 std::vector<float> bias;
@@ -1469,10 +1381,14 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, plan.n_ff, L.w[kUp]));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), plan.n_ff, c.n_embd, L.w[kDown]));
-            continue;
+            if (!plan.parallel_ffn) continue;
         }
         if (plan.ffn == FfnKind::None) continue;
         LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate_inp.weight"), c.n_embd, c.n_expert, L.w[kRouter]));
+        if (plan.router_input_rms) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_inp.scale"), c.n_embd, true, L.router_scale));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down_exps.scale"), c.n_expert, true, L.expert_scale));
+        }
         auto experts = [&](const char* suffix, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
             const std::string name = block_tensor(l, suffix);
             const TensorView* t = f.tensor(name);
@@ -1532,52 +1448,6 @@ size_t Transformer::recurrent_state_bytes() const noexcept {
 // ---------------------------------------------------------------------------
 // Forward pass
 // ---------------------------------------------------------------------------
-Status CombinedLatentWeights::bind(const TensorView& source, const LatentAttention& m, int32_t n_heads) {
-    if (m.kv_rank <= 0 || m.nope_dim <= 0 || m.v_dim <= 0 || n_heads <= 0 || source.n_dims != 2 ||
-        source.ne[2] != 1 || source.ne[3] != 1 ||
-        source.cols() != m.kv_rank || source.rows() != int64_t{n_heads} * (int64_t{m.nope_dim} + m.v_dim)) {
-        return Status(ErrorCode::InvalidModel, "combined latent expansion has inconsistent dimensions");
-    }
-    DType type;
-    if (!dtype_from_ggml(static_cast<uint32_t>(source.type), type) ||
-        m.kv_rank % dtype_traits(type).block_size != 0) {
-        return Status(ErrorCode::Unsupported, "combined latent expansion needs ordinary on-disk weight rows");
-    }
-    if (source.data == nullptr || source.nbytes / source.row_bytes() < static_cast<size_t>(source.rows())) {
-        return Status(ErrorCode::InvalidModel, "combined latent expansion has incomplete weight rows");
-    }
-    const auto rank = static_cast<size_t>(m.kv_rank);
-    const auto nope = static_cast<size_t>(m.nope_dim);
-    const auto vd = static_cast<size_t>(m.v_dim);
-    const auto heads = static_cast<size_t>(n_heads);
-    if (nope > std::numeric_limits<size_t>::max() / heads / rank / sizeof(float)) {
-        return Status(ErrorCode::InvalidModel, "combined latent expansion is too large");
-    }
-    keys_.resize(heads * rank * nope);
-    values_.resize(heads * vd * source.row_bytes());
-    std::vector<float> row(rank);
-    for (size_t h = 0; h < heads; ++h) {
-        const auto start = static_cast<int64_t>(h * (nope + vd));
-        for (size_t i = 0; i < nope; ++i) {
-            quant::dequantize_row(source.type, source.row(start + static_cast<int64_t>(i)), row.data(), m.kv_rank);
-            for (size_t r = 0; r < rank; ++r) keys_[(h * rank + r) * nope + i] = row[r];
-        }
-        std::memcpy(values_.data() + h * vd * source.row_bytes(),
-                    source.row(start + m.nope_dim), vd * source.row_bytes());
-    }
-    key_ = source;
-    key_.type = DType::F32;
-    key_.n_dims = 3;
-    key_.ne = {m.nope_dim, m.kv_rank, n_heads, 1};
-    key_.data = reinterpret_cast<const uint8_t*>(keys_.data());
-    key_.nbytes = keys_.size() * sizeof(float);
-    value_ = source;
-    value_.n_dims = 3;
-    value_.ne = {m.kv_rank, m.v_dim, n_heads, 1};
-    value_.data = values_.data();
-    value_.nbytes = values_.size();
-    return Status::ok();
-}
 
 class Transformer::BlockWeights {
 public:
@@ -2115,7 +1985,7 @@ void Transformer::set_rollback_window(int32_t positions) {
     }
 }
 void Transformer::rope(float* vec, int32_t n_heads, int32_t pos, const RopeTable& table) const {
-    rope(vec, n_heads, static_cast<size_t>(config_.head_dim), pos, table);
+    rope(vec, n_heads, static_cast<size_t>(table.head_dim), pos, table);
 }
 
 void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const {
@@ -2124,7 +1994,7 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 
 void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table,
                        RopeLayout layout) const {
-    const int32_t half = config_.rope_dim / 2;
+    const int32_t half = static_cast<int32_t>(table.inv_freq.size());
     const bool halves = layout == RopeLayout::Halves;
     const float p = static_cast<float>(pos) / table.scale;
     for (int32_t h = 0; h < n_heads; ++h) {
@@ -2203,14 +2073,14 @@ void Transformer::attention(const Layer& L, int32_t n, ThreadPool& pool, const u
     }
     const int32_t* row_list = all_rows ? nullptr : attn_rows_.data();
     auto row_at = [row_list](int64_t i) { return row_list == nullptr ? static_cast<int32_t>(i) : row_list[i]; };
-    const int32_t hd = c.head_dim;
+    const int32_t hd = plan.head_dim;
     const int32_t group = plan.n_head / plan.n_head_kv;
     // Values may be narrower than keys (latent attention: the latent part of
     // each key row); every value-sized buffer below follows value_dim.
-    const int32_t vd = c.value_dim;
+    const int32_t vd = plan.value_dim;
     const auto uvd = static_cast<size_t>(vd);
     const size_t out_dim = static_cast<size_t>(plan.n_head) * uvd;  // att_ row: every head's output
-    const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
+    const float scale = plan.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
     const float softcap = c.attn_softcap;
     const DType kv_type = segs_.front().kv->dtype();  // every context's cache has the same format
     const bool quantized_kv = quant::is_block_quantized(kv_type);
@@ -2642,8 +2512,8 @@ Status Transformer::project_fused_qkv(const Layer& L, const Route& route, Backen
                                       int32_t n) {
     const ModelConfig& c = config_;
     const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
-    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(c.head_dim);
-    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(plan.head_dim);
+    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(plan.head_dim);
     const size_t row = q_dim + 2 * kv_dim;
     qkv_.resize(static_cast<size_t>(n) * row);
     LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kQkv], xb_.data(), qkv_.data(), n));
@@ -2681,18 +2551,18 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         }
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         if (plan.values_from_keys) {
-            std::copy_n(k_.data(), static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim), v_.data());
+            std::copy_n(k_.data(), static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(plan.head_dim), v_.data());
         }
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
         if (!c.blocks[static_cast<size_t>(l)].latent) {
-            const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+            const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(plan.head_dim);
             clamp_kqv(k_.data(), kv_dim);
             clamp_kqv(v_.data(), kv_dim);
         }
         if (c.spec->value_norm) {
-            const auto hd = static_cast<size_t>(c.head_dim);
-            for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
-                const float scale = rms_scale(v_.data() + h * hd, c.head_dim, c.rms_eps);
+            const auto hd = static_cast<size_t>(plan.head_dim);
+            for (size_t h = 0; h < static_cast<size_t>(plan.n_head_kv); ++h) {
+                const float scale = rms_scale(v_.data() + h * hd, plan.head_dim, c.rms_eps);
                 for (size_t i = 0; i < hd; ++i) v_[h * hd + i] *= scale;
             }
         }
@@ -2714,7 +2584,8 @@ KeyScalingShape Transformer::key_scaling_shape() const {
     // so every process gets the same factors (and the same replies).
     const int32_t positions = c.n_ctx_train > 0 ? std::min(c.n_ctx_train, kKeyRangePositions) : kKeyRangePositions;
     KeyScalingShape shape{c.n_kv_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim,
-                          c.spec->rope, {}, {}, positions, {}, {}};
+                          c.spec->rope, {}, {}, positions, {}, {}, 1.0f, {}, {}};
+    for (const BlockPlan& plan : c.blocks) shape.rope_dim = std::max(shape.rope_dim, plan.rope_dim);
     if (c.attn_temp_scale != 0.0f) {
         shape.query_scale = static_cast<float>(
             1.0 + c.attn_temp_scale * std::log1p(std::floor(static_cast<double>(positions - 1) / c.attn_temp_length)));
@@ -2727,7 +2598,11 @@ KeyScalingShape Transformer::key_scaling_shape() const {
         if (L.kv_slot < 0 || c.blocks[l].kv_source >= 0) continue;
         const RopeTable& t = rope_tables_[static_cast<size_t>(L.rope_table)];
         const bool rotated = c.blocks[l].rope;  // a NoPE block's pairs never turn
-        for (const float f : t.inv_freq) shape.pair_speed.push_back(rotated ? f / t.scale : 0.0f);
+        for (size_t i = 0; i < static_cast<size_t>(shape.rope_dim / 2); ++i) {
+            shape.pair_speed.push_back(rotated && i < t.inv_freq.size() ? t.inv_freq[i] / t.scale : 0.0f);
+        }
+        shape.head_dims.push_back(c.blocks[l].head_dim);
+        shape.rope_dims.push_back(c.blocks[l].rope_dim);
         shape.rope_magnitude.push_back(rotated ? t.magnitude : 1.0f);
         shape.query_heads.push_back(c.blocks[l].n_head);
         shape.kv_heads.push_back(c.blocks[l].n_head_kv);
@@ -2738,23 +2613,23 @@ KeyScalingShape Transformer::key_scaling_shape() const {
 void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
     const ModelConfig& c = config_;
     const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
-    const auto hd = static_cast<size_t>(c.head_dim);
+    const auto hd = static_cast<size_t>(plan.head_dim);
     // Head h's weight (and bias): row h of a per-head norm, else the one shared row.
     auto row = [hd](const std::vector<float>& v, size_t h) {
         return v.empty() ? nullptr : v.data() + (v.size() > hd ? h * hd : 0);
     };
     if (q != nullptr && (!L.q_norm.empty() || !L.q_norm_b.empty())) {
         if (plan.qk_norm_whole) {
-            norm_row(q, opt(L.q_norm), opt(L.q_norm_b), q, plan.n_head * c.head_dim);
+            norm_row(q, opt(L.q_norm), opt(L.q_norm_b), q, plan.n_head * plan.head_dim);
         } else for (size_t h = 0; h < static_cast<size_t>(plan.n_head); ++h) {
-            norm_row(q + h * hd, row(L.q_norm, h), row(L.q_norm_b, h), q + h * hd, c.head_dim);
+            norm_row(q + h * hd, row(L.q_norm, h), row(L.q_norm_b, h), q + h * hd, plan.head_dim);
         }
     }
     if (k != nullptr && (!L.k_norm.empty() || !L.k_norm_b.empty())) {
         if (plan.qk_norm_whole) {
-            norm_row(k, opt(L.k_norm), opt(L.k_norm_b), k, plan.n_head_kv * c.head_dim);
+            norm_row(k, opt(L.k_norm), opt(L.k_norm_b), k, plan.n_head_kv * plan.head_dim);
         } else for (size_t h = 0; h < static_cast<size_t>(plan.n_head_kv); ++h) {
-            norm_row(k + h * hd, row(L.k_norm, h), row(L.k_norm_b, h), k + h * hd, c.head_dim);
+            norm_row(k + h * hd, row(L.k_norm, h), row(L.k_norm_b, h), k + h * hd, plan.head_dim);
         }
     }
 }
@@ -2804,7 +2679,7 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
     // factor, the same for every rotation (a rotation keeps the norm). So the
     // ranges see x * s, unrotated, and the norm weight w as a gain applied
     // after the rotation (KeyRanges::add).
-    const auto hd = static_cast<size_t>(c.head_dim);
+    const auto hd = static_cast<size_t>(plan.head_dim);
     // RoPE's magnitude (LongRoPE) scales the rotated channels before the norm.
     const float magnitude = c.blocks[static_cast<size_t>(&L - layers_.data())].rope
                                 ? rope_tables_[static_cast<size_t>(L.rope_table)].magnitude
@@ -2817,8 +2692,8 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
         for (size_t h = 0; h < static_cast<size_t>(heads); ++h) {
             float* xh = out.data() + h * hd;
             std::copy(xh, xh + hd, rotated.begin());
-            for (size_t i = 0; i < static_cast<size_t>(c.rope_dim); ++i) rotated[i] *= magnitude;
-            const float s = rms_scale(rotated.data(), c.head_dim, c.rms_eps);
+            for (size_t i = 0; i < static_cast<size_t>(plan.rope_dim); ++i) rotated[i] *= magnitude;
+            const float s = rms_scale(rotated.data(), plan.head_dim, c.rms_eps);
             for (size_t i = 0; i < hd; ++i) xh[i] *= s;
         }
     };
@@ -2833,11 +2708,12 @@ void Transformer::scale_keys(const Layer& L, float* q, float* k) const {
     if (key_scale_.empty()) return;
     const ModelConfig& c = config_;
     const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
-    const auto hd = static_cast<size_t>(c.head_dim);
+    const auto hd = static_cast<size_t>(plan.head_dim);
+    const auto stored = static_cast<size_t>(c.head_dim);
     const auto group = static_cast<size_t>(plan.n_head / plan.n_head_kv);
-    const float* t = key_scale_.data() + static_cast<size_t>(L.kv_slot) * static_cast<size_t>(c.n_head_kv) * hd;
+    const float* t = key_scale_.data() + static_cast<size_t>(L.kv_slot) * static_cast<size_t>(c.n_head_kv) * stored;
     for (size_t g = 0; g < static_cast<size_t>(plan.n_head_kv); ++g) {
-        const float* tg = t + g * hd;
+        const float* tg = t + g * stored;
         if (k != nullptr) {
             float* kg = k + g * hd;
             for (size_t i = 0; i < hd; ++i) kg[i] /= tg[i];
@@ -2853,16 +2729,17 @@ void Transformer::scale_keys(const Layer& L, float* q, float* k) const {
 void Transformer::store_kv(const Layer& L, KvCache& cache, int32_t pos, const float* k, const float* v) {
     const ModelConfig& c = config_;
     const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
-    if (plan.n_head_kv == c.n_head_kv) {
+    if (plan.n_head_kv == c.n_head_kv && plan.head_dim == c.head_dim && plan.value_dim == c.value_dim) {
         cache.store(L.kv_slot, pos, k, v);
         return;
     }
-    const size_t active = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
-    const size_t padded = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
-    padded_k_.assign(padded, 0.0f);
-    padded_v_.assign(padded, 0.0f);
-    std::copy(k, k + active, padded_k_.begin());
-    std::copy(v, v + active, padded_v_.begin());
+    const size_t stride = static_cast<size_t>(c.head_dim);
+    padded_k_.assign(static_cast<size_t>(c.n_head_kv) * stride, 0.0f);
+    padded_v_.assign(static_cast<size_t>(c.n_head_kv) * stride, 0.0f);
+    for (size_t h = 0; h < static_cast<size_t>(plan.n_head_kv); ++h) {
+        std::copy_n(k + h * static_cast<size_t>(plan.head_dim), plan.head_dim, padded_k_.data() + h * stride);
+        std::copy_n(v + h * static_cast<size_t>(plan.value_dim), plan.value_dim, padded_v_.data() + h * stride);
+    }
     cache.store(L.kv_slot, pos, padded_k_.data(), padded_v_.data());
 }
 
@@ -3020,9 +2897,9 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     const bool head_gate = L.w[kZ] != nullptr && L.w[kZ]->rows() == plan.n_head;
     const bool own_kv = plan.kv_source < 0;
     const auto un = static_cast<size_t>(n);
-    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(c.head_dim);
-    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
-    const size_t hd = static_cast<size_t>(c.head_dim);
+    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(plan.head_dim);
+    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(plan.head_dim);
+    const size_t hd = static_cast<size_t>(plan.head_dim);
     const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
     const bool rotated = c.blocks[static_cast<size_t>(layer)].rope;  // false: a NoPE block
@@ -3081,7 +2958,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             if (c.spec->value_norm) {
                 for (size_t h = 0; h < static_cast<size_t>(plan.n_head_kv); ++h) {
                     float* vh = v + h * hd;
-                    const float scale = rms_scale(vh, c.head_dim, c.rms_eps);
+                    const float scale = rms_scale(vh, plan.head_dim, c.rms_eps);
                     for (size_t i = 0; i < hd; ++i) vh[i] *= scale;
                 }
             }
@@ -4743,6 +4620,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
         if (plan.norm_before_ffn) norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), pred_in_.data() + t * d, c.n_embd);
         else std::copy_n(x_.data() + t * d, d, pred_in_.data() + t * d);
     }
+    if (!L.router_scale.empty()) normalize_router_input(L, x_.data(), pred_in_.data(), n);
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     if (!L.router_bias.empty()) {
         for (size_t t = 0; t < un; ++t) {
@@ -4857,7 +4735,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
         return Status::ok();
     }
-    if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
+    if (plan.parallel_ffn ? plan.dense_fused_gate_up : plan.fused_gate_up) {
         // One [gate | up] projection per token (no per-projection hook: the
         // halves are one matrix); act(gate) * up lands in hb_.
         const auto ff = static_cast<size_t>(plan.n_ff);
@@ -4924,6 +4802,18 @@ size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const
 // optionally with the expert's own bias).
 // Tokens are grouped by expert so a batch reads every expert once. A shared
 // expert, optionally scaled by sigmoid(shared_gate . x), is added on top.
+// The router can read the residual through its own unweighted RMS norm,
+// independently of the weighted norm that prepares the expert projections.
+void Transformer::normalize_router_input(const Layer& L, const float* input, float* out, int32_t n) const {
+    const auto d = static_cast<size_t>(config_.n_embd);
+    const float root = 1.0f / std::sqrt(static_cast<float>(d));
+    for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
+        const float* row = input + t * d;
+        const float scale = rms_scale(row, config_.n_embd, config_.rms_eps);
+        for (size_t i = 0; i < d; ++i) out[t * d + i] = ((row[i] * scale) * L.router_scale[i]) * root;
+    }
+}
+
 Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route) {
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
@@ -4943,7 +4833,13 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     // read a miss waits for, and their uses are what the cache should keep.
     if (expert_store_ != nullptr) expert_store_->set_batch(n > 1 && !steps_only_);
     router_.resize(un * E);
-    LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], xb_.data(), router_.data(), n));
+    const float* router_input = xb_.data();
+    if (!L.router_scale.empty()) {
+        router_input_.resize(un * d);
+        normalize_router_input(L, x_.data(), router_input_.data(), n);
+        router_input = router_input_.data();
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kRouter], router_input, router_.data(), n));
     if (!L.router_bias.empty()) {  // a router with a bias (gpt-oss): part of the logits, selection and weights alike
         for (size_t t = 0; t < un; ++t) {
             for (size_t e = 0; e < E; ++e) router_[t * E + e] += L.router_bias[e];
@@ -5002,7 +4898,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
         for (size_t k = 0; k < kept; ++k) {
             const auto e = static_cast<size_t>(order[k]);
             assigned[e].push_back(
-                {static_cast<int32_t>(t), static_cast<int32_t>(k), probs[e] * norm * c.moe_weights_scale});
+                {static_cast<int32_t>(t), static_cast<int32_t>(k), probs[e] * norm * c.moe_weights_scale * (L.expert_scale.empty() ? 1.0f : L.expert_scale[e])});
             token_weight[t] += assigned[e].back().weight;
         }
     }
@@ -5573,7 +5469,20 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
             else std::copy_n(x_.data() + t * d, d, xb_.data() + t * d);
         }
     }
-    if (moe) {
+    if (plan.parallel_ffn) {
+        {
+            const PhaseTimer timer(phases_.dense_ffn);
+            LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
+        }
+        post_norm(L.dense_post_norm);
+        parallel_ffn_out_.assign(xb_.begin(), xb_.begin() + static_cast<std::ptrdiff_t>(un * d));
+        for (size_t t = 0; t < un; ++t) {
+            norm_row(x_.data() + t * d, L.expert_norm.data(), nullptr, xb_.data() + t * d, c.n_embd);
+        }
+        LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
+        post_norm(L.expert_post_norm);
+        for (size_t i = 0; i < un * d; ++i) xb_[i] = parallel_ffn_out_[i] + xb_[i];
+    } else if (moe) {
         LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
     } else {
         const PhaseTimer timer(phases_.dense_ffn);
@@ -5957,13 +5866,11 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
     // Nothing turns: every row keeps its bits.
     if (count == 0 || from == to || c.rope_dim == 0) return Status::ok();
     const DType type = kv_->dtype();
-    const int32_t half = c.rope_dim / 2;
     const bool halves = c.spec->rope == RopeLayout::Halves;
     const auto hd = static_cast<size_t>(c.head_dim);
     // The leading channels a move touches: the rotated ones, in whole blocks
     // of a quantized row (the blocks after them keep their bits).
     const int32_t block = quant::is_block_quantized(type) ? quant::kBlock : 1;
-    const int32_t touched = std::min(c.head_dim, (c.rope_dim + block - 1) / block * block);
     const bool norm_after = c.spec->qk_norm == QkNormOrder::AfterRope;
 
     // Each table's turns, back from the stored positions and on to the new
@@ -5974,8 +5881,9 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
     std::vector<Turns> turns(rope_tables_.size());
     auto turns_of = [&](size_t table) -> const Turns& {
         Turns& t = turns[table];
-        if (!t.cos_from.empty() || half == 0) return t;
         const RopeTable& rt = rope_tables_[table];
+        const auto half = static_cast<int32_t>(rt.inv_freq.size());
+        if (!t.cos_from.empty() || half == 0) return t;
         const auto n = static_cast<size_t>(count) * static_cast<size_t>(half);
         t.cos_from.resize(n);
         t.sin_from.resize(n);
@@ -6003,6 +5911,8 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
         const Turns* turns = nullptr;
         std::vector<float> unscale, rescale;  // [kv_head][touched channel]
         int32_t heads = 0;
+        int32_t rope_dim = 0;
+        int32_t touched = 0;
     };
     std::vector<Slot> blocks;
     for (const Layer& L : layers_) {
@@ -6013,6 +5923,9 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
         if (!c.blocks[static_cast<size_t>(&L - layers_.data())].rope) continue;
         Slot& s = blocks[static_cast<size_t>(L.kv_slot)];
         s.heads = c.blocks[static_cast<size_t>(&L - layers_.data())].n_head_kv;
+        s.rope_dim = c.blocks[static_cast<size_t>(&L - layers_.data())].rope_dim;
+        s.touched = (s.rope_dim + block - 1) / block * block;
+        const int32_t touched = s.touched;
         s.turns = &turns_of(static_cast<size_t>(L.rope_table));
         s.unscale.assign(static_cast<size_t>(s.heads) * static_cast<size_t>(touched), 1.0f);
         s.rescale.assign(s.unscale.size(), 1.0f);
@@ -6028,19 +5941,20 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
     const auto n_blocks = static_cast<int64_t>(blocks.size());
     auto move = [&](int64_t begin, int64_t end) {
         thread_local std::vector<float> row;
-        row.resize(static_cast<size_t>(touched));
         for (int64_t task = begin; task < end; ++task) {
             const auto slot = static_cast<int32_t>(task % n_blocks);
             const auto i = static_cast<int32_t>(task / n_blocks);
             const Slot& s = blocks[static_cast<size_t>(slot)];
             if (s.turns == nullptr) continue;
+            const int32_t touched = s.touched, half = s.rope_dim / 2;
+            row.resize(static_cast<size_t>(touched));
             const size_t at = static_cast<size_t>(i) * static_cast<size_t>(half);
             for (int32_t g = 0; g < s.heads; ++g) {
                 uint8_t* r = image + kv_->image_key_offset(slots, slot, first + i, g);
                 quant::dequantize_row(type, r, row.data(), touched);
                 const float* un = s.unscale.data() + static_cast<size_t>(g) * static_cast<size_t>(touched);
                 const float* re = s.rescale.data() + static_cast<size_t>(g) * static_cast<size_t>(touched);
-                for (int32_t ch = 0; ch < c.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= un[ch];
+                for (int32_t ch = 0; ch < s.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= un[ch];
                 for (int32_t j = 0; j < half; ++j) {
                     const int32_t a = halves ? j : 2 * j;
                     const int32_t b = halves ? j + half : 2 * j + 1;
@@ -6053,7 +5967,7 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
                     row[static_cast<size_t>(a)] = x0 * s.turns->cos_to[k] - x1 * s.turns->sin_to[k];
                     row[static_cast<size_t>(b)] = x0 * s.turns->sin_to[k] + x1 * s.turns->cos_to[k];
                 }
-                for (int32_t ch = 0; ch < c.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= re[ch];
+                for (int32_t ch = 0; ch < s.rope_dim; ++ch) row[static_cast<size_t>(ch)] *= re[ch];
                 quant::quantize_row(type, row.data(), r, touched);
             }
         }

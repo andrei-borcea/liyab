@@ -515,6 +515,11 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (s.logit_scale != 0.0f) w.add_f32(a + ".logit_scale", s.logit_scale);
     if (s.attn_temp_scale != 0.0f) w.add_f32(a + ".attention.temperature_scale", s.attn_temp_scale);
     if (s.attn_temp_length != 0) w.add_u32(a + ".attention.temperature_length", static_cast<uint32_t>(s.attn_temp_length));
+    if (s.swa_head_dim > 0) {
+        w.add_u32(a + ".attention.key_length_swa", static_cast<uint32_t>(s.swa_head_dim));
+        w.add_u32(a + ".attention.value_length_swa", static_cast<uint32_t>(s.swa_head_dim));
+    }
+    if (s.swa_rope_dim > 0) w.add_u32(a + ".rope.dimension_count_swa", static_cast<uint32_t>(s.swa_rope_dim));
     if (s.sliding_window > 0) w.add_u32(a + ".attention.sliding_window", static_cast<uint32_t>(s.sliding_window));
     if (!s.swa_layers.empty()) {
         w.add_bool_array(a + ".attention.sliding_window_pattern", s.swa_layers);
@@ -687,6 +692,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
+        const bool windowed = !s.swa_layers.empty() && s.swa_layers[static_cast<size_t>(l)];
+        const int64_t hd = windowed && s.swa_head_dim > 0 ? s.swa_head_dim :
+            (s.head_dim > 0 ? s.head_dim : a == "deepseek4" && s.shared_head_dim > 0 ? s.shared_head_dim : d / s.n_head);
         const int64_t heads = s.block_heads.empty() ? s.n_head : s.block_heads[static_cast<size_t>(l)];
         const int64_t kv_heads = s.block_kv_heads.empty() ? s.n_head_kv : s.block_kv_heads[static_cast<size_t>(l)];
         const int64_t kv = kv_heads * hd;
@@ -992,6 +1000,16 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ffn_up.weight", {d, ff}, s.ffn_type, up);
             w.add_tensor(p + "ffn_down.weight", {ff, d}, s.ffn_type, down);
             continue;
+        }
+        if (s.parallel_experts && s.n_expert > 0) {
+            w.add_tensor(p + "ffn_gate.weight", {d, ff}, s.ffn_type, gate);
+            w.add_tensor(p + "ffn_up.weight", {d, ff}, s.ffn_type, up);
+            w.add_tensor(p + "ffn_down.weight", {ff, d}, s.ffn_type, down);
+            for (const char* name : {"pre_ffw_norm_2.weight", "post_ffw_norm_1.weight", "post_ffw_norm_2.weight"}) {
+                w.add_tensor(p + name, {d}, DType::F32, norm_weights(d));
+            }
+            w.add_tensor(p + "ffn_gate_inp.scale", {d}, DType::F32, norm_weights(d));
+            w.add_tensor(p + "ffn_down_exps.scale", {s.n_expert}, DType::F32, norm_weights(s.n_expert));
         }
         if (s.n_expert == 0 && s.fused_gate_up) {
             std::vector<float> gate_up = gate;
