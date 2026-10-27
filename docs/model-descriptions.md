@@ -453,6 +453,51 @@ bartowski's Q8_0 header, SmolLM2 from bartowski's f16), both give the registry's
 row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
 such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
 
+### Modern block regression check
+
+The modern block, tokenizer and saved-context changes pass 14/14 test suites on native ARM64 with Metal
+available (135.71 s), Rosetta AVX2 (343.65 s) and Rosetta scalar (236.38 s). The experimental Android arm64
+build passes with four build jobs. There are 49 golden cases per platform: all 111 earlier pins are unchanged,
+and 12 new cases add 36 pins. The saved-main Qwen3-0.6B BF16 reference still gives identical 512 IDs, mean/max
+KL 0.00000, top-1 100% and perplexity 27.119 with F16 KV.
+
+Performance compares the frozen main and branch binaries back to back on an M4 Pro. Each configuration has
+a separate warmup pair and six balanced AB/BA pairs, using four threads. CPU `liyab-bench` measures 512-token
+prefill with `--repeat 1`; CLI measurements use an ordinary preselected request per model, a 128-token target,
+at least 64 naturally generated tokens, temperature 0 and seed 42. Main and branch replies and all six work
+counts match: prompt, cached-prefix, generated, forced, proposed-draft and accepted-draft tokens.
+
+Throughputs below are separate main/branch medians in tokens/s. Changes are medians of the six paired
+percentage changes, so they need not equal the percentage change of those throughput medians.
+BF16 Metal-route measurements include the existing CPU matrix fallback; F16 rows verify actual Metal
+projections. No Vulkan runtime measurement was available on this Mac.
+
+| Model | Route | Prefill main → branch | Paired change | Decode main → branch | Paired change |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | CPU CLI | 91.29 → 91.32 | -0.112% | 57.06 → 57.11 | +0.170% |
+| Qwen3-0.6B | CPU bench, 512 tokens | 87.95 → 87.90 | -0.114% | — | — |
+| Qwen3-0.6B | BF16 Metal route / CPU matrix fallback | 91.33 → 91.23 | -0.113% | 57.43 → 57.18 | -0.318% |
+| Llama-3.2-1B-Instruct | CPU CLI | 37.61 → 37.57 | -0.139% | 28.19 → 28.19 | -0.027% |
+| Llama-3.2-1B-Instruct | CPU bench, 512 tokens | 36.75 → 36.80 | +0.272% | — | — |
+| Llama-3.2-1B-Instruct | BF16 Metal route / CPU matrix fallback | 37.65 → 37.62 | +0.068% | 28.29 → 28.20 | -0.266% |
+| Qwen3.5-0.8B | CPU CLI | 84.73 → 84.23 | -0.338% | 53.43 → 53.29 | -0.444% |
+| Qwen3.5-0.8B | CPU bench, 512 tokens | 83.90 → 83.85 | -0.059% | — | — |
+| Qwen3.5-0.8B | BF16 Metal route / CPU matrix fallback | 84.25 → 84.11 | -0.178% | 53.50 → 53.36 | -0.434% |
+| Qwen3-0.6B | F16 Metal projections | 277.96 → 272.59 | -0.668% | 27.06 → 27.30 | +2.200% |
+| Llama-3.2-1B-Instruct | F16 Metal projections | 152.72 → 152.47 | -0.219% | 32.65 → 32.48 | -0.771% |
+| Qwen3.5-0.8B | F16 Metal projections, AC confirmation | 272.60 → 272.35 | -0.085% | 33.13 → 33.02 | -0.231% |
+
+The original 72-pair matrix had 20 of 21 metrics within the symmetric ±3% bound. Its Qwen3.5 F16 Metal
+decode result was faster by +6.2486% (23.265 → 25.259 tokens/s), outside that band; this result is preserved.
+Its prefill medians were 228.58 → 258.05 tokens/s, with a +0.851% paired median change and large individual
+outliers. The original matrix has no per-sample power telemetry, so a specific cause is not assigned to it.
+After a host battery/power-mode confound was identified, only that configuration received a separately
+authorized AC confirmation: the same frozen binaries, request (317 prompt IDs), context 1024 and flags,
+one warmup pair and six measured pairs. All 28 read-only power observations before/after those 14 runs
+show AC power; no system power settings changed. The last row reports that confirmation. The other 20
+original metrics remain accepted, and all 21 effective metrics are within ±3% (-0.7714% to +2.1996%).
+All 60 measured CLI reply pairs and six work counts agree across the original and confirmation runs.
+
 ## Limits
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers

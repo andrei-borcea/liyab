@@ -279,6 +279,12 @@ so equal dimensions cannot mix contexts computed with different layouts or scale
 Per-block geometry is checked against an independent float reference on CPU and available GPU backends. Streamed
 block projections use the existing CPU route because their reused slot addresses cannot identify persistent GPU weights.
 
+The modern block changes pass all 14 host suites on native ARM64, Rosetta AVX2 and Rosetta scalar, plus the
+experimental Android arm64 build. All 111 earlier golden pins remain unchanged; 12 new cases are pinned on
+all three platforms. The three-model CPU/Metal comparison passes the symmetric ±3% bound after a separately
+recorded AC confirmation of its one affected configuration. The original timing outlier and the accepted
+[before/after measurements](docs/model-descriptions.md#modern-block-regression-check) are both retained.
+
 ---
 
 ## Quick start
