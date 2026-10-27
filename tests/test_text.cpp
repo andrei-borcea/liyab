@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/architecture.h"
 #include "core/pre_tokenizer.h"
 #include "core/regex.h"
 #include "core/tokenizer.h"
@@ -457,6 +458,63 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(unknown.status().code() == ErrorCode::Unsupported);
     CHECK(unknown.status().message().find("'starcoder-9'") != std::string::npos);
     CHECK(unknown.status().message().find(names) != std::string::npos);
+}
+
+TEST_CASE("Classic pre-tokenizers match their published tokenizer splits") {
+    const std::string text = "Hello world! test (cats) 123.\nNext";
+    for (const auto& [name, expected] : std::vector<std::pair<const char*, std::vector<std::string>>>{
+             {"bloom", {"Hello", " world", "!", " test", " (", "cats", ")", " 123", ".\n", "Next"}},
+             {"starcoder", {"Hello", " world", "!", " test", " (", "cats", ")", " ", "1", "2", "3", ".", "\n", "Next"}}}) {
+        auto pre = PreTokenizer::for_name(name);
+        REQUIRE(pre.has_value());
+        std::vector<std::string_view> pieces;
+        pre->split(text, pieces);
+        CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+    }
+}
+
+TEST_CASE("Falcon applies digit grouping after byte encoding, including UTF-8 byte fragments") {
+    // tokenizers' Punctuation -> ByteLevel -> Digits -> three-digit Split.
+    // U+00B2 becomes byte-alphabet letters C2 then B2 (a number), split apart.
+    const std::string text = "\xC2\xB2 1234567 a$+!!\n";
+    const std::vector<std::string> expected = {"\xC2", "\xB2", " ", "123", "456", "7", " a", "$+!!", "\n"};
+    auto pre = PreTokenizer::for_name("falcon");
+    REQUIRE(pre.has_value());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+}
+
+TEST_CASE("DBRX follows cl100k contractions, three-digit groups and trailing whitespace") {
+    const std::string text = "We're 2024!\n\n  ";
+    auto pre = PreTokenizer::for_name("dbrx");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) ==
+          std::vector<std::string>({"We", "'re", " ", "202", "4", "!\n\n", "  "}));
+}
+
+TEST_CASE("SentencePiece character maps preserve their trained normalization and reject invalid offsets") {
+    const auto data = SpmNormalizer::registered_map(find_architecture("orion")->spm_charsmap);
+    REQUIRE(!data.empty());
+    auto normalizer = SpmNormalizer::load(data);
+    REQUIRE(normalizer.has_value());
+    // This layer applies the map only. The tokenizer protects user-defined
+    // tabs/newlines before invoking it, as SentencePiece itself does.
+    CHECK(normalizer->normalize("cafe\u0301 １２３\n\nCittà\t～") == "café 123  Città ～");
+    CHECK(normalizer->normalize(std::string("a\x01") + "b\r\nc") == "ab  c");
+    CHECK(normalizer->normalize("a  b") == "a  b");
+    CHECK(normalizer->normalize("e\u0301") == "é");  // a multi-code-point rule
+    CHECK(SpmNormalizer::load({})->normalize("１２３") == "１２３");
+    auto invalid = std::vector<uint8_t>(data.begin(), data.end());
+    invalid[0] = invalid[1] = invalid[2] = invalid[3] = 0xff;
+    CHECK(!SpmNormalizer::load(invalid).has_value());
+    CHECK(!SpmNormalizer::load(data.first(7)).has_value());
+    invalid.assign(data.begin(), data.end());
+    std::fill(invalid.end() - 10, invalid.end(), 0xff);  // missing replacement terminators
+    CHECK(!SpmNormalizer::load(invalid).has_value());
 }
 
 // ---------------------------------------------------------------------------

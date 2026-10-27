@@ -308,6 +308,17 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
     }
 }
 
+TEST_CASE("Classic models: sequences keep positions, parallel inputs, norms and logits separate") {
+    for (const std::string arch : {"gpt2", "gptneox", "bloom", "olmo", "stablelm", "command-r", "apertus", "dbrx"}) {
+        for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            const auto s = test::classic_model_spec(arch);
+            TransformerOptions options;
+            options.kv_type = kv;
+            CHECK(check_schedule("classic_" + arch, model_path("classic_" + arch, s), options, mixed_plans()));
+        }
+    }
+}
+
 TEST_CASE("Sequences together: windowed blocks and fused projections keep each sequence's bits") {
     for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
         test::TinyModelSpec s;

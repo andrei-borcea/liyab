@@ -760,6 +760,12 @@ private:
         std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
+        // Optional LayerNorm biases (ArchSpec::norm Layer) of attn_norm, ffn_norm and the Q/K norms. With
+        // per-head Q/K norm weights (StableLM 2 12B, Command-R+) q_norm / k_norm hold one head_dim row per
+        // head; a parallel block without an FFN norm of its own has an empty ffn_norm (it shares attn_norm's).
+        std::vector<float> attn_norm_b, ffn_norm_b, q_norm_b, k_norm_b;
+        // Optional projection biases, added after their matmuls: attention output, FFN gate, up and down.
+        std::vector<float> bo, b_gate, b_up, b_down;
     };
     // Recurrent memory of one DeltaNet block.
     struct RecurrentState {
@@ -847,7 +853,8 @@ private:
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
     // or keys and values expanded per head from the cached latents
-    // (latent_expanded()); then attn_output.
+    // (latent_expanded()); then attn_output and its optional output bias,
+    // just as for ordinary attention.
     Status latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                   ThreadPool& pool, const uint8_t* head_mask);
     // Latent attention's projections of the n normalized rows in xb_: each
@@ -912,6 +919,16 @@ private:
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
     // nullptr: none) and keys (n_head_kv heads), where the block has them.
     void qk_norm(const Layer& L, float* q, float* k) const;
+    // One row of n values through the model's norm (ArchSpec::norm) with
+    // weight `w` and bias `b` (nullptr: none; RMSNorm always has a weight),
+    // epsilon ModelConfig::rms_eps. `out` may be `x`.
+    void norm_row(const float* x, const float* w, const float* b, float* out, int32_t n) const;
+    // Adds the learned absolute position embedding of each batch row's
+    // position (pos_of) to x_; no-op without position_embd. ContextFull for
+    // a position past its rows.
+    Status add_positions(int32_t n);
+    // Clamps n values to [-ModelConfig::clamp_kqv, clamp_kqv] (no-op at 0).
+    void clamp_kqv(float* x, size_t n) const;
     // Calibration (key_ranges_ set): one token's unrotated queries and keys of
     // block `L`, as the ranges need them whatever the Q/K norm order.
     void add_key_ranges(const Layer& L, const float* q, const float* k);
@@ -933,6 +950,9 @@ private:
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of
     // x_, then the final soft-cap (if any) on `pool`.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
+    // After the LM head's matmul into the first `rows` rows of logits_: adds
+    // the head's bias (output.bias) and multiplies by ModelConfig::logit_scale.
+    void finish_logits(int32_t rows);
     // The same over the hidden rows `rows` of x_ (any order), into logits_
     // rows 0, 1, ... (forward_batch()).
     Status compute_logits_rows(const Route& route, std::span<const int32_t> rows, ThreadPool& pool);
@@ -984,6 +1004,11 @@ private:
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
     std::vector<float> output_norm_;
+    std::vector<float> output_norm_b_;               // optional LayerNorm bias of the final norm
+    std::vector<float> output_bias_;                 // optional bias of the LM head (Phi-2)
+    std::vector<float> embd_norm_, embd_norm_b_;     // optional LayerNorm of the embeddings (BLOOM)
+    const TensorView* position_embd_ = nullptr;      // learned absolute positions (GPT-2), or nullptr
+    std::vector<float> alibi_slopes_;                // ALiBi: per query head (ModelConfig::alibi_bias); empty: none
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
@@ -1060,6 +1085,7 @@ private:
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
+    std::vector<float> par_in_;      // parallel blocks: the FFN's normed input while the mixer runs
     // The active adapter (set_adapter): its targets by base tensor name, with
     // their scales; empty when none (the only check a pass pays then).
     struct BoundAdapter {

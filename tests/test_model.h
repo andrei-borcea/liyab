@@ -22,6 +22,7 @@ public:
     void add_string_array(const std::string& key, const std::vector<std::string>& v);
     void add_f32_array(const std::string& key, const std::vector<float>& v);
     void add_i32_array(const std::string& key, const std::vector<int32_t>& v);
+    void add_u8_array(const std::string& key, const std::vector<uint8_t>& v);
     void add_bool_array(const std::string& key, const std::vector<bool>& v);
     // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
     void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
@@ -142,11 +143,28 @@ struct TinyModelSpec {
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
 
+    // Classic blocks. Optional tensors use an independent generator, so
+    // enabling biases never changes the projection weights being compared.
+    bool ungated = false;             // ffn_up -> activation -> ffn_down
+    bool norm_bias = false;           // LayerNorm offsets, including output_norm
+    bool no_norm_weights = false;     // non-parametric LayerNorm (OLMo)
+    bool projection_bias = false;     // Q/K/V/O, FFN and output biases
+    bool attn_output_bias = false;    // attention output only, also for latent attention
+    bool shared_parallel_norm = false; // omit ffn_norm (one shared norm)
+    bool embedding_norm = false;      // token_embd_norm, as in BLOOM
+    bool learned_positions = false;   // context_length absolute position rows
+    bool per_head_qk_norm = false;    // distinct LayerNorm weight for each head
+    float logit_scale = 1.0f;
+    float clamp_kqv = 0.0f;
+    int32_t parallel_residual = -1;    // -1: row default, 0/1: metadata override
+
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their
     // own, so the other weights stay those of the same spec without them.
     int32_t pooling_type = -1;            // >= 0: <arch>.pooling_type
     int32_t add_eos = -1;                 // >= 0: tokenizer.ggml.add_eos_token (nonzero: true)
+    int32_t add_bos = 1;                  // -1: omit metadata; 0/1: explicit tokenizer BOS policy
+    bool identity_normalizer = false;    // explicit identity map and dummy prefix for the synthetic vocabulary
     std::vector<std::string> cls_labels;  // non-empty: <arch>.classifier.output_labels
     // > 0: a ranking head cls.output.weight of this many rows (in output_type):
     // the output head's rows of the tokens in cls_rows_from when given (its
@@ -162,6 +180,10 @@ struct TinyModelSpec {
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
 };
+
+// A representative classic block layout, shared by the cache, sequence and
+// rollback tests. The architecture must be one of the classic registry rows.
+TinyModelSpec classic_model_spec(const std::string& arch);
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
 // lowercase letters, and every substring of "▁hello" / "▁world".

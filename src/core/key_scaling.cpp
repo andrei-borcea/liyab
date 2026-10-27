@@ -62,7 +62,8 @@ void KeyRanges::update(const float* rows, int32_t heads, float* max, const float
 void KeyRanges::add(int32_t block, const float* q, const float* k, const float* q_gain, const float* k_gain) {
     const auto hd = static_cast<size_t>(shape_.head_dim);
     const auto b = static_cast<size_t>(block);
-    const float* speed = shape_.pair_speed.data() + b * static_cast<size_t>(shape_.rope_dim / 2);
+    const float* speed = shape_.rope_dim == 0 ? nullptr :
+                            shape_.pair_speed.data() + b * static_cast<size_t>(shape_.rope_dim / 2);
     const double magnitude = shape_.rope_magnitude.empty() ? 1.0 : shape_.rope_magnitude[b];
     update(k, shape_.n_head_kv, key_max_.data() + b * static_cast<size_t>(shape_.n_head_kv) * hd, speed, magnitude,
            k_gain);

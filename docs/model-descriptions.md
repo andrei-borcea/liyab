@@ -241,3 +241,222 @@ such a model is checked with `liyab-kl` instead ([README, Correctness](../README
 * **Chat templates** are not checked (`liyab-tok --render` and `tests/data/chat_templates.json` do that).
 * **The gate measures one text.** `tests/data/conform_text.txt` (512 tokens): long contexts past a model's sliding
   window or LongRoPE's original context are checked by hand (the README's correctness table has examples).
+
+## Classic transformer parts
+
+The generic planner also recognizes `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`,
+`stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee` and `dbrx`. Registry presence alone is not
+conformance evidence: the family gates and their measured results must accompany a support claim.
+
+`ArchSpec::norm` selects LayerNorm or RMSNorm. Each LayerNorm binds its own optional weight and bias; omitting
+both implements OLMo 1's non-parametric normalization. The converter stores Nemotron LayerNorm1P weights as
+`1 + w`, so the runtime applies ordinary LayerNorm. Norm arithmetic uses double precision for mean and variance,
+then a scalar, NEON or AVX2 affine step. The AVX2 path uses the existing CPU feature dispatch.
+
+A dense block without a gate and with an `n_ff`-row up projection plans an ungated FFN: `down(act(up(x) + b)) + b`.
+Supported activations include exact GELU (erf), GELU (tanh), ReLU, ReLU squared and Apertus xIELU. The latter reads
+its per-block parameters from the four `xielu.*` GGUF arrays. Split and fused gate/up projections apply their
+optional biases after projection; attention output and LM-head biases follow the same rule. `logit_scale`
+multiplies biased logits before any final soft-cap.
+
+Parallel residual blocks preserve the normalized block input for the FFN while attention runs. The FFN uses its
+own norm when present, otherwise the attention norm's input. Learned position rows are added at each sequence's
+absolute positions and limit the addressable context. Their residuals cannot be moved for segment reuse; the
+engine refuses that operation. Prefix reuse and context save/restore keep the original positions.
+
+ALiBi adds each query head's slope times the logical key-to-query distance before softmax, independently of page
+slots and speculative tree row slots. Q/K/V clamping follows projection and bias, before normalization and RoPE.
+Per-head Q/K norms accept shared head weights or one row per head. StarCoder2's declared sliding window uses the
+existing per-block paged-cache layout.
+
+These elementwise operations execute on the CPU with Metal/Vulkan projection routing unchanged. The CPU is the
+reference; the new norms have scalar, NEON and x86 AVX2 affine paths. Synthetic golden cases cover every added
+part; batching, rollback, speculative trees, sequences, prefix caching, context files and segment reuse exercise
+how those parts compose with existing caches.
+
+The published b11819 StarCoder2 converter omits `attention.sliding_window`. All three official StarCoder2
+configurations (3B, 7B and 15B) declare 4096. The transformers 5.19 configuration class defaults to `None`, so
+a family-wide fallback cannot be inferred from that constructor or from a single customized checkpoint. The registry records this
+as `sliding_window_default`, a generic fallback used only when the file omits the key. Explicit metadata wins,
+including zero for full attention. A custom checkpoint whose window differs must record it: the description
+tool reports a file error when an omitted key would choose a different window. The tool checks a declared
+registry fallback against the observed reference window when the key is absent, and refuses an omitted-window
+file with no established fallback. The 4223-position unpatched-converter check crosses position 4096: KL mean
+0.00000, top-1 99.98%; an explicit 32-position override gives KL 0.00000, top-1 100%.
+
+Some older MoE converters, including DBRX, store an expert's width as `feed_forward_length`. The planner accepts
+that key when `expert_feed_forward_length` is absent; the latter always takes precedence. Expert tensor shapes
+are still checked when weights are bound.
+
+The description tool also observes eager attention implementations that bypass transformers' attention registry:
+score products, softmax inputs and value products must agree numerically. Scaled QK and linear per-head position
+slopes are established from those values. Non-parametric and LayerNorm1P formulas, both parallel residual forms,
+per-head LayerNorm modules, learned positions, embedding norms, projection clamps and xIELU scalars have matching
+rules. Nested attention and expert configuration objects retain their types when tiny checkpoints are reduced or
+overridden with `--config`.
+
+Falcon's pre-tokenizer orders punctuation splitting, ByteLevel, then digit grouping. The steps following
+ByteLevel see its printable byte alphabet, so they can split within an original UTF-8 character. The pre-tokenizer
+returns raw byte views in that case; the BPE encoder uses the shared alphabet to merge them. Existing profiles
+continue to split Unicode text before byte encoding. Command-R and OLMo profiles normalize to NFC before their
+splits; StarCoder/Refact and StableLM 2 keep the input's normalization.
+DBRX follows its declared GPT-4/cl100k tiktoken encoding, with three-digit groups, possessive word matching,
+and whole-piece vocabulary lookup before BPE merges. Its native IDs, including special-token gaps, are retained.
+
+SentencePiece's dummy space after a literal control token is an architecture fact omitted by GGUF.
+`spm_prefix_after_control` preserves the usual behavior by default; Nemotron's Metaspace `first` scheme
+adds it only at the beginning of plain text. Real spaces after controls remain significant. The description
+tool probes the reference tokenizer after literal BOS/EOS controls before proposing the row. Prefix matching
+distinguishes an implicitly added BOS from an explicit control so saved contexts reuse the correct text.
+`spm_add_bos_default` records an absent BOS key's policy independently: Nemotron adds no BOS, while existing
+SentencePiece rows retain their default. Explicit `tokenizer.ggml.add_bos_token` always wins. The tool derives
+this field from encoding with and without special tokens.
+
+The Command-R and Arcee templates are checked byte for byte against their own transformers tokenizers,
+including generation prompts, tool requests, Unicode text and rejected conversations.
+
+Orion's published converter omits its SentencePiece normalization map and dummy-space policy. The generic
+SentencePiece path reads `tokenizer.ggml.precompiled_charsmap` when present; otherwise `ArchSpec::spm_charsmap`
+selects an exact registered map by SHA-256. `spm_add_space_prefix_default` supplies an omitted prefix key.
+The Orion row records the map from official `OrionStarAI/Orion-14B-Base` revision
+`b988a511e9c880a465e704c57e3f297a3e7ef282`: NMT-NFKC with tabs/newlines retained, no dummy prefix and no whitespace
+collapse. This is the trained map, including its Unicode-version choices, rather than a substitute contemporary
+NFKC transform. `tools/spm_normalizer.py` reads the model's protobuf fields without external protobuf packages
+and emits the map data reproducibly. The description tool compares the native reference's exact map digest
+and refuses a missing unregistered map. Character-map offsets and replacement terminators are validated at load;
+normalization uses longest-prefix matches on every CPU backend before SentencePiece BPE.
+The same converter also drops SentencePiece's user-defined token types. `spm_user_defined` identifies the exact
+307-symbol set from that tokenizer, used only for the legacy omitted-map layout. Those symbols bypass character
+normalization and remain indivisible during BPE; this is what preserves tabs, newlines and two-space pieces.
+Files carrying an explicit character map use their own token types instead of the fallback.
+SentencePiece byte fallback follows BYTE token types, not token spelling. Without them, consecutive unknown
+characters form one unknown token; normal vocabulary entries spelled `<0xXX>` decode literally.
+The trace registers an explicit eager causal mask while evaluating captured attention with SDPA, allowing
+implementations that require a materialized mask (such as MPT) to expose their score operations too.
+LayerNorm epsilon is taken from the observed function call when the reference supplies it there, including
+parameterless OLMo norms whose modules have no epsilon attribute.
+Scalar checkpoint tensors are read as scalars too, so per-block xIELU parameters are verified against the file.
+
+`ArchSpec::attn_norm` names the mixer's norm independently of `ffn_norm`. A parallel block whose mixer norm
+is absent uses the FFN norm as its shared input norm; otherwise each branch normalizes the block input with its
+own tensor. This reads the published Falcon layouts: `ln_attn` is stored as `attn_norm_2`, and `ln_mlp` as
+`attn_norm`, while Falcon-7B stores one shared `attn_norm`. The description tool matches each tensor to its
+reference norm's weights and verifies both roles. The unused alternate name of a shared-norm checkpoint remains
+the registered default until a two-norm checkpoint establishes it.
+When eager attention expands grouped keys/values before the score product, the trace recovers logical KV
+groups only after both repeated keys and values agree bit for bit, then matches them to their projections.
+An observed GELU function's mode is authoritative when its input and output link exactly to the FFN projections;
+small activations can otherwise make erf and tanh approximations indistinguishable at the trace's tolerance.
+The xIELU path is the ungated FFN described above; files requesting a gated xIELU FFN are refused explicitly.
+Synthetic F16 GPT-2, Falcon, BLOOM, Apertus and biased latent-attention models compare CPU execution with GPU projections plus CPU
+operations through prefill, decode and rollback; available Metal/Vulkan backends use the existing operation routing.
+ReLU and ReLU² have NEON and runtime-dispatched AVX2 kernels with scalar tails, for ungated and gated FFNs.
+Comparison/select retains the scalar signed-zero and NaN behavior. Their arithmetic order stays unchanged;
+GELU and xIELU keep scalar libm for the transcendental functions so pinned rounded results remain portable.
+Odd FFN widths check ReLU² scalar tails against different batch boundaries and compare fused/split biased
+gated projections on every KV type.
+The reference trace reduces FFN widths and expert counts in typed child configurations too. Original residual
+and head dimensions remain intact for matching file geometry; nested DBRX FFNs no longer allocate the full
+expert widths while describing an architecture without its weights.
+Learned position embeddings combined with an embedding norm are refused because their relative order is not
+established; either a scale or a bias tensor establishes the norm's presence, including bias-only LayerNorm.
+The optional `attn_output.bias` is bound for ordinary and latent attention alike. It is added after the output
+projection in both absorbed and expanded latent forms, before any post-mixer norm or residual add.
+Local PyTorch `.bin` checkpoints and their indexed shards can supply the reference tensors too. The reader uses
+`torch.load(weights_only=True, mmap=True)`, maps each shard only when requested, and materializes only the rows
+needed for matching. Remote checkpoint inspection still requires safetensors. Run
+`python tests/test_describe_model.py` in the reference environment to compare both readers, scalar and partial
+rows, saved gradient flags, invalid row ranges, missing/malformed checkpoints and lazy loading of PyTorch shards.
+
+### Classic conformance
+
+F32 checkpoints with reduced dimensions and random weights exercise the real transformers implementations,
+using F16 KV and the same 512-token conformance text. Every row below has identical token IDs on all three
+tokenizer texts and an exactly matching derived registry row. Printed KL values are rounded to five decimals.
+
+| Architecture | Source configuration | Tiny mean KL | Tiny top-1 |
+| :--- | :--- | ---: | ---: |
+| `gpt2` | `openai-community/gpt2` | 0.00000 | 100.00% |
+| `gptneox` | `EleutherAI/pythia-410m-deduped` | 0.00000 | 100.00% |
+| `falcon` | `tiiuae/falcon-7b`, shared and separate branch norms | 0.00000 | 100.00% |
+| `bloom` | `bigscience/bloomz-560m`, four and three heads | 0.00000 | 100.00% |
+| `mpt` | `anas-awadalla/mpt-7b` | 0.00000 | 100.00% |
+| `starcoder` | `bigcode/tiny_starcoder_py` | 0.00000 | 100.00% |
+| `starcoder2` | `bigcode/starcoder2-3b`, explicit 32-position window | 0.00000 | 100.00% |
+| `phi2` | `microsoft/phi-2` | 0.00000 | 100.00% |
+| `stablelm` | `stabilityai/stablelm-2-1_6b`, with and without per-head Q/K norms | 0.00000 | 100.00% |
+| `orion` | official `OrionStarAI/Orion-14B-Base` code | 0.00000 | 100.00% |
+| `olmo` | `allenai/OLMo-1B-hf` | 0.00000 | 100.00% |
+| `command-r` | `mlx-community/c4ai-command-r-v01-4bit` configuration, with and without Q/K norms | 0.00000 | 100.00% |
+| `nemotron` | `nvidia/Minitron-4B-Base` | 0.00000 | 99.80% |
+| `apertus` | `swiss-ai/Apertus-8B-2509` | 0.00000 | 99.80% |
+| `arcee` | `arcee-ai/AFM-4.5B` | 0.00000 | 100.00% |
+| `dbrx` | `alpindale/dbrx-instruct`, native GPT-4 tokenizer export | 0.00000 | 100.00% |
+
+Real checkpoints measured so far use the full weights and pass the description tool's gate, including the
+registry row and all three tokenizer texts. These results do not stand in for pending family gates.
+
+| Checkpoint | GGUF | Mean KL | Top-1 |
+| :--- | :--- | ---: | ---: |
+| `openai-community/gpt2` | F16 | 0.00001 | 99.61% |
+| `EleutherAI/pythia-410m-deduped` | F16 | 0.00065 | 97.46% |
+| `bigscience/bloomz-560m` | F16 | 0.00000 | 99.80% |
+| `bigcode/tiny_starcoder_py` | F16 | 0.00000 | 99.80% |
+| `stabilityai/stablelm-2-1_6b` | Q8_0 | 0.00130 | 97.46% |
+| `allenai/OLMo-1B-hf` | Q8_0 | 0.00089 | 97.26% |
+| `microsoft/phi-2` | F16 | 0.00009 | 98.83% |
+| `bigcode/starcoder2-3b` | F16 | 0.00000 | 100.00% |
+| `nvidia/Minitron-4B-Base` | F16 | 0.00000 | 100.00% |
+
+The same Phi-2 checkpoint converted to Q8_0 gives mean KL 0.00573 and top-1 agreement 94.91%, below the
+97% gate. Its registry row and token IDs match; the passing Phi-2 result above establishes F16 conformance.
+StarCoder2-3B in Q8_0 gives mean KL 0.00091 and top-1 agreement 96.87%, also below the gate, with matching
+registry row and token IDs. Its F16 result above uses the same full checkpoint and conformance text.
+
+The unmodified b11819 converter rejects a reduced official `tiiuae/falcon-rw-1b` checkpoint at
+`transformer.h.0.post_attention_layernorm.bias` (unmapped tensor). Its full weights were not downloaded;
+Falcon evidence above covers the 7B configuration and its separate-norm variant.
+
+The configurations above without a real-checkpoint row have tiny conformance only.
+Command-R and Arcee chat templates are checked byte for byte against transformers;
+the other selected base tokenizers do not provide a chat template.
+
+### Classic performance regression check
+
+On the M4 Pro, the controlled main/branch comparison passes all 14 metrics below within ±3%.
+Each of eight configurations has one warmup pair followed by six balanced AB/BA measured pairs:
+48 measured pairs in total. Rates are cohort medians; changes are medians of the six paired branch/main
+ratios, so they need not equal the ratio of the displayed rates. Both cohorts use four threads and F16 KV.
+
+| Model | Weights / route / workload | Main → branch prefill tok/s | Paired change | Main → branch decode tok/s | Paired change |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | BF16 / CPU / `liyab-bench` | 87.85 → 87.85 | −0.06% | N/A | N/A |
+| Qwen3-0.6B | BF16 / CPU / CLI | 93.98 → 94.06 | +0.01% | 61.91 → 61.66 | −0.42% |
+| Qwen3-0.6B | BF16 / Metal route, CPU matrix fallback / CLI | 95.66 → 94.85 | −0.23% | 61.60 → 62.00 | +0.96% |
+| Qwen3-0.6B | F16 / actual Metal / CLI | 262.63 → 260.29 | −0.34% | 32.47 → 32.41 | −0.08% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / `liyab-bench` | 36.70 → 36.70 | +0.14% | N/A | N/A |
+| Llama-3.2-1B-Instruct | BF16 / CPU / CLI | 38.12 → 38.08 | −0.24% | 28.46 → 28.15 | −1.08% |
+| Llama-3.2-1B-Instruct | BF16 / Metal route, CPU matrix fallback / CLI | 37.61 → 37.56 | −0.17% | 27.96 → 27.85 | −0.24% |
+| Llama-3.2-1B-Instruct | F16 / actual Metal / CLI | 126.02 → 126.36 | +0.37% | 29.60 → 29.63 | −0.17% |
+
+The standalone CPU benchmark uses 512 tokens, batch 512 and three internal repeats. CLI timing uses one
+fixed ordinary question per model and a maximum of 128 generated tokens; every run naturally generated
+128 with zero forced tokens. Main/branch UTF-8 reply bytes and all four counts (`prompt_tokens`,
+`cached_prefix_tokens`, `generated_tokens`, `forced_tokens`) match. Actual Metal attention is checked on
+both Metal routes, and F16 additionally requires Metal FFNs. No cancellation, thermal rerouting or pacing
+was accepted. Conformance text and tokenizer gates remain separate from timing.
+
+The protocol was declared before measurement. Exact original executable/library bytes are copied before
+each run to the same neutral tool paths for both cohorts, with identical arguments, environment and CWD.
+Each CLI's loaded library path and source UUID are verified; standalone benchmarks load no shared Liyab
+library. All six original SHA-256s match before and after the matrix. Both loader preflights and all 112
+model processes have AC checks before and after: all 228 power stamps show AC, with no other model/build/test
+jobs allowed. The AC confirmation reuses the original neutral runner; only its results directory changes.
+
+Earlier results remain part of the evidence: the original separate-path matrix passed 13/14 metrics but
+Qwen3 CPU 512-token prefill failed at −8.11%; its fully quiet control failed at −8.12%. An unchanged-byte
+same-path diagnostic supported an execution-context confound without identifying its precise cause.
+The first full neutral-path attempt passed 10/14 while the host discharged from 13% to 3% on battery;
+that attempt remains a failure. The table reports the subsequent complete, prospectively approved AC
+confirmation with unchanged binaries, runner, prompts, flags and ±3% threshold. This establishes the
+controlled harness comparison; no engine or kernel source performance fix is claimed.

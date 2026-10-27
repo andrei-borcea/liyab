@@ -25,6 +25,8 @@ Where the facts come from:
   key projection, which tell whether the converter permuted its rows (so how RoPE pairs dimensions in the file),
   and one block's norm weights, which tell which GGUF tensor holds which norm and whether a norm the reference
   applies as x * (1 + w) is stored as 1 + w.
+  Local PyTorch .bin checkpoints are inspected with torch.load(weights_only=True, mmap=True); remote tensor
+  inspection requires safetensors. The local reader maps storage and materializes only the requested rows.
 * The engine's own sources: the ArchSpec fields and enums (architecture.h), the registry rows and the metadata keys
   and RoPE scaling types describe_model() reads (architecture.cpp: what the engine takes from the file, such as an
   attention scale, soft caps or YaRN, is supported exactly when it reads it), the tensors the forward pass binds
@@ -238,7 +240,7 @@ def block_index(name):
 
 
 class Checkpoint:
-    """Safetensors tensors of a Hugging Face model (local directory or repository), read on demand."""
+    """Safetensors (local or remote) and local PyTorch checkpoint tensors, read on demand."""
 
     DTYPES = {"F32": ("<f4", 4), "F16": ("<f2", 2), "BF16": ("<u2", 2)}
 
@@ -246,13 +248,35 @@ class Checkpoint:
         self.model, self.revision = model, revision
         self.files = {}  # shard name -> (source, header dict, data start)
         self.index = {}  # tensor name -> shard name
+        self.pytorch = {}  # local shard name -> memory-mapped state dictionary
         index = self._json("model.safetensors.index.json")
         if index is not None:
             self.index = dict(index["weight_map"])
+        elif os.path.isdir(model) and not os.path.exists(os.path.join(model, "model.safetensors")):
+            index = self._json("pytorch_model.bin.index.json")
+            if index is not None:
+                self.index = dict(index["weight_map"])
+            elif os.path.isfile(os.path.join(model, "pytorch_model.bin")):
+                self.index = dict.fromkeys(self._pytorch_shard("pytorch_model.bin"), "pytorch_model.bin")
+            else:
+                raise FormatError(f"no safetensors or PyTorch checkpoint in {model}")
         else:
             for name in self._header("model.safetensors")[0]:
                 if name != "__metadata__":
                     self.index[name] = "model.safetensors"
+
+    def _pytorch_shard(self, shard):
+        """Maps a local zip checkpoint without executing pickle globals or copying all its storage."""
+        if shard not in self.pytorch:
+            import torch
+            if not os.path.isdir(self.model):
+                raise FormatError("PyTorch checkpoints must be local; remote inspection requires safetensors")
+            state = torch.load(self._path(shard), map_location="cpu", weights_only=True, mmap=True)
+            if not isinstance(state, dict) or any(not isinstance(k, str) or not isinstance(v, torch.Tensor)
+                                                   for k, v in state.items()):
+                raise FormatError(f"{shard}: expected a tensor state dictionary")
+            self.pytorch[shard] = state
+        return self.pytorch[shard]
 
     def _path(self, name):
         if os.path.isdir(self.model):
@@ -271,8 +295,8 @@ class Checkpoint:
             return None
         try:
             src = ByteSource(path)
-            src.file.seek(0)
-            return json.loads(src.file.read())
+            with src.file:
+                return json.load(src.file)
         except (FileNotFoundError, OSError):
             return None
 
@@ -295,19 +319,32 @@ class Checkpoint:
         """The tensor, or `rows` of its rows from `first_row` (rows of the leading dimension), as float32."""
         import numpy as np
         shard = self.index[name]
+        if shard.endswith(".bin"):
+            value = self._pytorch_shard(shard)[name]
+            scalar = value.ndim == 0
+            value = value.reshape(1) if scalar else value
+            rows = value.shape[0] - first_row if rows is None else rows
+            if first_row < 0 or rows < 0 or first_row + rows > value.shape[0]:
+                raise FormatError(f"{name}: tensor row range is outside its shape")
+            values = value[first_row:first_row + rows].detach().float().numpy()
+            return values.reshape(()) if scalar and rows == 1 else values
         header, _ = self._header(shard)
         src, _, start = self.files[shard]
         info = header[name]
         dtype, size = self.DTYPES[info["dtype"]]
         begin, end = info["data_offsets"]
-        shape = list(info["shape"])
+        scalar = not info["shape"]
+        shape = list(info["shape"]) or [1]
         row_bytes = (end - begin) // max(shape[0], 1)
         rows = shape[0] - first_row if rows is None else rows
+        if first_row < 0 or rows < 0 or first_row + rows > shape[0]:
+            raise FormatError(f"{name}: tensor row range is outside its shape")
         raw = src.read_at(start + begin + first_row * row_bytes, rows * row_bytes)
         arr = np.frombuffer(raw, dtype=dtype)
         if info["dtype"] == "BF16":
             arr = (arr.astype(np.uint32) << 16).view(np.float32)
-        return arr.astype(np.float32).reshape([rows] + shape[1:])
+        values = arr.astype(np.float32).reshape([rows] + shape[1:])
+        return values.reshape(()) if scalar and rows == 1 else values
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -472,7 +509,7 @@ class Engine:
 
 # Activations the reference trace names, and the FfnActivation value that runs each (when the enum has it).
 ACTIVATION_ENUM = {"silu": "SiLU", "gelu_tanh": "GeluTanh", "gelu": "Gelu", "relu": "Relu", "relu2": "ReluSquared",
-                   "gelu_quick": "GeluQuick"}
+                   "gelu_quick": "GeluQuick", "xielu": "XIelu"}
 QK_ORDER_ENUM = {"before_rope": "BeforeRope", "after_rope": "AfterRope"}
 LAYOUT_ENUM = {"halves": "Halves", "adjacent": "Adjacent"}
 # The DeltaNet tensors the engine binds (transformer.cpp, bind_weights), present together in a recurrent block.
@@ -480,7 +517,9 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
                     "ssm_conv1d.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight"}
 # The fields this tool derives. A field architecture.h gains needs a rule here before rows are proposed again.
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
-                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa")
+                  "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
+                  "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm")
 
 
 def _close(a, b, rel=1e-5):
@@ -699,11 +738,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     head_dim = int(g.key("attention.key_length", n_embd // max(n_head, 1)))
     rope_dim = int(g.key("rope.dimension_count", head_dim))
     n_ff = int(g.key("feed_forward_length", 0) or 0)
-    eps = float(g.key("attention.layer_norm_rms_epsilon", 1e-5))
+    eps = float(g.key("attention.layer_norm_epsilon", g.key("attention.layer_norm_rms_epsilon", 1e-5)))
     if n_layers != facts["blocks"]:
         d.file_issues.append(f"the GGUF has {n_layers} blocks, the reference {facts['blocks']}")
-    if n_embd != cfg.get("hidden_size"):
-        d.file_issues.append(f"embedding_length {n_embd}, the reference's hidden_size {cfg.get('hidden_size')}")
+    ref_embd = next((cfg[k] for k in ("hidden_size", "n_embd", "d_model", "model_dim") if cfg.get(k)), None)
+    if n_embd != ref_embd:
+        d.file_issues.append(f"embedding_length {n_embd}, the reference's residual width {ref_embd}")
     vlen = g.key("attention.value_length")
     if vlen is not None and int(vlen) != head_dim:
         d.missing.append(f"value heads of {vlen} dimensions with key heads of {head_dim} "
@@ -759,6 +799,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         for u in b.get("unknown", []):
             d.unknown.append(f"block {b['index']}: {u}")
         for a in b.get("absent", []):
+            if b.get("parallel") and "same normed input" in a:
+                continue  # the shared-input form of a parallel block
             d.missing.append(f"block {b['index']}: {a}")
         i = b["index"]
         if i < len(plans):
@@ -794,11 +836,17 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             info = m.get(side)
             if info is None:
                 continue
-            if info["rope"] is None:
-                d.missing.append(f"block {b['index']}: {'keys' if side == 'key' else 'queries'} are not rotated "
-                                 f"(no position embedding in this block)")
-            else:
+            if info["rope"] is not None:
                 layouts.add(info["rope"]["layout"])
+    rotated = {(m.get(side) or {}).get("rope") is not None for b in att_blocks for m in [b["mixer"]]
+               for side in ("key", "query") if m.get(side) is not None}
+    if len(rotated) == 1:
+        d.set("rotary", next(iter(rotated)), "queries and keys are rotated" if True in rotated else
+              "queries and keys are passed without rotation")
+        if False in rotated:
+            d.set("rope", engine.enums["RopeLayout"][0], "no rotary dimensions (layout is unused)")
+    elif rotated:
+        d.missing.append("rotary attention in only some blocks; the architecture row applies rotary to every block")
     ref_layout = layouts.pop() if len(layouts) == 1 else None
     if len(layouts) > 0:
         d.unknown.append("the reference pairs RoPE dimensions differently in different blocks")
@@ -810,7 +858,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
 
     def layer_suffix(path):
         """'model.layers.3.self_attn.k_proj' -> 'layers.3.self_attn.k_proj' (checkpoint names vary in prefix)."""
-        m = re.search(r"(?:^|\.)(layers\.\d+\..+)$", path)
+        m = re.search(r"(?:^|\.)([^.]+\.\d+\..+)$", path)
         return m.group(1) if m else path
 
     file_layout = None
@@ -826,7 +874,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             # downloads.
             heads = min(n_head_kv, 2)
             first = q_dim if key["projection_layout"].startswith("fused") else 0
-            hf = ckpt.tensor(hname, first, heads * head_dim)
+            if key["projection_layout"].startswith("fused grouped"):
+                q_per_group = n_head // n_head_kv
+                hf = np.concatenate([ckpt.tensor(hname, (h * (q_per_group + 2) + q_per_group) * head_dim, head_dim)
+                                     for h in range(heads)])
+            else:
+                hf = ckpt.tensor(hname, first, heads * head_dim)
             gg = g.values(gname, first, heads * head_dim)
             perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
             if perm is None:
@@ -938,6 +991,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         win = [i for i, f in enumerate(flags) if f]
         att_idx = [i for i, p in enumerate(plans) if p["mixer"] == "attention"]
         period = 0
+        registered_default = engine.rows.get(arch, ({},))[0].get("sliding_window_default", 0)
+        fallback = registered_default
+        fw = g.key("attention.sliding_window")
+        if win and fw is None and not fallback:
+            d.unknown.append("the file omits its sliding window: a family-wide fallback cannot be established "
+                             "from one checkpoint; record it in the file or establish the registry default")
+        d.set("sliding_window_default", fallback, "registered family fallback checked against the reference when "
+              "window metadata is absent" if fallback else "the file supplies the window, or the architecture has no window")
         if win:
             if len(window_sizes) != 1:
                 d.unknown.append(f"windowed blocks use different windows: {sorted(window_sizes)}")
@@ -957,8 +1018,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                         d.missing.append(f"windowed blocks {_ranges(win)} follow no period and the file lists no "
                                          f"attention.sliding_window_pattern")
             w = next(iter(window_sizes)) if window_sizes else None
-            fw = g.key("attention.sliding_window")
-            if fw is None:
+            if fw is None and fallback and w == fallback:
+                d.parts.append(f"windowed blocks {_ranges(win)}: reference default {fallback}, omitted by the converter")
+            elif fw is None:
                 d.file_issues.append(f"the reference attends through a {w}-position window in blocks "
                                      f"{_ranges(win)}; the GGUF does not record it (attention.sliding_window)")
             elif w is not None and int(fw) != int(w):
@@ -998,6 +1060,24 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
 
     # --- attention arguments ---
     qk_orders, qk_spans = set(), set()
+    alibi = [b["mixer"].get("alibi_slopes") for b in att_blocks]
+    if alibi and all(slopes is None for slopes in alibi):
+        d.set("alibi_bias", 0.0, "no linear per-head position bias in the attention scores")
+    elif alibi and all(slopes is not None for slopes in alibi):
+        slopes = alibi[0]
+        pow2 = 2 ** int(math.log2(len(slopes)))
+        bias = float(f"{-math.log2(slopes[0]) * pow2:.6g}") if slopes[0] > 0 else None
+        expected = [2 ** (-bias * (h + 1) / pow2) if h < pow2 else
+                    2 ** (-bias * (2 * (h - pow2) + 1) / (2 * pow2)) for h in range(len(slopes))] if bias else []
+        if bias and all(np.allclose(s, expected, rtol=1e-4, atol=1e-6) for s in alibi):
+            d.set("alibi_bias", bias, "linear score slopes recomputed from native attention matmul and softmax")
+            if g.key("attention.max_alibi_bias") is not None and not _close(
+                    float(g.key("attention.max_alibi_bias")), bias, 1e-5):
+                d.file_issues.append("attention.max_alibi_bias disagrees with the observed slopes")
+        else:
+            d.unknown.append("attention has linear position slopes that do not follow the ALiBi construction")
+    elif alibi:
+        d.missing.append("ALiBi in only some attention blocks")
     # The q.k scale the engine uses: the file's attention.scale when it reads that key, else 1/sqrt(head_dim);
     # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
     file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
@@ -1006,6 +1086,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for b in att_blocks:
         m = b["mixer"]
         i = b["index"]
+        if not _close(float(g.key("attention.clamp_kqv", 0.0)), float(m.get("clamp_kqv", 0.0)), 1e-5):
+            d.file_issues.append(f"block {i}: attention.clamp_kqv differs from the observed symmetric clamp")
         if not _close(m["scale"], engine_scale, 1e-5):
             if "attention.scale" in engine.file_keys:
                 d.file_issues.append(f"block {i}: attention scale {m['scale']:.6g} in the reference, "
@@ -1070,8 +1152,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         formulas.add(facts["final_norm"]["formula"])
     if None in formulas:
         d.unknown.append("a norm whose formula is not RMSNorm (x w or x (1 + w)) or LayerNorm")
-    if "layer" in formulas:
-        d.missing.append("LayerNorm (mean-centred, with a bias): the engine's norms are RMSNorms")
+    norm_kinds = {"Layer" if f in ("layer", "layer_1p") else "Rms" for f in formulas if f is not None}
+    if len(norm_kinds) == 1:
+        d.set("norm", next(iter(norm_kinds)), "norm formula recomputed from every block and the final norm")
+    elif norm_kinds:
+        d.missing.append("different norm formulas across the block and output norms")
     if "rms_noweight" in formulas:
         d.missing.append("RMSNorm without a weight")
     eps_ref = {(b.get(r) or {}).get("eps") for b in bf for r in roles if b.get(r)} - {None}
@@ -1095,10 +1180,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 continue
             hname = ckpt.find(layer_suffix(info["module"]) + ".weight")
             if hname is None:
+                if info.get("weighted") is False:
+                    continue  # non-parametric LayerNorm has no stored tensor to match
                 d.unknown.append(f"no reference weights for {info['module']}")
                 continue
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if info["formula"] == "rms_1p" else w
+            want = w + 1.0 if info["formula"] in ("rms_1p", "layer_1p") else w
             hits = [s for s, v in candidates.items() if v.shape == want.shape and _rel_err(v, want) < 1e-2]
             if len(hits) == 1:
                 norm_names[r] = hits[0][: -len(".weight")]
@@ -1113,13 +1200,45 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.unknown.append(f"several tensors of block {i} hold the reference's {hname}: {hits}")
     elif b0 is not None:
         d.unknown.append("cannot tell which GGUF tensor holds which norm without the reference weights")
-    if placement.get("norm_before_mixer") and norm_names.get("norm_before_mixer") not in (None, "attn_norm"):
-        d.missing.append(f"the norm before the mixer is {norm_names['norm_before_mixer']}, the engine binds attn_norm")
+    observed_mixer_norm = norm_names.get("norm_before_mixer")
+    existing_norms = engine.rows.get(g.arch, ({},))[0]
+    mixer_norm = observed_mixer_norm or "attn_norm"
+    registered_mixer = existing_norms.get("attn_norm", "attn_norm")
+    shared_fallback = b0 and b0.get("parallel") and not placement.get("norm_before_ffn") and \
+        observed_mixer_norm == existing_norms.get("ffn_norm") and not any(
+            f"{registered_mixer}{suffix}" in ts for ts in blocks.values() for suffix in (".weight", ".bias"))
+    if shared_fallback:
+        mixer_norm = registered_mixer
+    d.set("attn_norm", mixer_norm, "shared parallel norm: the registered alternate mixer tensor is absent" if shared_fallback
+          else "the mixer's norm tensor matched to the reference" if observed_mixer_norm
+          else "the mixer's norm has no parameters; its optional tensor name is unused")
     if placement.get("norm_before_ffn"):
         if "norm_before_ffn" in norm_names:
             d.set("ffn_norm", norm_names["norm_before_ffn"],
                   f"{b0['norm_before_ffn']['module'].rsplit('.', 1)[-1]} normalizes the residual stream before the "
                   f"FFN; the GGUF holds its weights as blk.N.{norm_names['norm_before_ffn']}")
+        elif b0 and (b0.get("norm_before_ffn") or {}).get("weighted") is False:
+            d.set("ffn_norm", "ffn_norm", "the FFN's norm has no parameters (optional tensor name is unused)")
+    elif b0 and b0.get("parallel"):
+        existing = engine.rows.get(g.arch)
+        # An absent FFN norm has no name to establish. Keep the registered
+        # optional name if it is absent from the file, else use ffn_norm.
+        name = existing[0].get("ffn_norm") if existing else "ffn_norm"
+        if name != observed_mixer_norm and any(f"{name}.weight" in ts or f"{name}.bias" in ts for ts in blocks.values()):
+            d.file_issues.append(f"the FFN shares its attention norm, but the file has an extra {name}")
+        else:
+            d.set("ffn_norm", name, "the parallel FFN shares the mixer's norm (no separate FFN norm tensors)")
+    parallels = {bool(b.get("parallel")) for b in bf if "mixer" in b}
+    if len(parallels) == 1:
+        parallel = next(iter(parallels))
+        flag = g.key("use_parallel_residual")
+        if flag is not None and bool(flag) != parallel:
+            d.file_issues.append("use_parallel_residual disagrees with the observed residual inputs")
+        # If metadata states it, the registry default is unused.
+        d.set("parallel_residual", parallel,
+              "attention and FFN read the block input" if parallel else "the FFN follows the attention residual")
+    elif parallels:
+        d.missing.append("parallel residuals in only some blocks")
     for r, field in (("norm_after_mixer", "post_mixer_norm"), ("norm_after_ffn", "post_ffn_norm")):
         if not placement.get(r):
             d.set(field, "", f"no norm after the {'mixer' if 'mixer' in r else 'FFN'}")
@@ -1133,15 +1252,16 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             norm = (b["mixer"].get(side) or {}).get("norm")
             if not norm:
                 continue
-            if norm.get("formula") not in ("rms", "rms_1p"):
-                d.unknown.append(f"block {b['index']}: the {side} norm is not an RMSNorm (x w or x (1 + w))")
+            if norm.get("formula") not in ("rms", "rms_1p", "layer", "layer_1p"):
+                d.unknown.append(f"block {b['index']}: the {side} norm has an unknown formula")
                 continue
             gname = f"blk.{b['index']}.{gsuffix}"
-            hname = ckpt.find(layer_suffix(norm["module"]) + ".weight") if ckpt else None
+            hnames = [ckpt.find(layer_suffix(module) + ".weight") for module in norm.get("modules", [norm["module"]])] if ckpt else []
+            hname = hnames[0] if hnames and all(hnames) else None
             if gname not in g.tensors:
                 d.file_issues.append(f"the reference normalizes {side}s, the GGUF has no {gname}")
             elif hname is not None:
-                w = ckpt.tensor(hname).reshape(-1)
+                w = np.concatenate([ckpt.tensor(name).reshape(-1) for name in hnames])
                 want = w + 1.0 if norm["formula"] == "rms_1p" else w
                 have = g.values(gname).reshape(-1)
                 if have.shape != want.shape or _rel_err(have, want) > 1e-2:
@@ -1152,7 +1272,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         hname = ckpt.find(fn["module"].split(".", 1)[-1] + ".weight") or ckpt.find(fn["module"] + ".weight")
         if hname is not None:
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if fn["formula"] == "rms_1p" else w
+            want = w + 1.0 if fn["formula"] in ("rms_1p", "layer_1p") else w
             if _rel_err(g.values("output_norm.weight").reshape(-1), want) > 1e-2:
                 d.file_issues.append(f"output_norm.weight does not hold the reference's {hname}"
                                      + (" as 1 + w" if fn["formula"] == "rms_1p" else ""))
@@ -1168,9 +1288,18 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.unknown.append(f"block {i}: {u}")
         if f.get("kind") == "dense":
             if f.get("gated") is False:
-                d.missing.append(f"block {i}: a non-gated FFN, down({f.get('activation')}(up))")
+                ts = blocks.get(i, set())
+                if "ffn_gate.weight" in ts or suffix_rows(i, "ffn_up.weight") != n_ff:
+                    d.file_issues.append(f"block {i}: ungated FFN in the reference but not in the file")
             if f.get("activation"):
                 acts.add(f["activation"])
+            if f.get("activation") == "xielu":
+                for name, traced_value in f["scalars"].items():
+                    hname = ckpt.find(layer_suffix(f["activation_module"]) + "." + name) if ckpt else None
+                    actual = float(ckpt.tensor(hname).reshape(-1)[0]) if hname else traced_value
+                    values = g.metadata.get("xielu." + name)
+                    if values is None or len(values) <= i or not _close(float(values[i]), actual, 1e-5):
+                        d.file_issues.append(f"xielu.{name} does not hold the reference's block {i} scalar")
             if f.get("fused_gate_up") and f.get("fused_order") != "gate_first":
                 d.missing.append(f"block {i}: a fused [up | gate] projection (the engine reads [gate | up])")
             if plan and plan.get("ffn") != "dense":
@@ -1214,8 +1343,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if enum is None or enum not in engine.enums.get("FfnActivation", []):
             d.missing.append(f"FFN activation {act} (FfnActivation has {engine.enums.get('FfnActivation')})")
         else:
+            gated = bool(moe_facts) or any((b.get("ffn") or {}).get("gated") for b in bf)
             d.set("ffn_activation", enum, f"the {'experts compute' if moe_facts else 'FFN computes'} "
-                                          f"down({act}(gate) * up)")
+                  + (f"down({act}(gate) * up)" if gated else f"down({act}(up))"))
     if moe_facts:
         norms_ = {f.get("norm_topk") for f in moe_facts if "norm_topk" in f}
         if len(norms_) == 1:
@@ -1233,6 +1363,25 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.set("moe_norm_weights", False, "dense FFNs (the MoE default does not apply)")
 
     # --- embeddings and logits ---
+    pos = facts.get("position_embeddings")
+    if pos:
+        tensor = g.tensors.get("position_embd.weight")
+        if tensor is None or tuple(tensor["dims"]) != (n_embd, pos["rows"]):
+            d.file_issues.append("position_embd.weight does not hold the reference's learned position table")
+        elif ckpt is not None:
+            hname = ckpt.find(pos["module"] + ".weight")
+            if hname and _rel_err(g.values("position_embd.weight"), ckpt.tensor(hname)) > 1e-2:
+                d.file_issues.append("position_embd.weight differs from the reference weights")
+        d.parts.append(f"learned absolute positions: {pos['rows']} rows, added before block 0")
+    elif "position_embd.weight" in g.tensors:
+        d.file_issues.append("the file has learned position embeddings absent from the observed input")
+    emb_norm = facts.get("embedding_norm")
+    if emb_norm:
+        if "token_embd_norm.weight" not in g.tensors:
+            d.file_issues.append("the reference normalizes token embeddings but the file has no token_embd_norm.weight")
+        if (emb_norm.get("formula") in ("layer", "layer_1p")) != (d.fields.get("norm", (None,))[0] == "Layer"):
+            d.missing.append("the embedding norm uses a different formula from the block norms")
+        d.parts.append("token embeddings normalized before block 0")
     es = facts.get("embedding_scale")
     if es is None:
         pass  # reported as unknown by the trace
@@ -1246,7 +1395,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     lg = facts.get("logits") or {}
     final_cap = lg["value"] if lg.get("transform") == "softcap" else 0.0
     if lg.get("transform") == "scale":
-        d.missing.append(f"logits multiplied by {lg['value']:.6g} after the output projection")
+        if not _close(float(g.key("logit_scale", 1.0)), lg["value"], 1e-5):
+            d.file_issues.append(f"logit_scale {g.key('logit_scale', 1.0)} in the file, {lg['value']:.6g} in the reference")
+        else:
+            d.parts.append(f"logits multiplied by {lg['value']:.6g} from the file")
     elif "final_logit_softcapping" not in engine.file_keys:
         if final_cap:
             d.missing.append(f"final logit soft-capping at {final_cap:g}")
@@ -1261,6 +1413,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.file_issues.append("the reference has its own output matrix, the GGUF has no output.weight")
     else:
         d.parts.append("output matrix " + ("output.weight" if has_output else "tied to token_embd"))
+
+    check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine)
 
     # --- the row: values for every field ---
     row = {}
@@ -1277,12 +1431,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.unknown.append(f"{n}: not established")
 
     # --- every tensor must be bound (the norms' names come from the row, so only once they are known) ---
-    norm_fields = ("ffn_norm", "post_mixer_norm", "post_ffn_norm")
+    norm_fields = ("attn_norm", "ffn_norm", "post_mixer_norm", "post_ffn_norm")
     if no_ffn_norm:
         pass  # the block's structure is already not the engine's
     elif all(f in d.fields for f in norm_fields):
         names = {row.get(f) for f in norm_fields if row.get(f)}
-        bound = engine.block_tensors | {n + ".weight" for n in names}
+        bound = engine.block_tensors | {n + suffix for n in names for suffix in (".weight", ".bias")}
         unused = {}
         for b in range(n_layers):
             for s in blocks.get(b, set()) - bound:
@@ -1330,7 +1484,6 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.missing.append(f"BPE pre-tokenizer '{pre}' (tokenizer.ggml.pre) is not in the pre-tokenizer table")
     else:
         d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" else ""))
-    check_tokenizer_settings(d, g, model, revision, trust_remote_code)
 
     d.merge_blocks()
     if complete and not d.unknown:
@@ -1352,24 +1505,36 @@ def engine_default(engine, field):
     return next(dflt for n, _, dflt in engine.fields if n == field)
 
 
-def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
+def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
     """The GGUF's BOS and space-prefix rules against what the model's own tokenizer does (the engine follows the
     file: tokenizer.ggml.add_bos_token, by default on for SentencePiece only; tokenizer.ggml.add_space_prefix, by
     default on). A file that disagrees encodes every prompt differently from the model's training."""
+    kind = g.metadata.get("tokenizer.ggml.model")
+    if kind != "llama":
+        d.set("spm_prefix_after_control", True, "not a SentencePiece vocabulary; control-prefix policy is unused")
+        d.set("spm_add_bos_default", True, "not a SentencePiece vocabulary; absent BOS metadata means no BOS")
+        d.set("spm_add_space_prefix_default", True, "not a SentencePiece vocabulary; dummy-space policy is unused")
+        d.set("spm_charsmap", "", "not a SentencePiece vocabulary; compiled character map is unused")
+        d.set("spm_user_defined", "", "not a SentencePiece vocabulary; user-defined symbol fallback is unused")
     try:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
     except Exception as e:  # noqa: BLE001 - reported, the gate checks the ids anyway
         d.notes.append(f"the reference tokenizer did not load ({type(e).__name__}); its BOS and space-prefix rules "
                        f"are left to the gate")
+        if kind == "llama":
+            d.unknown.append("spm_prefix_after_control: the reference tokenizer could not be loaded")
+            d.unknown.append("spm_add_bos_default: the reference tokenizer could not be loaded")
         return
-    kind = g.metadata.get("tokenizer.ggml.model")
     bos = g.metadata.get("tokenizer.ggml.bos_token_id")
-    add_bos = g.metadata.get("tokenizer.ggml.add_bos_token", kind == "llama")
+    default_bos = kind == "llama" and engine.rows.get(g.arch, ({},))[0].get("spm_add_bos_default", True)
+    add_bos = g.metadata.get("tokenizer.ggml.add_bos_token", default_bos)
     add_bos = bool(add_bos) and bos is not None
     plain = tok("The sea", add_special_tokens=False)["input_ids"]
     special = tok("The sea", add_special_tokens=True)["input_ids"]
     ref_bos = len(special) > len(plain) and special[0] == bos and special[1:1 + len(plain)] == plain
+    if kind == "llama":
+        d.set("spm_add_bos_default", ref_bos, "observed initial BOS behavior of the reference tokenizer")
     # What the model's tokenizer_config.json declares. transformers does not always apply it (version 5 runs
     # DeepSeek's tokenizer.json as it is, without the BOS its LlamaTokenizerFast class added).
     declared = None
@@ -1393,12 +1558,70 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code):
     if kind == "llama" and plain:
         piece = tok.convert_ids_to_tokens(plain[0])
         ref_prefix = isinstance(piece, str) and piece.startswith("▁")
-        add_prefix = bool(g.metadata.get("tokenizer.ggml.add_space_prefix", True))
+        d.set("spm_add_space_prefix_default", ref_prefix, "observed initial dummy-space behavior of the reference tokenizer")
+        default_prefix = engine.rows.get(g.arch, ({},))[0].get("spm_add_space_prefix_default", True)
+        add_prefix = bool(g.metadata.get("tokenizer.ggml.add_space_prefix", default_prefix))
         if add_prefix != ref_prefix:
             d.file_issues.append(f"the model's tokenizer {'puts a' if ref_prefix else 'puts no'} space before the "
                                  f"text, the GGUF {'asks for one' if add_prefix else 'asks for none'} "
                                  f"(tokenizer.ggml.add_space_prefix "
                                  f"{g.metadata.get('tokenizer.ggml.add_space_prefix', 'absent')})")
+        # GGUF does not preserve Metaspace's prepend_scheme. Observe a plain
+        # segment after a literal control, independently of the initial BOS.
+        policies = set()
+        for token in (tok.bos_token, tok.eos_token):
+            if not token:
+                continue
+            control_id = tok.convert_tokens_to_ids(token)
+            ids = tok("hello" + token + "world", add_special_tokens=False)["input_ids"]
+            if control_id not in ids:
+                continue
+            index = ids.index(control_id) + 1
+            if index < len(ids):
+                piece = tok.convert_ids_to_tokens(ids[index])
+                if isinstance(piece, str):
+                    policies.add(piece.startswith("▁"))
+        if len(policies) == 1:
+            d.set("spm_prefix_after_control", policies.pop(),
+                  "observed dummy-space behavior after a literal BOS/EOS control token")
+        else:
+            d.unknown.append("spm_prefix_after_control: no consistent control-prefix behavior was observed")
+        sp_model = getattr(tok, "sp_model", None)
+        if sp_model is not None and hasattr(sp_model, "serialized_model_proto"):
+            from spm_normalizer import read_normalizer
+            normalizer = read_normalizer(sp_model.serialized_model_proto())
+            digest = normalizer["sha256"]
+            if normalizer["remove_extra_whitespaces"] or not normalizer["escape_whitespaces"]:
+                d.missing.append("SentencePiece normalization with collapsed or unescaped whitespace")
+            explicit = g.metadata.get("tokenizer.ggml.precompiled_charsmap")
+            if explicit is not None:
+                import hashlib
+                if hashlib.sha256(bytes(explicit)).hexdigest() != digest:
+                    d.file_issues.append("the GGUF precompiled character map differs from the reference")
+                fallback = engine.rows.get(g.arch, ({},))[0].get("spm_charsmap", "")
+            else:
+                fallback = digest
+                with open(os.path.join(REPO, "src/core/spm_normalizer.inc"), encoding="utf-8") as source:
+                    registered = source.read(400)
+                if digest and digest not in registered:
+                    d.missing.append("the file omits its SentencePiece character map and no exact registered map matches")
+            d.set("spm_charsmap", fallback, "exact SHA-256 of the native SentencePiece normalization map")
+            symbols = normalizer["user_defined"]
+            vocabulary = g.metadata.get("tokenizer.ggml.tokens", [])
+            types = g.metadata.get("tokenizer.ggml.token_type", [])
+            ids = {token: i for i, token in enumerate(vocabulary)}
+            preserved = all(token in ids and ids[token] < len(types) and types[ids[token]] == 4 for token in symbols)
+            symbols_fallback = engine.rows.get(g.arch, ({},))[0].get("spm_user_defined", "") if preserved else normalizer["user_defined_sha256"]
+            if symbols_fallback:
+                with open(os.path.join(REPO, "src/core/spm_normalizer.inc"), encoding="utf-8") as source:
+                    if symbols_fallback not in source.read():
+                        d.missing.append("the file loses SentencePiece user-defined types and no exact registered symbols match")
+            d.set("spm_user_defined", symbols_fallback, "exact native user-defined symbols, or the file's preserved token types")
+        else:
+            # Fast Metaspace tokenizers with no compiled map are checked by
+            # the token gate; the existing normalizer profiles own their NFC.
+            d.set("spm_charsmap", "", "the reference tokenizer has no native compiled SentencePiece map")
+            d.set("spm_user_defined", "", "the fast tokenizer's user-defined symbols come from the GGUF token types")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1413,7 +1636,8 @@ def run(cmd, log, cwd=None, env=None):
     with open(log, "a") as out:
         out.write("$ " + " ".join(cmd) + "\n")
         out.flush()
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, encoding="utf-8", errors="replace")
         out.write(p.stdout)
     return p.returncode, p.stdout
 

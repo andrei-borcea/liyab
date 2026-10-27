@@ -89,6 +89,15 @@ void GgufWriter::add_f32_array(const std::string& key, const std::vector<float>&
     ++n_kv_;
 }
 
+void GgufWriter::add_u8_array(const std::string& key, const std::vector<uint8_t>& v) {
+    put_string(kv_, key);
+    put<uint32_t>(kv_, kArray);
+    put<uint32_t>(kv_, 0);  // GGUF U8
+    put<uint64_t>(kv_, v.size());
+    kv_.insert(kv_.end(), v.begin(), v.end());
+    ++n_kv_;
+}
+
 void GgufWriter::add_i32_array(const std::string& key, const std::vector<int32_t>& v) {
     put_string(kv_, key);
     put<uint32_t>(kv_, kArray);
@@ -247,6 +256,16 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(ssm_hv * ssm_hd));
     }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (s.norm_bias || s.no_norm_weights) w.add_f32(a + ".attention.layer_norm_epsilon", 1e-5f);
+    if (s.logit_scale != 1.0f) w.add_f32(a + ".logit_scale", s.logit_scale);
+    if (s.clamp_kqv > 0.0f) w.add_f32(a + ".attention.clamp_kqv", s.clamp_kqv);
+    if (s.parallel_residual >= 0) w.add_bool(a + ".use_parallel_residual", s.parallel_residual != 0);
+    if (a == "apertus") {
+        for (const auto& [key, value] : std::vector<std::pair<const char*, float>>{
+                 {"alpha_p", -0.4f}, {"alpha_n", 0.6f}, {"beta", 0.5f}, {"eps", -1e-6f}}) {
+            w.add_f32_array(std::string("xielu.") + key, std::vector<float>(static_cast<size_t>(s.n_layers), value));
+        }
+    }
     w.add_f32(a + ".rope.freq_base", s.rope_base);
     if (s.sliding_window > 0) w.add_u32(a + ".attention.sliding_window", static_cast<uint32_t>(s.sliding_window));
     if (!s.swa_layers.empty()) {
@@ -287,7 +306,11 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     w.add_u32("tokenizer.ggml.unknown_token_id", 0);
     w.add_u32("tokenizer.ggml.bos_token_id", 1);
     w.add_u32("tokenizer.ggml.eos_token_id", 2);
-    w.add_bool("tokenizer.ggml.add_bos_token", true);
+    if (s.add_bos >= 0) w.add_bool("tokenizer.ggml.add_bos_token", s.add_bos != 0);
+    if (s.identity_normalizer) {
+        w.add_u8_array("tokenizer.ggml.precompiled_charsmap", {});
+        w.add_bool("tokenizer.ggml.add_space_prefix", true);
+    }
     if (s.pooling_type >= 0) w.add_u32(a + ".pooling_type", static_cast<uint32_t>(s.pooling_type));
     if (s.add_eos >= 0) w.add_bool("tokenizer.ggml.add_eos_token", s.add_eos != 0);
     if (!s.cls_labels.empty()) w.add_string_array(a + ".classifier.output_labels", s.cls_labels);
@@ -310,9 +333,28 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     const int64_t d = s.n_embd;
     const int64_t hd = d / s.n_head;
     const int64_t kv = hd * s.n_head_kv;
+    std::mt19937_64 classic_rng(s.seed ^ 0xc1a551c);
+    std::normal_distribution<float> classic_normal(0.0f, 0.1f);
+    auto extra = [&](int64_t n, float offset = 0.0f) {
+        std::vector<float> values(static_cast<size_t>(n));
+        for (float& v : values) v = offset + classic_normal(classic_rng);
+        return values;
+    };
+    auto bias = [&](const std::string& name, int64_t n, bool enabled) {
+        if (enabled) w.add_tensor(name, {n}, DType::F32, extra(n));
+    };
     const std::vector<float> embd = random(d * n_vocab, 0.5f);
     w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, embd);
-    w.add_tensor("output_norm.weight", {d}, DType::F32, norm_weights(d));
+    if (!s.no_norm_weights) w.add_tensor("output_norm.weight", {d}, DType::F32, norm_weights(d));
+    bias("output_norm.bias", d, s.norm_bias);
+    bias("output.bias", n_vocab, s.projection_bias);
+    if (s.embedding_norm) {
+        w.add_tensor("token_embd_norm.weight", {d}, DType::F32, extra(d, 1.0f));
+        bias("token_embd_norm.bias", d, s.norm_bias);
+    }
+    if (s.learned_positions) {
+        w.add_tensor("position_embd.weight", {d, s.context_length}, s.embd_type, extra(d * s.context_length));
+    }
     std::vector<float> output;  // the LM head's values (the embeddings when tied)
     if (!s.tied_output) {
         output = random(d * n_vocab, s.weight_scale);
@@ -363,7 +405,9 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     for (int32_t l = 0; l < s.n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        w.add_tensor(p + "attn_norm.weight", {d}, DType::F32, norm_weights(d));
+        const std::string attn_norm = a == "falcon" && !s.shared_parallel_norm ? "attn_norm_2" : "attn_norm";
+        if (!s.no_norm_weights) w.add_tensor(p + attn_norm + ".weight", {d}, DType::F32, norm_weights(d));
+        bias(p + attn_norm + ".bias", d, s.norm_bias);
         if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
@@ -404,6 +448,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                          random(rank * s.mla_v * heads, s.weight_scale));
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
+            bias(p + "attn_output.bias", d, s.projection_bias || s.attn_output_bias);
         } else {
             const int64_t q_rows = s.attn_gate ? 2 * d : d;  // [q_h | gate_h] per head when gated
             if (s.fused_qkv) {  // the same draws as separate matrices, stacked [q | k | v]
@@ -419,6 +464,21 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             }
             w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            if (s.projection_bias) {
+                const auto qb = extra(q_rows), kb = extra(kv), vb = extra(kv);
+                if (s.fused_qkv) {
+                    auto all = qb;
+                    all.insert(all.end(), kb.begin(), kb.end());
+                    all.insert(all.end(), vb.begin(), vb.end());
+                    w.add_tensor(p + "attn_qkv.bias", {q_rows + 2 * kv}, DType::F32, all);
+                } else {
+                    w.add_tensor(p + "attn_q.bias", {q_rows}, DType::F32, qb);
+                    w.add_tensor(p + "attn_k.bias", {kv}, DType::F32, kb);
+                    w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, vb);
+                }
+                bias(p + "attn_output.bias", d, true);
+            }
+            if (s.attn_output_bias && !s.projection_bias) bias(p + "attn_output.bias", d, true);
             if (s.qk_norm) {
                 w.add_tensor(p + "attn_q_norm.weight", {hd}, DType::F32, norm_weights(hd));
                 std::vector<float> k_norm = norm_weights(hd);
@@ -427,6 +487,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                     k_norm[static_cast<size_t>(hd - 3)] = s.k_norm_outlier;
                 }
                 w.add_tensor(p + "attn_k_norm.weight", {hd}, DType::F32, k_norm);
+            }
+            if (s.per_head_qk_norm) {
+                w.add_tensor(p + "attn_q_norm.weight", {hd, s.n_head}, DType::F32, extra(d, 1.0f));
+                w.add_tensor(p + "attn_k_norm.weight", {hd, s.n_head_kv}, DType::F32, extra(kv, 1.0f));
+                if (s.norm_bias) {
+                    w.add_tensor(p + "attn_q_norm.bias", {hd, s.n_head}, DType::F32, extra(d));
+                    w.add_tensor(p + "attn_k_norm.bias", {hd, s.n_head_kv}, DType::F32, extra(kv));
+                }
             }
         }
         if (a == "qwen2") {
@@ -443,8 +511,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
         const bool post_attention = a == "qwen35" || a == "qwen35moe";
-        w.add_tensor(p + (post_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), {d}, DType::F32,
-                     norm_weights(d));
+        const std::string ffn_norm = a == "falcon" ? "attn_norm" : a == "dbrx" ? "attn_output_norm" :
+                                     post_attention ? "post_attention_norm" : "ffn_norm";
+        if (!s.shared_parallel_norm) {
+            if (!s.no_norm_weights) w.add_tensor(p + ffn_norm + ".weight", {d}, DType::F32, norm_weights(d));
+            bias(p + ffn_norm + ".bias", d, s.norm_bias);
+        }
         if (s.post_norms) {  // Gemma: post_attention_norm is the norm after the attention, not before the FFN
             w.add_tensor(p + "post_attention_norm.weight", {d}, DType::F32, norm_weights(d));
             w.add_tensor(p + "post_ffw_norm.weight", {d}, DType::F32, norm_weights(d));
@@ -452,6 +524,23 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         const std::vector<float> gate = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> up = random(d * s.n_ff, s.weight_scale);
         const std::vector<float> down = random(s.n_ff * d, s.weight_scale);
+        if (s.projection_bias) {
+            const auto gb = extra(s.n_ff), ub = extra(s.n_ff);
+            if (!s.ungated && s.fused_gate_up) {
+                auto all = gb;
+                all.insert(all.end(), ub.begin(), ub.end());
+                w.add_tensor(p + "ffn_up.bias", {2 * s.n_ff}, DType::F32, all);
+            } else {
+                if (!s.ungated) w.add_tensor(p + "ffn_gate.bias", {s.n_ff}, DType::F32, gb);
+                w.add_tensor(p + "ffn_up.bias", {s.n_ff}, DType::F32, ub);
+            }
+            bias(p + "ffn_down.bias", d, true);
+        }
+        if (s.ungated) {
+            w.add_tensor(p + "ffn_up.weight", {d, s.n_ff}, s.ffn_type, up);
+            w.add_tensor(p + "ffn_down.weight", {s.n_ff, d}, s.ffn_type, down);
+            continue;
+        }
         if (s.n_expert == 0 && s.fused_gate_up) {
             std::vector<float> gate_up = gate;
             gate_up.insert(gate_up.end(), up.begin(), up.end());
@@ -505,6 +594,35 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         }
     }
     w.write(path);
+}
+
+TinyModelSpec classic_model_spec(const std::string& arch) {
+    TinyModelSpec s;
+    s.arch = arch;
+    s.identity_normalizer = arch == "orion";
+    s.norm_bias = arch != "olmo" && arch != "command-r" && arch != "apertus" && arch != "arcee" && arch != "dbrx";
+    s.projection_bias = s.norm_bias;
+    s.ungated = arch == "gpt2" || arch == "gptneox" || arch == "falcon" || arch == "bloom" || arch == "mpt" ||
+                arch == "starcoder" || arch == "starcoder2" || arch == "phi2" || arch == "nemotron" ||
+                arch == "apertus" || arch == "arcee";
+    s.fused_qkv = arch == "gpt2" || arch == "gptneox" || arch == "bloom" || arch == "falcon" || arch == "mpt" ||
+                  arch == "starcoder" || arch == "dbrx";
+    s.learned_positions = arch == "gpt2" || arch == "starcoder";
+    s.embedding_norm = arch == "bloom";
+    s.shared_parallel_norm = arch == "phi2" || arch == "command-r";
+    s.no_norm_weights = arch == "olmo";
+    s.per_head_qk_norm = arch == "stablelm" || arch == "command-r";
+    s.qk_norm = arch == "apertus";
+    if (arch == "gptneox" || arch == "phi2" || arch == "stablelm" || arch == "nemotron") s.rope_dim = 16;
+    if (arch == "mpt" || arch == "olmo" || arch == "dbrx") s.clamp_kqv = 0.5f;
+    if (arch == "command-r") s.logit_scale = 0.5f;
+    if (arch == "starcoder2") s.sliding_window = 16;
+    if (arch == "dbrx") {
+        s.n_expert = 4;
+        s.n_expert_used = 2;
+        s.identical_experts = false;
+    }
+    return s;
 }
 
 }  // namespace liyab::test

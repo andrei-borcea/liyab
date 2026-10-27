@@ -21,6 +21,13 @@ namespace {
 // GPT-2 (Hugging Face ByteLevel with use_regex): also Phi-2.
 constexpr const char* kGpt2 =
     R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)";
+// BLOOM's tokenizer.json Split, with its nested character class flattened
+// to the equivalent excluded set (cross-checked against Oniguruma).
+constexpr const char* kBloom = R"( ?[^\s.,!?\x{2026}\x{3002}\x{FF0C}\x{3001}\x{0964}\x{06D4}\x{060C}()|]+)";
+// DBRX's declared GPT-4/cl100k tiktoken encoding. Possessive groups and
+// trailing whitespace follow the original encoding, without NFC.
+constexpr const char* kDbrx =
+    R"('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s)";
 // Llama 3: case-insensitive contractions, digits in groups of up to three.
 constexpr const char* kLlama3 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -62,6 +69,7 @@ constexpr const char* kYoutuWords =
 struct StepSpec {
     const char* pattern;
     bool keep_gaps;  // Split "Isolated"; false: "Removed" with invert (only the matches are kept)
+    bool byte_level = false;  // match ByteLevel's alphabet, with one code point per original byte
 };
 
 struct Row {
@@ -71,8 +79,8 @@ struct Row {
     bool ignore_merges;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
+const std::array<Row, 18>& table() {
+    static const std::array<Row, 18> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -88,6 +96,16 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"bloom"}, {{kBloom, true}}, false, false},
+        {{"starcoder", "refact"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
+        {{"stablelm2"}, {{kQwen2, false}}, false, false},
+        {{"olmo"}, {{kGpt2, true}}, true, false},
+        // Falcon applies Digits and the three-ASCII-digit split after
+        // ByteLevel, so those steps can cut inside an original UTF-8 character.
+        {{"falcon"}, {{R"([\p{P}\x{21}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{60}\x{7B}-\x{7E}]+)", true},
+                      {kGpt2, true}, {R"(\p{N}+)", true, true}, {R"([0-9]{3})", true, true}}, false, false},
+        {{"command-r"}, {{kEachDigit, true}, {kGpt2, true}}, true, false},
+        {{"dbrx"}, {{kDbrx, true}}, false, true},
     }};
     return rows;
 }
@@ -100,6 +118,19 @@ struct Decoded {
 };
 
 }  // namespace
+
+uint32_t PreTokenizer::byte_codepoint(uint8_t byte) noexcept {
+    static constexpr auto table = [] {
+        std::array<uint32_t, 256> out{};
+        uint32_t extra = 0;
+        for (uint32_t b = 0; b < 256; ++b) {
+            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+            out[b] = printable ? b : 256 + extra++;
+        }
+        return out;
+    }();
+    return table[byte];
+}
 
 std::string PreTokenizer::supported_names() {
     std::string out;
@@ -124,7 +155,7 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         for (const StepSpec& step : row.steps) {
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
-            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps});
+            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps, step.byte_level});
         }
         return pre;
     }
@@ -150,11 +181,27 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
     thread_local std::vector<std::pair<uint32_t, uint32_t>> current, next;
     current.assign(1, {0u, static_cast<uint32_t>(d.cps.size())});
     if (d.cps.empty()) current.clear();
+    thread_local Decoded bytes;
+    bool byte_level = false;
     for (const Step& step : steps_) {
+        if (step.byte_level && !byte_level) {
+            for (auto& [from, to] : current) {
+                from = d.offsets[from];
+                to = d.offsets[to];
+            }
+            bytes.cps.resize(text.size());
+            bytes.keys.resize(text.size());
+            for (size_t i = 0; i < text.size(); ++i) {
+                bytes.cps[i] = byte_codepoint(static_cast<uint8_t>(text[i]));
+                bytes.keys[i] = regex_key(bytes.cps[i]);
+            }
+            byte_level = true;
+        }
         next.clear();
         for (const auto& [from, to] : current) {
             // A piece is matched on its own: anchors and lookaheads see its ends.
-            const RegexSubject s{d.cps.data() + from, d.keys.data() + from, to - from};
+            const Decoded& subject = byte_level ? bytes : d;
+            const RegexSubject s{subject.cps.data() + from, subject.keys.data() + from, to - from};
             size_t pos = 0, gap = 0;
             while (pos < s.size) {
                 size_t begin = 0, end = 0;
@@ -172,7 +219,8 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
         std::swap(current, next);
     }
     for (const auto& [from, to] : current) {
-        pieces.push_back(text.substr(d.offsets[from], d.offsets[to] - d.offsets[from]));
+        pieces.push_back(byte_level ? text.substr(from, to - from)
+                                    : text.substr(d.offsets[from], d.offsets[to] - d.offsets[from]));
     }
 }
 

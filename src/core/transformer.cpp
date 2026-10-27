@@ -15,6 +15,11 @@
 #include "core/quant.h"
 #include "core/thread_pool.h"
 
+#if defined(LIYAB_USE_AVX2)
+#include <immintrin.h>
+#include "core/quant_x86.h"
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -35,6 +40,72 @@ void rmsnorm(const float* x, const float* w, float* out, int32_t n, float eps) {
     for (int32_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
 }
 
+#if defined(LIYAB_USE_AVX2)
+// Keep the baseline binary runnable without AVX2, as in quant_x86.cpp.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma,f16c")))
+#endif
+int32_t layernorm_affine_avx2(const float* x, const float* w, const float* b, float* out, int32_t n,
+                              float mean, float scale) {
+    const __m256 m = _mm256_set1_ps(mean), s = _mm256_set1_ps(scale);
+    int32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), m), s);
+        if (w != nullptr) v = _mm256_mul_ps(v, _mm256_loadu_ps(w + i));
+        if (b != nullptr) v = _mm256_add_ps(v, _mm256_loadu_ps(b + i));
+        _mm256_storeu_ps(out + i, v);
+    }
+    return i;
+}
+#endif
+
+// LayerNorm: (x - mean) / sqrt(var + eps), times w and plus b where given.
+// Mean and variance are accumulated in double, as rms_scale() accumulates,
+// so the result does not depend on how a compiler orders a float sum.
+void layernorm(const float* x, const float* w, const float* b, float* out, int32_t n, float eps) {
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; ++i) sum += x[i];
+    const double mean = sum / n;
+    double ss = 0.0;
+    for (int32_t j = 0; j < n; ++j) {
+        const double dev = x[j] - mean;
+        ss += dev * dev;
+    }
+    const auto m = static_cast<float>(mean);
+    const auto scale = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+    int32_t i = 0;
+#if defined(LIYAB_USE_AVX2)
+    if (quant::x86::avx2_enabled()) i = layernorm_affine_avx2(x, w, b, out, n, m, scale);
+#elif defined(__ARM_NEON)
+    const float32x4_t mv = vdupq_n_f32(m), sv = vdupq_n_f32(scale);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vmulq_f32(vsubq_f32(vld1q_f32(x + i), mv), sv);
+        if (w != nullptr) v = vmulq_f32(v, vld1q_f32(w + i));
+        if (b != nullptr) v = vaddq_f32(v, vld1q_f32(b + i));
+        vst1q_f32(out + i, v);
+    }
+#endif
+    for (; i < n; ++i) {
+        float v = (x[i] - m) * scale;
+        if (w != nullptr) v *= w[i];
+        if (b != nullptr) v += b[i];
+        out[i] = v;
+    }
+}
+
+// An optional per-element vector as a pointer (nullptr when absent).
+const float* opt(const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); }
+
+// Every projection adds its optional bias to each output row before the
+// activation, output scaling or residual add that consumes the projection.
+void add_bias(const std::vector<float>& bias, float* y, size_t n) {
+    if (bias.empty()) return;
+    for (size_t t = 0; t < n; ++t) {
+        float* row = y + t * bias.size();
+        for (size_t i = 0; i < bias.size(); ++i) row[i] += bias[i];
+    }
+}
+
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 // GELU with the tanh approximation (PyTorch's gelu(approximate="tanh")):
@@ -46,10 +117,104 @@ float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + 0.044715f * x * x * x)));
 }
 
+
+
+// Exact GELU, x Phi(x) = 0.5 x (1 + erf(x / sqrt 2)). Evaluated in double
+// and rounded once: the C libraries' erff may disagree in the last bit
+// between platforms (the Mac and the phone share golden hashes), their
+// double erf rounds to the same float but for one argument in hundreds of
+// millions.
+float gelu_erf(float x) {
+    const double xd = x;
+    return static_cast<float>(0.5 * xd * (1.0 + std::erf(xd * 0.70710678118654752440)));
+}
+
+// xIELU (Apertus), with its block's scalars; expm1 in double for the same
+// reason as gelu_erf().
+float xielu(float x, const XIeluScalars& p) {
+    if (x > 0.0f) return p.alpha_p * x * x + p.beta * x;
+    const auto em1 = static_cast<float>(std::expm1(static_cast<double>(std::min(x, p.eps))));
+    return (em1 - x) * p.alpha_n + p.beta * x;
+}
+
+#if defined(LIYAB_USE_AVX2)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma,f16c")))
+#endif
+size_t relu_avx2(const float* x, const float* up, float* out, size_t n, bool squared) {
+    const __m256 zero = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 input = _mm256_loadu_ps(x + i);
+        // Comparison/select preserves std::max(x, 0)'s signed zero and NaN.
+        __m256 value = _mm256_blendv_ps(input, zero, _mm256_cmp_ps(input, zero, _CMP_LT_OQ));
+        if (squared) value = _mm256_mul_ps(value, value);
+        if (up != nullptr) value = _mm256_mul_ps(value, _mm256_loadu_ps(up + i));
+        _mm256_storeu_ps(out + i, value);
+    }
+    return i;
+}
+#endif
+
+// ReLU / ReLU², optionally times an up projection. out may equal x.
+void relu_activation(const float* x, const float* up, float* out, size_t n, bool squared) {
+    size_t i = 0;
+#if defined(LIYAB_USE_AVX2)
+    if (quant::x86::avx2_enabled()) i = relu_avx2(x, up, out, n, squared);
+#elif defined(__ARM_NEON)
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t input = vld1q_f32(x + i);
+        float32x4_t value = vbslq_f32(vcltq_f32(input, zero), zero, input);
+        if (squared) value = vmulq_f32(value, value);
+        if (up != nullptr) value = vmulq_f32(value, vld1q_f32(up + i));
+        vst1q_f32(out + i, value);
+    }
+#endif
+    for (; i < n; ++i) {
+        float value = std::max(x[i], 0.0f);
+        if (squared) value *= value;
+        out[i] = up != nullptr ? value * up[i] : value;
+    }
+}
+
+// An ungated FFN's activation, in place over n values: act(x).
+void ungated_activation(FfnActivation act, const XIeluScalars* scalars, float* x, size_t n) {
+    switch (act) {
+        case FfnActivation::SiLU:
+            for (size_t i = 0; i < n; ++i) x[i] = silu(x[i]);
+            return;
+        case FfnActivation::Gelu:
+            for (size_t i = 0; i < n; ++i) x[i] = gelu_erf(x[i]);
+            return;
+        case FfnActivation::Relu:
+        case FfnActivation::ReluSquared:
+            relu_activation(x, nullptr, x, n, act == FfnActivation::ReluSquared);
+            return;
+        case FfnActivation::XIelu:
+            for (size_t i = 0; i < n; ++i) x[i] = xielu(x[i], *scalars);
+            return;
+        default:  // GeluTanh
+            break;
+    }
+    for (size_t i = 0; i < n; ++i) x[i] = gelu_tanh(x[i]);
+}
 // The gated FFN's elementwise step: out[i] = act(gate[i]) * up[i] (out may be gate).
 void gated_activation(FfnActivation act, const float* gate, const float* up, float* out, size_t n) {
     if (act == FfnActivation::GeluTanh) {
         for (size_t i = 0; i < n; ++i) out[i] = gelu_tanh(gate[i]) * up[i];
+        return;
+    }
+    if (act == FfnActivation::Relu || act == FfnActivation::ReluSquared) {
+        relu_activation(gate, up, out, n, act == FfnActivation::ReluSquared);
+        return;
+    }
+    if (act == FfnActivation::Gelu) {
+        for (size_t i = 0; i < n; ++i) {
+            float g = gate[i];
+            ungated_activation(act, nullptr, &g, 1);
+            out[i] = g * up[i];
+        }
         return;
     }
     for (size_t i = 0; i < n; ++i) out[i] = silu(gate[i]) * up[i];
@@ -470,6 +635,24 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (c.n_ctx_train > 0 && model->context_length_ > c.n_ctx_train) {
         LIYAB_LOG_WARN("context %d exceeds the model's training context %d", model->context_length_, c.n_ctx_train);
     }
+    // Learned absolute positions: the model addresses only as many positions as it has embeddings for.
+    if (c.n_positions > 0 && model->context_length_ > c.n_positions) {
+        LIYAB_LOG_WARN("context %d limited to the model's %d learned positions", model->context_length_, c.n_positions);
+        model->context_length_ = c.n_positions;
+    }
+    // ALiBi slopes per query head: a geometric series over the largest power
+    // of two of heads, the remaining heads interleaved between its terms (the
+    // reference's construction, for any head count).
+    if (c.alibi_bias > 0.0f) {
+        int32_t pow2 = 1;
+        while (pow2 * 2 <= c.n_head) pow2 *= 2;
+        const double m0 = std::exp2(-static_cast<double>(c.alibi_bias) / pow2);
+        const double m1 = std::exp2(-static_cast<double>(c.alibi_bias) / 2.0 / pow2);
+        for (int32_t h = 0; h < c.n_head; ++h) {
+            const double slope = h < pow2 ? std::pow(m0, h + 1) : std::pow(m1, 2 * (h - pow2) + 1);
+            model->alibi_slopes_.push_back(static_cast<float>(slope));
+        }
+    }
     // A window holding the whole context keeps every position anyway: such
     // blocks stay with the others (a windowed group would only add bookkeeping).
     for (int32_t& w : windows) {
@@ -652,7 +835,31 @@ Status Transformer::bind_weights() {
     } else {
         output_ = token_embd_;  // tied embeddings
     }
-    LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, true, output_norm_));
+    // RMSNorm requires weights. Each LayerNorm independently allows an
+    // optional scale and offset, including OLMo's non-parametric norms.
+    const bool norm_weights = c.spec->norm == NormKind::Rms;
+    LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, norm_weights, output_norm_));
+    LIYAB_RETURN_IF_ERROR(vec("output_norm.bias", c.n_embd, false, output_norm_b_));
+    LIYAB_RETURN_IF_ERROR(vec("output.bias", c.n_vocab, false, output_bias_));
+    LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.weight", c.n_embd, false, embd_norm_));
+    LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.bias", c.n_embd, false, embd_norm_b_));
+    if (c.spec->norm == NormKind::Rms && !embd_norm_b_.empty()) {
+        return Status(ErrorCode::InvalidModel, "an RMS embedding norm with a bias");
+    }
+    if (c.n_positions > 0) position_embd_ = f.tensor("position_embd.weight");  // shape checked by describe_model()
+    // Per-head Q/K norms: one weight shared by every head, or one row per
+    // head (a [head_dim, heads] tensor: StableLM 2 12B, Command-R+).
+    auto qk_vec = [&](const std::string& name, int64_t heads, std::vector<float>& out) -> Status {
+        const TensorView* t = f.tensor(name);
+        if (t == nullptr) return Status::ok();
+        const bool per_head = t->n_dims == 2 && t->ne[0] == c.head_dim && t->ne[1] == heads && heads > 1;
+        if (t->elements() != c.head_dim && !per_head) {
+            return Status(ErrorCode::Unsupported, "tensor '" + name + "' is not a per-head norm of " +
+                                                      std::to_string(c.head_dim) + " (norms over all heads together "
+                                                      "are not supported)");
+        }
+        return vec(name, t->elements(), true, out);
+    };
 
     const int64_t dn_key = int64_t{c.ssm_k_heads} * c.ssm_head_dim;
     const int64_t dn_value = int64_t{c.ssm_v_heads} * c.ssm_head_dim;
@@ -664,7 +871,17 @@ Status Transformer::bind_weights() {
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_norm.weight"), c.n_embd, true, L.attn_norm));
+        auto has_norm = [&](std::string_view name) {
+            return f.tensor(block_tensor(l, std::string(name) + ".weight")) != nullptr ||
+                   f.tensor(block_tensor(l, std::string(name) + ".bias")) != nullptr;
+        };
+        const std::string_view attn_norm = plan.parallel && !has_norm(c.spec->attn_norm) && has_norm(c.spec->ffn_norm)
+                                               ? c.spec->ffn_norm : c.spec->attn_norm;
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".weight"), c.n_embd, norm_weights, L.attn_norm));
+        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".bias"), c.n_embd, false, L.attn_norm_b));
+        if (plan.mixer == MixerKind::Attention) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
+        }
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -719,8 +936,12 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), c.head_dim, false, L.q_norm));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), c.head_dim, false, L.k_norm));
+            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), c.n_head, L.q_norm));
+            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), c.n_head_kv, L.k_norm));
+            if (c.spec->norm == NormKind::Layer) {
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), c.n_head, L.q_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), c.n_head_kv, L.k_norm_b));
+            }
         } else {
             L.state_slot = state_slots++;
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
@@ -733,7 +954,12 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt.bias"), c.ssm_v_heads, true, L.ssm_dt));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
         }
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd, true, L.ffn_norm));
+        // A parallel block may have no FFN norm of its own: its FFN reads the mixer's normed input.
+        if (!plan.parallel || attn_norm != c.spec->ffn_norm) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd,
+                                      norm_weights && !plan.parallel, L.ffn_norm));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
+        }
         if (!c.spec->post_mixer_norm.empty()) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
                                       false, L.post_mixer_norm));
@@ -742,10 +968,28 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_ffn_norm) + ".weight"), c.n_embd,
                                       false, L.post_ffn_norm));
         }
+        if (plan.ffn == FfnKind::Ungated) {  // down(act(up)), each with its bias where present
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), c.n_ff, false, L.b_up));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
+            continue;
+        }
         if (plan.ffn == FfnKind::Dense) {
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
+            if (!plan.fused_gate_up) {
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate.bias"), c.n_ff, false, L.b_gate));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), c.n_ff, false, L.b_up));
+            }
             if (plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
                 LIYAB_RETURN_IF_ERROR(
                     matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{c.n_ff}, L.w[kUp]));
+                std::vector<float> bias;
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), 2 * int64_t{c.n_ff}, false, bias));
+                if (!bias.empty()) {
+                    L.b_gate.assign(bias.begin(), bias.begin() + c.n_ff);
+                    L.b_up.assign(bias.begin() + c.n_ff, bias.end());
+                }
             } else {
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
                 LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
@@ -1465,8 +1709,10 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         // own) from the slot of the token's ancestor at depth d: its branch.
         const int32_t* ancestors =
             tree_depth_.empty() ? nullptr : tree_ancestors_.data() + static_cast<size_t>(t - s.first) * tree_stride_;
+        // Visible position i, and the cache slot holding its rows.
+        auto logical = [&](int32_t i) { return i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks); };
         auto position = [&](int32_t i) {
-            const int32_t p = i < n_sinks ? vis.sink_begin + i : vis.first + (i - n_sinks);
+            const int32_t p = logical(i);
             return ancestors == nullptr || p < s.n_past ? p : s.n_past + ancestors[p - s.n_past];
         };
         const int32_t spans = spans_for(n_visible);
@@ -1501,6 +1747,15 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
                              : quant::dot_f16_f32(reinterpret_cast<const uint16_t*>(k), q_.data() + row * uhd, hd)) *
                         scale;
                 }
+            }
+        }
+        if (!alibi_slopes_.empty()) {
+            // ALiBi: each head's slope times the key's distance behind the
+            // query, from logical positions (a tree pass's ancestors, the
+            // sinks, any cache slot), so cached keys never depend on where they sit.
+            for (size_t i = 0; i < len; ++i) {
+                const auto dist = static_cast<float>(logical(i0 + static_cast<int32_t>(i)) - pos);
+                for (size_t j = 0; j < ugroup; ++j) scores[j * len + i] += alibi_slopes_[static_cast<size_t>(h0) + j] * dist;
             }
         }
         if (softcap > 0.0f) {  // Gemma 2: the scaled scores squashed into (-cap, cap) before the softmax
@@ -1751,17 +2006,27 @@ void apply_final_softcap(std::span<float> logits, float cap, ThreadPool& pool) {
     }
 }
 
+void Transformer::finish_logits(int32_t rows) {
+    const ModelConfig& c = config_;
+    const auto vocab = static_cast<size_t>(c.n_vocab);
+    add_bias(output_bias_, logits_.data(), static_cast<size_t>(rows));
+    if (c.logit_scale != 1.0f) {
+        for (size_t i = 0; i < static_cast<size_t>(rows) * vocab; ++i) logits_[i] *= c.logit_scale;
+    }
+}
+
 Status Transformer::compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool) {
     const ModelConfig& c = config_;
     const size_t d = static_cast<size_t>(c.n_embd);
     const PhaseTimer timer(phases_.lm_head);
     file_->begin_layer(c.n_layers);  // output head slot of the prefetch window
     for (int32_t r = 0; r < rows; ++r) {
-        rmsnorm(x_.data() + (first_row + static_cast<size_t>(r)) * d, output_norm_.data(),
-                xb_.data() + static_cast<size_t>(r) * d, c.n_embd, c.rms_eps);
+        norm_row(x_.data() + (first_row + static_cast<size_t>(r)) * d, opt(output_norm_), opt(output_norm_b_),
+                 xb_.data() + static_cast<size_t>(r) * d, c.n_embd);
     }
     logits_.resize(static_cast<size_t>(rows) * static_cast<size_t>(c.n_vocab));
     LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), rows));
+    finish_logits(rows);
     if (c.final_softcap > 0.0f) {  // Gemma 2: logits squashed into (-cap, cap)
         apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
     }
@@ -1779,8 +2044,8 @@ Status Transformer::final_hidden(std::span<const int32_t> rows, std::span<float>
             return Status(ErrorCode::InvalidArgument, "final_hidden: row outside the last pass");
         }
         // The same norm compute_logits() applies before the LM head.
-        rmsnorm(x_.data() + static_cast<size_t>(rows[i]) * d, output_norm_.data(), out.data() + i * d, c.n_embd,
-                c.rms_eps);
+        norm_row(x_.data() + static_cast<size_t>(rows[i]) * d, opt(output_norm_), opt(output_norm_b_),
+                 out.data() + i * d, c.n_embd);
     }
     return Status::ok();
 }
@@ -1809,7 +2074,7 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
         Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
-        rmsnorm(x_.data(), L.attn_norm.data(), xb_.data(), c.n_embd, c.rms_eps);
+        norm_row(x_.data(), opt(L.attn_norm), opt(L.attn_norm_b), xb_.data(), c.n_embd);
         if (c.blocks[static_cast<size_t>(l)].latent) {
             // The key row only: its latent channels are the values.
             LIYAB_RETURN_IF_ERROR(latent_project(l, w, 1, route, backend, false));
@@ -1821,6 +2086,11 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         }
         for (size_t i = 0; i < L.bk.size(); ++i) k_[i] += L.bk[i];
         for (size_t i = 0; i < L.bv.size(); ++i) v_[i] += L.bv[i];
+        if (!c.blocks[static_cast<size_t>(l)].latent) {
+            const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+            clamp_kqv(k_.data(), kv_dim);
+            clamp_kqv(v_.data(), kv_dim);
+        }
         const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
         if (!norm_after_rope) qk_norm(L, nullptr, k_.data());
         rope(k_.data(), c.n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
@@ -1852,16 +2122,53 @@ KeyScalingShape Transformer::key_scaling_shape() const {
 void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
     const ModelConfig& c = config_;
     const auto hd = static_cast<size_t>(c.head_dim);
-    if (q != nullptr && !L.q_norm.empty()) {
+    // Head h's weight (and bias): row h of a per-head norm, else the one shared row.
+    auto row = [hd](const std::vector<float>& v, size_t h) {
+        return v.empty() ? nullptr : v.data() + (v.size() > hd ? h * hd : 0);
+    };
+    if (q != nullptr && (!L.q_norm.empty() || !L.q_norm_b.empty())) {
         for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
-            rmsnorm(q + h * hd, L.q_norm.data(), q + h * hd, c.head_dim, c.rms_eps);
+            norm_row(q + h * hd, row(L.q_norm, h), row(L.q_norm_b, h), q + h * hd, c.head_dim);
         }
     }
-    if (!L.k_norm.empty()) {
+    if (!L.k_norm.empty() || !L.k_norm_b.empty()) {
         for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
-            rmsnorm(k + h * hd, L.k_norm.data(), k + h * hd, c.head_dim, c.rms_eps);
+            norm_row(k + h * hd, row(L.k_norm, h), row(L.k_norm_b, h), k + h * hd, c.head_dim);
         }
     }
+}
+
+void Transformer::norm_row(const float* x, const float* w, const float* b, float* out, int32_t n) const {
+    if (config_.spec->norm == NormKind::Layer) {
+        layernorm(x, w, b, out, n, config_.rms_eps);
+        return;
+    }
+    rmsnorm(x, w, out, n, config_.rms_eps);  // RMSNorm: the bits it always had
+}
+
+Status Transformer::add_positions(int32_t n) {
+    if (position_embd_ == nullptr) return Status::ok();
+    const ModelConfig& c = config_;
+    const auto d = static_cast<size_t>(c.n_embd);
+    thread_local std::vector<float> row;
+    row.resize(d);
+    for (int32_t t = 0; t < n; ++t) {
+        const int32_t pos = pos_of(segs_[segment_of(t)], t);
+        if (pos < 0 || pos >= c.n_positions) {
+            return Status(ErrorCode::ContextFull, "position " + std::to_string(pos) + " is past the model's " +
+                                                      std::to_string(c.n_positions) + " learned positions");
+        }
+        quant::dequantize_row(position_embd_->type, position_embd_->row(pos), row.data(), c.n_embd);
+        float* x = x_.data() + static_cast<size_t>(t) * d;
+        for (size_t i = 0; i < d; ++i) x[i] += row[i];
+    }
+    return Status::ok();
+}
+
+void Transformer::clamp_kqv(float* x, size_t n) const {
+    const float cap = config_.clamp_kqv;
+    if (cap <= 0.0f) return;
+    for (size_t i = 0; i < n; ++i) x[i] = std::clamp(x[i], -cap, cap);
 }
 
 void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k) {
@@ -2012,7 +2319,9 @@ Result<float> Transformer::calibrate_latent_form(const Route& route, ThreadPool&
     att_.resize(un * q_dim);
     std::vector<float> input(un * d);
     for (float& v : input) v = normal(rng);
-    for (size_t t = 0; t < un; ++t) rmsnorm(input.data() + t * d, L.attn_norm.data(), input.data() + t * d, c.n_embd, c.rms_eps);
+    for (size_t t = 0; t < un; ++t) {
+        norm_row(input.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), input.data() + t * d, c.n_embd);
+    }
     const int64_t pairs = latent_visible(live_segment(0, n, Logits::None), L.window);
     int64_t positions = 0;
     for (const auto& [a, b] : mla_union_) positions += b - a;
@@ -2087,6 +2396,9 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             for (size_t i = 0; i < L.bq.size(); ++i) q[i] += L.bq[i];
             for (size_t i = 0; i < L.bk.size(); ++i) k[i] += L.bk[i];
             for (size_t i = 0; i < L.bv.size(); ++i) v[i] += L.bv[i];
+            clamp_kqv(q, q_dim);
+            clamp_kqv(k, kv_dim);
+            clamp_kqv(v, kv_dim);
             if (!norm_after_rope) qk_norm(L, q, k);
             const int32_t pos = pos_of(s, static_cast<int32_t>(t));
             if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
@@ -2101,7 +2413,9 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
-    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
+    add_bias(L.bo, xb_.data(), un);
+    return Status::ok();
 }
 
 Status Transformer::per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out,
@@ -2601,7 +2915,9 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     }
     form_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     latent_ms_ += form_ms;
-    return matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kO], att_.data(), xb_.data(), n));
+    add_bias(L.bo, xb_.data(), un);
+    return Status::ok();
 }
 
 // Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention):
@@ -2882,7 +3198,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     pred_in_.resize(un * d);
     pred_logits_.resize(un * E);
     for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), pred_in_.data() + t * d, c.n_embd, c.rms_eps);
+        norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), pred_in_.data() + t * d, c.n_embd);
     }
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
@@ -2952,17 +3268,32 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         }
         return matmul(route, route.ffn, m, x, y, n);
     };
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto ff = static_cast<size_t>(c.n_ff);
+    if (c.blocks[static_cast<size_t>(layer)].ffn == FfnKind::Ungated) {
+        // down(act(up x + b_up)) + b_down
+        LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb_.data()));
+        add_bias(L.b_up, hb_.data(), static_cast<size_t>(n));
+        ungated_activation(c.spec->ffn_activation, c.xielu.empty() ? nullptr : &c.xielu[static_cast<size_t>(layer)],
+                           hb_.data(), rows);
+        LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
+        add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
+        return Status::ok();
+    }
     if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
         // One [gate | up] projection per token (no per-projection hook: the
         // halves are one matrix); act(gate) * up lands in hb_.
-        const auto ff = static_cast<size_t>(c.n_ff);
         hb2_.resize(2 * rows);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kUp], xb_.data(), hb2_.data(), n));
         for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
-            const float* gate_up = hb2_.data() + t * 2 * ff;
+            float* gate_up = hb2_.data() + t * 2 * ff;
+            for (size_t i = 0; i < L.b_gate.size(); ++i) gate_up[i] += L.b_gate[i];
+            for (size_t i = 0; i < L.b_up.size(); ++i) gate_up[ff + i] += L.b_up[i];
             gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff);
         }
-        return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
+        LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
+        add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
+        return Status::ok();
     }
     if (hook != nullptr) {
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Gate, w[kGate], xb_.data(), hb_.data()));
@@ -2972,8 +3303,12 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         float* outs[] = {hb_.data(), hb2_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.ffn, gate_up, xb_.data(), outs, n));
     }
+    add_bias(L.b_gate, hb_.data(), static_cast<size_t>(n));
+    add_bias(L.b_up, hb2_.data(), static_cast<size_t>(n));
     gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows);
-    return project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data());
+    LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
+    add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
+    return Status::ok();
 }
 
 size_t Transformer::experts_to_run(std::span<const float> probs, std::span<const int32_t> order, float top_sum) const {
@@ -3352,6 +3687,11 @@ Status Transformer::embed(std::span<const int32_t> tokens, std::span<float> x) c
     if (c.embd_scale != 1.0f) {
         for (size_t i = 0; i < tokens.size() * d; ++i) x[i] *= c.embd_scale;
     }
+    if (!embd_norm_.empty() || !embd_norm_b_.empty()) {  // BLOOM's word_embeddings_layernorm
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            norm_row(x.data() + t * d, opt(embd_norm_), opt(embd_norm_b_), x.data() + t * d, c.n_embd);
+        }
+    }
     return Status::ok();
 }
 
@@ -3370,7 +3710,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         if (weight.empty()) return;
         for (size_t t = 0; t < un; ++t) {
             float* row = xb_.data() + t * d;
-            rmsnorm(row, weight.data(), row, c.n_embd, c.rms_eps);
+            norm_row(row, weight.data(), nullptr, row, c.n_embd);
         }
     };
 
@@ -3381,7 +3721,19 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     // --- token mixer (attention or DeltaNet) ---
     if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
     for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.attn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+        norm_row(x_.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), xb_.data() + t * d, c.n_embd);
+    }
+    // A parallel block's FFN reads the block input too: normed by its own
+    // FFN norm, or the mixer's normed input itself; kept while the mixer runs.
+    if (plan.parallel) {
+        par_in_.resize(un * d);
+        for (size_t t = 0; t < un; ++t) {
+            if (L.ffn_norm.empty() && L.ffn_norm_b.empty()) {
+                std::copy_n(xb_.data() + t * d, d, par_in_.data() + t * d);
+            } else {
+                norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), par_in_.data() + t * d, c.n_embd);
+            }
+        }
     }
     if (plan.mixer == MixerKind::DeltaNet) {
         const PhaseTimer timer(phases_.delta_net);
@@ -3406,8 +3758,12 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         if (expert_store_ != nullptr && moe) predict_experts(l + 1, n, route);
         return Status::ok();
     }
-    for (size_t t = 0; t < un; ++t) {
-        rmsnorm(x_.data() + t * d, L.ffn_norm.data(), xb_.data() + t * d, c.n_embd, c.rms_eps);
+    if (plan.parallel) {
+        std::copy_n(par_in_.data(), un * d, xb_.data());
+    } else {
+        for (size_t t = 0; t < un; ++t) {
+            norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), xb_.data() + t * d, c.n_embd);
+        }
     }
     if (moe) {
         LIYAB_RETURN_IF_ERROR(moe_ffn(l, w, n, block_route));
@@ -3468,6 +3824,11 @@ Status Transformer::reuse_support() const {
     }
     if (kv_->window() > 0) {
         return Status(ErrorCode::Unsupported, "a sliding-window cache releases the positions it no longer shows");
+    }
+    if (position_embd_ != nullptr) {
+        return Status(ErrorCode::Unsupported,
+                      "learned absolute positions enter the residual stream, so every block's keys carry the "
+                      "position they were computed at, which no rotation can move");
     }
     if (kv_->has_windowed_layers()) {
         return Status(ErrorCode::Unsupported,
@@ -3690,6 +4051,7 @@ Result<std::span<const float>> Transformer::forward(std::span<const int32_t> tok
     size_batch(n);
     LIYAB_RETURN_IF_ERROR(embed(tokens, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
     begin_live_pass(n, logits);
+    LIYAB_RETURN_IF_ERROR(add_positions(n));
 
     for (int32_t l = 0; l < c.n_layers; ++l) {
         if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
@@ -4006,12 +4368,13 @@ Status Transformer::compute_logits_rows(const Route& route, std::span<const int3
     const PhaseTimer timer(phases_.lm_head);
     file_->begin_layer(c.n_layers);  // output head slot of the prefetch window
     for (size_t i = 0; i < rows.size(); ++i) {
-        rmsnorm(x_.data() + static_cast<size_t>(rows[i]) * d, output_norm_.data(), xb_.data() + i * d, c.n_embd,
-                c.rms_eps);
+        norm_row(x_.data() + static_cast<size_t>(rows[i]) * d, opt(output_norm_), opt(output_norm_b_),
+                 xb_.data() + i * d, c.n_embd);
     }
     logits_.resize(rows.size() * static_cast<size_t>(c.n_vocab));
     LIYAB_RETURN_IF_ERROR(
         matmul(route, route.ffn, *output_, xb_.data(), logits_.data(), static_cast<int32_t>(rows.size())));
+    finish_logits(static_cast<int32_t>(rows.size()));
     if (c.final_softcap > 0.0f) apply_final_softcap(std::span<float>(logits_.data(), logits_.size()), c.final_softcap, pool);
     return Status::ok();
 }
@@ -4129,6 +4492,7 @@ Status Transformer::forward_batch(std::span<const BatchItem> items, const Route&
     const auto un = static_cast<size_t>(total);
     size_batch(total);
     LIYAB_RETURN_IF_ERROR(embed(batch_tokens_, std::span<float>(x_.data(), un * static_cast<size_t>(c.n_embd))));
+    LIYAB_RETURN_IF_ERROR(add_positions(total));
     struct StepsOnly {
         bool& flag;
         ~StepsOnly() { flag = false; }

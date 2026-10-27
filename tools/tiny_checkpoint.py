@@ -26,7 +26,7 @@ What shrinks: the blocks (the shortest prefix holding every kind of block, at le
 blocks dropped), the attention heads (--heads, default 4; key/value heads in the model's ratio: as many as the
 query heads without grouping, 1 with multi-query attention, else --kv-heads), every FFN and expert width (--ffn,
 default 128) and the routed experts (--experts, default 16, at least top-k + 1 and a multiple of the expert
-groups). A reduction this generic cannot know every architecture's coupled sizes (a latent rank, a state size, a
+groups). Nested attention and expert configuration objects are reduced too. A reduction this generic cannot know every architecture's coupled sizes (a latent rank, a state size, a
 convolution's channels, an index's top-k small enough to select within a short text): --config sets fields after
 it, as JSON, and the tool prints the configuration it saved.
 
@@ -47,7 +47,7 @@ from reference_trace import EXPERT_COUNT_KEYS, TOP_K_KEYS, _layer_count, _random
 
 HIDDEN_KEYS = ("hidden_size", "n_embd", "d_model", "model_dim")
 HEAD_KEYS = ("num_attention_heads", "n_head", "num_heads", "n_heads")
-KV_HEAD_KEYS = ("num_key_value_heads", "n_head_kv", "num_kv_heads", "multi_query_group_num", "n_kv_heads")
+KV_HEAD_KEYS = ("num_key_value_heads", "n_head_kv", "num_kv_heads", "multi_query_group_num", "n_kv_heads", "kv_n_heads")
 HEAD_DIM_KEYS = ("head_dim", "kv_channels")
 FFN_KEYS = ("n_inner", "ffn_hidden_size", "ffn_dim", "d_ff")  # besides every "*intermediate_size*" field
 TOKENIZER_FILES = ("tokenizer*", "vocab*", "merges.txt", "special_tokens_map.json", "added_tokens.json", "*.tiktoken",
@@ -108,6 +108,20 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
             groups = getattr(cfg, "n_group", None) or 1
             count = max(experts, top_k + 1)
             setattr(cfg, k, min(v, ((count + groups - 1) // groups) * groups))
+    # Some configurations keep attention and expert dimensions in typed
+    # child configurations. Shrink those too, preserving their classes.
+    for child in vars(cfg).values():
+        if not hasattr(child, "to_dict"):
+            continue
+        for key, value in list(vars(child).items()):
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if ("intermediate_size" in key or key in FFN_KEYS) and value > ffn:
+                setattr(child, key, ffn)
+            elif key in EXPERT_COUNT_KEYS and value > experts:
+                setattr(child, key, max(experts, top_k + 1))
+            elif head_key and key in KV_HEAD_KEYS:
+                setattr(child, key, new_heads if value == n_head else min(value, kv_heads, new_heads))
     return keep, n
 
 
@@ -158,8 +172,11 @@ def main():
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
     keep, n = reduce(cfg, args.heads, args.kv_heads, args.width, args.ffn, args.experts)
-    for field, value in json.loads(args.config or "{}").items():
-        setattr(cfg, field, value)
+    overrides = json.loads(args.config or "{}")
+    # Re-run the configuration's own invariants after shrinking dimensions
+    # (e.g. an expert configuration's hidden_size must mirror d_model), and
+    # convert nested JSON overrides back to their typed forms.
+    cfg = type(cfg).from_dict({**cfg.to_dict(), **overrides})
 
     torch.manual_seed(args.seed)
     model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)

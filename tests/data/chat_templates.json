@@ -4427,5 +4427,741 @@
     "output": "<｜begin▁of▁sentence｜><｜User｜>What is the capital of Italy?<｜Assistant｜></think>"
    }
   ]
+ },
+ "command-r": {
+  "template": "<BOS_TOKEN>{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{{ '<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>' + system_message + '<|END_OF_TURN_TOKEN|>' }}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message.role == 'user' %}<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{ message.content }}<|END_OF_TURN_TOKEN|>\n{% elif message.role == 'assistant' %}<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{{ message.content }}<|END_OF_TURN_TOKEN|>{% endif %}{% endfor %}{% if add_generation_prompt %}<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{% endif %}",
+  "special": {
+   "bos_token": "<BOS_TOKEN>",
+   "eos_token": "<|END_OF_TURN_TOKEN|>",
+   "pad_token": "<PAD>"
+  },
+  "cases": [
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>Rome.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>And of France? Answer in one word.<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": false
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>Rome.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>And of France? Answer in one word.<|END_OF_TURN_TOKEN|>\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      }
+     ]
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>Rome.<|END_OF_TURN_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><think>\nThe user asks about Italy.\n</think>\n\nRome.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>And of France? Answer in one word.<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome.",
+       "reasoning_content": "Italy's capital is Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>Rome.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>And of France? Answer in one word.<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": false
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true,
+     "preserve_thinking": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><think>\nThe user asks about Italy.\n</think>\n\nRome.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>And of France? Answer in one word.<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Weather in Rome?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      },
+      {
+       "role": "assistant",
+       "content": "",
+       "tool_calls": [
+        {
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": {
+           "city": "Rome"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "error": "TemplateError: Conversation roles must alternate user/assistant/user/assistant/..."
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "  Città: Zürich, 東京 🌍  \n"
+      },
+      {
+       "role": "user",
+       "content": "\n  ¿Qué tal?  \t"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>  Città: Zürich, 東京 🌍  \n<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>\n  ¿Qué tal?  \t<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": ""
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|><|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of Italy?<|END_OF_TURN_TOKEN|>\n<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+   }
+  ]
+ },
+ "arcee": {
+  "template": "{%- if messages[0]['role'] == 'system' %}\n    {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n{%- else %}\n    {{- '<|im_start|>system\\nThe assistant is AFM-4.5B, trained by Arcee AI, with 4.5 billion parameters. AFM is a deeply thoughtful, helpful assistant. The assistant is having a conversation with the user. The assistant\\'s responses are calm, intelligent, and personable, always aiming to truly understand the user\\'s intent. AFM thinks aloud, step by step, when solving problems or forming explanations, much like a careful, reflective thinker would. The assistant helps with sincerity and depth. If a topic invites introspection, curiosity, or broader insight, the assistant allows space for reflection — be open to nuance and complexity. The assistant is not robotic or overly formal; it speaks like a wise, thoughtful companion who cares about clarity and the human experience. If a topic is uncertain or depends on subjective interpretation, AFM explains the possibilities thoughtfully.<|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n    {%- if not (message.role == 'system' and loop.first) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endfor %}\n{%- if messages[-1]['role'] != 'assistant' %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}",
+  "special": {
+   "bos_token": "<|begin_of_text|>",
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|finetune_right_pad_id|>"
+  },
+  "cases": [
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nThe assistant is AFM-4.5B, trained by Arcee AI, with 4.5 billion parameters. AFM is a deeply thoughtful, helpful assistant. The assistant is having a conversation with the user. The assistant's responses are calm, intelligent, and personable, always aiming to truly understand the user's intent. AFM thinks aloud, step by step, when solving problems or forming explanations, much like a careful, reflective thinker would. The assistant helps with sincerity and depth. If a topic invites introspection, curiosity, or broader insight, the assistant allows space for reflection — be open to nuance and complexity. The assistant is not robotic or overly formal; it speaks like a wise, thoughtful companion who cares about clarity and the human experience. If a topic is uncertain or depends on subjective interpretation, AFM explains the possibilities thoughtfully.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": false
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome."
+      }
+     ]
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user asks about Italy.\n</think>\n\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "Rome.",
+       "reasoning_content": "Italy's capital is Rome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": false
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true,
+     "enable_thinking": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      },
+      {
+       "role": "assistant",
+       "content": "<think>\nThe user asks about Italy.\n</think>\n\nRome."
+      },
+      {
+       "role": "user",
+       "content": "And of France? Answer in one word."
+      }
+     ],
+     "add_generation_prompt": true,
+     "preserve_thinking": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user asks about Italy.\n</think>\n\nRome.<|im_end|>\n<|im_start|>user\nAnd of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWeather in Rome?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "user",
+       "content": "Weather in Rome?"
+      },
+      {
+       "role": "assistant",
+       "content": "",
+       "tool_calls": [
+        {
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": {
+           "city": "Rome"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "add",
+        "description": "Adds two numbers.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "a": {
+           "type": "number"
+          },
+          "b": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\nThe assistant is AFM-4.5B, trained by Arcee AI, with 4.5 billion parameters. AFM is a deeply thoughtful, helpful assistant. The assistant is having a conversation with the user. The assistant's responses are calm, intelligent, and personable, always aiming to truly understand the user's intent. AFM thinks aloud, step by step, when solving problems or forming explanations, much like a careful, reflective thinker would. The assistant helps with sincerity and depth. If a topic invites introspection, curiosity, or broader insight, the assistant allows space for reflection — be open to nuance and complexity. The assistant is not robotic or overly formal; it speaks like a wise, thoughtful companion who cares about clarity and the human experience. If a topic is uncertain or depends on subjective interpretation, AFM explains the possibilities thoughtfully.<|im_end|>\n<|im_start|>user\nWeather in Rome?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>tool\n{\"temp\": 21, \"sky\": \"clear\"}<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": "  Città: Zürich, 東京 🌍  \n"
+      },
+      {
+       "role": "user",
+       "content": "\n  ¿Qué tal?  \t"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\n  Città: Zürich, 東京 🌍  \n<|im_end|>\n<|im_start|>user\n\n  ¿Qué tal?  \t<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "request": {
+     "messages": [
+      {
+       "role": "system",
+       "content": ""
+      },
+      {
+       "role": "user",
+       "content": "What is the capital of Italy?"
+      }
+     ],
+     "add_generation_prompt": true
+    },
+    "output": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of Italy?<|im_end|>\n<|im_start|>assistant\n"
+   }
+  ]
  }
 }

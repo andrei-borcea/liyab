@@ -38,10 +38,15 @@ public:
     static Result<PreTokenizer> for_name(std::string_view name);
     // Every supported tokenizer.ggml.pre value, comma-separated.
     static std::string supported_names();
+    // GPT-2 ByteLevel's fixed printable alphabet for one byte. Shared with
+    // the BPE encoder/decoder; pure and safe to call from any thread.
+    static uint32_t byte_codepoint(uint8_t byte) noexcept;
 
     // Appends the pieces of `text` (already normalized) to `pieces`, as byte
     // ranges of `text`, in order. Every byte of `text` is in exactly one
-    // piece unless a step drops what lies between its matches.
+    // piece unless a step drops what lies between its matches. A step after
+    // ByteLevel may split within a UTF-8 character: pieces are raw byte views,
+    // which the BPE encoder maps through the same byte alphabet afterwards.
     void split(std::string_view text, std::vector<std::string_view>& pieces) const;
 
     [[nodiscard]] bool nfc() const noexcept { return nfc_; }
@@ -52,6 +57,7 @@ private:
     struct Step {
         Regex regex;
         bool keep_gaps;
+        bool byte_level;
     };
     PreTokenizer() = default;
     std::string name_;

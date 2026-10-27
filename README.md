@@ -108,6 +108,8 @@ These rules decide what goes into the code:
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Classic transformer parts: LayerNorm, optional projection biases, ungated GELU/ReLU²/xIELU FFNs, parallel residuals, learned positions, ALiBi, Q/K/V clamping and output scaling | Implemented on CPU; family conformance is tracked in [model descriptions](docs/model-descriptions.md#classic-transformer-parts) |
+| Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
@@ -484,6 +486,7 @@ What the port does differently from the POSIX platforms:
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
     asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan, Tekken). Rows:
     `default` / `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`,
+    `bloom`, `starcoder` / `refact`, `olmo` (NFC), `stablelm2`, `falcon`, `command-r` (NFC), `dbrx` (cl100k),
     `hunyuan`, `hunyuan-dense` / `deepseek-v3`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
     digit alone, then GPT-2's split), `tekken` (Mistral-Nemo) and `youtu` (Youtu-LLM: Hangul, CJK punctuation,
     Bopomofo and Han/kana runs first; its `\p{Hangul}` is written out as the script's code-point ranges, since the
@@ -498,6 +501,13 @@ What the port does differently from the POSIX platforms:
   * **Special tokens** written in the text map to their ids, found in one pass over the text. Those of the Phi-3
     family (Phi-3/3.5, Phi-4-mini) swallow the white space after them, as their Hugging Face tokenizer does. A
     byte a vocabulary lacks (Hunyuan's dense models have no `\r`) is left out before merging, as there.
+    Nemotron's Metaspace `first` policy adds a dummy space only at the start of plain text; real spaces after
+    literal controls remain significant, including when matching saved contexts. Its absent BOS metadata
+    defaults to no BOS; an explicit file setting always wins.
+    SentencePiece compiled character maps run before BPE when the GGUF records one. Orion's converter omits
+    its map and initial-space policy, so its architecture row supplies the exact registered map and defaults;
+    this preserves its trained NMT-NFKC normalization, tabs and newlines without changing existing tokenizers.
+    Byte fallback follows BYTE token types; ordinary `<0xXX>` vocabulary entries retain their literal text.
   * **Checked token for token** against each model's Hugging Face tokenizer, special tokens, contractions,
     digits, white-space runs, composed and decomposed accents, CJK, emoji and right-to-left text included
     ([Correctness](#correctness)).
@@ -2103,6 +2113,12 @@ weights, the file's layouts and the repacked ones, batched and token-by-token pr
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
+The classic transformer extension passes 20 tiny cases across 16 families and nine full-checkpoint gates.
+Its controlled main/branch comparison on the M4 Pro passes all 14 prefill/decode metrics within ±3%, using
+48 balanced pairs on AC power. BF16 Metal-route measurements include CPU matrix fallback; F16 measurements
+verify actual Metal attention and FFNs. [Classic validation](docs/model-descriptions.md#classic-performance-regression-check)
+records the method, measured rates and earlier failed attempts. No engine performance fix is claimed.
+
 **Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
 float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every supported tokenizer
 gave the reference's ids for the whole text. The Hunyuan models were measured on the reference's ids
@@ -2469,6 +2485,23 @@ Benchmarks and tools built with the tests:
   gives the model's own ids on three texts and `liyab-kl --kv f16` passes against transformers. How each fact is
   established and what the tool said about the supported architectures and others:
   [docs/model-descriptions.md](docs/model-descriptions.md).
+  Architecture traces use explicit causal masks so eager score implementations can be observed alongside
+  transformers' attention registry, observe the actual LayerNorm epsilon when it is a function argument,
+  and check scalar activation parameters against the checkpoint and GGUF.
+  Parallel blocks bind mixer and FFN norms independently, with a shared input norm when one tensor is absent.
+  Attention traces recognize repeated GQA keys and values before matching their source projections.
+  Observed GELU modes distinguish exact erf from tanh even when tiny inputs make their outputs nearly equal.
+  Classic host operations are checked with GPU projections through prefill, decode and rollback as well.
+  LayerNorm affine steps and ReLU/ReLU² have NEON, dispatched AVX2 and scalar paths; GELU/xIELU retain scalar
+  libm for their rounded transcendental functions.
+  Odd FFN widths exercise SIMD tails across batching and fused/split projections on every KV type.
+  Reference traces also bound typed child FFN/expert configurations, keeping original residual/head dimensions.
+  Unsupported gated xIELU FFNs are refused when describing the file.
+  Learned position embeddings combined with an embedding norm are refused, including bias-only norms.
+  Optional attention-output bias follows both ordinary and latent attention projections, in either latent form.
+  Local PyTorch `.bin` checkpoints, including indexed shards, use `weights_only` memory maps for tensor inspection;
+  remote inspection requires safetensors. `python tests/test_describe_model.py` checks both local readers with
+  the reference environment, including row bounds, saved gradient flags and lazy shard loading.
 
   ```bash
   tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
@@ -2657,7 +2690,7 @@ Implemented features are described above. These are next, in order:
     locked in RAM;
   * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
     of their own, such as a temporary directory under a user name with accents.
-* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
+* **Architectures not supported yet:** Gemma 3n, Phi-1 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
   expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
   its keys unscaled (the key scales are measured on a text it cannot encode).
