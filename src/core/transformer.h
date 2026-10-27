@@ -7,11 +7,13 @@
 // mixer — softmax attention (GQA, separate or fused QKV projections, RoPE in
 // either pairing with a per-block table, LongRoPE factors or YaRN, optional QKV
 // bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
-// optional sliding window, optional soft cap), multi-head latent attention
+// optional sliding window, optional soft cap, optional sink logit per head,
+// optional output bias), multi-head latent attention
 // (absorbed queries over one cached [RoPE key | latent] row per position,
 // see LatentAttention) or a Gated DeltaNet linear-attention recurrence —
-// followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and
-// up projections) or a mixture of experts (router + top-k routed experts +
+// followed by a gated dense FFN (SwiGLU, GeGLU or gpt-oss's clamped SwiGLU,
+// separate or fused gate and up projections) or a mixture of experts (router,
+// optionally with a bias, + top-k routed experts, optionally with biases, +
 // optional gated shared expert), each optionally followed by its own norm
 // before the residual add. So hybrid models (Qwen3.5: three DeltaNet blocks
 // per attention block), models that alternate windowed and global attention
@@ -740,6 +742,7 @@ private:
     enum WeightRole : size_t {
         kQ, kK, kV, kO,              // attention (kQ yields [q | gate] per head when gated)
         kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
+                                        // kZ also holds a separate softmax-attention output gate
         kGate, kUp, kDown,           // SwiGLU FFN
         kRouter, kGateExps, kUpExps, kDownExps,  // MoE: router [n_embd x n_expert], experts stacked on dim 2
                                                  // (fused_gate_up: kUpExps holds [gate | up], no kGateExps)
@@ -772,6 +775,14 @@ private:
         std::vector<float> attn_norm_b, ffn_norm_b, q_norm_b, k_norm_b;
         // Optional projection biases, added after their matmuls: attention output, FFN gate, up and down.
         std::vector<float> bo, b_gate, b_up, b_down;
+        // Optional: attn_sinks, one learned logit per query head that joins
+        // the softmax's denominator (attention()).
+        std::vector<float> sinks;
+        std::vector<float> router_bias;   // optional: ffn_gate_inp.bias, added to the router's logits
+        // Optional per-expert biases of the experts' projections, [expert][rows]
+        // (ffn_gate_exps.bias, ffn_up_exps.bias, ffn_down_exps.bias), each
+        // added after its projection.
+        std::vector<float> gate_exps_bias, up_exps_bias, down_exps_bias;
     };
     // Recurrent memory of one DeltaNet block.
     struct RecurrentState {
@@ -918,7 +929,8 @@ private:
     // values of attention block `kv_slot`, each segment's tokens over its own
     // cache (segments in the expanded latent form are left out: see
     // latent_expanded); `window` > 0 limits each query to its last `window`
-    // positions (within what the KV cache keeps visible). Leaves each
+    // positions (within what the KV cache keeps visible). Layer::sinks joins
+    // each head softmax denominator without a value contribution. Leaves each
     // token's heads in att_, value_dim channels per head.
     void attention(const Layer& layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;

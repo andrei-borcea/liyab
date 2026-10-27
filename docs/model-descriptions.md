@@ -751,3 +751,160 @@ reports the colliding uncorrected export. The earlier OLMo gates used three
 ordinary texts and do not establish equivalence on this counterexample.
 A corrected metadata tag does not alter model tensor payloads. Final integration
 conformance for these files must record that correction explicitly.
+## Biased experts and learned attention sinks
+
+Optional `ffn_gate_inp.bias` is added to the router logits; `exp_probs_b.bias` remains a separate selection-only
+correction after softmax or sigmoid. The converter maps Flint's `.gate.expert_bias.bias` to that selection
+correction. Expert projection biases have shape `[rows, experts]` in GGUF order and apply before activation or
+router weighting. Shared-expert width and leading dense blocks already follow the tensors present; the metadata
+counts do not cause an extra expert or a block to execute.
+
+The reference trace recomputes fused expert outputs in either matrix orientation and with contiguous or
+interleaved gate/up values, including projection biases. It recognizes `SwigluOai` only when the observed output
+matches the activation and the reference's alpha and limit are 1.702 and 7. An unknown expert activation refuses
+a proposed row. Learned sink logits are checked against `attn_sinks.weight` in the file and join the attention
+softmax denominator once per query head, after merging its paged-cache spans.
+MXFP4 batched matmuls share a weight decode across four input rows on NEON and AVX2; their tests compare every
+result bit with single-row decode for partial row tiles and odd numbers of 32-value blocks. Decode dispatch and
+existing quantized formats retain their kernels and accumulation order.
+Per-block FFN width lists are reduced alongside scalar widths when constructing tiny checkpoints and reference
+traces; attention sizes, routing parameters, and shared-expert counts keep their original contracts.
+Learned sinks are covered by the multi-sequence scheduling tests and by KV relocation and segment-store reuse
+checks, including quantized key scaling. They add no per-sequence state: their only persistent values are the
+model's head logits. Router prefetch applies selection corrections in probability space, matching actual routing.
+A dense checkpoint cannot establish its family's unused expert-routing default. The tool preserves that field
+from a registered row and labels it unmeasurable from this checkpoint. Mixtral, which shares `llama` with dense
+Llama, supplies the evidence for that family's renormalization default; dense Llama's logits are unaffected.
+The trace randomizes declared router selection-correction buffers (`e_score_correction`,
+`e_score_correction_bias`, `expert_bias`), which otherwise start at zero and hide their effect. It compares
+candidate corrections anywhere inside the FFN with the experts' observed indices and weights; mathematical
+buffers such as RoPE frequencies retain their configured values.
+GLM-4 MoE binds `post_attention_norm` before the FFN. Its `glm4` BPE pre-tokenizer uses the same split expression
+as Llama 3, has no normalization, and honors `ignore_merges` from the tokenizer contract. Its sparse block plan
+skips trailing MTP blocks through `nextn_predict_layers`, as the existing loader already does.
+A separate attention output-gate tensor is planned alongside the existing fused query/gate layout. Both forms
+apply the sigmoid after attention and before the output projection; fused and separate gates together are
+rejected as ambiguous. Golden cases and all-KV-type tests compare the two layouts bit for bit.
+Legacy `rope_parameters.type` is renamed to `rope_parameters.rope_type` before constructing a transformers
+reference (including nested per-layer parameter dictionaries). This is a spelling compatibility fix; factors,
+bases, and scaling algorithms are unchanged.
+
+The tiny checkpoints for Qwen1.5-MoE-A2.7B, Mixtral-8x7B, dots.llm1.inst, GLM-4.5 and ERNIE-4.5-21B-A3B exercise
+routed and shared experts and leading dense blocks. The proposed Qwen2MoE, Mixtral and dots1 rows match the
+registry. The gpt-oss trace proposes its complete row including SwigluOai and its alternating window. GLM-4 MoE
+uses `post_attention_norm`; ERNIE uses adjacent-pair RoPE and renormalizes its selected probabilities. ERNIE's
+reduced configuration sets `intermediate_size=256` with one KV head and two 128-wide shared experts, preserving
+the converter's coupled shared-width metadata. Tiny numerical results are recorded in the README.
+The `glm4` table entry is covered by an explicit split/flag test, the 498-token conformance comparison, and
+fourteen reference chat-template renderings. Its normalizer is absent and `ignore_merges` is true, as in the
+published tokenizer JSON.
+
+`hy_v3` stores its expert selection correction as bare `exp_probs_b`; the loader accepts that spelling alongside
+`exp_probs_b.bias` while rejecting a duplicate pair. The trace checks both spellings. The same attention-gate
+part also accepts one scalar per head (broadcast over its value channels).
+
+`swiglu_clamp_exp` and `swiglu_clamp_shexp` are per-block float32 arrays. Their positive finite limits clamp the
+SiLU result, then multiply by the symmetrically clamped up projection. They differ from SwigluOai, whose clamp
+precedes activation. Dense and shared experts use the shared array, routed experts the expert array. Negative,
+nonfinite, short, or wrongly typed arrays are rejected; zero retains the original arithmetic. The reference
+trace recomputes these limits and compares them with the file.
+
+AFMoE's decimal splitter is equivalent to its tokenizer's bounded regex sequence: isolate each decimal run,
+then split in groups of three aligned at the right. A direct linear scan avoids repeated lookaheads on long
+numbers. Script splits and word splits follow it. EXAONE-MoE's own regex and NFC rule have a separate table row.
+AFMoE and EXAONE-MoE still need modern's support for their global blocks without RoPE before an architecture row
+can be admitted.
+The description tool proposes `{"hy_v3", RopeLayout::Halves, "ffn_norm", true}` for `tencent/Hy3-preview`.
+Its tiny checkpoint passes the standard reference gate (498 positions, KL 0.00000, top-1 100.00%), including the
+bare selection-bias tensor. Scalar-head and per-channel attention gates are checked against equivalent fused
+query/gate tensors for F16, Q8_0, Q4_0 and Q4_1 KV. An independent float reference checks the post-SiLU clamp;
+MXFP4 biased experts with attention wider than the residual stream match block-streamed execution exactly.
+
+The `ArchSpec::yarn_truncate` fact supplies the YaRN endpoint-rounding default when the file omits it. GPT-OSS
+uses fractional endpoints (`false`), as its reference config states; the published ggml-org MXFP4 GGUF omits the
+key. Explicit metadata overrides the row. The tool derives this default from the reference's YaRN parameters
+and checks the resulting frequencies numerically; when inactive or overridden it preserves the registered
+family default and labels it so. Every other existing row retains `true`, preserving its hashes.
+
+The `bailingmoe` tokenizer uses the author’s possessive word pattern, including the `'m` contraction,
+individual digits and NFC. It is checked independently against tokenizer.json splitting.
+
+DeepSeek-MoE v1 and Ling-lite 1.5 add `{deepseek, Adjacent, ffn_norm, false}` and
+`{bailingmoe, Adjacent, ffn_norm, true}` respectively. Their converters interleave the half-layout Q/K weights;
+the router defaults differ in selected-weight renormalization. Leading dense blocks and shared experts are
+planned from tensors. Each standard-reference tiny passes 511 positions (512 matching IDs), KL 0.00000,
+top-1 99.61%, with fourteen template cases. Their legacy remote implementations index private eager/SDPA
+class tables, rejecting the trace tool's `liyab_trace` attention function. Consequently the tool reports
+that precise failure and proposes neither row; source and converter inspection plus numerical conformance
+establish these rows. Local reference-only compatibility patches restore constructor RoPE buffers after
+transformers 5's meta loading and adapt removed serialization APIs; the attention and FFN math is unchanged.
+The DeepSeek tokenizer is loaded from its supplied tokenizer.json, avoiding transformers 5's incompatible
+SentencePiece reconstruction. Reproduction recipes and compatibility diffs accompany the validation report.
+
+`sarvam-moe` supplies a Unicode-symbol ranked-BPE mode: ASCII spaces become U+2581 without a prefix,
+Unicode characters initialize the ranked-merge heap, and absent characters remain unmergeable until byte
+fallback. Decoding reverses the space replacement and fallback. A synthetic vocabulary checks rank ordering,
+multibyte tokens, repeated spaces, no implicit prefix and an absent emoji. Sarvam's generic attention and
+sigmoid routing match a reference (diagnostic provisional row, KL 0.00000, top-1 100.00%), but the published
+converter supplies BOS 6 while tokenizer.json inserts BOS 2. No `bailingmoe2` row is admitted: the required
+same-token gate fails on the first ID. Its old weight-alias list and nonpersistent RoPE buffer also need
+local transformers 5 reference compatibility repairs, preserved with the report. This is independent of
+the stage-2 group-limited Ling 2.0 family.
+
+Final validation includes the published GPT-OSS-20B MXFP4 file, using its official Harmony rendering: resident
+F16 KV and forced triple-buffered Q8_0 KV return the same coherent greedy reply. Its numerical gate remains the
+representative F32 tiny checkpoint; no real-model KL result is inferred from that smoke. Sixty golden cases
+pass on NEON-dotprod, AVX2 and scalar without moving previous entries. All fourteen native and both x86 test
+targets pass; the Android experimental build also passes. The saved reproduction recipe was rerun from pinned
+upstream revisions for both GPT-OSS and DeepSeek-MoE v1, reproducing their stated conformance and tokenizer results.
+
+Mixtral-8x7B-Instruct-v0.1's author template has a dedicated fourteen-case fixture generated from revision
+`eba92302a2861cdc0098cc54bc9f17cb2c47eb61` with `tools/chat_template_reference.py`. Thirteen conversations match
+transformers byte for byte, including the optional system message and BOS/INST/EOS framing; the tool-result
+conversation is refused for its nonalternating roles. Native, AVX2 and scalar text suites check the same fixture.
+
+Generation stops also follow the file's chat protocol. When a control token `<|return|>` is declared EOS,
+`<|end|>` ends a message within that turn, and must allow the next channel to run; `<|call|>` hands off to a tool.
+The tokenizer identifies this from vocabulary and EOS metadata rather than an architecture name; explicit
+EOS/EOT/EOM overrides remain authoritative. A synthetic
+vocabulary checks both channelized and ordinary stops, token encoding, and tool handoff. The earlier GPT-OSS
+smokes stopped after coherent analysis because the generic `<|end|>` fallback was premature. Corrected resident
+F16 and block-streamed Q8_0 runs now complete the final answer in 32 generated tokens. A token trace passes
+through `<|end|>` into the final channel and stops at `<|return|>`; the export’s complete stop set equals the
+author’s generation_config.json: return, end-of-text and tool handoff.
+
+The final post-Harmony performance gate compares fixed main/branch binaries with a separate warmup followed by
+six balanced AB/BA pairs per configuration, four CPU threads and greedy generation. All 84 measured pairs
+(14 configurations, 26 metrics) pass ±3%; every CLI run produces 128 tokens with identical reply bytes,
+prompt/generated/forced/prefix counts, and the same reply across trials. Raw output is kept as bytes, with
+reversible UTF-8 decoding. Binary SHA256s and modification times are checked before and after the matrix.
+The coordinated CPU/GPU slot permitted one background HTTP download capped at 819200 bytes/s, plus checksums;
+these measurements do not claim zero concurrent downloads. No configuration required a rerun.
+BF16 under the Metal route retains CPU matrix fallback; the shared F16 files confirm actual Metal attention
+and FFN routing. CPU `liyab-bench` uses 512 synthetic tokens, Q8_0 KV and the best of three repeats; CLI uses
+F16 KV, the fixed conformance text and the separately retained ordinary-question prompt. The table gives
+medians of throughput, while each Δ is the median of the six paired percentage changes, not their ratio.
+
+| Model | Weights / route / prompt | Prefill main → branch (tok/s) | Paired Δ | Decode main → branch (tok/s) | Paired Δ |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | BF16 / CPU / synthetic512, Q8_0 KV | 85.500 → 85.500 | +0.000% | — | — |
+| Qwen3-0.6B | BF16 / CPU / conform, F16 KV | 88.017 → 88.000 | -0.086% | 52.414 → 52.251 | -0.011% |
+| Qwen3-0.6B | BF16 / CPU matrix fallback under Metal route / conform, F16 KV | 88.066 → 87.952 | -0.178% | 52.439 → 51.859 | -0.472% |
+| Qwen3-0.6B | F16 / true Metal / conform, F16 KV | 248.417 → 246.855 | -0.514% | 26.297 → 26.370 | -0.428% |
+| Qwen3-0.6B | BF16 / CPU / question, F16 KV | 93.151 → 93.086 | -0.170% | 59.566 → 59.041 | -0.699% |
+| Qwen3-0.6B | BF16 / CPU matrix fallback under Metal route / question, F16 KV | 93.035 → 92.801 | -0.039% | 59.181 → 59.522 | +0.814% |
+| Qwen3-0.6B | F16 / true Metal / question, F16 KV | 289.386 → 288.349 | -0.157% | 31.505 → 31.410 | -0.446% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / synthetic512, Q8_0 KV | 36.800 → 36.750 | -0.272% | — | — |
+| Llama-3.2-1B-Instruct | BF16 / CPU / conform, F16 KV | 37.521 → 37.416 | -0.169% | 27.774 → 27.679 | -0.191% |
+| Llama-3.2-1B-Instruct | BF16 / CPU matrix fallback under Metal route / conform, F16 KV | 37.435 → 37.419 | -0.096% | 27.670 → 27.657 | -0.027% |
+| Llama-3.2-1B-Instruct | F16 / true Metal / conform, F16 KV | 149.573 → 148.955 | -0.398% | 32.608 → 32.383 | -0.751% |
+| Llama-3.2-1B-Instruct | BF16 / CPU / question, F16 KV | 37.971 → 37.919 | -0.093% | 28.483 → 28.404 | -0.276% |
+| Llama-3.2-1B-Instruct | BF16 / CPU matrix fallback under Metal route / question, F16 KV | 37.973 → 37.897 | -0.194% | 28.463 → 28.453 | -0.035% |
+| Llama-3.2-1B-Instruct | F16 / true Metal / question, F16 KV | 154.698 → 153.843 | -0.425% | 33.078 → 33.073 | -0.210% |
+
+MXFP4 component measurements run sequentially after the model pairs, with a separate warmup and six balanced
+pairs of 100000 iterations at width 4096 and four activation rows. Shared prefill preserves every output bit
+of the four independent decode dots. NEON's paired median speedup is 1.652249× (47.222 → 28.575 ms), AVX2 under
+Rosetta 1.196605× (683.064 → 570.839 ms), and scalar under Rosetta 1.001263× (1241.818 → 1239.361 ms). Scalar
+retains its single-row implementation; no scalar speedup or whole-model GPT-OSS speedup is inferred. Earlier
+noisy trials and pre-Harmony-fix measurements are retained separately and are not used for this final gate.

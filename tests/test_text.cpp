@@ -582,6 +582,44 @@ TEST_CASE("SentencePiece character maps preserve their trained normalization and
     CHECK(!SpmNormalizer::load(invalid).has_value());
 }
 
+TEST_CASE("GLM4 pre-tokenization keeps three-digit groups, contractions and Unicode words") {
+    auto pre = PreTokenizer::for_name("glm4");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    const std::string text = "Hello 1234 can't\n世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Hello", " ", "123", "4", " can", "'t", "\n", "世界"};
+    CHECK(pieces == expected);
+}
+
+TEST_CASE("AFMoE aligns decimal groups on the right, including Unicode and long runs") {
+    auto pre = PreTokenizer::for_name("afmoe");
+    REQUIRE(pre.has_value());
+    const std::string text = "1234 １２３４ abc 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"1", "234", " ", "１", "２３４", " abc", " ", "世界"};
+    CHECK(pieces == expected);
+    const std::string digits(1021, '1');
+    pieces.clear();
+    pre->split(digits, pieces);
+    REQUIRE(pieces.size() == 341);
+    CHECK(pieces.front().size() == 1);
+    for (size_t i = 1; i < pieces.size(); ++i) CHECK(pieces[i].size() == 3);
+}
+
+TEST_CASE("EXAONE-MoE keeps spaces inside word runs and splits individual digits") {
+    auto pre = PreTokenizer::for_name("exaone-moe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "ab cd ef\n12/ 34";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"ab cd ef", "\n", "1", "2", "/", " ", "3", "4"};
+    CHECK(pieces == expected);
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------
@@ -1187,4 +1225,83 @@ TEST_CASE("Colliding export tags retain distinct whitespace splits and merge pol
     CHECK(a == std::vector<std::string_view>({"   \n\n  "}));
     CHECK(b == std::vector<std::string_view>({"   \n\n", "  "}));
     CHECK(dbrx->ignore_merges() && !ordinary->ignore_merges());
+}
+
+TEST_CASE("Ling pre-tokenization preserves contractions, NFC and individual digits") {
+    auto pre = PreTokenizer::for_name("bailingmoe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "I'm can't WE'RE\n\n abc 1234 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"I", "'m", " can", "'t", " WE", "'RE", "\n\n", " abc", " ",
+                                                     "1", "2", "3", "4", " 世界"};
+    CHECK(pieces == expected);
+}
+
+TEST_CASE("Unicode ranked BPE replaces spaces, merges by rank and falls back after whole characters") {
+    BpeVocab v;
+    v.tokens = {"a", "b", "c", "é", "▁", "ab", "bc", "▁é", "ab▁é"};
+    v.types.assign(v.tokens.size(), 1);
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        char name[8];
+        std::snprintf(name, sizeof name, "<0x%02X>", byte);
+        v.tokens.emplace_back(name);
+        v.types.push_back(6);
+    }
+    v.merges = {"a b", "b c", "▁ é", "ab ▁é"};
+    BpeTokenizer t("unicode_ranked", v, "sarvam-moe");
+    REQUIRE(t.tok.has_value());
+    CHECK(t.encode("abc") == std::vector<int32_t>({v.id("ab"), v.id("c")}));
+    CHECK(t.encode("ab é") == std::vector<int32_t>({v.id("ab▁é")}));
+    CHECK(t.encode(" é") == std::vector<int32_t>({v.id("▁é")}));
+    CHECK(t.encode("a  b") == std::vector<int32_t>({v.id("a"), v.id("▁"), v.id("▁"), v.id("b")}));
+    CHECK(t.encode("").empty());
+    const std::string text = "a🙂b";
+    const auto ids = t.encode(text);
+    REQUIRE(ids.size() == 6);
+    CHECK(ids == std::vector<int32_t>({v.id("a"), v.id("<0xF0>"), v.id("<0x9F>"),
+                                      v.id("<0x99>"), v.id("<0x82>"), v.id("b")}));
+    std::string decoded;
+    for (const auto id : ids) decoded += t.tok->piece(id);
+    CHECK(decoded == text);
+    CHECK(t.tok->piece(v.id("ab▁é")) == "ab é");
+    // No implicit leading space and no byte-level reinterpretation of é.
+    CHECK(t.encode("é") == std::vector<int32_t>({v.id("é")}));
+    CHECK(t.tok->piece(v.id("é")) == "é");
+}
+
+TEST_CASE("Channelized turns continue after a message and stop on return or tool handoff") {
+    for (const bool channel_turn : {false, true}) {
+        for (const bool explicit_message_stop : {false, true}) {
+            auto v = bpe_vocab(false);
+            for (const char* token : {"<|end|>", "<|return|>", "<|call|>"}) {
+                v.tokens.emplace_back(token);
+                v.types.push_back(3);
+            }
+            const std::string path = test::temp_dir() + "/liyab_channel_stops_" + std::to_string(channel_turn) + std::to_string(explicit_message_stop) + ".gguf";
+            test::GgufWriter w;
+            w.add_string("tokenizer.ggml.model", "gpt2");
+            w.add_string("tokenizer.ggml.pre", "default");
+            w.add_string_array("tokenizer.ggml.tokens", v.tokens);
+            w.add_i32_array("tokenizer.ggml.token_type", v.types);
+            w.add_string_array("tokenizer.ggml.merges", v.merges);
+            w.add_u32("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(v.id(channel_turn ? "<|return|>" : "<|end|>")));
+            if (explicit_message_stop) w.add_u32("tokenizer.ggml.eot_token_id", static_cast<uint32_t>(v.id("<|end|>")));
+            w.write(path);
+            auto file = MmapLoader::open(path);
+            REQUIRE(file.has_value());
+            auto tok = Tokenizer::load(**file);
+            REQUIRE(tok.has_value());
+            CHECK(tok->is_end_of_generation(v.id("<|end|>")) == (!channel_turn || explicit_message_stop));
+            CHECK(tok->is_end_of_generation(v.id("<|return|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|call|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|im_end|>")));
+            CHECK(tok->piece(v.id("<|end|>")).empty());
+            auto ids = tok->encode("hello<|end|>hello<|return|>", false);
+            REQUIRE(ids.has_value());
+            CHECK(*ids == std::vector<int32_t>({v.id("hello"), v.id("<|end|>"), v.id("hello"), v.id("<|return|>")}));
+            std::remove(path.c_str());
+        }
+    }
 }

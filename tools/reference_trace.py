@@ -158,6 +158,17 @@ EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "mo
 TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_k", "moe_topk", "top_k", "moe_top_k")
 
 
+def canonical_rope_config(cfg):
+    """Spell a legacy RoPE `type` key as `rope_type`, without changing its value or other parameters."""
+    def visit(value):
+        if isinstance(value, dict):
+            if "type" in value and "rope_type" not in value:
+                value["rope_type"] = value.pop("type")
+            for child in value.values():
+                visit(child)
+    visit(getattr(cfg, "rope_parameters", None))
+
+
 def _layer_count(cfg):
     for k in LAYER_COUNT_KEYS:
         v = getattr(cfg, k, None)
@@ -183,7 +194,8 @@ def blocks_to_trace(cfg):
                 if h not in seen:
                     seen.add(h)
                     want = max(want, i + 1)
-    for key in ("first_k_dense_replace", "decoder_sparse_step", "moe_layer_freq", "full_attention_interval"):
+    for key in ("first_k_dense_replace", "decoder_sparse_step", "moe_layer_freq", "full_attention_interval",
+                "num_dense_layers", "moe_layer_start_index"):
         v = getattr(cfg, key, None)
         if isinstance(v, int) and v > 0:
             want = max(want, v + 1)
@@ -228,6 +240,8 @@ def reduced_config(config):
     for k, v in list(vars(cfg).items()):
         if "intermediate_size" in k and isinstance(v, int) and v > FFN:
             setattr(cfg, k, FFN)
+        elif "intermediate_size" in k and isinstance(v, (list, tuple)):
+            setattr(cfg, k, type(v)(min(x, FFN) if isinstance(x, int) and x > 0 else x for x in v))
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
     for k in EXPERT_COUNT_KEYS:
         v = getattr(cfg, k, None)
@@ -396,6 +410,14 @@ def _randomize(model):
             else:
                 fan_in = p.shape[-1]
                 p.copy_(torch.randn(p.shape, generator=g) / math.sqrt(max(1, fan_in)))
+        # Persistent router corrections are often buffers initialized to zero.
+        # Give these declared selection biases a signal so the trace and tiny
+        # checkpoint exercise their selection-only effect. RoPE and other
+        # mathematical buffers keep the model's values.
+        for name, b in model.named_buffers():
+            if b.is_floating_point() and b.dim() == 1 and name.rsplit(".", 1)[-1] in (
+                    "e_score_correction", "e_score_correction_bias", "expert_bias"):
+                b.copy_(torch.randn(b.shape, generator=g) * 0.1)
 
 
 def _decoder_layers(model, keep):
@@ -523,6 +545,7 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     config = AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=trust_remote_code)
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     reduced, keep, n = reduced_config(config)
+    canonical_rope_config(reduced)
     _register_attention()
     torch.manual_seed(0)
     try:
@@ -886,6 +909,19 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                 f["output"] = c.path
                 f["output_gate"] = "sigmoid of the second half of each query head's projection"
                 break
+    if f["output"] is None and att_out is not None:
+        for c in later:
+            for gate in linears:
+                values = gate.output
+                if values.numel() == SEQ * n_q and values.shape[-1] == n_q:
+                    values = values.reshape(1, SEQ, n_q, 1).expand(1, SEQ, n_q, hd_v).reshape(att_out.shape)
+                if gate is not c and values.numel() == att_out.numel() and close(
+                        c.input, att_out * torch.sigmoid(values.reshape(att_out.shape))):
+                    f["output"] = c.path
+                    f["output_gate"] = "sigmoid of a separate gate projection"
+                    break
+            if f["output"]:
+                break
     if f["output"] is None:
         f["unknown"].append("the output projection does not read the attention output (or its gated form)")
     return f
@@ -903,6 +939,10 @@ def analyze_dense_ffn(ffn_call, block_calls):
         return Facts(kind="dense", unknown=["the FFN's output is not one projection's output"])
     first = [c for c in lin if c is not down and close(c.input, x)]
     d_in = down.input.float()
+    limit = float(getattr(ffn_call.module, "limit", 0.0) or 0.0)
+    limit = limit if math.isfinite(limit) and limit > 0 else 0.0
+    def activate(act, gate, up):
+        return act(gate).clamp(max=limit) * up.clamp(-limit, limit) if limit else act(gate) * up
     modules = {ffn_call.module} | {c.module for c in block_calls if _is_descendant(c.path, ffn_call.path)}
 
     def activation_allowed(name, source, multiply=None):
@@ -936,9 +976,9 @@ def analyze_dense_ffn(ffn_call, block_calls):
     for act_name, act in ACTIVATIONS.items():
         for g in first:
             for u in first:
-                if g is not u and activation_allowed(act_name, g.output, u.output) and close(act(g.output.float()) * u.output.float(), d_in):
+                if g is not u and activation_allowed(act_name, g.output, u.output) and close(activate(act, g.output.float(), u.output.float()), d_in):
                     return Facts(kind="dense", gated=True, fused_gate_up=False, activation=act_name,
-                                 gate=g.path, up=u.path, down=down.path,
+                                 gate=g.path, up=u.path, down=down.path, clamp=limit,
                                  biases=any(getattr(c.module, "bias", None) is not None for c in (g, u, down)),
                                  unknown=[])
         for c in first:
@@ -946,9 +986,9 @@ def analyze_dense_ffn(ffn_call, block_calls):
             if o.shape[-1] == 2 * d_in.shape[-1]:
                 h = d_in.shape[-1]
                 for order, (gp, up) in (("gate_first", (o[..., :h], o[..., h:])), ("up_first", (o[..., h:], o[..., :h]))):
-                    if activation_allowed(act_name, gp, up) and close(act(gp) * up, d_in):
+                    if activation_allowed(act_name, gp, up) and close(activate(act, gp, up), d_in):
                         return Facts(kind="dense", gated=True, fused_gate_up=True, fused_order=order,
-                                     activation=act_name, gate=c.path, up=c.path, down=down.path,
+                                     activation=act_name, gate=c.path, up=c.path, down=down.path, clamp=limit,
                                      biases=any(getattr(m.module, "bias", None) is not None for m in (c, down)),
                                      unknown=[])
             if activation_allowed(act_name, o) and close(act(o), d_in):
@@ -1001,10 +1041,11 @@ def analyze_moe(ffn_call, block_calls, cfg):
         return f
     rcall, logits = router
     f.update(experts=n_exp, top_k=k, router=rcall.path, experts_module=ecall.path)
+    f["router_bias"] = torch.is_tensor(getattr(rcall.module, "bias", None))
     biases = []
-    for name, t in list(rcall.module.named_parameters()) + list(rcall.module.named_buffers()):
-        if t.dim() == 1 and t.numel() == n_exp:
-            biases.append((name, t.detach().float()))
+    for name, t in list(ffn_call.module.named_parameters()) + list(ffn_call.module.named_buffers()):
+        if t.numel() == n_exp and t.squeeze().dim() == 1:
+            biases.append((name, t.detach().float().reshape(-1)))
     found = None
     for gating in ("softmax", "sigmoid"):
         probs = torch.softmax(logits, -1) if gating == "softmax" else torch.sigmoid(logits)
@@ -1052,30 +1093,53 @@ def analyze_moe(ffn_call, block_calls, cfg):
                 break
         if f["shared_expert"] is None:
             f["unknown"].append("the block output is not the experts' output plus a (gated) shared expert")
-    # Experts' activation: recomputed from 3-D [experts, 2 * ff, d] / [experts, d, ff] weights when the experts
-    # module holds them in that layout (transformers' fused experts).
+    # Recompute fused experts numerically. Both projection orientations and
+    # contiguous/interleaved gate-up layouts occur in transformers. Biases are
+    # part of each projection, before activation and before routing weights.
     params = dict(ecall.module.named_parameters(recurse=False))
     gu, dn = params.get("gate_up_proj"), params.get("down_proj")
+    gb, db = params.get("gate_up_proj_bias"), params.get("down_proj_bias")
     f["expert_activation"] = None
     if gu is not None and dn is not None and gu.dim() == 3 and dn.dim() == 3:
         x = ecall.input.reshape(n_tokens, -1).float()
-        for name, act in ACTIVATIONS.items():
-            out = torch.zeros(n_tokens, dn.shape[1])
-            ok = True
-            for t in range(n_tokens):
-                for j in range(k):
-                    e = int(idx[t, j])
-                    w = gu[e].float()
-                    if w.shape[0] != 2 * dn.shape[2]:
-                        ok = False
+        target = ecall.output.reshape(n_tokens, -1).float()
+        limit = float(getattr(ecall.module, "limit", 0.0) or 0.0)
+        limit = limit if math.isfinite(limit) and limit > 0 and not hasattr(ecall.module, "alpha") else 0.0
+        acts = {name: (lambda g, u, act=act: act(g).clamp(max=limit) * u.clamp(-limit, limit)
+                       if limit else act(g) * u) for name, act in ACTIVATIONS.items()}
+        # These constants define SwigluOai; another clamp/alpha needs a new
+        # engine contract, so never silently describe it as this activation.
+        if getattr(ecall.module, "alpha", None) == 1.702 and getattr(ecall.module, "limit", None) == 7.0:
+            acts["swiglu_oai"] = lambda g, u: (u.clamp(-7, 7) + 1) * (g.clamp(max=7) *
+                                                                           torch.sigmoid(1.702 * g.clamp(max=7)))
+        for transposed in (False, True):
+            gate_up = gu.float().transpose(-1, -2) if transposed else gu.float()
+            down = dn.float().transpose(-1, -2) if transposed else dn.float()
+            if gate_up.shape[-1] != x.shape[-1] or down.shape[1] != target.shape[-1] or gate_up.shape[1] != 2 * down.shape[2]:
+                continue
+            ff = down.shape[2]
+            for interleaved in (False, True):
+                for name, act in acts.items():
+                    out = torch.zeros_like(target)
+                    for t in range(n_tokens):
+                        for j in range(k):
+                            e = int(idx[t, j])
+                            h = gate_up[e] @ x[t]
+                            if gb is not None:
+                                h = h + gb[e].float()
+                            gate, up = (h[::2], h[1::2]) if interleaved else (h[:ff], h[ff:])
+                            y = down[e] @ act(gate, up)
+                            if db is not None:
+                                y = y + db[e].float()
+                            out[t] += wts[t, j].float() * y
+                    if close(out, target):
+                        f["expert_activation"] = name
+                        f["expert_biases"] = gb is not None or db is not None
+                        f["expert_clamp"] = limit
                         break
-                    h = w @ x[t]
-                    g_, u_ = h[: dn.shape[2]], h[dn.shape[2]:]
-                    out[t] += float(wts[t, j]) * (dn[e].float() @ (act(g_) * u_))
-                if not ok:
+                if f["expert_activation"]:
                     break
-            if ok and close(out, ecall.output.reshape(n_tokens, -1)):
-                f["expert_activation"] = name
+            if f["expert_activation"]:
                 break
     if f["expert_activation"] is None:
         # Eager experts can pass their three weight slices as arguments to a
@@ -1099,6 +1163,10 @@ def analyze_moe(ffn_call, block_calls, cfg):
                 break
     if f["expert_activation"] is None:
         f["unknown"].append("the experts' activation could not be recomputed from their weights and inputs")
+    if f.get("shared_expert"):
+        shared = next((c for c in inside if c.path == f["shared_expert"]["module"]), None)
+        limit = float(getattr(shared.module, "limit", 0.0) or 0.0) if shared else 0.0
+        f["shared_expert"]["clamp"] = limit if math.isfinite(limit) and limit > 0 else 0.0
     return f
 
 

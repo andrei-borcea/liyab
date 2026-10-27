@@ -15,7 +15,9 @@ namespace {
 // is one row here, plus a case in tests/test_golden.cpp and a conformance run
 // against its reference implementation (tools/conform_reference.py).
 constexpr ArchSpec kArchitectures[] = {
-    {"llama", RopeLayout::Adjacent, "ffn_norm", false},
+    // Llama, and Mixtral, which the converter writes as llama with experts:
+    // its router renormalizes the top-k weights (the file does not say so).
+    {"llama", RopeLayout::Adjacent, "ffn_norm", true},
     {"mistral", RopeLayout::Adjacent, "ffn_norm", false},
     {"qwen2", RopeLayout::Halves, "ffn_norm", false},
     {"qwen3", RopeLayout::Halves, "ffn_norm", false},
@@ -269,6 +271,26 @@ constexpr ArchSpec kArchitectures[] = {
     {.name = "plamo3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false,
      .post_mixer_norm = "post_attention_norm", .post_ffn_norm = "post_ffw_norm", .swa_period = 8,
      .rope_base_swa = 10000.0f},
+    // gpt-oss: biases on Q/K/V and the attention output, a learned sink
+    // logit per head (attn_sinks), every other block (the even ones)
+    // windowed, YaRN from the file; the norm before the FFN is the GGUF's
+    // post_attention_norm. The router has a bias and takes a softmax over the
+    // top-k logits (renormalized softmax: the same function); the experts
+    // have biases and the clamped SwiGLU.
+    {.name = "gpt-oss",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "post_attention_norm",
+     .moe_norm_weights = true,
+     .ffn_activation = FfnActivation::SwigluOai,
+     .swa_period = 2,
+     .yarn_truncate = false},
+    {"qwen2moe", RopeLayout::Halves, "ffn_norm", false},
+    {"glm4moe", RopeLayout::Halves, "post_attention_norm", true},
+    {"dots1", RopeLayout::Halves, "ffn_norm", true},
+    {"ernie4_5-moe", RopeLayout::Adjacent, "ffn_norm", true},
+    {"hy_v3", RopeLayout::Halves, "ffn_norm", true},
+    {"deepseek", RopeLayout::Adjacent, "ffn_norm", false},
+    {"bailingmoe", RopeLayout::Adjacent, "ffn_norm", true},
 };
 
 }  // namespace
@@ -329,10 +351,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
-        // Older MoE converters state the expert width as feed_forward_length
-        // when every FFN is routed (DBRX). Explicit expert metadata wins.
-        LIYAB_RETURN_IF_ERROR(require_int(f.metadata(key("expert_feed_forward_length")) != nullptr
-                                             ? "expert_feed_forward_length" : "feed_forward_length", c.n_ff_expert));
+        // Absent (Mixtral, written by the llama converter): from the experts' tensors, below.
+        if (f.get_int(key("expert_feed_forward_length"))) {
+            LIYAB_RETURN_IF_ERROR(require_int("expert_feed_forward_length", c.n_ff_expert));
+        }
         c.n_ff_shared = static_cast<int32_t>(f.get_int(key("expert_shared_feed_forward_length")).value_or(0));
         const int64_t gating = f.get_int(key("expert_gating_func")).value_or(1);
         if (gating != 1 && gating != 2) {
@@ -463,7 +485,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             if (truncate != nullptr && !truncate->as_bool()) {
                 return Status(ErrorCode::InvalidModel, "invalid " + key("rope.scaling.yarn_truncate"));
             }
-            y.truncate = truncate == nullptr || *truncate->as_bool();
+            y.truncate = truncate == nullptr ? c.spec->yarn_truncate : *truncate->as_bool();
             if (!(y.factor > 0.0f) || !std::isfinite(y.factor) || y.ctx_orig <= 0 || !(y.beta_fast > 0.0f) ||
                 !(y.beta_slow > 0.0f) || !(y.ext_factor >= 0.0f) || !std::isfinite(y.ext_factor)) {
                 return Status(ErrorCode::InvalidModel, "invalid YaRN parameters (" + key("rope.scaling.*") + ")");
@@ -676,12 +698,28 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     const bool parallel = parallel_key != nullptr && parallel_key->as_bool() ? *parallel_key->as_bool()
                                                                              : c.spec->parallel_residual;
     c.blocks.resize(static_cast<size_t>(c.n_layers));
+    auto block_clamp = [&](const char* suffix, int32_t l, float& out) -> Status {
+        const GgufValue* v = f.metadata(key(suffix));
+        if (v == nullptr) return Status::ok();
+        if (v->type != GgufValue::Type::Array || v->array_type != GgufValue::Type::F32 ||
+            v->array_size < static_cast<uint64_t>(c.n_layers)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+        }
+        std::memcpy(&out, v->array_data + static_cast<size_t>(l) * sizeof(float), sizeof(float));
+        if (!std::isfinite(out) || out < 0.0f) return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+        if (out > 0.0f && c.spec->ffn_activation != FfnActivation::SiLU) {
+            return Status(ErrorCode::Unsupported, "post-activation SwiGLU clamps require SiLU");
+        }
+        return Status::ok();
+    };
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
         b.n_head = block_heads[static_cast<size_t>(l)];
         b.n_head_kv = block_kv_heads[static_cast<size_t>(l)];
         b.n_ff = block_ff[static_cast<size_t>(l)];
         const int64_t q_dim = int64_t{b.n_head} * c.head_dim;
+        LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_exp", l, b.expert_swiglu_clamp));
+        LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_shexp", l, b.shared_swiglu_clamp));
         if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr) {
             b.mixer = MixerKind::DeltaNet;
         } else if (b.n_head_kv == 0) {
@@ -713,6 +751,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
+            if (!b.latent && f.tensor(block_tensor(l, "attn_gate.weight")) != nullptr) {
+                if (b.attn_gate) return Status(ErrorCode::InvalidModel, "both fused and separate attention gates in block " + std::to_string(l));
+                b.attn_gate = true;
+            }
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
             b.rope = rotated[static_cast<size_t>(l)];
@@ -769,6 +811,12 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_gate_up = f.tensor(block_tensor(l, "ffn_gate_exps.weight")) == nullptr &&
                               f.tensor(block_tensor(l, "ffn_gate_up_exps.weight")) != nullptr;
             b.shared_expert = f.tensor(block_tensor(l, "ffn_up_shexp.weight")) != nullptr;
+            // Without expert_feed_forward_length, the hidden size is the
+            // down projections' input width (bind_weights() checks the rest).
+            const TensorView* down = f.tensor(block_tensor(l, "ffn_down_exps.weight"));
+            if (c.n_ff_expert == 0 && down != nullptr && down->ne[0] > 0 && down->ne[0] <= (int64_t{1} << 24)) {
+                c.n_ff_expert = static_cast<int32_t>(down->ne[0]);
+            }
         }
         if (c.spec->ffn_activation == FfnActivation::XIelu && b.ffn != FfnKind::Ungated) {
             return Status(ErrorCode::Unsupported, "gated xIELU FFN in block " + std::to_string(l) + " is not implemented");
@@ -797,6 +845,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             return Status(ErrorCode::InvalidModel,
                           "missing tensor '" + block_tensor(l, std::string(c.spec->ffn_norm) + ".weight") + "'");
         }
+        // Attention sinks (a learned logit per query head joining the
+        // softmax) are applied by the softmax attention; latent attention's
+        // expanded form has no place for them.
+        if (b.latent && f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr) {
+            return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                                                      ": attention sinks with latent attention are not supported");
+        }
+    }
+    if (c.n_expert > 0 && c.n_ff_expert <= 0 &&
+        std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.ffn == FfnKind::Moe; })) {
+        return Status(ErrorCode::InvalidModel, "missing or invalid " + key("expert_feed_forward_length"));
     }
     if (std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.mixer == MixerKind::DeltaNet; })) {
         LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", c.ssm_conv_kernel));

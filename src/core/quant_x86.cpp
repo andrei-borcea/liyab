@@ -539,6 +539,36 @@ LIYAB_AVX2 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) 
     return dot_codebook4(static_cast<const BlockMxfp4*>(row), x, n / kBlock, kMxfp4Values, Mxfp4Scale{});
 }
 
+namespace {
+template <int NR>
+LIYAB_AVX2 void dot_mxfp4_rows(const BlockMxfp4* w, const BlockQ8_0* const* x, int64_t nb, float* out) noexcept {
+    const __m256i table = _mm256_broadcastsi128_si256(load128(kMxfp4Values));
+    __m256 acc[NR][2];
+    for (int r = 0; r < NR; ++r) acc[r][0] = acc[r][1] = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; ++b) {
+        const __m256i v = _mm256_shuffle_epi8(table, nibbles32(w[b].qs));
+        const float d = e8m0_to_fp32_half(w[b].e);
+        for (int r = 0; r < NR; ++r) {
+            const __m256i p = dot_i8(v, load256(x[r][b].qs));
+            acc[r][b & 1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * h2f(x[r][b].d)), acc[r][b & 1]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = hsum_ps(_mm256_add_ps(acc[r][0], acc[r][1]));
+}
+}  // namespace
+
+LIYAB_AVX2 void dot_mxfp4_q8_0_rows(const void* row, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept {
+    const auto* w = static_cast<const BlockMxfp4*>(row);
+    int32_t r = 0;
+    for (; r + 4 <= rows; r += 4) dot_mxfp4_rows<4>(w, x + r, n / kBlock, out + r);
+    switch (rows - r) {
+        case 3: dot_mxfp4_rows<3>(w, x + r, n / kBlock, out + r); break;
+        case 2: dot_mxfp4_rows<2>(w, x + r, n / kBlock, out + r); break;
+        case 1: out[r] = x86::dot_mxfp4_q8_0(row, x[r], n); break;
+        default: break;
+    }
+}
+
 // --- Q8_K activations -----------------------------------------------------------------
 //
 // One template per format serves 1 to 4 activation rows: each super-block is

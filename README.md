@@ -107,7 +107,7 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3`, `exaone` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3`, `exaone`, `gpt-oss`, `qwen2moe`, `glm4moe`, `dots1`, `ernie4_5-moe`, `hy_v3`, `deepseek`, `bailingmoe` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Additional architecture coverage on tiny checkpoints: `seed_oss`, `glm4`; the new `deci` paths also use tiny checkpoints | ✅ F32 conformance, tokenizer IDs and template fixtures; no full-weight checkpoint measured for these families |
 | Classic transformer parts: LayerNorm, optional projection biases, ungated GELU/ReLU²/xIELU FFNs, parallel residuals, learned positions, ALiBi, Q/K/V clamping and output scaling | Implemented on CPU; family conformance is tracked in [model descriptions](docs/model-descriptions.md#classic-transformer-parts) |
 | Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
@@ -3003,3 +3003,95 @@ Tokenizer export limitations, including the `dbrx` label collision between two
 source pipelines, are recorded in [model descriptions](docs/model-descriptions.md#tokenizer-export-label-collision).
 Engine architecture coverage does not imply that every published GGUF has correct
 chat or tokenizer metadata.
+MoE projection variants: optional router logit bias and per-expert gate/up/down biases are applied before routing
+and after their respective projections. `SwigluOai` clamps gate values above 7, clamps up values to [-7, 7], then
+computes `gate * sigmoid(1.702 * gate) * (up + 1)`. Learned per-head `attn_sinks.weight` contributes one score only
+to each attention softmax denominator, including windowed attention. These elementwise operations run on the CPU
+beside the existing backend projection routing. MXFP4 projections use the existing NEON and AVX2/FMA codebook
+kernels (scalar fallback), including expert slices loaded through the bounded expert cache. Mixtral's `llama`
+files renormalize selected router weights and infer expert width from the down projection when metadata omits it.
+MXFP4 prefill shares each nibble lookup and exponent conversion across up to four activation rows on NEON and
+AVX2/FMA, preserving the corresponding decode kernel's float accumulation order. The CPU backend uses this path
+for resident and streamed expert matrices; scalar targets retain the single-row kernel.
+The tiny-checkpoint and reference-trace tools also reduce per-block lists of FFN widths, retaining each block's
+original width when it is already smaller than the requested test width.
+Tiny fixtures randomize declared persistent router selection-bias buffers as well as parameters, so those paths
+are exercised even when the published configuration initializes the corrections to zero.
+The `glm4` pre-tokenizer uses the model's three-digit grouping and contraction rules, without normalization and
+with vocabulary-first merge lookup. Harmony and Qwen2MoE templates have byte-for-byte reference fixtures.
+A gated attention block can also store its sigmoid gate in a separate `attn_gate.weight` projection (AFMoE),
+instead of fusing it into each query head. It follows the same CPU/Metal/Vulkan projection routing.
+For legacy configurations, the tiny-checkpoint and trace tools canonicalize RoPE's `type` spelling to
+`rope_type`, preserving the scaling type and every numerical parameter.
+
+Tiny MoE conformance against the models' transformers implementations (F32 GGUF, F16 KV, full fixed text):
+
+| Architecture / configuration | Positions | Mean KL | Top-1 |
+| --- | ---: | ---: | ---: |
+| gpt-oss, two heads, top-4/16, both block kinds, window 128 | 483 | 0.00000 | 99.79% |
+| Mixtral (`llama`), top-2 routing with inferred expert width | 511 | 0.00000 | 100.00% |
+| qwen2moe, routed and gated shared experts | 511 | 0.00000 | 100.00% |
+| dots1, leading dense block and nonzero selection correction | 511 | 0.00000 | 99.80% |
+| glm4moe, leading dense blocks and shared experts | 497 | 0.00000 | 100.00% |
+| ernie4_5-moe, leading dense block and two shared experts | 511 | 0.00000 | 99.80% |
+
+The original four-head random gpt-oss checkpoint gave KL 0.00000 and top-1 98.76%, below the tiny gate. Seven of
+959 expert selections changed when F32 reference keys/values were rounded to the F16 cache format; every routing
+choice matched a reference rounded the same way. That rounded reference is diagnostic, and the table uses the
+standard untouched reference. The smaller checkpoint keeps every block kind, crosses the sliding window, and
+retains top-4 selection among sixteen experts.
+GLM4 tokenization matches all 498 token IDs in its tiny conformance text; its fourteen author-template reference
+conversations render byte for byte through the same chat interpreter.
+MoE files may name a selection correction `exp_probs_b` or `exp_probs_b.bias`; supplying both is rejected.
+Attention output gates may supply one scalar per head or one value per head channel. Optional per-block
+`swiglu_clamp_exp` and `swiglu_clamp_shexp` arrays clamp the activated SiLU gate above their limit and the up
+projection symmetrically; zero disables this separate clamp convention. AFMoE decimal groups align on the right
+in a linear scan, and the `exaone-moe` pre-tokenizer preserves spaces inside words and normalizes NFC.
+HY3 (`hy_v3`) tiny conformance uses its sigmoid router, nonzero selection correction, shared expert and dense
+leading block: 498 positions, identical 499 token IDs, mean KL 0.00000 and top-1 100.00%. Its registry row is
+proposed exactly by the description tool.
+The gpt-oss row supplies fractional YaRN correction endpoints when older GGUFs omit `yarn_truncate` (the
+published ggml-org MXFP4 file does). Explicit file metadata overrides that architecture default; existing
+architectures keep rounded endpoints. Synthetic default/explicit cases must produce identical bits.
+
+The `bailingmoe` pre-tokenizer preserves Ling’s contractions and individual digits, with NFC normalization.
+
+DeepSeek-MoE v1 (`deepseek`) and Ling-lite 1.5 (`bailingmoe`) use ordinary attention, leading dense blocks and
+shared experts. Their F32 tiny checkpoints pass the standard F32 reference with F16 KV: 511 positions each,
+512 identical token IDs, mean KL 0.00000 and top-1 99.61%. Fourteen template cases per family match transformers.
+Their old remote code needs local transformers 5 compatibility repairs for saved-weight aliases and unsaved
+RoPE buffers. The automatic description tool refuses these legacy references because their hard-coded
+attention-class tables do not expose its registered attention function; these two rows are verified by
+converter tensor permutations, source inspection and end-to-end conformance instead.
+
+The `sarvam-moe` tokenizer uses Unicode-symbol ranked BPE, replaces spaces with `▁` without adding a prefix,
+and falls back to `<0xXX>` bytes for missing characters after merging. This shares the ranked merge engine with
+byte-level BPE. Its parts are implemented, but Sarvam is not added to the architecture registry: b11819 writes
+BOS ID 6 while the author's tokenizer.json postprocessor inserts ID 2. A diagnostic reference-token comparison
+passes KL 0.00000/top-1 100.00%; it does not pass the required identical-token gate. The converter/tokenizer
+metadata conflict must be resolved before claiming support.
+
+The published ggml-org GPT-OSS-20B MXFP4 GGUF also produces the same coherent greedy reply through its own
+Harmony template with resident F16 KV and forced block streaming with Q8_0 KV. This is a real-model smoke check;
+the numerical conformance table above uses the random-weight F32 checkpoints. Sixty golden cases are pinned for
+NEON-dotprod, x86 AVX2 and x86 scalar, preserving every earlier hash. The final native and both x86 test suites
+pass all fourteen targets, including sequence and KV-store reuse, and the Android experimental build passes.
+
+Mixtral's own chat template is checked against fourteen transformers reference cases: thirteen render byte for
+byte, and a tool-result conversation is refused because the template requires alternating user/assistant turns.
+The fixture covers its optional initial system message, BOS, `[INST]` framing and assistant EOS on native,
+x86 AVX2 and x86 scalar builds.
+
+Channelized chat vocabularies that declare `<|return|>` as EOS disable the generic `<|end|>` stop fallback,
+so reasoning can continue into a final message. `<|return|>` completes the turn and `<|call|>` stops
+for a tool handoff. This is selected from token vocabulary and EOS metadata; formats whose EOS is `<|end|>`
+retain their existing stop behavior. Explicit EOS/EOT/EOM metadata remains authoritative.
+
+The final MoE performance comparison uses six warmed, balanced main/branch pairs per configuration on the
+M4 Pro: all 26 prefill/decode metrics across Qwen3-0.6B and Llama-3.2-1B are within ±3% (paired medians
+−0.751% to +0.814%), with identical generated bytes and token counts. CPU 512-token `liyab-bench` uses Q8_0 KV;
+CLI CPU, BF16 Metal-route/CPU-matrix-fallback and F16 true-Metal runs use F16 KV. A capped 800 KiB/s background
+download was permitted during the coordinated CPU/GPU slot. MXFP4 four-row prefill is 1.65× faster on NEON and
+1.20× on AVX2 than four separate decode dots, with identical bits; scalar fallback is unchanged (1.001×).
+These are component speedups, not a measured whole-model GPT-OSS speedup. The full paired results and method
+are recorded in [Model descriptions](docs/model-descriptions.md).

@@ -53,6 +53,9 @@ public:
     // which the BPE encoder maps through the same byte alphabet afterwards.
     void split(std::string_view text, std::vector<std::string_view>& pieces) const;
 
+    // Unicode-symbol ranked BPE: spaces become U+2581, with no initial prefix;
+    // absent characters fall back to <0xXX> bytes after merging.
+    [[nodiscard]] bool metaspace_bpe() const noexcept { return metaspace_bpe_; }
     [[nodiscard]] bool nfc() const noexcept { return nfc_; }
     [[nodiscard]] bool nfkc() const noexcept { return nfkc_; }
     [[nodiscard]] bool ignore_merges() const noexcept { return ignore_merges_; }
@@ -70,6 +73,8 @@ private:
     bool nfc_ = false;
     bool ignore_merges_ = false;
     bool nfkc_ = false;
+    bool metaspace_bpe_ = false;
+    bool right_digits3_ = false;  // isolate decimal runs into groups of three aligned at their right end
 };
 
 }  // namespace liyab

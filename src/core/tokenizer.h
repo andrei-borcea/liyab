@@ -1,5 +1,5 @@
-// Liyab — GGUF vocabulary: SentencePiece BPE/greedy, byte-level BPE and unigram encoding,
-// decoding (internal). Byte-level BPE pre-tokenizers come from a table keyed
+// Liyab — GGUF vocabulary: SentencePiece BPE/greedy, byte-level BPE, Unicode-symbol
+// ranked BPE and unigram encoding/decoding (internal). BPE pre-tokenizers come from a table keyed
 // by tokenizer.ggml.pre (core/pre_tokenizer.h).
 #ifndef LIYAB_CORE_TOKENIZER_H
 #define LIYAB_CORE_TOKENIZER_H
@@ -34,7 +34,7 @@ public:
     // already spells them (a rendered chat template wrote them). Usually
     // this is one BOS; chatglm-spm uses [gMASK], sop instead.
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
-    // and byte-level BPE ("gpt2") with the pre-tokenizers of
+    // and byte-level or Unicode-symbol ranked BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
     // tokenizer.ggml.pre returns Unsupported naming it and the supported
     // ones (the model still loads, and runs on token ids). Special tokens
@@ -78,6 +78,10 @@ public:
     [[nodiscard]] int32_t bos() const noexcept { return bos_; }
     [[nodiscard]] int32_t eos() const noexcept { return eos_; }
     [[nodiscard]] bool add_bos_default() const noexcept { return add_bos_; }
+    // EOS/EOT/EOM metadata and protocol terminators. A declared <|return|>
+    // completes a channelized turn; its <|end|> continues to the next message,
+    // and <|call|> stops for a tool handoff. Explicit metadata stays authoritative;
+    // other formats keep their existing stop fallbacks.
     [[nodiscard]] bool is_end_of_generation(int32_t id) const;
 
 private:
@@ -101,7 +105,7 @@ private:
     // there): its offset and id, or npos.
     size_t find_special(std::string_view text, size_t from, int32_t& id) const;
 
-    std::optional<PreTokenizer> pre_;  // byte-level BPE: the scheme of tokenizer.ggml.pre
+    std::optional<PreTokenizer> pre_;  // ranked BPE: the scheme of tokenizer.ggml.pre
     Status pre_error_;                 // why pre_ is empty for a BPE vocabulary
     struct Merge {
         int32_t rank;  // position in tokenizer.ggml.merges: lower merges first

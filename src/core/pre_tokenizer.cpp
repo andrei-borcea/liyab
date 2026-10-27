@@ -75,16 +75,26 @@ struct StepSpec {
     bool byte_level = false;  // match ByteLevel's alphabet, with one code point per original byte
 };
 
+constexpr const char* kAfmoeScripts = R"pre((?:[\x{4E00}-\x{9FFF}\x{3040}-\x{309F}\x{30A0}-\x{30FF}\x{3400}-\x{4DBF}\x{f900}-\x{FAFF}\x{FF65}-\x{FF9F}\x{2F00}-\x{2FDF}]+|[\x{0E00}-\x{0E7F}]+|[\x{0E80}-\x{0EFF}]+|[\x{1780}-\x{17FF}]+|[\x{1000}-\x{109F}\x{AA60}-\x{AA7F}\x{A9E0}-\x{A9FF}]+|[\x{AC00}-\x{D7AF}\x{1100}-\x{11FF}]+))pre";
+
+constexpr const char* kExaoneMoe = R"pre((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+)pre";
+
+// Ling-lite 1.5: possessive Qwen-like words, including the 'm contraction.
+constexpr const char* kBailingMoe =
+    R"pre('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)pre";
+
 struct Row {
     std::initializer_list<std::string_view> names;  // tokenizer.ggml.pre values
     std::initializer_list<StepSpec> steps;
     bool nfc;
     bool ignore_merges;
     bool nfkc = false;
+    bool metaspace_bpe = false;
+    bool right_digits3 = false;
 };
 
-const std::array<Row, 21>& table() {
-    static const std::array<Row, 21> rows = {{
+const std::array<Row, 25>& table() {
+    static const std::array<Row, 25> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
@@ -116,6 +126,10 @@ const std::array<Row, 21>& table() {
         {{"llama-bpe-merges"}, {{kLlama3, false}}, false, false},
         {{"seed-coder"}, {{kSeedCoder, true}}, true, false},
         {{"gpt2-nfkc-digits"}, {{kEachDigit, true}, {kGpt2, true}}, false, false, true},
+        {{"exaone-moe"}, {{kExaoneMoe, true}}, true, false},
+        {{"afmoe"}, {{kAfmoeScripts, true}, {kDeepSeekV3Words, true}}, false, false, false, false, true},
+        {{"bailingmoe"}, {{kBailingMoe, true}}, true, false},
+        {{"sarvam-moe"}, {}, false, false, false, true},
     }};
     return rows;
 }
@@ -163,6 +177,8 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
         pre.nfkc_ = row.nfkc;
+        pre.right_digits3_ = row.right_digits3;
+        pre.metaspace_bpe_ = row.metaspace_bpe;
         for (const StepSpec& step : row.steps) {
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
@@ -194,6 +210,27 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
     if (d.cps.empty()) current.clear();
     thread_local Decoded bytes;
     bool byte_level = false;
+    if (right_digits3_) {
+        // AFMoE's bounded regex sequence first isolates decimal runs, then
+        // groups each from the right in threes. A direct scan has the same
+        // pieces and linear cost even for untrusted, very long numbers.
+        current.clear();
+        size_t pos = 0, gap = 0;
+        while (pos < d.cps.size()) {
+            if ((d.keys[pos] & 31u) != static_cast<uint8_t>(unicode::Nd)) { ++pos; continue; }
+            if (gap < pos) current.emplace_back(static_cast<uint32_t>(gap), static_cast<uint32_t>(pos));
+            size_t end = pos;
+            while (end < d.cps.size() && (d.keys[end] & 31u) == static_cast<uint8_t>(unicode::Nd)) ++end;
+            size_t length = (end - pos - 1) % 3 + 1;
+            while (pos < end) {
+                current.emplace_back(static_cast<uint32_t>(pos), static_cast<uint32_t>(pos + length));
+                pos += length;
+                length = 3;
+            }
+            gap = end;
+        }
+        if (gap < pos) current.emplace_back(static_cast<uint32_t>(gap), static_cast<uint32_t>(pos));
+    }
     for (const Step& step : steps_) {
         if (step.byte_level && !byte_level) {
             for (auto& [from, to] : current) {

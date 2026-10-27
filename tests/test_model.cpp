@@ -9,6 +9,7 @@
 #include <set>
 
 #include "core/quant.h"
+#include "core/quant_tables.h"
 
 namespace liyab::test {
 
@@ -123,6 +124,31 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
     const auto rows = static_cast<int64_t>(values.size()) / row;
     const size_t row_bytes = dtype_row_bytes(type, row);
     t.data.resize(row_bytes * static_cast<size_t>(rows));
+    if (type == DType::MXFP4) {
+        // Test-only nearest-grid encoding. The production engine reads this
+        // format; it does not expose an MXFP4 quantizer.
+        for (size_t b = 0; b < values.size() / 32; ++b) {
+            const float* x = values.data() + b * 32;
+            float amax = 0.0f;
+            for (size_t j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+            const int exponent = amax > 0 ? std::clamp(static_cast<int>(std::ceil(std::log2(amax / 6.0f))), -127, 127) : 0;
+            uint8_t* dst = t.data.data() + b * 17;
+            dst[0] = static_cast<uint8_t>(exponent + 127);
+            const float scale = std::ldexp(0.5f, exponent);
+            auto index = [&](float value) {
+                uint8_t best = 0;
+                float error = INFINITY;
+                for (uint8_t k = 0; k < 16; ++k) {
+                    const float e = std::fabs(value - scale * quant::kMxfp4Values[k]);
+                    if (e < error) { error = e; best = k; }
+                }
+                return best;
+            };
+            for (size_t j = 0; j < 16; ++j) dst[j + 1] = static_cast<uint8_t>(index(x[j]) | (index(x[j + 16]) << 4));
+        }
+        tensors_.push_back(std::move(t));
+        return;
+    }
     if (type == DType::BF16) {  // quant::quantize_row has no BF16: the upper half, rounded to nearest even
         for (size_t i = 0; i < values.size(); ++i) {
             uint32_t bits = 0;
@@ -244,16 +270,19 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (!s.block_heads.empty() && s.mla_kv_rank == 0) {
         w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
     }
+    if (s.head_dim > 0 && s.block_heads.empty()) w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.head_dim));
     w.add_u32(a + ".context_length", static_cast<uint32_t>(s.context_length));
     if (s.n_expert > 0) {
         w.add_u32(a + ".expert_count", static_cast<uint32_t>(s.n_expert));
         w.add_u32(a + ".expert_used_count", static_cast<uint32_t>(s.n_expert_used));
-        w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
+        if (!s.omit_expert_width) w.add_u32(a + ".expert_feed_forward_length", static_cast<uint32_t>(s.n_ff));
         if (s.expert_weights_norm >= 0) w.add_bool(a + ".expert_weights_norm", s.expert_weights_norm != 0);
         if (s.n_ff_shared > 0) w.add_u32(a + ".expert_shared_feed_forward_length", static_cast<uint32_t>(s.n_ff_shared));
         if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
     }
     if (s.dense_lead > 0) w.add_u32(a + ".leading_dense_block_count", static_cast<uint32_t>(s.dense_lead));
+    if (s.expert_swiglu_clamp > 0) w.add_f32_array(a + ".swiglu_clamp_exp", std::vector<float>(static_cast<size_t>(s.n_layers), s.expert_swiglu_clamp));
+    if (s.shared_swiglu_clamp > 0) w.add_f32_array(a + ".swiglu_clamp_shexp", std::vector<float>(static_cast<size_t>(s.n_layers), s.shared_swiglu_clamp));
     if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b
         w.add_u32(a + ".attention.kv_lora_rank", static_cast<uint32_t>(s.mla_kv_rank));
         if (s.mla_q_rank > 0) w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
@@ -307,7 +336,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.yarn_beta_fast > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_fast", s.yarn_beta_fast);
         if (s.yarn_beta_slow > 0.0f) w.add_f32(a + ".rope.scaling.yarn_beta_slow", s.yarn_beta_slow);
         if (s.yarn_log_mul != 0.0f) w.add_f32(a + ".rope.scaling.yarn_log_multiplier", s.yarn_log_mul);
-        if (!s.yarn_truncate) w.add_bool(a + ".rope.scaling.yarn_truncate", false);
+        if (s.yarn_truncate >= 0) w.add_bool(a + ".rope.scaling.yarn_truncate", s.yarn_truncate != 0);
     }
     if (s.attn_softcap > 0.0f) w.add_f32(a + ".attn_logit_softcapping", s.attn_softcap);
     if (s.final_softcap > 0.0f) w.add_f32(a + ".final_logit_softcapping", s.final_softcap);
@@ -356,7 +385,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     };
 
     const int64_t d = s.n_embd;
-    const int64_t hd = d / s.n_head;
+    const int64_t hd = s.head_dim > 0 ? s.head_dim : d / s.n_head;
+    const int64_t q_dim = hd * s.n_head;
     const int64_t kv = hd * s.n_head_kv;
     std::mt19937_64 classic_rng(s.seed ^ 0xc1a551c);
     std::normal_distribution<float> classic_normal(0.0f, 0.1f);
@@ -489,7 +519,30 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 }
                 w.add_tensor(p + "attn_qkv.weight", {d, q_rows + 2 * kv}, s.attn_type, qkv);
             } else {
-                w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, random(d * q_rows, s.weight_scale));
+                auto query = random(d * q_rows, s.weight_scale);
+                if (s.head_attention_gate) {
+                    for (int32_t h = 0; h < s.n_head; ++h) {
+                        const auto at = static_cast<size_t>((h * 2 * hd + hd) * d);
+                        for (int64_t j = 1; j < hd; ++j) std::copy_n(query.data() + at, d, query.data() + at + static_cast<size_t>(j * d));
+                    }
+                }
+                if (s.separate_attention_gate) {
+                    std::vector<float> q, gate;
+                    for (int32_t h = 0; h < s.n_head; ++h) {
+                        const auto at = static_cast<std::ptrdiff_t>(h * 2 * hd * d);
+                        const auto count = static_cast<std::ptrdiff_t>(hd * d);
+                        q.insert(q.end(), query.begin() + at, query.begin() + at + count);
+                        if (s.head_attention_gate) {
+                            gate.insert(gate.end(), query.begin() + at + count, query.begin() + at + count + d);
+                        } else {
+                            gate.insert(gate.end(), query.begin() + at + count, query.begin() + at + 2 * count);
+                        }
+                    }
+                    w.add_tensor(p + "attn_q.weight", {d, q_dim}, s.attn_type, q);
+                    w.add_tensor(p + "attn_gate.weight", {d, s.head_attention_gate ? s.n_head : q_dim}, s.attn_type, gate);
+                } else {
+                    w.add_tensor(p + "attn_q.weight", {d, q_rows}, s.attn_type, query);
+                }
                 w.add_tensor(p + "attn_k.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
                 w.add_tensor(p + "attn_v.weight", {d, kv}, s.attn_type, random(d * kv, s.weight_scale));
             }
@@ -531,7 +584,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_output.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
         }
         if (a == "qwen2") {
-            w.add_tensor(p + "attn_q.bias", {d}, DType::F32, random(d, 0.1f));
+            w.add_tensor(p + "attn_q.bias", {q_dim}, DType::F32, random(q_dim, 0.1f));
             std::vector<float> k_bias = random(kv, 0.1f);
             // A few large, constant key channels, as Qwen2.5's K bias has
             // (the slowest-turning RoPE pair of each KV head).
@@ -543,7 +596,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
-        const bool post_attention = a == "qwen35" || a == "qwen35moe" || a == "seed_oss";
+        const bool post_attention = a == "qwen35" || a == "qwen35moe" || a == "seed_oss" || a == "gpt-oss" || a == "glm4moe";
         const std::string ffn_norm = a == "falcon" ? "attn_norm" : a == "dbrx" ? "attn_output_norm" :
                                      post_attention ? "post_attention_norm" : "ffn_norm";
         if (!s.shared_parallel_norm && !s.post_only_norms && (ff > 0 || s.n_expert > 0)) {
@@ -620,13 +673,32 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         std::vector<float> router(static_cast<size_t>(d * s.n_expert));
         for (float& x : router) x = normal(router_rng) * 0.5f;
         w.add_tensor(p + "ffn_gate_inp.weight", {d, s.n_expert}, DType::F32, router);
-        if (s.expert_bias) w.add_tensor(p + "exp_probs_b.bias", {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
+        if (s.expert_bias) w.add_tensor(p + (s.bare_expert_bias ? "exp_probs_b" : "exp_probs_b.bias"), {s.n_expert}, DType::F32, random(s.n_expert, 0.2f));
         if (s.n_ff_shared > 0) {
             const int64_t sh = s.n_ff_shared;
             w.add_tensor(p + "ffn_gate_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));
             w.add_tensor(p + "ffn_up_shexp.weight", {d, sh}, s.ffn_type, random(d * sh, s.weight_scale));
             w.add_tensor(p + "ffn_down_shexp.weight", {sh, d}, s.ffn_type, random(sh * d, s.weight_scale));
             if (s.shared_gate) w.add_tensor(p + "ffn_gate_inp_shexp.weight", {d}, DType::F32, random(d, s.weight_scale));
+        }
+    }
+    // Keep optional tensors independent of the original random stream.
+    std::mt19937_64 bias_rng(s.seed ^ 0xb1a5);
+    auto moe_bias = [&](int64_t n) {
+        std::vector<float> v(static_cast<size_t>(n));
+        for (float& x : v) x = normal(bias_rng) * 0.2f;
+        return v;
+    };
+    for (int32_t l = 0; l < s.n_layers; ++l) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        if (s.attention_output_bias) w.add_tensor(p + "attn_output.bias", {d}, DType::F32, moe_bias(d));
+        if (s.attention_sinks) w.add_tensor(p + "attn_sinks.weight", {s.n_head}, DType::F32, moe_bias(s.n_head));
+        if (s.n_expert == 0 || l < s.dense_lead) continue;
+        if (s.router_bias) w.add_tensor(p + "ffn_gate_inp.bias", {s.n_expert}, DType::F32, moe_bias(s.n_expert));
+        if (s.expert_projection_bias) {
+            w.add_tensor(p + "ffn_gate_exps.bias", {s.n_ff, s.n_expert}, DType::F32, moe_bias(s.n_ff * s.n_expert));
+            w.add_tensor(p + "ffn_up_exps.bias", {s.n_ff, s.n_expert}, DType::F32, moe_bias(s.n_ff * s.n_expert));
+            w.add_tensor(p + "ffn_down_exps.bias", {d, s.n_expert}, DType::F32, moe_bias(d * s.n_expert));
         }
     }
     w.write(path);

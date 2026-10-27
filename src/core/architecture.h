@@ -14,9 +14,10 @@
 //    metadata, and each block's structure from the tensors present (which
 //    token mixer, fused or separate projections, a gated attention output,
 //    a windowed attention, a dense or mixture-of-experts FFN, a shared
-//    expert). Optional per-element tensors (QKV biases, Q/K norms, the norms
-//    after the mixer and the FFN, the shared expert's gate, the router's
-//    selection bias, RoPE frequency factors) are bound where present and
+//    expert). Optional per-element tensors (QKV biases, the attention output
+//    bias, attention sinks, Q/K norms, the norms after the mixer and the FFN,
+//    the shared expert's gate, the router's bias and selection bias, the
+//    experts' biases, RoPE frequency factors) are bound where present and
 //    need no plan entry.
 //
 // describe_model() is a pure function of the file: it reads metadata and
@@ -56,6 +57,7 @@ enum class FfnActivation : uint8_t {
     Gelu,         // exact GELU, x Phi(x) with erf: GPT-NeoX, Falcon, MPT (ungated)
     Relu,         // max(x, 0)
     ReluSquared,  // max(x, 0)^2: Nemotron, AFM (ungated)
+    SwigluOai,  // clamped gate * sigmoid(1.702 gate) * (clamp(up, -7, 7) + 1)
     XIelu,        // xIELU with per-block scalars (ModelConfig::xielu): Apertus (ungated)
 };
 
@@ -78,7 +80,10 @@ struct ArchSpec {
     // another family (Gemma's post_attention_norm follows the attention output).
     std::string_view ffn_norm;
     // MoE: whether the top-k router weights are renormalized to sum to 1 when
-    // the file has no <arch>.expert_weights_norm.
+    // the file has no <arch>.expert_weights_norm. With softmax gating, true
+    // is also a softmax over the selected top-k logits alone (gpt-oss): the
+    // softmax over every expert renormalized over the top k is the same
+    // function. An architecture whose models are all dense says false.
     bool moe_norm_weights;
     QkNormOrder qk_norm = QkNormOrder::BeforeRope;
     FfnActivation ffn_activation = FfnActivation::SiLU;
@@ -167,6 +172,9 @@ struct ArchSpec {
     // is then mscale(1) / mscale(mscale_all_dim), mscale(m) = 0.1 m ln(factor)
     // + 1, on the rotation's magnitude (Ministral 3).
     bool yarn_mscale_all_dim = false;
+    // YaRN correction-range rounding when the GGUF omits yarn_truncate.
+    // gpt-oss uses fractional endpoints; explicit file metadata overrides it.
+    bool yarn_truncate = true;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -207,8 +215,9 @@ struct BlockPlan {
     // ModelConfig::mla). Keys and values come from one compressed latent per
     // position, which is what the KV cache stores.
     bool latent = false;
-    // Attention: attn_q projects [q | gate] per head (twice as tall) and the
-    // attention output is multiplied by sigmoid(gate).
+    // Attention: attn_q projects [q | gate] per head (twice as tall), or
+    // attn_gate projects the gate separately. The attention output is
+    // multiplied by sigmoid(gate).
     bool attn_gate = false;
     // Attention: sees only the last ModelConfig::sliding_window positions
     // (ArchSpec::swa_period), and rotates with ModelConfig::rope_base_swa
@@ -230,6 +239,11 @@ struct BlockPlan {
     // Falcon-40B's ln_mlp), else through the mixer's normed input (Phi-2,
     // Falcon-7B, Command-R); the residual adds both outputs.
     bool parallel = false;
+    // Optional per-block post-SiLU gate / symmetric up clamps from GGUF.
+    // Zero disables the clamp. Shared applies to dense FFNs as well.
+    float expert_swiglu_clamp = 0.0f;
+    float shared_swiglu_clamp = 0.0f;
+
     // Attention: queries and keys are rotated by RoPE; false: the block has no
     // positional encoding of its own (NoPE, ArchSpec::nope_period /
     // nope_global or the file's attention.rope_pattern).
@@ -379,7 +393,10 @@ struct ModelConfig {
     // Mixture of experts (zero when every FFN is dense).
     int32_t n_expert = 0;        // routed experts per MoE block
     int32_t n_expert_used = 0;   // experts selected per token (top-k)
-    int32_t n_ff_expert = 0;     // hidden size of one routed expert
+    // Hidden size of one routed expert: <arch>.expert_feed_forward_length,
+    // else the experts' tensors (the llama converter writes Mixtral without
+    // the key).
+    int32_t n_ff_expert = 0;
     int32_t n_ff_shared = 0;     // hidden size of the shared expert (0: from its tensors)
     MoeGating moe_gating = MoeGating::Softmax;
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1

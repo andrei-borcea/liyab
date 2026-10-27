@@ -408,7 +408,7 @@ class Engine:
         # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
         # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
         # caps, YaRN) are supported exactly when it reads them.
-        self.file_keys = set(re.findall(r'(?:key|require_int|block_values)\(\s*"([^"]+)"', cpp))
+        self.file_keys = set(re.findall(r'(?:key|require_int|block_values|block_clamp)\(\s*"([^"]+)"', cpp))
         self.rope_scalings = set(re.findall(r'\*scaling\s*[!=]=\s*"([\w-]+)"', cpp))
         m = re.search(r"kArchitectures\[\]\s*=\s*\{(.*?)\n\};", cpp, re.S)
         if m is None:
@@ -520,7 +520,7 @@ class Engine:
 
 # Activations the reference trace names, and the FfnActivation value that runs each (when the enum has it).
 ACTIVATION_ENUM = {"silu": "SiLU", "gelu_tanh": "GeluTanh", "gelu": "Gelu", "relu": "Relu", "relu2": "ReluSquared",
-                   "gelu_quick": "GeluQuick", "xielu": "XIelu"}
+                   "gelu_quick": "GeluQuick", "xielu": "XIelu", "swiglu_oai": "SwigluOai"}
 QK_ORDER_ENUM = {"before_rope": "BeforeRope", "after_rope": "AfterRope"}
 LAYOUT_ENUM = {"halves": "Halves", "adjacent": "Adjacent"}
 # The DeltaNet tensors the engine binds (transformer.cpp, bind_weights), present together in a recurrent block.
@@ -530,7 +530,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate")
 
 
 def _close(a, b, rel=1e-5):
@@ -654,7 +654,7 @@ def _f32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim=False):
+def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim=False, yarn_truncate=True):
     """RoPE frequencies and magnitude the engine computes from the file (Transformer::load and describe_model()):
     base^(-2i/r) divided by the file's frequency factors, blended by YaRN when the file asks for it, over the
     linear position scale. Returns (inv_freq / scale list, magnitude, q.k factor, how)."""
@@ -686,7 +686,7 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim
         fast = float(g.key("rope.scaling.yarn_beta_fast", 32.0))
         slow = float(g.key("rope.scaling.yarn_beta_slow", 1.0))
         ext = float(g.key("rope.scaling.yarn_ext_factor", 1.0))
-        truncate = bool(g.key("rope.scaling.yarn_truncate", True))
+        truncate = bool(g.key("rope.scaling.yarn_truncate", yarn_truncate))
         # The correction range: the (fractional) pairs that turn beta_fast and beta_slow times over the
         # original context.
         turning = lambda turns: rope_dim * math.log(ctx / (turns * 2.0 * math.pi)) / (2.0 * math.log(base))
@@ -742,6 +742,15 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         registered = engine.rows.get(arch, ({}, ""))[0]
         d.set(field, registered.get(field, engine_default(engine, field)),
               why + "; this switch is inactive (registered value, or the engine default for a new row)")
+    registered = engine.rows.get(arch, ({}, ""))[0]
+    params = cfg.get("rope_parameters") or cfg.get("rope_scaling") or {}
+    if g.key("rope.scaling.type") != "yarn" or g.key("rope.scaling.yarn_truncate") is not None:
+        truncate_default = registered.get("yarn_truncate", True)
+        evidence = "inactive or overridden by file metadata; preserve the registered YaRN default"
+    else:
+        truncate_default = bool(params.get("truncate", True))
+        evidence = "reference YaRN truncate parameter (default true); frequencies checked against the observed table"
+    d.set("yarn_truncate", truncate_default, evidence)
     d.notes.append(f"reference: {facts['model_class']} ({facts.get('model_type')}), {facts['traced_blocks']} of "
                    f"{facts['blocks']} blocks traced")
     unknown_fields = [n for n, _, _ in engine.fields if n not in DERIVED_FIELDS]
@@ -806,7 +815,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             p["mixer"] = "none" if block_heads[b] == 0 else "linear"
         else:
             p["mixer"] = "attention"
-            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * block_heads[b] * head_dim
+            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * block_heads[b] * head_dim or "attn_gate.weight" in ts
             p["fused_qkv"] = "attn_q.weight" not in ts and "attn_qkv.weight" in ts
             p["qkv_bias"] = bool({"attn_q.bias", "attn_qkv.bias"} & ts)
             p["qk_norm"] = "attn_k_norm.weight" in ts
@@ -814,7 +823,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             p["ffn"] = "moe"
             p["shared_expert"] = "ffn_up_shexp.weight" in ts
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
-            p["selection_bias"] = "exp_probs_b.bias" in ts
+            p["selection_bias"] = "exp_probs_b.bias" in ts or "exp_probs_b" in ts
+            p["router_bias"] = "ffn_gate_inp.bias" in ts
+            p["expert_biases"] = bool({"ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"} & ts)
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
         elif block_ff[b] == 0 and "ffn_up.weight" not in ts:
             p["ffn"] = "none"
@@ -884,7 +895,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         if False in rotated:
             d.set("rope", engine.enums["RopeLayout"][0], "no rotary dimensions (layout is unused)")
     elif rotated:
-        d.missing.append("rotary attention in only some blocks; the architecture row applies rotary to every block")
+        d.set("rotary", True, "rotary attention is present; per-block NoPE is established separately below")
     ref_layout = layouts.pop() if len(layouts) == 1 else None
     if len(layouts) > 0:
         d.unknown.append("the reference pairs RoPE dimensions differently in different blocks")
@@ -956,7 +967,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         matches = []
         for convention in (False, True):
             _, mag, qk, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
-                                           mscale_all_dim=convention)
+                                           mscale_all_dim=convention, yarn_truncate=truncate_default)
             scales = [b["mixer"]["scale"] for b in att_blocks]
             want_scale = float(g.key("attention.scale", head_dim ** -0.5)) * qk ** 2
             if (all(_close(rope_tables[t]["magnitude"], mag, 1e-5) for t in main) and
@@ -974,7 +985,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     else:
         inactive("yarn_mscale_all_dim", "no YaRN log multiplier in this file")
     _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
-                                       mscale_all_dim=mscale_all_dim)
+                                       mscale_all_dim=mscale_all_dim, yarn_truncate=truncate_default)
     rope_dims = {b["mixer"]["key"]["rope"]["dims"] for b in att_blocks
                  if b["mixer"].get("key") and b["mixer"]["key"].get("rope")}
     if rope_dims and rope_dims != {rope_dim}:
@@ -988,7 +999,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         ref = t["inv_freq"]
         if rope_base is None:
             inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
-                                              mscale_all_dim=mscale_all_dim)
+                                              mscale_all_dim=mscale_all_dim, yarn_truncate=truncate_default)
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"
@@ -1239,7 +1250,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         elif cap:
             d.parts.append(f"attention scores soft-capped at {cap:g} (from the file)")
         if m.get("sinks"):
-            d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
+            if "attn_sinks.weight" not in engine.block_tensors:
+                d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
+            elif f"blk.{i}.attn_sinks.weight" not in g.tensors:
+                d.file_issues.append(f"block {i}: learned attention sinks in the reference but none in the file")
+            else:
+                d.parts.append(f"block {i}: learned sink logits in the attention softmax denominator")
         if not m.get("causal", True):
             d.missing.append(f"block {i}: non-causal attention")
         if m["head_dim"] != head_dim or m["heads"] != block_heads[i] or m["kv_heads"] != block_kv_heads[i]:
@@ -1473,6 +1489,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                                      f"(expert_gating_func)")
             if bool(f.get("selection_bias")) != bool(plan.get("selection_bias")):
                 d.file_issues.append(f"block {i}: an expert selection bias in one of the reference and the file only")
+            if bool(f.get("router_bias")) != bool(plan.get("router_bias")):
+                d.file_issues.append(f"block {i}: a router logit bias in one of the reference and the file only")
+            if bool(f.get("expert_biases")) != bool(plan.get("expert_biases")):
+                d.file_issues.append(f"block {i}: expert projection biases in one of the reference and the file only")
             fnorm = g.key("expert_weights_norm")
             if fnorm is not None and bool(fnorm) != bool(f["norm_topk"]):
                 d.file_issues.append(f"block {i}: expert_weights_norm {fnorm} in the file, the reference "
@@ -1486,6 +1506,21 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                 d.file_issues.append(f"block {i}: a shared expert in one of the reference and the file only")
             elif sh and bool(sh.get("gate")) != bool(plan.get("shared_gate")):
                 d.file_issues.append(f"block {i}: the shared expert's gate in one of the reference and the file only")
+    for b in bf:
+        f = b.get("ffn") or {}
+        i = b["index"]
+        expected = {"swiglu_clamp_exp": f.get("expert_clamp", 0.0),
+                    "swiglu_clamp_shexp": (f.get("shared_expert") or {}).get("clamp", 0.0)
+                    if f.get("kind") == "moe" else f.get("clamp", 0.0)}
+        for suffix, ref_limit in expected.items():
+            values = g.key(suffix, 0.0)
+            value = values[i] if isinstance(values, list) and i < len(values) else values
+            if isinstance(value, list) or not isinstance(value, (int, float)):
+                d.file_issues.append(f"block {i}: invalid {suffix}")
+            elif not _close(float(value), float(ref_limit), 1e-5):
+                d.file_issues.append(f"block {i}: {suffix} {value}, reference {ref_limit}")
+            elif ref_limit and suffix not in engine.file_keys:
+                d.missing.append(f"block {i}: post-activation SwiGLU clamp {ref_limit}")
     if len(acts) > 1:
         d.missing.append(f"FFNs with different activations {sorted(acts)} (one activation per architecture)")
     elif acts:
@@ -1511,7 +1546,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                            + (", a shared expert" + (" with a sigmoid gate" if f["shared_expert"].get("gate") else "")
                               if f.get("shared_expert") else ""))
     elif bf:
-        d.set("moe_norm_weights", False, "dense FFNs (the MoE default does not apply)")
+        # A dense checkpoint cannot establish an expert-routing default. Keep
+        # a registered family's value: e.g. llama also names Mixtral files.
+        inactive = engine.rows.get(arch, ({}, ""))[0].get("moe_norm_weights", False)
+        d.set("moe_norm_weights", inactive, "dense FFNs: inactive; preserve the registered family's MoE default "
+                                             "(unmeasurable without an expert checkpoint)")
 
     # --- embeddings and logits ---
     pos = facts.get("position_embeddings")

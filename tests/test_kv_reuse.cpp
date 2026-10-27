@@ -199,6 +199,17 @@ std::vector<MoveCase> move_cases() {
     add("bloom-alibi", test::classic_model_spec("bloom"));
     add("mpt-alibi", test::classic_model_spec("mpt"));
     add("command-r-headnorms", test::classic_model_spec("command-r"));
+    s = {};
+    s.arch = "gpt-oss";
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.router_bias = s.expert_projection_bias = true;
+    s.attention_sinks = s.attention_output_bias = true;
+    add("gpt-oss-learned-sinks", s);
+    add("gpt-oss-learned-sinks-f16", s, f16);
+    s.qk_norm = true;
+    s.k_norm_outlier = 60.0f;
+    add("gpt-oss-learned-sinks-q4_1", s, q4, true);
     return out;
 }
 
@@ -400,6 +411,13 @@ TEST_CASE("Blocks run at scattered positions give the rows and logits a whole pa
     s.rope_dim = 32;
     s.mla_kv_rank = 64;
     archs.push_back({"deepseek2", s});
+    s = {};
+    s.arch = "gpt-oss";
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.attention_sinks = s.attention_output_bias = true;
+    s.router_bias = s.expert_projection_bias = true;
+    archs.push_back({"gpt-oss-learned-sinks", s});
     s = {};
     s.arch = "qwen3moe";
     s.n_expert = 4;

@@ -132,7 +132,6 @@ struct TinyModelSpec {
     float yarn_beta_fast = 0.0f;
     float yarn_beta_slow = 0.0f;
     float yarn_log_mul = 0.0f;
-    bool yarn_truncate = true;  // false writes the fractional YaRN-ramp convention
     // > 0: attn_logit_softcapping / final_logit_softcapping (Gemma 2) and
     // attention.scale, the q·k scale the file states. Metadata only.
     float attn_softcap = 0.0f;
@@ -197,6 +196,20 @@ struct TinyModelSpec {
     int32_t space_prefix = -1;
     // Optional ignored metadata before the tokenizer, to test large headers.
     size_t tokenizer_padding = 0;
+    // Optional MoE projection biases and learned attention sink logits. A separate
+    // generator supplies these tensors so existing synthetic cases keep their bits.
+    bool router_bias = false;
+    bool expert_projection_bias = false;
+    bool attention_output_bias = false;
+    bool attention_sinks = false;
+    bool omit_expert_width = false;  // Mixtral: infer the expert width from down projections
+    bool separate_attention_gate = false;  // attn_gate instead of a fused [query | gate], with attn_gate true
+    bool head_attention_gate = false;  // one scalar gate per head, with separate_attention_gate
+    bool bare_expert_bias = false;     // selection correction named exp_probs_b without .bias
+    float expert_swiglu_clamp = 0.0f;
+    float shared_swiglu_clamp = 0.0f;
+    int32_t head_dim = 0;  // explicit attention head width, independent of the residual width
+    int32_t yarn_truncate = -1;  // -1: absent, 0/1: explicit YaRN endpoint rounding
 };
 
 // A representative classic block layout, shared by the cache, sequence and

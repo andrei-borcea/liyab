@@ -345,7 +345,7 @@ TEST_CASE("Classic models: sequences keep positions, parallel inputs, norms and 
 }
 
 TEST_CASE("Sequences together: windowed blocks and fused projections keep each sequence's bits") {
-    for (const std::string arch : {"gemma3", "gemma2", "phi3", "exaone4"}) {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3", "exaone4", "gpt-oss"}) {
         test::TinyModelSpec s;
         s.arch = arch;
         s.sliding_window = 16;
@@ -362,6 +362,12 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
         } else if (arch == "exaone4") {
             s.n_layers = 4;
             s.qk_norm = s.post_only_norms = true;
+        } else if (arch == "gpt-oss") {
+            s.n_expert = 8;
+            s.n_expert_used = 3;
+            s.identical_experts = false;
+            s.router_bias = s.expert_projection_bias = true;
+            s.attention_sinks = s.attention_output_bias = true;
         } else {
             s.fused_qkv = true;
             s.fused_gate_up = true;
