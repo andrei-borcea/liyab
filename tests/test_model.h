@@ -51,6 +51,10 @@ struct TinyModelSpec {
     int32_t n_ff = 256;
     int32_t n_head = 4;
     int32_t n_head_kv = 2;
+    // Optional NAS metadata, one entry per block. Zero KV/query heads omit
+    // the mixer, positive query heads with zero KV heads write a linear
+    // projection; zero FFN width omits the FFN. Head size stays n_embd/n_head.
+    std::vector<int32_t> block_heads, block_kv_heads, block_ff;
     int32_t context_length = 512;
     // Mixed precision by default: Q8_0 attention, Q4_0 FFN, F16 embeddings.
     DType attn_type = DType::Q8_0;
@@ -76,6 +80,14 @@ struct TinyModelSpec {
     // default, and drawn from the generator only when on, so every model
     // written before these existed keeps its exact weights.
     bool qk_norm = false;        // per-head RMSNorm of Q and K (attn_q_norm / attn_k_norm)
+    bool qk_norm_whole = false;  // one Q/K RMSNorm over all heads (requires qk_norm)
+    bool post_only_norms = false; // norms after mixer/FFN, with no norms before either (OLMo 2)
+    std::vector<bool> rope_layers; // attention.rope_pattern: true rotates, false leaves Q/K unchanged
+    float embedding_scale = 0.0f; // > 0: explicit embedding/residual/logit metadata (no weight changes)
+    float residual_scale = 0.0f;
+    float logit_scale = 0.0f;
+    float attn_temp_scale = 0.0f; // attention.temperature_scale / _length (Ministral 3)
+    int32_t attn_temp_length = 0;
     bool attn_gate = false;      // attention output gated per head: attn_q is [q | gate], twice as tall
     int32_t rope_dim = 0;        // rotated dimensions per head (partial RoPE); 0: the whole head
     bool rope_freqs = false;     // per-pair RoPE frequency factors (rope_freqs.weight, Llama 3.x)
@@ -98,6 +110,7 @@ struct TinyModelSpec {
     float rope_base = 10000.0f;  // rope.freq_base (of the global blocks when some are windowed)
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
+    bool bare_post_norms = false; // omit their .weight suffix, as the PLaMo3 converter does
     bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
     // ffn_up holds [gate | up], no ffn_gate (Phi-3); with n_expert > 0, ffn_gate_up_exps holds each
     // expert's [gate | up] (the split tensors' weights, as a converter fuses them)
@@ -119,6 +132,7 @@ struct TinyModelSpec {
     float yarn_beta_fast = 0.0f;
     float yarn_beta_slow = 0.0f;
     float yarn_log_mul = 0.0f;
+    bool yarn_truncate = true;  // false writes the fractional YaRN-ramp convention
     // > 0: attn_logit_softcapping / final_logit_softcapping (Gemma 2) and
     // attention.scale, the q·k scale the file states. Metadata only.
     float attn_softcap = 0.0f;
@@ -154,7 +168,6 @@ struct TinyModelSpec {
     bool embedding_norm = false;      // token_embd_norm, as in BLOOM
     bool learned_positions = false;   // context_length absolute position rows
     bool per_head_qk_norm = false;    // distinct LayerNorm weight for each head
-    float logit_scale = 1.0f;
     float clamp_kqv = 0.0f;
     int32_t parallel_residual = -1;    // -1: row default, 0/1: metadata override
 
@@ -179,6 +192,11 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+    // Optional SentencePiece selection and prefix flag, metadata only.
+    std::string spm_pre;
+    int32_t space_prefix = -1;
+    // Optional ignored metadata before the tokenizer, to test large headers.
+    size_t tokenizer_padding = 0;
 };
 
 // A representative classic block layout, shared by the cache, sequence and
@@ -189,6 +207,11 @@ TinyModelSpec classic_model_spec(const std::string& arch);
 // lowercase letters, and every substring of "▁hello" / "▁world".
 std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
+
+// NAS geometry covering two GQA ratios, differing query and FFN widths,
+// an absent block, and a linear mixer. A single spec keeps every path test
+// on the same geometry; optional norms/scales can be added by the caller.
+TinyModelSpec nas_spec();
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
 

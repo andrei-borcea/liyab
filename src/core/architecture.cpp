@@ -1,5 +1,6 @@
 #include "core/architecture.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -189,6 +190,85 @@ constexpr ArchSpec kArchitectures[] = {
     // DBRX: LayerNorms without biases (the FFN's is attn_output_norm), fused
     // QKV clamped, a softmax top-k MoE renormalized.
     {.name = "dbrx", .rope = RopeLayout::Halves, .ffn_norm = "attn_output_norm", .moe_norm_weights = true, .norm = NormKind::Layer},
+    // SmolLM3: Llama's block (the converter interleaves the Q/K rows), every
+    // fourth block without RoPE. The converter writes no per-block list
+    // (attention.rope_pattern), so the period is the row's.
+    {.name = "smollm3", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .nope_period = 4},
+    // OLMo 2 and OLMo 3: post-only norms (after the attention and after the
+    // FFN, none before: planned from the tensors) and RMSNorms of Q and K
+    // over the whole projections (from their size), before RoPE. OLMo 3
+    // attends through a window in the blocks its file lists (all but every
+    // fourth by default); those rotate with the base unscaled, the YaRN the
+    // converter writes being the global blocks'.
+    {.name = "olmo2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .swa_period = 4,
+     .swa_rope_unscaled = true},
+    // EXAONE 4: post-only norms as OLMo 2's, per-head Q/K norms before RoPE.
+    // With a window (EXAONE 4.0 32B: three windowed blocks, then a global
+    // one), only the windowed blocks rotate: the global ones are NoPE.
+    {.name = "exaone4",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .swa_period = 4,
+     .nope_global = true},
+    // EXAONE 3 / 3.5: a pre-norm block with SwiGLU, rotating halves (the
+    // converter keeps the rows), Llama 3 frequency factors in rope_freqs.
+    {"exaone", RopeLayout::Halves, "ffn_norm", false},
+    // Granite 3.x dense: Llama's block with μP scalars from the file
+    // (embedding_scale, residual_scale, attention.scale) and logits divided
+    // by its logit_scale (logits_scaling).
+    {.name = "granite", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .logit_scale_divides = true},
+    // MiniCPM (1, 2, 4 dense): Llama's block with μP scalars from the file:
+    // scale_emb, scale_depth / sqrt(n_layers) and logits divided by n_embd /
+    // dim_model_base; LongRoPE factors when the model has them.
+    {.name = "minicpm", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .logit_scale_divides = true},
+    // InternLM 2 / 2.5: Llama's block once the converter has split and
+    // interleaved the fused wqkv. (InternLM 3 converts as llama.)
+    {"internlm2", RopeLayout::Adjacent, "ffn_norm", false},
+    // Seed-OSS: QKV biases, halves; the norm before the FFN is stored as
+    // post_attention_norm (as Qwen3.5's).
+    {"seed_oss", RopeLayout::Halves, "post_attention_norm", false},
+    // ChatGLM 2 / 3 and GLM-4 (2024, GlmForCausalLM): fused attn_qkv with a
+    // bias, fused [gate | up], RoPE on adjacent pairs of the first half of
+    // each head (rope.dimension_count).
+    {"chatglm", RopeLayout::Adjacent, "ffn_norm", false},
+    // GLM-4-0414: ChatGLM's rotation (adjacent pairs, half of each head), QKV
+    // biases, fused [gate | up], and norms after the attention and the FFN
+    // besides the ones before them.
+    {.name = "glm4",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm"},
+    // Gemma (1): embeddings scaled by sqrt(d), GeGLU; the converter stores
+    // the RMSNorm weights as 1 + w.
+    {.name = "gemma",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .scale_embeddings = true},
+    // Ministral 3 (mistral3): Llama's block with YaRN whose
+    // yarn_log_multiplier is the reference's mscale_all_dim, and the
+    // queries' temperature by position (attention.temperature_scale).
+    {.name = "mistral3", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = false, .yarn_mscale_all_dim = true},
+    // Deci / Nemotron-NAS: block geometry comes from scalar or per-block
+    // head_count, head_count_kv and feed_forward_length, and the tensors.
+    {"deci", RopeLayout::Adjacent, "ffn_norm", false},
+    // PLaMo 3: fused QKV and gate/up, folded RMSNorm offsets, Q/K norms,
+    // sandwich norms and windowed blocks with an unscaled local RoPE base.
+    {.name = "plamo3", .rope = RopeLayout::Halves, .ffn_norm = "ffn_norm", .moe_norm_weights = false,
+     .post_mixer_norm = "post_attention_norm", .post_ffn_norm = "post_ffw_norm", .swa_period = 8,
+     .rope_base_swa = 10000.0f},
 };
 
 }  // namespace
@@ -212,6 +292,12 @@ std::string block_tensor(int32_t block, std::string_view suffix) {
     char buf[96];
     std::snprintf(buf, sizeof buf, "blk.%d.%.*s", block, static_cast<int>(suffix.size()), suffix.data());
     return buf;
+}
+
+std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string_view suffix) {
+    const std::string weighted = block_tensor(block, std::string(suffix) + ".weight");
+    const std::string bare = block_tensor(block, suffix);
+    return file.tensor(weighted) != nullptr || file.tensor(bare) == nullptr ? weighted : bare;
 }
 
 Result<ModelConfig> describe_model(const MmapLoader& f) {
@@ -267,10 +353,43 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                                                       " " + std::to_string(groups) + ") is not supported yet");
         }
     }
-    c.n_ff = static_cast<int32_t>(f.get_int(key("feed_forward_length")).value_or(0));
-    if (c.n_ff <= 0 && c.n_expert == 0) return Status(ErrorCode::InvalidModel, "missing or invalid " + key("feed_forward_length"));
-    LIYAB_RETURN_IF_ERROR(require_int("attention.head_count", c.n_head));
-    c.n_head_kv = static_cast<int32_t>(f.get_int(key("attention.head_count_kv")).value_or(c.n_head));
+    auto block_values = [&](const char* suffix, const std::vector<int32_t>& fallback,
+                            std::vector<int32_t>& out) -> Status {
+        const GgufValue* value = f.metadata(key(suffix));
+        out = fallback;
+        if (value == nullptr) return Status::ok();
+        if (value->type == GgufValue::Type::Array) {
+            if (value->array_size < static_cast<uint64_t>(c.n_layers) ||
+                (value->array_type != GgufValue::Type::U32 && value->array_type != GgufValue::Type::I32)) {
+                return Status(ErrorCode::InvalidModel, "expected one 32-bit integer per block in " + key(suffix));
+            }
+            for (size_t l = 0; l < out.size(); ++l) {
+                uint32_t v = 0;
+                std::memcpy(&v, value->array_data + l * sizeof(v), sizeof(v));
+                if (v > (uint32_t{1} << 24)) return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+                out[l] = static_cast<int32_t>(v);
+            }
+        } else {
+            const auto v = value->as_int();
+            if (!v || *v < 0 || *v > (int64_t{1} << 24)) {
+                return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+            }
+            std::fill(out.begin(), out.end(), static_cast<int32_t>(*v));
+        }
+        return Status::ok();
+    };
+    const std::vector<int32_t> zero(static_cast<size_t>(c.n_layers), 0);
+    std::vector<int32_t> block_heads, block_kv_heads, block_ff;
+    LIYAB_RETURN_IF_ERROR(block_values("attention.head_count", zero, block_heads));
+    LIYAB_RETURN_IF_ERROR(block_values("attention.head_count_kv", block_heads, block_kv_heads));
+    LIYAB_RETURN_IF_ERROR(block_values("feed_forward_length", zero, block_ff));
+    c.n_ff = *std::max_element(block_ff.begin(), block_ff.end());
+    c.n_head = std::max(*std::max_element(block_heads.begin(), block_heads.end()), 1);
+    c.n_head_kv = std::max(*std::max_element(block_kv_heads.begin(), block_kv_heads.end()), 1);
+    if (f.metadata(key("attention.head_count")) == nullptr ||
+        (f.metadata(key("feed_forward_length")) == nullptr && c.n_expert == 0)) {
+        return Status(ErrorCode::InvalidModel, "missing attention.head_count or feed_forward_length");
+    }
     c.head_dim = static_cast<int32_t>(f.get_int(key("attention.key_length")).value_or(c.n_embd / c.n_head));
     c.value_dim = c.head_dim;
     c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
@@ -357,8 +476,16 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             const double ln_factor = y.factor > 1.0f ? std::log(static_cast<double>(y.factor)) : 0.0;
             const auto log_mul = f.get_float(key("rope.scaling.yarn_log_multiplier"));
             const auto attn_factor = f.get_float(key("rope.scaling.yarn_attn_factor"));
-            const double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
-            if (log_mul) qk_mscale = 1.0 + *log_mul * ln_factor;
+            // With ArchSpec::yarn_mscale_all_dim the multiplier is the
+            // reference's mscale_all_dim m instead: the rotation's magnitude
+            // is (0.1 ln(factor) + 1) / (0.1 m ln(factor) + 1) and q·k keeps
+            // its scale (Ministral 3: m = 1, a magnitude of 1).
+            double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            if (log_mul && c.spec->yarn_mscale_all_dim) {
+                if (!attn_factor) magnitude = (0.1 * ln_factor + 1.0) / (0.1 * *log_mul * ln_factor + 1.0);
+            } else if (log_mul) {
+                qk_mscale = 1.0 + *log_mul * ln_factor;
+            }
             if (!(magnitude > 0.0) || !(qk_mscale > 0.0)) {
                 return Status(ErrorCode::InvalidModel, "invalid YaRN attention factor (" + key("rope.scaling.*") + ")");
             }
@@ -372,6 +499,39 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     // As the reference scales them: sqrt(d) rounded once to float.
     if (c.spec->scale_embeddings) c.embd_scale = static_cast<float>(std::sqrt(static_cast<double>(c.n_embd)));
+    // μP scalars, wherever the file states them: the embeddings' multiplier,
+    // the residual branches' multiplier and the logits' scale (a divisor in
+    // the architectures whose converter writes one, ArchSpec::logit_scale_divides).
+    const auto finite_positive = [](double v) {
+        const float stored = static_cast<float>(v);
+        return stored > 0.0f && std::isfinite(stored);
+    };
+    if (const auto scale = f.get_float(key("embedding_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("embedding_scale"));
+        c.embd_scale = static_cast<float>(*scale);
+    }
+    if (const auto scale = f.get_float(key("residual_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("residual_scale"));
+        c.residual_scale = static_cast<float>(*scale);
+    }
+    if (const auto scale = f.get_float(key("logit_scale"))) {
+        if (!finite_positive(*scale)) return Status(ErrorCode::InvalidModel, "invalid " + key("logit_scale"));
+        const double multiplier = c.spec->logit_scale_divides ? 1.0 / *scale : *scale;
+        if (!finite_positive(multiplier)) return Status(ErrorCode::InvalidModel, "invalid " + key("logit_scale"));
+        c.logit_scale = static_cast<float>(multiplier);
+    }
+    // Attention temperature by position (llama_4_scaling): its length is the
+    // file's, else YaRN's original context.
+    if (const auto beta = f.get_float(key("attention.temperature_scale")); beta && *beta != 0.0) {
+        c.attn_temp_scale = static_cast<float>(*beta);
+        const int64_t length =
+            f.get_int(key("attention.temperature_length")).value_or(c.yarn.factor > 0.0f ? c.yarn.ctx_orig : 0);
+        if (!std::isfinite(c.attn_temp_scale) || c.attn_temp_scale < 0.0f || length <= 0 || length > (int64_t{1} << 24)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.temperature_scale") + " / " +
+                                                       key("attention.temperature_length"));
+        }
+        c.attn_temp_length = static_cast<int32_t>(length);
+    }
 
     // Sliding-window attention blocks: the architecture's period, or the
     // file's own pattern (a period, or one flag per block).
@@ -384,6 +544,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     if (window > 0) {
         c.sliding_window = static_cast<int32_t>(window);
         c.rope_base_swa = static_cast<float>(f.get_float(key("rope.freq_base_swa")).value_or(c.spec->rope_base_swa));
+        if (c.rope_base_swa == 0.0f && c.spec->swa_rope_unscaled) c.rope_base_swa = c.rope_base;
         int64_t period = c.spec->swa_period;
         const GgufValue* pattern = f.metadata(key("attention.sliding_window_pattern"));
         if (pattern != nullptr && pattern->type == GgufValue::Type::Array) {
@@ -401,8 +562,22 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
     }
 
-    if (c.n_head_kv <= 0 || c.n_head % c.n_head_kv != 0) {
-        return Status(ErrorCode::InvalidModel, "head_count must be a multiple of head_count_kv");
+    // Blocks without positional rotation (NoPE): the file's own list (true =
+    // rotated), else the architecture's rules: a period, and the global
+    // blocks of a model that has windowed ones.
+    std::vector<bool> rotated(static_cast<size_t>(c.n_layers), true);
+    if (const GgufValue* rp = f.metadata(key("attention.rope_pattern"))) {
+        if (rp->type != GgufValue::Type::Array || rp->array_type != GgufValue::Type::Bool ||
+            rp->array_size < static_cast<uint64_t>(c.n_layers)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.rope_pattern"));
+        }
+        for (size_t l = 0; l < rotated.size(); ++l) rotated[l] = rp->array_data[l] != 0;
+    } else {
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const auto i = static_cast<size_t>(l);
+            if (c.spec->nope_period > 0 && (l + 1) % c.spec->nope_period == 0) rotated[i] = false;
+            if (c.spec->nope_global && c.sliding_window > 0 && !windowed[i]) rotated[i] = false;
+        }
     }
     if (c.head_dim <= 0 || (c.rope_dim <= 0 && c.spec->rotary) || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
@@ -435,7 +610,6 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     c.n_vocab = static_cast<int32_t>(embd->rows());
     // Command-R: the logits are multiplied by the file's scale.
-    c.logit_scale = static_cast<float>(f.get_float(key("logit_scale")).value_or(1.0));
     // MPT, DBRX, OLMo: queries, keys and values clamped after their projections.
     c.clamp_kqv = static_cast<float>(f.get_float(key("attention.clamp_kqv")).value_or(0.0));
     // ALiBi, for architectures whose row has it: the file's maximum bias, else the row's.
@@ -497,7 +671,6 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Block plans, from the tensors present: a block with a DeltaNet
     // convolution is recurrent, every other block is attention; a router
     // makes the FFN a mixture of experts.
-    const int64_t q_dim = int64_t{c.n_head} * c.head_dim;
     // Parallel blocks: the file's flag (GPT-NeoX, StableLM), else the architecture's.
     const GgufValue* parallel_key = f.metadata(key("use_parallel_residual"));
     const bool parallel = parallel_key != nullptr && parallel_key->as_bool() ? *parallel_key->as_bool()
@@ -505,9 +678,28 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.blocks.resize(static_cast<size_t>(c.n_layers));
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
+        b.n_head = block_heads[static_cast<size_t>(l)];
+        b.n_head_kv = block_kv_heads[static_cast<size_t>(l)];
+        b.n_ff = block_ff[static_cast<size_t>(l)];
+        const int64_t q_dim = int64_t{b.n_head} * c.head_dim;
         if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr) {
             b.mixer = MixerKind::DeltaNet;
+        } else if (b.n_head_kv == 0) {
+            b.mixer = b.n_head == 0 ? MixerKind::None : MixerKind::Linear;
+            if (f.tensor(block_tensor(l, "attn_q.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_k.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_v.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_q_norm.weight")) != nullptr ||
+                f.tensor(block_tensor(l, "attn_k_norm.weight")) != nullptr ||
+                (b.mixer == MixerKind::None && f.tensor(block_tensor(l, "attn_output.weight")) != nullptr)) {
+                return Status(ErrorCode::InvalidModel, "attention tensors with zero KV heads in block " + std::to_string(l));
+            }
         } else {
+            if (b.n_head <= 0 || b.n_head % b.n_head_kv != 0) {
+                return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                                           ": head_count must be a positive multiple of head_count_kv");
+            }
             ++c.n_attn_layers;
             b.latent = f.tensor(block_tensor(l, "attn_kv_a_mqa.weight")) != nullptr;
             if (b.latent != (c.mla.kv_rank > 0)) {
@@ -515,17 +707,59 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + ": latent attention tensors and " +
                                                            key("attention.kv_lora_rank") + " disagree");
             }
+            if (b.latent && (b.n_head != c.n_head || b.n_head_kv != 1)) {
+                return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                                                          ": per-block latent attention head counts are not supported");
+            }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
+            b.rope = rotated[static_cast<size_t>(l)];
+            if (!b.rope && b.latent) {
+                return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                                                          ": latent attention without RoPE is not supported");
+            }
+            // Q/K norms over the whole projection (one weight per channel of
+            // every head) rather than one head's weights shared by all heads.
+            const TensorView* qn = f.tensor(block_tensor(l, "attn_q_norm.weight"));
+            const TensorView* kn = f.tensor(block_tensor(l, "attn_k_norm.weight"));
+            if (qn != nullptr || kn != nullptr) {
+                const int64_t kv_dim = int64_t{b.n_head_kv} * c.head_dim;
+                const bool q_whole = qn != nullptr && qn->n_dims == 1 && qn->elements() == q_dim && q_dim != c.head_dim;
+                const bool k_whole = kn != nullptr && kn->n_dims == 1 && kn->elements() == kv_dim && kv_dim != c.head_dim;
+                b.qk_norm_whole = q_whole || k_whole;
+                auto valid_norm = [&](const TensorView* t, int64_t heads) {
+                    if (t == nullptr) return true;
+                    const int64_t width = b.qk_norm_whole ? heads * c.head_dim : c.head_dim;
+                    return t->elements() == width || (!b.qk_norm_whole &&
+                        c.spec->norm == NormKind::Layer && t->n_dims == 2 &&
+                        t->ne[0] == c.head_dim && t->ne[1] == heads);
+                };
+                if (!valid_norm(qn, b.n_head) || !valid_norm(kn, b.n_head_kv)) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                                               ": attn_q_norm / attn_k_norm span neither one head "
+                                                               "nor the whole projection");
+                }
+                if (b.qk_norm_whole && c.spec->qk_norm == QkNormOrder::AfterRope) {
+                    return Status(ErrorCode::Unsupported, "Q/K norms over the whole projection after RoPE");
+                }
+            }
         }
         b.parallel = parallel;
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             const bool gate = f.tensor(block_tensor(l, "ffn_gate.weight")) != nullptr;
-            b.fused_gate_up = !gate && up->rows() == 2 * int64_t{c.n_ff};
+            b.fused_gate_up = !gate && up->rows() == 2 * int64_t{b.n_ff};
             // No gate and up as tall as the FFN: down(act(up)).
-            if (!gate && up->rows() == int64_t{c.n_ff}) b.ffn = FfnKind::Ungated;
+            if (!gate && up->rows() == int64_t{b.n_ff}) b.ffn = FfnKind::Ungated;
+        } else if (b.n_ff == 0 && f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr) {
+            b.ffn = FfnKind::None;
+            const std::string prefix = block_tensor(l, "ffn_");
+            for (const TensorView& tensor : f.tensors()) {
+                if (tensor.name.starts_with(prefix)) {
+                    return Status(ErrorCode::InvalidModel, "tensor '" + std::string(tensor.name) + "' with zero FFN width");
+                }
+            }
         }
         if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) != nullptr) {
             if (c.n_expert <= 0) return Status(ErrorCode::InvalidModel, "MoE tensors without expert_count");
@@ -539,8 +773,32 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (c.spec->ffn_activation == FfnActivation::XIelu && b.ffn != FfnKind::Ungated) {
             return Status(ErrorCode::Unsupported, "gated xIELU FFN in block " + std::to_string(l) + " is not implemented");
         }
+        // Post-only norms: a block without the norm before its mixer (or FFN)
+        // feeds it the residual stream as it is, and normalizes its output
+        // instead. A block with neither norm is a damaged file, not a variant.
+        auto has = [&](std::string_view suffix) {
+            return !suffix.empty() && f.tensor(block_norm_tensor(f, l, suffix)) != nullptr;
+        };
+        // A parameterless LayerNorm still normalizes. In a parallel block
+        // the FFN can share the mixer's norm without a second tensor.
+        const bool parameterless = c.spec->norm == NormKind::Layer;
+        b.norm_before_mixer = b.mixer != MixerKind::None &&
+            (parameterless || has(c.spec->attn_norm) || (b.parallel && has(c.spec->ffn_norm)));
+        b.norm_before_ffn = b.ffn != FfnKind::None &&
+            (parameterless || has(c.spec->ffn_norm) || b.parallel);
+        if ((b.mixer == MixerKind::None && (b.norm_before_mixer || has(c.spec->post_mixer_norm))) ||
+            (b.ffn == FfnKind::None && (b.norm_before_ffn || has(c.spec->post_ffn_norm)))) {
+            return Status(ErrorCode::InvalidModel, "normalization tensor for an absent branch in block " + std::to_string(l));
+        }
+        if (b.mixer != MixerKind::None && !b.norm_before_mixer && !has(c.spec->post_mixer_norm)) {
+            return Status(ErrorCode::InvalidModel, "missing tensor '" + block_tensor(l, "attn_norm.weight") + "'");
+        }
+        if (b.ffn != FfnKind::None && !b.norm_before_ffn && !has(c.spec->post_ffn_norm)) {
+            return Status(ErrorCode::InvalidModel,
+                          "missing tensor '" + block_tensor(l, std::string(c.spec->ffn_norm) + ".weight") + "'");
+        }
     }
-    if (c.n_attn_layers < c.n_layers) {
+    if (std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.mixer == MixerKind::DeltaNet; })) {
         LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", c.ssm_conv_kernel));
         LIYAB_RETURN_IF_ERROR(require_int("ssm.state_size", c.ssm_head_dim));
         LIYAB_RETURN_IF_ERROR(require_int("ssm.group_count", c.ssm_k_heads));

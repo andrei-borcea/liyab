@@ -134,6 +134,18 @@ std::vector<MoveCase> move_cases() {
     add("llama", s);  // adjacent pairs
     add("llama-f16", s, f16);
     add("llama-q4_1", s, q4);
+    s.rope_layers = {false, true};  // the first block's keys must keep their bits at every position
+    add("nope-f16", s, f16);
+    add("nope-q8", s);
+    add("nope-q4_1", s, q4);
+    s = {};
+    s.arch = "olmo2";
+    s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+    add("olmo2-whole-qk", s, f16);
+    s = test::nas_spec();
+    s.qk_norm = s.qk_norm_whole = true;
+    add("deci-block-geometry", s, f16);
+    s = {};
     s.rope_freqs = true;  // per-pair frequency factors, linear position scaling
     s.rope_scale = 2.0f;
     add("llama-ropefreqs-linear", s);
@@ -359,6 +371,16 @@ TEST_CASE("Blocks run at scattered positions give the rows and logits a whole pa
     };
     std::vector<Arch> archs;
     archs.push_back({"llama", {}});
+    test::TinyModelSpec modern;
+    modern.arch = "smollm3";
+    modern.n_layers = 4;
+    archs.push_back({"smollm3-nope", modern});
+    modern = {};
+    modern.arch = "olmo2";
+    modern.post_only_norms = modern.qk_norm = modern.qk_norm_whole = true;
+    archs.push_back({"olmo2-post-only-whole-qk", modern});
+    modern = test::nas_spec();
+    archs.push_back({"deci-block-geometry", modern});
     test::TinyModelSpec s;
     s.arch = "qwen3";
     s.qk_norm = true;
@@ -490,6 +512,17 @@ TEST_CASE("Reused segments: recomputing every token gives a full prefill's bits;
     };
     std::vector<Arch> archs;
     archs.push_back({"llama", {}});
+    archs.push_back({"deci-block-geometry", test::nas_spec()});
+    {
+        test::TinyModelSpec s;
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        archs.push_back({"smollm3-nope", s});
+        s = {};
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        archs.push_back({"olmo2-post-only", s});
+    }
     test::TinyModelSpec s;
     s.arch = "qwen3";
     s.qk_norm = true;

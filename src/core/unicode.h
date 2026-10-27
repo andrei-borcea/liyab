@@ -1,5 +1,5 @@
 // Liyab — Unicode support for the tokenizers (internal): UTF-8 decoding,
-// general categories, White_Space, and NFC normalization.
+// general categories, White_Space, and NFC / NFKC normalization.
 //
 // The data is generated from the Unicode Character Database by
 // tools/gen_unicode_tables.py into unicode_tables.inc (the version is in its
@@ -59,6 +59,12 @@ void append_utf8(std::string& out, uint32_t cp);
 // Canonical composition (Unicode Normalization Form C). Malformed UTF-8 bytes
 // are kept as they are. Returns `text` unchanged when nfc_quick_check holds.
 [[nodiscard]] std::string to_nfc(std::string_view text);
+// Unicode 9 compatibility decomposition followed by canonical composition
+// (NFKC), matching the tokenizers normalization dependency. Characters
+// unassigned in Unicode 9 remain inert.
+// Malformed UTF-8 bytes are preserved; ASCII returns unchanged. Stateless
+// and thread-safe; existing NFC uses its own current Unicode tables.
+[[nodiscard]] std::string to_nfkc(std::string_view text);
 
 }  // namespace liyab::unicode
 

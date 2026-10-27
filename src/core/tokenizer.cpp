@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <unordered_set>
@@ -93,7 +95,10 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     if (!kind) return Status(ErrorCode::InvalidModel, "missing tokenizer.ggml.model");
     if (*kind == "llama") tok.kind_ = Kind::Spm;
     else if (*kind == "gpt2") tok.kind_ = Kind::Gpt2;
+    else if (*kind == "plamo3") tok.kind_ = Kind::Unigram;
     else return Status(ErrorCode::Unsupported, "tokenizer type '" + std::string(*kind) + "' is not supported");
+    const auto spm_pre = model.get_string("tokenizer.ggml.pre");
+    tok.spm_greedy_ = tok.kind_ == Kind::Spm && spm_pre && *spm_pre == "spm-greedy";
 
     const GgufValue* tokens = model.metadata("tokenizer.ggml.tokens");
     if (!tokens || tokens->type != GgufValue::Type::Array || tokens->array_type != GgufValue::Type::String ||
@@ -105,10 +110,21 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
 
     tok.scores_.assign(n, 0.0f);
     if (const GgufValue* s = model.metadata("tokenizer.ggml.scores")) {
-        if (s->type != GgufValue::Type::Array || s->array_type != GgufValue::Type::F32 || s->array_size != n) {
+        if (s->type != GgufValue::Type::Array || s->array_size != n ||
+            (s->array_type != GgufValue::Type::F32 && s->array_type != GgufValue::Type::I32)) {
             return Status(ErrorCode::InvalidModel, "tokenizer.ggml.scores does not match the vocabulary");
         }
-        std::memcpy(tok.scores_.data(), s->array_data, n * sizeof(float));
+        if (s->array_type == GgufValue::Type::F32) {
+            std::memcpy(tok.scores_.data(), s->array_data, n * sizeof(float));
+        } else {
+            // The published converter writes Tekken's integer merge ranks
+            // as I32 scores. Read their numeric values, never their bits.
+            for (size_t i = 0; i < n; ++i) {
+                int32_t score = 0;
+                std::memcpy(&score, s->array_data + i * sizeof(score), sizeof(score));
+                tok.scores_[i] = static_cast<float>(score);
+            }
+        }
     }
     tok.types_.assign(n, kNormal);
     if (const GgufValue* t = model.metadata("tokenizer.ggml.token_type")) {
@@ -181,10 +197,14 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
         if (type == kControl || type == kUnused) continue;
 
         uint8_t byte = 0;
-        if (tok.kind_ == Kind::Spm) {
-            if (type == kByte && parse_byte_token(text, byte)) {
+        if (tok.kind_ != Kind::Gpt2) {
+            if ((type == kByte || (tok.kind_ == Kind::Unigram && type == kNormal)) && parse_byte_token(text, byte)) {
                 tok.spm_byte_fallback_ = true;
                 piece.assign(1, static_cast<char>(byte));
+                continue;
+            }
+            if (tok.kind_ == Kind::Unigram) {
+                piece.assign(text);
                 continue;
             }
             for (size_t pos = 0; pos < text.size();) {
@@ -250,8 +270,75 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
             tok.byte_token_[b] = it == tok.lookup_.end() ? -1 : it->second;
         }
     }
+    if (tok.kind_ == Kind::Unigram || tok.spm_greedy_) {
+        if (tok.kind_ == Kind::Unigram && model.metadata("tokenizer.ggml.scores") == nullptr) {
+            return Status(ErrorCode::InvalidModel, "unigram vocabulary without tokenizer.ggml.scores");
+        }
+        tok.byte_token_.fill(-1);
+        if (tok.kind_ == Kind::Unigram) tok.unigram_scores_.resize(n);
+        tok.unigram_trie_.emplace_back();
+        for (size_t i = 0; i < n; ++i) {
+            if (tok.kind_ == Kind::Unigram) {
+                const double score = std::nearbyint(static_cast<double>(tok.scores_[i]) * 10000.0);
+                if (!std::isfinite(score) || score < std::numeric_limits<int32_t>::min() ||
+                    score > std::numeric_limits<int32_t>::max()) {
+                    return Status(ErrorCode::InvalidModel, "unigram token score is outside its integer range");
+                }
+                tok.unigram_scores_[i] = static_cast<int32_t>(score);
+            }
+            uint8_t byte = 0;
+            if (tok.types_[i] == kByte && parse_byte_token(tok.texts_[i], byte)) {
+                tok.byte_token_[byte] = static_cast<int32_t>(i);
+                continue;
+            }
+            if (tok.types_[i] == kUnused) continue;
+            if (tok.spm_greedy_ && (tok.types_[i] == kControl || tok.types_[i] == kUserDefined)) continue;
+            int32_t node = 0;
+            for (const unsigned char c : tok.texts_[i]) {
+                int32_t child = tok.unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && tok.unigram_trie_[static_cast<size_t>(child)].byte != c) {
+                    child = tok.unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) {
+                    if (tok.unigram_trie_.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                        return Status(ErrorCode::InvalidModel, tok.spm_greedy_ ? "greedy SentencePiece vocabulary trie is too large"
+                                                                             : "unigram vocabulary trie is too large");
+                    }
+                    child = static_cast<int32_t>(tok.unigram_trie_.size());
+                    UnigramNode entry;
+                    entry.byte = c;
+                    entry.next = tok.unigram_trie_[static_cast<size_t>(node)].child;
+                    tok.unigram_trie_.push_back(entry);
+                    tok.unigram_trie_[static_cast<size_t>(node)].child = child;
+                }
+                node = child;
+            }
+            tok.unigram_trie_[static_cast<size_t>(node)].token = static_cast<int32_t>(i);
+        }
+        if (std::find(tok.byte_token_.begin(), tok.byte_token_.end(), -1) != tok.byte_token_.end()) {
+            return Status(ErrorCode::InvalidModel, tok.spm_greedy_ ? "greedy SentencePiece vocabulary lacks byte fallback tokens"
+                                                                 : "unigram vocabulary lacks byte fallback tokens");
+        }
+    }
     tok.special_.assign(n, false);
     for (const int32_t id : tok.control_) tok.special_[static_cast<size_t>(id)] = true;
+    const auto scheme = model.get_string("tokenizer.ggml.pre");
+    if (tok.kind_ == Kind::Spm && scheme && *scheme == "chatglm-spm") {
+        // This tokenizer's start-of-sequence rule is a two-token prefix,
+        // independent of the converter's false ordinary add_bos_token flag.
+        for (const char* text : {"[gMASK]", "sop"}) {
+            const auto it = tok.lookup_.find(text);
+            if (it == tok.lookup_.end() || !tok.special_[static_cast<size_t>(it->second)]) {
+                return Status(ErrorCode::InvalidModel, "chatglm-spm vocabulary lacks special token '" + std::string(text) + "'");
+            }
+            tok.initial_tokens_.push_back(it->second);
+            tok.initial_text_ += text;
+        }
+        tok.add_bos_ = true;
+    } else if (tok.bos_ >= 0) {
+        tok.initial_tokens_.push_back(tok.bos_);
+        if (tok.special_[static_cast<size_t>(tok.bos_)]) tok.initial_text_ = tok.texts_[static_cast<size_t>(tok.bos_)];
+    }
     std::sort(tok.control_.begin(), tok.control_.end(), [&](int32_t a, int32_t b) {
         return tok.texts_[static_cast<size_t>(a)].size() > tok.texts_[static_cast<size_t>(b)].size();
     });
@@ -317,10 +404,12 @@ std::string_view Tokenizer::prompt_text(int32_t id, int32_t previous) const {
 }
 
 Result<std::vector<int32_t>> Tokenizer::encode(std::string_view text, bool add_bos) const {
-    if (add_bos && bos_ >= 0 && special_[static_cast<size_t>(bos_)] && text.starts_with(texts_[static_cast<size_t>(bos_)])) {
-        add_bos = false;  // the text spells its BOS (a chat template wrote it): no second one
-    }
     return encode_from(text, add_bos, true);
+}
+
+std::span<const int32_t> Tokenizer::initial_tokens(std::string_view text, bool add_bos) const {
+    if (!add_bos || (!initial_text_.empty() && text.starts_with(initial_text_))) return {};
+    return initial_tokens_;
 }
 
 std::string_view Tokenizer::token_text(int32_t id) const {
@@ -356,11 +445,15 @@ size_t Tokenizer::find_special(std::string_view text, size_t from, int32_t& id) 
 
 Result<std::vector<int32_t>> Tokenizer::encode_from(std::string_view text, bool add_bos, bool after_control) const {
     if (kind_ == Kind::Gpt2 && !pre_) return pre_error_;
-    std::vector<int32_t> out;
-    if (add_bos && bos_ >= 0) out.push_back(bos_);
-    // Split around control-token texts. SentencePiece prefixes the first
-    // plain segment; subsequent segments follow the Metaspace policy. Real
-    // whitespace after a control is retained even when no dummy is added.
+    const auto initial = initial_tokens(text, add_bos);
+    std::vector<int32_t> out(initial.begin(), initial.end());
+    if (kind_ == Kind::Unigram) {
+        encode_unigram(text, out);
+        return out;
+    }
+    // Split around control-token texts; plain segments go through SPM. As in
+    // llama.cpp, a segment gets the space prefix when it starts the text or
+    // follows a control token.
     bool prev_control = after_control;
     size_t pos = 0;
     while (pos < text.size()) {
@@ -398,6 +491,35 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
     for (const char c : text) {
         if (c == ' ') normalized += kSpmSpace;
         else normalized += c;
+    }
+
+    if (spm_greedy_) {
+        // SentencePiece freezes the longest USER_DEFINED match before BPE.
+        // A vocabulary whose ordinary pieces are all USER_DEFINED therefore
+        // uses greedy matching. The file states this mode because converters
+        // may discard those piece flags; merge ranks cannot establish it.
+        for (size_t pos = 0; pos < normalized.size();) {
+            int32_t node = 0, best = -1;
+            size_t after = pos;
+            for (size_t at = pos; at < normalized.size(); ++at) {
+                int32_t child = unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && unigram_trie_[static_cast<size_t>(child)].byte != static_cast<unsigned char>(normalized[at])) {
+                    child = unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) break;
+                node = child;
+                const int32_t id = unigram_trie_[static_cast<size_t>(node)].token;
+                if (id >= 0) { best = id; after = at + 1; }
+            }
+            if (best >= 0) {
+                out.push_back(best);
+                pos = after;
+            } else {
+                const size_t end = std::min(normalized.size(), pos + utf8_len(static_cast<unsigned char>(normalized[pos])));
+                while (pos < end) out.push_back(byte_token_[static_cast<unsigned char>(normalized[pos++])]);
+            }
+        }
+        return;
     }
 
     // SentencePiece BPE: start from UTF-8 characters and repeatedly merge the
@@ -486,6 +608,87 @@ void Tokenizer::encode_plain(std::string_view text, bool space_prefix, std::vect
     }
 }
 
+void Tokenizer::encode_unigram(std::string_view text, std::vector<int32_t>& out) const {
+    std::vector<uint32_t> chars;
+    std::vector<size_t> offsets;
+    for (size_t at = 0; at < text.size();) {
+        offsets.push_back(at);
+        chars.push_back(unicode::decode_utf8(text, at));
+    }
+    offsets.push_back(text.size());
+    const size_t n = chars.size();
+    std::vector<bool> boundary(n + 1, false);
+    boundary[0] = boundary[n] = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (chars[i] == 0xee00) boundary[i] = boundary[i + 1] = true;
+    }
+    // Match <|plamo:[^|\s]{0,64}|>. These boundaries also protect unknown
+    // special spellings from merging with their surrounding prose.
+    for (size_t i = 0; i < n; ++i) {
+        if (!text.substr(offsets[i]).starts_with("<|plamo:")) continue;
+        size_t end = i + 8;
+        while (end < n && end - (i + 8) < 64 && chars[end] != '|' && !unicode::is_whitespace(chars[end]) &&
+               !(chars[end] >= 0x1c && chars[end] <= 0x1f)) ++end;
+        if (end + 1 < n && chars[end] == '|' && chars[end + 1] == '>') {
+            boundary[i] = boundary[end + 2] = true;
+            i = end + 1;
+        }
+    }
+    // The plamo3 scheme uses the authors' hard splits around runs of two
+    // spaces or four repeated characters (Python '.' excludes a newline).
+    for (size_t i = 0; i < n;) {
+        size_t end = i + 1;
+        while (end < n && !boundary[end] && chars[end] == chars[i]) ++end;
+        if ((chars[i] == ' ' && end - i >= 2) || (chars[i] != '\n' && end - i >= 4)) {
+            boundary[i] = boundary[end] = true;
+        }
+        i = end;
+    }
+    std::vector<int64_t> costs(n + 1);
+    std::vector<size_t> next(n);
+    std::vector<int32_t> token(n, -1);
+    for (size_t start = 0; start < n;) {
+        if (chars[start] == 0xee00) { ++start; continue; }  // the reference's invisible boundary marker
+        size_t end = start + 1;
+        while (end < n && !boundary[end]) ++end;
+        costs[end] = 0;
+        for (size_t i = end; i-- > start;) {
+            costs[i] = costs[i + 1] + 10000000;  // one unknown Unicode character, then byte fallback
+            next[i] = i + 1;
+            int32_t node = 0;
+            size_t after = i + 1;
+            for (size_t pos = offsets[i]; pos < offsets[end]; ++pos) {
+                int32_t child = unigram_trie_[static_cast<size_t>(node)].child;
+                while (child >= 0 && unigram_trie_[static_cast<size_t>(child)].byte != static_cast<unsigned char>(text[pos])) {
+                    child = unigram_trie_[static_cast<size_t>(child)].next;
+                }
+                if (child < 0) break;
+                node = child;
+                if (pos + 1 != offsets[after]) continue;
+                const int32_t id = unigram_trie_[static_cast<size_t>(node)].token;
+                if (id >= 0 && unigram_scores_[static_cast<size_t>(id)] > -20000000) {
+                    const int64_t candidate = costs[after] - unigram_scores_[static_cast<size_t>(id)];
+                    // Equal costs choose the longest prefix, like the
+                    // reference's table sorted by descending piece length.
+                    if (candidate <= costs[i]) {
+                        costs[i] = candidate;
+                        token[i] = id;
+                        next[i] = after;
+                    }
+                }
+                ++after;
+            }
+        }
+        for (size_t i = start; i < end; i = next[i]) {
+            if (token[i] >= 0) out.push_back(token[i]);
+            else for (size_t pos = offsets[i]; pos < offsets[i + 1]; ++pos) {
+                out.push_back(byte_token_[static_cast<unsigned char>(text[pos])]);
+            }
+        }
+        start = end;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE (GPT-2 family: Qwen, Llama 3, DeepSeek, Hunyuan, Phi...)
 // ---------------------------------------------------------------------------
@@ -493,7 +696,10 @@ void Tokenizer::encode_bpe(std::string_view text, std::vector<int32_t>& out) con
     // Normalize, cut into pieces with the family's patterns, then merge each
     // piece on its own (core/pre_tokenizer.h).
     std::string normalized;
-    if (pre_->nfc() && !unicode::nfc_quick_check(text)) {
+    if (pre_->nfkc()) {
+        normalized = unicode::to_nfkc(text);
+        text = normalized;
+    } else if (pre_->nfc() && !unicode::nfc_quick_check(text)) {
         normalized = unicode::to_nfc(text);
         text = normalized;
     }

@@ -57,6 +57,9 @@ constexpr const char* kEachDigit = R"(\p{N})";
 // Mistral-Nemo and later Mistral models (Tekken): the GPT-4o words without the contractions, single digits.
 constexpr const char* kTekken =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Seed-OSS: single digits and punctuation split separately from following newlines; NFC first.
+constexpr const char* kSeedCoder =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1}| ?[^\s\p{L}\p{N}\r\n]+|\s*[\r\n]+|\s+(?!\S)|\s+)";
 // Youtu-LLM: Hangul, CJK punctuation, Bopomofo and Han/kana runs first, then the GPT-4o words with single
 // digits. The file writes the first class as \p{Hangul}; script properties are not part of core/regex.h, so it
 // is spelled out as the Hangul script's ranges (Unicode 16 Scripts.txt: the set Oniguruma matches, checked code
@@ -77,12 +80,13 @@ struct Row {
     std::initializer_list<StepSpec> steps;
     bool nfc;
     bool ignore_merges;
+    bool nfkc = false;
 };
 
-const std::array<Row, 18>& table() {
-    static const std::array<Row, 18> rows = {{
-        {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
-        {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
+const std::array<Row, 21>& table() {
+    static const std::array<Row, 21> rows = {{
+        {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
+        {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},
@@ -97,7 +101,7 @@ const std::array<Row, 18>& table() {
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
         {{"bloom"}, {{kBloom, true}}, false, false},
-        {{"starcoder", "refact"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
+        {{"starcoder"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"stablelm2"}, {{kQwen2, false}}, false, false},
         {{"olmo"}, {{kGpt2, true}}, true, false},
         // Falcon applies Digits and the three-ASCII-digit split after
@@ -106,6 +110,12 @@ const std::array<Row, 18>& table() {
                       {kGpt2, true}, {R"(\p{N}+)", true, true}, {R"([0-9]{3})", true, true}}, false, false},
         {{"command-r"}, {{kEachDigit, true}, {kGpt2, true}}, true, false},
         {{"dbrx"}, {{kDbrx, true}}, false, true},
+        // Some published exports label this pipeline dbrx too. Its source
+        // uses ordinary merges and a different split: an explicit tag avoids
+        // silently changing either tokenizer's IDs.
+        {{"llama-bpe-merges"}, {{kLlama3, false}}, false, false},
+        {{"seed-coder"}, {{kSeedCoder, true}}, true, false},
+        {{"gpt2-nfkc-digits"}, {{kEachDigit, true}, {kGpt2, true}}, false, false, true},
     }};
     return rows;
 }
@@ -152,6 +162,7 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.name_ = std::string(name);
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
+        pre.nfkc_ = row.nfkc;
         for (const StepSpec& step : row.steps) {
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());

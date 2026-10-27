@@ -276,6 +276,31 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
     specs.push_back({"llama-q8", {}, KvCacheType::Q8_0});
     {
         test::TinyModelSpec s;
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        specs.push_back({"smollm3-nope", s, KvCacheType::Q8_0});
+        s = {};
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        specs.push_back({"olmo2-post-only", s, KvCacheType::Q4_1});
+        s = {};
+        s.arch = "granite";
+        s.embedding_scale = 12.0f;
+        s.residual_scale = 0.22f;
+        s.logit_scale = 8.0f;
+        specs.push_back({"granite-mup", s, KvCacheType::F16});
+        s = {};
+        s.arch = "mistral3";
+        s.attn_temp_scale = 0.1f;
+        s.attn_temp_length = 8;
+        specs.push_back({"mistral3-temperature", s, KvCacheType::Q4_0});
+        s = test::nas_spec();
+        s.qk_norm = s.qk_norm_whole = true;
+        s.k_norm_outlier = 60.0f;
+        specs.push_back({"deci-block-geometry", s, KvCacheType::Q8_0});
+    }
+    {
+        test::TinyModelSpec s;
         s.arch = "qwen2";  // QKV bias, NeoX RoPE
         specs.push_back({"qwen2-f16", s, KvCacheType::F16});
     }
@@ -320,7 +345,7 @@ TEST_CASE("Classic models: sequences keep positions, parallel inputs, norms and 
 }
 
 TEST_CASE("Sequences together: windowed blocks and fused projections keep each sequence's bits") {
-    for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3", "exaone4"}) {
         test::TinyModelSpec s;
         s.arch = arch;
         s.sliding_window = 16;
@@ -334,6 +359,9 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
             s.post_norms = true;
             s.attn_softcap = 50.0f;
             s.final_softcap = 30.0f;
+        } else if (arch == "exaone4") {
+            s.n_layers = 4;
+            s.qk_norm = s.post_only_norms = true;
         } else {
             s.fused_qkv = true;
             s.fused_gate_up = true;

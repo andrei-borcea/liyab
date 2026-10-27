@@ -75,8 +75,9 @@ Status encode_segmented(const Tokenizer& tokenizer, std::string_view text, size_
     for (const PromptSegment& s : segments) {
         if (s.begin < at) continue;  // in the known text, or straddling it: plain text from `at` on
         LIYAB_RETURN_IF_ERROR(piece(text.substr(at, s.begin - at)));
-        if (tokens.empty() && bos && tokenizer.bos() >= 0 && !text.starts_with(tokenizer.token_text(tokenizer.bos()))) {
-            tokens.push_back(tokenizer.bos());  // BOS before the segment, not in it
+        if (tokens.empty()) {
+            const auto initial = tokenizer.initial_tokens(text, bos);
+            tokens.insert(tokens.end(), initial.begin(), initial.end());  // before the segment, not in it
         }
         const auto begin = static_cast<int32_t>(tokens.size());
         if (tokens.empty()) {

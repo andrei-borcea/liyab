@@ -1,4 +1,4 @@
-// Liyab — GGUF vocabulary: SentencePiece-BPE and byte-level BPE encoding,
+// Liyab — GGUF vocabulary: SentencePiece BPE/greedy, byte-level BPE and unigram encoding,
 // decoding (internal). Byte-level BPE pre-tokenizers come from a table keyed
 // by tokenizer.ggml.pre (core/pre_tokenizer.h).
 #ifndef LIYAB_CORE_TOKENIZER_H
@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -20,13 +21,18 @@ namespace liyab {
 
 class Tokenizer {
 public:
-    enum class Kind { Spm, Gpt2 };
+    enum class Kind { Spm, Gpt2, Unigram };
 
+    // Loads vocabulary metadata. Scores may be F32 or the converter's I32
+    // Tekken ranks; lengths and element types must match the vocabulary.
+    // For SentencePiece, tokenizer.ggml.pre=spm-greedy selects longest-prefix
+    // matching after space escaping; it requires all 256 byte fallback tokens.
     static Result<Tokenizer> load(const MmapLoader& model);
 
     // Text → token ids, as the model's Hugging Face tokenizer encodes them.
-    // `add_bos` adds no BOS to a text that starts with the BOS token's own
-    // text (a rendered chat template wrote it).
+    // `add_bos` adds the scheme's initial special tokens unless the text
+    // already spells them (a rendered chat template wrote them). Usually
+    // this is one BOS; chatglm-spm uses [gMASK], sop instead.
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
     // and byte-level BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
@@ -36,6 +42,10 @@ public:
     // the text between them is normalized (NFC for the Qwen families) and
     // pre-tokenized on its own.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view text, bool add_bos) const;
+    // Initial special tokens to insert before `text`, or an empty span when
+    // disabled/already written. Borrows this tokenizer; used by segmented
+    // encoding to keep automatic prefix tokens outside reusable segments.
+    [[nodiscard]] std::span<const int32_t> initial_tokens(std::string_view text, bool add_bos) const;
     // Encodes `text` that directly follows already-encoded text ending with
     // token `previous` (a prompt that continues the context): no BOS and, for
     // SentencePiece vocabularies, the space prefix only after a control token
@@ -98,9 +108,20 @@ private:
         int32_t id;    // the token the pair becomes
     };
     std::unordered_map<uint64_t, Merge> merges_;  // BPE: (left id << 32 | right id) -> merge
-    std::array<int32_t, 256> byte_token_{};       // BPE: each byte's token, -1 when the vocabulary lacks it
+    std::array<int32_t, 256> byte_token_{};       // BPE/unigram: each byte's token, -1 when absent
 
     void encode_plain(std::string_view text, bool space_prefix, std::vector<int32_t>& out) const;
+    // PLaMo3's integer-score unigram DP, with hard boundaries around its
+    // special-token spellings, consecutive spaces and repeated characters.
+    void encode_unigram(std::string_view text, std::vector<int32_t>& out) const;
+    struct UnigramNode {
+        int32_t child = -1, next = -1, token = -1;
+        unsigned char byte = 0;
+    };
+    // Both unigram segmentation and greedy SentencePiece use this byte trie;
+    // only unigram uses scores and dynamic programming.
+    std::vector<UnigramNode> unigram_trie_;
+    std::vector<int32_t> unigram_scores_;
     void encode_bpe(std::string_view text, std::vector<int32_t>& out) const;
     void bpe_word(std::string_view word, std::vector<int32_t>& out) const;
     int32_t bos_ = -1;
@@ -111,6 +132,9 @@ private:
     bool spm_prefix_after_control_ = true;
     SpmNormalizer spm_normalizer_;
     bool spm_byte_fallback_ = false;
+    bool spm_greedy_ = false;
+    std::vector<int32_t> initial_tokens_;
+    std::string initial_text_;  // their literal spelling, when all are special
 };
 
 }  // namespace liyab

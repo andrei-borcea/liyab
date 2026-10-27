@@ -107,11 +107,12 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `smollm3`, `plamo3`, `olmo2`, `exaone4`, `deci`, `minicpm`, `internlm2`, `gemma`, `granite`, `mistral3`, `exaone` | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Additional architecture coverage on tiny checkpoints: `seed_oss`, `glm4`; the new `deci` paths also use tiny checkpoints | ✅ F32 conformance, tokenizer IDs and template fixtures; no full-weight checkpoint measured for these families |
 | Classic transformer parts: LayerNorm, optional projection biases, ungated GELU/ReLU²/xIELU FFNs, parallel residuals, learned positions, ALiBi, Q/K/V clamping and output scaling | Implemented on CPU; family conformance is tracked in [model descriptions](docs/model-descriptions.md#classic-transformer-parts) |
 | Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
-| Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
+| Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
@@ -137,6 +138,154 @@ These rules decide what goes into the code:
 | Local API for other apps on the device: OpenAI, Anthropic Messages, gRPC; loopback only, token-protected, off by default; tools and JSON answers by constrained decoding | ✅ text (no images) |
 | Voice, actions (alarms, events, replies), local memory/RAG | 🔜 [Roadmap](#roadmap) |
 | Experimental: early exit, head pruning, EGLS, 2:4 sparsity, JIT unpacker, persistent KV prefix files, io_uring | 🧪 `LIYAB_ENABLE_EXPERIMENTAL` |
+
+SmolLM3 (`smaug-bpe`) uses Llama 3's split and whole-piece lookup; OLMo 2/3 (`dbrx`) uses that split with ordinary
+merge ranks. Granite (`refact`) and EXAONE 4 (`exaone4`) use GPT-2's ByteLevel rule. Seed-OSS (`seed-coder`)
+normalizes NFC and splits punctuation separately from following newlines. These tokenizers are checked against
+their Hugging Face token IDs on prose, edge cases and chat text. SmolLM3's own chat template is pinned in the
+template fixture, with 14 byte-identical reference renders.
+GLM-4's `glm4` pre-tokenizer uses the Llama-3 split and whole-piece vocabulary lookup without normalization.
+The tokenizer also reads the integer scores the converter writes for Tekken. The template fixture includes
+GLM-4, Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS; scalar dictionary keys retain their Python types,
+including Seed-OSS's integer thinking-budget lookup. The reference tool disables the unused generation cache
+for its single teacher-forced pass.
+For old model classes with nonpersistent rotary buffers, `conform_reference.py --state-dict` constructs the local
+model on CPU and loads its safetensors directly, checking every parameter (including tied weights). Reference
+tracing can observe older models' native PyTorch SDPA calls when they predate transformers' attention interface.
+`describe_model.py --gate --reference-state-dict` uses that loader for a local checkpoint's conformance gate.
+Tiny-checkpoint JSON overrides pass through the configuration constructor, preserving nested block descriptions.
+The description tool measures scalar offsets in RMSNorm weights and verifies that conversion folds them into
+the stored weights. Native SDPA traces check causal/window masks and report additional score biases as unknown.
+`chat_template_reference.py --trust-remote-code` can record templates from trusted official custom tokenizers.
+The `chatglm-spm` tokenizer scheme adds its `[gMASK], sop` prefix when initial special tokens are requested,
+recognizes a prefix already written by a chat template, and keeps automatic prefix tokens outside reusable segments.
+Template fixtures also cover ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder (14 cases each).
+The `plamo3` tokenizer uses integer-score unigram segmentation with byte fallback, preserving raw spaces and
+Unicode. It keeps the authors' boundaries around special spellings, repeated characters and consecutive spaces.
+Norm vectors accept the converter's bare names as well as names ending in `.weight`, including PLaMo3's post norms.
+PLaMo3's two-block tiny case (local/global attention, an eight-token window) gives mean KL 0.00000 and 99.61% top-1.
+The real 610m-fin-instruct F16 checkpoint passes the gate at mean KL 0.00000 and 100% top-1. The eight-block tiny
+case gives 98.83% top-1 with F16 KV, below the tiny threshold.
+Reference tools offer `--slow-tokenizer` when a new library's fast conversion changes the authors' SentencePiece
+segmentation; `describe_model.py --reference-slow-tokenizer` applies that choice consistently throughout its gate.
+Reference tracing also observes legacy eager attention's paired matrix products, accepting their scale and mask
+only after recomputing the full softmax probabilities from the recorded queries and keys.
+Packed GQA projections are matched to their observed per-group Q/K/V rows; the file may split those projections.
+InternLM2's tiny checkpoint matches all three tokenizer texts with the original slow implementation and gives
+mean KL 0.00000 and 100% top-1. The description tool reports that dynamic RoPE growth beyond the original
+context is not implemented. For multimodal checkpoints such as Ministral 3, the reference tool selects
+transformers' image/text model class and runs the same text-only prompt, without images or added image tokens.
+InternLM2 and Ministral 3 each have 14 template fixtures. An explicit template file is rendered through
+transformers' Jinja renderer, including for tokenizers whose own chat formatter does not use Jinja.
+Reference tracing shortens a uniform configured attention window so its boundary occurs within the probe,
+verifies the actual mask there and reports the original configured size. Full conformance uses the original size.
+For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
+count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
+Both residual branches must be present and verified before this correction is applied.
+`gpt2-nfkc-digits` normalizes Unicode 9 NFKC, isolates every numeric character and then applies GPT-2 ByteLevel.
+It uses the existing canonical ordering/composition and additive Unicode 9 compatibility tables; existing NFC
+tables are unchanged. A converter that labels this source pipeline as plain ByteLevel needs a metadata-corrected
+copy. The description tool verifies the source JSON pipeline and refuses incompatible or unverified uses.
+Normalization and tokenization run on the CPU for every backend.
+Modern per-block geometry, scalar/rotation metadata, NoPE, post-only and whole-projection norm plans, and
+corrected `spm-greedy` / `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts,
+key-scale/latent-form calibration and KV-store keys. Equal-sized metadata or tokenizer changes beyond the first MiB therefore invalidate incompatible contexts
+and derived calibrations. Legacy plans without these features retain their prior identities and state compatibility.
+If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
+reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
+configuration and chat template are retained; a class that discards the supplied pipeline is refused.
+EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after correcting the converter's
+`tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
+and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
+its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
+its existing plain ByteLevel rule. The full corrected-file result is recorded below.
+The explicit original slow-tokenizer path is unchanged.
+`python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
+
+If a legacy reference omits its input-embedding accessor, the trace can use a unique embedding lookup observed
+on the actual token IDs before the first block. Ambiguous lookups remain unknown; the measured embedding scale
+must still explain the entire input to that block.
+The same rule applies to a missing output accessor: one observed linear projection after the blocks must have
+the logits' shape, and its input and full output must pass the norm and logit-transform checks.
+Gate logs escape invalid UTF-8 in byte-token mismatch diagnostics and preserve the failed check's exit status.
+SentencePiece files can select `tokenizer.ggml.pre=spm-greedy`: identity text normalization, escaped spaces and
+longest-prefix matching with byte fallback. This represents a source vocabulary whose ordinary pieces are all
+`USER_DEFINED`; the description tool verifies those flags through `sentencepiece` and `protobuf` before accepting
+the mode. The converter can discard the flags and incorrectly declare ordinary BPE; its space-prefix declaration
+can also disagree with the source model. `tools/gguf_set_keys.py` can correct those metadata keys in a copy.
+InternLM3's F32 tiny checkpoint passes with `spm-greedy` and `add_space_prefix=false`: mean KL 0.00000,
+top-1 100%, all three tokenizer texts identical (606/1,007/205 IDs), and 14 template renders identical.
+The original slow tokenizer is the reference. All 21 tensor payloads remain byte-identical after the metadata
+correction. This check stays within the declared 32,768-token context; dynamic-NTK extrapolation remains unsupported.
+DeciLM's three-block F32 tiny checkpoint (2/1/4 KV heads) passes the strict gate with mean/max KL 0.00000,
+top-1 100%, three tokenizer texts identical (629/1,032/279 IDs) and 14 template renders identical.
+For DeciLM-7B, b11819's `LlamaHfVocab` drops SentencePiece scores; a local converter override must use its native
+SentencePiece reader when `tokenizer.model` is present. All 30 tensor payloads are unchanged by that override.
+The separate eight-block Nemotron-NAS tiny case covers varied query heads, absent attention and FFN widths.
+The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (631/1049/248), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The legacy MiniCPM reference needs two local transformers 5 API adaptations: recognize its normalized default
+RoPE configuration as unscaled, and express its tied-weight declaration as a mapping. Its forward equations and
+checkpoint tensors are unchanged; the b11819 GGUF conversion is unmodified.
+The full F16 gate for `internlm/internlm2_5-1_8b-chat` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (575/989/190), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+This gate restores source EOS 2 and unknown token 0 in metadata, preserving the converter's chat terminator
+92542 as EOT. The original converter replaces EOS and omits unknown; all 219 tensor payloads are unchanged.
+
+The full F16 gate for `unsloth/gemma-1.1-2b-it` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (513/786/211), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (1 rendered, 13 correctly refused).
+The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (625/971/247), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (517/879/235), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+This corrected-file gate preserves the official authored template: b11819 otherwise selects a Devstral community fallback. The metadata-only correction leaves all 236 tensor descriptors and the entire tensor data section unchanged. Future conversion uses the native tekken vocabulary reader and the generic author-file precedence shim.
+The tokenizer exposes no Jinja template attribute; its shipped `chat_template.jinja` is rendered explicitly through transformers, matching the actual GGUF rendered bytes. Comments/code whitespace may differ; the Jinja AST is equivalent. This does not assert equivalence to its separate native chat formatter.
+The `ministral3` fixture tests the full official author template; `ministral3-real` tests its compact equivalent stored in the corrected GGUF.
+The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (615/917/243), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The b11819 tokenizer metadata needs the source-pipeline correction `gpt2-nfkc-digits`; this is a corrected-file gate, not a plug-and-play unmodified export. The metadata-only converter shim retains all tensor conversion code.
+Under transformers 5, the validation converter explicitly permits the pinned official configuration class during tokenizer loading; the generic configuration fallback cannot initialize its legacy RoPE fields. The source configuration and tensor conversion code are unchanged.
+Its 80-channel heads use the existing F16 KV fallback for Q8_0, Q4_0 and Q4_1 requests; all three produce the same full conformance result as the F16 request.
+GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
+in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
+
+The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
+Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
+file's whole-dimension magnitude convention, and queries can take a position-dependent attention temperature.
+These operations run on the CPU on every backend; matrix projections retain the existing Metal/Vulkan routing.
+Quantized-key calibration bounds query ranges with the largest attention temperature in the covered context.
+Synthetic tests cover prefill, decode, rollback, sequences and KV reuse. The description tool checks these facts
+against the reference and file; candidate registry rows alone do not establish model conformance.
+A five-block Nemotron-NAS tiny case exercises two GQA ratios, a linear mixer, absent attention, a fully empty
+block and different FFN widths. Its exact registry row passes the strict F32 gate: mean/max KL 0.00000,
+top-1 99.80%, 499 conformance IDs and three tokenizer texts identical (498/797/202). The 14 template
+cases match the existing fixture. Regeneration from the original configuration produces identical tensor bytes;
+the official forward source is unchanged. The existing NAS golden case covers these numerical paths.
+A linear mixer is established by recomputing its entire observed output from a unique linear projection,
+including any bias. This also covers direct child `forward` calls that bypass module hooks. Ambiguous projections,
+additional transformations and shape changes remain unknown; both one-branch and two-branch blocks use this rule.
+`tests/test_reference_trace.py` checks these positive and negative cases with PyTorch and no model weights.
+Per-block head counts and FFN widths can be scalar metadata or integer arrays. Zero KV heads select a single
+linear mixer projection (positive query heads) or no mixer (zero query heads); a zero FFN width omits that branch.
+Attention uses each block's own grouping. The existing KV image layout reserves the maximum KV-head count for
+each attention block and zero-pads unused heads, preserving the same sequence, rollback and saved-context paths.
+Latent attention retains uniform head geometry; files that vary its head counts are refused with a precise reason.
+Saved states of models with per-block geometry or explicit modern scalars also check the model-file fingerprint,
+so equal dimensions cannot mix contexts computed with different layouts or scales. Empty blocks create no streaming I/O items.
+Per-block geometry is checked against an independent float reference on CPU and available GPU backends. Streamed
+block projections use the existing CPU route because their reused slot addresses cannot identify persistent GPU weights.
+
+The modern block changes pass all 14 host suites on native ARM64, Rosetta AVX2 and Rosetta scalar, plus the
+experimental Android arm64 build. All 111 earlier golden pins remain unchanged; 12 new cases are pinned on
+all three platforms. The three-model CPU/Metal comparison passes the symmetric ±3% bound after a separately
+recorded AC confirmation of its one affected configuration. The original timing outlier and the accepted
+[before/after measurements](docs/model-descriptions.md#modern-block-regression-check) are both retained.
 
 ---
 
@@ -386,6 +535,20 @@ What the port does differently from the POSIX platforms:
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already, for Gemma 2 too;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE;
+  * `smollm3` (SmolLM3-3B): every fourth block leaves Q/K unrotated; its `smaug-bpe` tokenizer and own chat
+    template match transformers. The real F16 checkpoint passes `describe_model.py --gate` with identical
+    498 prompt IDs, mean KL 0.00000 and 100% top-1 agreement; projections use the existing CPU/Metal/Vulkan routes;
+  * `plamo3` (PLaMo-3-610m-fin-instruct): fused QKV and gate/up projections, Q/K and sandwich RMSNorms,
+    seven local RoPE/windowed blocks per global YaRN block, raw unigram tokenizer. The real F16 checkpoint
+    passes the gate with identical 512 prompt IDs, mean KL 0.00000 and 100% top-1. Norms, RoPE and tokenization
+    run on the CPU; projections retain CPU/Metal/Vulkan routing;
+  * `olmo2` (OLMo-2-0425-1B): RMSNorm after each residual branch, Q/K RMSNorm over the entire projection,
+    and the `dbrx` pre-tokenizer. Its real F16 checkpoint passes the gate with identical 512 prompt IDs,
+    mean KL 0.00000, maximum 0.00003 and 100% top-1. Norms run on the CPU; projections retain CPU/Metal/Vulkan routing;
+  * `exaone4` (EXAONE-4.0-1.2B): post-only branch norms, per-head Q/K RMSNorm and Llama 3 rotary frequency factors.
+    Its real F16 checkpoint passes the gate with identical 512 prompt IDs, mean KL 0.00001, maximum 0.00018
+    and 100% top-1. A separate four-block tiny case checks windowed rotary/global unrotated attention at a 64-token
+    window (99.80% top-1). Norms and rotation run on the CPU; projections retain CPU/Metal/Vulkan routing;
   * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
     proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
     The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
@@ -480,7 +643,8 @@ What the port does differently from the POSIX platforms:
     the same order. That holds on the file's layout or repacked, for one activation row or several. A row's result
     is then the same bits whichever kernel computed it, so logits depend neither on the batch size nor on the layout
     (tested for every format).
-* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3) and byte-level BPE (`gpt2`).
+* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3), byte-level BPE (`gpt2`) and raw unigram
+  (`plamo3`: integer-cost segmentation, longest-prefix ties and byte fallback).
   * **Pre-tokenizers are data.** Before merging, a byte-level BPE tokenizer cuts the text into pieces with regular
     expressions. Each scheme is one row of a table keyed by the GGUF's `tokenizer.ggml.pre`
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
@@ -493,10 +657,13 @@ What the port does differently from the POSIX platforms:
     regex engine has categories, not scripts). A GGUF without the key uses `default`. Any other value is an error
     naming it and the supported list; the model still loads and runs on token ids, with a quantized KV cache too
     (its keys then unscaled, see [key scaling](#architecture)).
+    Additional rows are `smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`, `glm4` and
+    `gpt2-nfkc-digits` (Unicode 9 NFKC, individual numbers, then GPT-2 ByteLevel). The latter requires the
+    corrected source-pipeline tag described in Correctness; EXAONE 4 keeps plain ByteLevel.
   * **Liyab's own regex engine** (`src/core/regex.cpp`) runs the patterns: Unicode general categories (`\p{L}`,
     `\p{Lu}`, `\P{N}`…), classes, alternation, greedy, lazy and possessive quantifiers, case-insensitive groups,
     lookahead and atomic groups. It decodes the text once into code points with a category key each, so a class
-    test is a bit lookup. The Unicode data (categories, NFC tables) is generated into `src/core/unicode_tables.inc`
+    test is a bit lookup. The Unicode data (categories, NFC and NFKC tables) is generated into `src/core/unicode_tables.inc`
     by `tools/gen_unicode_tables.py`.
   * **Special tokens** written in the text map to their ids, found in one pass over the text. Those of the Phi-3
     family (Phi-3/3.5, Phi-4-mini) swallow the white space after them, as their Hugging Face tokenizer does. A
@@ -534,6 +701,8 @@ What the port does differently from the POSIX platforms:
     Hunyuan-0.5B, Hunyuan-A13B and DeepSeek V3.1: 165 renders identical, and the 3 conversations transformers
     refuses refused too (`tests/data/chat_templates.json`, written by `tools/chat_template_reference.py`). The
     templates the GGUFs themselves carry gave the same 168 results.
+    Clock-reading fixtures pin a UTC instant and supply it to both renderers, so their expected date is reproducible.
+    The C++ fixture helper uses the platform's thread-safe UTC conversion (`gmtime_s` on Windows).
 * **Prompts are used as given** by `generate()` and `prefill()`: render them with the template first (the app does).
 
 ---
@@ -2336,7 +2505,7 @@ interpreter: `describe_model_registry`.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
+| `test_text` | The regex engine, the pre-tokenizer table and NFC/NFKC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting; NFKC matches its Unicode 9 normalizer); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts and in every `latent_form`; its expanded form vs the absorbed form and the reference, the same bits for every split into passes and thread count over several tiles of expanded rows (F16, Q8_0 with key scaling, a sliding window with sinks), no further from an F16 cache than the absorbed form, absorbed decoding after an expanded prefill; the automatic form's work counts and threshold, calibrated once and then the same forms and bits while other threads load every core, the ratio kept in `cache_dir` (engines give the same sampled reply, models given the kept ratio the same logits bit for bit; damaged files measured again; in memory without a `cache_dir`); hybrid snapshots, also restored from a saved context; windowed blocks keeping only their window (Gemma 2 and 3, Phi-3, F16 and Q8_0) giving the logits of blocks keeping every position bit for bit over long prompts, decoding, rollback inside the margin and back to a snapshot, refused beyond it, in less memory; their saved contexts restored exactly, older files converted and other layouts refused; their conversations brought back by the prefix cache (replaced, edited back to a snapshot, saved as kept, from storage in a later engine) and their live context reused back to a snapshot; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage (persisting for a later engine within its cap, a shared system prompt kept once and restored for a new conversation, a chat after a long system prompt set aside and restored while an edited draft is not, damaged files removed with the output unchanged, one engine per directory); key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); tree verification (the continuation tree likeliest first, siblings' probabilities within their parent's, calibrated from tree outcomes; a tree pass giving every branch a linear pass's bits and keep_path() that pass's context, rollbacks into it included, on dense, windowed, latent, hybrid and MoE models with Q8_0 and F16 caches; trees verified by the decoder giving plain decoding's tokens, greedy and seeded, and keeping a branch other than the likeliest); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier, each in the absorbed and the expanded form, the expanded one also with a sliding window and sinks) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
@@ -2694,7 +2863,7 @@ Implemented features are described above. These are next, in order:
   expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
   supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
   its keys unscaled (the key scales are measured on a text it cannot encode).
-  `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see
+  `tools/describe_model.py` lists what each model lacks; for Granite, see
   [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
 * **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long
   prompt's attention differently (each repeats its own bits run after run). A pass's form also follows its
@@ -2829,3 +2998,8 @@ work, [CITATION.cff](CITATION.cff) has the citation.
 
 Apache 2.0 (see [`LICENSE`](LICENSE)). The low-bit NEON dot kernels are adapted from llama.cpp / ggml (MIT); see
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Tokenizer export limitations, including the `dbrx` label collision between two
+source pipelines, are recorded in [model descriptions](docs/model-descriptions.md#tokenizer-export-label-collision).
+Engine architecture coverage does not imply that every published GGUF has correct
+chat or tokenizer metadata.

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -94,6 +95,11 @@ public:
         hd_ = d_ / n_head_;
     }
 
+    Reference(const MmapLoader& f, const test::TinyModelSpec& spec)
+        : f_(f), d_(spec.n_embd), n_head_(spec.n_head), n_kv_(spec.n_head_kv), n_layers_(spec.n_layers),
+          hd_(spec.n_embd / spec.n_head), block_heads_(spec.block_heads), block_kv_(spec.block_kv_heads),
+          block_ff_(spec.block_ff) {}
+
     std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens, int window = 0, int sinks = 0) const {
         const int n = static_cast<int>(tokens.size());
         std::vector<std::vector<float>> x(static_cast<size_t>(n));
@@ -104,6 +110,20 @@ public:
         }
         for (int l = 0; l < n_layers_; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
+            const int heads = block_heads_.empty() ? n_head_ : block_heads_[static_cast<size_t>(l)];
+            const int kv_heads = block_kv_.empty() ? n_kv_ : block_kv_[static_cast<size_t>(l)];
+            const bool has_ffn = block_ff_.empty() || block_ff_[static_cast<size_t>(l)] > 0;
+            if (kv_heads == 0) {
+                if (heads > 0) {
+                    const auto wo = weights(p + "attn_output.weight");
+                    for (auto& row : x) {
+                        const auto branch = matvec(wo, norm(row, weights(p + "attn_norm.weight")));
+                        for (int i = 0; i < d_; ++i) row[i] += branch[i];
+                    }
+                }
+                if (has_ffn) ffn(x, p);
+                continue;
+            }
             const auto wq = weights(p + "attn_q.weight"), wk = weights(p + "attn_k.weight");
             const auto wv = weights(p + "attn_v.weight"), wo = weights(p + "attn_output.weight");
             std::vector<std::vector<float>> q(n), k(n), v(n);
@@ -116,9 +136,9 @@ public:
                 rope(k[t], t);
             }
             for (int t = 0; t < n; ++t) {
-                std::vector<float> att(static_cast<size_t>(d_), 0.0f);
-                for (int h = 0; h < n_head_; ++h) {
-                    const int g = h / (n_head_ / n_kv_);
+                std::vector<float> att(static_cast<size_t>(heads * hd_), 0.0f);
+                for (int h = 0; h < heads; ++h) {
+                    const int g = h / (heads / kv_heads);
                     const int first = window > 0 ? std::max(0, t - window + 1) : 0;
                     const int sink_end = std::min(sinks, first);  // attention sinks before the window
                     std::vector<int> visible;
@@ -143,16 +163,7 @@ public:
                 const auto o = matvec(wo, att);
                 for (int i = 0; i < d_; ++i) x[t][i] += o[i];
             }
-            const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
-            const auto wd = weights(p + "ffn_down.weight");
-            for (int t = 0; t < n; ++t) {
-                const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
-                auto g = matvec(wg, h);
-                const auto u = matvec(wu, h);
-                for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
-                const auto down = matvec(wd, g);
-                for (int i = 0; i < d_; ++i) x[t][i] += down[i];
-            }
+            if (has_ffn) ffn(x, p);
         }
         const auto out_w = f_.tensor("output.weight") ? weights("output.weight") : emb;
         std::vector<std::vector<float>> result;
@@ -164,6 +175,18 @@ public:
     }
 
 private:
+    void ffn(std::vector<std::vector<float>>& x, const std::string& p) const {
+        const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
+        const auto wd = weights(p + "ffn_down.weight");
+        for (size_t t = 0; t < x.size(); ++t) {
+            const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
+            auto g = matvec(wg, h);
+            const auto u = matvec(wu, h);
+            for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+            const auto down = matvec(wd, g);
+            for (int i = 0; i < d_; ++i) x[t][i] += down[i];
+        }
+    }
     std::vector<float> weights(const std::string& name) const {
         const TensorView* t = f_.tensor(name);
         std::vector<float> out(static_cast<size_t>(t->elements()));
@@ -204,6 +227,7 @@ private:
 
     const MmapLoader& f_;
     int d_, n_head_, n_kv_, n_layers_, hd_;
+    std::vector<int32_t> block_heads_, block_kv_, block_ff_;
 };
 
 // Independent float reference of a deepseek2 model with multi-head latent
@@ -1490,6 +1514,35 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
 }
 
+TEST_CASE("describe_model rejects invalid modern scales, rotation patterns and norm placement") {
+    {
+        test::TinyModelSpec s;
+        s.arch = "exaone4";
+        s.post_only_norms = true;
+        s.sliding_window = 8;
+        s.swa_layers = {false, false}; // a file may contain only global blocks beside its window setting
+        auto file = MmapLoader::open(model_path("modern_all_global_nope", s));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(described.has_value());
+        for (const BlockPlan& b : described->blocks) CHECK(!b.rope && !b.windowed);
+    }
+    for (int variant = 0; variant < 6; ++variant) {
+        test::TinyModelSpec s;
+        if (variant == 0) s.rope_layers = {true};  // fewer flags than blocks
+        if (variant == 1) s.embedding_scale = std::numeric_limits<float>::infinity();
+        if (variant == 2) s.residual_scale = -1.0f;
+        if (variant == 3) { s.arch = "granite"; s.logit_scale = std::numeric_limits<float>::denorm_min(); }
+        if (variant == 4) { s.attn_temp_scale = 0.1f; s.attn_temp_length = -1; }
+        if (variant == 5) s.post_only_norms = true; // llama has no post-norm contract
+        auto file = MmapLoader::open(model_path("invalid_modern_" + std::to_string(variant), s));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        CHECK(!described.has_value());
+        if (!described) CHECK(described.status().code() == ErrorCode::InvalidModel);
+    }
+}
+
 TEST_CASE("describe_model: windowed blocks from the architecture or the file, fused projections, LongRoPE") {
     auto describe = [](const std::string& name, const test::TinyModelSpec& spec) -> ModelConfig {
         auto file = MmapLoader::open(model_path(name, spec));
@@ -1755,6 +1808,17 @@ test::TinyModelSpec latent_spec(int32_t q_rank) {
 }
 
 }  // namespace
+
+TEST_CASE("Per-block latent head counts are refused before the uniform latent path can run") {
+    test::TinyModelSpec spec = latent_spec(64);
+    spec.block_heads = {2, 4};
+    auto file = MmapLoader::open(model_path("latent_varying_heads", spec));
+    REQUIRE(file.has_value());
+    auto config = describe_model(**file);
+    REQUIRE(!config.has_value());
+    CHECK(config.status().code() == ErrorCode::Unsupported);
+    CHECK(config.status().message().find("per-block latent attention head counts") != std::string::npos);
+}
 
 // Latent attention attends with absorbed queries over the cached [k_pe |
 // latent] rows; the model was trained with per-head keys and values
@@ -2909,6 +2973,177 @@ TEST_CASE("Classic models: batching and rollback preserve every logit on every K
     }
 }
 
+TEST_CASE("Per-block geometry matches an independent float reference") {
+    test::TinyModelSpec spec = test::nas_spec();
+    spec.tokenizer_padding = (size_t{1} << 20) + 64;
+    spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto model = load_transformer(model_path("nas_float_reference", spec), options);
+    REQUIRE(model != nullptr);
+    CHECK(model->config().n_attn_layers == 3);
+    CHECK(model->config().blocks[3].mixer == MixerKind::None && model->config().blocks[3].ffn == FfnKind::None);
+    CHECK(model->config().blocks[4].mixer == MixerKind::Linear);
+    CHECK(model->config().blocks[2].n_ff == 192);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(logits.has_value());
+    const auto expected = Reference(model->file(), spec).logits(tokens);
+    const auto vocab = static_cast<size_t>(model->config().n_vocab);
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        const auto row = logits->subspan(t * vocab, vocab);
+        CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+        CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+    }
+    std::vector<float> padding(static_cast<size_t>(model->config().head_dim));
+    for (const int32_t slot : {1, 2}) {
+        quant::dequantize_row(model->kv_cache().dtype(), model->kv_cache().k_row(slot, 7, 1), padding.data(),
+                             model->config().head_dim);
+        for (const float v : padding) CHECK(v == 0.0f);
+    }
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        auto gpu = make();
+        if (!gpu) continue;
+        model->reset();
+        const Route gpu_route{gpu->get(), gpu->get(), cpu.get()};
+        auto accelerated = model->forward(tokens, Transformer::Logits::All, gpu_route, pool);
+        REQUIRE(accelerated.has_value());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            const auto row = accelerated->subspan(t * vocab, vocab);
+            CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+            CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+        }
+    }
+    // Swapping KV heads between equal-width query blocks preserves the file
+    // size and global maxima, but a saved context must still be refused.
+    std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE(model->write_state(saved).is_ok());
+    std::swap(spec.block_kv_heads[0], spec.block_kv_heads[1]);
+    auto other = load_transformer(model_path("nas_other_geometry", spec), options);
+    REQUIRE(other != nullptr);
+    CHECK(model->file().file_size() == other->file().file_size());
+    CHECK(model_fingerprint(model->file().file()) == model_fingerprint(other->file().file()));
+    CHECK(model->context_fingerprint() != other->context_fingerprint());
+    CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
+    CHECK(other->n_past() == 0);
+}
+
+TEST_CASE("Absent first blocks and stacks with no FFN load and run") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    for (const bool all : {false, true}) {
+        test::TinyModelSpec s = test::nas_spec();
+        s.block_heads[0] = s.block_kv_heads[0] = s.block_ff[0] = 0;
+        if (all) {
+            std::fill(s.block_heads.begin(), s.block_heads.end(), 0);
+            std::fill(s.block_kv_heads.begin(), s.block_kv_heads.end(), 0);
+            std::fill(s.block_ff.begin(), s.block_ff.end(), 0);
+        }
+        auto model = load_transformer(model_path(all ? "nas_all_absent" : "nas_leading_absent", s));
+        REQUIRE(model != nullptr);
+        const std::vector<int32_t> tokens = {1, 270, 300};
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(logits.has_value());
+        for (const float value : *logits) CHECK(std::isfinite(value));
+        CHECK(model->n_past() == 3);
+    }
+}
+
+TEST_CASE("Saved states and calibration reject residual-scale changes beyond the first MiB") {
+    test::TinyModelSpec s;
+    s.arch = "granite";
+    s.tokenizer_padding = (size_t{1} << 20) + 64;
+    s.residual_scale = 0.22f;
+    const std::string& first_path = model_path("modern_state_scale_a", s);
+    auto first = load_transformer(first_path);
+    s.residual_scale = 0.44f;
+    const std::string& second_path = model_path("modern_state_scale_b", s);
+    auto second = load_transformer(second_path);
+    REQUIRE(first && second);
+    CHECK(first->file().file_size() == second->file().file_size());
+    CHECK(model_fingerprint(first->file().file()) == model_fingerprint(second->file().file()));
+    CHECK(first->context_fingerprint() != second->context_fingerprint());
+    CHECK(first->file_fingerprint() != second->file_fingerprint());
+    for (const std::string arch : {"llama", "qwen35", "gemma2"}) {
+        test::TinyModelSpec legacy;
+        legacy.arch = arch;
+        auto model = load_transformer(model_path("legacy_header_identity_" + arch, legacy));
+        REQUIRE(model != nullptr);
+        CHECK(model->file_fingerprint() == model_fingerprint(model->file().file()));
+    }
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    REQUIRE(first->forward(tokens, Transformer::Logits::Last, route, pool).has_value());
+    std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE(first->write_state(saved).is_ok());
+    CHECK(second->read_state(saved).code() == ErrorCode::InvalidArgument);
+    CHECK(second->n_past() == 0);
+    const std::string dir = temp_path("modern_scale_keys");
+    std::filesystem::remove_all(dir);
+    EngineConfig config = engine_config(first_path);
+    config.backend = BackendKind::Cpu;
+    config.kv_cache_type = KvCacheType::Q8_0;
+    config.cache_dir = dir;
+    for (const std::string* path : {&first_path, &second_path, &first_path}) {
+        config.model_path = *path;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+    }
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().starts_with("keys-")) ++files;
+    }
+    CHECK(files == 2);  // distinct models, then a repeat that reuses its own calibration
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Corrected tokenizer modes isolate saved contexts and KV keys beyond the first MiB") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    for (const bool hybrid : {false, true}) {
+        for (const std::string mode : {"spm-greedy", "gpt2-nfkc-digits", "llama-bpe-merges"}) {
+            const bool greedy = mode == "spm-greedy";
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                test::TinyModelSpec spec;
+                spec.arch = hybrid ? "qwen35" : "llama";
+                spec.tokenizer_padding = (size_t{1} << 20) + 64;
+                if (greedy) spec.spm_pre = "spm-greedy";
+                else spec.bpe_pre = mode;
+                spec.space_prefix = 0;
+                TransformerOptions options;
+                options.kv_type = kv;
+                const std::string label = std::string(hybrid ? "hybrid" : "attn") + mode +
+                                          std::to_string(static_cast<int>(kv));
+                auto first = load_transformer(model_path("tokenizer_state_a_" + label, spec), options);
+                auto same = load_transformer(model_path("tokenizer_state_same_" + label, spec), options);
+                spec.space_prefix = 1;
+                auto other = load_transformer(model_path("tokenizer_state_b_" + label, spec), options);
+                REQUIRE(first && same && other);
+                // The standard first-MiB fingerprint cannot see the changed flag.
+                CHECK(first->file().file_size() == other->file().file_size());
+                CHECK(model_fingerprint(first->file().file()) == model_fingerprint(other->file().file()));
+                CHECK(first->context_fingerprint() != other->context_fingerprint());
+                REQUIRE(first->forward(tokens, Transformer::Logits::Last, route, pool).has_value());
+                std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+                REQUIRE(first->write_state(saved).is_ok());
+                REQUIRE(same->read_state(saved).is_ok());
+                CHECK(same->n_past() == 3);
+                saved.clear(); saved.seekg(0);
+                CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
+                CHECK(other->n_past() == 0);
+            }
+        }
+    }
+}
+
 TEST_CASE("Gated ReLU squared: fused and split biased projections agree across SIMD tails") {
     auto spec = test::classic_model_spec("arcee");
     spec.ungated = false;
@@ -2932,6 +3167,55 @@ TEST_CASE("Gated ReLU squared: fused and split biased projections agree across S
             auto b = fused->forward(ids, Transformer::Logits::All, route, pool);
             REQUIRE(a && b && a->size() == b->size());
             CHECK(std::memcmp(a->data(), b->data(), a->size_bytes()) == 0);
+        }
+    }
+}
+
+TEST_CASE("Modern block plans preserve batching and rollback for every KV format") {
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99, 36, 64};
+    for (const std::string arch : {"smollm3", "olmo2", "exaone4", "granite", "minicpm", "mistral3", "deci"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (arch == "deci") {
+            spec = test::nas_spec();
+            spec.qk_norm = spec.qk_norm_whole = true;
+        } else if (arch == "olmo2" || arch == "exaone4") {
+            spec.qk_norm = spec.post_only_norms = true;
+            spec.qk_norm_whole = arch == "olmo2";
+            if (arch == "exaone4") spec.sliding_window = 8;
+        } else if (arch == "granite" || arch == "minicpm") {
+            spec.embedding_scale = 12.0f;
+            spec.residual_scale = 0.22f;
+            spec.logit_scale = 8.0f;
+        } else if (arch == "mistral3") {
+            spec.attn_temp_length = 4;
+            spec.attn_temp_scale = 0.1f;
+        }
+        const std::string& path = model_path("modern_" + arch, spec);
+        for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = type;
+            auto batched = load_transformer(path, options);
+            auto stepwise = load_transformer(path, options);
+            REQUIRE(batched && stepwise);
+            auto all = batched->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(all.has_value());
+            const std::vector<float> expected(all->begin(), all->end());
+            const auto vocab = static_cast<size_t>(batched->config().n_vocab);
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                auto one = stepwise->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(one.has_value());
+                CHECK(max_abs_diff(*one, std::vector<float>(expected.begin() + t * vocab,
+                                                           expected.begin() + (t + 1) * vocab)) == 0.0);
+            }
+            REQUIRE(batched->truncate(6).is_ok());
+            auto replay = batched->forward(std::span(tokens).subspan(6), Transformer::Logits::All, route, pool);
+            REQUIRE(replay.has_value());
+            CHECK(max_abs_diff(*replay, std::vector<float>(expected.begin() + 6 * vocab, expected.end())) == 0.0);
         }
     }
 }
@@ -4557,8 +4841,14 @@ TEST_CASE("Engine routes to CPU when forced and matches the default route") {
 
 TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place mmap reads") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
+    for (const std::string& path : {mixed_model(), model_path("streamed_nas", test::nas_spec())}) {
+    EngineConfig baseline = engine_config(path);
+    baseline.backend = BackendKind::Cpu;
+    auto reference = Engine::create(baseline);
+    REQUIRE(reference.has_value());
+    const auto expected = run(*reference.value(), prompt, greedy(20));
     for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal, BackendKind::Vulkan}) {
-        EngineConfig config = engine_config(mixed_model());
+        EngineConfig config = engine_config(path);
         config.backend = backend;
         auto in_place = Engine::create(config);
         if (!in_place) continue;  // Metal unavailable on this platform
@@ -4567,9 +4857,13 @@ TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place 
         REQUIRE(streamed.has_value());
         CHECK(streamed.value()->describe().find("triple-buffered") != std::string::npos);
         GenerationStats stats;
-        const auto expected = run(*in_place.value(), prompt, greedy(20));
+        // Streamed slots must use CPU projections: their addresses are
+        // reused and cannot key persistent GPU weight copies. Quantized GPU
+        // projections do not quantize activations as the CPU does, so an
+        // in-place GPU generation is not this path's numeric reference.
         CHECK(run(*streamed.value(), prompt, greedy(20), &stats) == expected);
         CHECK(!expected.empty());
+    }
     }
 }
 
@@ -5486,6 +5780,17 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         s.identical_experts = false;
         cases.push_back({"tree_moe", s});
     }
+    cases.push_back({"tree_nas", test::nas_spec()});
+    {
+        test::TinyModelSpec s;
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        cases.push_back({"tree_olmo2", s});
+        s = {};
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        cases.push_back({"tree_nope", s});
+    }
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
     const std::vector<std::vector<int32_t>> paths = {{0, 4, 8}, {0, 1, 2, 3}, {0}, {0, 1, 6, 7}, {0, 4, 5}};
@@ -5651,6 +5956,17 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
         s.n_expert_used = 2;
         s.identical_experts = false;
         cases.push_back({"tree_moe", s});
+    }
+    cases.push_back({"tree_nas", test::nas_spec()});
+    {
+        test::TinyModelSpec s;
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        cases.push_back({"tree_olmo2", s});
+        s = {};
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        cases.push_back({"tree_nope", s});
     }
     ThreadPool pool(3);
     auto cpu = make_cpu_backend(pool);

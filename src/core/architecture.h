@@ -85,7 +85,8 @@ struct ArchSpec {
     // Suffixes of the norms applied to the mixer's and the FFN's outputs
     // before their residual adds ("sandwich" norms: Gemma's
     // post_attention_norm and post_ffw_norm). Bound where a block has them;
-    // empty: the architecture has none.
+    // empty: the architecture has none. Both <suffix>.weight and a bare
+    // <suffix> vector are accepted (the published converter writes both).
     std::string_view post_mixer_norm = {};
     std::string_view post_ffn_norm = {};
     // Token embeddings are multiplied by sqrt(n_embd) before the first block.
@@ -144,6 +145,28 @@ struct ArchSpec {
     // ffn_norm as its shared input norm; two present tensors keep their own
     // roles (Falcon stores ln_attn as attn_norm_2 and ln_mlp as attn_norm).
     std::string_view attn_norm = "attn_norm";
+    // Blocks without positional rotation (NoPE: their queries and keys are
+    // not rotated), for files that do not list them in
+    // <arch>.attention.rope_pattern (one bool per block, true = rotated, which
+    // overrides both rules). nope_period N > 0: blocks N-1, 2N-1, ... (SmolLM3:
+    // every 4th). nope_global: when the file sets an attention window, the
+    // blocks attending globally (EXAONE 4: the windowed ones carry the
+    // positions, the global ones see every position unrotated).
+    int32_t nope_period = 0;
+    bool nope_global = false;
+    // Windowed blocks rotate with rope.freq_base but unscaled: no YaRN, linear
+    // scaling or frequency factors, which only the global blocks take (OLMo 3,
+    // whose converter writes the global blocks' YaRN).
+    bool swa_rope_unscaled = false;
+    // <arch>.logit_scale divides the output logits (Granite's logits_scaling,
+    // MiniCPM's n_embd / dim_model_base) instead of multiplying them.
+    bool logit_scale_divides = false;
+    // <arch>.rope.scaling.yarn_log_multiplier holds the reference's
+    // mscale_all_dim, as the converter writes it for every architecture but
+    // DeepSeek's (0.1 x mscale_all_dim, scaling q·k): YaRN's attention factor
+    // is then mscale(1) / mscale(mscale_all_dim), mscale(m) = 0.1 m ln(factor)
+    // + 1, on the rotation's magnitude (Ministral 3).
+    bool yarn_mscale_all_dim = false;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -153,6 +176,10 @@ const ArchSpec* find_architecture(std::string_view name) noexcept;
 
 // GGUF name of a block tensor: "blk.<block>.<suffix>".
 std::string block_tensor(int32_t block, std::string_view suffix);
+// Resolves a norm vector's name: prefer <suffix>.weight, else the bare
+// suffix when present. A missing vector returns the conventional .weight
+// name, so required bindings retain their precise missing-tensor error.
+std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string_view suffix);
 
 // How a mixture-of-experts router turns logits into expert probabilities.
 enum class MoeGating : uint8_t { Softmax, Sigmoid };
@@ -161,6 +188,8 @@ enum class MoeGating : uint8_t { Softmax, Sigmoid };
 enum class MixerKind : uint8_t {
     Attention,  // softmax attention over the KV cache
     DeltaNet,   // Gated DeltaNet: causal conv + delta-rule recurrent state, no KV cache
+    None,       // no mixer branch (zero query and KV heads in per-block metadata)
+    Linear,     // one normalized residual projection, no attention or KV rows
 };
 
 // Feed-forward network of one block.
@@ -168,6 +197,7 @@ enum class FfnKind : uint8_t {
     Dense,    // gated: down(act(gate) * up), act = ArchSpec::ffn_activation
     Moe,      // router + top-k routed gated experts
     Ungated,  // down(act(up x + b)) + b: ffn_up and ffn_down only (GPT-2, Falcon, Nemotron)
+    None,     // no FFN branch (zero per-block feed_forward_length)
 };
 
 // The structure of one block, from the tensors present.
@@ -200,6 +230,26 @@ struct BlockPlan {
     // Falcon-40B's ln_mlp), else through the mixer's normed input (Phi-2,
     // Falcon-7B, Command-R); the residual adds both outputs.
     bool parallel = false;
+    // Attention: queries and keys are rotated by RoPE; false: the block has no
+    // positional encoding of its own (NoPE, ArchSpec::nope_period /
+    // nope_global or the file's attention.rope_pattern).
+    bool rope = true;
+    // A norm before the mixer (attn_norm) and before the FFN (the
+    // architecture's ffn_norm), from the tensors present. false: the mixer or
+    // FFN reads the residual stream as it is, and the block must then have
+    // the norm after it (post-only norms: OLMo 2, EXAONE 4).
+    bool norm_before_mixer = true;
+    bool norm_before_ffn = true;
+    // Attention: attn_q_norm / attn_k_norm are one RMSNorm over the whole
+    // projection (n_head x head_dim, n_head_kv x head_dim: OLMo 2) instead of
+    // one per head (head_dim, shared by every head: Qwen3).
+    bool qk_norm_whole = false;
+    // This block's geometry, from scalar or per-block metadata. ModelConfig's
+    // dimensions are the maxima used for scratch buffers and the fixed KV
+    // image layout; an attention block uses only its first n_head_kv heads.
+    int32_t n_head = 0;
+    int32_t n_head_kv = 0;
+    int32_t n_ff = 0;
 };
 
 // xIELU's scalars of one block (Apertus), as the reference computes them
@@ -211,6 +261,7 @@ struct XIeluScalars {
     float alpha_n = 0.0f;
     float beta = 0.0f;
     float eps = 0.0f;
+
 };
 
 // YaRN context extension (<arch>.rope.scaling.type "yarn"), as the GGUF
@@ -258,9 +309,9 @@ struct ModelConfig {
     int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
     int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention (they own the KV cache)
     int32_t n_embd = 0;
-    int32_t n_ff = 0;
-    int32_t n_head = 0;
-    int32_t n_head_kv = 0;
+    int32_t n_ff = 0;       // maximum block FFN width (individual widths in blocks)
+    int32_t n_head = 0;     // maximum query heads, at least one for scratch sizing
+    int32_t n_head_kv = 0;  // maximum KV heads, at least one for the fixed cache layout
     int32_t head_dim = 0;    // key (and query) channels per head; rope_dim + mla.kv_rank with latent attention
     int32_t value_dim = 0;   // value channels per KV head: head_dim, or the latent (mla.kv_rank)
     int32_t rope_dim = 0;  // rotated channels per head; 0: no rotation (ArchSpec::rotary false)
@@ -298,8 +349,25 @@ struct ModelConfig {
     // RoPE table of their own (ArchSpec::rope_base_swa).
     int32_t sliding_window = 0;
     float rope_base_swa = 0.0f;
-    // Multiplies the token embeddings: sqrt(n_embd) with ArchSpec::scale_embeddings, else 1.
+    // Multiplies the token embeddings: <arch>.embedding_scale when the file
+    // has it (μP: Granite's embedding_multiplier, MiniCPM's scale_emb), else
+    // sqrt(n_embd) with ArchSpec::scale_embeddings, else 1.
     float embd_scale = 1.0f;
+    // Multiplies the mixer's and the FFN's outputs before each residual add
+    // (<arch>.residual_scale: Granite's residual_multiplier, MiniCPM's
+    // scale_depth / sqrt(n_layers)); 1: none.
+    float residual_scale = 1.0f;
+    // Multiplies the output logits (after the output projection, before any
+    // soft cap): <arch>.logit_scale, or its inverse with
+    // ArchSpec::logit_scale_divides; 1: none.
+    float logit_scale = 1.0f;
+    // Attention temperature by position (Ministral 3's llama_4_scaling): each
+    // query is multiplied by 1 + attn_temp_scale ln(1 + floor(pos /
+    // attn_temp_length)) after RoPE (<arch>.attention.temperature_scale, the
+    // length <arch>.attention.temperature_length or YaRN's original context).
+    // 0: none; the factor is exactly 1 below attn_temp_length.
+    float attn_temp_scale = 0.0f;
+    int32_t attn_temp_length = 0;
     std::vector<BlockPlan> blocks;  // per executed block
 
     // Gated DeltaNet geometry (zero when every block is attention).
@@ -317,9 +385,6 @@ struct ModelConfig {
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
     float moe_weights_scale = 1.0f;
 
-    // Multiplies the output logits (<arch>.logit_scale: Command-R), before
-    // any final soft-cap; 1 when absent.
-    float logit_scale = 1.0f;
     // > 0: queries, keys and values are clamped to [-clamp_kqv, clamp_kqv]
     // after their projections and biases (<arch>.attention.clamp_kqv: MPT,
     // DBRX, OLMo's clip_qkv).

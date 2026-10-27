@@ -554,6 +554,40 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     if (!described) return described.status();
     model->config_ = std::move(described).value();
     const ModelConfig& c = model->config_;
+    bool extended_identity = c.spec->nope_period > 0 || c.spec->nope_global;
+    for (const BlockPlan& block : c.blocks) {
+        extended_identity = extended_identity || (block.qk_norm_whole && block.n_head > 1) ||
+                            (block.mixer != MixerKind::None && !block.norm_before_mixer) ||
+                            (block.ffn != FfnKind::None && !block.norm_before_ffn);
+    }
+    for (const char* suffix : {"attention.head_count", "attention.head_count_kv", "feed_forward_length"}) {
+        const GgufValue* value = f.metadata(c.arch + "." + suffix);
+        if (value != nullptr && value->type == GgufValue::Type::Array) {
+            extended_identity = true;
+            break;
+        }
+    }
+    for (const char* suffix : {"embedding_scale", "residual_scale", "logit_scale", "attention.rope_pattern",
+                               "attention.temperature_scale", "attention.temperature_length"}) {
+        if (f.metadata(c.arch + "." + suffix) != nullptr) {
+            extended_identity = true;
+            break;
+        }
+    }
+    const auto tokenizer_pre = f.get_string("tokenizer.ggml.pre");
+    extended_identity = extended_identity ||
+                        (tokenizer_pre && (*tokenizer_pre == "spm-greedy" || *tokenizer_pre == "gpt2-nfkc-digits" || *tokenizer_pre == "llama-bpe-merges"));
+    if (extended_identity) {
+        // Geometry, scalars, norm placement and tokenizer flags can be beyond
+        // the first MiB. Equal-sized edits must invalidate states and every
+        // derived calibration/cache key. Hash the complete first header before
+        // binding or relocation; legacy plans retain their previous identity.
+        size_t header = f.file().size();
+        for (const TensorView& tensor : f.tensors()) {
+            if (tensor.shard == 0) header = std::min(header, static_cast<size_t>(tensor.file_offset));
+        }
+        model->variant_fingerprint_ = xxhash64(f.file().data(), header, model_fingerprint(f.file()));
+    }
     model->expert_mass_ = options.expert_mass;
     model->max_experts_ = options.max_experts;
     model->skip_slow_ = options.skip_slow;
@@ -562,9 +596,12 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
     const Layer& first = model->layers_[0];
     const TensorView* ffn_weight = c.blocks[0].ffn == FfnKind::Moe ? first.w[kUpExps] : first.w[kUp];
+    if (ffn_weight == nullptr) ffn_weight = model->token_embd_; // the first block can have no FFN
+    const auto delta_blocks = std::count_if(c.blocks.begin(), c.blocks.end(),
+                                          [](const BlockPlan& b) { return b.mixer == MixerKind::DeltaNet; });
     LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d, %d attention + %d DeltaNet blocks)", c.n_layers,
                    std::string(dtype_traits(ffn_weight->type).name).c_str(), c.arch.c_str(), c.head_dim,
-                   c.n_attn_layers, c.n_layers - c.n_attn_layers);
+                   c.n_attn_layers, static_cast<int>(delta_blocks));
     if (c.n_expert > 0) {
         LIYAB_LOG_INFO("MoE: %d experts, top-%d, expert ff %d, shared ff %d, %s gating%s", c.n_expert, c.n_expert_used,
                        c.n_ff_expert, c.n_ff_shared, c.moe_gating == MoeGating::Softmax ? "softmax" : "sigmoid",
@@ -804,8 +841,6 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
 Status Transformer::bind_weights() {
     const MmapLoader& f = *file_;
     const ModelConfig& c = config_;
-    const int64_t q_dim = int64_t{c.n_head} * c.head_dim;
-    const int64_t kv_dim = int64_t{c.n_head_kv} * c.head_dim;
 
     auto matrix = [&](const std::string& name, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
         const TensorView* t = f.tensor(name);
@@ -877,11 +912,13 @@ Status Transformer::bind_weights() {
         };
         const std::string_view attn_norm = plan.parallel && !has_norm(c.spec->attn_norm) && has_norm(c.spec->ffn_norm)
                                                ? c.spec->ffn_norm : c.spec->attn_norm;
-        LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".weight"), c.n_embd, norm_weights, L.attn_norm));
+        LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, attn_norm), c.n_embd, norm_weights && plan.norm_before_mixer, L.attn_norm));
         LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(attn_norm) + ".bias"), c.n_embd, false, L.attn_norm_b));
         if (plan.mixer == MixerKind::Attention) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_output.bias"), c.n_embd, false, L.bo));
         }
+        const int64_t q_dim = int64_t{plan.n_head} * c.head_dim;
+        const int64_t kv_dim = int64_t{plan.n_head_kv} * c.head_dim;
         if (plan.mixer == MixerKind::Attention && plan.latent) {
             L.kv_slot = kv_slots++;
             const LatentAttention& m = c.mla;
@@ -936,13 +973,18 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_v.bias"), kv_dim, false, L.bv));
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), q_dim, c.n_embd, L.w[kO]));
-            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), c.n_head, L.q_norm));
-            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), c.n_head_kv, L.k_norm));
+            if (plan.qk_norm_whole) {
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_q_norm.weight"), q_dim, false, L.q_norm));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "attn_k_norm.weight"), kv_dim, false, L.k_norm));
+            } else {
+            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.weight"), plan.n_head, L.q_norm));
+            LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.weight"), plan.n_head_kv, L.k_norm));
             if (c.spec->norm == NormKind::Layer) {
-                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), c.n_head, L.q_norm_b));
-                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), c.n_head_kv, L.k_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_q_norm.bias"), plan.n_head, L.q_norm_b));
+                LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), plan.n_head_kv, L.k_norm_b));
             }
-        } else {
+            }
+        } else if (plan.mixer == MixerKind::DeltaNet) {
             L.state_slot = state_slots++;
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_gate.weight"), c.n_embd, dn_value, L.w[kZ]));
@@ -953,50 +995,53 @@ Status Transformer::bind_weights() {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_a"), c.ssm_v_heads, true, L.ssm_a));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt.bias"), c.ssm_v_heads, true, L.ssm_dt));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), c.ssm_head_dim, true, L.ssm_norm));
+        } else if (plan.mixer == MixerKind::Linear) {
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), c.n_embd, c.n_embd, L.w[kO]));
         }
         // A parallel block may have no FFN norm of its own: its FFN reads the mixer's normed input.
         if (!plan.parallel || attn_norm != c.spec->ffn_norm) {
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".weight"), c.n_embd,
-                                      norm_weights && !plan.parallel, L.ffn_norm));
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->ffn_norm), c.n_embd,
+                                      norm_weights && plan.norm_before_ffn && !plan.parallel, L.ffn_norm));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
         }
         if (!c.spec->post_mixer_norm.empty()) {
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_mixer_norm) + ".weight"), c.n_embd,
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->post_mixer_norm), c.n_embd,
                                       false, L.post_mixer_norm));
         }
         if (!c.spec->post_ffn_norm.empty()) {
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->post_ffn_norm) + ".weight"), c.n_embd,
+            LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->post_ffn_norm), c.n_embd,
                                       false, L.post_ffn_norm));
         }
         if (plan.ffn == FfnKind::Ungated) {  // down(act(up)), each with its bias where present
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), c.n_ff, false, L.b_up));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, plan.n_ff, L.w[kUp]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), plan.n_ff, c.n_embd, L.w[kDown]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), plan.n_ff, false, L.b_up));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
             continue;
         }
         if (plan.ffn == FfnKind::Dense) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down.bias"), c.n_embd, false, L.b_down));
             if (!plan.fused_gate_up) {
-                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate.bias"), c.n_ff, false, L.b_gate));
-                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), c.n_ff, false, L.b_up));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate.bias"), plan.n_ff, false, L.b_gate));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), plan.n_ff, false, L.b_up));
             }
             if (plan.fused_gate_up) {  // ffn_up is [gate | up]; no ffn_gate
                 LIYAB_RETURN_IF_ERROR(
-                    matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{c.n_ff}, L.w[kUp]));
+                    matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, 2 * int64_t{plan.n_ff}, L.w[kUp]));
                 std::vector<float> bias;
-                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), 2 * int64_t{c.n_ff}, false, bias));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_up.bias"), 2 * int64_t{plan.n_ff}, false, bias));
                 if (!bias.empty()) {
-                    L.b_gate.assign(bias.begin(), bias.begin() + c.n_ff);
-                    L.b_up.assign(bias.begin() + c.n_ff, bias.end());
+                    L.b_gate.assign(bias.begin(), bias.begin() + plan.n_ff);
+                    L.b_up.assign(bias.begin() + plan.n_ff, bias.end());
                 }
             } else {
-                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, c.n_ff, L.w[kGate]));
-                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, c.n_ff, L.w[kUp]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate.weight"), c.n_embd, plan.n_ff, L.w[kGate]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_up.weight"), c.n_embd, plan.n_ff, L.w[kUp]));
             }
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), c.n_ff, c.n_embd, L.w[kDown]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_down.weight"), plan.n_ff, c.n_embd, L.w[kDown]));
             continue;
         }
+        if (plan.ffn == FfnKind::None) continue;
         LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ffn_gate_inp.weight"), c.n_embd, c.n_expert, L.w[kRouter]));
         auto experts = [&](const char* suffix, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
             const std::string name = block_tensor(l, suffix);
@@ -1191,12 +1236,15 @@ bool get(std::istream& in, T& v) {
 // What must match for a saved state to be valid here: the model (file size
 // and shape) and how the KV cache stores rows. A LongRoPE model whose context
 // picked the long factors rotates its keys otherwise than with the short
-// ones, so that choice marks the first field (every other model's
-// fingerprint, and so its saved states, stay as they were).
+// ones, so that choice marks the first field. New per-block and scalar
+// metadata also adds the file fingerprint; corrected tokenizer modes hash
+// the complete header, including vocabulary and flags. Older layouts keep their state
+// compatibility and bytes unchanged.
 std::array<int64_t, 9> Transformer::state_fingerprint() const noexcept {
     const KvCacheConfig& kv = kv_->config();
     const bool long_rope = config_.rope_ctx_orig > 0 && context_length_ > config_.rope_ctx_orig;
-    const int64_t file = static_cast<int64_t>(file_->file_size()) ^ (long_rope ? int64_t{1} << 62 : 0);
+    const int64_t file = static_cast<int64_t>(file_->file_size()) ^ (long_rope ? int64_t{1} << 62 : 0) ^
+                         static_cast<int64_t>(variant_fingerprint_);
     return {file, config_.n_layers, config_.n_embd, config_.n_vocab, kv.n_layers, kv.n_head_kv, kv.head_dim,
             static_cast<int64_t>(kv_->dtype()), kv.page_tokens};
 }
@@ -1616,8 +1664,10 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
 // keeps only those positions (KvCache's per-block layout), so a windowed block
 // saves memory as well as compute (with TransformerOptions::keep_windowed_rows,
 // compute only).
-void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
+void Transformer::attention(const Layer& L, int32_t n, ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
+    const int32_t kv_slot = L.kv_slot, window = L.window;
     // Each segment's rows of the block, their group and offsets resolved
     // once for the pass (a pass of several sequences reads several caches).
     row_views_.clear();
@@ -1642,31 +1692,31 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     const int32_t* row_list = all_rows ? nullptr : attn_rows_.data();
     auto row_at = [row_list](int64_t i) { return row_list == nullptr ? static_cast<int32_t>(i) : row_list[i]; };
     const int32_t hd = c.head_dim;
-    const int32_t group = c.n_head / c.n_head_kv;
+    const int32_t group = plan.n_head / plan.n_head_kv;
     // Values may be narrower than keys (latent attention: the latent part of
     // each key row); every value-sized buffer below follows value_dim.
     const int32_t vd = c.value_dim;
     const auto uvd = static_cast<size_t>(vd);
-    const size_t out_dim = static_cast<size_t>(c.n_head) * uvd;  // att_ row: every head's output
+    const size_t out_dim = static_cast<size_t>(plan.n_head) * uvd;  // att_ row: every head's output
     const float scale = c.attn_scale;  // 1/sqrt(head_dim) unless the file states another (ModelConfig)
     const float softcap = c.attn_softcap;
     const DType kv_type = segs_.front().kv->dtype();  // every context's cache has the same format
     const bool quantized_kv = quant::is_block_quantized(kv_type);
     const auto uhd = static_cast<size_t>(hd);
     const auto ugroup = static_cast<size_t>(group);
-    const auto n_head = static_cast<size_t>(c.n_head);
+    const auto n_head = static_cast<size_t>(plan.n_head);
     const size_t q8_per_head = uhd / quant::kBlock;
 
     // Quantized caches are scored with integer dot products against a Q8_0
     // copy of each query (same kernels as the weight matmuls), made once per
     // (token, head) rather than in every span.
     if (quantized_kv) {
-        const auto rows = static_cast<int64_t>(m) * c.n_head;
+        const auto rows = static_cast<int64_t>(m) * plan.n_head;
         q8_queries_.resize(static_cast<size_t>(n) * n_head * q8_per_head);
         auto quantize = [&](int64_t begin, int64_t end) {
             for (int64_t r = begin; r < end; ++r) {
                 const size_t row =
-                    static_cast<size_t>(row_at(r / c.n_head)) * n_head + static_cast<size_t>(r % c.n_head);
+                    static_cast<size_t>(row_at(r / plan.n_head)) * n_head + static_cast<size_t>(r % plan.n_head);
                 quant::quantize_row_q8_0(q_.data() + row * uhd, q8_queries_.data() + row * q8_per_head, hd);
             }
         };
@@ -1822,13 +1872,13 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
         if (!s.expanded) max_spans = std::max(max_spans, spans_of(s.first + s.n - 1));
     }
     for (int32_t t = 0; !tree_depth_.empty() && t + 1 < n; ++t) max_spans = std::max(max_spans, spans_of(t));
-    const int64_t pairs = int64_t{m} * c.n_head_kv;
+    const int64_t pairs = int64_t{m} * plan.n_head_kv;
     if (max_spans == 1 || pairs >= int64_t{pool.max_threads()} * ThreadPool::kChunksPerThread) {
         pool.parallel_for(pairs, [&](int64_t begin, int64_t end) {
             thread_local std::vector<float> mx, sm, out;  // [head of the group][span]
             for (int64_t task = begin; task < end; ++task) {
-                const int32_t t = row_at(task / c.n_head_kv);
-                const auto g = static_cast<int32_t>(task % c.n_head_kv);
+                const int32_t t = row_at(task / plan.n_head_kv);
+                const auto g = static_cast<int32_t>(task % plan.n_head_kv);
                 const int32_t spans = spans_of(t);
                 const auto uspans = static_cast<size_t>(spans);
                 mx.resize(ugroup * uspans);
@@ -1855,9 +1905,9 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     pool.parallel_for(pairs * max_spans, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const auto sp = static_cast<int32_t>(task % max_spans);
-            const int64_t i = task / max_spans / c.n_head_kv;
+            const int64_t i = task / max_spans / plan.n_head_kv;
             const int32_t t = row_at(i);
-            const auto g = static_cast<int32_t>(task / max_spans % c.n_head_kv);
+            const auto g = static_cast<int32_t>(task / max_spans % plan.n_head_kv);
             if (sp >= spans_of(t)) continue;  // an earlier token of the batch sees fewer positions
             const size_t at = base(i, g * group) + static_cast<size_t>(sp);
             score_span(t, g, sp, part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd, slots);
@@ -1868,17 +1918,17 @@ void Transformer::attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPo
     constexpr int32_t kParallelMergeSpans = 32;
     auto merge_range = [&](int64_t begin, int64_t end) {
         for (int64_t th = begin; th < end; ++th) {
-            const int64_t i = th / c.n_head;
+            const int64_t i = th / plan.n_head;
             const int32_t t = row_at(i);
-            const auto h = static_cast<int32_t>(th % c.n_head);
+            const auto h = static_cast<int32_t>(th % plan.n_head);
             const size_t at = base(i, h);
             merge(t, h, spans_of(t), part_max_.data() + at, part_sum_.data() + at, part_out_.data() + at * uvd);
         }
     };
     if (max_spans >= kParallelMergeSpans) {
-        pool.parallel_for(int64_t{m} * c.n_head, merge_range);
+        pool.parallel_for(int64_t{m} * plan.n_head, merge_range);
     } else {
-        merge_range(0, int64_t{m} * c.n_head);
+        merge_range(0, int64_t{m} * plan.n_head);
     }
 }
 
@@ -2050,10 +2100,12 @@ Status Transformer::final_hidden(std::span<const int32_t> rows, std::span<float>
     return Status::ok();
 }
 
-Status Transformer::project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n) {
+Status Transformer::project_fused_qkv(const Layer& L, const Route& route, Backend* backend, const BlockWeights& w,
+                                      int32_t n) {
     const ModelConfig& c = config_;
-    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
-    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
+    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(c.head_dim);
+    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
     const size_t row = q_dim + 2 * kv_dim;
     qkv_.resize(static_cast<size_t>(n) * row);
     LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kQkv], xb_.data(), qkv_.data(), n));
@@ -2071,15 +2123,18 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
     // Only reached for attention-only stacks: early exit is disabled for hybrid models.
     for (int32_t l = from; l < c.n_layers; ++l) {
         const Layer& L = layers_[static_cast<size_t>(l)];
+        const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
+        if (L.kv_slot < 0) continue; // identity and linear mixers have no cached rows
         const BlockWeights w(*this, l);
         LIYAB_RETURN_IF_ERROR(w.status());
         Backend* backend = w.streamed() ? route.cpu : route.attention;  // see BlockWeights::streamed()
-        norm_row(x_.data(), opt(L.attn_norm), opt(L.attn_norm_b), xb_.data(), c.n_embd);
+        if (plan.norm_before_mixer) norm_row(x_.data(), opt(L.attn_norm), opt(L.attn_norm_b), xb_.data(), c.n_embd);
+        else std::copy_n(x_.data(), c.n_embd, xb_.data());
         if (c.blocks[static_cast<size_t>(l)].latent) {
             // The key row only: its latent channels are the values.
             LIYAB_RETURN_IF_ERROR(latent_project(l, w, 1, route, backend, false));
         } else if (c.blocks[static_cast<size_t>(l)].fused_qkv) {
-            LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, backend, w, 1));
+            LIYAB_RETURN_IF_ERROR(project_fused_qkv(L, route, backend, w, 1));
         } else {
             LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kK], xb_.data(), k_.data(), 1));
             LIYAB_RETURN_IF_ERROR(matmul(route, backend, w[kV], xb_.data(), v_.data(), 1));
@@ -2093,10 +2148,12 @@ Status Transformer::propagate_kv(const Route& route, int32_t from, int32_t pos) 
         }
         const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
         if (!norm_after_rope) qk_norm(L, nullptr, k_.data());
-        rope(k_.data(), c.n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
+        if (c.blocks[static_cast<size_t>(l)].rope) {
+            rope(k_.data(), c.blocks[static_cast<size_t>(l)].n_head_kv, pos, rope_tables_[static_cast<size_t>(L.rope_table)]);
+        }
         if (norm_after_rope) qk_norm(L, nullptr, k_.data());
-        scale_keys(L.kv_slot, nullptr, k_.data());
-        kv_->store(L.kv_slot, pos, k_.data(), v_.data());
+        scale_keys(L, nullptr, k_.data());
+        store_kv(L, *kv_, pos, k_.data(), v_.data());
     }
     return Status::ok();
 }
@@ -2107,32 +2164,45 @@ KeyScalingShape Transformer::key_scaling_shape() const {
     // so every process gets the same factors (and the same replies).
     const int32_t positions = c.n_ctx_train > 0 ? std::min(c.n_ctx_train, kKeyRangePositions) : kKeyRangePositions;
     KeyScalingShape shape{c.n_attn_layers, c.n_head, c.n_head_kv, c.head_dim, c.rope_dim,
-                          c.spec->rope, {}, {}, positions};
+                          c.spec->rope, {}, {}, positions, {}, {}};
+    if (c.attn_temp_scale != 0.0f) {
+        shape.query_scale = static_cast<float>(
+            1.0 + c.attn_temp_scale * std::log1p(std::floor(static_cast<double>(positions - 1) / c.attn_temp_length)));
+    }
     // Transformer::rope: pair i of an attention block turns by
     // inv_freq[i] / scale of the block's table per position.
-    for (const Layer& L : layers_) {
+    for (size_t l = 0; l < layers_.size(); ++l) {
+        const Layer& L = layers_[l];
         if (L.kv_slot < 0) continue;  // attention blocks only, in KV slot order
         const RopeTable& t = rope_tables_[static_cast<size_t>(L.rope_table)];
-        for (const float f : t.inv_freq) shape.pair_speed.push_back(f / t.scale);
-        shape.rope_magnitude.push_back(t.magnitude);
+        const bool rotated = c.blocks[l].rope;  // a NoPE block's pairs never turn
+        for (const float f : t.inv_freq) shape.pair_speed.push_back(rotated ? f / t.scale : 0.0f);
+        shape.rope_magnitude.push_back(rotated ? t.magnitude : 1.0f);
+        shape.query_heads.push_back(c.blocks[l].n_head);
+        shape.kv_heads.push_back(c.blocks[l].n_head_kv);
     }
     return shape;
 }
 
 void Transformer::qk_norm(const Layer& L, float* q, float* k) const {
     const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
     const auto hd = static_cast<size_t>(c.head_dim);
     // Head h's weight (and bias): row h of a per-head norm, else the one shared row.
     auto row = [hd](const std::vector<float>& v, size_t h) {
         return v.empty() ? nullptr : v.data() + (v.size() > hd ? h * hd : 0);
     };
     if (q != nullptr && (!L.q_norm.empty() || !L.q_norm_b.empty())) {
-        for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
+        if (plan.qk_norm_whole) {
+            norm_row(q, opt(L.q_norm), opt(L.q_norm_b), q, plan.n_head * c.head_dim);
+        } else for (size_t h = 0; h < static_cast<size_t>(plan.n_head); ++h) {
             norm_row(q + h * hd, row(L.q_norm, h), row(L.q_norm_b, h), q + h * hd, c.head_dim);
         }
     }
     if (!L.k_norm.empty() || !L.k_norm_b.empty()) {
-        for (size_t h = 0; h < static_cast<size_t>(c.n_head_kv); ++h) {
+        if (plan.qk_norm_whole) {
+            norm_row(k, opt(L.k_norm), opt(L.k_norm_b), k, plan.n_head_kv * c.head_dim);
+        } else for (size_t h = 0; h < static_cast<size_t>(plan.n_head_kv); ++h) {
             norm_row(k + h * hd, row(L.k_norm, h), row(L.k_norm_b, h), k + h * hd, c.head_dim);
         }
     }
@@ -2173,6 +2243,7 @@ void Transformer::clamp_kqv(float* x, size_t n) const {
 
 void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k) {
     const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
     const bool after = c.spec->qk_norm == QkNormOrder::AfterRope;
     if (!after || (L.q_norm.empty() && L.k_norm.empty())) {
         key_ranges_->add(L.kv_slot, q, k);
@@ -2184,7 +2255,9 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
     // after the rotation (KeyRanges::add).
     const auto hd = static_cast<size_t>(c.head_dim);
     // RoPE's magnitude (LongRoPE) scales the rotated channels before the norm.
-    const float magnitude = rope_tables_[static_cast<size_t>(L.rope_table)].magnitude;
+    const float magnitude = c.blocks[static_cast<size_t>(&L - layers_.data())].rope
+                                ? rope_tables_[static_cast<size_t>(L.rope_table)].magnitude
+                                : 1.0f;
     std::vector<float> rotated(hd);
     auto scaled = [&](const float* x, int32_t heads, bool normed, std::vector<float>& out) {
         out.assign(x, x + static_cast<size_t>(heads) * hd);
@@ -2198,19 +2271,20 @@ void Transformer::add_key_ranges(const Layer& L, const float* q, const float* k)
         }
     };
     std::vector<float> qs, ks;
-    scaled(q, c.n_head, !L.q_norm.empty(), qs);
-    scaled(k, c.n_head_kv, !L.k_norm.empty(), ks);
+    scaled(q, plan.n_head, !L.q_norm.empty(), qs);
+    scaled(k, plan.n_head_kv, !L.k_norm.empty(), ks);
     key_ranges_->add(L.kv_slot, qs.data(), ks.data(), L.q_norm.empty() ? nullptr : L.q_norm.data(),
                      L.k_norm.empty() ? nullptr : L.k_norm.data());
 }
 
-void Transformer::scale_keys(int32_t kv_slot, float* q, float* k) const {
+void Transformer::scale_keys(const Layer& L, float* q, float* k) const {
     if (key_scale_.empty()) return;
     const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
     const auto hd = static_cast<size_t>(c.head_dim);
-    const auto group = static_cast<size_t>(c.n_head / c.n_head_kv);
-    const float* t = key_scale_.data() + static_cast<size_t>(kv_slot) * static_cast<size_t>(c.n_head_kv) * hd;
-    for (size_t g = 0; g < static_cast<size_t>(c.n_head_kv); ++g) {
+    const auto group = static_cast<size_t>(plan.n_head / plan.n_head_kv);
+    const float* t = key_scale_.data() + static_cast<size_t>(L.kv_slot) * static_cast<size_t>(c.n_head_kv) * hd;
+    for (size_t g = 0; g < static_cast<size_t>(plan.n_head_kv); ++g) {
         const float* tg = t + g * hd;
         float* kg = k + g * hd;
         for (size_t i = 0; i < hd; ++i) kg[i] /= tg[i];
@@ -2220,6 +2294,22 @@ void Transformer::scale_keys(int32_t kv_slot, float* q, float* k) const {
             for (size_t i = 0; i < hd; ++i) qh[i] *= tg[i];
         }
     }
+}
+
+void Transformer::store_kv(const Layer& L, KvCache& cache, int32_t pos, const float* k, const float* v) {
+    const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
+    if (plan.n_head_kv == c.n_head_kv) {
+        cache.store(L.kv_slot, pos, k, v);
+        return;
+    }
+    const size_t active = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const size_t padded = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    padded_k_.assign(padded, 0.0f);
+    padded_v_.assign(padded, 0.0f);
+    std::copy(k, k + active, padded_k_.begin());
+    std::copy(v, v + active, padded_v_.begin());
+    cache.store(L.kv_slot, pos, padded_k_.data(), padded_v_.data());
 }
 
 Status Transformer::calibrate_keys(std::span<const int32_t> tokens, const Route& route, ThreadPool& pool) {
@@ -2360,19 +2450,21 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
                                     ThreadPool& pool, const uint8_t* head_mask) {
     const ModelConfig& c = config_;
     const Layer& L = layers_[static_cast<size_t>(layer)];
-    const bool gated = c.blocks[static_cast<size_t>(layer)].attn_gate;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(layer)];
+    const bool gated = plan.attn_gate;
     const auto un = static_cast<size_t>(n);
-    const size_t q_dim = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim);
-    const size_t kv_dim = static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(c.head_dim);
+    const size_t q_dim = static_cast<size_t>(plan.n_head) * static_cast<size_t>(c.head_dim);
+    const size_t kv_dim = static_cast<size_t>(plan.n_head_kv) * static_cast<size_t>(c.head_dim);
     const size_t hd = static_cast<size_t>(c.head_dim);
     const bool norm_after_rope = c.spec->qk_norm == QkNormOrder::AfterRope;
     const RopeTable& rope_table = rope_tables_[static_cast<size_t>(L.rope_table)];
+    const bool rotated = c.blocks[static_cast<size_t>(layer)].rope;  // false: a NoPE block
 
     // Gated blocks project [q_h | gate_h] per head into qg_; split it afterwards.
     if (gated) qg_.resize(un * 2 * q_dim);
     if (c.blocks[static_cast<size_t>(layer)].fused_qkv) {
         // One [q | k | v] projection per token, split into q_, k_ and v_.
-        LIYAB_RETURN_IF_ERROR(project_fused_qkv(route, route.attention, w, n));
+        LIYAB_RETURN_IF_ERROR(project_fused_qkv(L, route, route.attention, w, n));
     } else {
         const TensorView* qkv[] = {&w[kQ], &w[kK], &w[kV]};
         float* outs[] = {gated ? qg_.data() : q_.data(), k_.data(), v_.data()};
@@ -2381,8 +2473,8 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
     if (gated) {
         gate_.resize(un * q_dim);
         for (size_t t = 0; t < un; ++t) {
-            for (size_t h = 0; h < static_cast<size_t>(c.n_head); ++h) {
-                const float* src = qg_.data() + (t * static_cast<size_t>(c.n_head) + h) * 2 * hd;
+            for (size_t h = 0; h < static_cast<size_t>(plan.n_head); ++h) {
+                const float* src = qg_.data() + (t * static_cast<size_t>(plan.n_head) + h) * 2 * hd;
                 std::copy(src, src + hd, q_.data() + t * q_dim + h * hd);
                 std::copy(src + hd, src + 2 * hd, gate_.data() + t * q_dim + h * hd);
             }
@@ -2402,14 +2494,22 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             if (!norm_after_rope) qk_norm(L, q, k);
             const int32_t pos = pos_of(s, static_cast<int32_t>(t));
             if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-            rope(q, c.n_head, pos, rope_table);
-            rope(k, c.n_head_kv, pos, rope_table);
+            if (rotated) {
+                rope(q, plan.n_head, pos, rope_table);
+                rope(k, plan.n_head_kv, pos, rope_table);
+            }
             if (norm_after_rope) qk_norm(L, q, k);
-            scale_keys(L.kv_slot, q, k);
-            s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, v);
+            if (c.attn_temp_scale != 0.0f && pos >= c.attn_temp_length) {
+                // Attention temperature (llama_4_scaling): 1 below the length, so those rows keep their bits.
+                const auto temp = static_cast<float>(
+                    1.0 + c.attn_temp_scale * std::log1p(std::floor(static_cast<double>(pos) / c.attn_temp_length)));
+                for (size_t i = 0; i < q_dim; ++i) q[i] *= temp;
+            }
+            scale_keys(L, q, k);
+            store_kv(L, *s.kv, row_of(s, static_cast<int32_t>(t)), k, v);
         }
     }
-    attention(L.kv_slot, L.window, n, pool, head_mask);
+    attention(L, n, pool, head_mask);
     if (gated) {
         for (size_t i = 0; i < un * q_dim; ++i) att_[i] *= sigmoid(gate_[i]);
     }
@@ -2858,13 +2958,13 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
                 // stored scaled as in the absorbed form (the cache is shared).
                 rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
                 rope(k, 1, pos, rope_table);
-                scale_keys(L.kv_slot, nullptr, k);
+                scale_keys(L, nullptr, k);
             } else {
                 float* q = q_.data() + t * heads * kd;
                 if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
                 rope(q, c.n_head, pos, rope_table);
                 rope(k, 1, pos, rope_table);
-                scale_keys(L.kv_slot, q, k);
+                scale_keys(L, q, k);
             }
             s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
         }
@@ -2873,7 +2973,7 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
     if (any_absorbed) {
         // att_: per absorbed token and head, the softmax-weighted latent
         // (value_dim = rank), rows `rank` wide per head.
-        attention(L.kv_slot, L.window, n, pool, head_mask);
+        attention(L, n, pool, head_mask);
 
         // Per head, the weighted latent becomes the head's value: W_vb,h c. Keys
         // stored with per-channel scales carried their latent divided by them,
@@ -3189,7 +3289,8 @@ Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_b
 void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) {
     if (expert_store_ == nullptr || layer >= config_.n_layers) return;
     const ModelConfig& c = config_;
-    if (c.blocks[static_cast<size_t>(layer)].ffn != FfnKind::Moe) return;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(layer)];
+    if (plan.ffn != FfnKind::Moe) return;
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const PhaseTimer timer(phases_.router);
     const auto d = static_cast<size_t>(c.n_embd);
@@ -3198,7 +3299,8 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     pred_in_.resize(un * d);
     pred_logits_.resize(un * E);
     for (size_t t = 0; t < un; ++t) {
-        norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), pred_in_.data() + t * d, c.n_embd);
+        if (plan.norm_before_ffn) norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), pred_in_.data() + t * d, c.n_embd);
+        else std::copy_n(x_.data() + t * d, d, pred_in_.data() + t * d);
     }
     if (!route.cpu->matmul(*L.w[kRouter], pred_in_.data(), pred_logits_.data(), n).is_ok()) return;
     std::vector<int32_t> order(E);
@@ -3254,7 +3356,8 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
 Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                               FfnMatmulHook* hook) {
     const ModelConfig& c = config_;
-    const size_t rows = static_cast<size_t>(n) * static_cast<size_t>(c.n_ff);
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(layer)];
+    const size_t rows = static_cast<size_t>(n) * static_cast<size_t>(plan.n_ff);
     hb_.resize(rows);
     hb2_.resize(rows);
     // FFN projections: an experimental override first, else the routed backend.
@@ -3269,7 +3372,6 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         return matmul(route, route.ffn, m, x, y, n);
     };
     const Layer& L = layers_[static_cast<size_t>(layer)];
-    const auto ff = static_cast<size_t>(c.n_ff);
     if (c.blocks[static_cast<size_t>(layer)].ffn == FfnKind::Ungated) {
         // down(act(up x + b_up)) + b_down
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb_.data()));
@@ -3283,6 +3385,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
     if (c.blocks[static_cast<size_t>(layer)].fused_gate_up) {
         // One [gate | up] projection per token (no per-projection hook: the
         // halves are one matrix); act(gate) * up lands in hb_.
+        const auto ff = static_cast<size_t>(plan.n_ff);
         hb2_.resize(2 * rows);
         LIYAB_RETURN_IF_ERROR(matmul(route, route.ffn, w[kUp], xb_.data(), hb2_.data(), n));
         for (size_t t = 0; t < static_cast<size_t>(n); ++t) {
@@ -3705,6 +3808,15 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     const bool moe = plan.ffn == FfnKind::Moe;
     const Route cpu_route{route.cpu, route.cpu, route.cpu};
     const Route& block_route = w.streamed() ? cpu_route : route;
+    // The residual add: x += xb, the branch scaled first by the μP residual
+    // multiplier (ModelConfig::residual_scale) when it is not 1.
+    auto add_residual = [&](size_t count) {
+        if (c.residual_scale != 1.0f) {
+            for (size_t i = 0; i < count; ++i) x_[i] += c.residual_scale * xb_[i];
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) x_[i] += xb_[i];
+    };
     // Norm after the mixer or the FFN (ArchSpec::post_mixer_norm / post_ffn_norm), in place on xb_.
     auto post_norm = [&](const std::vector<float>& weight) {
         if (weight.empty()) return;
@@ -3721,7 +3833,8 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     // --- token mixer (attention or DeltaNet) ---
     if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
     for (size_t t = 0; t < un; ++t) {
-        norm_row(x_.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), xb_.data() + t * d, c.n_embd);
+        if (plan.norm_before_mixer) norm_row(x_.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), xb_.data() + t * d, c.n_embd);
+        else std::copy_n(x_.data() + t * d, d, xb_.data() + t * d);
     }
     // A parallel block's FFN reads the block input too: normed by its own
     // FFN norm, or the mixer's normed input itself; kept while the mixer runs.
@@ -3735,7 +3848,13 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
             }
         }
     }
-    if (plan.mixer == MixerKind::DeltaNet) {
+    if (plan.mixer == MixerKind::None) {
+        // No mixer branch: leave the residual stream exactly as it entered.
+    } else if (plan.mixer == MixerKind::Linear) {
+        att_.resize(un * std::max(d, static_cast<size_t>(c.n_head) * static_cast<size_t>(c.head_dim)));
+        LIYAB_RETURN_IF_ERROR(matmul(block_route, block_route.attention, w[kO], xb_.data(), att_.data(), n));
+        std::copy_n(att_.begin(), un * d, xb_.begin());
+    } else if (plan.mixer == MixerKind::DeltaNet) {
         const PhaseTimer timer(phases_.delta_net);
         LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
     } else if (plan.latent) {
@@ -3747,10 +3866,13 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         LIYAB_RETURN_IF_ERROR(
             attention_mixer(l, w, n, block_route, pool, head_mask != nullptr ? head_mask->mask(l) : nullptr));
     }
-    post_norm(L.post_mixer_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    if (plan.mixer != MixerKind::None) {
+        post_norm(L.post_mixer_norm);
+        add_residual(un * d);
+    }
     // A MoE block predicts the next one once its own experts are queued (moe_ffn).
     if (expert_store_ != nullptr && !moe) predict_experts(l + 1, n, route);
+    if (plan.ffn == FfnKind::None) return Status::ok();
 
     // --- FFN block: dense SwiGLU or mixture of experts (skippable by an experimental hook) ---
     if (ffn_skip != nullptr && ffn_skip->skip_ffn(l, c.n_layers, x_block_in_, x_)) {
@@ -3762,7 +3884,8 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         std::copy_n(par_in_.data(), un * d, xb_.data());
     } else {
         for (size_t t = 0; t < un; ++t) {
-            norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), xb_.data() + t * d, c.n_embd);
+            if (plan.norm_before_ffn) norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), xb_.data() + t * d, c.n_embd);
+            else std::copy_n(x_.data() + t * d, d, xb_.data() + t * d);
         }
     }
     if (moe) {
@@ -3772,7 +3895,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
         LIYAB_RETURN_IF_ERROR(dense_ffn(l, w, n, block_route, ffn_hook));
     }
     post_norm(L.post_ffn_norm);
-    for (size_t i = 0; i < un * d; ++i) x_[i] += xb_[i];
+    add_residual(un * d);
     return Status::ok();
 }
 
@@ -3930,16 +4053,20 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
     struct Slot {
         const Turns* turns = nullptr;
         std::vector<float> unscale, rescale;  // [kv_head][touched channel]
+        int32_t heads = 0;
     };
     std::vector<Slot> blocks;
     for (const Layer& L : layers_) {
         if (L.kv_slot < 0) continue;
         if (static_cast<size_t>(L.kv_slot) >= blocks.size()) blocks.resize(static_cast<size_t>(L.kv_slot) + 1);
+        // A NoPE block's keys do not depend on their position: they stay as stored (no turns).
+        if (!c.blocks[static_cast<size_t>(&L - layers_.data())].rope) continue;
         Slot& s = blocks[static_cast<size_t>(L.kv_slot)];
+        s.heads = c.blocks[static_cast<size_t>(&L - layers_.data())].n_head_kv;
         s.turns = &turns_of(static_cast<size_t>(L.rope_table));
-        s.unscale.assign(static_cast<size_t>(c.n_head_kv) * static_cast<size_t>(touched), 1.0f);
+        s.unscale.assign(static_cast<size_t>(s.heads) * static_cast<size_t>(touched), 1.0f);
         s.rescale.assign(s.unscale.size(), 1.0f);
-        for (size_t g = 0; g < static_cast<size_t>(c.n_head_kv); ++g) {
+        for (size_t g = 0; g < static_cast<size_t>(s.heads); ++g) {
             for (size_t i = 0; i < static_cast<size_t>(touched); ++i) {
                 float f = key_scale_.empty() ? 1.0f : key_scale_[(static_cast<size_t>(L.kv_slot) * static_cast<size_t>(c.n_head_kv) + g) * hd + i];
                 if (norm_after && !L.k_norm.empty()) f /= L.k_norm[i];
@@ -3958,7 +4085,7 @@ Status Transformer::move_keys(uint8_t* image, int32_t slots, int32_t first, int3
             const Slot& s = blocks[static_cast<size_t>(slot)];
             if (s.turns == nullptr) continue;
             const size_t at = static_cast<size_t>(i) * static_cast<size_t>(half);
-            for (int32_t g = 0; g < c.n_head_kv; ++g) {
+            for (int32_t g = 0; g < s.heads; ++g) {
                 uint8_t* r = image + kv_->image_key_offset(slots, slot, first + i, g);
                 quant::dequantize_row(type, r, row.data(), touched);
                 const float* un = s.unscale.data() + static_cast<size_t>(g) * static_cast<size_t>(touched);

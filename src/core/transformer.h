@@ -187,6 +187,12 @@ public:
 
     [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
     [[nodiscard]] const MmapLoader& file() const noexcept { return *file_; }
+    // Stable model identity for derived calibration and cache files. New plan
+    // features hash the complete first GGUF header; legacy plans retain the
+    // size/first-MiB identity. Constant after load, safe for concurrent reads.
+    [[nodiscard]] uint64_t file_fingerprint() const noexcept {
+        return variant_fingerprint_ != 0 ? variant_fingerprint_ : model_fingerprint(file_->file());
+    }
     [[nodiscard]] MmapLoader& mutable_file() noexcept { return *file_; }
     [[nodiscard]] const KvCache& kv_cache() const noexcept { return *kv_; }
     [[nodiscard]] int32_t context_length() const noexcept { return context_length_; }
@@ -889,7 +895,7 @@ private:
     Status per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out, int32_t n);
     // BlockPlan::fused_qkv: projects xb_ through the block's attn_qkv on
     // `backend` and splits each token's [q | k | v] into q_, k_ and v_.
-    Status project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
+    Status project_fused_qkv(const Layer& layer, const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
@@ -914,7 +920,7 @@ private:
     // latent_expanded); `window` > 0 limits each query to its last `window`
     // positions (within what the KV cache keeps visible). Leaves each
     // token's heads in att_, value_dim channels per head.
-    void attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    void attention(const Layer& layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
     // nullptr: none) and keys (n_head_kv heads), where the block has them.
@@ -935,7 +941,10 @@ private:
     // Divides one token's keys (n_head_kv heads) by the key scales of
     // attention block `kv_slot` and multiplies its queries (n_head heads;
     // nullptr: none) by them. No-op without scales.
-    void scale_keys(int32_t kv_slot, float* q, float* k) const;
+    void scale_keys(const Layer& layer, float* q, float* k) const;
+    // Store only this block's real heads and zero-pad the fixed KV image's
+    // remaining heads. Every forward and early-exit path shares this rule.
+    void store_kv(const Layer& layer, KvCache& cache, int32_t pos, const float* k, const float* v);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
@@ -1000,6 +1009,11 @@ private:
     TripleBufferLoader* layer_source_ = nullptr;
     std::vector<int32_t> layer_items_;
     bool layer_shared_ = false;
+    // New geometry/scalar metadata and plan features can change a model
+    // without changing global dimensions, file size or the first MiB.
+    // A complete first-header fingerprint protects states, raw text and
+    // all derived cache keys; other legacy layouts keep 0.
+    uint64_t variant_fingerprint_ = 0;
 
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
@@ -1058,6 +1072,7 @@ private:
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
+    std::vector<float> padded_k_, padded_v_; // one KV row, only for blocks narrower than the cache layout
     std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
     std::vector<KvCache::RowView> row_views_;           // attention: each segment's rows of the block
     std::vector<int32_t> attn_rows_;                    // attention: the rows attending, when not every row

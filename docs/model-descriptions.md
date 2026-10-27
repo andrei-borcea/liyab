@@ -83,6 +83,215 @@ trip), the tensors the forward pass binds from `transformer.cpp`, the pre-tokeni
 `pre_tokenizer.cpp` and `tokenizer.cpp`. An `ArchSpec` field the tool has no rule for makes it refuse to propose
 rows until the rule is added.
 
+The tool also checks blocks without rotation (the file's `attention.rope_pattern`, a periodic pattern, or global
+blocks beside windowed ones), post-only branch norms, whole-projection Q/K RMSNorm, and embedding/residual/logit
+scales against the reference. A file's logit scale is tested as both a multiplier and a divisor. YaRN's two
+log-multiplier conventions are distinguished by the reference's rotation magnitude and attention scale. Windowed
+blocks' unscaled rotary table can use the global base. A switch whose activation condition is absent cannot be
+established from that checkpoint: the tool explicitly reports it as inactive and retains its registered value
+(the engine default for a new row). It never uses a registered value to decide an active behavior.
+
+Per-block `attention.head_count`, `attention.head_count_kv` and `feed_forward_length` arrays describe NAS geometry.
+The planner distinguishes softmax attention, a single linear residual projection, and an absent mixer; zero-width
+FFNs are absent. Only softmax-attention blocks own KV slots. Scratch buffers and cache images use the maximum
+dimensions, with inactive KV heads stored as zeros; projections, normalization, grouped-query attention, key
+calibration and relocation use the active dimensions of the block.
+The independent float-reference check also runs through available GPU backends. Streamed block slots retain the
+CPU projection route; its quantized activation arithmetic is the reference for the streaming check.
+Latent attention still uses uniform head geometry; a file varying latent head counts is refused before loading
+the uniform projection path.
+Saved states include the file fingerprint when these arrays or modern scalar/rotation-pattern keys are present;
+models with different geometry or scales cannot exchange states just because their dimensions and file sizes match.
+For quantized KV caches, key calibration includes a conservative query-temperature gain over its covered context;
+the measured channel bounds remain valid beyond the first temperature boundary.
+
+A five-block Nemotron-NAS tiny case exercises two GQA ratios, a linear mixer, absent attention, a fully empty
+block and different FFN widths. Its exact registry row passes the strict F32 gate: mean/max KL 0.00000,
+top-1 99.80%, 499 conformance IDs and three tokenizer texts identical (498/797/202). The 14 template
+cases match the existing fixture. Regeneration from the original configuration produces identical tensor bytes;
+the official forward source is unchanged. The existing NAS golden case covers these numerical paths.
+A linear mixer is established by recomputing its entire observed output from a unique linear projection,
+including any bias. This also covers direct child `forward` calls that bypass module hooks. Ambiguous projections,
+additional transformations and shape changes remain unknown; both one-branch and two-branch blocks use this rule.
+`tests/test_reference_trace.py` checks these positive and negative cases with PyTorch and no model weights.
+The modern model tokenizer rules (`smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`) are validated on all
+three gate texts. SmolLM3's chat template is also recorded in `tests/data/chat_templates.json`; its 14 cases render
+exactly as transformers does. An OLMo 2 base checkpoint has no chat template to render.
+Clock-reading template fixtures store a fixed `clock_utc` instant; both reference generation and the C++ test
+override `strftime_now` through their existing template context, independently of the current day and time zone.
+The fixture helper uses `gmtime_s` on Windows and `gmtime_r` elsewhere; neither changes the runtime clock.
+GLM-4's `glm4` name selects the Llama-3 split and whole-piece lookup, without Unicode normalization.
+The tokenizer accepts the converter's integer Tekken scores as numeric values. Template fixtures cover GLM-4,
+Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS, including Seed-OSS's integer dictionary keys and thinking-budget
+boundaries. `conform_reference.py` disables the unused generation cache during its single teacher-forced pass;
+this also avoids generation-cache API differences in older official model implementations.
+Its `--state-dict` option constructs a local model on CPU before loading safetensors and checks all parameters,
+including tied aliases. This retains the authors' nonpersistent rotary buffers when newer transformers pretrained
+loading does not. The trace observes native SDPA for classes that predate `AttentionInterface`, verifies repeated
+KV heads before collapsing them for analysis, and leaves the attention computation unchanged. Tiny-checkpoint JSON
+overrides run through the configuration constructor so nested block descriptions retain their required types.
+`describe_model.py --gate --reference-state-dict` passes the local CPU loader through to the gate's reference run.
+For RMSNorm weights with a scalar offset, the trace measures that offset against the full output and the tool
+checks the converter's folded weights. Native SDPA observation also verifies the actual causal/window mask;
+additional additive score biases remain unknown.
+`chat_template_reference.py --trust-remote-code` enables official custom tokenizer code when recording templates;
+the default still loads tokenizers without executing remote code.
+For `chatglm-spm`, the initial-special-token rule is `[gMASK], sop`, independently of the ordinary BOS flag.
+The tokenizer resolves these control tokens from the vocabulary, refuses an incomplete prefix, and inserts it
+once; segmented encoding keeps an automatic prefix before the reusable text. The description tool compares the
+scheme's prefix with the official tokenizer's actual special-token output.
+ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder templates have 14 reference cases each.
+Seed-OSS and GLM-4-9B-0414 have F32 tiny-checkpoint conformance: mean KL 0.00000, top-1 100.00% and 99.80%,
+respectively, with 512 and 498 identical conformance IDs and all three tokenizer texts matching. Their template
+fixtures cover 19 and 14 requests. No full-weight checkpoint was measured for these families or for Deci/Nemotron-NAS.
+ChatGLM3's tiny forward pass matches after adding its prefix, but the published converter also renames the
+SentencePiece BOS/EOS strings and marks more literal spellings as control tokens than its official tokenizer
+recognizes by default. Its three-text tokenizer gate therefore remains incomplete.
+The `plamo3` tokenizer scheme reads the converter's raw vocabulary and scores, rounds scores to the reference's
+integer units and finds the minimum-cost segmentation, preferring the longest prefix on ties. A Unicode character
+without a piece uses byte fallback. Its scheme fixes boundaries around `<|plamo:...|>` spellings, runs of two spaces
+and four repeated non-newline characters; raw whitespace is preserved. Missing byte tokens and invalid scores are
+refused when loading. PLaMo3's block row combines existing sandwich norms, fused projections and local/global RoPE.
+The converter does not record alternate boundary thresholds: the description tool refuses a reference using
+values other than the `plamo3` scheme's two spaces and four repeated characters.
+Norm names resolve both `.weight` and bare vector tensors through one helper shared by planning and loading. The
+description tool verifies either spelling against the reference's offset-folded weights.
+For `pfnet/plamo-3-610m-fin-instruct`, a tiny checkpoint with two blocks, window 8 and period 2 exercises both block
+kinds: identical 512 reference IDs, mean KL 0.00000 and top-1 99.61% with F16 KV. Keeping the original eight-block
+period instead gives mean KL 0.00000 (maximum 0.00005) and top-1 98.83%, below the tiny acceptance threshold. Its
+real F16 checkpoint passes the gate with mean KL 0.00000, maximum 0.00002 and 100% top-1. The original-period file
+proposes the registered `plamo3` row exactly; the two-block
+file's explicit metadata overrides its period, and the tool proposes period 2 for that reduced configuration.
+`conform_reference.py`, `tokenizer_reference.py --transformers` and `chat_template_reference.py` accept
+`--slow-tokenizer` to use the model authors' original implementation when conversion to a fast tokenizer changes
+its segmentation. `describe_model.py --reference-slow-tokenizer` uses it for settings, the three tokenizer texts
+and the teacher-forced reference, so every part of a gate uses the same tokenizer.
+For legacy eager attention, tracing observes the native `Q Kᵀ` and `probabilities V` matrix products. It retains
+the actual Q/K/V tensors and accepts a standard scale and causal/window mask only after recomputing every softmax
+probability; other score transformations remain unknown. The authors' forward calculation is unchanged.
+Packed GQA source projections are checked against both contiguous and per-group Q/K/V views, and only an exact
+numerical match establishes the layout. Weight comparison reads those measured rows even when the converter
+splits the projection into separate GGUF tensors. A requested remote slow tokenizer is loaded from its declared
+Python class, with explicit trust required; a library silently selecting a fast class is an error.
+InternLM2's original slow tokenizer matches 575, 989 and 190 IDs on the three gate texts. Its tiny checkpoint gives
+identical 512 reference IDs, mean KL 0.00000 and 100% top-1, and proposes the registered row exactly. Its real-model
+gate also passes with the EOS/EOT metadata correction recorded below; dynamic RoPE growth beyond the original
+context remains a reported limitation.
+The teacher-forced reference selects `AutoModelForImageTextToText` when a multimodal checkpoint has no
+`AutoModelForCausalLM` class. Its tokenizer IDs are passed directly to the model without images or an image
+processor, so this measures the text-only route of the authors' original implementation.
+`chat_template_reference.py --model NAME=TOKENIZER:TEMPLATE` renders that explicit file with transformers'
+Jinja renderer. This also covers Mistral's backend, whose native chat formatter ignores a Jinja template
+argument. InternLM2 and Ministral 3 each have 14 new fixtures, all byte-identical in the engine.
+To expose a window boundary within the 13-token trace, the tracer reduces a uniform scalar `sliding_window` /
+`window_size` through the configuration's constructor, verifies the resulting mask, then maps that observed size
+back to the original configured size. This keeps local/global blocks distinguishable even when the full window
+is thousands of tokens. It changes only the tracing configuration; the teacher-forced reference and engine gate
+run the checkpoint's original window. An OLMo 3 regression verifies three local blocks and a global block; the
+real PLaMo 3 description now derives its exact local-base/period row instead of conflating short causal masks.
+For configurations with `scale_depth`, both residual branches must numerically match
+`scale_depth / sqrt(traced_layer_count)` before the tool maps that multiplier to the original layer count.
+An unmatched rule remains unknown. This preserves MiniCPM's full-stack multiplier when tracing only two blocks;
+the teacher-forced reference continues to run the original checkpoint and configuration.
+Blocks without either the mixer or the FFN cannot establish a two-branch depth rule and leave it unknown.
+The `gpt2-nfkc-digits` scheme applies Unicode 9 NFKC before individual-digit splitting and GPT-2 ByteLevel.
+Compatibility decompositions and Unicode 9 assignment ranges are appended to the existing Unicode tables;
+canonical decomposition, ordering and composition are shared with NFC. Newer characters remain inert, matching
+the reference normalization dependency. Unicode 16 normalization differs on newer characters and is not used
+for this tokenizer mode. The description tool verifies this exact source JSON pipeline and reports a
+wrong file tag, incompatible source, or unavailable source proof. Active corrected tokenizer modes also remain
+unknown when the reference tokenizer itself cannot load. Neither rule depends on a model name.
+Normalization preserves malformed bytes while still composing valid characters after them.
+Modern per-block geometry, scalar/rotation metadata, NoPE, post-only and whole-projection norm plans, and
+corrected `spm-greedy` / `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts,
+key-scale/latent-form calibration and KV-store keys. Equal-sized metadata or tokenizer changes beyond the first MiB therefore invalidate incompatible contexts
+and derived calibrations. Legacy plans without these features retain their prior identities and state compatibility.
+If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
+reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
+configuration and chat template are retained; a class that discards the supplied pipeline is refused.
+EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after correcting the converter's
+`tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
+and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
+its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
+its existing plain ByteLevel rule. The full corrected-file result is recorded below.
+The explicit original slow-tokenizer path is unchanged.
+`python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
+
+`tools/gen_text_tests.py --nfkc-only` generates the additive NFKC expectations and source pipeline splits in
+`tests/data/text_cases.txt`; the default generator includes these after all existing records.
+When a legacy model does not implement its input-embedding accessor, the trace identifies a unique observed
+`Embedding` call on the actual token IDs, before any first-block child runs and with the first block's input shape.
+Repeated calls to the same table count once; different candidate tables remain unknown. The existing full-tensor
+embedding-scale check still applies, so positional additions or other input transformations cannot be hidden.
+An unavailable output accessor similarly requires exactly one observed linear projection after the last block,
+with the logits' shape. Its norm input, possible input multiplier, bias and entire logit transform are still
+verified numerically. Multiple candidate calls remain unknown, including repeated calls to the same head.
+Byte-token mismatch diagnostics may contain individual UTF-8 bytes. Gate subprocess output escapes those bytes
+when decoding its log, preserving the actual failed check instead of aborting with a Unicode decoding error.
+For SentencePiece references, the tool reads the source model's piece flags with `sentencepiece` and `protobuf`.
+If every ordinary BPE piece is `USER_DEFINED`, SentencePiece freezes the longest match rather than applying merge
+ranks. The corresponding file mode is `tokenizer.ggml.pre=spm-greedy`, with all byte fallback tokens, identity
+normalization, escaped spaces and preserved whitespace. The tool rejects an incompatible reference or leaves the
+rule unknown if its source flags cannot be read. A converter that drops those flags needs a corrected metadata
+copy; the tensor data does not change. Tokenization runs on the CPU with every backend.
+InternLM3's two-block F32 checkpoint uses the existing `llama` row. With `spm-greedy` and
+`tokenizer.ggml.add_space_prefix=false`, the strict tiny gate gives mean/max KL 0.00000 and top-1 100% over
+511 positions, with 512 BOS-inclusive IDs identical. The three full tokenizer texts match 606/1,007/205 IDs
+through the author's original slow tokenizer; all 14 chat-template cases render identically. The metadata copy
+preserves all 21 tensor payloads byte for byte. This validates the declared 32,768-position context only:
+the reference's dynamic-NTK recomputation beyond that limit is reported separately and is not implemented.
+The `deci` row also passes a three-block DeciLM-7B F32 tiny gate with 2/1/4 KV heads: mean/max KL 0.00000,
+top-1 100%, 512 BOS-inclusive IDs identical, and all three full tokenizer texts identical (629/1,032/279 IDs).
+Its 14 template cases match transformers. The b11819 Python converter needs a local vocabulary override:
+use `_set_vocab_sentencepiece()` when the source includes `tokenizer.model`, retaining its actual scores instead
+of `LlamaHfVocab`'s constant scores. The tensor conversion remains unchanged (all 30 payload hashes identical).
+Transformers 5 also needs the concrete remote causal class's `config_class = DeciLMConfig`; this registration
+compatibility change does not alter its forward pass. The strict gate remains within the declared context.
+The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` (revision `85252935bfc9acb3ee93dcea4b793fb87a0b43e8`) proposes the exact `minicpm` row.
+It gives mean/max KL 0.00000/0.00002, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (631/1049/248). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+For this reference run under transformers 5, a local copy of the legacy Python class treats normalized
+`rope_type=default` as the original unscaled branch and declares
+`_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}`. These two API adaptations leave its forward
+equations unchanged. The source's 470 tensors retain their exact dtypes and values when transcoded to safetensors;
+the unpatched b11819 converter then writes the F16 GGUF. The full 52-layer residual multiplier is verified as
+`1.4 / sqrt(52)`, with embedding multiplier 12 and logit multiplier 1/6.
+The full F16 gate for `internlm/internlm2_5-1_8b-chat` (revision `57dcbc5455bf050d27a80f0ebd7808387caa714d`) proposes the exact `internlm2` row.
+It gives mean/max KL 0.00000/0.00001, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (575/989/190). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+A metadata-only copy restores source EOS 2 and unknown token 0 and preserves chat EOS 92542 as EOT, matching
+the source generation stop set [2, 92542]. b11819 otherwise replaces EOS 2 with 92542 and omits unknown token 0.
+The unmodified file passes numerical and three-text checks but differs in template context and misses the
+original EOS stop. All 219 tensor payload hashes are unchanged.
+The full F16 gate for `unsloth/gemma-1.1-2b-it` (revision `619e546640669a280738627cc623f4bd74a7b069`) proposes the exact `gemma` row.
+It gives mean/max KL 0.00000/0.00000, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (513/786/211). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (1 rendered, 13 correctly refused).
+The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` (revision `707f574c62054322f6b5b04b6d075f0a8f05e0f0`) proposes the exact `granite` row.
+It gives mean/max KL 0.00000/0.00004, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (625/971/247). The source and GGUF chat templates and
+special strings match; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` (revision `b6d637bef2393152b3da2b2fde72eecdee30557e`) proposes the exact `mistral3` row.
+It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (517/879/235). Actual GGUF template renders and
+special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The unmodified b11819 HF-format path selects a different Devstral community template and fails author-output comparisons. Its native tekken vocabulary reader is selected by temporarily hiding the own tokenizer.json and restoring it before references. This gate changes only the template metadata slot to the official author Jinja, lexer-minified with the same AST and all 14 rendered outputs; all 236 tensor descriptors and the entire tensor data section are unchanged (SHA256 0ee6f18db9635f745dcc81d6904048ebcc66fc004d17247df1ea54f17e0c72c8). The private generic converter shim instead prefers a local author Jinja file after the existing vocabulary method, with no tensor changes. The existing `ministral3` fixture holds the full 11912-byte official author template (SHA256 0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b). The `ministral3-real` fixture tests the compact equivalent stored in the corrected GGUF. The Devstral fallback remains a separately recorded failed-export comparison.
+The native tokenizer exposes no Jinja attribute. Template proof uses the checkpoint's own `chat_template.jinja` explicitly with transformers Jinja, rather than asserting equivalence to the separate native tokenizer chat formatter.
+The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` (revision `ccce25bd39c141fe053e0bc75818a8f5fe962802`) proposes the exact `exaone` row.
+It gives mean/max KL 0.00000/0.00003, top-1 100.00%, 512 BOS-inclusive IDs identical,
+and three full tokenizer texts identical (615/917/243). Actual GGUF template renders and
+special strings match the author reference; all 14 fixture cases agree (14 rendered, 0 correctly refused).
+The standard b11819 tag `exaone4` loses the source NFKC/individual-digit pipeline. This real gate uses the metadata-only converter override `modern-nfkc-converter.py`, writing `gpt2-nfkc-digits` directly to avoid a duplicate full GGUF. The tiny direct override is byte-identical to the independently corrected unmodified export; all21 tensor payloads are unchanged. The unmodified real export was not separately gated and is not claimed to pass.
+For transformers 5 API compatibility, the private converter keeps the original AutoTokenizer factory but explicitly trusts the pinned official LGAI-EXAONE configuration. b11819 otherwise falls back to a generic configuration that cannot initialize legacy rope_scaling before max_position_embeddings exists. No source configuration, forward function or tensor conversion code is patched.
+The model has 80 channels per head. The existing Transformer loader selects F16 KV when a requested block-quantized KV row is not a multiple of 32. Q8_0, Q4_0 and Q4_1 requests each reproduce the F16 gate metrics and 512 source IDs; this is F16 fallback coverage, not native 80-channel quantized-KV support.
+GraniteSWA is deferred to integration with learned attention sinks. The current `GraniteSWAAttention` always
+allocates a per-head `sinks` parameter, uses it as an extra softmax-denominator logit and passes it as `s_aux` to
+registered attention. Its configuration also describes interleaved windows and per-layer `layer_rope_theta`
+(zero means NoPE); the converter writes a RoPE mask from its older `no_rope_layers` field. The exact checkpoint's
+metadata must therefore be checked at that integration. No GraniteSWA conformance result is claimed here.
+
 ## The conformance gate
 
 `--gate` verifies the row on a build that has it:
@@ -200,6 +409,20 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 | ERNIE-4.5-0.3B (F16, as published) | new `ernie4_5` | first token differs on each text | on the reference's ids: mean KL 0.00000, top-1 100.00% | rejected: the file's BOS and space-prefix rules |
 | ERNIE-4.5-0.3B (F16, the two tokenizer keys set to the model's rules) | new `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
 | ERNIE-4.5-0.3B (F16, fixed by `tools/gguf_set_keys.py`), again once the row was in the registry | registry's `ernie4_5` | 575 / 920 / 240, identical | 511 positions, mean KL 0.00000, top-1 100.00% | accepted |
+| SmolLM3-3B (F16, b11819 conversion of revision `a07cc9a`) | registry's `smollm3`, exact | 498 / 797 / 165, identical | 497 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
+| PLaMo-3-610m-fin-instruct (F16, b11819 conversion of revision `a000b59`) | registry's `plamo3`, exact | 521 / 950 / 251, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
+| OLMo-2-0425-1B (F16, b11819 conversion of revision `a1847df`) | registry's `olmo2`, exact | 544 / 882 / 187, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted |
+| EXAONE-4.0-1.2B (F16, b11819 conversion of revision `3abf281`) | registry's `exaone4`, exact | 618 / 993 / 254, identical | 511 positions, mean KL 0.00001, maximum 0.00018, top-1 100.00% | accepted |
+| openbmb/MiniCPM-1B-sft-bf16 (F16, b11819 conversion of revision `8525293`) | registry's `minicpm`, exact | 631 / 1049 / 248, identical | 511 positions, mean KL 0.00000, maximum 0.00002, top-1 100.00% | accepted |
+| internlm/internlm2_5-1_8b-chat (F16, b11819 with EOS/EOT metadata correction, revision `57dcbc5`) | registry's `internlm2`, exact | 575 / 989 / 190, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted corrected metadata |
+| unsloth/gemma-1.1-2b-it (F16, b11819 conversion of revision `619e546`) | registry's `gemma`, exact | 513 / 786 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00000, top-1 100.00% | accepted |
+| ibm-granite/granite-3.3-2b-instruct (F16, b11819 conversion of revision `707f574`) | registry's `granite`, exact | 625 / 971 / 247, identical | 511 positions, mean KL 0.00000, maximum 0.00004, top-1 100.00% | accepted |
+| mistralai/Ministral-3-3B-Instruct-2512-BF16 (F16, b11819 with author-template metadata correction, revision `b6d637b`) | registry's `mistral3`, exact | 517 / 879 / 235, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted corrected template; original community template differs |
+| LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct (F16, b11819 with NFKC metadata correction, revision `ccce25b`) | registry's `exaone`, exact | 615 / 917 / 243, identical | 511 positions, mean KL 0.00000, maximum 0.00003, top-1 100.00% | accepted corrected file; original tag incompatible |
+
+EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
+rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean
+KL 0.00000 and 99.80% top-1. The real gate and tiny hybrid check the same post-only norms and per-head Q/K norms.
 
 ### Models Liyab does not run
 
@@ -207,9 +430,18 @@ What the tool reports, in its words, for models whose architecture or tokenizer 
 
 | Model (GGUF) | Not implemented in Liyab |
 | :--- | :--- |
-| OLMo 2 1B (`olmo2`) | no norm before the mixer or the FFN (only after them); Q/K norms over all heads (2048) rather than per head (128); the `dbrx` pre-tokenizer |
-| Granite 3.1 2B (`granite`) | attention scale 0.015625 instead of 1/√64; residual multiplier 0.22; embeddings × 12 (not √d); logits × 0.125; the `refact` pre-tokenizer |
-| SmolLM3 3B (`smollm3`) | blocks without RoPE (block 3 of the 4 traced; the configuration's `no_rope_layers` lists every 4th); the `smaug-bpe` pre-tokenizer |
+| ChatGLM3 (b11819 export) | Raw control spellings and recognition differ from the original tokenizer; its three-text gate remains incomplete. |
+| IQuest-Coder (b11819 export) | The source added-token `single_word` boundaries are absent in the file; its tokenizer gate remains incomplete. |
+
+Granite's former entry required metadata attention scaling, embedding/residual/logit multipliers and the `refact` pre-tokenizer. These generic parts now pass the full Granite 3.3-2B gate above; Granite 3.1 itself was not separately gated.
+
+SmolLM3 moved out of this table after adding its unrotated blocks and `smaug-bpe` pre-tokenizer. The tool now
+proposes its registered row exactly and its full F16 checkpoint passes the gate above; its 14 chat-template
+fixtures also render byte for byte like transformers.
+
+OLMo 2 moved out after adding post-only branch norms, whole-projection Q/K norms and the `dbrx` pre-tokenizer.
+The real OLMo-2-0425-1B F16 checkpoint reproduces the registered row exactly and passes the gate above. This base
+checkpoint has no chat template. OLMo 3's local/global window pattern is covered separately by tiny conformance.
 
 Gemma 2 and DeepSeek-V2 were in this table until the engine gained what the tool listed for them: logit
 soft-capping (Gemma 2), and multi-head latent attention, YaRN and the file's attention scale (DeepSeek-V2). The
@@ -220,6 +452,51 @@ bartowski's Q8_0 header, SmolLM2 from bartowski's f16), both give the registry's
 0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention it reports an unknown rather than a
 row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
 such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
+
+### Modern block regression check
+
+The modern block, tokenizer and saved-context changes pass 14/14 test suites on native ARM64 with Metal
+available (135.71 s), Rosetta AVX2 (343.65 s) and Rosetta scalar (236.38 s). The experimental Android arm64
+build passes with four build jobs. There are 49 golden cases per platform: all 111 earlier pins are unchanged,
+and 12 new cases add 36 pins. The saved-main Qwen3-0.6B BF16 reference still gives identical 512 IDs, mean/max
+KL 0.00000, top-1 100% and perplexity 27.119 with F16 KV.
+
+Performance compares the frozen main and branch binaries back to back on an M4 Pro. Each configuration has
+a separate warmup pair and six balanced AB/BA pairs, using four threads. CPU `liyab-bench` measures 512-token
+prefill with `--repeat 1`; CLI measurements use an ordinary preselected request per model, a 128-token target,
+at least 64 naturally generated tokens, temperature 0 and seed 42. Main and branch replies and all six work
+counts match: prompt, cached-prefix, generated, forced, proposed-draft and accepted-draft tokens.
+
+Throughputs below are separate main/branch medians in tokens/s. Changes are medians of the six paired
+percentage changes, so they need not equal the percentage change of those throughput medians.
+BF16 Metal-route measurements include the existing CPU matrix fallback; F16 rows verify actual Metal
+projections. No Vulkan runtime measurement was available on this Mac.
+
+| Model | Route | Prefill main → branch | Paired change | Decode main → branch | Paired change |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | CPU CLI | 91.29 → 91.32 | -0.112% | 57.06 → 57.11 | +0.170% |
+| Qwen3-0.6B | CPU bench, 512 tokens | 87.95 → 87.90 | -0.114% | — | — |
+| Qwen3-0.6B | BF16 Metal route / CPU matrix fallback | 91.33 → 91.23 | -0.113% | 57.43 → 57.18 | -0.318% |
+| Llama-3.2-1B-Instruct | CPU CLI | 37.61 → 37.57 | -0.139% | 28.19 → 28.19 | -0.027% |
+| Llama-3.2-1B-Instruct | CPU bench, 512 tokens | 36.75 → 36.80 | +0.272% | — | — |
+| Llama-3.2-1B-Instruct | BF16 Metal route / CPU matrix fallback | 37.65 → 37.62 | +0.068% | 28.29 → 28.20 | -0.266% |
+| Qwen3.5-0.8B | CPU CLI | 84.73 → 84.23 | -0.338% | 53.43 → 53.29 | -0.444% |
+| Qwen3.5-0.8B | CPU bench, 512 tokens | 83.90 → 83.85 | -0.059% | — | — |
+| Qwen3.5-0.8B | BF16 Metal route / CPU matrix fallback | 84.25 → 84.11 | -0.178% | 53.50 → 53.36 | -0.434% |
+| Qwen3-0.6B | F16 Metal projections | 277.96 → 272.59 | -0.668% | 27.06 → 27.30 | +2.200% |
+| Llama-3.2-1B-Instruct | F16 Metal projections | 152.72 → 152.47 | -0.219% | 32.65 → 32.48 | -0.771% |
+| Qwen3.5-0.8B | F16 Metal projections, AC confirmation | 272.60 → 272.35 | -0.085% | 33.13 → 33.02 | -0.231% |
+
+The original 72-pair matrix had 20 of 21 metrics within the symmetric ±3% bound. Its Qwen3.5 F16 Metal
+decode result was faster by +6.2486% (23.265 → 25.259 tokens/s), outside that band; this result is preserved.
+Its prefill medians were 228.58 → 258.05 tokens/s, with a +0.851% paired median change and large individual
+outliers. The original matrix has no per-sample power telemetry, so a specific cause is not assigned to it.
+After a host battery/power-mode confound was identified, only that configuration received a separately
+authorized AC confirmation: the same frozen binaries, request (317 prompt IDs), context 1024 and flags,
+one warmup pair and six measured pairs. All 28 read-only power observations before/after those 14 runs
+show AC power; no system power settings changed. The last row reports that confirmation. The other 20
+original metrics remain accepted, and all 21 effective metrics are within ±3% (-0.7714% to +2.1996%).
+All 60 measured CLI reply pairs and six work counts agree across the original and confirmation runs.
 
 ## Limits
 
@@ -460,3 +737,17 @@ The first full neutral-path attempt passed 10/14 while the host discharged from 
 that attempt remains a failure. The table reports the subsequent complete, prospectively approved AC
 confirmation with unchanged binaries, runner, prompts, flags and ±3% threshold. This establishes the
 controlled harness comparison; no engine or kernel source performance fix is claimed.
+
+
+### Tokenizer export label collision
+
+Integration found two distinct source pipelines sharing the converter's `dbrx` label.
+DBRX uses its cl100k split and `ignore_merges=true`; the measured OLMo 2/3 source
+uses a Llama split with ordinary merge ranks. Their whitespace splits differ,
+for example on three spaces, two newlines, then two spaces. Liyab keeps `dbrx`
+for the former and provides `llama-bpe-merges` for the latter. The description
+tool verifies that explicit mode against the original serialized tokenizer and
+reports the colliding uncorrected export. The earlier OLMo gates used three
+ordinary texts and do not establish equivalence on this counterexample.
+A corrected metadata tag does not alter model tensor payloads. Final integration
+conformance for these files must record that correction explicitly.

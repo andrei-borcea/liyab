@@ -41,6 +41,10 @@ must find the file's own encoding of the text, BOS included, equal to the refere
 afterwards, so the scratch tree stays a pristine copy and later runs rebuild only what changed. The row is accepted
 only if every check passes. The gate needs the GGUF as a local file (a BF16/F16 one: lower bit widths add their own
 error) and downloads the Hugging Face weights.
+For a local legacy checkpoint, --reference-state-dict passes conform_reference.py's --state-dict option through
+the gate, preserving nonpersistent buffers by constructing the model on CPU before loading its safetensors.
+--reference-slow-tokenizer selects the authors' original slow tokenizer consistently for settings, all three
+tokenizer texts and the teacher-forced reference, bypassing incompatible slow-to-fast conversion.
 
 Needs torch, transformers, huggingface_hub, numpy and gguf (for quantized tensors). Run with the toolchain on PATH
 (cmake, ninja) for --gate. --self-test checks the registry parser and printer against architecture.cpp (no network).
@@ -404,7 +408,7 @@ class Engine:
         # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
         # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
         # caps, YaRN) are supported exactly when it reads them.
-        self.file_keys = set(re.findall(r'(?:key|require_int)\(\s*"([^"]+)"', cpp))
+        self.file_keys = set(re.findall(r'(?:key|require_int|block_values)\(\s*"([^"]+)"', cpp))
         self.rope_scalings = set(re.findall(r'\*scaling\s*[!=]=\s*"([\w-]+)"', cpp))
         m = re.search(r"kArchitectures\[\]\s*=\s*\{(.*?)\n\};", cpp, re.S)
         if m is None:
@@ -415,15 +419,22 @@ class Engine:
             self.rows[values["name"]] = (values, entry)
         transformer = read("src/core/transformer.cpp")
         self.block_tensors = set(re.findall(r'block_tensor\(\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
+        norms = set(re.findall(r'block_norm_tensor\(\s*\w+\s*,\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
+        self.block_tensors |= norms | {name + ".weight" for name in norms}
         self.block_tensors |= set(re.findall(r'experts\(\s*"([^"]+)"', transformer))
         literals = set(re.findall(r'"([a-z][a-z0-9_]*\.(?:weight|bias))"', transformer))
         self.global_tensors = {t for t in literals if t not in self.block_tensors}
         pre = read("src/core/pre_tokenizer.cpp")
         table = re.search(r"table\(\)\s*\{(.*?)\n\}", pre, re.S)
+        # Reuse the engine's declared regex when verifying serialized source
+        # pipelines; export labels alone can collide between tokenizers.
+        self.llama_bpe_pattern = re.search(r'constexpr const char\* kLlama3 =\s*R"\((.*?)\)";', pre, re.S).group(1)
         self.pre_tokenizers = []
         for names in re.findall(r'\{\{("[^"]+"(?:\s*,\s*"[^"]+")*)\}', table.group(1) if table else ""):
             self.pre_tokenizers += re.findall(r'"([^"]+)"', names)
-        self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', read("src/core/tokenizer.cpp"))
+        tokenizer = read("src/core/tokenizer.cpp")
+        self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', tokenizer)
+        self.spm_greedy = bool(re.search(r'\*spm_pre\s*==\s*"spm-greedy"', _strip_comments(tokenizer)))
 
     @staticmethod
     def _entries(text):
@@ -519,7 +530,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim")
 
 
 def _close(a, b, rel=1e-5):
@@ -643,7 +654,7 @@ def _f32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
+def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False, mscale_all_dim=False):
     """RoPE frequencies and magnitude the engine computes from the file (Transformer::load and describe_model()):
     base^(-2i/r) divided by the file's frequency factors, blended by YaRN when the file asks for it, over the
     linear position scale. Returns (inv_freq / scale list, magnitude, q.k factor, how)."""
@@ -689,8 +700,11 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
         ln = math.log(factor) if factor > 1.0 else 0.0
         log_mul = g.key("rope.scaling.yarn_log_multiplier")
         attn = g.key("rope.scaling.yarn_attn_factor")
-        magnitude *= float(attn) if attn is not None else (1.0 if log_mul is not None else 0.1 * ln + 1.0)
-        if log_mul is not None:
+        if mscale_all_dim and log_mul is not None:
+            magnitude *= float(attn) if attn is not None else (1.0 + 0.1 * ln) / (1.0 + 0.1 * float(log_mul) * ln)
+        else:
+            magnitude *= float(attn) if attn is not None else (1.0 if log_mul is not None else 0.1 * ln + 1.0)
+        if log_mul is not None and not mscale_all_dim:
             qk = 1.0 + float(log_mul) * ln
         how.append(f"YaRN factor {factor:g} over {ctx:g} positions")
     inv = []
@@ -705,7 +719,7 @@ def engine_inv_freq(g, rope_dim, n_ctx_train, long_context=False):
     return inv, _f32(magnitude), qk, ", ".join(how)
 
 
-def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
+def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, slow_tokenizer=False):
     import numpy as np
     import reference_trace
 
@@ -722,6 +736,12 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         return d, None, g
     cfg = facts["config"]
     d.set("name", arch, "general.architecture of the GGUF")
+    def inactive(field, why):
+        # An inactive switch cannot be inferred from this file. Keeping its registered value is safe only
+        # after proving its activation condition absent; it preserves a family's row across its variants.
+        registered = engine.rows.get(arch, ({}, ""))[0]
+        d.set(field, registered.get(field, engine_default(engine, field)),
+              why + "; this switch is inactive (registered value, or the engine default for a new row)")
     d.notes.append(f"reference: {facts['model_class']} ({facts.get('model_type')}), {facts['traced_blocks']} of "
                    f"{facts['blocks']} blocks traced")
     unknown_fields = [n for n, _, _ in engine.fields if n not in DERIVED_FIELDS]
@@ -733,11 +753,19 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     # --- hyperparameters from the file, as describe_model() reads them ---
     n_layers = int(g.key("block_count", 0)) - int(g.key("nextn_predict_layers", 0) or 0)
     n_embd = int(g.key("embedding_length", 0))
-    n_head = int(g.key("attention.head_count", 0) or 0)
-    n_head_kv = int(g.key("attention.head_count_kv", n_head) or n_head)
+    def per_block(value, label):
+        values = [int(v) for v in value] if isinstance(value, list) else [int(value or 0)] * n_layers
+        if len(values) < n_layers or any(v < 0 for v in values):
+            raise FormatError(f"invalid per-block {label}")
+        return values[:n_layers]
+    block_heads = per_block(g.key("attention.head_count", 0), "attention.head_count")
+    block_kv_heads = per_block(g.key("attention.head_count_kv", block_heads), "attention.head_count_kv")
+    block_ff = per_block(g.key("feed_forward_length", 0), "feed_forward_length")
+    n_head = max(max(block_heads, default=0), 1)
+    n_head_kv = max(max(block_kv_heads, default=0), 1)
     head_dim = int(g.key("attention.key_length", n_embd // max(n_head, 1)))
     rope_dim = int(g.key("rope.dimension_count", head_dim))
-    n_ff = int(g.key("feed_forward_length", 0) or 0)
+    n_ff = max(block_ff, default=0)
     eps = float(g.key("attention.layer_norm_epsilon", g.key("attention.layer_norm_rms_epsilon", 1e-5)))
     if n_layers != facts["blocks"]:
         d.file_issues.append(f"the GGUF has {n_layers} blocks, the reference {facts['blocks']}")
@@ -771,12 +799,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     plans = []
     for b in range(n_layers):
         ts = blocks.get(b, set())
-        p = {}
+        p = {"n_head": block_heads[b], "n_head_kv": block_kv_heads[b], "n_ff": block_ff[b]}
         if "ssm_conv1d.weight" in ts:
             p["mixer"] = "deltanet"
+        elif block_kv_heads[b] == 0:
+            p["mixer"] = "none" if block_heads[b] == 0 else "linear"
         else:
             p["mixer"] = "attention"
-            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * q_dim
+            p["attn_gate"] = suffix_rows(b, "attn_q.weight") == 2 * block_heads[b] * head_dim
             p["fused_qkv"] = "attn_q.weight" not in ts and "attn_qkv.weight" in ts
             p["qkv_bias"] = bool({"attn_q.bias", "attn_qkv.bias"} & ts)
             p["qk_norm"] = "attn_k_norm.weight" in ts
@@ -786,9 +816,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             p["shared_gate"] = "ffn_gate_inp_shexp.weight" in ts
             p["selection_bias"] = "exp_probs_b.bias" in ts
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
+        elif block_ff[b] == 0 and "ffn_up.weight" not in ts:
+            p["ffn"] = "none"
         else:
             p["ffn"] = "dense"
-            p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * n_ff
+            p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * block_ff[b]
         plans.append(p)
 
     # --- the reference, block by block ---
@@ -801,16 +833,22 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         for a in b.get("absent", []):
             if b.get("parallel") and "same normed input" in a:
                 continue  # the shared-input form of a parallel block
-            d.missing.append(f"block {b['index']}: {a}")
+            post_only = ((a.startswith("no norm before the token mixer") and b.get("norm_after_mixer")) or
+                         (a.startswith("no norm before the FFN") and b.get("norm_after_ffn")))
+            if post_only:
+                d.parts.append(f"block {b['index']}: {a}; its branch has a norm after it")
+            else:
+                d.missing.append(f"block {b['index']}: {a}")
         i = b["index"]
         if i < len(plans):
             kind = b.get("mixer", {}).get("kind")
             if kind == "attention" and plans[i]["mixer"] != "attention":
                 d.file_issues.append(f"block {i}: the reference attends, the GGUF has a recurrent block")
             if kind == "recurrent" and plans[i]["mixer"] != "deltanet":
-                d.missing.append(f"block {i}: a token mixer that is not softmax attention "
-                                 f"({', '.join(b['mixer'].get('classes', []))}) without the engine's Gated "
-                                 f"DeltaNet tensors")
+                d.unknown.append(f"block {i}: no standard attention calculation was captured for the token mixer "
+                                 f"({', '.join(b['mixer'].get('classes', []))}); its computation is not established")
+            if kind in ("none", "linear") and plans[i]["mixer"] != kind:
+                d.file_issues.append(f"block {i}: {kind} mixer in the reference, {plans[i]['mixer']} in the file")
 
     # Unknown mixers: say what the file holds, e.g. latent attention.
     for b in att_blocks:
@@ -872,14 +910,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if gname in g.tensors and hname is not None:
             # Two heads tell the row order (and whether the weights are the same); the rest would only cost
             # downloads.
-            heads = min(n_head_kv, 2)
-            first = q_dim if key["projection_layout"].startswith("fused") else 0
-            if key["projection_layout"].startswith("fused grouped"):
-                q_per_group = n_head // n_head_kv
-                hf = np.concatenate([ckpt.tensor(hname, (h * (q_per_group + 2) + q_per_group) * head_dim, head_dim)
-                                     for h in range(heads)])
-            else:
-                hf = ckpt.tensor(hname, first, heads * head_dim)
+            heads = min(block_kv_heads[i], 2)
+            source_rows = key["projection_rows"][:heads * head_dim]
+            # Converters may split a packed source projection. Compare the
+            # measured source rows with the key rows in the file independently.
+            hf = np.concatenate([ckpt.tensor(hname, source_rows[h * head_dim], head_dim)
+                                 for h in range(heads)])
+            first = block_heads[i] * head_dim if gname.endswith("attn_qkv.weight") else 0
             gg = g.values(gname, first, heads * head_dim)
             perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
             if perm is None:
@@ -912,7 +949,32 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     if scaling_type not in (None, "none") and scaling_type not in engine.rope_scalings:
         d.missing.append(f"{'YaRN' if scaling_type == 'yarn' else repr(scaling_type)} RoPE scaling "
                          f"(rope.scaling.type {scaling_type})")
-    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+    mscale_all_dim = False
+    log_mul = g.key("rope.scaling.yarn_log_multiplier")
+    if scaling_type == "yarn" and log_mul is not None:
+        main = global_tables or window_tables
+        matches = []
+        for convention in (False, True):
+            _, mag, qk, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                           mscale_all_dim=convention)
+            scales = [b["mixer"]["scale"] for b in att_blocks]
+            want_scale = float(g.key("attention.scale", head_dim ** -0.5)) * qk ** 2
+            if (all(_close(rope_tables[t]["magnitude"], mag, 1e-5) for t in main) and
+                    all(_close(s, want_scale, 1e-5) for s in scales)):
+                matches.append(convention)
+        if len(matches) == 1:
+            mscale_all_dim = matches[0]
+            d.set("yarn_mscale_all_dim", mscale_all_dim,
+                  "YaRN rotation magnitude and attention scale establish the file's log-multiplier convention")
+        elif len(matches) == 2:
+            inactive("yarn_mscale_all_dim", "both conventions give the same magnitude and attention scale")
+            mscale_all_dim = d.fields["yarn_mscale_all_dim"][0]
+        else:
+            d.unknown.append("neither YaRN log-multiplier convention matches the reference")
+    else:
+        inactive("yarn_mscale_all_dim", "no YaRN log multiplier in this file")
+    _, _, qk_factor, _ = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                       mscale_all_dim=mscale_all_dim)
     rope_dims = {b["mixer"]["key"]["rope"]["dims"] for b in att_blocks
                  if b["mixer"].get("key") and b["mixer"]["key"].get("rope")}
     if rope_dims and rope_dims != {rope_dim}:
@@ -925,7 +987,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         t = rope_tables[tname]
         ref = t["inv_freq"]
         if rope_base is None:
-            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0))
+            inv, mag, _, how = engine_inv_freq(g, rope_dim, int(g.key("context_length", 0) or 0),
+                                              mscale_all_dim=mscale_all_dim)
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"
@@ -949,6 +1012,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for tname in sorted(main_tables):
         check_table(tname, "attention blocks" if not (global_tables and window_tables) else "globally attending blocks")
     rope_params = cfg.get("rope_parameters") or {}
+    if facts.get("window_probe"):
+        probe = facts["window_probe"]
+        d.notes.append(f"window boundary verified with a reduced {probe['traced']}-position window; "
+                       f"the original configuration's uniform window is {probe['configured']}")
     rope_types = {v.get("rope_type") for v in rope_params.values() if isinstance(v, dict)} or {rope_params.get("rope_type")}
     if "dynamic" in rope_types:
         d.notes.append("the reference's dynamic RoPE recomputes its frequencies once a sequence grows past "
@@ -1035,7 +1102,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             why = "the file's sliding_window_pattern lists the windowed blocks"
         else:
             why = f"blocks {period - 1}, {2 * period - 1}, ... attend globally, the others through the window"
-        d.set("swa_period", period, why)
+        if not win:
+            inactive("swa_period", why)
+        else:
+            d.set("swa_period", period, why)
         # Windowed blocks with their own RoPE table: an unscaled base of their own.
         base_swa = 0.0
         if win and global_tables and window_tables and window_tables != global_tables:
@@ -1048,15 +1118,64 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 if base is None:
                     d.unknown.append("cannot read the windowed blocks' RoPE base")
                 else:
-                    base = float(f"{base:.6g}")
+                    # Prefer the file's exact scalar once its full frequency
+                    # table is verified; inversion of one F32 frequency can
+                    # turn a base of 10000 into 9999.98.
+                    base = float(g.key("rope.freq_base_swa", float(f"{base:.6g}")))
                     if check_table(t["name"], "windowed blocks", rope_base=base):
                         base_swa = base
                         fb = g.key("rope.freq_base_swa")
                         if fb is not None and not _close(float(fb), base):
                             d.file_issues.append(f"rope.freq_base_swa {fb} in the file, {base:g} in the reference")
-        d.set("rope_base_swa", base_swa,
+        unscaled = bool(base_swa and _close(base_swa, float(g.key("rope.freq_base", 10000.0)), 1e-5))
+        if base_swa:
+            d.set("swa_rope_unscaled", unscaled, "windowed blocks' frequencies compared with the global base")
+        else:
+            inactive("swa_rope_unscaled", "no separate unscaled windowed RoPE table")
+        d.set("rope_base_swa", 0.0 if unscaled else base_swa,
               f"windowed blocks rotate unscaled with base {base_swa:g}" if base_swa else
               "windowed blocks rotate like the others" if win else "no windowed block")
+
+    # NoPE is planned from the file's bool list, or from the row's periodic/global rule. Establish the rule
+    # from observed Q/K and the configuration's list, and verify every traced block against the plan.
+    rotation = {}
+    for b in att_blocks:
+        info = b["mixer"]
+        q, k = info.get("query"), info.get("key")
+        if q is not None and k is not None:
+            if bool(q.get("rope")) != bool(k.get("rope")):
+                d.unknown.append(f"block {b['index']}: only one of Q and K is rotated")
+            else:
+                rotation[b["index"]] = bool(k.get("rope"))
+    configured = cfg.get("no_rope_layers")
+    full_rotation = [bool(v) for v in configured] if isinstance(configured, list) and len(configured) == n_layers else None
+    if full_rotation is not None and any(full_rotation[i] != v for i, v in rotation.items()):
+        d.unknown.append("the configuration's no_rope_layers flags disagree with observed Q/K rotation")
+    no_rotation = [i for i, v in rotation.items() if not v]
+    global_nope = bool(no_rotation and flags and g.key("attention.sliding_window", 0) and
+                       all(v == bool(flags[i]) for i, v in rotation.items()))
+    if no_rotation:
+        d.set("nope_global", global_nope, "only windowed blocks rotate" if global_nope else
+              "NoPE blocks are independent of attention windows")
+        period = 0
+        if not global_nope:
+            source = dict(enumerate(full_rotation)) if full_rotation is not None else rotation
+            period = next((p for p in range(1, n_layers + 1)
+                           if all(v == ((i + 1) % p != 0) for i, v in source.items())), 0)
+        d.set("nope_period", period, "period established by Q/K rotation and the configuration's flags" if period else
+              "rotation is selected by the global-block rule or the file's explicit list")
+        pattern = g.key("attention.rope_pattern")
+        for i, v in rotation.items():
+            planned = (bool(pattern[i]) if isinstance(pattern, list) and i < len(pattern) else
+                       not ((period and (i + 1) % period == 0) or (global_nope and not flags[i])))
+            if v != planned:
+                d.file_issues.append(f"block {i}: the file and row do not select the observed Q/K rotation")
+        if not period and not global_nope and not isinstance(pattern, list):
+            d.missing.append("irregular NoPE blocks without attention.rope_pattern metadata")
+        d.parts.append(f"NoPE blocks {_ranges(no_rotation)} (Q and K are not rotated)")
+    else:
+        inactive("nope_period", "every traced attention block rotates")
+        inactive("nope_global", "no observed global NoPE block")
 
     # --- attention arguments ---
     qk_orders, qk_spans = set(), set()
@@ -1088,6 +1207,17 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         i = b["index"]
         if not _close(float(g.key("attention.clamp_kqv", 0.0)), float(m.get("clamp_kqv", 0.0)), 1e-5):
             d.file_issues.append(f"block {i}: attention.clamp_kqv differs from the observed symmetric clamp")
+        temperature = m.get("temperature")
+        beta = float(g.key("attention.temperature_scale", 0.0))
+        if temperature:
+            length = int(g.key("attention.temperature_length",
+                               g.key("rope.scaling.original_context_length", 0)))
+            if not _close(beta, temperature["beta"]) or length != temperature["length"]:
+                d.file_issues.append(f"block {i}: query temperature {temperature}, file beta {beta:g}, length {length}")
+            else:
+                d.parts.append(f"query temperature 1 + {beta:g} ln(1 + floor(pos / {length})) from the file")
+        elif beta != 0.0:
+            d.file_issues.append(f"block {i}: file query temperature beta {beta:g}, absent in the reference")
         if not _close(m["scale"], engine_scale, 1e-5):
             if "attention.scale" in engine.file_keys:
                 d.file_issues.append(f"block {i}: attention scale {m['scale']:.6g} in the reference, "
@@ -1112,9 +1242,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             d.missing.append(f"block {i}: attention sinks (a learned logit per head)")
         if not m.get("causal", True):
             d.missing.append(f"block {i}: non-causal attention")
-        if m["head_dim"] != head_dim or m["heads"] != n_head or m["kv_heads"] != n_head_kv:
+        if m["head_dim"] != head_dim or m["heads"] != block_heads[i] or m["kv_heads"] != block_kv_heads[i]:
             d.file_issues.append(f"block {i}: {m['heads']}/{m['kv_heads']} heads of {m['head_dim']} in the "
-                                 f"reference, {n_head}/{n_head_kv} of {head_dim} in the file")
+                                 f"reference, {block_heads[i]}/{block_kv_heads[i]} of {head_dim} in the file")
         for side in ("key", "query"):
             info = m.get(side) or {}
             if info.get("norm"):
@@ -1125,12 +1255,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         if bool(gate) != bool(plan.get("attn_gate")):
             d.file_issues.append(f"block {i}: the reference {'gates' if gate else 'does not gate'} the attention "
                                  f"output, the file's attn_q {'is not' if gate else 'is'} twice as tall")
-        key = m.get("key") or {}
-        if key.get("projection_layout", "").startswith("fused") != bool(plan.get("fused_qkv")):
-            d.file_issues.append(f"block {i}: fused QKV in one of the reference and the file only")
     if qk_spans - {head_dim}:
-        d.missing.append(f"Q/K norms over {sorted(qk_spans - {head_dim})} dimensions (all heads together), "
-                         f"not each head's {head_dim}")
+        valid_spans = {head_dim} | {h * head_dim for h in block_heads + block_kv_heads if h > 0}
+        bad = qk_spans - valid_spans
+        if bad:
+            d.missing.append(f"Q/K norms span unsupported dimensions {sorted(bad)}")
+        else:
+            d.parts.append("Q/K RMSNorm over the whole projection, planned from the norm tensor's length")
     if len(qk_orders) > 1:
         d.unknown.append("Q/K norms sit before RoPE in some blocks and after it in others")
     elif qk_orders:
@@ -1143,7 +1274,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     roles = ("norm_before_mixer", "norm_after_mixer", "norm_before_ffn", "norm_after_ffn")
     placement = {}
     for r in roles:
-        present = {b.get(r) is not None for b in bf if "mixer" in b}
+        branch = "mixer" if "mixer" in r else "ffn"
+        present = {b.get(r) is not None for b in bf if b.get(branch, {}).get("kind") not in (None, "none")}
         if len(present) > 1:
             d.unknown.append(f"{r.replace('_', ' ')} exists in some blocks only")
         placement[r] = present == {True}
@@ -1162,17 +1294,29 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     eps_ref = {(b.get(r) or {}).get("eps") for b in bf for r in roles if b.get(r)} - {None}
     if eps_ref and not all(_close(e, eps, 1e-3) for e in eps_ref):
         d.file_issues.append(f"norm epsilon {sorted(eps_ref)} in the reference, {eps} in the file")
+    if facts.get("depth_scale_probe"):
+        probe = facts["depth_scale_probe"]
+        d.notes.append(f"residual scale verified as scale_depth/sqrt(layers) with {probe['traced_layers']} traced "
+                       f"layers; the original {probe['original_layers']}-layer configuration uses "
+                       f"{probe['original_multiplier']:.6g}")
     if any(isinstance(b.get("residual"), dict) for b in bf):
         mults = sorted({round(b["residual"]["multiplier"], 6) for b in bf if isinstance(b.get("residual"), dict)})
-        d.missing.append(f"residual multiplier {mults}: the block's mixer and FFN outputs are scaled before "
-                         f"they are added")
+        if any(b.get("residual", {}).get("only_ffn") for b in bf if isinstance(b.get("residual"), dict)):
+            d.missing.append("residual multiplier on the FFN only")
+        elif len(mults) != 1 or not _close(mults[0], float(g.key("residual_scale", 1.0)), 1e-5):
+            d.file_issues.append(f"residual multipliers {mults}, file residual_scale {g.key('residual_scale', 1.0)}")
+        else:
+            d.parts.append(f"residual branches multiplied by {mults[0]:g} (residual_scale)")
+    elif not _close(float(g.key("residual_scale", 1.0)), 1.0):
+        d.file_issues.append("file residual_scale differs from the reference's unscaled residual branches")
 
     norm_names = {}
-    b0 = next((b for b in bf if "mixer" in b and b["index"] < n_layers), None)
+    b0 = next((b for b in bf if b.get("mixer", {}).get("kind") not in (None, "none") and
+               b.get("ffn", {}).get("kind") not in (None, "none") and b["index"] < n_layers), None)
     if b0 is not None and ckpt is not None:
         i = b0["index"]
         candidates = {s: g.values(f"blk.{i}.{s}").reshape(-1) for s in blocks.get(i, set())
-                      if s.endswith(".weight") and len(g.tensors[f"blk.{i}.{s}"]["dims"]) == 1
+                      if len(g.tensors[f"blk.{i}.{s}"]["dims"]) == 1
                       and g.tensors[f"blk.{i}.{s}"]["dims"][0] == n_embd}
         for r in roles:
             info = b0.get(r)
@@ -1185,10 +1329,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.unknown.append(f"no reference weights for {info['module']}")
                 continue
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if info["formula"] in ("rms_1p", "layer_1p") else w
+            want = w + info.get("weight_offset", 1.0 if info["formula"] in ("rms_1p", "layer_1p") else 0.0)
             hits = [s for s, v in candidates.items() if v.shape == want.shape and _rel_err(v, want) < 1e-2]
             if len(hits) == 1:
-                norm_names[r] = hits[0][: -len(".weight")]
+                norm_names[r] = hits[0].removesuffix(".weight")
             elif not hits:
                 stored_raw = [s for s, v in candidates.items() if v.shape == w.shape and _rel_err(v, w) < 1e-2]
                 if info["formula"] == "rms_1p" and stored_raw:
@@ -1239,6 +1383,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
               "attention and FFN read the block input" if parallel else "the FFN follows the attention residual")
     elif parallels:
         d.missing.append("parallel residuals in only some blocks")
+    elif placement.get("norm_after_ffn"):
+        d.set("ffn_norm", "ffn_norm", "no norm before the FFN; the conventional absent tensor name is unused")
+    elif all(b.get("ffn", {}).get("kind") == "none" for b in bf):
+        d.set("ffn_norm", "ffn_norm", "no FFN branch; its conventional norm name is inactive")
     for r, field in (("norm_after_mixer", "post_mixer_norm"), ("norm_after_ffn", "post_ffn_norm")):
         if not placement.get(r):
             d.set(field, "", f"no norm after the {'mixer' if 'mixer' in r else 'FFN'}")
@@ -1252,7 +1400,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
             norm = (b["mixer"].get(side) or {}).get("norm")
             if not norm:
                 continue
-            if norm.get("formula") not in ("rms", "rms_1p", "layer", "layer_1p"):
+            if norm.get("formula") not in ("rms", "rms_1p", "rms_offset", "layer", "layer_1p"):
                 d.unknown.append(f"block {b['index']}: the {side} norm has an unknown formula")
                 continue
             gname = f"blk.{b['index']}.{gsuffix}"
@@ -1262,7 +1410,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.file_issues.append(f"the reference normalizes {side}s, the GGUF has no {gname}")
             elif hname is not None:
                 w = np.concatenate([ckpt.tensor(name).reshape(-1) for name in hnames])
-                want = w + 1.0 if norm["formula"] == "rms_1p" else w
+                want = w + norm.get("weight_offset", 1.0 if norm["formula"] in ("rms_1p", "layer_1p") else 0.0)
                 have = g.values(gname).reshape(-1)
                 if have.shape != want.shape or _rel_err(have, want) > 1e-2:
                     d.file_issues.append(f"{gname} does not hold the reference's {hname}"
@@ -1272,7 +1420,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         hname = ckpt.find(fn["module"].split(".", 1)[-1] + ".weight") or ckpt.find(fn["module"] + ".weight")
         if hname is not None:
             w = ckpt.tensor(hname).reshape(-1)
-            want = w + 1.0 if fn["formula"] in ("rms_1p", "layer_1p") else w
+            want = w + fn.get("weight_offset", 1.0 if fn["formula"] in ("rms_1p", "layer_1p") else 0.0)
             if _rel_err(g.values("output_norm.weight").reshape(-1), want) > 1e-2:
                 d.file_issues.append(f"output_norm.weight does not hold the reference's {hname}"
                                      + (" as 1 + w" if fn["formula"] == "rms_1p" else ""))
@@ -1306,6 +1454,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                 d.file_issues.append(f"block {i}: dense FFN in the reference, MoE in the file")
             elif plan and bool(f.get("fused_gate_up")) != bool(plan.get("fused_gate_up")):
                 d.file_issues.append(f"block {i}: fused gate/up projection in one of the reference and the file only")
+        elif f.get("kind") == "none":
+            if plan and plan.get("ffn") != "none":
+                d.file_issues.append(f"block {i}: no FFN in the reference, but the file has one")
         elif f.get("kind") == "moe":
             if f.get("expert_activation"):
                 acts.add(f["expert_activation"])
@@ -1385,21 +1536,37 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     es = facts.get("embedding_scale")
     if es is None:
         pass  # reported as unknown by the trace
+    elif g.key("embedding_scale") is not None:
+        if not _close(es, float(g.key("embedding_scale")), 1e-5):
+            d.file_issues.append(f"embedding scale {es:g}, file embedding_scale {g.key('embedding_scale')}")
+        d.set("scale_embeddings", False, "explicit embedding_scale metadata overrides the sqrt(d) switch")
+        d.parts.append(f"embeddings multiplied by {es:g} (embedding_scale)")
     elif _close(es, 1.0, 1e-6):
         d.set("scale_embeddings", False, "block 0 receives the embedding rows as they are")
     elif _close(es, float(np.float32(math.sqrt(n_embd))), 1e-5):
         d.set("scale_embeddings", True, f"block 0 receives the embedding rows times sqrt({n_embd}) = {es:.6g}")
     else:
-        d.missing.append(f"embeddings multiplied by {es:g} (the engine scales by sqrt(n_embd) = "
-                         f"{math.sqrt(n_embd):.6g} or not at all)")
+        d.set("scale_embeddings", False, "a non-sqrt(d) multiplier requires explicit embedding_scale metadata")
+        d.file_issues.append(f"embeddings multiplied by {es:g}, but the file has no embedding_scale metadata")
     lg = facts.get("logits") or {}
     final_cap = lg["value"] if lg.get("transform") == "softcap" else 0.0
-    if lg.get("transform") == "scale":
-        if not _close(float(g.key("logit_scale", 1.0)), lg["value"], 1e-5):
-            d.file_issues.append(f"logit_scale {g.key('logit_scale', 1.0)} in the file, {lg['value']:.6g} in the reference")
+    if g.key("logit_scale") is not None:
+        stored = float(g.key("logit_scale"))
+        actual = float(lg["value"]) if lg.get("transform") == "scale" else 1.0
+        matches = [divides for divides in (False, True)
+                   if stored > 0 and _close(actual, 1.0 / stored if divides else stored, 1e-5)]
+        if len(matches) == 1:
+            d.set("logit_scale_divides", matches[0], "output projection compared with logits and file logit_scale")
+        elif len(matches) == 2:
+            inactive("logit_scale_divides", "unit logit scale has identical multiplier and divisor semantics")
         else:
-            d.parts.append(f"logits multiplied by {lg['value']:.6g} from the file")
-    elif "final_logit_softcapping" not in engine.file_keys:
+            d.file_issues.append(f"logits multiplied by {actual:g}, incompatible file logit_scale {stored:g}")
+        d.parts.append(f"logits multiplied by {actual:g} (logit_scale)")
+    else:
+        inactive("logit_scale_divides", "no logit_scale metadata")
+        if lg.get("transform") == "scale":
+            d.file_issues.append(f"logits multiplied by {lg['value']:.6g}, file has no logit_scale")
+    if "final_logit_softcapping" not in engine.file_keys:
         if final_cap:
             d.missing.append(f"final logit soft-capping at {final_cap:g}")
     elif not _close(float(g.key("final_logit_softcapping", 0.0) or 0.0), final_cap, 1e-6):
@@ -1414,7 +1581,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     else:
         d.parts.append("output matrix " + ("output.weight" if has_output else "tied to token_embd"))
 
-    check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine)
+
+    check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine, slow_tokenizer)
 
     # --- the row: values for every field ---
     row = {}
@@ -1436,7 +1604,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         pass  # the block's structure is already not the engine's
     elif all(f in d.fields for f in norm_fields):
         names = {row.get(f) for f in norm_fields if row.get(f)}
-        bound = engine.block_tensors | {n + suffix for n in names for suffix in (".weight", ".bias")}
+    # Bare post-norm vectors and affine norm biases are both valid.
+    # Resolution below retains their precise tensor names.
+        bound = engine.block_tensors | names | {n + suffix for n in names for suffix in (".weight", ".bias")}
         unused = {}
         for b in range(n_layers):
             for s in blocks.get(b, set()) - bound:
@@ -1462,6 +1632,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
     for i, p in enumerate(plans):
         if p["mixer"] == "deltanet":
             mix = "Gated DeltaNet"
+        elif p["mixer"] == "none":
+            mix = "no mixer"
+        elif p["mixer"] == "linear":
+            mix = "linear mixer (one residual projection)"
         else:
             mix = "attention" + ("".join(f", {t}" for t, on in (("fused QKV", p["fused_qkv"]),
                                                                 ("QKV biases", p["qkv_bias"]),
@@ -1469,6 +1643,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
                                                                 ("gated output", p["attn_gate"])) if on))
         if p["ffn"] == "moe":
             ffn = "MoE FFN" + (" + shared expert" if p["shared_expert"] else "")
+        elif p["ffn"] == "none":
+            ffn = "no FFN"
         else:
             ffn = "dense FFN" + (" (fused gate/up)" if p["fused_gate_up"] else "")
         groups.setdefault(f"{mix}; {ffn}", []).append(i)
@@ -1482,8 +1658,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False):
         d.missing.append(f"tokenizer type '{kind}' (the engine reads {engine.tokenizer_kinds})")
     elif kind == "gpt2" and pre not in engine.pre_tokenizers:
         d.missing.append(f"BPE pre-tokenizer '{pre}' (tokenizer.ggml.pre) is not in the pre-tokenizer table")
+    elif kind == "llama" and pre == "spm-greedy" and not engine.spm_greedy:
+        d.missing.append("greedy SentencePiece matching (tokenizer.ggml.pre=spm-greedy)")
     else:
-        d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" else ""))
+        d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" or pre == "spm-greedy" else ""))
 
     d.merge_blocks()
     if complete and not d.unknown:
@@ -1505,7 +1683,7 @@ def engine_default(engine, field):
     return next(dflt for n, _, dflt in engine.fields if n == field)
 
 
-def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
+def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine, slow_tokenizer=False):
     """The GGUF's BOS and space-prefix rules against what the model's own tokenizer does (the engine follows the
     file: tokenizer.ggml.add_bos_token, by default on for SentencePiece only; tokenizer.ggml.add_space_prefix, by
     default on). A file that disagrees encodes every prompt differently from the model's training."""
@@ -1517,21 +1695,127 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine):
         d.set("spm_charsmap", "", "not a SentencePiece vocabulary; compiled character map is unused")
         d.set("spm_user_defined", "", "not a SentencePiece vocabulary; user-defined symbol fallback is unused")
     try:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
+        from reference_tokenizer import load_tokenizer
+        tok = load_tokenizer(model, revision=revision, trust_remote_code=trust_remote_code,
+                             slow=slow_tokenizer)
     except Exception as e:  # noqa: BLE001 - reported, the gate checks the ids anyway
+        if g.metadata.get("tokenizer.ggml.pre") in ("spm-greedy", "gpt2-nfkc-digits"):
+            d.unknown.append(f"tokenizer mode {g.metadata['tokenizer.ggml.pre']} cannot be verified: "
+                             f"the reference tokenizer did not load ({type(e).__name__})")
+            return
         d.notes.append(f"the reference tokenizer did not load ({type(e).__name__}); its BOS and space-prefix rules "
                        f"are left to the gate")
         if kind == "llama":
             d.unknown.append("spm_prefix_after_control: the reference tokenizer could not be loaded")
             d.unknown.append("spm_add_bos_default: the reference tokenizer could not be loaded")
         return
+    kind = g.metadata.get("tokenizer.ggml.model")
+    if kind == "gpt2":
+        nfkc_mode = g.metadata.get("tokenizer.ggml.pre") == "gpt2-nfkc-digits"
+        try:
+            path = os.path.join(model, "tokenizer.json")
+            if not os.path.isfile(path):
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(model, "tokenizer.json", revision=revision)
+            with open(path, encoding="utf-8") as source:
+                source_tokenizer = json.load(source)
+        except Exception as error:  # an active mode needs the original pipeline, not an inferred backend
+            if nfkc_mode:
+                d.unknown.append("gpt2-nfkc-digits cannot be verified: source tokenizer.json could not be read "
+                                 f"({type(error).__name__})")
+        else:
+            mode = g.metadata.get("tokenizer.ggml.pre")
+            pipeline = source_tokenizer.get("pre_tokenizer") or {}
+            sequence = pipeline.get("pretokenizers", []) if pipeline.get("type") == "Sequence" else []
+            ordinary_llama = (source_tokenizer.get("normalizer") is None and len(sequence) == 2 and
+                              sequence[0] == {"type": "Split", "pattern": {"Regex": engine.llama_bpe_pattern},
+                                              "behavior": "Removed", "invert": True} and
+                              sequence[1] == {"type": "ByteLevel", "add_prefix_space": False,
+                                              "trim_offsets": True, "use_regex": False} and
+                              source_tokenizer.get("model", {}).get("ignore_merges") is False)
+            if mode == "llama-bpe-merges" and not ordinary_llama:
+                d.file_issues.append("llama-bpe-merges requires the serialized Llama split with ordinary merges")
+            elif mode == "dbrx" and ordinary_llama:
+                d.file_issues.append("the dbrx export label collides with a different tokenizer; "
+                                     "this source requires tokenizer.ggml.pre=llama-bpe-merges")
+            elif mode == "llama-bpe-merges":
+                d.parts.append("serialized Llama split with ordinary merge ranks verified from tokenizer.json")
+            normalization = source_tokenizer.get("normalizer") or {}
+            pre = source_tokenizer.get("pre_tokenizer") or {}
+            steps = pre.get("pretokenizers", []) if pre.get("type") == "Sequence" else []
+            requires_nfkc = (normalization.get("type") == "NFKC" and len(steps) == 2 and
+                             steps[0].get("type") == "Digits" and steps[0].get("individual_digits") is True and
+                             steps[1].get("type") == "ByteLevel" and steps[1].get("add_prefix_space") is False and
+                             steps[1].get("use_regex", True) is True)
+            if requires_nfkc and not nfkc_mode:
+                d.file_issues.append("the source normalizes NFKC, splits individual digits and applies ByteLevel; "
+                                     "the file needs tokenizer.ggml.pre=gpt2-nfkc-digits")
+            elif nfkc_mode and not requires_nfkc:
+                d.file_issues.append("gpt2-nfkc-digits requires source NFKC followed by individual Digits and "
+                                     "ByteLevel without a space prefix")
+            elif nfkc_mode:
+                # tokenizers' alignment normalizer uses Unicode 9. A newer
+                # normalizer has different IDs for newly assigned characters.
+                backend = getattr(tok, "backend_tokenizer", None)
+                normalizer = getattr(backend, "normalizer", None)
+                probe = "ＡＢＣ１２３，ÅK ﬃ Ⅳ ½ ²㋿\U0001e030\U000105d2\u0307A\U0001e4ec\u0301"
+                expected = "ABC123,ÅK ffi IV 1⁄2 2㋿\U0001e030\U000105d2\u0307A\U0001e4ec\u0301"
+                if normalizer is None or normalizer.normalize_str(probe) != expected:
+                    d.unknown.append("gpt2-nfkc-digits requires the source Unicode 9 NFKC normalizer")
+                else:
+                    d.parts.append("Unicode 9 NFKC, individual digits and ByteLevel, verified from source tokenizer.json")
+    if kind == "llama":
+        greedy = g.metadata.get("tokenizer.ggml.pre") == "spm-greedy"
+        processor = getattr(tok, "sp_model", None)
+        if greedy and processor is None:
+            d.unknown.append("spm-greedy cannot be verified: the reference exposes no SentencePiece processor")
+        if processor is not None:
+            try:
+                from sentencepiece import sentencepiece_model_pb2 as spm_proto
+                proto = spm_proto.ModelProto()
+                proto.ParseFromString(processor.serialized_model_proto())
+            except (ImportError, AttributeError, ValueError) as error:
+                detail = f"SentencePiece piece flags could not be read ({type(error).__name__}); install protobuf"
+                (d.unknown if greedy else d.notes).append(detail)
+            else:
+                piece = spm_proto.ModelProto.SentencePiece
+                ordinary = [p for p in proto.pieces if p.type not in
+                            (piece.UNKNOWN, piece.CONTROL, piece.BYTE, piece.UNUSED)]
+                requires_greedy = (proto.trainer_spec.model_type == spm_proto.TrainerSpec.BPE
+                                   and bool(ordinary) and all(p.type == piece.USER_DEFINED for p in ordinary))
+                if requires_greedy and not greedy:
+                    d.file_issues.append("all ordinary SentencePiece pieces are USER_DEFINED; the file needs "
+                                         "tokenizer.ggml.pre=spm-greedy (the converter loses these piece flags)")
+                elif greedy and not requires_greedy:
+                    d.file_issues.append("spm-greedy requires a SentencePiece BPE reference whose ordinary pieces "
+                                         "are all USER_DEFINED")
+                elif greedy:
+                    norm = proto.normalizer_spec
+                    if (norm.name not in ("", "identity") or norm.precompiled_charsmap or
+                            norm.remove_extra_whitespaces or not norm.escape_whitespaces):
+                        d.missing.append("the greedy SentencePiece reference's normalization: this mode requires "
+                                         "identity normalization, escaped spaces and preserved whitespace")
+                    if not proto.trainer_spec.byte_fallback:
+                        d.missing.append("greedy SentencePiece without byte fallback")
+                    d.parts.append("SentencePiece USER_DEFINED longest-prefix matching, verified from the source model")
+    if kind == "plamo3":
+        for field, expected in (("break_around_consecutive_spaces_threshold", 2),
+                                ("break_around_repeated_chars_threshold", 4)):
+            actual = getattr(tok, field, None)
+            if actual != expected:
+                d.file_issues.append(f"plamo3 tokenizer {field}={actual}; its GGUF scheme uses {expected} "
+                                     "and the converter does not record alternate thresholds")
     bos = g.metadata.get("tokenizer.ggml.bos_token_id")
     default_bos = kind == "llama" and engine.rows.get(g.arch, ({},))[0].get("spm_add_bos_default", True)
     add_bos = g.metadata.get("tokenizer.ggml.add_bos_token", default_bos)
     add_bos = bool(add_bos) and bos is not None
     plain = tok("The sea", add_special_tokens=False)["input_ids"]
     special = tok("The sea", add_special_tokens=True)["input_ids"]
+    if g.metadata.get("tokenizer.ggml.pre") == "chatglm-spm":
+        tokens = g.metadata.get("tokenizer.ggml.tokens", [])
+        prefix = [tokens.index(text) if text in tokens else -1 for text in ("[gMASK]", "sop")]
+        if special != prefix + plain:
+            d.file_issues.append("chatglm-spm's [gMASK], sop prefix differs from the reference tokenizer")
     ref_bos = len(special) > len(plain) and special[0] == bos and special[1:1 + len(plain)] == plain
     if kind == "llama":
         d.set("spm_add_bos_default", ref_bos, "observed initial BOS behavior of the reference tokenizer")
@@ -1743,8 +2027,10 @@ def gate(args, d, row_text, arch, engine):
         cmd = [py, os.path.join(tools, "tokenizer_reference.py"), "--model", args.model, "--text", text, "--out", ids]
         if args.revision:
             cmd += ["--revision", args.revision]
-        if not has_tokenizer_json(args.model, args.revision):
+        if args.reference_slow_tokenizer or not has_tokenizer_json(args.model, args.revision):
             cmd += ["--transformers"] + (["--trust-remote-code"] if args.trust_remote_code else [])
+        if args.reference_slow_tokenizer:
+            cmd.append("--slow-tokenizer")
         code, out = run(cmd, log)
         if code == 0:
             code, out = run([os.path.join(build, "liyab-tok"), "-m", args.gguf, "-f", text, "--ids", ids, "--quiet"],
@@ -1762,6 +2048,10 @@ def gate(args, d, row_text, arch, engine):
         cmd += ["--revision", args.revision]
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
+    if args.reference_state_dict:
+        cmd.append("--state-dict")
+    if args.reference_slow_tokenizer:
+        cmd.append("--slow-tokenizer")
     # transformers' default attention kernel leaves a soft cap out: the reference then needs the eager one.
     if d.softcap and "--attn-implementation" in open(conform, encoding="utf-8").read():
         cmd += ["--attn-implementation", "eager"]
@@ -1843,6 +2133,10 @@ def print_description(d, engine, arch):
 
 def self_test(engine):
     """Every registry row parsed and printed back as architecture.cpp writes it."""
+    unknown = [name for name, _, _ in engine.fields if name not in DERIVED_FIELDS]
+    if unknown:
+        print("ArchSpec fields without derivation rules: " + ", ".join(unknown))
+        return False
     failures = 0
     for name, (values, text) in engine.rows.items():
         printed = engine.format_row(values)
@@ -1864,6 +2158,10 @@ def main():
                         help="run modeling code shipped with the model (only for repositories you trust)")
     parser.add_argument("--gate", action="store_true", help="verify the row: build with it and run the conformance "
                                                             "checks (tokenizer ids, liyab-kl against transformers)")
+    parser.add_argument("--reference-state-dict", action="store_true",
+                        help="gate: construct a local reference checkpoint on CPU before loading safetensors")
+    parser.add_argument("--reference-slow-tokenizer", action="store_true",
+                        help="use the original slow tokenizer for settings and every gate reference")
     parser.add_argument("--source", default=REPO, help="Liyab source tree (default: this repository)")
     parser.add_argument("--scratch", default=os.path.join(REPO, "build", "describe_model"),
                         help="scratch copy and build for --gate (default: build/describe_model)")
@@ -1883,7 +2181,8 @@ def main():
 
     print(f"Describing {args.model} with {args.gguf}", flush=True)
     try:
-        d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code)
+        d, row, g = describe(args.model, args.gguf, engine, args.revision, args.trust_remote_code,
+                             args.reference_slow_tokenizer)
     except (OSError, FormatError) as e:  # an unreadable or malformed GGUF
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
