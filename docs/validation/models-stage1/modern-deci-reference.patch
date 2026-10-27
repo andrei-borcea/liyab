@@ -1,0 +1,10 @@
+--- a/modeling_decilm.py
++++ b/modeling_decilm.py
+@@ -306,6 +306,7 @@
+ 
+ 
+ class DeciLMForCausalLM(LlamaForCausalLM, DeciLMPreTrainedModel):
++    config_class = DeciLMConfig  # transformers 5 checks the concrete config type
+     def __init__(self, config):
+         DeciLMPreTrainedModel.__init__(self, config)
+         self.model = DeciLMModel(config)

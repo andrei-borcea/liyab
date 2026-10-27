@@ -63,6 +63,52 @@ double rel_rms_error(const std::vector<float>& ref, const std::vector<float>& go
 
 }  // namespace
 
+TEST_CASE("Auxiliary index keys share pages, images, scaling and rollback with the main keys") {
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        auto config = small_config(type);
+        config.values_in_keys = true;
+        config.value_offset = 32;
+        config.auxiliary_dim = 32;
+        auto made = KvCache::create(config);
+        REQUIRE(made.has_value());
+        auto& kv = *made.value();
+        REQUIRE(kv.reserve(20).is_ok());
+        const auto main = row_for(7, 128);
+        const auto aux = row_for(19, 64);
+        for (int32_t l = 0; l < config.n_layers; ++l) {
+            for (int32_t pos = 0; pos < 20; ++pos) {
+                kv.store(l, pos, main.data(), nullptr);
+                kv.store_auxiliary(l, pos, aux.data());
+            }
+        }
+        const size_t aux_bytes = 32 * sizeof(float);
+        std::vector<uint8_t> original(kv.auxiliary_key(0, 7, 0), kv.auxiliary_key(0, 7, 0) + aux_bytes);
+        std::vector<float> factors(static_cast<size_t>(config.n_layers * config.n_head_kv * config.head_dim), 2.0f);
+        REQUIRE(kv.scale_keys(20, factors).is_ok());
+        CHECK(std::memcmp(original.data(), kv.auxiliary_key(0, 7, 0), aux_bytes) == 0);
+        REQUIRE(kv.copy_position(7, 19).is_ok());
+        CHECK(std::memcmp(original.data(), kv.auxiliary_key(0, 19, 0), aux_bytes) == 0);
+        std::vector<uint8_t> image(kv.rows_bytes(config.page_tokens));
+        REQUIRE(kv.read_rows(0, config.page_tokens, image.data()).is_ok());
+        const auto layout = kv_row_layout(config);
+        CHECK(layout.image_bytes(config.page_tokens) == image.size());
+        std::vector<uint8_t> encoded, decoded(image.size());
+        CHECK(!kv_encode(KvEncoding::Lossless, layout, config.page_tokens, image, encoded, nullptr));
+        CHECK(!kv_encode(KvEncoding::Lossy4, layout, config.page_tokens, image, encoded, nullptr));
+        decoded = image;  // the store uses its raw image fallback
+        CHECK(image == decoded);
+        auto restored = KvCache::create(config);
+        REQUIRE(restored.has_value());
+        REQUIRE((*restored)->reserve(16).is_ok());
+        REQUIRE((*restored)->write_rows(0, decoded.data(), 16, 0, 16).is_ok());
+        CHECK(std::memcmp(original.data(), (*restored)->auxiliary_key(0, 7, 0), aux_bytes) == 0);
+        REQUIRE(kv.truncate(8).is_ok());
+        CHECK(std::memcmp(original.data(), kv.auxiliary_key(0, 7, 0), aux_bytes) == 0);
+        CHECK(kv.layout_fingerprint() != 0);
+        CHECK(kv.bytes_in_use() == KvCache::bytes_per_token(config) * config.page_tokens);
+    }
+}
+
 TEST_CASE("INT4 KV formats cut memory per token versus F16") {
     // A 32-layer, 8 KV-head, head_dim 128 model (Llama-3-8B / Qwen-2.5-7B class).
     const auto f16 = KvCache::bytes_per_token(32, 8, 128, KvCacheType::F16);

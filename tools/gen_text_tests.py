@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates tests/data/text_cases.txt, the expectations tests/test_text.cpp checks the regex engine, the
-pre-tokenizer table and NFC normalization against:
+pre-tokenizer table and NFC / NFKC normalization against:
 
 * regex splits: Python's `regex` module, cross-checked against the Hugging Face tokenizers' own Split
   (Oniguruma), which is what models are tokenized with. Where the two disagree (`^` and `$` match at line
@@ -8,10 +8,11 @@ pre-tokenizer table and NFC normalization against:
 * pre-tokenizer splits: a tokenizers Sequence of Split pre-tokenizers built from PRE_TOKENIZERS, which mirrors
   the table in src/core/pre_tokenizer.cpp (the conformance runs of liyab-tok against each model's own
   tokenizer.json check that the table is right; this file checks that the engine runs it);
-* NFC: Python's unicodedata.
+* NFC: Python's unicodedata; NFKC: the source tokenizers Unicode 9 normalizer, including every changed scalar.
 
     pip install regex tokenizers
     python3 tools/gen_text_tests.py > tests/data/text_cases.txt
+    python3 tools/gen_text_tests.py --nfkc-only  # only the additive NFKC section
 
 Format, one record per line, fields separated by tabs, text escaped as \\\\ \\t and \\u{HEX} (any non-printable or
 non-ASCII code point):
@@ -21,15 +22,18 @@ non-ASCII code point):
                                       or start-end when it does not start where the piece before ended
     E pattern                         a pattern that must fail to compile
     S pre_name text_id spans          a pre-tokenizer split of the text (NFC-normalized first when the row says so)
+    B pre_name text_id spans          a pre-tokenizer split in byte offsets (steps after ByteLevel can split UTF-8)
     N input expected                  NFC normalization
+    K input expected                  NFKC normalization
 """
+import argparse
 import os
 import random
 import sys
 import unicodedata
 
 import regex
-from tokenizers import Regex, pre_tokenizers
+from tokenizers import Regex, normalizers, pre_tokenizers
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -74,6 +78,8 @@ YOUTU_CJK = (r"[\x{1100}-\x{11FF}\x{302E}\x{302F}\x{3131}-\x{318E}\x{3200}-\x{32
 YOUTU_WORDS = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+KIMI_HAN = r"[\x{2E80}-\x{2E99}\x{2E9B}-\x{2EF3}\x{2F00}-\x{2FD5}\x{3005}\x{3007}\x{3021}-\x{3029}\x{3038}-\x{303B}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FA6D}\x{FA70}-\x{FAD9}\x{16FE2}-\x{16FE3}\x{16FF0}-\x{16FF6}\x{20000}-\x{2A6DF}\x{2A700}-\x{2B81E}\x{2B820}-\x{2CEAD}\x{2CEB0}-\x{2EBE0}\x{2EBF0}-\x{2EE5D}\x{2F800}-\x{2FA1D}\x{30000}-\x{3134A}\x{31350}-\x{33479}]+"
+KIMI_WORDS = GPT4O.replace(r"[\r\n/]*", r"[\r\n]*")
 PRE_TOKENIZERS = {
     "default": ([(GPT2, True)], False),
     "llama3": ([(LLAMA3, True)], False),
@@ -87,6 +93,8 @@ PRE_TOKENIZERS = {
     "smollm": ([(r"\p{N}", True), (GPT2, True)], False),
     "tekken": ([(TEKKEN, True)], False),
     "youtu": ([(YOUTU_CJK, True), (YOUTU_WORDS, True)], False),
+    "lfm2": ([(LLAMA3, True)], False),
+    "kimi-k2": ([(KIMI_HAN, True), (KIMI_WORDS, True)], False),
 }
 
 # Engine features beyond the table's patterns: (pattern, keep_gaps, text).
@@ -184,6 +192,43 @@ def spans_text(spans):
     return " ".join(out)
 
 
+def nfkc_records(edge, conform):
+    """Source Unicode 9 expectations and the Digits -> ByteLevel pipeline."""
+    rows = [f"# NFKC expectations (tokenizers Unicode 9); gpt2-nfkc-digits splits"]
+    def escaped(text):
+        return esc(text).replace(" ", r"\u{20}")
+    changed = []
+    for cp in range(0x110000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        text = chr(cp)
+        normalized = normalizers.NFKC().normalize_str(text)
+        if text != normalized:
+            rows.append(f"K\t{escaped(text)}\t{escaped(normalized)}")
+            changed.append(text)
+    mixed = ["", "plain ASCII 123", "ＡＢＣ１２３，", "ÅK ﬃ Ⅳ ½ ²", "ㄱㅏᆨ", "ｶﾞ", "\uFDFA",
+             "A\u030A\u0323", "\u00A8\u0301", "\u212B\u0323"]
+    rng = random.Random(2048)
+    pool = changed + ["A", "e", "\u030A", "\u0301", "\u0323", "\u1100", "\u1161", "\u11A8"]
+    for _ in range(256):
+        mixed.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 8))))
+    for text in mixed:
+        if text:
+            rows.append(f"K\t{escaped(text)}\t{escaped(normalizers.NFKC().normalize_str(text))}")
+    source = pre_tokenizers.Sequence([pre_tokenizers.Digits(individual_digits=True),
+                                     pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)])
+    normalization = normalizers.NFKC()
+    for i, text in enumerate(edge.splitlines(keepends=True) + [conform[:600]] + mixed[:10]):
+        if not text:
+            continue
+        normalized = normalizers.NFKC().normalize_str(text)
+        assert normalization.normalize_str(text) == normalized
+        rows.append(f"T\tnfkc_{i}\t{escaped(normalized)}")
+        spans = [span for _, span in source.pre_tokenize_str(normalized)]
+        rows.append(f"S\tgpt2-nfkc-digits\tnfkc_{i}\t{spans_text(spans)}")
+    return rows
+
+
 def main():
     edge = open(os.path.join(ROOT, "tests/data/tokenizer_edge.txt"), encoding="utf-8", newline="").read()
     conform = open(os.path.join(ROOT, "tests/data/conform_text.txt"), encoding="utf-8", newline="").read()
@@ -239,10 +284,48 @@ def main():
         cases.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 8))))
     for s in cases:
         out.append(f"N\t{esc(s)}\t{esc(unicodedata.normalize('NFC', s))}")
+    out.extend(nfkc_records(edge, conform))
+    # The SSM tokenizers' original Rust pipelines, rather than a second copy
+    # of the regex table. Keep these additive so existing pattern/text ids
+    # and their pinned expectations remain stable.
+    ssm_pre = {
+        "olmo": pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True),
+        "falcon": pre_tokenizers.Sequence([
+            pre_tokenizers.Punctuation(behavior="contiguous"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True),
+            pre_tokenizers.Digits(individual_digits=False),
+            pre_tokenizers.Split(Regex("[0-9][0-9][0-9]"), behavior="isolated"),
+        ]),
+    }
+    for name, pre in ssm_pre.items():
+        for t in texts:
+            # The Rust offsets refer to whole original characters even when
+            # a later step cuts their encoded bytes. Decode the actual
+            # pieces to bytes to establish their exact boundaries instead.
+            alphabet = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+            chars = alphabet + [256 + i for i in range(256 - len(alphabet))]
+            byte_values = alphabet + [b for b in range(256) if b not in alphabet]
+            decoder = dict(zip(map(chr, chars), byte_values))
+            spans, pos = [], 0
+            for piece, _ in pre.pre_tokenize_str(t):
+                raw = bytes(decoder[c] for c in piece)
+                assert t.encode()[pos:pos + len(raw)] == raw
+                spans.append((pos, pos + len(raw)))
+                pos += len(raw)
+            assert pos == len(t.encode())
+            out.append(f"B\t{name}\t{text_id(t)}\t{spans_text(spans)}")
     print("\n".join(out))
     print(f"{disagreements} split(s) where Python's regex and the tokenizers differ (tokenizers kept)",
           file=sys.stderr)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--nfkc-only", action="store_true", help="write only the additive NFKC and source-split records")
+    args = parser.parse_args()
+    if args.nfkc_only:
+        edge = open(os.path.join(ROOT, "tests/data/tokenizer_edge.txt"), encoding="utf-8", newline="").read()
+        conform = open(os.path.join(ROOT, "tests/data/conform_text.txt"), encoding="utf-8", newline="").read()
+        print("\n".join(nfkc_records(edge, conform)))
+    else:
+        main()

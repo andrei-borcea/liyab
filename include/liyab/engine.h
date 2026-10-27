@@ -84,7 +84,7 @@ struct EngineConfig {
     // caps the OS counters do not show (HyperOS stops apps above 6 GiB PSS).
     int64_t memory_budget_mb = 0;
     // With expert streaming (MoE): convert the resident Q8_0 matrices
-    // (attention / DeltaNet projections, shared experts) to Q4_K (4) or Q5_K
+    // (attention / recurrent projections, shared experts) to Q4_K (4) or Q5_K
     // (5) at load. Lossy, opt-in: fewer bytes read per token, and the memory
     // saved goes to the expert cache. Converted on every core at load;
     // ignored when experts are not streamed. 0: off. -1: automatic, only when
@@ -120,7 +120,7 @@ struct EngineConfig {
     // cache layout, key scales, kernels and the LoRA adapter selected (see
     // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
-    // restores it; recurrent (DeltaNet) states are kept as images at the
+    // restores it; recurrent mixer and compression states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model
     // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
     // of memory_budget_mb; on a MoE whose experts stream, only as far as the
@@ -418,11 +418,13 @@ struct PromptSegment {
 // (Engine::set_adapter), and a pass without one costs what it did.
 //  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each
 //    matrix's own rank; alpha 0 or absent: s = scale), as PEFT computes it.
-//  * Dense matrices of every block (attention, DeltaNet, FFN, the shared
-//    expert, the router, latent attention's whole projections) and the LM
+//  * Dense matrices of every block (attention, recurrent mixers, FFN, the shared
+//    expert, the router, latent attention's whole projections, compression,
+//    indexer and residual-stream projections) and the LM
 //    head; a mixture of experts' per-expert stacks (each expert its slice).
 //    Refused: adapters of the token embeddings, of latent attention's
-//    per-head attn_k_b / attn_v_b, activated LoRA, other adapter types.
+//    per-head attn_k_b / attn_v_b or combined attn_kv_b, shared-KV's grouped
+//    attn_output_a, activated LoRA, other adapter types.
 //  * Contexts are kept apart by adapter (and scale): one computed with
 //    adapter X is never continued with Y or without it. Selecting another
 //    adapter sets the live context aside in the prefix cache under X (when
@@ -574,7 +576,7 @@ public:
     // A prompt that leaves that text partway keeps its tokens up to the last
     // one whose text it still starts with. Otherwise the longest common token
     // prefix is kept: any length on
-    // attention-only models; on hybrid (DeltaNet) models, whose recurrent
+    // attention-only models; on models with recurrent mixers or compression, whose
     // states cannot rewind, up to the nearest state snapshot, taken at the end
     // of every prompt and prefill (Transformer::snapshot_state), so an edited
     // last reply or a dropped turn recomputes only what follows that point.
@@ -681,9 +683,11 @@ public:
     // foreground request that follows.
     void cancel_prefill() noexcept;
 
-    // `add_bos` prepends BOS only for models that use one (tokenizer.ggml.add_bos_token),
-    // and not to a text that already starts with the BOS token's text (a
-    // chat template wrote it).
+    // Tokenizes UTF-8 into owned ids; thread-safe, without changing context.
+    // `add_bos` requests the model's initial special tokens: normally BOS
+    // (tokenizer.ggml.add_bos_token), or [gMASK], sop for chatglm-spm. A
+    // prefix already spelled by the text is not added again. Unsupported
+    // for an unknown tokenizer scheme; InvalidArgument for unencodable bytes.
     [[nodiscard]] Result<std::vector<int32_t>> tokenize(std::string_view text, bool add_bos) const;
     [[nodiscard]] std::string token_to_piece(int32_t token) const;
 
@@ -739,7 +743,9 @@ public:
     // reranker. Thread-safe.
     [[nodiscard]] Pooling pooling() const noexcept;
     // Values per vector embed() returns without EmbedOptions::dimensions: the
-    // model's hidden size (1024 for Qwen3-Embedding-0.6B). Thread-safe.
+    // model's hidden size (1024 for Qwen3-Embedding-0.6B), or the width of
+    // the dense projections the GGUF applies after pooling (dense_2 /
+    // dense_3: 768 for EmbeddingGemma). Thread-safe.
     [[nodiscard]] int32_t embedding_size() const noexcept;
     // One vector per text, in order. Each text is encoded as generate()
     // encodes a prompt (special tokens written in it map to their ids, BOS
@@ -750,12 +756,16 @@ public:
     //  * every input holds at least one token and at most context_length()
     //    positions (else InvalidArgument naming it, unless options.truncate);
     //  * vectors have embedding_size() values (options.dimensions when set),
-    //    unit length unless options.normalize is false;
+    //    unit length unless options.normalize is false; the pooled states go
+    //    through the model's dense projections first when it has them;
     //  * the texts run one after another in the context, sorted so that those
     //    sharing a token prefix (an instruction) are neighbours: each keeps
     //    the KV of the prefix it shares with the one before and processes
-    //    only the rest (Last pooling, attention-only models). On the CPU
-    //    backend a vector is the same bits whatever the batch around it;
+    //    only the rest (Last pooling, attention-only causal models; a
+    //    bidirectional model such as EmbeddingGemma reads each text whole in
+    //    one pass; token generation on such a model returns Unsupported).
+    //    On the CPU backend a vector is the same bits whatever the
+    //    batch around it;
     //  * the context is used and left empty: a conversation in progress is
     //    set aside in the prefix cache when one is configured (prefix_cache_mb
     //    or prefix_cache_disk_mb), as when another prompt replaces it, and is

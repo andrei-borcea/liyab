@@ -20,13 +20,14 @@ What is kept and why:
   largest tensors (vocabulary x width).
 * The size of a key/query head: RoPE tables, frequency factors (LongRoPE, Llama 3) and the default attention
   scale depend on it. The width of the residual stream becomes heads x head size (unless --width sets it).
-* Every scalar of the configuration (bases, epsilons, multipliers, windows, soft caps, routing parameters).
+* Every scalar of the configuration (bases, epsilons, multipliers, windows, soft caps, routing parameters). A
+  quantization configuration is dropped: the checkpoint's weights are float32.
 
 What shrinks: the blocks (the shortest prefix holding every kind of block, at least 2; multi-token-prediction
 blocks dropped), the attention heads (--heads, default 4; key/value heads in the model's ratio: as many as the
 query heads without grouping, 1 with multi-query attention, else --kv-heads), every FFN and expert width (--ffn,
 default 128) and the routed experts (--experts, default 16, at least top-k + 1 and a multiple of the expert
-groups). A reduction this generic cannot know every architecture's coupled sizes (a latent rank, a state size, a
+groups). Nested attention and expert configuration objects are reduced too. A reduction this generic cannot know every architecture's coupled sizes (a latent rank, a state size, a
 convolution's channels, an index's top-k small enough to select within a short text): --config sets fields after
 it, as JSON, and the tool prints the configuration it saved.
 
@@ -43,11 +44,11 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from reference_trace import EXPERT_COUNT_KEYS, TOP_K_KEYS, _layer_count, _randomize, blocks_to_trace  # noqa: E402
+from reference_trace import EXPERT_COUNT_KEYS, TOP_K_KEYS, _layer_count, _randomize, blocks_to_trace, canonical_rope_config  # noqa: E402
 
 HIDDEN_KEYS = ("hidden_size", "n_embd", "d_model", "model_dim")
 HEAD_KEYS = ("num_attention_heads", "n_head", "num_heads", "n_heads")
-KV_HEAD_KEYS = ("num_key_value_heads", "n_head_kv", "num_kv_heads", "multi_query_group_num", "n_kv_heads")
+KV_HEAD_KEYS = ("num_key_value_heads", "n_head_kv", "num_kv_heads", "multi_query_group_num", "n_kv_heads", "kv_n_heads")
 HEAD_DIM_KEYS = ("head_dim", "kv_channels")
 FFN_KEYS = ("n_inner", "ffn_hidden_size", "ffn_dim", "d_ff")  # besides every "*intermediate_size*" field
 TOKENIZER_FILES = ("tokenizer*", "vocab*", "merges.txt", "special_tokens_map.json", "added_tokens.json", "*.tiktoken",
@@ -56,7 +57,10 @@ TOKENIZER_FILES = ("tokenizer*", "vocab*", "merges.txt", "special_tokens_map.jso
 
 def first(cfg, keys):
     for k in keys:
-        v = getattr(cfg, k, None)
+        # This is the global baseline. Explicit per-layer overrides remain
+        # in the serialized config, so heterogeneous models keep their own
+        # head geometry instead of invoking an ambiguous global property.
+        v = vars(cfg).get(k)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
             return k, v
     return None, None
@@ -78,7 +82,24 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
 
     head_key, n_head = first(cfg, HEAD_KEYS)
     hidden_key, hidden = first(cfg, HIDDEN_KEYS)
-    if head_key and hidden_key:
+    pure_ssm = hasattr(cfg, "state_size") and hasattr(cfg, "conv_kernel") and not hasattr(cfg, "num_attention_heads")
+    if pure_ssm and hidden_key:
+        expand = int(getattr(cfg, "expand", 2))
+        if head_key:
+            groups = int(getattr(cfg, "n_groups", 1))
+            head_dim = int(cfg.head_dim)
+            new_heads = max(groups, min(heads, n_head))
+            new_heads -= new_heads % groups
+            hidden = width or new_heads * head_dim // expand
+            if hidden * expand % (groups * head_dim):
+                raise ValueError("SSM width times expansion must be divisible by groups times head_dim")
+            setattr(cfg, head_key, hidden * expand // head_dim)
+        else:
+            hidden = width or min(hidden, 128)
+        setattr(cfg, hidden_key, hidden)
+        if hasattr(cfg, "intermediate_size"):
+            cfg.intermediate_size = hidden * expand
+    elif head_key and hidden_key:
         dim_key, head_dim = first(cfg, HEAD_DIM_KEYS)
         head_dim = head_dim or hidden // n_head
         new_heads = min(heads, n_head)
@@ -98,8 +119,10 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
         setattr(cfg, hidden_key, width or new_heads * head_dim)
 
     for k, v in list(vars(cfg).items()):
-        if isinstance(v, int) and not isinstance(v, bool) and v > ffn and ("intermediate_size" in k or k in FFN_KEYS):
+        if not pure_ssm and isinstance(v, int) and not isinstance(v, bool) and v > ffn and ("intermediate_size" in k or k in FFN_KEYS):
             setattr(cfg, k, ffn)
+        elif isinstance(v, (list, tuple)) and ("intermediate_size" in k or k in FFN_KEYS):
+            setattr(cfg, k, type(v)(min(x, ffn) if isinstance(x, int) and x > 0 else x for x in v))
 
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
     for k in EXPERT_COUNT_KEYS:
@@ -108,6 +131,20 @@ def reduce(cfg, heads, kv_heads, width, ffn, experts):
             groups = getattr(cfg, "n_group", None) or 1
             count = max(experts, top_k + 1)
             setattr(cfg, k, min(v, ((count + groups - 1) // groups) * groups))
+    # Some configurations keep attention and expert dimensions in typed
+    # child configurations. Shrink those too, preserving their classes.
+    for child in vars(cfg).values():
+        if not hasattr(child, "to_dict"):
+            continue
+        for key, value in list(vars(child).items()):
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if ("intermediate_size" in key or key in FFN_KEYS) and value > ffn:
+                setattr(child, key, ffn)
+            elif key in EXPERT_COUNT_KEYS and value > experts:
+                setattr(child, key, max(experts, top_k + 1))
+            elif head_key and key in KV_HEAD_KEYS:
+                setattr(child, key, new_heads if value == n_head else min(value, kv_heads, new_heads))
     return keep, n
 
 
@@ -141,15 +178,17 @@ def main():
     parser.add_argument("--heads", type=int, default=4, help="attention heads (default 4)")
     parser.add_argument("--kv-heads", type=int, default=2,
                         help="key/value heads when the model groups them (default 2)")
-    parser.add_argument("--width", type=int, help="residual width (default heads x the model's head size)")
+    parser.add_argument("--width", type=int, help="residual width (default attention heads x head size; pure SSMs preserve expansion and head/group divisibility)")
     parser.add_argument("--ffn", type=int, default=128, help="FFN and expert widths (default 128)")
     parser.add_argument("--experts", type=int, default=16, help="routed experts (default 16)")
-    parser.add_argument("--config", help="JSON object of configuration fields to set after the reduction")
+    parser.add_argument("--config", help="JSON fields applied after reduction through the configuration constructor")
     parser.add_argument("--seed", type=int, default=1234, help="seed of the random weights (default 1234)")
+    parser.add_argument("--base-model", action="store_true",
+                        help="save AutoModel without an LM head (embedding checkpoints; copy pooling modules separately)")
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
     from transformers.utils import logging as hf_logging
 
     hf_logging.set_verbosity_error()
@@ -158,11 +197,19 @@ def main():
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
     keep, n = reduce(cfg, args.heads, args.kv_heads, args.width, args.ffn, args.experts)
-    for field, value in json.loads(args.config or "{}").items():
-        setattr(cfg, field, value)
+    overrides = json.loads(args.config or "{}")
+    # Re-run the configuration's own invariants after shrinking dimensions
+    # (e.g. an expert configuration's hidden_size must mirror d_model), and
+    # convert nested JSON overrides back to their typed forms.
+    cfg = type(cfg).from_dict({**cfg.to_dict(), **overrides})
+    _, keep = _layer_count(cfg)
+    if hasattr(cfg, "quantization_config"):
+        delattr(cfg, "quantization_config")
+    canonical_rope_config(cfg)
 
     torch.manual_seed(args.seed)
-    model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)
+    factory = AutoModel if args.base_model else AutoModelForCausalLM
+    model = factory.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)
     model.eval()
     _randomize(model)  # seeded: the same arguments give the same checkpoint
     os.makedirs(args.out)

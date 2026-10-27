@@ -8,6 +8,7 @@
 # Output: <out>/<abi>/libliyab.so, liyab-cli, liyab-bench, liyab-kl, test_* (default out: build/android)
 # NDK lookup order: --ndk, $ANDROID_NDK_HOME, $ANDROID_NDK_ROOT, newest NDK under
 # $ANDROID_HOME/ndk, $ANDROID_SDK_ROOT/ndk, ~/Library/Android/sdk/ndk, ~/Android/Sdk/ndk.
+# Build jobs: set CMAKE_BUILD_PARALLEL_LEVEL (for example, 4); unset uses the generator's default.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +23,7 @@ NEUROPILOT=ON
 TESTS=ON
 EXPERIMENTAL=OFF
 
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -79,7 +80,7 @@ cmake -S "$ROOT" -B "$BUILD_DIR" ${GENERATOR[@]+"${GENERATOR[@]}"} \
   -DLIYAB_USE_NEUROPILOT="$NEUROPILOT" \
   -DLIYAB_BUILD_TESTS="$TESTS" \
   -DLIYAB_ENABLE_EXPERIMENTAL="$EXPERIMENTAL"
-cmake --build "$BUILD_DIR" --parallel
+cmake --build "$BUILD_DIR"
 
 LIB="$BUILD_DIR/libliyab.so"
 STRIP="$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/llvm-strip 2>/dev/null | head -n 1)"

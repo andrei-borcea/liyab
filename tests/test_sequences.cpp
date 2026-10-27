@@ -273,7 +273,36 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
         KvCacheType kv;
     };
     std::vector<Spec> specs;
+    specs.push_back({"compressed-q8", test::compressed_spec(), KvCacheType::Q8_0});
+    specs.push_back({"compressed-f16", test::compressed_spec(), KvCacheType::F16});
+    specs.push_back({"compressed-q4", test::compressed_spec(), KvCacheType::Q4_0});
+    specs.push_back({"compressed-q4-1", test::compressed_spec(), KvCacheType::Q4_1});
     specs.push_back({"llama-q8", {}, KvCacheType::Q8_0});
+    {
+        test::TinyModelSpec s;
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        specs.push_back({"smollm3-nope", s, KvCacheType::Q8_0});
+        s = {};
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        specs.push_back({"olmo2-post-only", s, KvCacheType::Q4_1});
+        s = {};
+        s.arch = "granite";
+        s.embedding_scale = 12.0f;
+        s.residual_scale = 0.22f;
+        s.logit_scale = 8.0f;
+        specs.push_back({"granite-mup", s, KvCacheType::F16});
+        s = {};
+        s.arch = "mistral3";
+        s.attn_temp_scale = 0.1f;
+        s.attn_temp_length = 8;
+        specs.push_back({"mistral3-temperature", s, KvCacheType::Q4_0});
+        s = test::nas_spec();
+        s.qk_norm = s.qk_norm_whole = true;
+        s.k_norm_outlier = 60.0f;
+        specs.push_back({"deci-block-geometry", s, KvCacheType::Q8_0});
+    }
     {
         test::TinyModelSpec s;
         s.arch = "qwen2";  // QKV bias, NeoX RoPE
@@ -308,8 +337,19 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
     }
 }
 
+TEST_CASE("Classic models: sequences keep positions, parallel inputs, norms and logits separate") {
+    for (const std::string arch : {"gpt2", "gptneox", "bloom", "olmo", "stablelm", "command-r", "apertus", "dbrx"}) {
+        for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            const auto s = test::classic_model_spec(arch);
+            TransformerOptions options;
+            options.kv_type = kv;
+            CHECK(check_schedule("classic_" + arch, model_path("classic_" + arch, s), options, mixed_plans()));
+        }
+    }
+}
+
 TEST_CASE("Sequences together: windowed blocks and fused projections keep each sequence's bits") {
-    for (const std::string arch : {"gemma3", "gemma2", "phi3"}) {
+    for (const std::string arch : {"gemma3", "gemma2", "phi3", "exaone4", "gpt-oss"}) {
         test::TinyModelSpec s;
         s.arch = arch;
         s.sliding_window = 16;
@@ -323,6 +363,15 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
             s.post_norms = true;
             s.attn_softcap = 50.0f;
             s.final_softcap = 30.0f;
+        } else if (arch == "exaone4") {
+            s.n_layers = 4;
+            s.qk_norm = s.post_only_norms = true;
+        } else if (arch == "gpt-oss") {
+            s.n_expert = 8;
+            s.n_expert_used = 3;
+            s.identical_experts = false;
+            s.router_bias = s.expert_projection_bias = true;
+            s.attention_sinks = s.attention_output_bias = true;
         } else {
             s.fused_qkv = true;
             s.fused_gate_up = true;
@@ -338,11 +387,12 @@ TEST_CASE("Sequences together: windowed blocks and fused projections keep each s
 }
 
 TEST_CASE("Sequences together: hybrid (DeltaNet) models continue each sequence's states, checkpoints included") {
+    for (const char* arch : {"qwen35", "mamba", "mamba2"}) {
     test::TinyModelSpec s;
-    s.arch = "qwen35";
+    s.arch = arch;
     s.n_layers = 4;
-    s.delta_net_interval = 2;
-    const std::string& path = model_path("hybrid", s);
+    if (std::string_view(arch) == "qwen35") s.delta_net_interval = 2;
+    const std::string& path = model_path(std::string("state_") + arch, s);
     TransformerOptions options;
     CHECK(check_schedule("hybrid", path, options, mixed_plans()));
     CHECK(check_schedule("hybrid, rollback window", path, options, mixed_plans(), 4));
@@ -377,6 +427,7 @@ TEST_CASE("Sequences together: hybrid (DeltaNet) models continue each sequence's
     CHECK(same_bits(*again, std::span<const float>(all).subspan(4 * rows)));
     model->swap_context(**other);
     CHECK(model->n_past() == 10);
+    }
 }
 
 TEST_CASE("Sequences together: a mixture of experts reads the union of the experts, each sequence its bits") {
@@ -414,6 +465,13 @@ TEST_CASE("Sequences together: latent attention takes each sequence's own form, 
             options.latent_form = form;
             const char* names[] = {"auto", "absorbed", "expanded"};
             CHECK(check_schedule(std::string("latent ") + names[static_cast<int>(form)], path, options, mixed_plans()));
+        }
+        s.mla_legacy = true;
+        const std::string& combined = model_path("latent_combined_q" + std::to_string(q_rank), s);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+            TransformerOptions options;
+            options.latent_form = form;
+            CHECK(check_schedule("latent combined", combined, options, mixed_plans()));
         }
     }
 }
@@ -463,6 +521,23 @@ std::string write_adapter(const std::string& name, const std::string& model_path
 }
 
 }  // namespace
+
+TEST_CASE("Sequences together: sparse index keys belong to each sequence in both latent forms") {
+    test::TinyModelSpec s;
+    s.arch = "glm-dsa";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_q_rank = 64;
+    s.index_dim = 64;
+    s.index_topk = 4;
+    const std::string path = model_path("indexed_sequences", s);
+    for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+        TransformerOptions options;
+        options.latent_form = form;
+        CHECK(check_schedule("indexed sequences", path, options, mixed_plans()));
+    }
+}
 
 TEST_CASE("Sequences together: each sequence applies its own LoRA adapter, or none") {
     // Dense: attention, FFN and the LM head adapted.
@@ -766,12 +841,13 @@ test::TinyModelSpec moe_spec() {
     return s;
 }
 
-test::TinyModelSpec latent_spec() {
+test::TinyModelSpec latent_spec(bool combined = false) {
     test::TinyModelSpec s;
     s.arch = "deepseek2";
     s.n_head_kv = 1;
     s.rope_dim = 32;
     s.mla_kv_rank = 64;
+    s.mla_legacy = combined;
     return s;
 }
 
@@ -789,7 +865,8 @@ TEST_CASE("Engine sequences generate together, each one's output what it gives a
     windowed.sliding_window = 16;
     windowed.post_norms = true;
     for (const Model& m : {Model{"llama", {}}, Model{"hybrid", hybrid_spec()}, Model{"moe streamed", moe_spec(), 1},
-                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed}}) {
+                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed},
+                           Model{"latent combined", latent_spec(true)}}) {
         EngineConfig config = engine_config(model_path(std::string("engine_") + m.name, m.spec), 4);
         config.expert_cache_mb = m.expert_cache_mb;
         Engine::SchedulerStats st;
@@ -1597,3 +1674,15 @@ TEST_CASE("C API: sequences open, generate together as alone, cancel and close")
 }
 
 TEST_MAIN()
+
+TEST_CASE("ShortConv, KDA and grouped DeltaNet continue independent sequences and rollback states") {
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("recurrent_" + spec.arch, spec);
+        for (auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            options.expert_cache_bytes = spec.n_expert > 0 ? 1 : 0;
+            CHECK(check_schedule(spec.arch, path, options, mixed_plans(), 4));
+        }
+    }
+}

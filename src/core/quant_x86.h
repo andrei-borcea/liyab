@@ -63,6 +63,7 @@ float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, int64_t n) noexcept;
 void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
+void dot_mxfp4_q8_0_rows(const void* row, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
 
 // Against Q8_K activations: the types for which has_q8_K_kernel() is true.
 bool has_q8_K_kernel(DType type) noexcept;

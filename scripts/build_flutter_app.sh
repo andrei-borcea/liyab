@@ -2,7 +2,7 @@
 # Builds the Liyab Flutter app (app/) with the engine and its experimental
 # modules (Settings > Experimental turns them on; all off by default).
 #
-#   scripts/build_flutter_app.sh [--install]   Android: release APK, optionally installed
+#   scripts/build_flutter_app.sh [--install --serial SERIAL]   Android: release APK, optionally installed
 #   scripts/build_flutter_app.sh --macos       macOS: Liyab.app (Apple silicon)
 #
 # Android requires Flutter, Android SDK (platform 36), NDK, JDK 17, cmake. The
@@ -17,20 +17,30 @@
 # the app (app/macos/Runner/Configs/Engine.xcconfig); `flutter run -d macos`
 # works once this has built build/macos/engine/libliyab.a.
 # Output: app/build/macos/Build/Products/Release/Liyab.app
+# --serial (or ANDROID_SERIAL) is required for --install; every device call uses it.
+# Native build jobs respect CMAKE_BUILD_PARALLEL_LEVEL.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL=0
 MACOS=0
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+SERIAL="${ANDROID_SERIAL:-}"
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --install) INSTALL=1; shift ;;
+    --serial) [[ $# -ge 2 && -n "$2" ]] || { echo "error: --serial needs a device serial" >&2; exit 2; }; SERIAL="$2"; shift 2 ;;
     --macos) MACOS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ "$INSTALL" == 1 && "$MACOS" == 0 && -z "$SERIAL" ]]; then
+  echo "error: --install requires --serial SERIAL or ANDROID_SERIAL" >&2
+  exit 2
+fi
+ADB=(adb -s "$SERIAL")
 
 if [[ "$MACOS" == 1 ]]; then
   [[ "$(uname)" == "Darwin" ]] || { echo "error: the macOS app builds on macOS only" >&2; exit 1; }
@@ -45,7 +55,7 @@ if [[ "$MACOS" == 1 ]]; then
     -DLIYAB_BUILD_TESTS=OFF \
     -DLIYAB_BUILD_CLI=OFF \
     -DLIYAB_ENABLE_EXPERIMENTAL=ON >/dev/null
-  cmake --build "$ROOT/build/macos/engine" --parallel >/dev/null
+  cmake --build "$ROOT/build/macos/engine" >/dev/null
   echo "==> Liyab.app"
   (cd "$ROOT/app" && flutter build macos --release)
   APP="$ROOT/app/build/macos/Build/Products/Release/Liyab.app"
@@ -76,15 +86,15 @@ if [[ "$INSTALL" == 1 ]]; then
   # backgrounded chat keep it alive indefinitely.
   # On screen means the screen is on too: with it off, Liyab can be the resumed activity unseen.
   in_use() {
-    { adb shell dumpsys power | grep -q 'mWakefulness=Awake' &&
-      adb shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat; } ||
-      adb shell dumpsys activity services com.liyab.chat | grep 'isForeground=true' | grep -qv 'channel=listening'
+    { "${ADB[@]}" shell dumpsys power | grep -q 'mWakefulness=Awake' &&
+      "${ADB[@]}" shell dumpsys activity activities | grep -E 'ResumedActivity' | grep -q com.liyab.chat; } ||
+      "${ADB[@]}" shell dumpsys activity services com.liyab.chat | grep 'isForeground=true' | grep -qv 'channel=listening'
   }
   while in_use; do
     echo "    Liyab is in use on the phone; waiting for it to go to the background…"
     sleep 10
   done
-  adb install -r "$APK"
+  "${ADB[@]}" install -r "$APK"
   # Installing stops the app, and it stays stopped until opened: launched over another app it got in the owner's
   # way, and launched with the screen off it never saw itself leave the screen, so it never released its model.
   echo "==> Installed com.liyab.chat; open it once to start it again (its local API starts with it)"

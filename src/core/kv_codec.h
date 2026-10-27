@@ -94,6 +94,9 @@ struct KvRowLayout {
     int32_t layers = 0;
     int32_t heads = 0;   // KV heads
     int32_t head_dim = 0;
+    // F32 channels after each main row; store these mixed-format images raw
+    // so neither codec can change the sparse indexer's discrete selection.
+    int32_t auxiliary_dim = 0;
 
     // Planes, layers, heads and head_dim positive, head_dim a multiple of 32
     // for block types.

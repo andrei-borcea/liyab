@@ -14,7 +14,7 @@
 // elif / else, for (tuple targets, `if` filters, else, loop.index / index0 /
 // revindex / first / last / length / previtem / nextitem / cycle), break /
 // continue, set (names, namespace attributes, blocks), macro with defaults,
-// generation blocks; literals, lists, dicts, tuples, attribute / item /
+// generation blocks; literals, lists, dicts (string and scalar keys), tuples, attribute / item /
 // slice access, calls with keyword arguments, + - * / // % ** ~, comparisons,
 // in / not in, and / or / not, conditional expressions; Python string,
 // list and dict methods (split, strip, startswith, items, get...); the
@@ -63,6 +63,8 @@ public:
     Value(int i) : Value(static_cast<int64_t>(i)) {}  // NOLINT(google-explicit-constructor)
     Value(double f);               // NOLINT(google-explicit-constructor)
     Value(std::string s);          // NOLINT(google-explicit-constructor)
+    // String views are copied: the value never borrows the caller's bytes.
+    Value(std::string_view s) : Value(std::string(s)) {}  // NOLINT(google-explicit-constructor)
     Value(const char* s) : Value(std::string(s)) {}  // NOLINT(google-explicit-constructor)
     static Value array(Array items = {});
     static Value object();
@@ -106,10 +108,10 @@ private:
 };
 
 struct Object {
-    std::vector<std::pair<std::string, Value>> entries;  // insertion order, as Python dicts
+    std::vector<std::pair<Value, Value>> entries;  // insertion order, scalar keys retain their types
     bool is_namespace = false;
-    [[nodiscard]] const Value* find(std::string_view key) const;
-    void set(const std::string& key, Value value);
+    [[nodiscard]] const Value* find(const Value& key) const;
+    void set(const Value& key, Value value);
 };
 
 struct Callable {
@@ -127,7 +129,10 @@ namespace liyab {
 class ChatTemplate {
 public:
     // Parses `source`. InvalidArgument names the problem and its line.
-    static Result<ChatTemplate> parse(std::string_view source);
+    // sort_tools reproduces a reference tokenizer's recursive ordering of
+    // tool-object keys before render_chat(); other request values keep their
+    // order. Immutable after parsing; rendering owns its request values.
+    static Result<ChatTemplate> parse(std::string_view source, bool sort_tools = false);
 
     // Renders with `context` (an object: messages, tools, add_generation_prompt...).
     // A template's raise_exception() and every evaluation error come back as
@@ -154,6 +159,7 @@ public:
 
 private:
     std::shared_ptr<const std::vector<Node>> body_;
+    bool sort_tools_ = false;
 };
 
 }  // namespace liyab

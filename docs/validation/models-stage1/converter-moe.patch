@@ -1,0 +1,22 @@
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -2132,6 +2132,8 @@
+             # ref: https://huggingface.co/IFM/K2-Horizon-36B
+             res = "k2-horizon"
+ 
++        if chkhsh == "99ecacb482755b6abc6f96d6f278fa7f540b51d4549bcc0c5c068a60934d128c":
++            res = "deepseek-llm"  # author tokenizer.json through transformers 5 TokenizersBackend
+         if res is None:
+             logger.warning("\n")
+             logger.warning("**************************************************************************************")
+--- a/conversion/hunyuan.py
++++ b/conversion/hunyuan.py
+@@ -24,6 +24,8 @@
+     def set_vocab(self):
+         from transformers import AutoTokenizer
+         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
++        if not hasattr(tokenizer, "mergeable_ranks"):
++            return self._set_vocab_gpt2()
+ 
+         # 1. Get the pre-tokenizer identifier hash
+         tokpre = self.get_vocab_base_pre(tokenizer)

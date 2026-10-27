@@ -5,15 +5,17 @@ A reduced copy of the model is built from its configuration with random weights:
 every kind of block the configuration lists), a small vocabulary, narrow FFNs and few experts. The widths of the
 residual stream and of the attention heads are kept, so every scale, base and multiplier is the model's own. One
 pass over a short sequence is recorded: what every module receives and returns, and, through an attention function
-registered with transformers, the queries, keys and values each attention gets with its arguments (scale, window,
-soft-cap). The facts the engine needs are then established by recomputing them, never from class or module names:
+registered with transformers (or by observing native SDPA in older classes), the queries, keys and values each
+attention gets with its arguments (scale, window, soft-cap). The facts the engine needs are then established by
+recomputing them, never from class or module names:
 
 * the order of norms, token mixer and FFN in a block and how the residual adds combine them;
-* each norm's formula (RMSNorm multiplying by w or by 1 + w, LayerNorm);
+* each norm's formula (RMSNorm multiplying by w plus a measured scalar offset, LayerNorm);
 * how keys and queries are rotated (which dimensions are paired, how many, with which frequencies), whether their
   norms come before or after the rotation, and over how many dimensions those norms reach;
 * the attention scale, window and soft-cap, and whether the attention output is gated;
-* the FFN's form and activation, and a mixture of experts' routing (probabilities, selection bias, top-k,
+* the FFN's form and activation, and a mixture of experts' routing (fused or individually observed experts,
+  logits from a module or a direct linear operation, probabilities, selection bias, top-k,
   renormalization, scale, shared expert and its gate);
 * how the embeddings enter the first block and how the logits leave the last one.
 
@@ -25,12 +27,15 @@ What cannot be recomputed is reported as unknown, never guessed. Needs torch and
 import argparse
 import copy
 import json
+import functools
+import inspect
 import math
 import sys
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+from torch.overrides import TorchFunctionMode
 
 SEQ = 13  # trace length: prime, so it is never mistaken for a head count when shapes are matched
 VOCAB = 512  # reduced vocabulary (the trace's token ids are below it)
@@ -62,6 +67,10 @@ class Call:
         for key in ("hidden_states", "x", "input", "inputs_embeds"):
             if torch.is_tensor(self.kwargs.get(key)):
                 return self.kwargs[key]
+        for a in self.args:
+            nested = _tensors(a)
+            if nested:
+                return nested[0]
         for v in self.kwargs.values():
             if torch.is_tensor(v):
                 return v
@@ -88,7 +97,11 @@ class AttnCall:
 class Recorder:
     calls: list = field(default_factory=list)
     attn: list = field(default_factory=list)
+    recurrences: list = field(default_factory=list)
     counter: int = 0
+    clamps: list = field(default_factory=list)
+    norm_eps: dict = field(default_factory=dict)
+    gelu_modes: list = field(default_factory=list)
 
     def next(self):
         self.counter += 1
@@ -100,7 +113,7 @@ RECORDER = Recorder()
 
 def _tensors(obj):
     if torch.is_tensor(obj):
-        return [obj.detach()]
+        return [obj.detach().clone()]
     if isinstance(obj, (list, tuple)):
         out = []
         for o in obj:
@@ -120,7 +133,7 @@ def _register_attention():
     """Registers ATTN_IMPL: records the attention's inputs and arguments, then runs transformers' SDPA path."""
     from transformers import AttentionInterface
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
-    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, eager_mask
 
     def traced(module, query, key, value, attention_mask, **kwargs):
         rec = AttnCall(RECORDER.next(), module, query.detach().clone(), key.detach().clone(),
@@ -134,7 +147,10 @@ def _register_attention():
         return out, weights
 
     AttentionInterface.register(ATTN_IMPL, traced)
-    ALL_MASK_ATTENTION_FUNCTIONS.register(ATTN_IMPL, sdpa_mask)
+    # An explicit mask also works for eager implementations that cast it to
+    # bool. SDPA's optional None fast path would make those fail before the
+    # observed score operations; the trace itself still runs SDPA.
+    ALL_MASK_ATTENTION_FUNCTIONS.register(ATTN_IMPL, eager_mask)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -143,7 +159,18 @@ def _register_attention():
 
 LAYER_COUNT_KEYS = ("num_hidden_layers", "n_layer", "num_layers", "n_layers")
 EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
-TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_k", "moe_topk", "top_k")
+TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_k", "moe_topk", "top_k", "moe_top_k")
+
+
+def canonical_rope_config(cfg):
+    """Spell a legacy RoPE `type` key as `rope_type`, without changing its value or other parameters."""
+    def visit(value):
+        if isinstance(value, dict):
+            if "type" in value and "rope_type" not in value:
+                value["rope_type"] = value.pop("type")
+            for child in value.values():
+                visit(child)
+    visit(getattr(cfg, "rope_parameters", None))
 
 
 def _layer_count(cfg):
@@ -158,7 +185,12 @@ def blocks_to_trace(cfg):
     """The shortest prefix of blocks that holds every kind of block the configuration lists per block, at least 2."""
     _, n = _layer_count(cfg)
     want = min(n, 2)
-    for key, value in vars(cfg).items():
+    fields = dict(vars(cfg))
+    for key in ("layer_types", "interleaved_sliding_window"):
+        value = getattr(cfg, key, None)
+        if isinstance(value, (list, tuple)):
+            fields[key] = value
+    for key, value in fields.items():
         if isinstance(value, (list, tuple)) and len(value) == n and n > 1:
             seen = set()
             for i, v in enumerate(value):
@@ -166,7 +198,8 @@ def blocks_to_trace(cfg):
                 if h not in seen:
                     seen.add(h)
                     want = max(want, i + 1)
-    for key in ("first_k_dense_replace", "decoder_sparse_step", "moe_layer_freq", "full_attention_interval"):
+    for key in ("first_k_dense_replace", "decoder_sparse_step", "moe_layer_freq", "full_attention_interval",
+                "num_dense_layers", "moe_layer_start_index"):
         v = getattr(cfg, key, None)
         if isinstance(v, int) and v > 0:
             want = max(want, v + 1)
@@ -176,12 +209,27 @@ def blocks_to_trace(cfg):
         sparse = [i for i in range(n) if i not in mlp_only]
         if dense and sparse:
             want = max(want, max(dense[0], sparse[0]) + 1)
+    # A shared-KV suffix needs a source block of every attention kind before
+    # it starts. Keep the declared suffix and that shortest source prefix.
+    shared = getattr(cfg, "num_kv_shared_layers", 0) or 0
+    kinds = getattr(cfg, "layer_types", None)
+    if shared and kinds:
+        first_of_kind = max(kinds.index(t) + 1 for t in set(kinds))
+        want = max(want, shared + first_of_kind)
     return min(n, max(want, 2))
 
 
 def reduced_config(config):
     """A copy of the text configuration with fewer blocks, a small vocabulary, narrow FFNs and few experts."""
     cfg = copy.deepcopy(config.get_text_config() if hasattr(config, "get_text_config") else config)
+    # A window longer than the trace looks exactly like global causal
+    # attention. Shorten a uniform configured window so its boundary is
+    # exercised, just as FFN widths are reduced below. Reconstruct through
+    # the configuration owner so aliases and computed layer types agree.
+    windows = {k: getattr(cfg, k, None) for k in ("sliding_window", "window_size")}
+    windows = {k: v for k, v in windows.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+    if len(set(windows.values())) == 1 and next(iter(windows.values())) > SEQ // 2:
+        cfg = type(cfg).from_dict({**cfg.to_dict(), **{k: SEQ // 2 for k in windows}})
     key, n = _layer_count(cfg)
     keep = blocks_to_trace(cfg)
     for k, v in list(vars(cfg).items()):
@@ -195,6 +243,8 @@ def reduced_config(config):
             setattr(cfg, k, 0)
     if getattr(cfg, "vocab_size", 0) > VOCAB:
         cfg.vocab_size = VOCAB
+    if getattr(cfg, "vocab_size_per_layer_input", 0) > VOCAB:
+        cfg.vocab_size_per_layer_input = VOCAB
     for k, v in list(vars(cfg).items()):
         if k.endswith("token_id") and isinstance(v, int) and v >= VOCAB:
             setattr(cfg, k, None)
@@ -203,6 +253,18 @@ def reduced_config(config):
     for k, v in list(vars(cfg).items()):
         if "intermediate_size" in k and isinstance(v, int) and v > FFN:
             setattr(cfg, k, FFN)
+        elif "intermediate_size" in k and isinstance(v, (list, tuple)):
+            setattr(cfg, k, type(v)(min(x, FFN) if isinstance(x, int) and x > 0 else x for x in v))
+    # Pure SSM stacks have no attention head geometry to preserve. Keep the
+    # expansion and head/group divisibility, with a small residual stream.
+    if hasattr(cfg, "state_size") and hasattr(cfg, "conv_kernel") and not hasattr(cfg, "num_attention_heads"):
+        cfg.hidden_size = 128
+        cfg.intermediate_size = int(getattr(cfg, "expand", 2)) * cfg.hidden_size
+        if hasattr(cfg, "num_heads"):
+            groups = int(getattr(cfg, "n_groups", 1))
+            cfg.num_heads = max(groups, cfg.intermediate_size // cfg.head_dim)
+            cfg.intermediate_size = cfg.num_heads * cfg.head_dim
+            cfg.hidden_size = cfg.intermediate_size // int(getattr(cfg, "expand", 2))
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
     for k in EXPERT_COUNT_KEYS:
         v = getattr(cfg, k, None)
@@ -211,6 +273,25 @@ def reduced_config(config):
             count = max(EXPERTS, top_k + 1)
             count = ((count + groups - 1) // groups) * groups
             setattr(cfg, k, min(v, count))
+    # Typed child configurations can own expert widths/counts too (DBRX).
+    # Keep the residual width for matching the original file, but bound the
+    # randomly constructed FFNs just as the top-level ones are bounded.
+    for child in vars(cfg).values():
+        if not hasattr(child, "to_dict"):
+            continue
+        child_top_k = max([getattr(child, key) for key in TOP_K_KEYS
+                           if isinstance(getattr(child, key, None), int)] or [top_k])
+        for key, value in list(vars(child).items()):
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if value > FFN and ("intermediate_size" in key or key in ("n_inner", "ffn_hidden_size", "ffn_dim", "d_ff")):
+                setattr(child, key, FFN)
+            elif key in EXPERT_COUNT_KEYS and value > EXPERTS:
+                groups = getattr(child, "n_group", None) or 1
+                count = max(EXPERTS, child_top_k + 1)
+                setattr(child, key, min(value, ((count + groups - 1) // groups) * groups))
+    if isinstance(getattr(cfg, "index_topk", None), int):
+        cfg.index_topk = min(cfg.index_topk, SEQ // 2)  # select within the short trace
     return cfg, keep, n
 
 
@@ -269,6 +350,8 @@ ACTIVATIONS = {
 
 
 def _eps_of(module, fallback):
+    if module in RECORDER.norm_eps:
+        return RECORDER.norm_eps[module]
     for k in ("variance_epsilon", "eps", "epsilon"):
         v = getattr(module, k, None)
         if isinstance(v, float):
@@ -276,13 +359,26 @@ def _eps_of(module, fallback):
     return fallback
 
 
+def rms_offset(call, eps):
+    """A measured scalar offset to the weight; accepted only if the entire RMSNorm output agrees."""
+    x, y = call.input.float(), call.output.float()
+    rms = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    valid = rms.abs() > 1e-4
+    if not valid.any():
+        return None
+    offset = float((y / torch.where(valid, rms, torch.ones_like(rms)) - call.module.weight.detach().float())[valid].median())
+    return offset if math.isfinite(offset) and close(rms * (call.module.weight.detach().float() + offset), y) else None
+
+
 def norm_formula(call, eps_fallback):
-    """How a norm module maps its input to its output: ("rms" | "rms_1p" | "layer" | "rms_noweight", eps), or None."""
+    """How a norm maps input to output: (rms | rms_1p | rms_offset | layer | rms_noweight, eps), or None."""
     x, y = call.input, call.output
     if x is None or y is None or x.shape != y.shape:
         return None
     w = getattr(call.module, "weight", None)
     bias = getattr(call.module, "bias", None)
+    if w is not None and tuple(w.shape) != tuple(x.shape[-w.dim():]):
+        return None
     eps = _eps_of(call.module, eps_fallback)
     xf = x.float()
     rms = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
@@ -292,16 +388,32 @@ def norm_formula(call, eps_fallback):
             return "rms", eps
         if close(rms * (1.0 + wf), y):
             return "rms_1p", eps
-        mean = xf.mean(-1, keepdim=True)
-        var = (xf - mean).pow(2).mean(-1, keepdim=True)
-        ln = (xf - mean) * torch.rsqrt(var + eps) * wf
-        if bias is not None and torch.is_tensor(bias):
-            ln = ln + bias.detach().float()
-        if close(ln, y):
-            return "layer", eps
+        if rms_offset(call, eps) is not None:
+            return "rms_offset", eps
     elif w is None and close(rms, y):
         return "rms_noweight", eps
+    mean = xf.mean(-1, keepdim=True)
+    var = (xf - mean).pow(2).mean(-1, keepdim=True)
+    ln = (xf - mean) * torch.rsqrt(var + eps)
+    for formula, gain in (("layer", w.detach().float() if w is not None else 1.0),
+                           ("layer_1p", 1.0 + w.detach().float() if w is not None else 1.0)):
+        result = ln * gain
+        if bias is not None and torch.is_tensor(bias):
+            result = result + bias.detach().float()
+        if close(result, y):
+            return formula, eps
     return None
+
+
+def norm_fact(call, eps):
+    form = norm_formula(call, eps)
+    fact = {"module": call.path, "formula": form[0] if form else None, "eps": form[1] if form else None,
+            "weighted": getattr(call.module, "weight", None) is not None}
+    if form and form[0] in ("rms", "rms_1p", "rms_offset"):
+        fact["weight_offset"] = {"rms": 0.0, "rms_1p": 1.0}.get(form[0])
+        if fact["weight_offset"] is None:
+            fact["weight_offset"] = rms_offset(call, form[1])
+    return fact
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -323,6 +435,14 @@ def _randomize(model):
             else:
                 fan_in = p.shape[-1]
                 p.copy_(torch.randn(p.shape, generator=g) / math.sqrt(max(1, fan_in)))
+        # Persistent router corrections are often buffers initialized to zero.
+        # Give these declared selection biases a signal so the trace and tiny
+        # checkpoint exercise their selection-only effect. RoPE and other
+        # mathematical buffers keep the model's values.
+        for name, b in model.named_buffers():
+            if b.is_floating_point() and b.dim() == 1 and name.rsplit(".", 1)[-1] in (
+                    "e_score_correction", "e_score_correction_bias", "expert_bias"):
+                b.copy_(torch.randn(b.shape, generator=g) * 0.1)
 
 
 def _decoder_layers(model, keep):
@@ -353,6 +473,102 @@ class Trace:
     ids: torch.Tensor
     logits: torch.Tensor
     class_name: str
+    clamps: list = field(default_factory=list)
+    recurrences: list = field(default_factory=list)
+
+
+class NativeAttentionTrace(TorchFunctionMode):
+    """Observe eager matmul/softmax attention in implementations without AttentionInterface.
+
+    No model classes are selected: a score product, its softmax and its value
+    product must agree numerically. Scores are fitted to scaled QK plus a
+    per-head linear position bias and a softmax-invariant constant per query.
+    """
+    def __init__(self, stack):
+        super().__init__()
+        self.stack, self.dots, self.probs = stack, {}, {}
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        out = func(*args, **kwargs)
+        if not self.stack or not torch.is_tensor(out):
+            return out
+        module = self.stack[-1][1]
+        if any(rec.module is module for rec in RECORDER.attn):
+            return out  # AttentionInterface already recorded this invocation.
+        name = func.__name__
+        if name == "linear" and not isinstance(module, nn.Linear):
+            source = args[0] if args else kwargs["input"]
+            weight = args[1] if len(args) > 1 else kwargs["weight"]
+            own = getattr(module, "weight", None)
+            if torch.is_tensor(own) and own.dim() == 2 and torch.equal(weight, own):
+                # A parameter-owning router may call functional linear rather
+                # than a child module. Record the observed logits directly.
+                RECORDER.calls.append(Call(RECORDER.next(), self.stack[-1][0], module,
+                                           [source.detach().clone()], {}, [out.detach().clone()]))
+        elif name == "gelu":
+            approximate = kwargs.get("approximate", args[1] if len(args) > 1 else "none")
+            if approximate in ("none", "tanh"):
+                source = args[0] if args else kwargs["input"]
+                RECORDER.gelu_modes.append((module, "gelu" if approximate == "none" else "gelu_tanh",
+                                           source.detach().clone(), out.detach().clone()))
+        elif name == "layer_norm":
+            RECORDER.norm_eps[module] = float(kwargs.get("eps", args[4] if len(args) > 4 else 1e-5))
+        elif name in ("clamp", "clamp_"):
+            lo = kwargs.get("min", args[1] if len(args) > 1 else None)
+            hi = kwargs.get("max", args[2] if len(args) > 2 else None)
+            if isinstance(lo, (float, int)) and isinstance(hi, (float, int)) and hi > 0 and lo == -hi:
+                RECORDER.clamps.append((module, float(hi)))
+        elif name in ("scaled_dot_product_attention",):
+            q, k, v = args[:3]
+            rec = AttnCall(RECORDER.next(), module, q.detach().clone(), k.detach().clone(), v.detach().clone(),
+                           {"scaling": kwargs.get("scale") or q.shape[-1] ** -0.5,
+                            "observed_sdpa": True,
+                            "is_causal": kwargs.get("is_causal", args[5] if len(args) > 5 else False),
+                            "attention_mask": (kwargs.get("attn_mask", args[3] if len(args) > 3 else None))})
+            rec.output = out.transpose(1, 2).detach().clone()
+            RECORDER.attn.append(rec)
+        elif name in ("matmul", "bmm", "baddbmm") and (len(args) >= 2 or "batch1" in kwargs):
+            a = kwargs["batch1"] if "batch1" in kwargs else args[-2]
+            b = kwargs["batch2"] if "batch2" in kwargs else args[-1]
+            if not torch.is_tensor(a) or not torch.is_tensor(b) or a.dim() < 3 or b.dim() < 3:
+                return out
+            pending = self.probs.get(module)
+            if pending and a.shape[-2:] == (SEQ, SEQ) and b.shape[-2] == SEQ and close(a, pending[0]):
+                rec = pending[1]
+                rec.value = b.reshape(1, -1, SEQ, b.shape[-1]).detach().clone()
+                rec.output = out.reshape(1, -1, SEQ, b.shape[-1]).transpose(1, 2).detach().clone()
+                RECORDER.attn.append(rec)
+                del self.probs[module]
+            elif out.shape[-2:] == (SEQ, SEQ) and a.shape[-2] == SEQ and b.shape[-1] == SEQ:
+                q = a.reshape(1, -1, SEQ, a.shape[-1]).detach().clone()
+                k = b.transpose(-1, -2).reshape(1, -1, SEQ, b.shape[-2]).detach().clone()
+                self.dots[module] = (q, k)
+        elif name == "softmax" and out.shape[-2:] == (SEQ, SEQ) and module in self.dots:
+            q, k = self.dots.pop(module)
+            score = args[0].reshape(1, -1, SEQ, SEQ).double()
+            dots = (q.double() @ k.double().transpose(-1, -2))
+            scales, slopes = [], []
+            valid = True
+            for h in range(score.shape[1]):
+                # Differences to column zero remove the constant per query.
+                ds, dq, positions = [], [], []
+                for t in range(1, SEQ):
+                    for j in range(1, t + 1):
+                        ds.append(score[0, h, t, j] - score[0, h, t, 0])
+                        dq.append(dots[0, h, t, j] - dots[0, h, t, 0])
+                        positions.append(j)
+                design = torch.stack((torch.stack(dq), torch.tensor(positions, dtype=torch.float64)), dim=1)
+                target = torch.stack(ds)
+                fit = torch.linalg.lstsq(design, target).solution
+                valid = valid and close(design @ fit, target, rtol=2e-4, atol=2e-5)
+                scales.append(float(fit[0]))
+                slopes.append(float(fit[1]))
+            if valid and max(scales) - min(scales) < 1e-5:
+                rec = AttnCall(RECORDER.next(), module, q, k, None,
+                               {"scaling": sum(scales) / len(scales), "alibi_slopes": slopes})
+                self.probs[module] = (out.detach().clone(), rec)
+        return out
 
 
 def run_trace(model_id, revision=None, trust_remote_code=False):
@@ -364,37 +580,103 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     config = AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=trust_remote_code)
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     reduced, keep, n = reduced_config(config)
+    canonical_rope_config(reduced)
     _register_attention()
-    reduced._attn_implementation = ATTN_IMPL
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
-                                             attn_implementation=ATTN_IMPL)
+    try:
+        model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                 attn_implementation=ATTN_IMPL)
+    except (ValueError, KeyError) as error:
+        if ATTN_IMPL not in str(error):
+            raise
+        # Older official classes predate AttentionInterface. Observe their
+        # native SDPA call without replacing any forward computation.
+        reduced._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        try:
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="sdpa")
+        except (ValueError, KeyError) as unsupported:
+            if not any(name in str(unsupported) for name in ("sdpa", "scaled_dot_product_attention")):
+                raise
+            # Some classes call functional SDPA directly without declaring
+            # transformers' backend capability. Their eager path is observed
+            # too, including paired manual QK and probabilities/V products.
+            reduced._attn_implementation = "eager"
+            torch.manual_seed(0)
+            model = AutoModelForCausalLM.from_config(reduced, trust_remote_code=trust_remote_code, dtype=torch.float32,
+                                                     attn_implementation="eager")
     model.eval()
     _randomize(model)
     layers_path, layers = _decoder_layers(model, keep)
 
+    # Record algorithm operands as well as module boundaries. These functions
+    # are operations (shared by several architectures), not model-name rules.
+    originals = []
+    namespaces = {id(type(m).forward.__globals__): type(m).forward.__globals__
+                  for m in model.modules() if hasattr(type(m).forward, "__globals__")}
+    for namespace in namespaces.values():
+        for name, fn in list(namespace.items()):
+            if not callable(fn) or "chunk" not in name or not any(t in name for t in ("delta_rule", "delta_attention")):
+                continue
+            signature = inspect.signature(fn)
+            if not {"query", "key", "value"}.issubset(signature.parameters):
+                continue
+            @functools.wraps(fn)
+            def recorded(*args, _fn=fn, _sig=signature, **kwargs):
+                bound = _sig.bind(*args, **kwargs).arguments
+                values = {k: v.detach().clone() for k, v in bound.items() if torch.is_tensor(v)}
+                RECORDER.recurrences.append(values)
+                return _fn(*args, **kwargs)
+            originals.append((namespace, name, fn))
+            namespace[name] = recorded
+    RECORDER.recurrences.clear()
     RECORDER.calls.clear()
     RECORDER.attn.clear()
+    RECORDER.clamps.clear()
+    RECORDER.norm_eps.clear()
+    RECORDER.gelu_modes.clear()
     handles = []
+    stack = []
     for path, mod in model.named_modules():
         if mod is model:
             continue
 
         def hook(module, args, kwargs, output, path=path):
             RECORDER.calls.append(Call(RECORDER.next(), path, module,
-                                       [a.detach() if torch.is_tensor(a) else a for a in args],
-                                       {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
+                                       [a.detach().clone() if torch.is_tensor(a) else a for a in args],
+                                       {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in kwargs.items()},
                                        _tensors(output)))
+            stack.pop()
 
+        def enter(module, args, path=path):
+            stack.append((path, module))
+
+        handles.append(mod.register_forward_pre_hook(enter))
         handles.append(mod.register_forward_hook(hook, with_kwargs=True))
     ids = torch.tensor([[(7 + 37 * i) % VOCAB for i in range(SEQ)]])
-    with torch.no_grad():
-        out = model(input_ids=ids, use_cache=False)
-    for h in handles:
-        h.remove()
+    try:
+        try:
+            with torch.no_grad(), NativeAttentionTrace(stack):
+                out = model(input_ids=ids, use_cache=False)
+        except KeyError as error:
+            if error.args != (ATTN_IMPL,):
+                raise
+            # Some implementations expose only their local eager/SDPA map.
+            # Observe their eager operations through the same numerical trace.
+            model.set_attn_implementation("eager")
+            stack.clear()
+            RECORDER.calls.clear(); RECORDER.attn.clear(); RECORDER.clamps.clear(); RECORDER.norm_eps.clear(); RECORDER.gelu_modes.clear()
+            with torch.no_grad(), NativeAttentionTrace(stack):
+                out = model(input_ids=ids, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
+        for namespace, name, fn in originals:
+            namespace[name] = fn
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
     return Trace(text, reduced, n, keep, model, layers_path, layers, list(RECORDER.calls), list(RECORDER.attn), ids,
-                 logits, type(model).__name__)
+                 logits, type(model).__name__, list(RECORDER.clamps), list(RECORDER.recurrences))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -417,14 +699,39 @@ def _direct_children(calls, parent):
 
 
 def _linears(calls, parent):
-    return [c for c in calls if _is_descendant(c.path, parent) and isinstance(c.module, nn.Linear)]
+    from transformers.pytorch_utils import Conv1D
+    return [c for c in calls if _is_descendant(c.path, parent) and isinstance(c.module, (nn.Linear, Conv1D))]
+
+
+def analyze_linear_mixer(call):
+    """A unique Linear must explain the entire mixer output, including its bias.
+
+    Explicit child.forward(x) calls bypass module hooks. Enumerating parameters
+    and recomputing the full observed output also covers those implementations;
+    unused duplicate candidates, extra transformations and shape changes remain
+    unknown. No class name or parameter spelling decides the computation.
+    """
+    if call.input is None or call.output is None or call.input.dim() == 0:
+        return None
+    matches = []
+    for name, module in call.module.named_modules():
+        if not isinstance(module, nn.Linear) or module.in_features != call.input.shape[-1]:
+            continue
+        bias = module.bias.detach().float() if module.bias is not None else None
+        expected = torch.nn.functional.linear(call.input.float(), module.weight.detach().float(), bias)
+        if expected.shape == call.output.shape and close(expected, call.output):
+            matches.append(call.path + ("." + name if name else ""))
+    if len(matches) == 1:
+        return Facts(kind="linear", projection=matches[0], unknown=[])
+    return None
 
 
 def _norm_like(call):
     w = getattr(call.module, "weight", None)
-    return (w is not None and torch.is_tensor(w) and w.dim() == 1 and call.input is not None
+    return ((w is None or (torch.is_tensor(w) and w.dim() in (1, 2))) and call.input is not None
             and call.output is not None and call.input.shape == call.output.shape
-            and not isinstance(call.module, (nn.Linear, nn.Embedding)))
+            and not isinstance(call.module, (nn.Linear, nn.Embedding))
+            and ((w is not None and w.dim() == 1) or norm_formula(call, 1e-5) is not None))
 
 
 def _inv_freqs(model):
@@ -434,7 +741,7 @@ def _inv_freqs(model):
         for bname, buf in mod.named_buffers(recurse=False):
             if bname.endswith("inv_freq") and "original" not in bname:
                 prefix = bname[: -len("inv_freq")]
-                scaling = getattr(mod, prefix + "attention_scaling", None)
+                scaling = getattr(mod, prefix + "attention_scaling", getattr(mod, "concentration", None))
                 if not isinstance(scaling, (int, float)):
                     scaling = 1.0
                 out.append((f"{path}.{bname}" if path else bname, buf.detach().float().clone(), float(scaling)))
@@ -474,35 +781,185 @@ def _projection_views(linear_calls, heads, head_dim, total_heads):
 def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
     """How target [b, heads, s, d] (what the attention received) is made from a projection: returns a dict with
     the projection, its layout, the rotation, and where a norm sits (with its formula), or None."""
-    for call, how, raw in raw_views:
+    for call, how, raw, rows in raw_views:
         if raw is None:
             continue
         for rot, r in _rotations(raw, freqs):
             if close(r, target):
-                return {"projection": call.path, "projection_layout": how, **rot, "norm": None}
+                return {"projection": call.path, "projection_layout": how, "projection_rows": rows,
+                        **rot, "norm": None}
         for n in norm_calls:
             nin = n.input
             nout = n.output
             if nin is None or nout is None or nin.numel() != raw.numel():
                 continue
             w = getattr(n.module, "weight", None)
-            span = int(w.numel()) if w is not None else None
-            form = norm_formula(n, eps)
-            norm = {"module": n.path, "span": span, "formula": form[0] if form else None,
-                    "eps": form[1] if form else None}
+            span = int(n.input.shape[-1])
+            norm = {**norm_fact(n, eps), "span": span}
             # Norm before the rotation: the norm reads the projection, the rotation reads the norm.
             if close(_as_heads(nin, heads, head_dim), raw):
                 normed = _as_heads(nout, heads, head_dim)
                 for rot, r in _rotations(normed, freqs):
                     if close(r, target):
-                        return {"projection": call.path, "projection_layout": how, **rot,
+                        return {"projection": call.path, "projection_layout": how, "projection_rows": rows, **rot,
                                 "norm": {**norm, "order": "before_rope"}}
             # Norm after the rotation: the norm reads the rotated projection and gives the target.
             if close(_as_heads(nout, heads, head_dim), target):
                 for rot, r in _rotations(raw, freqs):
                     if close(r, _as_heads(nin, heads, head_dim)):
-                        return {"projection": call.path, "projection_layout": how, **rot,
+                        return {"projection": call.path, "projection_layout": how, "projection_rows": rows, **rot,
                                 "norm": {**norm, "order": "after_rope"}}
+        # One LayerNorm module per head (rather than one shared weight).
+        per_head = []
+        for h in range(heads):
+            match = next((n for n in norm_calls if n.input is not None and
+                          n.input.numel() == raw[:, h:h + 1].numel() and
+                          close(_as_heads(n.input, 1, head_dim), raw[:, h:h + 1])), None)
+            if match is None:
+                break
+            per_head.append(match)
+        if len(per_head) == heads:
+            forms = [norm_formula(n, eps) for n in per_head]
+            if forms[0] is not None and all(form == forms[0] for form in forms):
+                normed = torch.cat([_as_heads(n.output, 1, head_dim) for n in per_head], dim=1)
+                for rot, r in _rotations(normed, freqs):
+                    if close(r, target):
+                        return {"projection": call.path, "projection_layout": how, "projection_rows": rows, **rot,
+                                "norm": {"module": per_head[0].path, "modules": [n.path for n in per_head],
+                                         "span": head_dim, "formula": forms[0][0], "eps": forms[0][1],
+                                         "order": "before_rope"}}
+    return None
+
+
+def analyze_indexer(trace, mixer_path, block_calls, freqs):
+    """Recompute the observed integer position selection from the indexer's own projections."""
+    cfg = trace.reduced
+    heads, dim = getattr(cfg, "index_n_heads", 0), getattr(cfg, "index_head_dim", 0)
+    if not heads or not dim:
+        return None
+    for call in block_calls:
+        if not _is_descendant(call.path, mixer_path):
+            continue
+        outputs = [t for t in call.outputs if not t.is_floating_point() and t.dim() == 3 and t.shape[1] == SEQ]
+        if not outputs:
+            continue
+        args = [t for t in list(call.args) + list(call.kwargs.values())
+                if torch.is_tensor(t) and t.is_floating_point() and t.dim() == 3]
+        if len(args) < 2:
+            continue
+        hidden, residual = args[:2]
+        linears = _linears(block_calls, call.path)
+        q = next((c for c in linears if close(c.input, residual) and c.output.shape[-1] == heads * dim), None)
+        key = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == dim), None)
+        weight = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == heads), None)
+        norm = next((c for c in block_calls if _is_descendant(c.path, call.path) and _norm_like(c)
+                     and key is not None and close(c.input, key.output)), None)
+        if q is None or key is None or weight is None or norm is None:
+            return Facts(unknown=["indexer projections and key norm could not be established"])
+        form = norm_formula(norm, 1e-6)
+        if not form or form[0] != "layer" or not math.isclose(form[1], 1e-6):
+            return Facts(unknown=[f"indexer key norm is {form}, not LayerNorm with epsilon 1e-6"])
+        observed = outputs[0][0]
+        raw_q, raw_k = _as_heads(q.output, heads, dim), _as_heads(norm.output, 1, dim)
+        matched = []
+        for name, inv, magnitude in freqs:
+            if 2 * inv.numel() > dim:
+                continue
+            for layout in ("adjacent", "halves"):
+                qr, kr = rope(raw_q, inv, layout, magnitude), rope(raw_k, inv, layout, magnitude)
+                scores = torch.relu(qr @ kr.transpose(-1, -2) / math.sqrt(dim))
+                scores = (scores * weight.output.transpose(1, 2).unsqueeze(-1) / math.sqrt(heads)).sum(1)
+                scores = scores.masked_fill(torch.ones(SEQ, SEQ, dtype=torch.bool).triu(1), -torch.inf)
+                ok = True
+                for t in range(SEQ):
+                    count = min(observed.shape[-1], t + 1)
+                    expected = scores[0, t].topk(count).indices.sort().values
+                    actual = observed[t][observed[t] <= t].long().sort().values
+                    if not torch.equal(expected, actual):
+                        ok = False
+                        break
+                if ok:
+                    matched.append((name, layout, int(inv.numel() * 2)))
+        layouts = {m[1] for m in matched}
+        if len(layouts) != 1:
+            return Facts(unknown=["indexer RoPE pairing is not uniquely established by position selection"])
+        return Facts(unknown=[], rope=matched[0][1], table=matched[0][0], rope_dim=matched[0][2],
+                     heads=heads, head_dim=dim, topk=int(getattr(trace.config, "index_topk", 0)),
+                     query=q.path, key=key.path, weights=weight.path, key_norm=norm.path)
+    mixer = next((c for c in block_calls if c.path == mixer_path), None)
+    attention = next((a for a in trace.attn if mixer is not None and a.module is mixer.module), None)
+    indices = attention.kwargs.get("indices") if attention is not None else None
+    if torch.is_tensor(indices):
+        earlier = [a for a in trace.attn if a.order < attention.order]
+        if earlier and torch.is_tensor(earlier[-1].kwargs.get("indices")) and torch.equal(
+                indices, earlier[-1].kwargs["indices"]):
+            return Facts(unknown=[], shared=True)
+    return Facts(unknown=["no indexer's integer position selection was observed"])
+
+
+def analyze_latent_attention(att, linears, norms, freqs, eps, cfg):
+    """Establish MLA by reconstructing both expanded tensors from the observed shared latent.
+
+    The rotary result may be returned in halves even when its input pairs are adjacent;
+    that simultaneous output permutation changes neither query/key dots nor the GGUF row contract.
+    """
+    rank = getattr(cfg, "kv_lora_rank", 0)
+    rd = getattr(cfg, "qk_rope_head_dim", 0)
+    if not rank or not rd:
+        return None
+    heads, hd, vd = att.query.shape[1], att.query.shape[-1], att.value.shape[-1]
+    nope = hd - rd
+    for kv in linears:
+        if kv.output.shape[-1] != rank + rd:
+            continue
+        norm = next((n for n in norms if close(n.input, kv.output[..., :rank])), None)
+        form = norm_formula(norm, eps) if norm is not None else None
+        if not form or form[0] != "rms":
+            continue
+        expanded = next((p for p in linears if close(p.input, norm.output)
+                         and p.output.shape[-1] == heads * (nope + vd)), None)
+        if expanded is None:
+            continue
+        parts = _as_heads(expanded.output, heads, nope + vd)
+        if not close(parts[..., nope:], att.value):
+            continue
+        for query in linears:
+            if query.output.shape[-1] != heads * hd:
+                continue
+            qrank = 0
+            if not close(query.input, kv.input):
+                qnorm = next((n for n in norms if close(n.output, query.input)), None)
+                qform = norm_formula(qnorm, eps) if qnorm is not None else None
+                qa = next((p for p in linears if qnorm is not None and close(p.output, qnorm.input)
+                           and close(p.input, kv.input)), None)
+                if qa is None or qform != form:
+                    continue
+                qrank = query.input.shape[-1]
+            raw_q = _as_heads(query.output, heads, hd)
+            raw_k = kv.output[..., rank:].unsqueeze(1)
+            for name, inv, magnitude in freqs:
+                if 2 * inv.numel() != rd:
+                    continue
+                for layout in ("adjacent", "halves"):
+                    qr = rope(raw_q[..., nope:], inv, layout, magnitude)
+                    kr = rope(raw_k, inv, layout, magnitude)
+                    for permuted in (False, True) if layout == "adjacent" else (False,):
+                        qrot, krot = qr, kr
+                        if permuted:
+                            qrot = torch.cat([qr[..., ::2], qr[..., 1::2]], -1)
+                            krot = torch.cat([kr[..., ::2], kr[..., 1::2]], -1)
+                        q = torch.cat([raw_q[..., :nope], qrot], -1)
+                        k = torch.cat([parts[..., :nope], krot.expand(-1, heads, -1, -1)], -1)
+                        if close(q, att.query) and close(k, att.key):
+                            r = {"table": name, "layout": layout, "dims": rd, "magnitude": magnitude}
+                            return {"kv_rank": rank, "q_rank": qrank, "nope_dim": nope, "v_dim": vd,
+                                    "norm_eps": form[1],
+                                    "kv_projection": kv.path, "kv_norm": norm.path,
+                                    "key": {"projection": kv.path, "projection_layout": "latent", "rope": r,
+                                            "norm": None},
+                                    "query": {"projection": query.path, "projection_layout": "latent", "rope": r,
+                                              "norm": None},
+                                    "value": {"projection": expanded.path, "projection_layout": "latent"}}
     return None
 
 
@@ -515,30 +972,97 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     f = Facts(kind="attention")
     _, n_q, s, hd = a.query.shape
     n_kv = a.key.shape[1]
+    key_states, value_states = a.key, a.value
+    # Eager implementations may expand GQA keys/values before the observed
+    # score product. Recover their logical groups only when every repeated
+    # key AND value agrees bit for bit; projection matching then proves it.
+    if a.value.shape[1] == n_kv:
+        for groups in range(1, n_kv):
+            if n_kv % groups:
+                continue
+            keys = a.key.reshape(a.key.shape[0], groups, n_kv // groups, s, hd)
+            values = a.value.reshape(a.value.shape[0], groups, n_kv // groups, s, a.value.shape[-1])
+            if torch.equal(keys, keys[:, :, :1].expand_as(keys)) and torch.equal(values, values[:, :, :1].expand_as(values)):
+                key_states, value_states = keys[:, :, 0], values[:, :, 0]
+                n_kv = groups
+                break
     hd_v = a.value.shape[-1]
     f.update(heads=n_q, kv_heads=n_kv, head_dim=hd, value_head_dim=hd_v, unknown=[])
+    f["shared_key_value"] = close(a.key, a.value)
     linears = _linears(block_calls, mixer_path)
     norms = [c for c in block_calls if _is_descendant(c.path, mixer_path) and _norm_like(c)]
     fused_total = n_q + 2 * n_kv
+    caps = {cap for module, cap in trace.clamps if any(c.module is module and
+            (c.path == mixer_path or _is_descendant(c.path, mixer_path)) for c in block_calls)}
+    cap = next(iter(caps)) if len(caps) == 1 else None
+    f["clamp_kqv"] = cap or 0.0
 
     def views_for(heads, offset_heads):
         views = []
         for call, how, v in _projection_views(linears, heads, hd, fused_total):
             if how == "fused":
-                y = v
-                part = y[..., offset_heads * hd:(offset_heads + heads) * hd]
-                views.append((call, f"fused [q | k | v] at head {offset_heads}", _as_heads(part, heads, hd)))
+                y = v.clamp(-cap, cap) if cap else v
+                rows = list(range(offset_heads * hd, (offset_heads + heads) * hd))
+                views.append((call, f"fused [q | k | v] at head {offset_heads}",
+                              _as_heads(y[..., rows], heads, hd), rows))
+                if n_q % n_kv == 0:
+                    # Packed GQA stores each KV group's queries, key and value
+                    # together. Verify this view against the actual attention
+                    # tensors, just as for the contiguous Q/K/V candidate.
+                    group = n_q // n_kv
+                    rows = []
+                    for g in range(n_kv):
+                        start = g * (group + 2)
+                        slots = range(start, start + group) if offset_heads == 0 else [start + group + (offset_heads != n_q)]
+                        rows.extend(row for slot in slots for row in range(slot * hd, (slot + 1) * hd))
+                    views.append((call, "fused groups [queries | key | value]",
+                                  _as_heads(y[..., rows], heads, hd), rows))
             else:
-                views.append((call, how, v))
+                views.append((call, how, v.clamp(-cap, cap) if cap else v, list(range(heads * hd))))
         return views
 
-    key = _match_rotated(a.key, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
-    query = _match_rotated(a.query, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
+    key = _match_rotated(key_states, views_for(n_kv, n_q), norms, freqs, n_kv, hd, eps)
+    query_target = a.query
+    params = getattr(trace.reduced, "rope_parameters", None) or {}
+    beta, length = params.get("llama_4_scaling_beta"), params.get("original_max_position_embeddings")
+    if beta is not None and length:
+        # A position-dependent query temperature is separate from the rotary transform. Remove precisely
+        # the configuration's factor before matching the projection/norm/rotation, so a mismatch still fails.
+        positions = torch.arange(s, device=query_target.device)
+        temperature = 1.0 + float(beta) * torch.log1p(torch.floor(positions / int(length)))
+        query_target = query_target / temperature[None, None, :, None]
+        f["temperature"] = {"beta": float(beta), "length": int(length)}
+    query = _match_rotated(query_target, views_for(n_q, 0), norms, freqs, n_q, hd, eps)
     value = None
-    for call, how, v in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
-        if close(v, a.value):
-            value = {"projection": call.path, "projection_layout": how}
+    for call, how, v, rows in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
+        if close(v, value_states):
+            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows, "rms_norm": False}
             break
+        # Some architectures normalize values per head without a learned
+        # weight. Establish that formula from the projection and observed
+        # values, rather than from a family or module name.
+        normalized = v * torch.rsqrt(v.float().square().mean(-1, keepdim=True) + eps)
+        if close(normalized, value_states):
+            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows, "rms_norm": True}
+            break
+    if key is None and value is None:
+        # Shared KV is observed as the exact earlier attention's K/V, with
+        # no local projections. Reuse that source's established formula.
+        for previous in trace.attn:
+            if previous is a:
+                break
+            if close(previous.key, a.key) and close(previous.value, a.value):
+                source = next((c.path for c in trace.calls if c.module is previous.module), None)
+                if source:
+                    prior = analyze_attention(trace, source, trace.calls, freqs, eps)
+                    if prior and prior.get("key") and prior.get("value"):
+                        key, value = prior["key"], prior["value"]
+                        f["shared_kv_source"] = source
+                        break
+    latent = analyze_latent_attention(a, linears, norms, freqs, eps, trace.reduced)
+    if latent is not None:
+        key, query, value = latent["key"], latent["query"], latent["value"]
+        f["latent"] = latent
     f["key"] = key
     f["query"] = query
     f["value"] = value
@@ -555,6 +1079,36 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     f["softcap"] = float(softcap) if isinstance(softcap, (int, float)) and softcap else None
     f["sinks"] = torch.is_tensor(a.kwargs.get("s_aux")) or torch.is_tensor(getattr(a.module, "sinks", None))
     f["causal"] = bool(getattr(a.module, "is_causal", True))
+    slopes = a.kwargs.get("alibi_slopes")
+    f["alibi_slopes"] = slopes if slopes and max(map(abs, slopes)) > 1e-6 else None
+    if a.kwargs.get("observed_sdpa"):
+        if a.kwargs.get("manual_scores_verified") is False:
+            f["unknown"].append("native matmul attention probabilities are not the verified scaled Q/K softmax")
+        mask = a.kwargs.get("attention_mask")
+        f["causal"] = bool(a.kwargs["is_causal"])
+        if mask is not None:
+            if mask.shape[-2:] != (s, s):
+                f["unknown"].append("native SDPA mask does not span the traced sequence")
+            else:
+                if mask.dtype == torch.bool:
+                    allowed = mask
+                else:
+                    blocked = torch.isneginf(mask) | (mask == torch.finfo(mask.dtype).min)
+                    if not torch.all((mask == 0) | blocked):
+                        f["unknown"].append("native SDPA uses an additive score bias beyond a causal mask")
+                    allowed = ~blocked
+                masks = allowed.reshape(-1, s, s)
+                positions = torch.arange(s, device=mask.device)
+                causal = positions[None, :] <= positions[:, None]
+                if a.kwargs["is_causal"]:
+                    masks = masks & causal
+                window = int(masks[0, -1].count_nonzero())
+                expected = causal & (positions[None, :] > positions[:, None] - window)
+                if window > 0 and torch.all(masks == expected):
+                    f["causal"] = True
+                    f["window"] = window if window < s else None
+                else:
+                    f["unknown"].append("native SDPA mask is not causal or a fixed causal window")
     # Output: o_proj reads the attention output, possibly gated by sigmoid of the second half of [q | gate].
     att_out = a.output.reshape(1, SEQ, n_q * hd_v) if a.output is not None else None
     later = [c for c in linears if c.order > a.order]
@@ -571,6 +1125,19 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                 f["output"] = c.path
                 f["output_gate"] = "sigmoid of the second half of each query head's projection"
                 break
+    if f["output"] is None and att_out is not None:
+        for c in later:
+            for gate in linears:
+                values = gate.output
+                if values.numel() == SEQ * n_q and values.shape[-1] == n_q:
+                    values = values.reshape(1, SEQ, n_q, 1).expand(1, SEQ, n_q, hd_v).reshape(att_out.shape)
+                if gate is not c and values.numel() == att_out.numel() and close(
+                        c.input, att_out * torch.sigmoid(values.reshape(att_out.shape))):
+                    f["output"] = c.path
+                    f["output_gate"] = "sigmoid of a separate gate projection"
+                    break
+            if f["output"]:
+                break
     if f["output"] is None:
         f["unknown"].append("the output projection does not read the attention output (or its gated form)")
     return f
@@ -580,17 +1147,61 @@ def analyze_dense_ffn(ffn_call, block_calls):
     """A dense FFN: down(act(gate) * up), down(act(up)), or a fused [gate | up] projection."""
     lin = [c for c in _linears(block_calls, ffn_call.path)]
     x, y = ffn_call.input, ffn_call.output
-    down = next((c for c in lin if close(c.output, y)), None)
+    residuals = [a for a in list(ffn_call.args[1:]) + list(ffn_call.kwargs.values())
+                 if torch.is_tensor(a) and a.shape == y.shape]
+    down = next((c for c in lin if c.output.shape == y.shape and
+                 (close(c.output, y) or any(close(c.output + r, y) for r in residuals))), None)
     if down is None:
         return Facts(kind="dense", unknown=["the FFN's output is not one projection's output"])
     first = [c for c in lin if c is not down and close(c.input, x)]
     d_in = down.input.float()
+    limit = float(getattr(ffn_call.module, "limit", 0.0) or 0.0)
+    limit = limit if math.isfinite(limit) and limit > 0 else 0.0
+    def activate(act, gate, up):
+        return act(gate).clamp(max=limit) * up.clamp(-limit, limit) if limit else act(gate) * up
+    modules = {ffn_call.module} | {c.module for c in block_calls if _is_descendant(c.path, ffn_call.path)}
+
+    def activation_allowed(name, source, multiply=None):
+        # Tiny norm scales can make erf/tanh GELU numerically indistinguishable.
+        # An observed GELU call linked exactly to the down input establishes
+        # its mode independently of that approximation tolerance.
+        modes = set()
+        for module, mode, x, y in RECORDER.gelu_modes:
+            if module not in modules or not torch.equal(x.float(), source.float()):
+                continue
+            linked = y.float() if multiply is None else y.float() * multiply.float()
+            if torch.equal(linked, d_in):
+                modes.add(mode)
+        return not modes or name in modes
+    for c in first:
+        for activation in block_calls:
+            m = activation.module
+            if not all(hasattr(m, attr) for attr in ("alpha_p", "alpha_n", "beta", "eps")):
+                continue
+            if not close(c.output, activation.input) or not close(activation.output, d_in):
+                continue
+            x = activation.input.float()
+            ap, an = nn.functional.softplus(m.alpha_p.float()), m.beta.float() + nn.functional.softplus(m.alpha_n.float())
+            expected = torch.where(x > 0, ap * x * x + m.beta * x,
+                                   (torch.expm1(torch.minimum(x, m.eps)) - x) * an + m.beta * x)
+            if close(expected, d_in):
+                return Facts(kind="dense", gated=False, activation="xielu", up=c.path, down=down.path,
+                             activation_module=activation.path,
+                             scalars={k: float(getattr(m, k).detach().reshape(-1)[0]) for k in
+                                      ("alpha_p", "alpha_n", "beta", "eps")}, unknown=[])
     for act_name, act in ACTIVATIONS.items():
         for g in first:
             for u in first:
-                if g is not u and close(act(g.output.float()) * u.output.float(), d_in):
+                gate = g.output.float()
+                sparsity = getattr(ffn_call.module, "activation_sparsity", 0.0)
+                if sparsity > 0.0:
+                    multiplier = torch.distributions.Normal(0.0, 1.0).icdf(torch.tensor(sparsity))
+                    gate = torch.relu(gate - (gate.mean(-1, keepdim=True) +
+                                             gate.std(-1, keepdim=True, correction=0) * multiplier))
+                if g is not u and activation_allowed(act_name, gate, u.output) and close(activate(act, gate, u.output.float()), d_in):
                     return Facts(kind="dense", gated=True, fused_gate_up=False, activation=act_name,
                                  gate=g.path, up=u.path, down=down.path,
+                                 activation_sparsity=float(sparsity), clamp=limit,
                                  biases=any(getattr(c.module, "bias", None) is not None for c in (g, u, down)),
                                  unknown=[])
         for c in first:
@@ -598,12 +1209,12 @@ def analyze_dense_ffn(ffn_call, block_calls):
             if o.shape[-1] == 2 * d_in.shape[-1]:
                 h = d_in.shape[-1]
                 for order, (gp, up) in (("gate_first", (o[..., :h], o[..., h:])), ("up_first", (o[..., h:], o[..., :h]))):
-                    if close(act(gp) * up, d_in):
+                    if activation_allowed(act_name, gp, up) and close(activate(act, gp, up), d_in):
                         return Facts(kind="dense", gated=True, fused_gate_up=True, fused_order=order,
-                                     activation=act_name, gate=c.path, up=c.path, down=down.path,
+                                     activation=act_name, gate=c.path, up=c.path, down=down.path, clamp=limit,
                                      biases=any(getattr(m.module, "bias", None) is not None for m in (c, down)),
                                      unknown=[])
-            if close(act(o), d_in):
+            if activation_allowed(act_name, o) and close(act(o), d_in):
                 return Facts(kind="dense", gated=False, activation=act_name, up=c.path, down=down.path, unknown=[])
     return Facts(kind="dense", unknown=["the FFN is not down(act(gate) * up) or down(act(up)) for a known activation"])
 
@@ -624,15 +1235,63 @@ def analyze_moe(ffn_call, block_calls, cfg):
             experts_call = (c, ints[0], floats[0])
             break
     if experts_call is None:
-        f["unknown"].append("no experts call with routed indices and weights was observed")
-        return f
+        # Older modules return routing from a gate and call ModuleList
+        # experts individually. Reconstruct their weighted sum from observed
+        # inputs/outputs, checking the router's token ordering for every call.
+        for gate in inside:
+            indices = next((a for a in gate.outputs if not a.is_floating_point() and a.dim() == 2
+                            and a.shape[0] == n_tokens), None)
+            weights = next((a for a in gate.outputs if a.is_floating_point() and indices is not None
+                            and a.shape == indices.shape), None)
+            if indices is None or weights is None:
+                continue
+            count = max([getattr(cfg, key) for key in EXPERT_COUNT_KEYS
+                         if isinstance(getattr(cfg, key, None), int)] or [0])
+            for name, module in ffn_call.module.named_children():
+                if not isinstance(module, nn.ModuleList) or len(module) != count:
+                    continue
+                order = indices.flatten().argsort()
+                flat_ids = indices.flatten()[order]
+                x = ffn_call.input.reshape(n_tokens, -1)
+                flat_out = torch.empty(indices.numel(), x.shape[-1], dtype=x.dtype)
+                activation = set()
+                observed = []
+                for expert, item in enumerate(module):
+                    slots = order[flat_ids == expert]
+                    if slots.numel() == 0:
+                        continue
+                    calls = [call for call in inside if call.module is item]
+                    if len(calls) != 1 or not close(calls[0].input, x[slots // indices.shape[1]]):
+                        break
+                    call = calls[0]
+                    facts = analyze_dense_ffn(call, block_calls)
+                    if facts.get("unknown") or not facts.get("gated"):
+                        break
+                    activation.add(facts["activation"])
+                    flat_out[slots] = call.output
+                    observed.append(call)
+                else:
+                    if len(activation) != 1 or not observed:
+                        continue
+                    total = (flat_out.reshape(*indices.shape, -1) * weights.unsqueeze(-1)).sum(1)
+                    aggregate = Call(max(c.order for c in observed), ffn_call.path + "." + name, module,
+                                     [x, indices, weights], {}, [total.reshape(ffn_call.output.shape)])
+                    experts_call = (aggregate, indices, weights)
+                    f["expert_activation"] = activation.pop()
+                    break
+            if experts_call is not None:
+                break
+        if experts_call is None:
+            f["unknown"].append("no experts call or verified per-expert routed outputs were observed")
+            return f
     ecall, idx, wts = experts_call
     k = idx.shape[1]
     # The expert count: the leading dimension of the experts' 3-D weights, else the configuration's.
     n_exp = next((p.shape[0] for p in ecall.module.parameters() if p.dim() == 3), None)
     if n_exp is None:
-        n_exp = max([getattr(cfg, key) for key in EXPERT_COUNT_KEYS if isinstance(getattr(cfg, key, None), int)]
-                    or [0])
+        configs = [cfg] + [child for child in vars(cfg).values() if hasattr(child, "to_dict")]
+        n_exp = max([getattr(config, key) for config in configs for key in EXPERT_COUNT_KEYS
+                     if isinstance(getattr(config, key, None), int)] or [0])
     # The router: what produced one logit per expert and token from the block input, before the experts ran.
     router = None
     for c in inside:
@@ -652,25 +1311,44 @@ def analyze_moe(ffn_call, block_calls, cfg):
         return f
     rcall, logits = router
     f.update(experts=n_exp, top_k=k, router=rcall.path, experts_module=ecall.path)
+    f["router_bias"] = torch.is_tensor(getattr(rcall.module, "bias", None))
     biases = []
-    for name, t in list(rcall.module.named_parameters()) + list(rcall.module.named_buffers()):
-        if t.dim() == 1 and t.numel() == n_exp:
-            biases.append((name, t.detach().float()))
+    for name, t in list(ffn_call.module.named_parameters()) + list(ffn_call.module.named_buffers()):
+        if t.numel() == n_exp and t.squeeze().dim() == 1:
+            biases.append((name, t.detach().float().reshape(-1)))
     found = None
     for gating in ("softmax", "sigmoid"):
         probs = torch.softmax(logits, -1) if gating == "softmax" else torch.sigmoid(logits)
-        for bias_name, bias in [(None, None)] + biases:
+        for bias_name, bias in biases + [(None, None)]:
             sel = probs + (bias if bias is not None else 0.0)
-            top = torch.topk(sel, k, dim=-1).indices
-            if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
-                continue
-            chosen = torch.gather(probs, -1, idx.long())
-            for norm in (False, True):
-                w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
-                ratio = (wts.float() / w)
-                scale = float(ratio.mean())
-                if close(w * scale, wts.float()):
-                    found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale}
+            groups = getattr(cfg, "n_group", 1) or 1
+            used = getattr(cfg, "topk_group", groups) or groups
+            # Test the grouping rule against the expert indices actually
+            # observed. Configuration supplies geometry, never the rule.
+            candidates = [(1, 1, None, sel)]
+            if 1 <= used < groups and n_exp % groups == 0:
+                grouped = sel.reshape(n_tokens, groups, n_exp // groups)
+                for rule in ("max", "top2"):
+                    scores = (grouped.max(-1).values if rule == "max" else
+                              grouped.topk(min(2, n_exp // groups), dim=-1).values.sum(-1))
+                    keep = scores.topk(used, dim=-1).indices
+                    mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, keep, True)
+                    candidates.append((groups, used, rule,
+                                       sel.masked_fill(~mask.repeat_interleave(n_exp // groups, -1), -torch.inf)))
+            for groups_, used_, rule, selection in candidates:
+                top = torch.topk(selection, k, dim=-1).indices
+                if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
+                    continue
+                chosen = torch.gather(probs, -1, idx.long())
+                for norm in (False, True):
+                    w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
+                    ratio = (wts.float() / w)
+                    scale = float(ratio.mean())
+                    if close(w * scale, wts.float()):
+                        found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale,
+                                 "groups": groups_, "groups_used": used_, "group_score": rule}
+                        break
+                if found:
                     break
             if found:
                 break
@@ -678,7 +1356,7 @@ def analyze_moe(ffn_call, block_calls, cfg):
             break
     if found is None:
         f["unknown"].append("routing is not top-k over softmax or sigmoid probabilities (with an optional "
-                            "selection bias, renormalization and scale), e.g. group-limited routing")
+                            "selection bias, group maximum or top-two sum, renormalization and scale)")
         return f
     f.update(found)
     # Shared expert: a sub-module reading the block input whose output is added (gated or not) to the experts'.
@@ -703,32 +1381,111 @@ def analyze_moe(ffn_call, block_calls, cfg):
                 break
         if f["shared_expert"] is None:
             f["unknown"].append("the block output is not the experts' output plus a (gated) shared expert")
-    # Experts' activation: recomputed from 3-D [experts, 2 * ff, d] / [experts, d, ff] weights when the experts
-    # module holds them in that layout (transformers' fused experts).
+    # Recompute fused experts numerically. Both projection orientations and
+    # contiguous/interleaved gate-up layouts occur in transformers. Biases are
+    # part of each projection, before activation and before routing weights.
     params = dict(ecall.module.named_parameters(recurse=False))
     gu, dn = params.get("gate_up_proj"), params.get("down_proj")
-    f["expert_activation"] = None
+    gb, db = params.get("gate_up_proj_bias"), params.get("down_proj_bias")
+    f.setdefault("expert_activation", None)
     if gu is not None and dn is not None and gu.dim() == 3 and dn.dim() == 3:
         x = ecall.input.reshape(n_tokens, -1).float()
-        for name, act in ACTIVATIONS.items():
-            out = torch.zeros(n_tokens, dn.shape[1])
-            ok = True
-            for t in range(n_tokens):
-                for j in range(k):
-                    e = int(idx[t, j])
-                    w = gu[e].float()
-                    if w.shape[0] != 2 * dn.shape[2]:
-                        ok = False
+        target = ecall.output.reshape(n_tokens, -1).float()
+        limit = float(getattr(ecall.module, "limit", 0.0) or 0.0)
+        limit = limit if math.isfinite(limit) and limit > 0 and not hasattr(ecall.module, "alpha") else 0.0
+        acts = {name: (lambda g, u, act=act: act(g).clamp(max=limit) * u.clamp(-limit, limit)
+                       if limit else act(g) * u) for name, act in ACTIVATIONS.items()}
+        # These constants define SwigluOai; another clamp/alpha needs a new
+        # engine contract, so never silently describe it as this activation.
+        if getattr(ecall.module, "alpha", None) == 1.702 and getattr(ecall.module, "limit", None) == 7.0:
+            acts["swiglu_oai"] = lambda g, u: (u.clamp(-7, 7) + 1) * (g.clamp(max=7) *
+                                                                           torch.sigmoid(1.702 * g.clamp(max=7)))
+        for transposed in (False, True):
+            gate_up = gu.float().transpose(-1, -2) if transposed else gu.float()
+            down = dn.float().transpose(-1, -2) if transposed else dn.float()
+            if gate_up.shape[-1] != x.shape[-1] or down.shape[1] != target.shape[-1] or gate_up.shape[1] != 2 * down.shape[2]:
+                continue
+            ff = down.shape[2]
+            for interleaved in (False, True):
+                for name, act in acts.items():
+                    out = torch.zeros_like(target)
+                    for t in range(n_tokens):
+                        for j in range(k):
+                            e = int(idx[t, j])
+                            h = gate_up[e] @ x[t]
+                            if gb is not None:
+                                h = h + gb[e].float()
+                            gate, up = (h[::2], h[1::2]) if interleaved else (h[:ff], h[ff:])
+                            y = down[e] @ act(gate, up)
+                            if db is not None:
+                                y = y + db[e].float()
+                            out[t] += wts[t, j].float() * y
+                    if close(out, target):
+                        f["expert_activation"] = name
+                        f["expert_biases"] = gb is not None or db is not None
+                        f["expert_clamp"] = limit
                         break
-                    h = w @ x[t]
-                    g_, u_ = h[: dn.shape[2]], h[dn.shape[2]:]
-                    out[t] += float(wts[t, j]) * (dn[e].float() @ (act(g_) * u_))
-                if not ok:
+                if f["expert_activation"]:
                     break
-            if ok and close(out, ecall.output.reshape(n_tokens, -1)):
+            if f["expert_activation"]:
+                break
+    if f["expert_activation"] is None:
+        # Eager experts can pass their three weight slices as arguments to a
+        # shared module instead of holding fused 3-D parameters on the caller.
+        expert_calls = [c for c in inside if _is_descendant(c.path, ecall.path) and len(c.args) == 4
+                        and all(torch.is_tensor(w) and w.dim() == 2 for w in c.args)]
+        for name, act in ACTIVATIONS.items():
+            matched = bool(expert_calls)
+            for c in expert_calls:
+                x, gate, up, down = (w.float() for w in c.args)
+                if gate.shape != up.shape or x.shape[-1] != gate.shape[-1]:
+                    matched = False
+                    break
+                h = act(x @ gate.T) * (x @ up.T)
+                result = h @ down if h.shape[-1] == down.shape[0] else h @ down.T
+                if not close(result, c.output):
+                    matched = False
+                    break
+            if matched:
                 f["expert_activation"] = name
                 break
+    if f["expert_activation"] is None:
+        f["unknown"].append("the experts' activation could not be recomputed from their weights and inputs")
+    if f.get("shared_expert"):
+        shared = next((c for c in inside if c.path == f["shared_expert"]["module"]), None)
+        limit = float(getattr(shared.module, "limit", 0.0) or 0.0) if shared else 0.0
+        f["shared_expert"]["clamp"] = limit if math.isfinite(limit) and limit > 0 else 0.0
     return f
+
+
+def _input_embedding(trace, first_block):
+    """Use the public accessor, or one unambiguous token lookup observed before the first block."""
+    try:
+        embedding = trace.model.get_input_embeddings()
+    except (AttributeError, NotImplementedError):
+        embedding = None
+    if embedding is not None:
+        return embedding
+    boundary = min(c.order for c in trace.calls if c.path == first_block.path or
+                   c.path.startswith(first_block.path + "."))
+    candidates = {id(c.module): c.module for c in trace.calls
+                  if c.order < boundary and isinstance(c.module, nn.Embedding) and
+                  c.input is not None and torch.equal(c.input, trace.ids) and c.output is not None and
+                  first_block.input is not None and c.output.shape == first_block.input.shape}
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
+def _output_projection(trace, last_block):
+    """Use the public accessor, or a unique linear call after the blocks with the logits' shape."""
+    try:
+        projection = trace.model.get_output_embeddings()
+    except (AttributeError, NotImplementedError):
+        projection = None
+    if projection is not None:
+        return next((c for c in trace.calls if c.module is projection), None)
+    candidates = [c for c in trace.calls if c.order > last_block.order and isinstance(c.module, nn.Linear) and
+                  c.output is not None and c.output.shape == trace.logits.shape]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def analyze(trace):
@@ -750,9 +1507,14 @@ def analyze(trace):
 
     # Embeddings into block 0, against the rows of the embedding table (what a GGUF stores as token_embd): an
     # embedding module may scale its own output.
-    emb_mod = trace.model.get_input_embeddings()
+    emb_mod = _input_embedding(trace, layer_calls[0])
     h0 = layer_calls[0].input
+    streams = h0 is not None and h0.dim() == 4
+    if streams:
+        h0 = h0[0]  # the embedding stream; projections make the others
     facts["embedding_scale"] = None
+    if emb_mod is None:
+        facts["unknown"].append("the reference's input embedding table cannot be identified uniquely from its calls")
     if emb_mod is not None and h0 is not None:
         e = emb_mod.weight.detach()[trace.ids[0]].float().reshape(h0.shape)
         if close(e, h0):
@@ -762,26 +1524,68 @@ def analyze(trace):
             c = float(ratio.flatten()[e.abs().flatten() > 1e-3].median())
             facts["embedding_scale"] = c if close(e * c, h0) else None
             if facts["embedding_scale"] is None:
-                facts["unknown"].append("block 0 does not receive the token embeddings times a constant "
-                                        "(position embeddings or another input are added)")
+                for call in calls:
+                    if call.order >= layer_calls[0].order:
+                        continue
+                    if isinstance(call.module, nn.Embedding) and call.module is not emb_mod and call.output.shape == e.shape and close(e + call.output, h0):
+                        facts["position_embeddings"] = {"module": call.path, "rows": call.module.weight.shape[0]}
+                        facts["embedding_scale"] = 1.0
+                        break
+                    if _norm_like(call) and close(call.input, e) and close(call.output, h0):
+                        form = norm_formula(call, eps)
+                        facts["embedding_norm"] = {"module": call.path, "formula": form[0] if form else None,
+                                                   "eps": form[1] if form else None}
+                        facts["embedding_scale"] = 1.0
+                        break
+                if facts["embedding_scale"] is None:
+                    facts["unknown"].append("block 0 does not receive token embeddings, scaled embeddings, "
+                                            "learned positions or a norm of the embeddings")
     # Output: final norm, then the output projection, then the logits.
     last = layer_calls[-1]
-    head_mod = trace.model.get_output_embeddings()
-    head = next((c for c in calls if c.module is head_mod), None)
+    head = _output_projection(trace, last)
+    head_mod = head.module if head is not None else None
     after = [c for c in calls if c.order > last.order and not _is_descendant(c.path, trace.layers_path)]
     final_norm = next((c for c in after if _norm_like(c) and close(c.input, last.output)), None)
+    if streams and head is not None:
+        # AltUp merges its final streams through the unembedding projections,
+        # matching their magnitudes to stream zero, then takes their mean.
+        candidates = [c for c in after if _norm_like(c) and close(c.output, head.input)]
+        for candidate in candidates:
+            st = last.output
+            merged = st[0].float().clone()
+            magnitude = st[0].float().square().mean(-1, keepdim=True).sqrt()
+            for i in range(1, st.shape[0]):
+                projection = next((c for c in after if isinstance(c.module, nn.Linear) and close(c.input, st[i])), None)
+                if projection is None:
+                    break
+                x = projection.output.float()
+                merged += x * magnitude / x.square().mean(-1, keepdim=True).clamp(min=1e-5).sqrt()
+            else:
+                if close(merged / st.shape[0], candidate.input):
+                    final_norm = candidate
+                    break
     facts["final_norm"] = None
     if final_norm is not None:
-        form = norm_formula(final_norm, eps)
-        facts["final_norm"] = {"module": final_norm.path, "formula": form[0] if form else None,
-                               "eps": form[1] if form else None}
+        facts["final_norm"] = norm_fact(final_norm, eps)
     else:
         facts["unknown"].append("no norm between the last block and the output projection")
     facts["logits"] = None
+    if head is None:
+        facts["unknown"].append("the reference's output projection cannot be identified uniquely from its calls")
     if head is not None:
+        input_scale = 1.0
         if final_norm is not None and not close(head.input, final_norm.output):
-            facts["unknown"].append("the output projection does not read the final norm's output")
-        lm = head.output.float()
+            source = final_norm.output.float()
+            nonzero = source.abs() > 1e-6
+            input_scale = float((head.input.float()[nonzero] / source[nonzero]).median())
+            if (not math.isfinite(input_scale) or input_scale <= 0 or
+                    not close(head.input, source * input_scale) or getattr(head_mod, "bias", None) is not None):
+                facts["unknown"].append("the output projection does not read the final norm's output or a "
+                                        "constant multiple of it without a bias")
+                input_scale = 1.0
+        # Scaling a bias-free projection's input is the same linear scale
+        # as scaling its output. Canonicalize both conventions for the row.
+        lm = head.output.float() / input_scale
         lg = trace.logits.float()
         if close(lm, lg):
             facts["logits"] = {"transform": None}
@@ -806,46 +1610,236 @@ def analyze(trace):
     return facts
 
 
+def analyze_recurrent(trace, mixer, block_calls):
+    """Prove short convolution and the query/key head sharing of delta-rule operations."""
+    calls = [c for c in block_calls if _is_descendant(c.path, mixer.path)]
+    result = Facts(kind="recurrent", unknown=[], classes=sorted({type(c.module).__name__ for c in calls}))
+    d = mixer.input.shape[-1]
+    linears = [c for c in calls if isinstance(c.module, nn.Linear)]
+    convs = [c.module for c in calls if isinstance(c.module, nn.Conv1d)]
+    # Functional convolution kernels may bypass nn.Conv1d.forward; its weights
+    # remain owned by the mixer and are inspected without invoking that kernel.
+    convs += [m for m in mixer.module.modules() if isinstance(m, nn.Conv1d) and m not in convs]
+    for projected in linears:
+        if projected.output.shape[-1] != 3 * d:
+            continue
+        B, C, x = projected.output.chunk(3, dim=-1)
+        for conv in convs:
+            if conv.in_channels != d or conv.groups != d:
+                continue
+            y = torch.nn.functional.conv1d((B * x).transpose(1, 2), conv.weight, conv.bias,
+                                           padding=conv.kernel_size[0] - 1, groups=d)[..., :SEQ].transpose(1, 2) * C
+            if any(close(c.input, y) and close(c.output, mixer.output) for c in linears):
+                result.update(operation="shortconv", taps=conv.kernel_size[0],
+                              formula="out_proj(C * causal_depthwise_conv(B * x)); in_proj = [B | C | x]")
+                return result
+    # A convolution's SiLU output is what the delta rule receives before
+    # repeating query/key heads. Match both sharing orders numerically.
+    for conv in convs:
+        if conv.bias is not None or conv.groups != conv.in_channels:
+            continue
+        for projected in linears:
+            raw = projected.output
+            if raw.ndim != 3:
+                continue
+            candidates = [raw]
+            # A projection can group [q | k | v | gate] by key head. Its
+            # ordering method is exercised with recorded inputs, never named
+            # by architecture or trusted from a class-name assertion.
+            ordering = getattr(mixer.module, "fix_query_key_value_ordering", None)
+            if callable(ordering):
+                for other in linears:
+                    try:
+                        q, k, v, *_ = ordering(raw, other.output)
+                        candidates.append(torch.cat([t.reshape(1, SEQ, -1) for t in (q, k, v)], dim=-1))
+                    except (RuntimeError, ValueError):
+                        pass
+            for raw_qkv in candidates:
+                if raw_qkv.shape[-1] != conv.in_channels:
+                    continue
+                y = torch.nn.functional.silu(torch.nn.functional.conv1d(raw_qkv.transpose(1, 2), conv.weight,
+                    padding=conv.kernel_size[0] - 1, groups=conv.groups)[..., :SEQ].transpose(1, 2))
+                for rec in trace.recurrences:
+                    q, k, v = (rec[t] for t in ("query", "key", "value"))
+                    hv, hd = v.shape[-2:]
+                    key_dim = (conv.in_channels - hv * v.shape[-1]) // 2
+                    if key_dim <= 0 or key_dim % hd or hv % (key_dim // hd):
+                        continue
+                    hk = key_dim // hd
+                    q0, k0, v0 = y.split((key_dim, key_dim, hv * v.shape[-1]), dim=-1)
+                    if not close(v0, v):
+                        continue
+                    q0, k0 = (t.reshape(1, SEQ, hk, hd) for t in (q0, k0))
+                    if close(q0.repeat_interleave(hv // hk, dim=2), q) and close(k0.repeat_interleave(hv // hk, dim=2), k):
+                        out_proj = next((c.path for c in linears if close(c.output, mixer.output)), None)
+                        result.update(operation="deltanet", grouped_heads=True, key_heads=hk, value_heads=hv,
+                                      head_dim=hd, output_projection=out_proj)
+                        return result
+    return result
+
+
 def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     b = Facts(index=index, unknown=[], absent=[])
     h_in, h_out = layer_call.input, layer_call.output
     # Sub-modules that pass their input through unchanged (dropout in evaluation mode) take no part.
     direct = [c for c in _direct_children(block_calls, path)
               if not (not any(True for _ in c.module.parameters()) and close(c.input, c.output))]
-    norms = [c for c in direct if _norm_like(c)]
+    norms = [c for c in block_calls if c.input is not None and c.input.shape == h_in.shape and _norm_like(c)]
     others = [c for c in direct if not _norm_like(c)]
+    if len(others) == 1:
+        mixer = others[0]
+        m = mixer.module
+        # Identify the SSM by its projections and state tensors, independent
+        # of model/class names. Unknown one-part blocks still refuse a row.
+        if all(hasattr(m, k) for k in ("in_proj", "conv1d", "A_log", "D", "out_proj")):
+            pre = next((c for c in norms if close(c.input, h_in) and close(c.output, mixer.input)), None)
+            form = norm_formula(pre, eps) if pre else None
+            b["norm_before_mixer"] = ({"module": pre.path, "formula": form[0] if form else None,
+                                       "eps": form[1] if form else None, "size": pre.module.weight.numel()}
+                                      if pre else None)
+            if pre is None:
+                b["unknown"].append("SSM mixer has no identified input norm")
+            if not close(h_in.float() + mixer.output.float(), h_out):
+                b["unknown"].append("SSM block output is not its input plus the mixer output")
+            v2 = not hasattr(m, "x_proj")
+            b["mixer"] = Facts(kind="mamba2" if v2 else "mamba", unknown=[],
+                inner=m.intermediate_size, state=m.ssm_state_size, kernel=m.conv1d.kernel_size[0],
+                rank=m.num_heads if v2 else m.time_step_rank, groups=m.n_groups if v2 else 1,
+                activation=m.activation, dt_b_c_rms=hasattr(m, "dt_layernorm"),
+                dt_b_c_eps=float(getattr(m, "rms_eps", 1e-6)),
+                dt_limit=list(getattr(m, "time_step_limit", (0.0, float("inf")))))
+            if v2:
+                nc = next((c for c in block_calls if c.module is m.norm), None)
+                group_size = int(getattr(m.norm, "group_size", m.intermediate_size))
+                b["mixer"]["norm_grouped"] = group_size < m.intermediate_size
+                # Verify the observed norm, including gating order. A module
+                # that does anything else leaves the SSM fact unknown.
+                if nc is None or len(nc.args) < 2:
+                    b["unknown"].append("SSM gated norm invocation was not recorded")
+                else:
+                    z = nc.input.float() * torch.nn.functional.silu(nc.args[1].float())
+                    z = z.reshape(*z.shape[:-1], -1, group_size)
+                    e = float(getattr(m.norm, "variance_epsilon", eps))
+                    want = (z * torch.rsqrt(z.square().mean(-1, keepdim=True) + e)).reshape(nc.input.shape)
+                    want = want * m.norm.weight.detach()
+                    if not close(want, nc.output):
+                        b["unknown"].append("SSM gated norm is not gate-then-RMSNorm with the declared grouping")
+            b["ffn"] = Facts(kind="none")
+            b["residual"] = "sequential"
+            return b
+
+    def branch_norm(c):
+        return {**norm_fact(c, eps), "size": int(c.input.shape[-1]),
+                "weighted": getattr(c.module, "weight", None) is not None}
+
+    if not others and not norms and close(h_in, h_out):
+        return Facts(index=index, unknown=[], absent=[], mixer={"kind": "none"}, ffn={"kind": "none"},
+                     residual="sequential", norm_before_mixer=None, norm_after_mixer=None,
+                     norm_before_ffn=None, norm_after_ffn=None)
+    if len(others) == 1:
+        branch = others[0]
+        ffn_facts = analyze_dense_ffn(branch, block_calls)
+        mixer_facts = analyze_attention(trace, branch.path, block_calls, freqs, eps)
+        if mixer_facts is None:
+            mixer_facts = analyze_linear_mixer(branch)
+        is_ffn = not ffn_facts.get("unknown")
+        if is_ffn or mixer_facts is not None:
+            before = next((c for c in norms if close(c.input, h_in) and close(c.output, branch.input)), None)
+            after = next((c for c in norms if c.order > branch.order and close(c.input, branch.output)), None)
+            if before is None and not close(branch.input, h_in):
+                b["unknown"].append("the only branch does not read the residual or its norm")
+            if any(c is not before and c is not after for c in norms):
+                b["unknown"].append("an extra norm outside the only residual branch")
+            value = after.output if after is not None else branch.output
+            delta = h_out.float() - h_in.float()
+            b["residual"] = "sequential"
+            if not close(h_in.float() + value.float(), h_out):
+                nonzero = value.abs() > 1e-6
+                r = float((delta[nonzero] / value.float()[nonzero]).median()) if nonzero.any() else 1.0
+                if close(h_in.float() + r * value.float(), h_out):
+                    b["residual"] = {"multiplier": r}
+                else:
+                    b["unknown"].append("the only branch does not add to the input residual")
+            b.update(mixer={"kind": "none"} if is_ffn else mixer_facts,
+                     ffn=ffn_facts if is_ffn else {"kind": "none"},
+                     norm_before_mixer=None if is_ffn or before is None else branch_norm(before),
+                     norm_after_mixer=None if is_ffn or after is None else branch_norm(after),
+                     norm_before_ffn=branch_norm(before) if is_ffn and before else None,
+                     norm_after_ffn=branch_norm(after) if is_ffn and after else None)
+            return b
+    predicted = None
+    laurel = None
+    if h_in is not None and h_in.dim() == 4:
+        k = h_in.shape[0]
+        coefficients = next((c for c in _linears(block_calls, path)
+                             if c.output.shape[-1] == k * k and c.input.shape[-1] == k), None)
+        if coefficients is not None:
+            coef = coefficients.output.reshape(1, SEQ, k, k).transpose(-1, -2)
+            predicted = torch.matmul(h_in.permute(1, 2, 3, 0), coef).permute(3, 0, 1, 2) + h_in
+            mixer = next((c for c in direct if any(a.module is c.module for a in trace.attn)), None)
+            ffn = next((c for c in direct if len(_linears(block_calls, c.path)) == 3 and
+                        analyze_dense_ffn(c, block_calls).get("activation") is not None), None)
+            pre = next((n for n in norms if mixer is not None and close(n.output, mixer.input)), None)
+            active = next((i for i in range(k) if pre is not None and close(predicted[i], pre.input)), None)
+            if active is not None and mixer is not None and ffn is not None:
+                b["altup"] = {"streams": k, "active": active}
+                h_in = predicted[active]
+                others = [mixer, ffn]
+                laurel = next((c for c in direct if c not in others and
+                               close(c.input, pre.output) and c.output is not None and
+                               len(_linears(block_calls, c.path)) == 2), None)
+    elif len(others) > 2:
+        # A per-layer token-input branch adds two direct projections beside
+        # the mixer and gated FFN. Identify the latter by their observed
+        # attention and activation equations, leaving the branch for the
+        # output check below.
+        mixer = next((c for c in direct if any(a.module is c.module for a in trace.attn)), None)
+        ffn = next((c for c in direct if len(_linears(block_calls, c.path)) == 3 and
+                    analyze_dense_ffn(c, block_calls).get("activation") is not None), None)
+        if mixer is not None and ffn is not None:
+            others = [mixer, ffn]
     if len(others) != 2:
         b["unknown"].append(f"the block runs {len(others)} sub-modules besides its norms "
                             f"({', '.join(c.path.rsplit('.', 1)[-1] for c in others)}), not a mixer and an FFN")
         return b
     mixer, ffn = others
+    nested_att = [c for c in block_calls if (c.path == mixer.path or _is_descendant(c.path, mixer.path))
+                  and any(c.module is a.module for a in trace.attn)]
+    if len(nested_att) == 1:
+        mixer = nested_att[0]  # norms may wrap the attention and its residual
     b["mixer_module"] = mixer.path
     b["ffn_module"] = ffn.path
 
-    def norm_fact(c):
-        form = norm_formula(c, eps)
-        return {"module": c.path, "formula": form[0] if form else None, "eps": form[1] if form else None,
-                "size": int(c.module.weight.numel())}
-
     pre_mixer = next((n for n in norms if close(n.input, h_in) and close(n.output, mixer.input)), None)
-    b["norm_before_mixer"] = norm_fact(pre_mixer) if pre_mixer else None
+    b["norm_before_mixer"] = branch_norm(pre_mixer) if pre_mixer else None
     if pre_mixer is None:
         if close(mixer.input, h_in):
             b["absent"].append("no norm before the token mixer (it reads the residual stream directly)")
         else:
             b["unknown"].append("the token mixer does not read the block input or a norm of it")
-    post_mixer = next((n for n in norms if n.order > mixer.order and close(n.input, mixer.output)), None)
-    b["norm_after_mixer"] = norm_fact(post_mixer) if post_mixer else None
-    m_out = post_mixer.output if post_mixer else mixer.output
-    h_mid = h_in.float() + m_out.float()
     pre_ffn = next((n for n in norms if n.order < ffn.order and n is not pre_mixer and close(n.output, ffn.input)),
                    None)
+    post_mixer = next((n for n in norms if n is not pre_ffn and n.order > mixer.order and close(n.input, mixer.output)), None)
+    b["norm_after_mixer"] = branch_norm(post_mixer) if post_mixer else None
+    m_out = post_mixer.output if post_mixer else mixer.output
+    # Some eager implementations return a residual from the mixer or FFN.
+    # Prove it against the inner projection rather than its module name.
+    if pre_ffn is not None and close(pre_ffn.input, m_out) and any(
+            c.output.shape == h_in.shape and close(c.output + h_in, m_out) for c in _linears(block_calls, mixer.path)):
+        m_out = m_out.float() - h_in.float()
+    h_mid = h_in.float() + m_out.float()
+    if predicted is not None and laurel is not None:
+        h_mid = (h_mid + laurel.output.float()) / math.sqrt(2)
+        b["laurel"] = True
     b["parallel"] = False
     b["residual"] = "sequential"
     if pre_mixer is not None and close(ffn.input, pre_mixer.output):
         b["parallel"] = True
         b["residual"] = "parallel"
         b["absent"].append("the FFN reads the same normed input as the mixer (parallel attention and FFN)")
+    elif pre_ffn is not None and close(pre_ffn.input, h_in):
+        b["parallel"] = True
+        b["residual"] = "parallel"
     elif pre_ffn is not None and not close(pre_ffn.input, h_mid):
         # A multiplier on the mixer's output before the residual add.
         delta = pre_ffn.input.float() - h_in.float()
@@ -856,15 +1850,50 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
             h_mid = h_in.float() + r * m_out.float()
         else:
             b["unknown"].append("the FFN's norm does not read the block input plus the mixer's output")
-    b["norm_before_ffn"] = norm_fact(pre_ffn) if pre_ffn else None
+    b["norm_before_ffn"] = branch_norm(pre_ffn) if pre_ffn else None
     if pre_ffn is None and not b["parallel"]:
         if close(ffn.input, h_mid):
             b["absent"].append("no norm before the FFN (it reads the residual stream directly)")
         else:
             b["unknown"].append("the FFN does not read the residual stream or a norm of it")
     post_ffn = next((n for n in norms if n.order > ffn.order and close(n.input, ffn.output)), None)
-    b["norm_after_ffn"] = norm_fact(post_ffn) if post_ffn else None
+    b["norm_after_ffn"] = branch_norm(post_ffn) if post_ffn else None
     f_out = (post_ffn.output if post_ffn else ffn.output).float()
+    if any(c.output.shape == h_mid.shape and close(c.output + h_mid, f_out) for c in _linears(block_calls, ffn.path)):
+        f_out = f_out - h_mid
+    if b.get("altup"):
+        # Verify the correction and per-layer residual against the complete
+        # observed stream output; the ordinary block below ends before them.
+        core_out = h_mid + f_out
+        k, active = b["altup"]["streams"], b["altup"]["active"]
+        coefficients = next((c for c in _linears(block_calls, path)
+                             if c.output.shape[-1] == k and c.input.shape[-1] == k), None)
+        corrected = None
+        if coefficients is not None:
+            coefs = (coefficients.output + 1).permute(2, 0, 1).unsqueeze(-1)
+            corrected = predicted + (core_out - predicted[active]).unsqueeze(0) * coefs
+        per_layer_norms = [n for n in norms if post_ffn is not None and n.order > post_ffn.order]
+        if corrected is None or len(per_layer_norms) != 1:
+            b["unknown"].append("could not establish the multi-stream correction and per-layer residual")
+        else:
+            corrected[1:] += per_layer_norms[0].output
+            if not close(corrected, h_out):
+                b["unknown"].append("the stream output does not match prediction, correction and per-layer residual")
+        h_out = core_out
+        norms = [n for n in norms if n not in per_layer_norms]
+    elif post_ffn is not None:
+        per_layer_norms = [n for n in norms if n.order > post_ffn.order]
+        if len(per_layer_norms) == 1:
+            core_out = h_mid + f_out
+            branch = per_layer_norms[0].output
+            combined = core_out + branch
+            scale = float((h_out.float() / torch.where(combined.abs() > 1e-6, combined,
+                                                      torch.ones_like(combined))).median())
+            if close(combined * scale, h_out):
+                b["per_layer_input"] = True
+                b["output_scale"] = scale
+                h_out = core_out
+                norms = [n for n in norms if n not in per_layer_norms]
     extra = [n for n in norms if n not in (pre_mixer, post_mixer, pre_ffn, post_ffn)]
     if extra:
         b["unknown"].append("norms with no place in the block: " + ", ".join(n.path for n in extra))
@@ -885,15 +1914,44 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
 
     mixer_facts = analyze_attention(trace, mixer.path, block_calls, freqs, eps)
     if mixer_facts is None:
-        mixer_facts = Facts(kind="recurrent", unknown=[],
-                            classes=sorted({type(c.module).__name__ for c in block_calls
-                                            if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))
+        mixer_facts = analyze_linear_mixer(mixer)
+        if mixer_facts is None:
+            mixer_facts = analyze_recurrent(trace, mixer, block_calls)
+    mixer_facts["indexer"] = analyze_indexer(trace, mixer.path, block_calls, freqs)
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)
-                 for a in list(c.args) + list(c.kwargs.values()) if torch.is_tensor(a))
+                 for a in list(c.args) + list(c.kwargs.values()) + c.outputs if torch.is_tensor(a))
     b["ffn"] = analyze_moe(ffn, block_calls, trace.reduced) if is_moe else analyze_dense_ffn(ffn, block_calls)
     return b
+
+
+def restore_depth_scale(facts, config, traced_layers, full_layers):
+    """Map a verified scale_depth/sqrt(layer_count) branch scale to the full configuration."""
+    depth = getattr(config, "scale_depth", None)
+    if depth is None or traced_layers == full_layers:
+        return
+    blocks = facts["block_facts"]
+    if not isinstance(depth, (int, float)) or isinstance(depth, bool) or not math.isfinite(depth) or depth <= 0:
+        facts["unknown"].append("scale_depth is not a finite positive scalar")
+        return
+    expected = float(depth) / math.sqrt(traced_layers)
+    if (not blocks or any(b.get("mixer", {}).get("kind") in (None, "none")
+                                 or b.get("ffn", {}).get("kind") in (None, "none")
+                                 or not isinstance(b.get("residual"), dict)
+                                 or b["residual"].get("only_ffn")
+                                 or not math.isclose(b["residual"]["multiplier"], expected, rel_tol=1e-5, abs_tol=1e-6)
+                                 for b in blocks)):
+        facts["unknown"].append("scale_depth is not the verified scale_depth/sqrt(traced layer count) "
+                                "on both residual branches")
+        return
+    original = float(depth) / math.sqrt(full_layers)
+    for block in blocks:
+        block["residual"]["traced_multiplier"] = block["residual"]["multiplier"]
+        block["residual"]["multiplier"] = original
+    facts["depth_scale_probe"] = {"scale_depth": depth, "traced_layers": traced_layers,
+                                  "original_layers": full_layers, "traced_multiplier": expected,
+                                  "original_multiplier": original}
 
 
 def describe_reference(model_id, revision=None, trust_remote_code=False):
@@ -901,7 +1959,24 @@ def describe_reference(model_id, revision=None, trust_remote_code=False):
     trace = run_trace(model_id, revision, trust_remote_code)
     facts = analyze(trace)
     cfg = trace.config
+    restore_depth_scale(facts, cfg, trace.keep, trace.n_layers)
+    original_windows = {getattr(cfg, k, None) for k in ("sliding_window", "window_size")
+                        if isinstance(getattr(cfg, k, None), int) and getattr(cfg, k) > 0}
+    reduced_windows = {getattr(trace.reduced, k, None) for k in ("sliding_window", "window_size")
+                       if isinstance(getattr(trace.reduced, k, None), int) and getattr(trace.reduced, k) > 0}
+    if len(original_windows) == len(reduced_windows) == 1 and original_windows != reduced_windows:
+        original, reduced = next(iter(original_windows)), next(iter(reduced_windows))
+        facts["window_probe"] = {"configured": original, "traced": reduced}
+        for block in facts["block_facts"]:
+            mixer = block.get("mixer", {})
+            if mixer.get("window") == reduced:
+                mixer["observed_window"] = reduced
+                mixer["window"] = original
     facts["config"] = {k: v for k, v in cfg.to_dict().items() if not k.startswith("_") or k == "_sliding_window_pattern"}
+    for key in ("layer_types", "interleaved_sliding_window"):
+        value = getattr(cfg, key, None)
+        if isinstance(value, (list, tuple)):
+            facts["config"][key] = list(value)
     facts["model_type"] = getattr(cfg, "model_type", None)
     return facts
 

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -19,7 +20,9 @@
 #include <vector>
 
 #include "core/draft_budget.h"
+#include "core/moe_routing.h"
 #include "core/quant.h"
+#include "core/quant_blocks.h"
 #include "core/sampling.h"
 #include "core/suffix_drafter.h"
 #include "core/thread_pool.h"
@@ -68,9 +71,14 @@ const std::string& model_path(const std::string& name, const test::TinyModelSpec
 
 const std::string& mixed_model() { return model_path("mixed", {}); }
 const std::string& f32_model() { return model_path("f32", f32_spec()); }
+const std::string& ssm_model(const char* arch) {
+    test::TinyModelSpec s;
+    s.arch = arch;
+    return model_path(arch, s);
+}
 
-std::unique_ptr<Transformer> load_transformer(const std::string& path, TransformerOptions options = {}) {
-    auto file = MmapLoader::open(path);
+std::unique_ptr<Transformer> load_transformer(const std::string& path, TransformerOptions options = {}, LoaderOptions loader = {}) {
+    auto file = MmapLoader::open(path, loader);
     if (!file) return nullptr;
     auto model = Transformer::load(std::move(file).value(), options);
     if (!model) {
@@ -94,6 +102,11 @@ public:
         hd_ = d_ / n_head_;
     }
 
+    Reference(const MmapLoader& f, const test::TinyModelSpec& spec)
+        : f_(f), d_(spec.n_embd), n_head_(spec.n_head), n_kv_(spec.n_head_kv), n_layers_(spec.n_layers),
+          hd_(spec.n_embd / spec.n_head), block_heads_(spec.block_heads), block_kv_(spec.block_kv_heads),
+          block_ff_(spec.block_ff) {}
+
     std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens, int window = 0, int sinks = 0) const {
         const int n = static_cast<int>(tokens.size());
         std::vector<std::vector<float>> x(static_cast<size_t>(n));
@@ -104,8 +117,24 @@ public:
         }
         for (int l = 0; l < n_layers_; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
+            const int heads = block_heads_.empty() ? n_head_ : block_heads_[static_cast<size_t>(l)];
+            const int kv_heads = block_kv_.empty() ? n_kv_ : block_kv_[static_cast<size_t>(l)];
+            const bool has_ffn = block_ff_.empty() || block_ff_[static_cast<size_t>(l)] > 0;
+            if (kv_heads == 0) {
+                if (heads > 0) {
+                    const auto wo = weights(p + "attn_output.weight");
+                    for (auto& row : x) {
+                        const auto branch = matvec(wo, norm(row, weights(p + "attn_norm.weight")));
+                        for (int i = 0; i < d_; ++i) row[i] += branch[i];
+                    }
+                }
+                if (has_ffn) ffn(x, p);
+                continue;
+            }
             const auto wq = weights(p + "attn_q.weight"), wk = weights(p + "attn_k.weight");
             const auto wv = weights(p + "attn_v.weight"), wo = weights(p + "attn_output.weight");
+            const auto sink_logits = f_.tensor(p + "attn_sinks.weight") ? weights(p + "attn_sinks.weight") : std::vector<float>{};
+            const auto output_bias = f_.tensor(p + "attn_output.bias") ? weights(p + "attn_output.bias") : std::vector<float>{};
             std::vector<std::vector<float>> q(n), k(n), v(n);
             for (int t = 0; t < n; ++t) {
                 const auto h = norm(x[t], weights(p + "attn_norm.weight"));
@@ -116,9 +145,9 @@ public:
                 rope(k[t], t);
             }
             for (int t = 0; t < n; ++t) {
-                std::vector<float> att(static_cast<size_t>(d_), 0.0f);
-                for (int h = 0; h < n_head_; ++h) {
-                    const int g = h / (n_head_ / n_kv_);
+                std::vector<float> att(static_cast<size_t>(heads * hd_), 0.0f);
+                for (int h = 0; h < heads; ++h) {
+                    const int g = h / (heads / kv_heads);
                     const int first = window > 0 ? std::max(0, t - window + 1) : 0;
                     const int sink_end = std::min(sinks, first);  // attention sinks before the window
                     std::vector<int> visible;
@@ -132,7 +161,8 @@ public:
                         s.push_back(dot / std::sqrt(static_cast<double>(hd_)));
                         mx = std::max(mx, s.back());
                     }
-                    double sum = 0;
+                    if (!sink_logits.empty()) mx = std::max(mx, static_cast<double>(sink_logits[h]));
+                    double sum = sink_logits.empty() ? 0.0 : std::exp(sink_logits[h] - mx);
                     for (double& e : s) sum += (e = std::exp(e - mx));
                     for (size_t idx = 0; idx < visible.size(); ++idx) {
                         for (int i = 0; i < hd_; ++i) {
@@ -141,18 +171,9 @@ public:
                     }
                 }
                 const auto o = matvec(wo, att);
-                for (int i = 0; i < d_; ++i) x[t][i] += o[i];
+                for (int i = 0; i < d_; ++i) x[t][i] += o[i] + (output_bias.empty() ? 0.0f : output_bias[i]);
             }
-            const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
-            const auto wd = weights(p + "ffn_down.weight");
-            for (int t = 0; t < n; ++t) {
-                const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
-                auto g = matvec(wg, h);
-                const auto u = matvec(wu, h);
-                for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
-                const auto down = matvec(wd, g);
-                for (int i = 0; i < d_; ++i) x[t][i] += down[i];
-            }
+            if (has_ffn) ffn(x, p);
         }
         const auto out_w = f_.tensor("output.weight") ? weights("output.weight") : emb;
         std::vector<std::vector<float>> result;
@@ -164,6 +185,26 @@ public:
     }
 
 private:
+    void ffn(std::vector<std::vector<float>>& x, const std::string& p) const {
+        const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
+        const auto wd = weights(p + "ffn_down.weight");
+        for (size_t t = 0; t < x.size(); ++t) {
+            const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
+            auto g = matvec(wg, h);
+            const auto u = matvec(wu, h);
+            float limit = 0.0f;
+            const auto layer = static_cast<size_t>(std::stoi(p.substr(4)));
+            if (const auto* value = f_.metadata("llama.swiglu_clamp_shexp")) {
+                std::memcpy(&limit, value->array_data + layer * sizeof(float), sizeof(float));
+            }
+            for (size_t i = 0; i < g.size(); ++i) {
+                const float activated = g[i] / (1.0f + std::exp(-g[i]));
+                g[i] = limit > 0 ? std::min(activated, limit) * std::clamp(u[i], -limit, limit) : activated * u[i];
+            }
+            const auto down = matvec(wd, g);
+            for (int i = 0; i < d_; ++i) x[t][i] += down[i];
+        }
+    }
     std::vector<float> weights(const std::string& name) const {
         const TensorView* t = f_.tensor(name);
         std::vector<float> out(static_cast<size_t>(t->elements()));
@@ -204,6 +245,7 @@ private:
 
     const MmapLoader& f_;
     int d_, n_head_, n_kv_, n_layers_, hd_;
+    std::vector<int32_t> block_heads_, block_kv_, block_ff_;
 };
 
 // Independent float reference of a deepseek2 model with multi-head latent
@@ -221,8 +263,10 @@ public:
         rank_ = static_cast<int>(*f.get_int("deepseek2.attention.kv_lora_rank"));
         q_rank_ = static_cast<int>(f.get_int("deepseek2.attention.q_lora_rank").value_or(0));
         rd_ = static_cast<int>(*f.get_int("deepseek2.rope.dimension_count"));
-        nope_ = static_cast<int>(*f.get_int("deepseek2.attention.key_length_mla")) - rd_;
-        vd_ = static_cast<int>(*f.get_int("deepseek2.attention.value_length_mla"));
+        nope_ = static_cast<int>(f.get_int("deepseek2.attention.key_length_mla").value_or(
+            *f.get_int("deepseek2.attention.key_length"))) - rd_;
+        vd_ = static_cast<int>(f.get_int("deepseek2.attention.value_length_mla").value_or(
+            *f.get_int("deepseek2.attention.value_length")));
     }
 
     std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens) const {
@@ -234,8 +278,24 @@ public:
         for (int l = 0; l < layers_; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
             const auto kv_a = weights(p + "attn_kv_a_mqa.weight");
-            const auto kb = weights(p + "attn_k_b.weight");  // [head][rank][nope]
-            const auto vb = weights(p + "attn_v_b.weight");  // [head][v][rank]
+            std::vector<float> kb, vb;
+            if (f_.tensor(p + "attn_kv_b.weight")) {
+                const auto combined = weights(p + "attn_kv_b.weight");
+                kb.resize(static_cast<size_t>(heads_ * rank_ * nope_));
+                vb.resize(static_cast<size_t>(heads_ * vd_ * rank_));
+                for (int h = 0; h < heads_; ++h) {
+                    for (int j = 0; j < nope_ + vd_; ++j) {
+                        for (int r = 0; r < rank_; ++r) {
+                            const float v = combined[static_cast<size_t>((h * (nope_ + vd_) + j) * rank_ + r)];
+                            if (j < nope_) kb[static_cast<size_t>((h * rank_ + r) * nope_ + j)] = v;
+                            else vb[static_cast<size_t>((h * vd_ + j - nope_) * rank_ + r)] = v;
+                        }
+                    }
+                }
+            } else {
+                kb = weights(p + "attn_k_b.weight");  // [head][rank][nope]
+                vb = weights(p + "attn_v_b.weight");  // [head][v][rank]
+            }
             std::vector<std::vector<float>> q(n), keys(n), values(n);  // per token: [head][qk], [head][qk], [head][v]
             for (int t = 0; t < n; ++t) {
                 const auto h = norm(x[t], weights(p + "attn_norm.weight"));
@@ -266,6 +326,7 @@ public:
                 }
             }
             const auto wo = weights(p + "attn_output.weight");
+            const auto bo = f_.tensor(p + "attn_output.bias") ? weights(p + "attn_output.bias") : std::vector<float>{};
             for (int t = 0; t < n; ++t) {
                 std::vector<float> att(static_cast<size_t>(heads_ * vd_), 0.0f);
                 for (int hh = 0; hh < heads_; ++hh) {
@@ -283,7 +344,8 @@ public:
                         for (int i = 0; i < vd_; ++i) att[hh * vd_ + i] += static_cast<float>(s[j] / sum * values[j][hh * vd_ + i]);
                     }
                 }
-                const auto o = matvec(wo, att);
+                auto o = matvec(wo, att);
+                for (size_t i = 0; i < bo.size(); ++i) o[i] += bo[i];
                 for (int i = 0; i < d_; ++i) x[t][i] += o[i];
             }
             const auto wg = weights(p + "ffn_gate.weight"), wu = weights(p + "ffn_up.weight");
@@ -292,7 +354,15 @@ public:
                 const auto h = norm(x[t], weights(p + "ffn_norm.weight"));
                 auto g = matvec(wg, h);
                 const auto u = matvec(wu, h);
-                for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+                float limit = 0.0f;
+            const auto layer = static_cast<size_t>(std::stoi(p.substr(4)));
+            if (const auto* value = f_.metadata("llama.swiglu_clamp_shexp")) {
+                std::memcpy(&limit, value->array_data + layer * sizeof(float), sizeof(float));
+            }
+            for (size_t i = 0; i < g.size(); ++i) {
+                const float activated = g[i] / (1.0f + std::exp(-g[i]));
+                g[i] = limit > 0 ? std::min(activated, limit) * std::clamp(u[i], -limit, limit) : activated * u[i];
+            }
                 const auto down = matvec(wd, g);
                 for (int i = 0; i < d_; ++i) x[t][i] += down[i];
             }
@@ -342,7 +412,7 @@ private:
     int d_, heads_, layers_, rank_, q_rank_, rd_, nope_, vd_;
 };
 
-double max_abs_diff(std::span<const float> a, const std::vector<float>& b) {
+double max_abs_diff(std::span<const float> a, std::span<const float> b) {
     double m = 0;
     for (size_t i = 0; i < b.size(); ++i) m = std::max(m, std::fabs(static_cast<double>(a[i]) - b[i]));
     return m;
@@ -497,53 +567,8 @@ TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") 
     }
 }
 
-// One entry of tests/data/quant_vectors.bin (written by tools/gen_quant_vectors.py):
-// encoded blocks of a GGML format and the values llama.cpp's reference decodes.
-struct QuantVector {
-    DType type{};
-    int64_t n = 0;  // values
-    std::vector<uint8_t> blocks;
-    std::vector<float> expected;
-};
-
-// Reads every entry; false (with a "skipped" note) when the file is absent.
-bool load_quant_vectors(std::vector<QuantVector>& out) {
-    std::string dir = LIYAB_TEST_DATA_DIR;
-    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
-    std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
-    if (f == nullptr) {
-        std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
-        return false;
-    }
-    std::vector<uint8_t> file;
-    uint8_t chunk[4096];
-    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
-    std::fclose(f);
-    CHECK(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
-    if (file.size() <= 12) return false;
-    size_t pos = 12;
-    uint32_t count = 0;
-    std::memcpy(&count, file.data() + 8, 4);
-    for (uint32_t e = 0; e < count; ++e) {
-        uint32_t ggml = 0, n_blocks = 0;
-        std::memcpy(&ggml, file.data() + pos, 4);
-        std::memcpy(&n_blocks, file.data() + pos + 4, 4);
-        pos += 8;
-        QuantVector v;
-        const bool known = dtype_from_ggml(ggml, v.type);
-        CHECK(known);
-        if (!known) return false;
-        const DTypeTraits t = dtype_traits(v.type);
-        v.n = static_cast<int64_t>(n_blocks) * t.block_size;
-        v.blocks.assign(file.data() + pos, file.data() + pos + static_cast<size_t>(n_blocks) * t.block_bytes);
-        pos += v.blocks.size();
-        v.expected.resize(static_cast<size_t>(v.n));
-        std::memcpy(v.expected.data(), file.data() + pos, v.expected.size() * 4);
-        pos += v.expected.size() * 4;
-        out.push_back(std::move(v));
-    }
-    return true;
-}
+using test::QuantVector;
+using test::load_quant_vectors;
 
 TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
     std::vector<QuantVector> vectors;
@@ -1220,6 +1245,62 @@ TEST_CASE("GPU backends (Metal / Vulkan) agree with the CPU backend") {
   }
 }
 
+TEST_CASE("Classic CPU operations compose with GPU projections through prefill, decode and rollback") {
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        for (const std::string arch : {"gpt2", "falcon", "bloom", "apertus", "deepseek2"}) {
+            auto spec = test::classic_model_spec(arch);
+            if (arch == "deepseek2") {
+                spec = {};
+                spec.arch = arch;
+                spec.n_head_kv = 1;
+                spec.rope_dim = 32;
+                spec.mla_kv_rank = spec.mla_q_rank = 64;
+                spec.attn_output_bias = true;
+            }
+            spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F16;
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            options.latent_form = LatentForm::Expanded;  // latent prefill expands; single-token decode absorbs
+            const auto path = model_path("classic_gpu_" + arch, spec);
+            auto reference = load_transformer(path, options), accelerated = load_transformer(path, options);
+            REQUIRE(reference != nullptr && accelerated != nullptr);
+            // Destroy the accelerator before the models whose mapped weights
+            // it borrows, even when its buffer cache retains registrations.
+            auto accelerator = make();
+            if (!accelerator) {
+                std::printf("  skipped: %s\n", accelerator.status().to_string().c_str());
+                break;
+            }
+            ThreadPool pool(4);
+            auto cpu = make_cpu_backend(pool);
+            const Route plain{cpu.get(), cpu.get(), cpu.get()};
+            const Route mixed{cpu.get(), accelerator.value().get(), accelerator.value().get()};
+            auto compare = [&](const std::vector<int32_t>& ids) {
+                auto a = reference->forward(ids, Transformer::Logits::All, plain, pool);
+                auto b = accelerated->forward(ids, Transformer::Logits::All, mixed, pool);
+                if (!a || !b) {
+                    std::printf("  %s: CPU %s; accelerator %s\n", arch.c_str(),
+                                a ? "ok" : a.status().to_string().c_str(), b ? "ok" : b.status().to_string().c_str());
+                    return false;
+                }
+                if (a->size() != b->size()) return false;
+                double scale = 1.0, error = 0.0;
+                for (size_t i = 0; i < a->size(); ++i) {
+                    if (!std::isfinite((*a)[i]) || !std::isfinite((*b)[i])) return false;
+                    scale = std::max(scale, std::fabs(static_cast<double>((*a)[i])));
+                    error = std::max(error, std::fabs(static_cast<double>((*a)[i]) - (*b)[i]));
+                }
+                if (error > 1e-3 * scale) std::printf("  %s: relative GPU error %.6g\n", arch.c_str(), error / scale);
+                return error <= 1e-3 * scale;
+            };
+            REQUIRE(compare({1, 270, 280, 290, 300, 271}));
+            REQUIRE(compare({280}));
+            REQUIRE(reference->truncate(3).is_ok() && accelerated->truncate(3).is_ok());
+            REQUIRE(compare({272, 273}));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
@@ -1253,6 +1334,66 @@ TEST_CASE("SPM tokenizer merges by score and falls back to bytes") {
     CHECK(templated.value() == expected_ids);
 }
 
+TEST_CASE("Metaspace first: controls preserve real spaces without adding dummy spaces") {
+    auto spec = test::classic_model_spec("nemotron");
+    auto explicit_file = MmapLoader::open(model_path("nemotron_explicit_bos", spec));
+    REQUIRE(explicit_file.has_value());
+    auto explicit_tok = Tokenizer::load(*explicit_file.value());
+    REQUIRE(explicit_tok.has_value());
+    CHECK(explicit_tok->add_bos_default());  // metadata wins over the absent-key default
+    spec.add_bos = -1;
+    auto loader = MmapLoader::open(model_path("nemotron_metaspace", spec));
+    REQUIRE(loader.has_value());
+    auto tok = Tokenizer::load(*loader.value());
+    REQUIRE(tok.has_value());
+    const Tokenizer& t = *tok;
+    CHECK(!t.add_bos_default());
+    const int32_t hello = test::tiny_token("▁hello"), world = test::tiny_token("▁world");
+    auto initial = t.encode("hello world", true);
+    REQUIRE(initial.has_value());
+    CHECK(*initial == std::vector<int32_t>({t.bos(), hello, world}));
+    auto joined = t.encode("hello</s>world", false);
+    auto continuation = t.encode_continuation("world", t.eos());
+    REQUIRE(joined.has_value() && continuation.has_value());
+    std::vector<int32_t> expected = {hello, t.eos()};
+    expected.insert(expected.end(), continuation->begin(), continuation->end());
+    CHECK(*joined == expected);
+    std::string plain;
+    for (const auto id : *continuation) plain += t.piece(id);
+    CHECK(plain == "world");
+    auto spaced = t.encode("hello</s> world", false);
+    REQUIRE(spaced.has_value());
+    CHECK(*spaced == std::vector<int32_t>({hello, t.eos(), world}));
+    CHECK(t.prompt_text(world, -1) == "world");
+    CHECK(t.prompt_text(world, t.eos()) == " world");
+    auto explicit_bos = t.encode("<s> hello", true);
+    REQUIRE(explicit_bos.has_value());
+    CHECK(*explicit_bos == std::vector<int32_t>({t.bos(), hello}));
+}
+
+TEST_CASE("SentencePiece byte fallback follows token types and groups unknown runs") {
+    for (const int32_t type : {1, 6}) {
+        test::GgufWriter w;
+        w.add_string("general.architecture", "llama");
+        w.add_string("tokenizer.ggml.model", "llama");
+        w.add_string_array("tokenizer.ggml.tokens", {"<unk>", "<s>", "</s>", "<0xCD>", "<0x91>", "x"});
+        w.add_i32_array("tokenizer.ggml.token_type", {2, 3, 3, type, type, 1});
+        w.add_u32("tokenizer.ggml.unknown_token_id", 0);
+        w.add_bool("tokenizer.ggml.add_space_prefix", false);
+        const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_byte_types.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(*file.value());
+        REQUIRE(tok.has_value());
+        auto ids = tok->encode("\u0351\u0351x", false);
+        REQUIRE(ids.has_value());
+        CHECK(*ids == (type == 6 ? std::vector<int32_t>({3, 4, 3, 4, 5}) : std::vector<int32_t>({0, 5})));
+        CHECK(tok->piece(3) == (type == 6 ? std::string_view("\xcd") : std::string_view("<0xCD>")));
+        std::remove(path.c_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transformer
 // ---------------------------------------------------------------------------
@@ -1275,6 +1416,241 @@ TEST_CASE("Transformer matches the float reference (F32 weights, F16 KV)") {
         const auto row = logits->subspan(t * vocab, vocab);
         CHECK(max_abs_diff(row, expected[t]) < 2e-2);
         CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+    }
+}
+
+TEST_CASE("Learned attention sinks and output bias match a full softmax reference") {
+    auto spec = f32_spec();
+    spec.attention_sinks = spec.attention_output_bias = true;
+    const auto& path = model_path("learned_sinks_reference", spec);
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    const Reference ref(*file.value());
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 36; ++i) tokens.push_back(3 + (i * 37) % 250);
+    for (const int window : {0, 12}) {
+        TransformerOptions options;
+        options.kv_type = KvCacheType::F16;
+        options.sliding_window = window;
+        options.sink_tokens = window ? 2 : 0;
+        auto model = load_transformer(path, options);
+        REQUIRE(model != nullptr);
+        const auto expected = ref.logits(tokens, window, options.sink_tokens);
+        auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(got.has_value());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            CHECK(max_abs_diff(got->subspan(t * expected[t].size(), expected[t].size()), expected[t]) < 0.003f);
+        }
+    }
+}
+
+TEST_CASE("Biased clamped experts and sinks agree through streamed fused projections and rollback") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.n_expert = 8;
+    spec.n_expert_used = 3;
+    spec.identical_experts = false;
+    spec.router_bias = spec.expert_projection_bias = true;
+    spec.attention_sinks = spec.attention_output_bias = true;
+    spec.sliding_window = 12;
+    auto fused = spec;
+    fused.fused_gate_up = true;
+    const auto& split_path = model_path("gpt_oss_split_bias", spec);
+    const auto& fused_path = model_path("gpt_oss_fused_bias", fused);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 36; ++i) tokens.push_back(3 + (i * 37) % 250);
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = type;
+        options.expert_cache_bytes = 0;
+        options.keep_windowed_rows = true;  // speculative rejection can revisit rows before the window
+        auto a = load_transformer(split_path, options);
+        options.expert_cache_bytes = 1;
+        auto b = load_transformer(fused_path, options);
+        REQUIRE(a != nullptr && b != nullptr);
+        REQUIRE(b->expert_store() != nullptr);
+        auto expected = a->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(expected.has_value());
+        const std::vector<float> expected_copy(expected->begin(), expected->end());
+        auto got = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(got.has_value());
+        CHECK(max_abs_diff(expected_copy, *got) == 0.0f);
+        a->reset();
+        b->reset();
+        for (const int32_t token : tokens) {
+            auto x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+            auto y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+            REQUIRE(x.has_value() && y.has_value());
+            CHECK(max_abs_diff(*x, *y) == 0.0f);
+        }
+        REQUIRE(b->truncate(24).is_ok());
+        auto replay = b->forward(std::span<const int32_t>(tokens).subspan(24), Transformer::Logits::Last, route, pool);
+        REQUIRE(replay.has_value());
+        auto last = std::span<const float>(expected_copy).last(replay->size());
+        CHECK(max_abs_diff(*replay, last) < 0.002f);
+    }
+}
+
+TEST_CASE("Mixtral expert width and router normalization follow tensors and architecture defaults") {
+    test::TinyModelSpec spec;
+    spec.n_expert = 4;
+    spec.n_expert_used = 2;
+    spec.omit_expert_width = true;
+    spec.expert_weights_norm = -1;
+    auto model = load_transformer(model_path("mixtral_metadata", spec));
+    REQUIRE(model != nullptr);
+    CHECK(model->config().n_ff_expert == spec.n_ff);
+    CHECK(model->config().moe_norm_weights);
+}
+
+TEST_CASE("YaRN endpoint rounding follows architecture defaults and explicit file overrides") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.n_expert = 4;
+    spec.n_expert_used = 2;
+    spec.yarn_factor = 4.0f;
+    spec.yarn_ctx = 32;
+    auto implicit = load_transformer(model_path("gpt_yarn_implicit", spec));
+    REQUIRE(implicit != nullptr);
+    CHECK(!implicit->config().yarn.truncate);
+    spec.yarn_truncate = 0;
+    auto fractional = load_transformer(model_path("gpt_yarn_fractional", spec));
+    REQUIRE(fractional != nullptr);
+    CHECK(!fractional->config().yarn.truncate);
+    spec.yarn_truncate = 1;
+    auto rounded = load_transformer(model_path("gpt_yarn_rounded", spec));
+    REQUIRE(rounded != nullptr);
+    CHECK(rounded->config().yarn.truncate);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto a = implicit->forward(tokens, Transformer::Logits::All, route, pool);
+    auto b = fractional->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(a.has_value() && b.has_value());
+    CHECK(max_abs_diff(*a, *b) == 0.0f);
+}
+
+TEST_CASE("Post-SiLU clamps match the independent float reference and change a saturated FFN") {
+    auto spec = f32_spec();
+    spec.shared_swiglu_clamp = 0.25f;
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto model = load_transformer(model_path("post_silu_clamp", spec), options);
+    REQUIRE(model != nullptr);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(got.has_value());
+    const auto expected = Reference(model->file()).logits(tokens);
+    const size_t vocab = expected.front().size();
+    for (size_t t = 0; t < tokens.size(); ++t) CHECK(max_abs_diff(got->subspan(t * vocab, vocab), expected[t]) < 0.003f);
+    auto plain = load_transformer(f32_model(), options);
+    REQUIRE(plain != nullptr);
+    auto before = plain->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(before.has_value());
+    CHECK(max_abs_diff(*before, *got) > 0.01f);
+}
+
+TEST_CASE("Biased MXFP4 experts and wider attention agree through block streaming") {
+    test::TinyModelSpec spec;
+    spec.arch = "gpt-oss";
+    spec.head_dim = 64;
+    spec.n_expert = 8;
+    spec.n_expert_used = 3;
+    spec.ffn_type = DType::MXFP4;
+    spec.router_bias = spec.expert_projection_bias = true;
+    spec.attention_sinks = spec.attention_output_bias = true;
+    spec.identical_experts = false;
+    const auto& path = model_path("moe_wider_attention_streaming", spec);
+    TransformerOptions options;
+    options.expert_cache_bytes = 0;
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    LoaderOptions resident, streaming;
+    resident.streaming = false;
+    streaming.streaming = true;
+    auto a = load_transformer(path, options, resident);
+    auto b = load_transformer(path, options, streaming);
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(b->file().streaming());
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto x = a->forward(tokens, Transformer::Logits::All, route, pool);
+    auto y = b->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(x.has_value() && y.has_value());
+    CHECK(max_abs_diff(*x, *y) == 0.0f);
+    const int32_t token = 280;
+    x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+    y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+    REQUIRE(x.has_value() && y.has_value());
+    CHECK(max_abs_diff(*x, *y) == 0.0f);
+}
+
+TEST_CASE("MXFP4 prefill kernels preserve decode bits for odd blocks and partial row tiles") {
+    std::mt19937 rng(818);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (const int64_t n : {32, 96, 256, 1056}) {
+        std::vector<quant::BlockMxfp4> w(static_cast<size_t>(n / 32));
+        for (auto& b : w) {
+            b.e = static_cast<uint8_t>(124 + rng() % 7);
+            for (auto& q : b.qs) q = static_cast<uint8_t>(rng());
+        }
+        std::vector<quant::BlockQ8_0> x(static_cast<size_t>(9 * n / 32));
+        std::vector<float> input(static_cast<size_t>(9 * n));
+        for (float& v : input) v = normal(rng);
+        quant::quantize_row_q8_0(input.data(), x.data(), 9 * n);
+        const quant::BlockQ8_0* rows[9];
+        for (size_t r = 0; r < 9; ++r) rows[r] = x.data() + r * static_cast<size_t>(n / 32);
+        for (const int count : {1, 2, 3, 4, 5, 7, 8, 9}) {
+            float got[9]{};
+            quant::dot_mxfp4_q8_0_rows(w.data(), rows, count, n, got);
+            for (int r = 0; r < count; ++r) {
+                const float expected = quant::dot_mxfp4_q8_0(w.data(), rows[r], n);
+                CHECK(std::memcmp(&got[r], &expected, sizeof(float)) == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("Separate attention output gates preserve fused-query gate bits for every KV type") {
+    for (const bool head : {false, true}) {
+    test::TinyModelSpec spec;
+    spec.arch = "qwen3";
+    spec.qk_norm = spec.attn_gate = true;
+    spec.head_attention_gate = head;
+    auto split = spec;
+    split.separate_attention_gate = true;
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = type;
+        auto a = load_transformer(model_path("attention_fused_gate" + std::to_string(head), spec), options);
+        auto b = load_transformer(model_path("attention_separate_gate" + std::to_string(head), split), options);
+        REQUIRE(a != nullptr && b != nullptr);
+        CHECK(a->file().tensor("blk.0.attn_gate.weight") == nullptr);
+        REQUIRE(b->file().tensor("blk.0.attn_gate.weight") != nullptr);
+        auto x = a->forward(tokens, Transformer::Logits::All, route, pool);
+        auto y = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(x.has_value() && y.has_value());
+        CHECK(max_abs_diff(*x, *y) == 0.0f);
+        const int32_t token = 280;
+        x = a->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+        y = b->forward(std::span<const int32_t>(&token, 1), Transformer::Logits::Last, route, pool);
+        REQUIRE(x.has_value() && y.has_value());
+        CHECK(max_abs_diff(*x, *y) == 0.0f);
+    }
     }
 }
 
@@ -1359,7 +1735,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
     {
         test::TinyModelSpec spec;
-        spec.arch = "gemma3n";
+        spec.arch = "unsupported-test-architecture";
         auto file = MmapLoader::open(model_path("describe_unknown", spec));
         REQUIRE(file.has_value());
         auto described = describe_model(**file);
@@ -1367,8 +1743,37 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
         CHECK(described.status().code() == ErrorCode::Unsupported);
         // The message names the architecture and every supported one.
         const std::string message = described.status().to_string();
-        CHECK(message.find("'gemma3n'") != std::string::npos);
+        CHECK(message.find("'unsupported-test-architecture'") != std::string::npos);
         for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
+    }
+}
+
+TEST_CASE("describe_model rejects invalid modern scales, rotation patterns and norm placement") {
+    {
+        test::TinyModelSpec s;
+        s.arch = "exaone4";
+        s.post_only_norms = true;
+        s.sliding_window = 8;
+        s.swa_layers = {false, false}; // a file may contain only global blocks beside its window setting
+        auto file = MmapLoader::open(model_path("modern_all_global_nope", s));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(described.has_value());
+        for (const BlockPlan& b : described->blocks) CHECK(!b.rope && !b.windowed);
+    }
+    for (int variant = 0; variant < 6; ++variant) {
+        test::TinyModelSpec s;
+        if (variant == 0) s.rope_layers = {true};  // fewer flags than blocks
+        if (variant == 1) s.embedding_scale = std::numeric_limits<float>::infinity();
+        if (variant == 2) s.residual_scale = -1.0f;
+        if (variant == 3) { s.arch = "granite"; s.logit_scale = std::numeric_limits<float>::denorm_min(); }
+        if (variant == 4) { s.attn_temp_scale = 0.1f; s.attn_temp_length = -1; }
+        if (variant == 5) s.post_only_norms = true; // llama has no post-norm contract
+        auto file = MmapLoader::open(model_path("invalid_modern_" + std::to_string(variant), s));
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        CHECK(!described.has_value());
+        if (!described) CHECK(described.status().code() == ErrorCode::InvalidModel);
     }
 }
 
@@ -1477,13 +1882,14 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
             CHECK(c.blocks[l].ffn == (l == 0 ? FfnKind::Dense : FfnKind::Moe));
             CHECK(c.blocks[l].shared_expert == (l > 0));
         }
-        s.mla_legacy = true;  // attn_kv_b era: refused with what to do about it
+        s.mla_legacy = true;  // attn_kv_b era: normalized to the same cached-latent geometry
         auto file = MmapLoader::open(model_path("describe_deepseek2_legacy", s));
         REQUIRE(file.has_value());
         auto legacy = describe_model(**file);
-        REQUIRE(!legacy.has_value());
-        CHECK(legacy.status().code() == ErrorCode::Unsupported);
-        CHECK(legacy.status().to_string().find("convert") != std::string::npos);
+        REQUIRE(legacy.has_value());
+        CHECK(legacy->head_dim == c.head_dim && legacy->value_dim == c.value_dim && legacy->n_head_kv == 1);
+        CHECK(legacy->mla.nope_dim == c.mla.nope_dim && legacy->mla.v_dim == c.mla.v_dim);
+        for (const BlockPlan& b : legacy->blocks) CHECK(b.latent && b.latent_combined);
     }
     {
         test::TinyModelSpec s;  // YaRN with the reference's defaults
@@ -1506,6 +1912,42 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
         CHECK(d.rope_magnitude == 1.0f);  // DeepSeek's convention: the factor scales q·k
         const double m = 1.0 + static_cast<double>(0.0707f) * std::log(4.0);
         CHECK(d.attn_scale == static_cast<float>(1.0f / std::sqrt(32.0f) * m * m));
+    }
+}
+
+TEST_CASE("describe_model refuses a gated xIELU variant instead of choosing another activation") {
+    auto spec = test::classic_model_spec("apertus");
+    spec.ungated = false;
+    auto file = MmapLoader::open(model_path("gated_xielu", spec));
+    REQUIRE(file.has_value());
+    auto described = describe_model(**file);
+    REQUIRE(!described.has_value());
+    CHECK(described.status().code() == ErrorCode::Unsupported);
+    CHECK(described.status().message().find("gated xIELU FFN in block 0") != std::string::npos);
+}
+
+TEST_CASE("describe_model refuses learned positions with a scale-only or bias-only embedding norm") {
+    for (const bool scale : {false, true}) {
+        test::GgufWriter w;
+        w.add_string("general.architecture", "gpt2");
+        w.add_u32("gpt2.block_count", 1);
+        w.add_u32("gpt2.embedding_length", 32);
+        w.add_u32("gpt2.feed_forward_length", 32);
+        w.add_u32("gpt2.attention.head_count", 1);
+        w.add_tensor("token_embd.weight", {32, 8}, DType::F32, std::vector<float>(256));
+        w.add_tensor("position_embd.weight", {32, 8}, DType::F32, std::vector<float>(256));
+        w.add_tensor(scale ? "token_embd_norm.weight" : "token_embd_norm.bias", {32}, DType::F32,
+                     std::vector<float>(32, 1.0f));
+        const std::string path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) +
+                                 (scale ? "_position_norm_scale.gguf" : "_position_norm_bias.gguf");
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto described = describe_model(**file);
+        REQUIRE(!described.has_value());
+        CHECK(described.status().code() == ErrorCode::Unsupported);
+        CHECK(described.status().message().find("embedding norm with learned position embeddings") != std::string::npos);
+        std::remove(path.c_str());
     }
 }
 
@@ -1590,17 +2032,29 @@ test::TinyModelSpec outlier_spec() {
 
 namespace {
 
-test::TinyModelSpec latent_spec(int32_t q_rank) {
+test::TinyModelSpec latent_spec(int32_t q_rank, bool combined = false) {
     test::TinyModelSpec spec;
     spec.arch = "deepseek2";
     spec.n_head_kv = 1;
     spec.rope_dim = 32;    // the shared RoPE key
     spec.mla_kv_rank = 64;  // cached rows [k_pe | latent] of 96 values, values from channel 32
     spec.mla_q_rank = q_rank;
+    spec.mla_legacy = combined;
     return spec;
 }
 
 }  // namespace
+
+TEST_CASE("Per-block latent head counts are refused before the uniform latent path can run") {
+    test::TinyModelSpec spec = latent_spec(64);
+    spec.block_heads = {2, 4};
+    auto file = MmapLoader::open(model_path("latent_varying_heads", spec));
+    REQUIRE(file.has_value());
+    auto config = describe_model(**file);
+    REQUIRE(!config.has_value());
+    CHECK(config.status().code() == ErrorCode::Unsupported);
+    CHECK(config.status().message().find("per-block latent attention head counts") != std::string::npos);
+}
 
 // Latent attention attends with absorbed queries over the cached [k_pe |
 // latent] rows; the model was trained with per-head keys and values
@@ -1653,6 +2107,53 @@ TEST_CASE("Latent attention over cached latents matches an explicit per-head ref
     }
 }
 
+TEST_CASE("Latent attention applies its output bias in both forms and on every KV type") {
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 33, 120, 7, 260};
+    for (const int32_t q_rank : {0, 64}) {
+        auto spec = latent_spec(q_rank);
+        spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        const auto plain_path = model_path("latent_bias_plain_q" + std::to_string(q_rank), spec);
+        spec.attn_output_bias = true;
+        const auto path = model_path("latent_bias_q" + std::to_string(q_rank), spec);
+        for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                TransformerOptions options;
+                options.kv_type = kv;
+                options.latent_form = form;
+                auto model = load_transformer(path, options), plain = load_transformer(plain_path, options);
+                REQUIRE(model && plain);
+                auto got = model->forward(tokens, Transformer::Logits::All, route, pool);
+                auto without_bias = plain->forward(tokens, Transformer::Logits::All, route, pool);
+                REQUIRE(got && without_bias);
+                const std::vector<float> saved(got->begin(), got->end());
+                CHECK(max_abs_diff(*without_bias, saved) > 1e-3);
+                const auto vocab = static_cast<size_t>(model->config().n_vocab);
+                if (kv == KvCacheType::F16) {
+                    const auto expected = LatentReference(model->file()).logits(tokens);
+                    for (size_t t = 0; t < tokens.size(); ++t) {
+                        CHECK(max_abs_diff(std::span(saved).subspan(t * vocab, vocab), expected[t]) < 2e-2);
+                    }
+                }
+                REQUIRE(model->truncate(7).is_ok());
+                auto replay = model->forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+                REQUIRE(replay.has_value());
+                CHECK(std::memcmp(replay->data(), saved.data() + 7 * vocab, replay->size_bytes()) == 0);
+                if (form == LatentForm::Absorbed) {
+                    model->reset();
+                    for (size_t t = 0; t < tokens.size(); ++t) {
+                        auto step = model->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::All, route, pool);
+                        REQUIRE(step.has_value());
+                        CHECK(std::memcmp(step->data(), saved.data() + t * vocab, step->size_bytes()) == 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 namespace {
 
 // Logits of every token of `tokens`, prefilled in passes of the given sizes
@@ -1684,6 +2185,165 @@ size_t argmax_differences(const std::vector<float>& a, const std::vector<float>&
 }
 
 }  // namespace
+
+TEST_CASE("Combined latent expansion normalizes to split weights in every KV format") {
+    ThreadPool pool(4);
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 33, 120, 7, 260};
+    for (const int32_t q_rank : {0, 64}) {
+        auto spec = latent_spec(q_rank);
+        spec.attn_type = DType::F32;
+        const auto split_path = model_path("latent_split_layout_q" + std::to_string(q_rank), spec);
+        spec.mla_legacy = true;
+        const auto legacy_path = model_path("latent_combined_layout_q" + std::to_string(q_rank), spec);
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+                TransformerOptions options;
+                options.kv_type = kv;
+                options.latent_form = form;
+                auto split = load_transformer(split_path, options);
+                auto legacy = load_transformer(legacy_path, options);
+                REQUIRE(split && legacy);
+                const auto expected = latent_pass_logits(*split, tokens, {tokens.size()}, pool);
+                REQUIRE(!expected.empty());
+                CHECK(latent_pass_logits(*legacy, tokens, {tokens.size()}, pool) == expected);
+                // Single-token passes use absorption even when expanded
+                // prefill is pinned. Compare the same execution schedule.
+                const auto chunked = latent_pass_logits(*split, tokens, {3, 1, 5}, pool);
+                CHECK(latent_pass_logits(*legacy, tokens, {3, 1, 5}, pool) == chunked);
+                if (q_rank == 0 && kv == KvCacheType::F16) {
+                    std::vector<TripleBufferLoader::Item> items;
+                    for (int32_t l = 0; l < legacy->config().n_layers; ++l) {
+                        const auto [begin, end] = legacy->file().layer_range(l);
+                        REQUIRE(end > begin);
+                        items.push_back({begin, end - begin});
+                    }
+                    const auto& mapped = legacy->file().file();
+                    auto source = TripleBufferLoader::create(std::move(items),
+                        [&](uint64_t offset, size_t length, uint8_t* dst) {
+                            std::memset(dst, 0, length);
+                            if (offset < mapped.size()) {
+                                std::memcpy(dst, mapped.data() + offset,
+                                            std::min(length, mapped.size() - static_cast<size_t>(offset)));
+                            }
+                            return Status::ok();
+                        });
+                    REQUIRE(source.has_value());
+                    legacy->set_layer_source(source->get());
+                    CHECK(latent_pass_logits(*legacy, tokens, {3, 1, 5}, pool) == chunked);
+                    legacy->set_layer_source(nullptr);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Combined quantized latent expansion matches an independent per-head reference") {
+    ThreadPool pool(4);
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    for (const auto type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4_0, DType::Q4_1,
+                            DType::Q4_K, DType::Q5_K}) {
+        auto spec = latent_spec(0);
+        spec.n_embd = spec.n_ff = spec.mla_kv_rank = 256;
+        spec.mla_v = 64;
+        spec.mla_legacy = true;
+        spec.attn_type = type;
+        spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        spec.weight_scale = 0.02f;
+        const auto path = model_path("latent_combined_quant_" + std::to_string(static_cast<int>(type)), spec);
+        auto reference = MmapLoader::open(path);
+        REQUIRE(reference.has_value());
+        const auto expected = LatentReference(**reference).logits(tokens);
+        for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            options.latent_form = form;
+            options.repack_cpu = quant::repack_kernels_available();
+            auto model = load_transformer(path, options);
+            REQUIRE(model);
+            CHECK(model->file().tensor("blk.0.attn_kv_b.weight")->type == type);
+            const auto actual = latent_pass_logits(*model, tokens, {tokens.size()}, pool);
+            REQUIRE(actual.size() == tokens.size() * static_cast<size_t>(model->config().n_vocab));
+            double worst = 0.0;
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                worst = std::max(worst, max_abs_diff(std::span<const float>(actual).subspan(
+                    t * expected[t].size(), expected[t].size()), expected[t]));
+            }
+            std::printf("  combined latent %s, form %d: max |diff| %g\n",
+                        std::string(dtype_traits(type).name).c_str(), static_cast<int>(form), worst);
+            CHECK(worst < 3e-2);
+        }
+    }
+}
+
+TEST_CASE("Combined latent weight views preserve every GGML format's decoded keys and raw values") {
+    std::vector<QuantVector> vectors;
+    REQUIRE(load_quant_vectors(vectors));
+    for (const DType type : {DType::F32, DType::F16}) {
+        QuantVector v;
+        v.type = type;
+        v.n = 256;
+        std::vector<float> values(256);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(static_cast<float>(i));
+        v.blocks.resize(dtype_row_bytes(type, v.n));
+        quant::quantize_row(type, values.data(), v.blocks.data(), v.n);
+        vectors.push_back(std::move(v));
+    }
+    LatentAttention geometry;
+    geometry.kv_rank = 256;
+    geometry.nope_dim = 3;
+    geometry.v_dim = 5;
+    constexpr int32_t heads = 2;
+    const int64_t rows = heads * (geometry.nope_dim + geometry.v_dim);
+    size_t checked = 0;
+    for (const auto& qv : vectors) {
+        const auto traits = dtype_traits(qv.type);
+        const size_t row_bytes = dtype_row_bytes(qv.type, geometry.kv_rank);
+        std::vector<uint8_t> raw(static_cast<size_t>(rows) * row_bytes);
+        std::vector<float> decoded(static_cast<size_t>(rows) * geometry.kv_rank);
+        const size_t blocks = qv.blocks.size() / static_cast<size_t>(traits.block_bytes);
+        for (size_t row = 0; row < static_cast<size_t>(rows); ++row) {
+            for (size_t b = 0; b < static_cast<size_t>(geometry.kv_rank / traits.block_size); ++b) {
+                const size_t source_block = (row + b) % blocks;
+                std::memcpy(raw.data() + row * row_bytes + b * static_cast<size_t>(traits.block_bytes),
+                            qv.blocks.data() + source_block * static_cast<size_t>(traits.block_bytes),
+                            static_cast<size_t>(traits.block_bytes));
+            }
+            // Preserve this engine's decoded bits, including IQ1's existing
+            // rounding convention and signed zero, through the transpose.
+            quant::dequantize_row(qv.type, raw.data() + row * row_bytes,
+                                 decoded.data() + row * geometry.kv_rank, geometry.kv_rank);
+        }
+        TensorView source;
+        source.name = "blk.0.attn_kv_b.weight";
+        source.type = qv.type;
+        source.n_dims = 2;
+        source.ne = {geometry.kv_rank, rows, 1, 1};
+        source.data = raw.data();
+        source.nbytes = raw.size();
+        CombinedLatentWeights split;
+        REQUIRE(split.bind(source, geometry, heads).is_ok());
+        const auto* key = reinterpret_cast<const float*>(split.key().data);
+        for (int32_t h = 0; h < heads; ++h) {
+            for (int32_t j = 0; j < geometry.nope_dim; ++j) {
+                for (int32_t r = 0; r < geometry.kv_rank; ++r) {
+                    const size_t src = static_cast<size_t>((h * (geometry.nope_dim + geometry.v_dim) + j) * geometry.kv_rank + r);
+                    const size_t dst = static_cast<size_t>((h * geometry.kv_rank + r) * geometry.nope_dim + j);
+                    CHECK(std::memcmp(key + dst, decoded.data() + src, sizeof(float)) == 0);
+                }
+            }
+            CHECK(std::memcmp(split.value().data + static_cast<size_t>(h * geometry.v_dim) * row_bytes,
+                              source.row(h * (geometry.nope_dim + geometry.v_dim) + geometry.nope_dim),
+                              static_cast<size_t>(geometry.v_dim) * row_bytes) == 0);
+        }
+        source.ne[0] -= 1;
+        CHECK(split.bind(source, geometry, heads).code() == ErrorCode::InvalidModel);
+        source.ne[0] += 1;
+        source.type = DType::Q8_0_R4;
+        CHECK(split.bind(source, geometry, heads).code() == ErrorCode::Unsupported);
+        ++checked;
+    }
+    CHECK(checked == 26);
+}
 
 // The expanded form (per-head keys and values expanded from the cached
 // latents, for prefills) computes the absorbed form's function, rounded
@@ -1759,6 +2419,79 @@ TEST_CASE("Latent attention in the expanded form matches the absorbed form and t
 // before the expansion; calibration itself runs absorbed), and a sliding window
 // with attention sinks, where tokens see different positions; and close to the
 // absorbed form throughout.
+TEST_CASE("Sparse latent attention: dense identity, causal batching and saved contexts in every KV format") {
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t t = 0; t < 33; ++t) tokens.push_back(3 + (37 * t) % 250);
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        auto dense = latent_spec(64);
+        dense.arch = "glm-dsa";
+        auto indexed = dense;
+        indexed.index_dim = 64;
+        indexed.index_topk = 128;
+        indexed.index_full.assign(static_cast<size_t>(indexed.n_layers), false);
+        indexed.index_full[0] = true;
+        const std::string plain_path = model_path("dsa_dense", dense);
+        const std::string all_path = model_path("dsa_all", indexed);
+        indexed.index_topk = 4;
+        const std::string sparse_path = model_path("dsa_sparse", indexed);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            TransformerOptions options;
+            options.kv_type = type;
+            options.latent_form = form;
+            auto plain = load_transformer(plain_path, options);
+            auto all = load_transformer(all_path, options);
+            auto sparse = load_transformer(sparse_path, options);
+            REQUIRE(plain != nullptr && all != nullptr && sparse != nullptr);
+            CHECK(sparse->config().blocks[0].indexed);
+            CHECK(sparse->kv_cache().config().auxiliary_dim == 64);
+            auto a = plain->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(a.has_value());
+            const std::vector<float> expected(a->begin(), a->end());
+            auto b = all->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(b.has_value());
+            CHECK(max_abs_diff(*b, expected) == 0.0f);  // index_topk >= context is dense, bit for bit
+            auto c = sparse->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(c.has_value());
+            const std::vector<float> batched(c->begin(), c->end());
+            CHECK(max_abs_diff(*c, expected) > 0.0f);  // the sparse selection actually runs
+            sparse->reset();
+            if (form == LatentForm::Absorbed) {
+                std::vector<float> decoded;
+                for (const int32_t token : tokens) {
+                    auto row = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                    REQUIRE(row.has_value());
+                    decoded.insert(decoded.end(), row->begin(), row->end());
+                }
+                CHECK(max_abs_diff(decoded, batched) == 0.0f);
+            } else {
+                REQUIRE(sparse->forward(tokens, Transformer::Logits::None, route, pool).has_value());
+            }
+            std::stringstream image(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(sparse->write_state(image).is_ok());
+            auto restored = load_transformer(sparse_path, options);
+            REQUIRE(restored != nullptr);
+            REQUIRE(restored->read_state(image).is_ok());
+            for (const int32_t token : {71, 5, 250}) {
+                auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                REQUIRE(left.has_value() && right.has_value());
+                CHECK(left->size() == right->size());
+                CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+            }
+            REQUIRE(sparse->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            REQUIRE(restored->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            const int32_t token = 42;
+            auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(left.has_value() && right.has_value());
+            CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+        }
+    }
+}
+
 TEST_CASE("Expanded latent attention over many tiles: every split the same bits, close to the absorbed form") {
     test::TinyModelSpec spec = latent_spec(64);
     spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
@@ -1820,6 +2553,27 @@ TEST_CASE("Expanded latent attention over many tiles: every split the same bits,
         CHECK(err_expanded <= std::max(1e-3, 1.25 * err_absorbed));
         CHECK(flips_expanded <= std::max<size_t>(flips_absorbed, tokens.size() / 100));
     }
+}
+
+TEST_CASE("Sparse latent form calibration uses valid index keys and leaves an empty context") {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    auto model = load_transformer(model_path("indexed_calibration", spec));
+    REQUIRE(model != nullptr);
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    auto ratio = model->calibrate_latent_form(route, pool);
+    REQUIRE(ratio.has_value());
+    CHECK(*ratio >= LatentFormChooser::kMinRatio && *ratio <= LatentFormChooser::kMaxRatio);
+    CHECK(model->latent_chooser().ratio() == *ratio);
+    CHECK(model->n_past() == 0);
+    const std::vector<int32_t> tokens = {1, 3, 7, 9};
+    auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(logits.has_value());
+    for (const float value : *logits) CHECK(std::isfinite(value));
 }
 
 // The automatic choice: work counted per form, and a threshold set by one
@@ -2259,6 +3013,77 @@ TEST_CASE("A model whose text cannot be encoded loads with a quantized KV cache,
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("Group-limited routing scores groups before selecting experts") {
+    // Max scoring chooses group 0; the sum of the top two chooses group 1.
+    // Negative biased scores stay eligible: masking by multiplication would
+    // incorrectly prefer a zero from a group that was excluded.
+    const float scores[] = {-0.1f, -0.9f, -0.3f, -0.4f, -0.8f, -0.8f, -0.8f, -0.8f};
+    std::vector<uint8_t> allowed;
+    select_expert_groups(scores, 8, 4, 1, false, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 1, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{0, 1, 0, 0}));
+    select_expert_groups(scores, 8, 4, 3, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 0}));  // tied groups: lower first
+    select_expert_groups(scores, 8, 8, 2, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 1, 0, 0, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 4, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 1}));
+}
+
+TEST_CASE("Group-limited routing validates metadata and streamed experts keep its logits") {
+    test::TinyModelSpec s;
+    s.arch = "deepseek2";
+    s.n_expert = 8;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    for (int mode = 0; mode < 2; ++mode) {
+        s.sigmoid_gating = mode != 0;
+        s.expert_bias = mode != 0;
+        const std::string path = model_path("grouped_" + std::to_string(mode), s);
+        TransformerOptions opts;
+        auto a = load_transformer(path, opts);
+        opts.expert_cache_bytes = 1;
+        auto b = load_transformer(path, opts);
+        REQUIRE(a != nullptr && b != nullptr);
+        CHECK(a->config().n_expert_groups == 4);
+        CHECK(a->config().n_expert_groups_used == 2);
+        ThreadPool pool(2);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+        auto first = a->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(first.has_value());
+        const std::vector<float> expected(first->begin(), first->end());
+        auto second = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(second.has_value());
+        CHECK(max_abs_diff(*second, expected) == 0.0f);
+        a->reset();
+        b->reset();
+        for (const int32_t token : tokens) {
+            auto la = a->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto lb = b->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(la.has_value() && lb.has_value());
+            CHECK(la->size() == lb->size());
+            CHECK(std::memcmp(la->data(), lb->data(), la->size_bytes()) == 0);
+        }
+    }
+    const std::pair<int32_t, int32_t> invalid[] = {{3, 1}, {4, 0}, {4, 5}, {16, 1}, {8, 1}};
+    for (const auto [groups, used] : invalid) {
+        s.n_expert_groups = groups;
+        s.n_expert_groups_used = used;
+        auto file = MmapLoader::open(model_path("bad_groups_" + std::to_string(groups) + "_" +
+                                              std::to_string(used), s));
+        REQUIRE(file.has_value());
+        auto result = describe_model(**file);
+        REQUIRE(!result.has_value());
+        CHECK(result.status().code() == ErrorCode::InvalidModel);
+        CHECK(result.status().to_string().find("expert_group") != std::string::npos);
+    }
+}
+
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
     test::TinyModelSpec dense = f32_spec();
     dense.arch = "qwen3";
@@ -2672,12 +3497,296 @@ TEST_CASE("Batched forward equals token-by-token forward, and truncate() rolls b
     CHECK(!batched->truncate(11).is_ok());
 }
 
+TEST_CASE("Classic models: batching and rollback preserve every logit on every KV type") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens(70);
+    for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = 3 + static_cast<int32_t>((i * 37) % 280);
+    for (const std::string arch : {"gpt2", "gptneox", "falcon", "bloom", "mpt", "starcoder", "starcoder2", "phi2",
+                                  "stablelm", "orion", "olmo", "command-r", "nemotron", "apertus", "arcee", "dbrx"}) {
+        auto spec = test::classic_model_spec(arch);
+        if (arch == "arcee") {
+            spec.n_ff = 67;  // batch/decode boundaries put different values in SIMD tails
+            spec.ffn_type = DType::F32;
+        }
+        for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            const auto& path = model_path("classic_batch_" + arch, spec);
+            auto batch = load_transformer(path, options), step = load_transformer(path, options);
+            REQUIRE(batch && step);
+            auto all = batch->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(all.has_value());
+            const std::vector<float> saved(all->begin(), all->end());
+            const auto vocab = static_cast<size_t>(batch->config().n_vocab);
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                auto one = step->forward(std::span(tokens).subspan(i, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(one.has_value());
+                CHECK(std::memcmp(one->data(), saved.data() + i * vocab, vocab * sizeof(float)) == 0);
+            }
+            REQUIRE(batch->truncate(65).is_ok());
+            auto replay = batch->forward(std::span(tokens).subspan(65), Transformer::Logits::All, route, pool);
+            REQUIRE(replay.has_value());
+            CHECK(std::memcmp(replay->data(), saved.data() + 65 * vocab, replay->size_bytes()) == 0);
+        }
+    }
+}
+
+TEST_CASE("Per-block geometry matches an independent float reference") {
+    test::TinyModelSpec spec = test::nas_spec();
+    spec.tokenizer_padding = (size_t{1} << 20) + 64;
+    spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto model = load_transformer(model_path("nas_float_reference", spec), options);
+    REQUIRE(model != nullptr);
+    CHECK(model->config().n_attn_layers == 3);
+    CHECK(model->config().blocks[3].mixer == MixerKind::None && model->config().blocks[3].ffn == FfnKind::None);
+    CHECK(model->config().blocks[4].mixer == MixerKind::Linear);
+    CHECK(model->config().blocks[2].n_ff == 192);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(logits.has_value());
+    const auto expected = Reference(model->file(), spec).logits(tokens);
+    const auto vocab = static_cast<size_t>(model->config().n_vocab);
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        const auto row = logits->subspan(t * vocab, vocab);
+        CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+        CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+    }
+    std::vector<float> padding(static_cast<size_t>(model->config().head_dim));
+    for (const int32_t slot : {1, 2}) {
+        quant::dequantize_row(model->kv_cache().dtype(), model->kv_cache().k_row(slot, 7, 1), padding.data(),
+                             model->config().head_dim);
+        for (const float v : padding) CHECK(v == 0.0f);
+    }
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        auto gpu = make();
+        if (!gpu) continue;
+        model->reset();
+        const Route gpu_route{gpu->get(), gpu->get(), cpu.get()};
+        auto accelerated = model->forward(tokens, Transformer::Logits::All, gpu_route, pool);
+        REQUIRE(accelerated.has_value());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            const auto row = accelerated->subspan(t * vocab, vocab);
+            CHECK(max_abs_diff(row, expected[t]) < 2e-2);
+            CHECK(Sampler::argmax(row) == Sampler::argmax(expected[t]));
+        }
+    }
+    // Swapping KV heads between equal-width query blocks preserves the file
+    // size and global maxima, but a saved context must still be refused.
+    std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE(model->write_state(saved).is_ok());
+    std::swap(spec.block_kv_heads[0], spec.block_kv_heads[1]);
+    auto other = load_transformer(model_path("nas_other_geometry", spec), options);
+    REQUIRE(other != nullptr);
+    CHECK(model->file().file_size() == other->file().file_size());
+    CHECK(model_fingerprint(model->file().file()) == model_fingerprint(other->file().file()));
+    CHECK(model->context_fingerprint() != other->context_fingerprint());
+    CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
+    CHECK(other->n_past() == 0);
+}
+
+TEST_CASE("Absent first blocks and stacks with no FFN load and run") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    for (const bool all : {false, true}) {
+        test::TinyModelSpec s = test::nas_spec();
+        s.block_heads[0] = s.block_kv_heads[0] = s.block_ff[0] = 0;
+        if (all) {
+            std::fill(s.block_heads.begin(), s.block_heads.end(), 0);
+            std::fill(s.block_kv_heads.begin(), s.block_kv_heads.end(), 0);
+            std::fill(s.block_ff.begin(), s.block_ff.end(), 0);
+        }
+        auto model = load_transformer(model_path(all ? "nas_all_absent" : "nas_leading_absent", s));
+        REQUIRE(model != nullptr);
+        const std::vector<int32_t> tokens = {1, 270, 300};
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(logits.has_value());
+        for (const float value : *logits) CHECK(std::isfinite(value));
+        CHECK(model->n_past() == 3);
+    }
+}
+
+TEST_CASE("Saved states and calibration reject residual-scale changes beyond the first MiB") {
+    test::TinyModelSpec s;
+    s.arch = "granite";
+    s.tokenizer_padding = (size_t{1} << 20) + 64;
+    s.residual_scale = 0.22f;
+    const std::string& first_path = model_path("modern_state_scale_a", s);
+    auto first = load_transformer(first_path);
+    s.residual_scale = 0.44f;
+    const std::string& second_path = model_path("modern_state_scale_b", s);
+    auto second = load_transformer(second_path);
+    REQUIRE(first && second);
+    CHECK(first->file().file_size() == second->file().file_size());
+    CHECK(model_fingerprint(first->file().file()) == model_fingerprint(second->file().file()));
+    CHECK(first->context_fingerprint() != second->context_fingerprint());
+    CHECK(first->file_fingerprint() != second->file_fingerprint());
+    for (const std::string arch : {"llama", "qwen35", "gemma2"}) {
+        test::TinyModelSpec legacy;
+        legacy.arch = arch;
+        auto model = load_transformer(model_path("legacy_header_identity_" + arch, legacy));
+        REQUIRE(model != nullptr);
+        CHECK(model->file_fingerprint() == model_fingerprint(model->file().file()));
+    }
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    REQUIRE(first->forward(tokens, Transformer::Logits::Last, route, pool).has_value());
+    std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE(first->write_state(saved).is_ok());
+    CHECK(second->read_state(saved).code() == ErrorCode::InvalidArgument);
+    CHECK(second->n_past() == 0);
+    const std::string dir = temp_path("modern_scale_keys");
+    std::filesystem::remove_all(dir);
+    EngineConfig config = engine_config(first_path);
+    config.backend = BackendKind::Cpu;
+    config.kv_cache_type = KvCacheType::Q8_0;
+    config.cache_dir = dir;
+    for (const std::string* path : {&first_path, &second_path, &first_path}) {
+        config.model_path = *path;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+    }
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().starts_with("keys-")) ++files;
+    }
+    CHECK(files == 2);  // distinct models, then a repeat that reuses its own calibration
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Corrected tokenizer modes isolate saved contexts and KV keys beyond the first MiB") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300};
+    for (const bool hybrid : {false, true}) {
+        for (const std::string mode : {"spm-greedy", "gpt2-nfkc-digits", "llama-bpe-merges"}) {
+            const bool greedy = mode == "spm-greedy";
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                test::TinyModelSpec spec;
+                spec.arch = hybrid ? "qwen35" : "llama";
+                spec.tokenizer_padding = (size_t{1} << 20) + 64;
+                if (greedy) spec.spm_pre = "spm-greedy";
+                else spec.bpe_pre = mode;
+                spec.space_prefix = 0;
+                TransformerOptions options;
+                options.kv_type = kv;
+                const std::string label = std::string(hybrid ? "hybrid" : "attn") + mode +
+                                          std::to_string(static_cast<int>(kv));
+                auto first = load_transformer(model_path("tokenizer_state_a_" + label, spec), options);
+                auto same = load_transformer(model_path("tokenizer_state_same_" + label, spec), options);
+                spec.space_prefix = 1;
+                auto other = load_transformer(model_path("tokenizer_state_b_" + label, spec), options);
+                REQUIRE(first && same && other);
+                // The standard first-MiB fingerprint cannot see the changed flag.
+                CHECK(first->file().file_size() == other->file().file_size());
+                CHECK(model_fingerprint(first->file().file()) == model_fingerprint(other->file().file()));
+                CHECK(first->context_fingerprint() != other->context_fingerprint());
+                REQUIRE(first->forward(tokens, Transformer::Logits::Last, route, pool).has_value());
+                std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+                REQUIRE(first->write_state(saved).is_ok());
+                REQUIRE(same->read_state(saved).is_ok());
+                CHECK(same->n_past() == 3);
+                saved.clear(); saved.seekg(0);
+                CHECK(other->read_state(saved).code() == ErrorCode::InvalidArgument);
+                CHECK(other->n_past() == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("Gated ReLU squared: fused and split biased projections agree across SIMD tails") {
+    auto spec = test::classic_model_spec("arcee");
+    spec.ungated = false;
+    spec.projection_bias = true;
+    spec.n_ff = 67;
+    spec.ffn_type = DType::F32;
+    const auto split_path = model_path("relu2_split_tail", spec);
+    spec.fused_gate_up = true;
+    const auto fused_path = model_path("relu2_fused_tail", spec);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    for (const KvCacheType kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions options;
+        options.kv_type = kv;
+        auto split = load_transformer(split_path, options), fused = load_transformer(fused_path, options);
+        REQUIRE(split && fused);
+        for (const std::vector<int32_t> ids : {std::vector<int32_t>{1, 270, 280, 290, 300, 271, 272, 273},
+                                              std::vector<int32_t>{274}}) {
+            auto a = split->forward(ids, Transformer::Logits::All, route, pool);
+            auto b = fused->forward(ids, Transformer::Logits::All, route, pool);
+            REQUIRE(a && b && a->size() == b->size());
+            CHECK(std::memcmp(a->data(), b->data(), a->size_bytes()) == 0);
+        }
+    }
+}
+
+TEST_CASE("Modern block plans preserve batching and rollback for every KV format") {
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99, 36, 64};
+    for (const std::string arch : {"smollm3", "olmo2", "exaone4", "granite", "minicpm", "mistral3", "deci"}) {
+        test::TinyModelSpec spec;
+        spec.arch = arch;
+        spec.n_layers = 4;
+        if (arch == "deci") {
+            spec = test::nas_spec();
+            spec.qk_norm = spec.qk_norm_whole = true;
+        } else if (arch == "olmo2" || arch == "exaone4") {
+            spec.qk_norm = spec.post_only_norms = true;
+            spec.qk_norm_whole = arch == "olmo2";
+            if (arch == "exaone4") spec.sliding_window = 8;
+        } else if (arch == "granite" || arch == "minicpm") {
+            spec.embedding_scale = 12.0f;
+            spec.residual_scale = 0.22f;
+            spec.logit_scale = 8.0f;
+        } else if (arch == "mistral3") {
+            spec.attn_temp_length = 4;
+            spec.attn_temp_scale = 0.1f;
+        }
+        const std::string& path = model_path("modern_" + arch, spec);
+        for (const auto type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = type;
+            auto batched = load_transformer(path, options);
+            auto stepwise = load_transformer(path, options);
+            REQUIRE(batched && stepwise);
+            auto all = batched->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(all.has_value());
+            const std::vector<float> expected(all->begin(), all->end());
+            const auto vocab = static_cast<size_t>(batched->config().n_vocab);
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                auto one = stepwise->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
+                REQUIRE(one.has_value());
+                CHECK(max_abs_diff(*one, std::vector<float>(expected.begin() + t * vocab,
+                                                           expected.begin() + (t + 1) * vocab)) == 0.0);
+            }
+            REQUIRE(batched->truncate(6).is_ok());
+            auto replay = batched->forward(std::span(tokens).subspan(6), Transformer::Logits::All, route, pool);
+            REQUIRE(replay.has_value());
+            CHECK(max_abs_diff(*replay, std::vector<float>(expected.begin() + 6 * vocab, expected.end())) == 0.0);
+        }
+    }
+}
+
 TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactly") {
+    for (const char* arch : {"qwen35", "mamba", "mamba2"}) {
     test::TinyModelSpec spec;
-    spec.arch = "qwen35";
+    spec.arch = arch;
     spec.n_layers = 4;
-    spec.delta_net_interval = 2;  // DeltaNet, attention, DeltaNet, attention
-    const std::string& path = model_path("hybrid", spec);
+    if (std::string_view(arch) == "qwen35") spec.delta_net_interval = 2;  // DeltaNet, attention, DeltaNet, attention
+    const std::string& path = model_path(std::string("rollback_") + arch, spec);
     ThreadPool pool(4);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -2720,6 +3829,7 @@ TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactl
     auto again = model->forward(std::span<const int32_t>(tokens).subspan(5), Transformer::Logits::All, route, pool);
     REQUIRE(again.has_value());
     CHECK(max_abs_diff(*again, rows(5)) < 1e-4);
+    }
 }
 
 // A model with `ffn` FFNs and Q8_0 attention / output: repacked, it computes
@@ -3204,7 +4314,7 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
     // cut buffer), one with a whole "é".
     const ForcePlan plan = {{1, " world hello"}, {3, " hel\xC3"}, {4, " w\xC3\xA9rld"}, {6, " hello"}};
     constexpr int32_t kMaxTokens = 16;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto reference_engine = Engine::create(plain);
@@ -3277,8 +4387,9 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
 }
 
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
-    for (const char* arch : {"llama", "qwen35"}) {
-        test::TinyModelSpec spec;
+    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r", "nemotron", "mamba", "mamba2"}) {
+        test::TinyModelSpec spec = std::string(arch) == "llama" || std::string(arch) == "qwen35" || std::string(arch) == "mamba" || std::string(arch) == "mamba2"
+                                       ? test::TinyModelSpec{} : test::classic_model_spec(arch);
         spec.arch = arch;
         spec.n_layers = 4;
         if (std::string(arch) == "qwen35") spec.delta_net_interval = 2;
@@ -3304,15 +4415,24 @@ TEST_CASE("The prefix cache brings back a conversation another one replaced, exa
             b += i % 2 ? " world" : " hello world";
         }
         Engine& e = *cached.value();
-        const std::string reply_a = run(e, a);
-        run(e, b);  // another conversation: A's context goes to the prefix cache
+        const bool classic = std::string(arch) != "llama" && std::string(arch) != "qwen35";
+        std::string reply_a;
+        if (classic) {
+            // Keep an exact prompt prefix: random classic weights can emit
+            // EOS early or text that re-encodes differently at the boundary.
+            REQUIRE(e.prefill(a, true).is_ok());
+            REQUIRE(e.prefill(b, true).is_ok());
+        } else {
+            reply_a = run(e, a);
+            run(e, b);  // another conversation: A's context goes to the prefix cache
+        }
         const std::string next_a = a + reply_a + " hello";
         GenerationStats st{};
         const std::string out = run(e, next_a, &st);
         const auto a_tokens = static_cast<int32_t>(e.tokenize(a, true)->size());
         // A's prompt and its reply as generated, but the reply's last token,
         // which was sampled and never processed: nothing of A done again.
-        CHECK(st.cached_prefix_tokens == a_tokens + 5);
+        CHECK(st.cached_prefix_tokens == a_tokens + (classic ? 0 : 5));
         CHECK(out == run(*fresh.value(), next_a));
     }
 }
@@ -3386,6 +4506,64 @@ uint64_t dir_bytes(const std::string& dir) {
 }
 
 }  // namespace
+
+TEST_CASE("Sparse index keys survive storage prefix reuse and an engine restart in every KV format") {
+    for (const bool compressed : {false, true}) {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    spec.index_full = {true, false};
+    if (compressed) spec = test::compressed_spec();
+    const std::string path = model_path(compressed ? "compressed_prefix" : "indexed_prefix", spec);
+    std::string a, b;
+    for (int i = 0; i < 200; ++i) {
+        a += i % 3 ? " hello" : " world";
+        b += i % 2 ? " world" : " hello world";
+    }
+    auto run = [](Engine& engine, const std::string& prompt, GenerationStats* stats = nullptr) {
+        std::string text;
+        auto result = engine.generate(prompt, greedy(6), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        CHECK(result.has_value());
+        if (result && stats != nullptr) *stats = *result;
+        return text;
+    };
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        config.kv_cache_type = type;
+        auto reference = Engine::create(config);
+        REQUIRE(reference.has_value());
+        const std::string expected = run(*reference.value(), a);
+        const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) +
+                                "_indexed_prefix_" + std::to_string(static_cast<int>(type));
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_dir = dir;
+        config.prefix_cache_disk_mb = 4;
+        config.prefix_cache_lossy = true;  // F32 index images must use the exact raw fallback
+        {
+            auto cached = Engine::create(config);
+            REQUIRE(cached.has_value());
+            CHECK(run(*cached.value(), a) == expected);
+            run(*cached.value(), b);
+            GenerationStats restored{};
+            CHECK(run(*cached.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        {
+            auto restarted = Engine::create(config);
+            REQUIRE(restarted.has_value());
+            GenerationStats restored{};
+            CHECK(run(*restarted.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        std::filesystem::remove_all(dir);
+    }
+    }
+}
 
 TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later engines too") {
     test::TinyModelSpec spec;
@@ -3518,7 +4696,7 @@ TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later 
 }
 
 TEST_CASE("Conversations sharing a system prompt keep it once, and a new one restores it exactly") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -3582,14 +4760,14 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
         REQUIRE(fresh.value()->load_state(file).has_value());
         CHECK(out == run(*fresh.value(), next));
         CHECK(st.cached_prefix_tokens >= system_tokens);
-        if (std::string(arch) == "qwen35") CHECK(st.cached_prefix_tokens == system_tokens);  // its state image
+        if (std::string(arch) != "llama") CHECK(st.cached_prefix_tokens == system_tokens);  // its state image
         CHECK(e.prefix_cache_stats().restores == restores + 1);
         std::remove(file.c_str());
     }
 }
 
 TEST_CASE("A chat after a long shared system prompt is set aside and comes back; an edited draft is not") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -3655,12 +4833,12 @@ TEST_CASE("A chat after a long shared system prompt is set aside and comes back;
         CHECK(out3 == run(*reference.value(), a3));
         CHECK(st.cached_prefix_tokens >= static_cast<int32_t>(e.tokenize(a1, true)->size()) + 5);
         CHECK(e.prefix_cache_stats().restores == restores + 1);
-        CHECK(e.prefix_cache_stats().set_asides == aside + (std::string(arch) == "qwen35" ? 1 : 0));
+        CHECK(e.prefix_cache_stats().set_asides == aside + (std::string(arch) != "llama" ? 1 : 0));
     }
 }
 
 TEST_CASE("A later engine restores the prefix an earlier one left on storage") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -3932,7 +5110,7 @@ TEST_CASE("After cancelled work a turn still reuses a context whose text re-enco
 }
 
 TEST_CASE("The prefix cache brings back a conversation whose text re-encodes differently") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -3990,7 +5168,7 @@ TEST_CASE("The prefix cache brings back a conversation whose text re-encodes dif
 // and from the prefix cache alike; it used to be re-encoded whole, which on a
 // hybrid model processed the conversation again.
 TEST_CASE("A conversation whose last token ends inside a character is reused, live or from the prefix cache") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4166,7 +5344,14 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
     hybrid.delta_net_interval = 2;
     const std::string dir = test::temp_dir();
     // ... also with latent attention: its cache pages hold key rows only, values inside them.
-    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64))}) {
+    for (const std::string& path : {f32_model(), model_path("hybrid", hybrid), model_path("latent", latent_spec(64)),
+                                   model_path("saved_gpt2", test::classic_model_spec("gpt2")),
+                                   model_path("saved_bloom", test::classic_model_spec("bloom")),
+                                   model_path("saved_command-r", test::classic_model_spec("command-r")),
+                                   model_path("saved_nemotron", test::classic_model_spec("nemotron")),
+                                   model_path("latent_combined_state", latent_spec(64, true)),
+                                   model_path("compressed_state", test::compressed_spec())}) {
+
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);
@@ -4279,8 +5464,14 @@ TEST_CASE("Engine routes to CPU when forced and matches the default route") {
 
 TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place mmap reads") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
+    for (const std::string& path : {mixed_model(), model_path("streamed_nas", test::nas_spec())}) {
+    EngineConfig baseline = engine_config(path);
+    baseline.backend = BackendKind::Cpu;
+    auto reference = Engine::create(baseline);
+    REQUIRE(reference.has_value());
+    const auto expected = run(*reference.value(), prompt, greedy(20));
     for (const BackendKind backend : {BackendKind::Cpu, BackendKind::Metal, BackendKind::Vulkan}) {
-        EngineConfig config = engine_config(mixed_model());
+        EngineConfig config = engine_config(path);
         config.backend = backend;
         auto in_place = Engine::create(config);
         if (!in_place) continue;  // Metal unavailable on this platform
@@ -4289,9 +5480,13 @@ TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place 
         REQUIRE(streamed.has_value());
         CHECK(streamed.value()->describe().find("triple-buffered") != std::string::npos);
         GenerationStats stats;
-        const auto expected = run(*in_place.value(), prompt, greedy(20));
+        // Streamed slots must use CPU projections: their addresses are
+        // reused and cannot key persistent GPU weight copies. Quantized GPU
+        // projections do not quantize activations as the CPU does, so an
+        // in-place GPU generation is not this path's numeric reference.
         CHECK(run(*streamed.value(), prompt, greedy(20), &stats) == expected);
         CHECK(!expected.empty());
+    }
     }
 }
 
@@ -4388,7 +5583,7 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
     hybrid.arch = "qwen35";
     hybrid.n_layers = 4;
     hybrid.delta_net_interval = 2;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto base_engine = Engine::create(plain);
@@ -4609,7 +5804,7 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
     sampled.temperature = 0.9f;
     sampled.seed = 1234;
     sampled.max_tokens = 40;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto base_engine = Engine::create(plain);
@@ -4666,7 +5861,7 @@ TEST_CASE("A speculative turn that stops partway through a step leaves the conte
     hybrid.arch = "qwen35";
     hybrid.n_layers = 4;
     hybrid.delta_net_interval = 2;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         EngineConfig suffix = plain;
@@ -5189,7 +6384,11 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         test::TinyModelSpec spec;
     };
     std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")},
-                               {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)}};
+                               {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)},
+                               {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
+    for (const std::string arch : {"gpt2", "gptneox", "bloom", "olmo", "stablelm", "command-r", "apertus"}) {
+        cases.push_back({"tree_classic_" + arch, test::classic_model_spec(arch)});
+    }
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";
@@ -5205,6 +6404,30 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         s.identical_experts = false;
         cases.push_back({"tree_moe", s});
     }
+    cases.push_back({"tree_nas", test::nas_spec()});
+    {
+        test::TinyModelSpec s;
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        cases.push_back({"tree_olmo2", s});
+        s = {};
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        cases.push_back({"tree_nope", s});
+    }
+    for (const char* arch : {"mamba", "mamba2"}) {
+        test::TinyModelSpec s;
+        s.arch = arch;
+        cases.push_back({arch, s});
+    }
+    for (const auto& spec : test::recurrent_model_specs()) cases.push_back({"tree_" + spec.arch, spec});
+    {
+        auto s = latent_spec(64);
+        s.arch = "glm-dsa";
+        s.index_dim = 64;
+        s.index_topk = 4;
+        cases.push_back({"tree_dsa", s});
+    }
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
     const std::vector<std::vector<int32_t>> paths = {{0, 4, 8}, {0, 1, 2, 3}, {0}, {0, 1, 6, 7}, {0, 4, 5}};
@@ -5213,7 +6436,7 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
     const Route route{cpu.get(), cpu.get(), cpu.get()};
     constexpr int32_t kPrefix = 40;  // past the windowed blocks' window of 16
     for (const Case& c : cases) {
-        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16}) {
+        for (const KvCacheType type : {KvCacheType::Q8_0, KvCacheType::F16, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
             std::printf("  tree pass: %s %s\n", c.name.c_str(), type == KvCacheType::F16 ? "f16" : "q8_0");
             TransformerOptions options;
             options.context_length = 256;
@@ -5355,7 +6578,8 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
         std::string name;
         test::TinyModelSpec spec;
     };
-    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)}};
+    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)},
+                              {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";
@@ -5370,6 +6594,17 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
         s.n_expert_used = 2;
         s.identical_experts = false;
         cases.push_back({"tree_moe", s});
+    }
+    cases.push_back({"tree_nas", test::nas_spec()});
+    {
+        test::TinyModelSpec s;
+        s.arch = "olmo2";
+        s.post_only_norms = s.qk_norm = s.qk_norm_whole = true;
+        cases.push_back({"tree_olmo2", s});
+        s = {};
+        s.arch = "smollm3";
+        s.n_layers = 4;
+        cases.push_back({"tree_nope", s});
     }
     ThreadPool pool(3);
     auto cpu = make_cpu_backend(pool);
@@ -5463,6 +6698,134 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
             std::printf("  %s, temperature %.1f: %d drafts, %d accepted, %d tree steps, %d kept another branch\n",
                         c.name.c_str(), temperature, decoder.proposed(), decoder.accepted(), decoder.tree_steps(),
                         decoder.side_branches());
+        }
+    }
+}
+
+TEST_CASE("New recurrent mixers preserve checkpoints, snapshots and saved state for every KV type") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99};
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("state_" + spec.arch, spec);
+        for (auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            options.expert_cache_bytes = spec.n_expert > 0 ? 1 : 0;
+            auto model = load_transformer(path, options);
+            auto reference = load_transformer(path, options);
+            REQUIRE(model && reference);
+            const auto floats = model->recurrent_state_bytes() / sizeof(float);
+            size_t parts = 0;
+            for (auto part : model->recurrent_parts()) parts += part.size();
+            CHECK(parts == floats);
+            CHECK(model->context_state_bytes() >= model->recurrent_state_bytes());
+            REQUIRE(model->forward(std::span(tokens).first(5), Transformer::Logits::None, route, pool));
+            model->snapshot_state(true);
+            std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(model->write_state(saved).is_ok());
+            REQUIRE(reference->read_state(saved).is_ok());
+            model->set_rollback_window(8);
+            auto expected = reference->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(expected);
+            const std::vector<float> rows(expected->begin(), expected->end());
+            auto actual = model->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(actual);
+            CHECK(max_abs_diff(*actual, rows) == 0.0);
+            REQUIRE(model->truncate(7).is_ok());
+            auto replay = model->forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+            REQUIRE(replay);
+            CHECK(max_abs_diff(*replay, std::vector<float>(rows.begin() + 2 * model->config().n_vocab, rows.end())) == 0.0);
+            REQUIRE(model->truncate(5).is_ok());
+            auto restored = model->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(restored);
+            CHECK(max_abs_diff(*restored, rows) == 0.0);
+        }
+    }
+}
+
+TEST_CASE("New recurrent models reuse bounded prefix images across engines and verify suffix drafts") {
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("prefix_recurrent_" + spec.arch, spec);
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        config.expert_cache_mb = spec.n_expert > 0 ? 1 : 0;
+        const std::string dir = temp_path("prefix_" + spec.arch);
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_mb = 0;
+        config.prefix_cache_disk_mb = 8;
+        config.prefix_cache_dir = dir;
+        auto generate = [](Engine& engine, const std::string& prompt) {
+            std::string reply;
+            auto status = engine.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+                reply += piece;
+                return true;
+            });
+            return status ? reply : std::string("<error>");
+        };
+        auto fresh_config = config;
+        fresh_config.prefix_cache_disk_mb = 0;
+        fresh_config.prefix_cache_dir.clear();
+        auto reference = Engine::create(fresh_config);
+        REQUIRE(reference);
+        std::string a, b;
+        for (int i = 0; i < 70; ++i) {
+            a += "hello world hello ";
+            b += "world world hello ";
+        }
+        const auto prompt_ids = (*reference)->tokenize(a, true);
+        REQUIRE(prompt_ids && prompt_ids->size() >= 128);  // the store ignores shorter contexts
+        const std::string expected = generate(**reference, a);
+        REQUIRE(expected != "<error>");
+        {
+            auto cached = Engine::create(config);
+            REQUIRE(cached);
+            CHECK(generate(**cached, a) == expected);
+            REQUIRE(generate(**cached, b) != "<error>");
+            CHECK(generate(**cached, a) == expected);
+            CHECK((*cached)->prefix_cache_stats().restores > 0);
+            CHECK((*cached)->prefix_cache_stats().storage_bytes <= (uint64_t{8} << 20));
+        }
+        {
+            auto later = Engine::create(config);
+            REQUIRE(later);
+            CHECK(generate(**later, a) == expected);
+            CHECK((*later)->prefix_cache_stats().restores > 0);
+        }
+        std::filesystem::remove_all(dir);
+        fresh_config.lookup_drafts = true;
+        fresh_config.draft_tokens = 4;
+        fresh_config.adaptive_drafts = false;
+        auto drafted = Engine::create(fresh_config);
+        REQUIRE(drafted);
+        CHECK(generate(**drafted, a) == expected);
+    }
+}
+
+TEST_CASE("New recurrent mixers route projections to available GPU backends with CPU state updates") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route reference_route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        auto gpu = make();
+        if (!gpu) continue;
+        const Route route{gpu->get(), gpu->get(), cpu.get()};
+        for (auto spec : test::recurrent_model_specs()) {
+            spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+            const auto& path = model_path("gpu_recurrent_" + spec.arch, spec);
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            auto reference = load_transformer(path, options);
+            auto model = load_transformer(path, options);
+            REQUIRE(reference && model);
+            auto expected = reference->forward(tokens, Transformer::Logits::All, reference_route, pool);
+            REQUIRE(expected);
+            const std::vector<float> rows(expected->begin(), expected->end());
+            auto actual = model->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(actual);
+            CHECK(max_abs_diff(*actual, rows) < 1e-3);
         }
     }
 }

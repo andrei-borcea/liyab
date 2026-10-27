@@ -230,7 +230,7 @@ std::string Value::repr() const {
         case Type::Object: {
             std::string out = o_->is_namespace ? "<Namespace {" : "{";
             for (size_t i = 0; i < o_->entries.size(); ++i) {
-                out += (i ? ", " : "") + string_repr(o_->entries[i].first) + ": " + o_->entries[i].second.repr();
+                out += (i ? ", " : "") + o_->entries[i].first.repr() + ": " + o_->entries[i].second.repr();
             }
             return out + (o_->is_namespace ? "}>" : "}");
         }
@@ -281,16 +281,23 @@ std::string Value::to_json(int indent, bool ensure_ascii, std::string_view item_
                     out += "{}";
                     return;
                 }
-                std::vector<const std::pair<std::string, Value>*> entries;
+                std::vector<const std::pair<Value, Value>*> entries;
                 for (const auto& e : v.o_->entries) entries.push_back(&e);
                 if (sort_keys) {
-                    std::stable_sort(entries.begin(), entries.end(), [](auto* a, auto* b) { return a->first < b->first; });
+                    std::stable_sort(entries.begin(), entries.end(), [](auto* a, auto* b) {
+                        if (a->first.is_number() && b->first.is_number()) return a->first.as_float() < b->first.as_float();
+                        if (a->first.is_string() && b->first.is_string()) return a->first.as_string() < b->first.as_string();
+                        fail("dict keys of different types cannot be sorted");
+                    });
                 }
                 out += '{';
                 for (size_t i = 0; i < entries.size(); ++i) {
                     if (i) out += isep;
                     newline(level + 1);
-                    json_string(out, entries[i]->first, ensure_ascii);
+                    const Value& key = entries[i]->first;
+                    const std::string text = key.is_none() ? "null" : key.type() == Type::Bool ?
+                        (key.as_bool() ? "true" : "false") : key.str();
+                    json_string(out, text, ensure_ascii);
                     out += ksep;
                     dump(entries[i]->second, level + 1);
                 }
@@ -338,14 +345,15 @@ bool operator==(const Value& a, const Value& b) {
     }
 }
 
-const Value* Object::find(std::string_view key) const {
+const Value* Object::find(const Value& key) const {
     for (const auto& [k, v] : entries) {
         if (k == key) return &v;
     }
     return nullptr;
 }
 
-void Object::set(const std::string& key, Value value) {
+void Object::set(const Value& key, Value value) {
+    if (!key.is_string() && !key.is_number() && !key.is_none()) fail("dict keys must be strings or scalars");
     for (auto& [k, v] : entries) {
         if (k == key) {
             v = std::move(value);
@@ -1749,8 +1757,7 @@ Value Interpreter::eval(const Expr& e) {
             Value d = Value::object();
             for (const auto& [k, v] : e.entries) {
                 const Value key = eval(*k);
-                if (!key.is_string()) fail("dict keys must be strings");
-                d.fields().set(key.as_string(), eval(*v));
+                d.fields().set(key, eval(*v));
             }
             return d;
         }
@@ -1851,7 +1858,7 @@ Value Interpreter::binary(const std::string& op, const Value& a, const Value& b)
             return Value(b.as_string().find(a.as_string()) != std::string::npos);
         }
         if (b.is_array()) return Value(std::any_of(b.items().begin(), b.items().end(), [&](const Value& x) { return x == a; }));
-        if (b.is_object()) return Value(a.is_string() && b.fields().find(a.as_string()) != nullptr);
+        if (b.is_object()) return Value(b.fields().find(a) != nullptr);
         if (b.is_undefined()) return Value(false);
         fail(std::string("argument of type '") + jinja::type_name(b.type()) + "' is not iterable");
     }
@@ -1970,11 +1977,8 @@ Value Interpreter::attribute(const Value& target, const std::string& name) {
 Value Interpreter::index(const Value& target, const Value& key) {
     require_defined(target);
     if (target.is_object()) {
-        if (key.is_string()) {
-            if (const Value* v = target.fields().find(key.as_string())) return *v;
-            return Value::undefined(key.as_string());
-        }
-        return Value::undefined();
+        if (const Value* v = target.fields().find(key)) return *v;
+        return Value::undefined(key.str());
     }
     if (target.is_array() || target.is_string()) {
         if (!key.is_number()) {
@@ -2207,9 +2211,7 @@ Value Interpreter::method(const Value& self, const std::string& name) {
         if (name == "get") {
             return bind([](const Value& d, Array& args, Kwargs&) {
                 if (args.empty()) fail("get needs a key");
-                if (args[0].is_string()) {
-                    if (const Value* v = d.fields().find(args[0].as_string())) return *v;
-                }
+                if (const Value* v = d.fields().find(args[0])) return *v;
                 return args.size() > 1 ? args[1] : Value::none();
             });
         }
@@ -2454,9 +2456,10 @@ Value Interpreter::filter(const std::string& name, Value input, Array& args, Kwa
 // ---------------------------------------------------------------------------
 // ChatTemplate
 // ---------------------------------------------------------------------------
-Result<ChatTemplate> ChatTemplate::parse(std::string_view source) {
+Result<ChatTemplate> ChatTemplate::parse(std::string_view source, bool sort_tools) {
     try {
         ChatTemplate t;
+        t.sort_tools_ = sort_tools;
         t.body_ = std::make_shared<const std::vector<Node>>(TemplateParser(split_template(source)).parse());
         return t;
     } catch (const TemplateError& e) {
@@ -2469,7 +2472,10 @@ Result<std::string> ChatTemplate::render(const Value& context) const {
     try {
         Interpreter::Scope globals;
         if (context.is_object()) {
-            for (const auto& [k, v] : context.fields().entries) globals[k] = v;
+            for (const auto& [k, v] : context.fields().entries) {
+                if (!k.is_string()) return Status(ErrorCode::InvalidArgument, "chat template context keys must be strings");
+                globals[k.as_string()] = v;
+            }
         }
         Interpreter in(globals);
         in.exec(*body_);
@@ -2494,7 +2500,15 @@ Result<std::string> ChatTemplate::render_chat(std::string_view request_json, con
     Object& c = context.fields();
     c.set("messages", *messages);
     const Value* tools = request->fields().find("tools");
-    c.set("tools", tools ? *tools : Value::none());
+    if (tools != nullptr && sort_tools_) {
+        // Value's serializer already owns recursive key ordering. Parsing
+        // the ordered copy avoids mutating the caller's shared objects.
+        auto ordered = jinja::parse_json(tools->to_json(-1, false, {}, {}, true));
+        if (!ordered) return ordered.status();
+        c.set("tools", *ordered);
+    } else {
+        c.set("tools", tools ? *tools : Value::none());
+    }
     const Value* documents = request->fields().find("documents");
     c.set("documents", documents ? *documents : Value::none());
     const Value* agp = request->fields().find("add_generation_prompt");

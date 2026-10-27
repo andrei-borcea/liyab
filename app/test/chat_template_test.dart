@@ -1,9 +1,39 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liyab/chat/chat_template.dart';
+import 'package:liyab/engine/engine_service.dart';
+
+class FormatEngine implements EngineService {
+  FormatEngine({this.marker = ''});
+  final String marker;
+  @override
+  Future<int> countTokens(String text) async => text == marker ? 1 : 2;
+  @override
+  Future<Map<String, Object?>> chatFormat(Map<String, Object?> probe) async =>
+      {'prefix_stable': false, 'reason': 'past replies change when another turn is rendered'};
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 // The pieces Engine::chat_format finds in a model's template (tests/test_text.cpp checks them against the real
 // templates): prompts built from them must equal the built-in format where they are the same model family.
 void main() {
+  test('an incompatible author template without a recognized fallback refuses chat', () async {
+    final (template, thinking, why) = await ChatTemplate.resolve(FormatEngine(), 'author template');
+    expect(template, isNull);
+    expect(thinking, isFalse);
+    expect(why, contains('past replies change'));
+  });
+  test('known vocabulary fallbacks preserve ChatML and Llama chat', () async {
+    for (final (marker, expected) in [('<|im_start|>', ChatTemplate.chatml),
+                                     ('<|start_header_id|>', ChatTemplate.llama3)]) {
+      final (template, _, _) = await ChatTemplate.resolve(FormatEngine(marker: marker), 'author template');
+      expect(template, same(expected));
+    }
+  });
+  test('a missing author template retains the legacy Zephyr fallback', () async {
+    final (template, _, _) = await ChatTemplate.resolve(FormatEngine(), '');
+    expect(template, same(ChatTemplate.zephyr));
+  });
   // Qwen3.6's template with preserve_thinking, as the engine splits it (thinking switch after "<think>").
   const qwen36 = ChatTemplate(
     label: 'model template',

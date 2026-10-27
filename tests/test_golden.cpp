@@ -18,6 +18,7 @@
 // note, so a new CPU target never fails before its hashes are recorded.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +91,63 @@ std::vector<GoldenCase> cases() {
     test::TinyModelSpec s;
 
     add("llama", {});
+    s = {};
+    s.arch = "smollm3";
+    s.n_layers = 4;  // the fourth block has no RoPE
+    add("smollm3-nope", s);
+    s = {};
+    s.rope_layers = {false, true};  // the file overrides the architecture's rotation policy
+    add("llama-rope-pattern", s);
+    s = {};
+    s.arch = "olmo2";
+    s.qk_norm = s.qk_norm_whole = s.post_only_norms = true;
+    add("olmo2-post-only-whole-qk", s);
+    s = {};
+    s.arch = "exaone4";
+    s.qk_norm = s.post_only_norms = true;
+    s.n_layers = 4;
+    s.sliding_window = 12;
+    add("exaone4-post-only-global-nope", s);
+    s = {};
+    s.arch = "granite";
+    s.embedding_scale = 12.0f;
+    s.residual_scale = 0.22f;
+    s.logit_scale = 8.0f;
+    s.attn_scale = 0.015625f;
+    add("granite-mup", s);
+    s.arch = "minicpm";
+    add("minicpm-mup", s);
+    s = {};
+    s.arch = "mistral3";
+    s.yarn_factor = 4.0f;
+    s.yarn_ctx = 16;
+    s.yarn_log_mul = 1.0f;
+    s.attn_temp_length = 8;
+    s.attn_temp_scale = 0.1f;  // crosses two temperature boundaries during prefill and decode
+    add("mistral3-yarn-temperature", s);
+    s.qk_norm = true;
+    s.k_norm_outlier = 60.0f;
+    add("mistral3-temperature-keyscaled", s, {}, true);
+    s = test::nas_spec();
+    add("deci-block-geometry", s);
+    s.qk_norm = s.qk_norm_whole = true;
+    s.k_norm_outlier = 60.0f;
+    add("deci-block-geometry-keyscaled", s, {}, true);
+    s = test::nas_spec();
+    std::fill(s.block_heads.begin(), s.block_heads.end(), 0);
+    std::fill(s.block_kv_heads.begin(), s.block_kv_heads.end(), 0);
+    std::fill(s.block_ff.begin(), s.block_ff.end(), 0);
+    add("deci-no-branches", s);
+    s = {};
+    s.arch = "plamo3";
+    s.n_layers = 8;
+    s.qk_norm = s.post_norms = s.bare_post_norms = s.fused_qkv = s.fused_gate_up = true;
+    s.sliding_window = 12;
+    s.rope_base = 1000000.0f;
+    s.yarn_factor = 256.0f;
+    s.yarn_ctx = 4096;
+    s.yarn_truncate = false;
+    add("plamo3-bare-norms-local-yarn", s);
     s = {};
     s.tied_output = true;
     s.rope_freqs = true;
@@ -255,6 +313,330 @@ std::vector<GoldenCase> cases() {
     s.longrope_ctx = 32;  // shorter: the long factors
     s.rope_dim = 16;      // partial rotation (Phi-4-mini)
     add("phi3-longrope-partial", s);
+
+    s = {};
+    s.arch = "gpt2";
+    s.ungated = s.norm_bias = s.projection_bias = s.learned_positions = s.fused_qkv = true;
+    add("gpt2-classic", s);
+    add("gpt2-classic-f16kv", s, f16_kv);
+    s.arch = "starcoder";
+    s.n_head_kv = 1;
+    add("starcoder-classic", s);
+    s = {};
+    s.arch = "gptneox";
+    s.ungated = s.norm_bias = s.projection_bias = s.fused_qkv = true;
+    s.rope_dim = 16;
+    add("gptneox-classic", s);
+    s.parallel_residual = 0;
+    add("gptneox-sequential", s);
+    s.parallel_residual = -1;
+    s.arch = "falcon";
+    s.shared_parallel_norm = true;
+    add("falcon-shared-norm", s);
+    s.shared_parallel_norm = false;
+    add("falcon-two-norms", s);
+    s.arch = "phi2";
+    s.shared_parallel_norm = true;
+    add("phi2-classic", s);
+    s = {};
+    s.arch = "bloom";
+    s.ungated = s.norm_bias = s.projection_bias = s.embedding_norm = s.fused_qkv = true;
+    s.n_embd = 192;
+    s.n_head = s.n_head_kv = 6;  // ALiBi's non-power-of-two slope ordering
+    add("bloom-classic", s);
+    add("bloom-classic-sliding", s, window);
+    s.arch = "mpt";
+    s.embedding_norm = s.norm_bias = s.projection_bias = false;
+    s.clamp_kqv = 0.5f;
+    add("mpt-classic", s);
+    s = {};
+    s.arch = "starcoder2";
+    s.ungated = s.norm_bias = s.projection_bias = true;
+    s.sliding_window = 8;
+    add("starcoder2-classic", s);
+    s = {};
+    s.arch = "stablelm";
+    s.norm_bias = s.per_head_qk_norm = true;
+    s.rope_dim = 16;
+    add("stablelm-head-norms", s);
+    s.arch = "orion";
+    s.per_head_qk_norm = false;
+    add("orion-classic", s);
+    s = {};
+    s.arch = "olmo";
+    s.no_norm_weights = true;
+    s.clamp_kqv = 0.5f;
+    add("olmo-classic", s);
+    s = {};
+    s.arch = "command-r";
+    s.shared_parallel_norm = s.per_head_qk_norm = true;
+    s.logit_scale = 0.5f;
+    add("command-r-classic", s);
+    s = {};
+    s.arch = "nemotron";
+    s.ungated = s.projection_bias = true;
+    s.rope_dim = 16;
+    add("nemotron-classic", s);
+    s = {};
+    s.arch = "arcee";
+    s.ungated = true;
+    add("arcee-classic", s);
+    s.arch = "apertus";
+    s.qk_norm = true;
+    add("apertus-classic", s);
+    s = moe_spec("dbrx");
+    s.fused_qkv = true;
+    s.clamp_kqv = 0.5f;
+    add("dbrx-classic", s);
+    s = {};
+    s.projection_bias = s.fused_gate_up = true;
+    add("dense-fused-bias", s);
+    // Group-limited expert selection: 8 experts in 4 groups, top-2 within the
+    // 2 best groups. With a selection bias a group scores its two best biased
+    // scores (DeepSeek-V3, Ling 2.0), without one its best probability
+    // (DeepSeek-V2); streamed experts follow the same choice.
+    s = moe_spec("qwen3moe");
+    s.n_expert = 8;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    add("qwen3moe-grouped-softmax", s);
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    add("qwen3moe-grouped-sigmoid-bias", s);
+    add("qwen3moe-grouped-sigmoid-bias-streamed", s, streamed);
+    s = {};
+    s.arch = "deepseek32";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_q_rank = 64;
+    s.index_dim = 64;
+    s.index_topk = 4;
+    add("deepseek32-indexed", s);
+    s.arch = "glm-dsa";
+    add("glm-dsa-indexed", s);
+    TransformerOptions expanded_index;
+    expanded_index.latent_form = LatentForm::Expanded;
+    add("glm-dsa-indexed-expanded", s, expanded_index);
+    s.index_full = {true, false};
+    s.mla_v = 128;  // output heads wider than the cached head
+    add("glm-dsa-shared-indexed", s);
+    s = {};
+    s.arch = "bailingmoe2";
+    s.fused_qkv = true;
+    s.qk_norm = true;
+    s.rope_dim = 32;
+    s.n_expert = 16;
+    s.n_expert_used = 4;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    s.expert_bias = true;
+    s.sigmoid_gating = true;
+    add("bailingmoe2-fused-qk-norm-grouped", s);
+    add("bailingmoe2-fused-qk-norm-grouped-streamed", s, streamed);
+    s = {};
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = s.mla_q_rank = 64;
+    s.attn_output_bias = true;
+    add("latent-output-bias", s, absorbed);
+    add("latent-output-bias-expanded", s, expanded);
+    s = moe_spec("llama");
+    s.expert_weights_norm = -1;
+    s.omit_expert_width = true;
+    add("mixtral-inferred-expert-width", s);
+    s = {};
+    s.arch = "qwen3";
+    s.qk_norm = s.attn_gate = true;
+    add("qwen3-fused-attention-gate", s);
+    s.separate_attention_gate = true;
+    add("qwen3-separate-attention-gate", s);
+    s.head_attention_gate = true;
+    add("qwen3-head-attention-gate", s);
+    s = moe_spec("hy_v3");
+    s.qk_norm = s.expert_bias = s.bare_expert_bias = s.sigmoid_gating = true;
+    add("hy_v3-bare-selection-bias", s);
+    s = moe_spec("qwen3moe");
+    s.expert_swiglu_clamp = 0.125f;
+    s.shared_swiglu_clamp = 0.25f;
+    s.n_ff_shared = 64;
+    add("moe-post-silu-clamps", s);
+    s.fused_gate_up = true;
+    s.ffn_type = DType::MXFP4;
+    add("moe-post-silu-clamps-mxfp4-streamed", s, streamed);
+    for (const char* arch : {"qwen2moe", "glm4moe", "dots1", "ernie4_5-moe", "deepseek", "bailingmoe"}) {
+        s = moe_spec(arch);
+        s.expert_weights_norm = -1;
+        s.n_ff_shared = 64;
+        s.dense_lead = 1;
+        add(arch, s);
+    }
+    s = moe_spec("gpt-oss");
+    s.router_bias = s.expert_projection_bias = true;
+    s.attention_sinks = s.attention_output_bias = true;
+    s.sliding_window = 12;
+    add("gpt-oss-biased-sinks", s);
+    add("gpt-oss-biased-sinks-streamed", s, streamed);
+    s.fused_gate_up = true;
+    add("gpt-oss-fused-biased-sinks", s, streamed);
+    auto mxfp4 = s;
+    mxfp4.ffn_type = DType::MXFP4;
+    add("gpt-oss-mxfp4", mxfp4);
+    add("gpt-oss-mxfp4-streamed", mxfp4, streamed);
+    auto yarn = s;
+    yarn.yarn_factor = 4.0f;
+    yarn.yarn_ctx = 32;
+    add("gpt-oss-yarn-default", yarn);
+    yarn.yarn_truncate = 0;
+    add("gpt-oss-yarn-explicit-fractional", yarn);
+    for (const auto type : {KvCacheType::F16, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        TransformerOptions kv = streamed;
+        kv.kv_type = type;
+        const char* name = type == KvCacheType::F16 ? "gpt-oss-sinks-f16kv" :
+                           type == KvCacheType::Q4_0 ? "gpt-oss-sinks-q4_0kv" : "gpt-oss-sinks-q4_1kv";
+        auto scaled = s;
+        if (type != KvCacheType::F16) {
+            scaled.qk_norm = true;
+            scaled.k_norm_outlier = 60.0f;
+        }
+        add(name, scaled, kv, type != KvCacheType::F16);
+    }
+    s = {};
+    s.arch = "mamba";
+    add("mamba", s);
+    s.mamba_norms = true;
+    s.mamba_bias = true;
+    add("mamba-weightless-norms-bias", s);
+    s.mamba_norms = false;
+    s.mamba_weighted_norms = true;
+    add("mamba-weighted-norms-bias", s);
+    s = {};
+    s.arch = "mamba";
+    s.mamba_kernel = 1;
+    add("mamba-conv1", s);
+    s = {};
+    s.arch = "mamba2";
+    add("mamba2", s);
+    s.mamba_groups = 2;
+    s.mamba_bias = true;
+    add("mamba2-groups-bias", s);
+    s.arch = "llama";
+    s.n_layers = 3;
+    s.mamba = 2;
+    s.mamba_topology = true;
+    add("ssm-attention-ffn-only", s);
+    s.arch = "qwen3moe";
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    add("ssm-attention-moe-only", s);
+    add("ssm-attention-moe-only-streamed", s, streamed);
+    s = {};
+    s.arch = "lfm2";
+    s.n_layers = 3;
+    s.short_conv_interval = 3;
+    s.qk_norm = true;
+    s.tied_output = true;
+    add("lfm2-shortconv", s);
+    add("lfm2-shortconv-f16kv", s, f16_kv);
+    s.shortconv_bias = true;
+    add("lfm2-shortconv-bias", s);
+    s.shortconv_taps = 1;
+    add("lfm2-shortconv-one-tap", s);
+    s = moe_spec("lfm2moe");
+    s.n_layers = 3;
+    s.short_conv_interval = 3;
+    s.qk_norm = true;
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    s.dense_lead = 1;
+    add("lfm2moe", s);
+    add("lfm2moe-streamed", s, streamed);
+    s = moe_spec("qwen3next");
+    s.n_layers = 4;
+    s.delta_net_interval = 2;
+    s.fused_ssm_ba = true;
+    s.attn_gate = true;
+    s.qk_norm = true;
+    s.n_ff_shared = 96;
+    s.shared_gate = true;
+    add("qwen3next", s);
+    add("qwen3next-streamed", s, streamed);
+    s = moe_spec("kimi-linear");
+    s.n_layers = 4;
+    s.kda_interval = 4;
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    s.dense_lead = 1;
+    s.n_ff_shared = 64;
+    add("kimi-kda-nope", s, absorbed);
+    add("kimi-kda-nope-expanded", s, expanded);
+    add("kimi-kda-nope-f16kv", s, absorbed_f16);
+    add("kimi-kda-nope-streamed", s, streamed);
+    s.kda_head_dim = 7;  // scalar recurrence tail, with unquantized narrow low-rank projections
+    s.attn_type = DType::F32;
+    add("kimi-kda-scalar-tail", s, absorbed);
+    s = {};
+    s.arch = "gemma3n";
+    s.n_layers = 4;
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false, true, false};
+    s.altup_streams = 4;
+    s.laurel_rank = 32;
+    s.ple_dim = 32;
+    s.shared_kv_layers = 2;
+    s.sparsity_scale = {1.6448536f, 1.6448536f, -INFINITY, -INFINITY};
+    add("gemma3n-altup-laurel-ple-shared-sparse", s, f16_kv);
+    add("gemma3n-q8kv", s);
+    s.k_norm_outlier = 60.0f;
+    add("gemma3n-shared-keyscaled", s, {}, true);
+    s.altup_correct_scale = false;
+    add("gemma3n-unscaled-correction", s, f16_kv);
+
+    s = {};
+    s.arch = "gemma4";
+    s.n_layers = 4;
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false, true, false};
+    s.ple_dim = 32;
+    s.shared_kv_layers = 2;
+    s.values_from_keys = true;
+    s.layer_output_scale = 0.8f;
+    add("gemma4-ple-shared-k-equals-v-scale", s, f16_kv);
+    s.ple_dim = 0;
+    add("gemma4-no-ple", s);
+
+    s = {};
+    s.arch = "gemma-embedding";
+    s.qk_norm = true;
+    s.post_norms = true;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false};
+    add("embeddinggemma-bidirectional", s, f16_kv);
+    s = {};
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_legacy = true;
+    add("deepseek2-combined-mla", s, absorbed);
+    add("deepseek2-combined-mla-expanded", s, expanded);
+    s = test::compressed_spec();
+    s.hc_count = 0;
+    add("shared-kv-compression", s);
+    s.hc_count = 4;
+    add("shared-kv-compression-mhc", s);
+    s.yarn_factor = 16;
+    s.yarn_ctx = 32;
+    add("shared-kv-compression-mhc-yarn", s);
     return out;
 }
 
@@ -317,6 +699,7 @@ bool run_case(const GoldenCase& c, uint64_t& hash) {
         return false;
     }
     hash_floats(hash, *prefill);
+    if (!model->config().causal) return true;  // a bidirectional input is one complete pass
     for (size_t t = 20; t < tokens.size(); ++t) {
         auto step = model->forward(std::span(tokens).subspan(t, 1), Transformer::Logits::Last, route, pool);
         if (!step) {
@@ -391,4 +774,319 @@ TEST_CASE("Every architecture's logits match the hashes pinned for this platform
     }
 }
 
+TEST_CASE("AltUp and shared KV agree across prefill, decode, rollback, tree drafts and parked sequences") {
+    for (const bool per_block : {false, true}) {
+        for (const auto type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4_0}) {
+            test::TinyModelSpec s;
+            s.arch = "gemma3n";
+            s.n_layers = 4;
+            s.qk_norm = s.post_norms = true;
+            s.altup_streams = 4;
+            s.laurel_rank = 32;
+            s.ple_dim = 32;
+            s.shared_kv_layers = 2;
+            s.sparsity_scale = {1.6448536f, -INFINITY, 0.0f, -INFINITY};
+            s.swa_layers = {true, false, true, false};
+            s.sliding_window = 8;
+            if (per_block) {
+                // Each sharing block matches its source; the two physical slots
+                // have different head counts and exercise fixed-layout padding.
+                s.block_heads = {4, 2, 4, 2};
+                s.block_kv_heads = {2, 1, 2, 1};
+                s.block_ff = {96, 128, 64, 96};
+            }
+            s.attn_type = s.ffn_type = s.embd_type = s.output_type = type;
+            const std::string path = test::temp_dir() + "/liyab_gemma_parts_" + std::to_string(test::process_id()) + ".gguf";
+            test::write_tiny_model(path, s);
+            for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+                auto file = MmapLoader::open(path);
+                REQUIRE(file.has_value());
+                TransformerOptions options;
+                options.context_length = 64;
+                options.kv_type = kv;
+                options.keep_windowed_rows = true;
+                auto loaded = Transformer::load(std::move(file).value(), options);
+                REQUIRE(loaded.has_value());
+                auto& model = **loaded;
+                CHECK(model.config().n_kv_layers == 2);
+                CHECK(model.kv_cache().config().n_layers == 2);
+                ThreadPool pool(2);
+                auto cpu = make_cpu_backend(pool);
+                Route route{cpu.get(), cpu.get(), cpu.get()};
+                const std::vector<int32_t> tokens = {1, 7, 11, 23, 14, 18, 19, 40, 55, 12, 17, 33};
+                auto all = model.forward(tokens, Transformer::Logits::All, route, pool);
+                REQUIRE(all.has_value());
+                const std::vector<float> expected(all->begin(), all->end());
+                const size_t v = static_cast<size_t>(model.config().n_vocab);
+                model.reset();
+                for (size_t i = 0; i < tokens.size(); ++i) {
+                    auto row = model.forward(std::span(tokens).subspan(i, 1), Transformer::Logits::Last, route, pool);
+                    REQUIRE(row.has_value());
+                    CHECK(std::equal(row->begin(), row->end(), expected.begin() + i * v));
+                }
+                REQUIRE(model.truncate(7).is_ok());
+                auto again = model.forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+                REQUIRE(again.has_value());
+                CHECK(std::equal(again->begin(), again->end(), expected.begin() + 7 * v));
+                std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+                REQUIRE(model.write_state(saved).is_ok());
+                model.reset();
+                saved.seekg(0);
+                REQUIRE(model.read_state(saved).is_ok());
+                REQUIRE(model.truncate(7).is_ok());
+                auto parked = model.make_context();
+                REQUIRE(parked.has_value());
+                model.swap_context(**parked);
+                auto separate = model.forward(tokens, Transformer::Logits::All, route, pool);
+                REQUIRE(separate.has_value());
+                CHECK(std::equal(separate->begin(), separate->end(), expected.begin()));
+                model.swap_context(**parked);
+                const std::vector<int32_t> draft = {tokens[7], 88, tokens[8], tokens[9]};
+                const std::vector<int32_t> parents = {-1, 0, 0, 2};
+                auto tree = model.forward_tree(draft, parents, route, pool);
+                REQUIRE(tree.has_value());
+                const std::vector<int32_t> keep = {0, 2, 3};
+                REQUIRE(model.keep_path(keep).is_ok());
+                auto rest = model.forward(std::span(tokens).subspan(10), Transformer::Logits::All, route, pool);
+                REQUIRE(rest.has_value());
+                CHECK(std::equal(rest->begin(), rest->end(), expected.begin() + 10 * v));
+                model.reset();
+                auto other = model.make_context();
+                REQUIRE(other.has_value());
+                const Transformer::BatchItem items[] = {
+                    {nullptr, tokens, Transformer::Logits::All, false},
+                    {other->get(), tokens, Transformer::Logits::All, false},
+                };
+                std::vector<std::span<const float>> rows;
+                REQUIRE(model.forward_batch(items, route, pool, rows).is_ok());
+                REQUIRE(rows.size() == 2);
+                for (auto row : rows) CHECK(std::equal(row.begin(), row.end(), expected.begin()));
+            }
+            if (per_block) {
+                s.block_kv_heads[2] = 1;  // differs from its windowed source, block 0
+                test::write_tiny_model(path, s);
+                auto file = MmapLoader::open(path);
+                REQUIRE(file.has_value());
+                auto rejected = Transformer::load(std::move(file).value(), {});
+                REQUIRE(!rejected.has_value());
+                CHECK(rejected.status().message().find("incompatible head geometry") != std::string::npos);
+            }
+            std::remove(path.c_str());
+        }
+    }
+}
+
+
+TEST_CASE("Mapped per-layer embeddings match independent decoded tables in every reader and KV format") {
+    std::vector<test::QuantVector> formats;
+    REQUIRE(test::load_quant_vectors(formats, "ssm_quant_vectors.bin"));
+    for (const auto type : {DType::F32, DType::F16}) {
+        test::QuantVector f;
+        f.type = type;
+        f.n = 256;
+        f.expected.resize(256);
+        // Exactly representable in both formats; no reference decoder needed.
+        for (size_t i = 0; i < f.expected.size(); ++i) f.expected[i] = (static_cast<int>(i % 31) - 15) / 128.0f;
+        f.blocks.resize(dtype_row_bytes(type, f.n));
+        quant::quantize_row(type, f.expected.data(), f.blocks.data(), f.n);
+        formats.push_back(std::move(f));
+    }
+    REQUIRE(formats.size() == 26);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const auto stem = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_ple_reader";
+    const std::string encoded = stem + ".gguf", decoded = stem + "_f32.gguf", zero = stem + "_zero.gguf";
+    struct Cleanup {
+        std::vector<std::string> paths;
+        ~Cleanup() { for (const auto& path : paths) std::remove(path.c_str()); }
+    } cleanup{{encoded, decoded, zero}};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    double maximum_error = 0.0, minimum_ablation = INFINITY;
+    size_t checked = 0;
+    for (const auto& f : formats) {
+        REQUIRE(!f.blocks.empty() && !f.expected.empty());
+        test::TinyModelSpec s;
+        s.arch = "gemma4";
+        s.n_layers = 4;
+        s.ple_dim = 64;  // 256 table columns: valid for every reader's block size
+        s.qk_norm = s.post_norms = true;
+        s.swa_layers = {true, false, true, false};
+        s.sliding_window = 8;
+        s.shared_kv_layers = 2;
+        s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
+        const size_t table_values = static_cast<size_t>(s.n_layers * s.ple_dim) * test::tiny_vocab().size();
+        s.ple_values.resize(table_values);
+        for (size_t i = 0; i < table_values; ++i) s.ple_values[i] = f.expected[i % f.expected.size()];
+        s.ple_type = f.type;
+        s.ple_block_pattern = f.blocks;
+        test::write_tiny_model(encoded, s);
+        {
+            auto file = MmapLoader::open(encoded);
+            REQUIRE(file);
+            const auto* table = (*file)->tensor("per_layer_token_embd.weight");
+            REQUIRE(table && table->type == f.type && table->cols() == 256);
+            REQUIRE(std::any_of(table->data, table->data + table->nbytes, [](uint8_t x) { return x != 0; }));
+        }
+        s.ple_type = DType::F32;
+        s.ple_block_pattern.clear();
+        test::write_tiny_model(decoded, s);  // independently decoded fixture values, same complete graph
+        std::fill(s.ple_values.begin(), s.ple_values.end(), 0.0f);
+        test::write_tiny_model(zero, s);
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            auto load = [&](const std::string& path) {
+                TransformerOptions options;
+                options.context_length = 64;
+                options.keep_windowed_rows = true;
+                options.kv_type = kv;
+                return Transformer::load(std::move(MmapLoader::open(path)).value(), options);
+            };
+            auto quantized = load(encoded), reference = load(decoded), ablated = load(zero);
+            REQUIRE(quantized && reference && ablated);
+            auto q = (*quantized)->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(q);
+            const std::vector<float> expected(q->begin(), q->end());
+            auto r = (*reference)->forward(tokens, Transformer::Logits::All, route, pool);
+            auto z = (*ablated)->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(r && z);
+            REQUIRE(r->size() == expected.size() && z->size() == expected.size());
+            double error = 0.0, contribution = 0.0;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                REQUIRE(std::isfinite(expected[i]) && std::isfinite((*r)[i]) && std::isfinite((*z)[i]));
+                error = std::max(error, std::fabs(double{expected[i]} - (*r)[i]));
+                contribution = std::max(contribution, std::fabs(double{expected[i]} - (*z)[i]));
+            }
+            std::printf("  PLE %s KV %d: independent error %.9g, table ablation %.9g\n",
+                        std::string(dtype_traits(f.type).name).c_str(), static_cast<int>(kv), error, contribution);
+            CHECK(error < 2e-4);
+            CHECK(contribution > 1e-6);
+            maximum_error = std::max(maximum_error, error);
+            minimum_ablation = std::min(minimum_ablation, contribution);
+            // Re-reading mapped token rows after rollback must keep exactly the same logits.
+            REQUIRE((*quantized)->truncate(4).is_ok());
+            auto replay = (*quantized)->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+            REQUIRE(replay);
+            const size_t offset = 4 * static_cast<size_t>((*quantized)->config().n_vocab);
+            CHECK(std::equal(replay->begin(), replay->end(), expected.begin() + offset));
+            ++checked;
+        }
+    }
+    CHECK(checked == 104);
+    std::printf("  %zu mapped PLE format/KV cases; maximum independent error %.9g, minimum table ablation %.9g\n",
+                checked, maximum_error, minimum_ablation);
+}
+
 TEST_MAIN()
+
+TEST_CASE("KDA chunked prefill keeps its bits when value rows are split across workers") {
+    test::TinyModelSpec spec;
+    spec.arch = "kimi-linear";
+    spec.n_layers = 2;
+    spec.kda_interval = 2;
+    spec.n_head_kv = 1;
+    spec.rope_dim = 32;
+    spec.mla_kv_rank = 64;
+    const auto path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_kda_rows.gguf";
+    test::write_tiny_model(path, spec);
+    struct Remove {
+        const std::string& path;
+        ~Remove() { std::remove(path.c_str()); }
+    } remove{path};
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto load = [&]() -> std::unique_ptr<Transformer> {
+        auto file = MmapLoader::open(path);
+        if (!file) return nullptr;
+        auto model = Transformer::load(std::move(*file), options);
+        return model ? std::move(*model) : nullptr;
+    };
+    auto serial = load(), parallel = load();
+    REQUIRE(serial && parallel);
+    ThreadPool one(1), eight(8);  // four heads: the latter splits each head's value rows
+    auto cpu1 = make_cpu_backend(one), cpu8 = make_cpu_backend(eight);
+    const Route r1{cpu1.get(), cpu1.get(), cpu1.get()}, r8{cpu8.get(), cpu8.get(), cpu8.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+    serial->set_rollback_window(8);
+    parallel->set_rollback_window(8);
+    auto a = serial->forward(tokens, Transformer::Logits::All, r1, one);
+    auto b = parallel->forward(tokens, Transformer::Logits::All, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    REQUIRE(serial->truncate(3).is_ok());
+    REQUIRE(parallel->truncate(3).is_ok());
+    const std::vector<int32_t> parents = {-1, 0, 0, 2};
+    a = serial->forward_tree(std::span(tokens).first(4), parents, r1, one);
+    b = parallel->forward_tree(std::span(tokens).first(4), parents, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    REQUIRE(serial->keep_path(std::vector<int32_t>{0, 2, 3}).is_ok());
+    REQUIRE(parallel->keep_path(std::vector<int32_t>{0, 2, 3}).is_ok());
+    a = serial->forward(std::span(tokens).first(1), Transformer::Logits::Last, r1, one);
+    b = parallel->forward(std::span(tokens).first(1), Transformer::Logits::Last, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+}
+
+TEST_CASE("ShortConv state images omit empty fragments and preserve zero-length fields") {
+    for (const int32_t taps : {1, 3}) {
+        test::TinyModelSpec spec;
+        spec.arch = "lfm2";
+        spec.short_conv_interval = 3;  // both blocks are convolutions
+        spec.shortconv_taps = taps;
+        const auto path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_shortconv_state.gguf";
+        test::write_tiny_model(path, spec);
+        struct Remove {
+            const std::string& path;
+            ~Remove() { std::remove(path.c_str()); }
+        } remove{path};
+        auto load = [&]() -> std::unique_ptr<Transformer> {
+            auto file = MmapLoader::open(path);
+            if (!file) return nullptr;
+            auto result = Transformer::load(std::move(*file), {});
+            return result ? std::move(*result) : nullptr;
+        };
+        auto model = load(), restored = load();
+        REQUIRE(model && restored);
+        ThreadPool pool(3);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+        model->set_rollback_window(4);
+        REQUIRE(model->forward(std::span(tokens).first(4), Transformer::Logits::None, route, pool));
+        model->snapshot_state(true);
+        REQUIRE(model->forward(std::span(tokens).subspan(4), Transformer::Logits::None, route, pool));
+        std::vector<float> live, snapshot;
+        for (auto part : model->recurrent_parts()) {
+            CHECK(!part.empty());
+            live.insert(live.end(), part.begin(), part.end());
+        }
+        for (auto part : model->kept_state_parts(4)) {
+            CHECK(!part.empty());
+            snapshot.insert(snapshot.end(), part.begin(), part.end());
+        }
+        CHECK(live.size() * sizeof(float) == model->recurrent_state_bytes());
+        CHECK((taps == 1) == live.empty());
+        Transformer::ContextImage image;
+        image.n = model->n_past();
+        image.state = live;
+        image.snapshots.push_back({4, true, snapshot});
+        auto& kv = model->kv_cache();
+        std::vector<uint8_t> scratch(kv.page_bytes());
+        image.page = [&](int32_t page) -> const uint8_t* {
+            if (const auto* data = kv.page_data(page)) return data;
+            return kv.read_rows(page, kv.config().page_tokens, scratch.data()).is_ok() ? scratch.data() : nullptr;
+        };
+        std::stringstream current(std::ios::in | std::ios::out | std::ios::binary);
+        std::stringstream external(std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(model->write_state(current).is_ok());
+        REQUIRE(model->write_state(external, image).is_ok());
+        CHECK(current.str() == external.str());
+        REQUIRE(restored->read_state(external).is_ok());
+        REQUIRE(model->truncate(4).is_ok());  // the rollback ring
+        REQUIRE(restored->truncate(4).is_ok());  // the snapshot read from storage
+        auto a = model->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        auto b = restored->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        REQUIRE(a && b);
+        CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    }
+}

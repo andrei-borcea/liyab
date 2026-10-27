@@ -21,6 +21,13 @@ namespace {
 // GPT-2 (Hugging Face ByteLevel with use_regex): also Phi-2.
 constexpr const char* kGpt2 =
     R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)";
+// BLOOM's tokenizer.json Split, with its nested character class flattened
+// to the equivalent excluded set (cross-checked against Oniguruma).
+constexpr const char* kBloom = R"( ?[^\s.,!?\x{2026}\x{3002}\x{FF0C}\x{3001}\x{0964}\x{06D4}\x{060C}()|]+)";
+// DBRX's declared GPT-4/cl100k tiktoken encoding. Possessive groups and
+// trailing whitespace follow the original encoding, without NFC.
+constexpr const char* kDbrx =
+    R"('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s)";
 // Llama 3: case-insensitive contractions, digits in groups of up to three.
 constexpr const char* kLlama3 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -30,6 +37,9 @@ constexpr const char* kQwen2 =
 // Qwen3.5 / Qwen3.6: combining marks belong to words.
 constexpr const char* kQwen35 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Ling 2.0: single digits, possessive word/symbol prefixes and one newline per match.
+constexpr const char* kBailingMoe2 =
+    R"('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)";
 // GPT-4o (o200k; Phi-4-mini): upper/lower case aware words with contractions attached.
 constexpr const char* kGpt4o =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -50,6 +60,9 @@ constexpr const char* kEachDigit = R"(\p{N})";
 // Mistral-Nemo and later Mistral models (Tekken): the GPT-4o words without the contractions, single digits.
 constexpr const char* kTekken =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Seed-OSS: single digits and punctuation split separately from following newlines; NFC first.
+constexpr const char* kSeedCoder =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1}| ?[^\s\p{L}\p{N}\r\n]+|\s*[\r\n]+|\s+(?!\S)|\s+)";
 // Youtu-LLM: Hangul, CJK punctuation, Bopomofo and Han/kana runs first, then the GPT-4o words with single
 // digits. The file writes the first class as \p{Hangul}; script properties are not part of core/regex.h, so it
 // is spelled out as the Hangul script's ranges (Unicode 16 Scripts.txt: the set Oniguruma matches, checked code
@@ -59,26 +72,47 @@ constexpr const char* kYoutuCjk =
 constexpr const char* kYoutuWords =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
+// Kimi K2 / Kimi-Linear: isolate Han-script runs before words (the reference's
+// word classes exclude Han), then GPT-4o words without slash-joining punctuation.
+// Ranges reproduce the reference tokenizer's Unicode Han property.
+constexpr const char* kKimiHan = R"([\x{2E80}-\x{2E99}\x{2E9B}-\x{2EF3}\x{2F00}-\x{2FD5}\x{3005}\x{3007}\x{3021}-\x{3029}\x{3038}-\x{303B}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FA6D}\x{FA70}-\x{FAD9}\x{16FE2}-\x{16FE3}\x{16FF0}-\x{16FF6}\x{20000}-\x{2A6DF}\x{2A700}-\x{2B81E}\x{2B820}-\x{2CEAD}\x{2CEB0}-\x{2EBE0}\x{2EBF0}-\x{2EE5D}\x{2F800}-\x{2FA1D}\x{30000}-\x{3134A}\x{31350}-\x{33479}]+)";
+constexpr const char* kKimiWords =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
 struct StepSpec {
     const char* pattern;
     bool keep_gaps;  // Split "Isolated"; false: "Removed" with invert (only the matches are kept)
+    bool byte_level = false;  // match ByteLevel's alphabet, with one code point per original byte
 };
+
+constexpr const char* kAfmoeScripts = R"pre((?:[\x{4E00}-\x{9FFF}\x{3040}-\x{309F}\x{30A0}-\x{30FF}\x{3400}-\x{4DBF}\x{f900}-\x{FAFF}\x{FF65}-\x{FF9F}\x{2F00}-\x{2FDF}]+|[\x{0E00}-\x{0E7F}]+|[\x{0E80}-\x{0EFF}]+|[\x{1780}-\x{17FF}]+|[\x{1000}-\x{109F}\x{AA60}-\x{AA7F}\x{A9E0}-\x{A9FF}]+|[\x{AC00}-\x{D7AF}\x{1100}-\x{11FF}]+))pre";
+
+constexpr const char* kExaoneMoe = R"pre((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+)pre";
+
+// Ling-lite 1.5: possessive Qwen-like words, including the 'm contraction.
+constexpr const char* kBailingMoe =
+    R"pre('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)pre";
 
 struct Row {
     std::initializer_list<std::string_view> names;  // tokenizer.ggml.pre values
     std::initializer_list<StepSpec> steps;
     bool nfc;
     bool ignore_merges;
+    bool nfkc = false;
+    bool metaspace_bpe = false;
+    bool right_digits3 = false;
 };
 
-const std::array<Row, 11>& table() {
-    static const std::array<Row, 11> rows = {{
-        {{"default", "gpt-2", "gpt2", "phi-2"}, {{kGpt2, true}}, false, false},
-        {{"llama-bpe", "llama3"}, {{kLlama3, true}}, false, true},
+const std::array<Row, 28>& table() {
+    static const std::array<Row, 28> rows = {{
+        {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
+        {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},
-        {{"deepseek-v3", "hunyuan-dense"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
+        // "joyai-llm": the name the converter gives DeepSeek-V3's own tokenizer under transformers 5 (the same
+        // pre_tokenizer, normalizer and merges as DeepSeek-V3's tokenizer.json; JoyAI-LLM reuses it).
+        {{"deepseek-v3", "hunyuan-dense", "joyai-llm"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
         {{"deepseek-llm"},
          {{kNewline, true}, {kDeepSeekLetters, true}, {kDeepSeekPunct, true}, {kTrailingSpace, true},
           {kDeepSeekCjk, true}, {kEachDigit, true}},
@@ -88,6 +122,30 @@ const std::array<Row, 11>& table() {
         {{"smollm"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
         {{"tekken"}, {{kTekken, true}}, false, true},
         {{"youtu"}, {{kYoutuCjk, true}, {kYoutuWords, true}}, false, false},
+        {{"bloom"}, {{kBloom, true}}, false, false},
+        {{"starcoder"}, {{kEachDigit, true}, {kGpt2, true}}, false, false},
+        {{"stablelm2"}, {{kQwen2, false}}, false, false},
+        {{"olmo"}, {{kGpt2, true}}, true, false},
+        // Falcon applies Digits and the three-ASCII-digit split after
+        // ByteLevel, so those steps can cut inside an original UTF-8 character.
+        {{"falcon"}, {{R"([\p{P}\x{21}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{60}\x{7B}-\x{7E}]+)", true},
+                      {kGpt2, true}, {R"(\p{N}+)", true, true}, {R"([0-9]{3})", true, true}}, false, false},
+        {{"command-r"}, {{kEachDigit, true}, {kGpt2, true}}, true, false},
+        {{"dbrx"}, {{kDbrx, true}}, false, true},
+        // Some published exports label this pipeline dbrx too. Its source
+        // uses ordinary merges and a different split: an explicit tag avoids
+        // silently changing either tokenizer's IDs.
+        {{"llama-bpe-merges"}, {{kLlama3, false}}, false, false},
+        {{"seed-coder"}, {{kSeedCoder, true}}, true, false},
+        {{"gpt2-nfkc-digits"}, {{kEachDigit, true}, {kGpt2, true}}, false, false, true},
+        {{"exaone-moe"}, {{kExaoneMoe, true}}, true, false},
+        {{"afmoe"}, {{kAfmoeScripts, true}, {kDeepSeekV3Words, true}}, false, false, false, false, true},
+        {{"bailingmoe"}, {{kBailingMoe, true}}, true, false},
+        {{"sarvam-moe"}, {}, false, false, false, true},
+        // LFM2 / LFM2.5 (LiquidAI): Llama 3's split, merges applied to every piece (no ignore_merges).
+        {{"lfm2"}, {{kLlama3, true}}, false, false},
+        {{"kimi-k2"}, {{kKimiHan, true}, {kKimiWords, true}}, false, false},
+        {{"bailingmoe2"}, {{kBailingMoe2, true}}, true, false},
     }};
     return rows;
 }
@@ -100,6 +158,7 @@ struct Decoded {
 };
 
 }  // namespace
+
 
 std::string PreTokenizer::supported_names() {
     std::string out;
@@ -121,10 +180,16 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.name_ = std::string(name);
         pre.nfc_ = row.nfc;
         pre.ignore_merges_ = row.ignore_merges;
+        pre.nfkc_ = row.nfkc;
+        pre.right_digits3_ = row.right_digits3;
+        pre.metaspace_bpe_ = row.metaspace_bpe;
+        bool encoded = false;
         for (const StepSpec& step : row.steps) {
+            if (encoded && !step.byte_level) return Status(ErrorCode::Internal, "raw split after encoded-byte split");
+            encoded = step.byte_level;
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
-            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps});
+            pre.steps_.push_back({std::move(regex).value(), step.keep_gaps, step.byte_level});
         }
         return pre;
     }
@@ -150,11 +215,48 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
     thread_local std::vector<std::pair<uint32_t, uint32_t>> current, next;
     current.assign(1, {0u, static_cast<uint32_t>(d.cps.size())});
     if (d.cps.empty()) current.clear();
+    thread_local Decoded bytes;
+    bool byte_level = false;
+    if (right_digits3_) {
+        // AFMoE's bounded regex sequence first isolates decimal runs, then
+        // groups each from the right in threes. A direct scan has the same
+        // pieces and linear cost even for untrusted, very long numbers.
+        current.clear();
+        size_t pos = 0, gap = 0;
+        while (pos < d.cps.size()) {
+            if ((d.keys[pos] & 31u) != static_cast<uint8_t>(unicode::Nd)) { ++pos; continue; }
+            if (gap < pos) current.emplace_back(static_cast<uint32_t>(gap), static_cast<uint32_t>(pos));
+            size_t end = pos;
+            while (end < d.cps.size() && (d.keys[end] & 31u) == static_cast<uint8_t>(unicode::Nd)) ++end;
+            size_t length = (end - pos - 1) % 3 + 1;
+            while (pos < end) {
+                current.emplace_back(static_cast<uint32_t>(pos), static_cast<uint32_t>(pos + length));
+                pos += length;
+                length = 3;
+            }
+            gap = end;
+        }
+        if (gap < pos) current.emplace_back(static_cast<uint32_t>(gap), static_cast<uint32_t>(pos));
+    }
     for (const Step& step : steps_) {
+        if (step.byte_level && !byte_level) {
+            for (auto& [from, to] : current) {
+                from = d.offsets[from];
+                to = d.offsets[to];
+            }
+            bytes.cps.resize(text.size());
+            bytes.keys.resize(text.size());
+            for (size_t i = 0; i < text.size(); ++i) {
+                bytes.cps[i] = unicode::gpt2_byte_codepoint(static_cast<uint8_t>(text[i]));
+                bytes.keys[i] = regex_key(bytes.cps[i]);
+            }
+            byte_level = true;
+        }
         next.clear();
         for (const auto& [from, to] : current) {
             // A piece is matched on its own: anchors and lookaheads see its ends.
-            const RegexSubject s{d.cps.data() + from, d.keys.data() + from, to - from};
+            const Decoded& subject = byte_level ? bytes : d;
+            const RegexSubject s{subject.cps.data() + from, subject.keys.data() + from, to - from};
             size_t pos = 0, gap = 0;
             while (pos < s.size) {
                 size_t begin = 0, end = 0;
@@ -172,7 +274,8 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
         std::swap(current, next);
     }
     for (const auto& [from, to] : current) {
-        pieces.push_back(text.substr(d.offsets[from], d.offsets[to] - d.offsets[from]));
+        pieces.push_back(byte_level ? text.substr(from, to - from)
+                                    : text.substr(d.offsets[from], d.offsets[to] - d.offsets[from]));
     }
 }
 

@@ -64,7 +64,7 @@ constexpr char kKeyScalesMagic[4] = {'L', 'Y', 'K', 'S'};
 constexpr size_t kKeptKeyScales = 16;  // files in cache_dir at most, least recently used out first
 
 uint64_t key_scales_id(const Transformer& model) {
-    const uint64_t parts[] = {model_fingerprint(model.file().file()), kKeyScalingVersion,
+    const uint64_t parts[] = {model.file_fingerprint(), kKeyScalingVersion,
                               static_cast<uint64_t>(model.kv_cache().dtype())};
     const std::string_view isa = quant::kernel_isa();
     return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
@@ -151,7 +151,7 @@ constexpr uint32_t kLatentRatioVersion = 1;
 constexpr size_t kKeptLatentRatios = 16;  // files in cache_dir at most, least recently used out first
 
 uint64_t latent_ratio_id(const Transformer& model) {
-    const uint64_t parts[] = {model_fingerprint(model.file().file()), kLatentRatioVersion,
+    const uint64_t parts[] = {model.file_fingerprint(), kLatentRatioVersion,
                               static_cast<uint64_t>(model.kv_cache().dtype())};
     const std::string_view isa = quant::kernel_isa();
     return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
@@ -439,8 +439,10 @@ struct Engine::Impl {
     // text does not end with the token's.
     bool step_back(std::span<const int32_t> tokens, std::string_view text, size_t& end, size_t i) const {
         const int32_t id = tokens[i];
-        const bool segment_start = i == 0 || tokenizer->is_special(tokens[i - 1]);
-        for (const std::string_view t : {tokenizer->prompt_text(id, segment_start), std::string_view(tokenizer->piece(id))}) {
+        const bool implicit_bos = i == 1 && tokens[0] == tokenizer->bos() &&
+                                  !text.starts_with(tokenizer->token_text(tokens[0]));
+        const int32_t previous = i == 0 || implicit_bos ? -1 : tokens[i - 1];
+        for (const std::string_view t : {tokenizer->prompt_text(id, previous), std::string_view(tokenizer->piece(id))}) {
             if (t.size() <= end && text.substr(end - t.size(), t.size()) == t) {
                 end -= t.size();
                 return true;
@@ -828,7 +830,7 @@ struct Engine::Impl {
         const Route route = normal_route();
         const ExperimentalConfig& x = config.experimental;
         const uint64_t parts[] = {kStoreSeedVersion,
-                                  model_fingerprint(target->file().file()),
+                                  target->file_fingerprint(),
                                   target->context_fingerprint(),
                                   hash(quant::kernel_isa()),
                                   kind(route.attention),
@@ -2039,7 +2041,7 @@ struct Engine::Impl {
     [[nodiscard]] uint64_t reuse_calibration_id() const {
         uint32_t target_bits = 0;
         std::memcpy(&target_bits, &config.segment_reuse_max_kl, sizeof target_bits);
-        const uint64_t parts[] = {model_fingerprint(target->file().file()),
+        const uint64_t parts[] = {target->file_fingerprint(),
                                   target->context_fingerprint(),
                                   kReuseCalibrationVersion,
                                   target_bits,
@@ -2200,7 +2202,7 @@ struct Engine::Impl {
         special("eos_token", id_of("tokenizer.ggml.eos_token_id"));
         special("unk_token", id_of("tokenizer.ggml.unknown_token_id"));
         special("pad_token", id_of("tokenizer.ggml.padding_token_id"));
-        auto parsed = ChatTemplate::parse(*source);
+        auto parsed = ChatTemplate::parse(*source, tokenizer->chat_sort_tools());
         if (!parsed) {
             chat_template_error = parsed.status();
             LIYAB_LOG_WARN("%s", parsed.status().message().c_str());
@@ -2420,6 +2422,7 @@ struct Engine::Impl {
             block_total += end - begin;
         }
         const size_t largest = *std::max_element(bytes.begin(), bytes.end());
+        if (largest == 0) return Status::ok(); // a stack of identity blocks has no block weights to stream
         int32_t streamed = c.n_layers;
         if (!all) {
             const uint64_t available = usable_memory_bytes(
@@ -2431,7 +2434,7 @@ struct Engine::Impl {
             // pipeline slots and 1 GiB for KV cache, activations and the app.
             const size_t fixed = file.file_size() - block_total + 3 * largest + (size_t{1} << 30);
             const size_t budget = available > fixed ? static_cast<size_t>(available) - fixed : 0;
-            const size_t average = block_total / static_cast<size_t>(c.n_layers);
+            const size_t average = std::max<size_t>(block_total / static_cast<size_t>(c.n_layers), 1);
             const auto resident = static_cast<int32_t>(std::min<size_t>(budget / average, static_cast<size_t>(c.n_layers)));
             streamed = c.n_layers - resident;
             if (streamed == 0) return Status::ok();
@@ -2441,11 +2444,14 @@ struct Engine::Impl {
         for (int32_t l = 0; l < c.n_layers; ++l) {
             // Evenly spaced: block l streams when floor((l+1)s/n) > floor(ls/n).
             if ((int64_t{l} + 1) * streamed / c.n_layers > int64_t{l} * streamed / c.n_layers) {
-                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
                 const auto [begin, end] = file.layer_range(l);
+                if (end == begin) continue; // absent NAS blocks need no I/O item
+                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
                 ranges.push_back({begin, end - begin});
             }
         }
+        if (ranges.empty()) return Status::ok();
+        streamed = static_cast<int32_t>(ranges.size()); // empty NAS blocks do not count as streamed weights
         auto reader = DirectFile::open(file.file().path());
         if (!reader) return reader.status();
         direct_file = std::move(reader).value();
@@ -2725,7 +2731,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
-        // Rejected drafts are rolled back; recurrent (DeltaNet) states need a
+        // Rejected drafts are rolled back; recurrent (DeltaNet or compression) states need a
         // checkpoint per position of a verification batch (k + 1).
         impl->target->set_rollback_window(config.draft_tokens + 1);
         draft.value()->set_rollback_window(config.draft_tokens + 1);
@@ -2941,11 +2947,40 @@ std::string Engine::describe() const {
     out += "FFN:        " + route.ffn->description() + "\n";
     if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
     if (c.hybrid()) {
-        char mix[160];
-        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
-                      c.n_attn_layers, c.n_layers - c.n_attn_layers,
+        // Blocks by token mixer, in the order the kinds first appear (FFN-only blocks have none).
+        auto name = [](MixerKind m) -> std::string {
+            switch (m) {
+                case MixerKind::Attention: return "attention";
+                case MixerKind::DeltaNet: return "DeltaNet";
+                case MixerKind::Mamba: return "Mamba-1";
+                case MixerKind::Mamba2: return "Mamba-2";
+                case MixerKind::ShortConv: return "short convolution";
+                case MixerKind::Kda: return "Kimi Delta Attention";
+                case MixerKind::Linear: return "linear";
+                case MixerKind::None: return "FFN-only";
+                default: return "other";
+            }
+        };
+        std::vector<std::pair<std::string, int32_t>> kinds;
+        for (const BlockPlan& b : c.blocks) {
+            const std::string k = name(b.mixer);
+            auto it = std::find_if(kinds.begin(), kinds.end(), [&](const auto& e) { return e.first == k; });
+            if (it == kinds.end()) {
+                kinds.emplace_back(k, 1);
+            } else {
+                ++it->second;
+            }
+        }
+        std::string blocks;
+        for (const auto& [k, count] : kinds) blocks += (blocks.empty() ? "" : " + ") + std::to_string(count) + " " + k;
+        char mix[200];
+        std::snprintf(mix, sizeof mix, "Mixers:     %s blocks, recurrent state %.1f MiB\n", blocks.c_str(),
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
+    }
+    if (c.compressed_layers > 0) {
+        out += "Compression: " + std::to_string(c.compressed_layers) + " attention blocks, bounded recurrent window state, " +
+               std::to_string(impl_->target->recurrent_state_bytes()) + " bytes\n";
     }
     if (kv.has_windowed_layers()) {  // per-block KV: windowed blocks keep their window only
         int32_t every = 0;
@@ -3583,6 +3618,9 @@ Result<GenerationStats> Engine::Impl::generate_tokens_on(Seq& q, std::span<const
 Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> prompt, const SamplingParams& params,
                                                const TokenCallback& on_token, const std::string_view* text,
                                                const ForceCallback* force, const GenerateOptions* options) {
+    if (!target->config().causal) {
+        return Status(ErrorCode::Unsupported, "a bidirectional embedding model cannot generate tokens");
+    }
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
@@ -4290,7 +4328,11 @@ Result<std::string> Engine::render_chat(std::string_view request_json) const {
 
 Pooling Engine::pooling() const noexcept { return impl_->pooling.declared; }
 
-int32_t Engine::embedding_size() const noexcept { return impl_->target->config().n_embd; }
+int32_t Engine::embedding_size() const noexcept {
+    // After the model's dense projections, when it has them (EmbeddingGemma).
+    const int32_t width = impl_->pooling.embedding_width;
+    return width > 0 ? width : impl_->target->config().n_embd;
+}
 
 Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::string_view> texts,
                                                       const EmbedOptions& options, PoolingStats* stats) {
@@ -4320,7 +4362,7 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
     } else if (pooling != Pooling::Mean && pooling != Pooling::Last) {
         return Status(ErrorCode::InvalidArgument, "EmbedOptions::pooling must be Auto, Mean or Last");
     }
-    const int32_t size = s.target->config().n_embd;
+    const int32_t size = embedding_size();
     if (options.dimensions < 0 || options.dimensions > size) {
         return Status(ErrorCode::InvalidArgument,
                       "EmbedOptions::dimensions must be between 0 and " + std::to_string(size));
@@ -4336,7 +4378,10 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
     target.pooling = pooling;
     auto run = s.run_pooling(sequences, target);
     if (!run) return run.status();
-    auto vectors = finish_embeddings(run->values, static_cast<size_t>(size), options.dimensions, options.normalize);
+    // The pooled states through the model's dense projections (none: as they are).
+    auto projected = project_pooled(s.pooling, *s.cpu, run->values, s.target->config().n_embd);
+    if (!projected) return projected.status();
+    auto vectors = finish_embeddings(*projected, static_cast<size_t>(size), options.dimensions, options.normalize);
     const double ms = ms_since(t_start);
     LIYAB_LOG_INFO("embed: %zu inputs, %lld tokens (%lld shared) in %.0f ms", texts.size(),
                    static_cast<long long>(run->tokens), static_cast<long long>(run->reused), ms);

@@ -3,11 +3,12 @@
 // conversation so that each turn's prompt is a prefix of the next one's
 // (Engine::chat_format): the engine renders probe conversations once at load
 // and the pieces it finds (system block, user turn, the reply's opening and
-// end) build every prompt. Otherwise, or for a model without a template, a
-// built-in format is picked from the vocabulary: a special token that encodes
-// as one id identifies the family (ChatML for Qwen, Llama 3 headers), else the
-// Zephyr / TinyLlama format. Liyab maps special-token texts to their ids when
-// tokenizing.
+// end) build every prompt. Otherwise a built-in format is selected when the
+// vocabulary identifies ChatML or Llama 3 headers. Models without an author
+// template retain the legacy Zephyr / TinyLlama fallback. A present incompatible
+// template without a recognized fallback disables chat; the engine remains
+// available for raw completions or pooling. Liyab maps special-token texts
+// to their ids when tokenizing.
 //
 // Why pieces and not the whole conversation rendered each turn: the engine
 // reuses the context a prompt continues, and past replies are replayed exactly
@@ -165,6 +166,17 @@ class ChatTemplate {
     }
     if (await engine.countTokens('<|start_header_id|>') == 1) return (llama3, false);
     return (zephyr, false);
+  }
+
+  /// Selects the author format or a verified vocabulary fallback. A present
+  /// incompatible template must not silently become an unrelated protocol.
+  /// Null means chat is unavailable; raw completion and pooling do not need it.
+  static Future<(ChatTemplate?, bool, String)> resolve(EngineService engine, String source) async {
+    final (own, thinking, why) = await fromModel(engine, source);
+    if (own != null) return (own, thinking, '');
+    final (fallback, fallbackThinking) = await detect(engine);
+    if (source.isNotEmpty && identical(fallback, zephyr)) return (null, false, why);
+    return (fallback, fallbackThinking, why);
   }
 
   static Future<bool> _thinkTokens(EngineService engine) async =>

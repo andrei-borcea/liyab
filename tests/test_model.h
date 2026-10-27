@@ -5,6 +5,8 @@
 #define LIYAB_TESTS_TEST_MODEL_H
 
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -22,9 +24,23 @@ public:
     void add_string_array(const std::string& key, const std::vector<std::string>& v);
     void add_f32_array(const std::string& key, const std::vector<float>& v);
     void add_i32_array(const std::string& key, const std::vector<int32_t>& v);
+    void add_u8_array(const std::string& key, const std::vector<uint8_t>& v);
     void add_bool_array(const std::string& key, const std::vector<bool>& v);
-    // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`.
-    void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values);
+    // `ne` in GGUF order (ne[0] = row length). Values are quantized to `type`,
+    // or replaced by repeated whole encoded blocks when explicitly supplied.
+    // Aborts for reader-only formats without a payload, or malformed patterns:
+    // quantize_row deliberately has no encoder for those weight-only types.
+    void add_tensor(const std::string& name, std::vector<int64_t> ne, DType type, const std::vector<float>& values,
+                    std::span<const uint8_t> block_pattern = {});
+    // Replaces an existing tensor with repeated whole encoded blocks. Returns
+    // false for a missing tensor or an empty/incomplete block pattern. Opt-in:
+    // the ordinary writer and every existing golden fixture stay unchanged.
+    bool set_tensor_block_pattern(const std::string& name, std::span<const uint8_t> pattern);
+    // Supplies valid encoded blocks for matrix tensors of one type that has
+    // no encoder. add_tensor() distributes these blocks by tensor and row, instead
+    // of quantizing values. Copies the bytes; other types and vectors keep
+    // their ordinary values. Empty or incomplete blocks abort the fixture.
+    void set_tensor_block_pattern(DType type, const std::vector<uint8_t>& blocks);
     // Writes the file; aborts the test binary on I/O failure.
     void write(const std::string& path) const;
 
@@ -38,6 +54,8 @@ private:
     std::vector<uint8_t> kv_;
     uint64_t n_kv_ = 0;
     std::vector<Tensor> tensors_;
+    DType block_pattern_type_ = DType::F32;
+    std::vector<uint8_t> block_pattern_;
 };
 
 struct TinyModelSpec {
@@ -50,6 +68,10 @@ struct TinyModelSpec {
     int32_t n_ff = 256;
     int32_t n_head = 4;
     int32_t n_head_kv = 2;
+    // Optional NAS metadata, one entry per block. Zero KV/query heads omit
+    // the mixer, positive query heads with zero KV heads write a linear
+    // projection; zero FFN width omits the FFN. Head size stays n_embd/n_head.
+    std::vector<int32_t> block_heads, block_kv_heads, block_ff;
     int32_t context_length = 512;
     // Mixed precision by default: Q8_0 attention, Q4_0 FFN, F16 embeddings.
     DType attn_type = DType::Q8_0;
@@ -70,11 +92,28 @@ struct TinyModelSpec {
     // block is attention and the others are Gated DeltaNet (2 key heads, 4
     // value heads of 16, convolution kernel 4).
     int32_t delta_net_interval = 0;
+    // ShortConv / KDA in every block except each interval-th attention block.
+    // The tensors and metadata follow the published GGUF converter layout.
+    int32_t short_conv_interval = 0;
+    int32_t kda_interval = 0;
+    int32_t kda_head_dim = 32;
+    int32_t shortconv_taps = 3;
+    bool shortconv_bias = false;
+    bool fused_ssm_ba = false;  // Qwen3-Next's per-key-head [beta | alpha]
+
 
     // Optional features, each one a separate path of the forward pass. Off by
     // default, and drawn from the generator only when on, so every model
     // written before these existed keeps its exact weights.
     bool qk_norm = false;        // per-head RMSNorm of Q and K (attn_q_norm / attn_k_norm)
+    bool qk_norm_whole = false;  // one Q/K RMSNorm over all heads (requires qk_norm)
+    bool post_only_norms = false; // norms after mixer/FFN, with no norms before either (OLMo 2)
+    std::vector<bool> rope_layers; // attention.rope_pattern: true rotates, false leaves Q/K unchanged
+    float embedding_scale = 0.0f; // > 0: explicit embedding/residual/logit metadata (no weight changes)
+    float residual_scale = 0.0f;
+    float logit_scale = 0.0f;
+    float attn_temp_scale = 0.0f; // attention.temperature_scale / _length (Ministral 3)
+    int32_t attn_temp_length = 0;
     bool attn_gate = false;      // attention output gated per head: attn_q is [q | gate], twice as tall
     int32_t rope_dim = 0;        // rotated dimensions per head (partial RoPE); 0: the whole head
     bool rope_freqs = false;     // per-pair RoPE frequency factors (rope_freqs.weight, Llama 3.x)
@@ -97,6 +136,7 @@ struct TinyModelSpec {
     float rope_base = 10000.0f;  // rope.freq_base (of the global blocks when some are windowed)
     int32_t sliding_window = 0;  // > 0: attention.sliding_window (the architecture says which blocks use it)
     bool post_norms = false;     // post_attention_norm and post_ffw_norm after the mixer and the FFN (Gemma)
+    bool bare_post_norms = false; // omit their .weight suffix, as the PLaMo3 converter does
     bool fused_qkv = false;      // one attn_qkv [q | k | v] instead of attn_q, attn_k, attn_v (Phi-3)
     // ffn_up holds [gate | up], no ffn_gate (Phi-3); with n_expert > 0, ffn_gate_up_exps holds each
     // expert's [gate | up] (the split tensors' weights, as a converter fuses them)
@@ -137,16 +177,51 @@ struct TinyModelSpec {
     int32_t mla_q_rank = 0;
     int32_t mla_nope = 32;
     int32_t mla_v = 32;
-    bool mla_legacy = false;  // no *_mla keys, as in files converted before attn_kv_b was split
+    bool mla_legacy = false;  // expanded-head metadata and combined attn_kv_b, before the converter split it
     // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
+    // SSM synthetic blocks, selected by tensors rather than the architecture
+    // name: 1 = Mamba-1, 2 = Mamba-2. Optional attention/FFN-only blocks
+    // exercise mixed topology; norm and biases exercise Falcon-Mamba.
+    int32_t mamba = 0;
+    int32_t mamba_groups = 1;
+    int32_t mamba_kernel = 4;
+    bool mamba_norms = false;
+    bool mamba_weighted_norms = false;
+    bool mamba_bias = false;
+    bool mamba_topology = false;
+    bool mamba_parallel = false;  // invalid variant: attention and SSM in one block, for rejection tests
+    // Recurrent fixture geometry: defaults preserve every original random stream.
+    // Wider heads make every projection row valid for 256-value reader formats.
+    int32_t ssm_head_dim = 16;
+    int32_t ssm_key_heads = 2;
+    int32_t ssm_value_heads = 4;
+    // Explicit encoded blocks for recurrent projections only. Empty keeps the
+    // original random encoder path and every existing golden unchanged.
+    std::vector<uint8_t> ssm_block_pattern;
+
+    // Classic blocks. Optional tensors use an independent generator, so
+    // enabling biases never changes the projection weights being compared.
+    bool ungated = false;             // ffn_up -> activation -> ffn_down
+    bool norm_bias = false;           // LayerNorm offsets, including output_norm
+    bool no_norm_weights = false;     // non-parametric LayerNorm (OLMo)
+    bool projection_bias = false;     // Q/K/V/O, FFN and output biases
+    bool attn_output_bias = false;    // attention output only, also for latent attention
+    bool shared_parallel_norm = false; // omit ffn_norm (one shared norm)
+    bool embedding_norm = false;      // token_embd_norm, as in BLOOM
+    bool learned_positions = false;   // context_length absolute position rows
+    bool per_head_qk_norm = false;    // distinct LayerNorm weight for each head
+    float clamp_kqv = 0.0f;
+    int32_t parallel_residual = -1;    // -1: row default, 0/1: metadata override
 
     // Pooling models (core/pooling.h), off by default like the features above:
     // only metadata and tensors of their own, drawn from a generator of their
     // own, so the other weights stay those of the same spec without them.
     int32_t pooling_type = -1;            // >= 0: <arch>.pooling_type
     int32_t add_eos = -1;                 // >= 0: tokenizer.ggml.add_eos_token (nonzero: true)
+    int32_t add_bos = 1;                  // -1: omit metadata; 0/1: explicit tokenizer BOS policy
+    bool identity_normalizer = false;    // explicit identity map and dummy prefix for the synthetic vocabulary
     std::vector<std::string> cls_labels;  // non-empty: <arch>.classifier.output_labels
     // > 0: a ranking head cls.output.weight of this many rows (in output_type):
     // the output head's rows of the tokens in cls_rows_from when given (its
@@ -161,14 +236,106 @@ struct TinyModelSpec {
     // "gpt2", one merge) with this tokenizer.ggml.pre, e.g. a name the engine
     // does not know. Metadata only: the weights are those of the same spec.
     std::string bpe_pre;
+    // Optional SentencePiece selection and prefix flag, metadata only.
+    std::string spm_pre;
+    int32_t space_prefix = -1;
+    // Optional ignored metadata before the tokenizer, to test large headers.
+    size_t tokenizer_padding = 0;
+    // Optional MoE projection biases and learned attention sink logits. A separate
+    // generator supplies these tensors so existing synthetic cases keep their bits.
+    bool router_bias = false;
+    bool expert_projection_bias = false;
+    bool attention_output_bias = false;
+    bool attention_sinks = false;
+    bool omit_expert_width = false;  // Mixtral: infer the expert width from down projections
+    bool separate_attention_gate = false;  // attn_gate instead of a fused [query | gate], with attn_gate true
+    bool head_attention_gate = false;  // one scalar gate per head, with separate_attention_gate
+    bool bare_expert_bias = false;     // selection correction named exp_probs_b without .bias
+    float expert_swiglu_clamp = 0.0f;
+    float shared_swiglu_clamp = 0.0f;
+    int32_t head_dim = 0;  // explicit attention head width, independent of the residual width
+    int32_t yarn_truncate = -1;  // -1: absent, 0/1: explicit YaRN endpoint rounding
+
+    // Gemma 3n / Gemma 4 / EmbeddingGemma parts, off by default; their
+    // tensors are drawn from a generator of their own after the others.
+    int32_t altup_streams = 0;     // > 1: AltUp (altup.*, altup_proj, altup_unembd_proj, per-block router and coefficients)
+    bool altup_correct_scale = true;  // AltUp: altup_correct_scale per block
+    int32_t laurel_rank = 0;       // > 0: Laurel (laurel_l, laurel_r, laurel_post_norm) in every block
+    // Optional mapped-table-only overrides, independent of all matrix and
+    // token-embedding formats. Empty payloads retain ordinary random weights.
+    std::optional<DType> ple_type;
+    std::vector<uint8_t> ple_block_pattern;
+    std::vector<float> ple_values;
+    int32_t ple_dim = 0;           // > 0: per-layer embeddings of this width per block
+    // > 0: attention.shared_kv_layers; those last blocks get no attn_k, attn_v or attn_k_norm.
+    int32_t shared_kv_layers = 0;
+    std::vector<float> sparsity_scale;  // non-empty: activation_sparsity_scale (one per block, -inf: none)
+    bool values_from_keys = false;  // the global (non-windowed) blocks have no attn_v
+    float layer_output_scale = 0.0f;  // > 0: layer_output_scale.weight in every block (varied per block)
+    int32_t causal = -1;            // >= 0: attention.causal
+    std::vector<int32_t> dense_widths;  // pooling: dense_2 (and dense_3) projections of these output widths
+
+    // MoE: group-limited expert selection (DeepSeek-V3, Ling 2.0): > 0 writes
+    // expert_group_count and expert_group_used_count. Metadata only.
+    int32_t n_expert_groups = 0;
+    int32_t n_expert_groups_used = 0;
+    // DSA tensors and metadata; the indexer has an independent random stream
+    // so the main weights match a dense twin exactly.
+    int32_t index_dim = 0;
+    int32_t index_heads = 2;
+    int32_t index_topk = 4;
+    std::vector<bool> index_full;  // empty: every indexed block has its own projections
+    // Shared K=V attention fixtures: the converter's grouped output layout,
+    // sliding-only (0), nonoverlapping and overlapping compressed blocks.
+    int32_t shared_output_groups = 2;
+    int32_t shared_output_rank = 32;
+    int32_t shared_head_dim = 0;  // 0: n_embd / n_head; otherwise independent attention width
+    std::vector<int32_t> compression_strides;
+    std::vector<bool> compression_overlap;
+    int32_t hc_count = 0;
+    float rms_eps = 1e-5f;
+    float compress_rope_base = 12345.0f;
+    // Optional encoded block pattern for attn_type matrices; supports reader
+    // formats without a quantizer. Empty preserves all existing fixtures.
+    std::vector<uint8_t> attention_block_pattern;
+    // Shared-KV fixtures: scale the input, query-latent and key/compressor
+    // norms to balance reader-only blocks against ordinary weight amplitude.
+    // Output/FFN norms stay unchanged. One preserves existing fixture bytes.
+    float attention_norm_scale = 1.0f;
 };
+
+// A representative classic block layout, shared by the cache, sequence and
+// rollback tests. The architecture must be one of the classic registry rows.
+TinyModelSpec classic_model_spec(const std::string& arch);
 
 // Vocabulary used by every tiny model: <unk>, <s>, </s>, 256 byte tokens,
 // lowercase letters, and every substring of "▁hello" / "▁world".
 std::vector<std::string> tiny_vocab();
 int32_t tiny_token(const std::string& text);  // id of a vocab entry, or -1
 
+// NAS geometry covering two GQA ratios, differing query and FFN widths,
+// an absent block, and a linear mixer. A single spec keeps every path test
+// on the same geometry; optional norms/scales can be added by the caller.
+TinyModelSpec nas_spec();
+// The new recurrent layouts, reused by state, sequence and tree tests.
+std::vector<TinyModelSpec> recurrent_model_specs();
+
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
+// Component fixture with sliding, CSA and HCA blocks plus four residual
+// streams. Dense FFNs and no learned sinks: it does not stand in for a full
+// V4 conformance checkpoint, whose MoE/sink parts are integrated separately.
+TinyModelSpec compressed_spec();
+
+// Encoded GGML blocks and independently decoded values from gguf-py. Reads
+// tests/data/quant_vectors.bin (LIYAB_TEST_DATA overrides the directory).
+struct QuantVector {
+    DType type{};
+    int64_t n = 0;
+    std::vector<uint8_t> blocks;
+    std::vector<float> expected;
+};
+// False for absent or malformed data; reports the reason. No partial result.
+bool load_quant_vectors(std::vector<QuantVector>& out, const std::string& filename = "quant_vectors.bin");
 
 }  // namespace liyab::test
 

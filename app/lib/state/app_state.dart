@@ -309,8 +309,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
   @override
   String modelName = '';
   String description = '';
+  ChatTemplate? _template = ChatTemplate.zephyr;
+  static const _chatFormatError = "This model's chat format is not supported by the app.";
   @override
-  ChatTemplate template = ChatTemplate.zephyr;
+  ChatTemplate get template => _template ?? (throw const ApiError(400, _chatFormatError));
   @override
   bool thinkingSupported = false;
   ModelSettings settings = ModelSettings();
@@ -585,22 +587,18 @@ class AppState extends ChangeNotifier implements ApiBackend {
         _log('Adapter $name not loaded: $why');
       }
       if (adapters.isNotEmpty) _log('LoRA adapters: ${adapters.join(', ')}');
-      // The model's own chat template when it keeps each turn's prompt a prefix of the next one's (context
-      // reuse needs it), else the built-in format its vocabulary implies.
       final source = model.metadata['tokenizer.chat_template'] ?? '';
-      final (own, ownThinks, why) = await ChatTemplate.fromModel(engine, source);
-      if (own != null) {
-        template = own;
-        thinkingSupported = ownThinks;
-      } else {
-        final (detected, thinks) = await ChatTemplate.detect(engine);
-        template = detected;
-        thinkingSupported = thinks;
-        if (source.isNotEmpty) _log('Chat template of the model not used ($why): ${detected.label} instead');
+      final (selected, thinks, why) = await ChatTemplate.resolve(engine, source);
+      _template = selected;
+      thinkingSupported = thinks;
+      if (selected == null) {
+        _log('Chat unavailable: $why');
+      } else if (!selected.isModelTemplate && source.isNotEmpty) {
+        _log('Chat template of the model not used ($why): ${selected.label} instead');
       }
       settings = ModelSettings.resolve(prefs, name, model.metadata);
       // The tool formats are ChatML's: offered when the prompt pieces are ChatML's.
-      toolDialect = template.isChatML ? ToolDialect.of(source) : ToolDialect.none;
+      toolDialect = (_template?.isChatML ?? false) ? ToolDialect.of(source) : ToolDialect.none;
       modelPath = path;
       modelName = name;
       description = model.description;
@@ -618,17 +616,18 @@ class AppState extends ChangeNotifier implements ApiBackend {
       if (model.memory.requantBits > 0) {
         _log('Resident weights converted to ${model.memory.requantBits} bits to make room (memory was tight)');
       }
-      _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${template.label}, tools: ${toolDialect.name})');
+      _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${_template?.label ?? 'chat unavailable'}, tools: ${toolDialect.name})');
       if (experimental.active.isNotEmpty) _log('Experimental: ${experimental.active.join(', ')}');
       for (final line in description.split('\n')) {
         _log('  $line');
       }
       // A pooling model (embeddings, reranking) has no conversation to prepare or restore.
-      _preparing = pooling != LiyabPooling.none
+      _preparing = pooling != LiyabPooling.none || _template == null
           ? null
           : keepChat
               ? _restoreConversation()
               : prepareSystemPrompt();
+      if (_template == null && pooling == LiyabPooling.none) status += ' · chat format unsupported';
       unawaited(_loadExpertProfile());
       if (!keepChat) _discardConversation();
     } on EngineException catch (e) {
@@ -757,6 +756,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// the OS stopped Liyab): the saved messages if none are shown, and the
   /// conversation's context (system prompt included), else the system prompt alone.
   Future<void> _restoreConversation() async {
+    if (_template == null) return;
     final (state, chat) = await _conversationFiles();
     if (messages.isEmpty && File(chat).existsSync()) {
       try {
@@ -800,7 +800,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// else processed (about a minute on a 35B MoE with tools) and saved for the
   /// next start. The first message then only costs its own tokens.
   Future<void> prepareSystemPrompt() async {
-    if (!engine.loaded || pooling != LiyabPooling.none) return; // a pooling model does not chat
+    if (!engine.loaded || pooling != LiyabPooling.none || _template == null) return;
     final block = await _systemBlock();
     if (block == _prepared) return;
     _prepared = block;
@@ -905,13 +905,14 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// Called on every edit of the composer's text.
   void draftChanged(String text) {
+    if (_template == null) return;
     if (text.trim().isNotEmpty) _warmIfCold(); // the expert reads go first, the draft's work after them
     _typingAhead.changed(text);
   }
 
   /// The draft's words, then with `message` the whole message as it would be sent now.
   Future<void> _prefillDraft(String text, {bool message = true}) async {
-    if (generating || loading || _away || !engine.loaded || pooling != LiyabPooling.none) return;
+    if (generating || loading || _away || !engine.loaded || pooling != LiyabPooling.none || _template == null) return;
     if (_drafting) {
       _draftNext = (text, message); // the latest request wins
       return;
@@ -1032,7 +1033,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
     // The time line ends the turn: placed first (where typing ahead could
     // process it too), Qwen3.6 copied it at the start of its replies.
     final (promptUser, stamped) = _turnText(text, DateTime.now());
-    final message = ChatMessage(text, template.assistantPrefix(_thinking), promptUser: promptUser, stamped: stamped);
+    final message = ChatMessage(text, _template?.assistantPrefix(_thinking) ?? '', promptUser: promptUser, stamped: stamped);
     messages.add(message); // shown at once, also while the model wakes up
     notifyListeners();
     // Unloaded while idle, or still loading: wait for the model, then for its context.
@@ -1042,21 +1043,24 @@ class AppState extends ChangeNotifier implements ApiBackend {
     } else if (loading) {
       await _pendingLoad;
     }
-    engine.preempt(); // a system prompt still being prepared yields to the message
-    await _preparing;
-    final wakingMs = asked.elapsedMilliseconds; // the model loading again, or its context being prepared
-    if (!engine.loaded || pooling != LiyabPooling.none) {
+    if (!engine.loaded || pooling != LiyabPooling.none || _template == null) {
       message
         ..error = !engine.loaded
             ? 'The model could not be loaded'
             // An embedding model or a reranker serves other apps (the local API) and writes no text.
-            : 'This model ${pooling == LiyabPooling.rank ? 'ranks documents' : 'makes embeddings'} for other apps '
+            : _template == null && pooling == LiyabPooling.none
+                ? _chatFormatError
+                : 'This model ${pooling == LiyabPooling.rank ? 'ranks documents' : 'makes embeddings'} for other apps '
                 '(the local API) and does not chat: load a chat model to talk'
         ..streaming = false;
       generating = false;
       notifyListeners();
       return;
     }
+    message.prefix = template.assistantPrefix(_thinking);
+    engine.preempt(); // a system prompt still being prepared yields to the message
+    await _preparing;
+    final wakingMs = asked.elapsedMilliseconds; // the model loading again, or its context being prepared
     final prompt = await _prompt(promptUser);
     // The prompt without the reply's opening: each step appends the reply so far.
     final head = prompt.substring(0, prompt.length - message.prefix.length);

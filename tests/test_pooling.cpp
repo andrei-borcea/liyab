@@ -766,4 +766,73 @@ TEST_CASE("C API: embed and rerank, parameters, buffers and errors") {
     liyab_engine_destroy(engine);
 }
 
+TEST_CASE("Bidirectional mean pooling applies dense projections before truncation and normalization") {
+    auto s = f32_spec();
+    s.arch = "gemma-embedding";
+    s.qk_norm = s.post_norms = true;
+    s.pooling_type = 1;
+    s.sliding_window = 8;
+    s.swa_layers = {true, false};
+    s.dense_widths = {64, 32};
+    const auto& path = model_path("bidirectional-dense", s);
+    auto engine = make_engine(cpu_config(path));
+    REQUIRE(engine != nullptr);
+    CHECK(engine->embedding_size() == 32);
+    const std::vector<std::string> texts = {hellos(40), "hello world", "hello world!"};
+    PoolingStats stats;
+    EmbedOptions raw;
+    raw.normalize = false;
+    auto got = embed(*engine, texts, raw, &stats);
+    REQUIRE(got.has_value());
+    CHECK(stats.reused_tokens == 0);
+    for (size_t i = 0; i < texts.size(); ++i) {
+        auto alone = embed(*engine, {texts[i]}, raw);
+        REQUIRE(alone.has_value());
+        CHECK((*alone)[0] == (*got)[i]);
+    }
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    auto config = describe_model(**file);
+    REQUIRE(config.has_value());
+    auto pooling = read_pooling_model(**file, *config);
+    REQUIRE(pooling.has_value());
+    TransformerOptions opts;
+    opts.context_length = 128;
+    opts.kv_type = KvCacheType::F16;
+    auto loaded = Transformer::load(std::move(file).value(), opts);
+    REQUIRE(loaded.has_value());
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<std::vector<int32_t>> ids;
+    for (const auto& text : texts) ids.push_back(tokens_of(*engine, text, false));
+    PoolTarget target;
+    target.pooling = Pooling::Mean;
+    auto pooled = run_pooled(**loaded, ids, target, route, pool, 1, nullptr);
+    REQUIRE(pooled.has_value());
+    auto projected = project_pooled(*pooling, *cpu, pooled->values, s.n_embd);
+    REQUIRE(projected.has_value());
+    for (size_t i = 0; i < texts.size(); ++i) {
+        for (size_t j = 0; j < 32; ++j) CHECK(std::fabs((*projected)[i * 32 + j] - (*got)[i][j]) < 2e-5f);
+    }
+    EmbedOptions small;
+    small.dimensions = 16;
+    auto normalized = embed(*engine, texts, small);
+    REQUIRE(normalized.has_value());
+    auto expected = finish_embeddings(*projected, 32, 16, true);
+    for (size_t i = 0; i < texts.size(); ++i) {
+        for (size_t j = 0; j < 16; ++j) CHECK(std::fabs(expected[i][j] - (*normalized)[i][j]) < 2e-5f);
+    }
+    (*loaded)->reset();
+    auto first = (*loaded)->forward(std::span(ids[0]).first(3), Transformer::Logits::None, route, pool);
+    REQUIRE(first.has_value());
+    CHECK(!(*loaded)->forward(std::span(ids[0]).subspan(3, 1), Transformer::Logits::None, route, pool));
+    const std::vector<int32_t> parents = {-1, 0};
+    CHECK(!(*loaded)->forward_tree(std::span(ids[0]).first(2), parents, route, pool));
+    bool emitted = false;
+    auto generation = engine->generate("hello", SamplingParams{}, [&](std::string_view, int32_t) { emitted = true; return true; });
+    CHECK(!generation);
+    CHECK(!emitted);
+}
+
 TEST_MAIN()

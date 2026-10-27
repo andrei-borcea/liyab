@@ -10,9 +10,16 @@
 //     step: a pattern (core/regex.h) and whether the text between matches is
 //     kept as pieces of its own (Split "Isolated") or dropped (Split
 //     "Removed" with invert, which keeps only the matches);
+//   * NFC normalization of the text first (the Qwen tokenizers), or NFKC
+//     before individual digits and ByteLevel (gpt2-nfkc-digits);
+//   * whether a step runs on ByteLevel's encoded byte alphabet. Such steps
+//     return byte boundaries, including boundaries inside UTF-8 characters;
 //   * NFC normalization of the text first (the Qwen tokenizers);
 //   * `ignore_merges`: a piece that is a vocabulary entry as a whole is that
-//     token, without merging (Llama 3, Hunyuan, Tekken).
+//     token, without merging (Llama 3, SmolLM3, GLM-4, Hunyuan, Tekken). OLMo's
+//     dbrx uses Llama 3's split with ordinary merge ranks; refact and exaone4
+//     use GPT-2's ByteLevel split. Seed-OSS normalizes NFC and separates
+//     punctuation from following newlines.
 //
 // Adding a tokenizer family is adding a row, checked against the Hugging Face
 // tokenizer with tools/tokenizer_reference.py and liyab-tok. An unknown name
@@ -38,13 +45,18 @@ public:
     static Result<PreTokenizer> for_name(std::string_view name);
     // Every supported tokenizer.ggml.pre value, comma-separated.
     static std::string supported_names();
-
     // Appends the pieces of `text` (already normalized) to `pieces`, as byte
     // ranges of `text`, in order. Every byte of `text` is in exactly one
-    // piece unless a step drops what lies between its matches.
+    // piece unless a step drops what lies between its matches. A step after
+    // ByteLevel may split within a UTF-8 character: pieces are raw byte views,
+    // which the BPE encoder maps through the same byte alphabet afterwards.
     void split(std::string_view text, std::vector<std::string_view>& pieces) const;
 
+    // Unicode-symbol ranked BPE: spaces become U+2581, with no initial prefix;
+    // absent characters fall back to <0xXX> bytes after merging.
+    [[nodiscard]] bool metaspace_bpe() const noexcept { return metaspace_bpe_; }
     [[nodiscard]] bool nfc() const noexcept { return nfc_; }
+    [[nodiscard]] bool nfkc() const noexcept { return nfkc_; }
     [[nodiscard]] bool ignore_merges() const noexcept { return ignore_merges_; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
 
@@ -52,12 +64,16 @@ private:
     struct Step {
         Regex regex;
         bool keep_gaps;
+        bool byte_level;
     };
     PreTokenizer() = default;
     std::string name_;
     std::vector<Step> steps_;
     bool nfc_ = false;
     bool ignore_merges_ = false;
+    bool nfkc_ = false;
+    bool metaspace_bpe_ = false;
+    bool right_digits3_ = false;  // isolate decimal runs into groups of three aligned at their right end
 };
 
 }  // namespace liyab

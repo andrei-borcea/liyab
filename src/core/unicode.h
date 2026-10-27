@@ -1,5 +1,5 @@
 // Liyab — Unicode support for the tokenizers (internal): UTF-8 decoding,
-// general categories, White_Space, and NFC normalization.
+// general categories, White_Space, and NFC / NFKC normalization.
 //
 // The data is generated from the Unicode Character Database by
 // tools/gen_unicode_tables.py into unicode_tables.inc (the version is in its
@@ -14,6 +14,15 @@
 #include <vector>
 
 namespace liyab::unicode {
+
+// GPT-2 ByteLevel's printable stand-in for one byte. The three printable
+// ranges retain their code points; other bytes map, in order, from U+0100.
+// Shared by vocabulary encoding/decoding and pre-tokenizer steps that run
+// after ByteLevel (which can split inside an original UTF-8 character).
+[[nodiscard]] constexpr uint32_t gpt2_byte_codepoint(uint8_t b) noexcept {
+    const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174;
+    return printable ? b : 256u + (b < 33 ? b : b < 173 ? b - 94u : 67u);
+}
 
 // Unicode general categories. The order is the one of
 // tools/gen_unicode_tables.py (CATEGORIES); a regex character class keeps one
@@ -59,6 +68,12 @@ void append_utf8(std::string& out, uint32_t cp);
 // Canonical composition (Unicode Normalization Form C). Malformed UTF-8 bytes
 // are kept as they are. Returns `text` unchanged when nfc_quick_check holds.
 [[nodiscard]] std::string to_nfc(std::string_view text);
+// Unicode 9 compatibility decomposition followed by canonical composition
+// (NFKC), matching the tokenizers normalization dependency. Characters
+// unassigned in Unicode 9 remain inert.
+// Malformed UTF-8 bytes are preserved; ASCII returns unchanged. Stateless
+// and thread-safe; existing NFC uses its own current Unicode tables.
+[[nodiscard]] std::string to_nfkc(std::string_view text);
 
 }  // namespace liyab::unicode
 

@@ -6,15 +6,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/architecture.h"
+#include "core/kv_reuse.h"
 #include "core/pre_tokenizer.h"
 #include "core/regex.h"
 #include "core/tokenizer.h"
@@ -83,7 +88,7 @@ Spans parse_spans(const std::string& s) {
 
 struct Cases {
     std::unordered_map<std::string, std::string> texts, patterns;
-    std::vector<std::vector<std::string>> rows;  // R, E, S and N records
+    std::vector<std::vector<std::string>> rows;  // R, E, S, N and K records
     bool found = false;
 };
 
@@ -158,6 +163,11 @@ size_t codepoints(std::string_view text) {
 // ---------------------------------------------------------------------------
 class GgufWriter {
 public:
+    void boolean(const std::string& key, bool value) {
+        header(key, 7);
+        body_ += static_cast<char>(value);
+        ++count_;
+    }
     void string(const std::string& key, const std::string& value) {
         header(key, 8);
         str(value);
@@ -402,6 +412,37 @@ TEST_CASE("NFC normalization matches Python's unicodedata") {
     CHECK(unicode::nfc_quick_check("plain ASCII, caf\xC3\xA9"));
 }
 
+TEST_CASE("NFKC compatibility normalization matches the source Unicode 9 tokenizer") {
+    if (!cases().found) return;
+    size_t checked = 0;
+    for (const auto& row : cases().rows) {
+        if (row[0] != "K") continue;
+        const std::string input = unescape(row[1]), want = unescape(row.size() > 2 ? row[2] : "");
+        const auto got = unicode::to_nfkc(input);
+        if (got != want) std::printf("  NFKC(%s) differs\n", row[1].c_str());
+        CHECK(got == want);
+        ++checked;
+    }
+    CHECK(checked > 4800);
+    CHECK(unicode::to_nfkc("").empty());
+    for (const std::string& malformed : {std::string("\xE2(\xA1"), std::string("\xC0\xAF"),
+                                        std::string("\xED\xA0\x80"), std::string("\xF4\x90\x80\x80"),
+                                        std::string("\xE2\x82")}) {
+        CHECK(unicode::to_nfkc(malformed + "A\xCC\x8A") == malformed + "\xC3\x85");
+        CHECK(unicode::to_nfc(malformed + "A\xCC\x8A") == malformed + "\xC3\x85");
+    }
+    CHECK(!unicode::nfc_quick_check("\xE2" "A\xCC\x81"));
+    CHECK(unicode::to_nfc("\xE2" "A\xCC\x81") == "\xE2\xC3\x81");
+    const auto pre = PreTokenizer::for_name("gpt2-nfkc-digits");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfkc() && !pre->nfc() && !pre->ignore_merges());
+    CHECK(!PreTokenizer::for_name("exaone4")->nfkc());
+    // The alignment normalizer is Unicode 9: newer characters stay inert,
+    // including new compatibility letters, compositions and combining marks.
+    CHECK(unicode::to_nfkc("㋿\U0001e030") == "㋿\U0001e030");
+    CHECK(unicode::to_nfkc("\U000105d2\u0307A\U0001e4ec\u0301") == "\U000105d2\u0307A\U0001e4ec\u0301");
+}
+
 // ---------------------------------------------------------------------------
 // Pre-tokenizer table
 // ---------------------------------------------------------------------------
@@ -410,7 +451,7 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
     const Cases& c = cases();
     size_t checked = 0;
     for (const auto& row : c.rows) {
-        if (row[0] != "S") continue;
+        if (row[0] != "S" && row[0] != "B") continue;
         auto pre = PreTokenizer::for_name(row[1]);
         REQUIRE(pre.has_value());
         const std::string& text = c.texts.at(row[2]);
@@ -418,8 +459,9 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
         pre->split(text, pieces);
         Spans got;
         for (const std::string_view p : pieces) {
-            const size_t start = codepoints(std::string_view(text.data(), static_cast<size_t>(p.data() - text.data())));
-            got.emplace_back(start, start + codepoints(p));
+            const size_t byte = static_cast<size_t>(p.data() - text.data());
+            const size_t start = row[0] == "B" ? byte : codepoints(std::string_view(text.data(), byte));
+            got.emplace_back(start, start + (row[0] == "B" ? p.size() : codepoints(p)));
         }
         const Spans want = parse_spans(row.size() > 3 ? row[3] : "");
         if (got != want) {
@@ -430,6 +472,20 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
         ++checked;
     }
     CHECK(checked > 200);
+}
+
+TEST_CASE("The converter's joyai-llm alias uses DeepSeek-V3 splitting") {
+    auto original = PreTokenizer::for_name("deepseek-v3");
+    auto alias = PreTokenizer::for_name("joyai-llm");
+    REQUIRE(original.has_value() && alias.has_value());
+    for (const std::string text : {"Hello 1234567!\n", "你好 世界 カナ test's", "a\r\nb   c"}) {
+        std::vector<std::string_view> a, b;
+        original->split(text, a);
+        alias->split(text, b);
+        CHECK(a == b);
+    }
+    CHECK(original->nfc() == alias->nfc());
+    CHECK(original->ignore_merges() == alias->ignore_merges());
 }
 
 TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name") {
@@ -450,7 +506,42 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     }
     CHECK(PreTokenizer::for_name("qwen2")->nfc() && PreTokenizer::for_name("qwen35")->nfc());
     CHECK(!PreTokenizer::for_name("llama3")->nfc() && PreTokenizer::for_name("llama3")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("smaug-bpe")->nfc() && PreTokenizer::for_name("smaug-bpe")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("glm4")->nfc() && PreTokenizer::for_name("glm4")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("llama-bpe-merges")->nfc() && !PreTokenizer::for_name("llama-bpe-merges")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("exaone4")->nfc() && !PreTokenizer::for_name("exaone4")->ignore_merges());
+    CHECK(!PreTokenizer::for_name("refact")->nfc() && !PreTokenizer::for_name("refact")->ignore_merges());
+    {
+        auto seed = PreTokenizer::for_name("seed-coder");
+        REQUIRE(seed.has_value());
+        CHECK(seed->nfc() && !seed->ignore_merges());
+        std::vector<std::string_view> pieces;
+        seed->split("a!\n12", pieces);
+        CHECK(pieces == std::vector<std::string_view>({"a", "!", "\n", "1", "2"}));
+    }
+    for (const std::string text : {"We're testing 12345.\n", "東京 café!  42\r\n"}) {
+        std::vector<std::string_view> llama, smaug;
+        PreTokenizer::for_name("llama3")->split(text, llama);
+        PreTokenizer::for_name("smaug-bpe")->split(text, smaug);
+        CHECK(llama == smaug);
+        std::vector<std::string_view> glm;
+        PreTokenizer::for_name("glm4")->split(text, glm);
+        CHECK(llama == glm);
+        std::vector<std::string_view> dbrx;
+        PreTokenizer::for_name("llama-bpe-merges")->split(text, dbrx);
+        CHECK(llama == dbrx);
+    }
     CHECK(PreTokenizer::for_name("hunyuan")->ignore_merges() && !PreTokenizer::for_name("qwen2")->ignore_merges());
+    // GPT-NeoX/Mamba's ByteLevel tokenizer is published by the converter as
+    // "olmo". It uses the unmodified GPT-2 regex and keeps merge boundaries.
+    auto olmo = PreTokenizer::for_name("olmo");
+    REQUIRE(olmo);
+    CHECK(olmo->nfc() && !olmo->ignore_merges());
+    std::vector<std::string_view> a, b;
+    const std::string text = "Hello 12345\n we're testing\tnaïve 中文!";
+    olmo->split(text, a);
+    PreTokenizer::for_name("gpt2")->split(text, b);
+    CHECK(a == b);
 
     auto unknown = PreTokenizer::for_name("starcoder-9");
     REQUIRE(!unknown.has_value());
@@ -459,9 +550,151 @@ TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name")
     CHECK(unknown.status().message().find(names) != std::string::npos);
 }
 
+TEST_CASE("Classic pre-tokenizers match their published tokenizer splits") {
+    const std::string text = "Hello world! test (cats) 123.\nNext";
+    for (const auto& [name, expected] : std::vector<std::pair<const char*, std::vector<std::string>>>{
+             {"bloom", {"Hello", " world", "!", " test", " (", "cats", ")", " 123", ".\n", "Next"}},
+             {"starcoder", {"Hello", " world", "!", " test", " (", "cats", ")", " ", "1", "2", "3", ".", "\n", "Next"}}}) {
+        auto pre = PreTokenizer::for_name(name);
+        REQUIRE(pre.has_value());
+        std::vector<std::string_view> pieces;
+        pre->split(text, pieces);
+        CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+    }
+}
+
+TEST_CASE("Falcon applies digit grouping after byte encoding, including UTF-8 byte fragments") {
+    // tokenizers' Punctuation -> ByteLevel -> Digits -> three-digit Split.
+    // U+00B2 becomes byte-alphabet letters C2 then B2 (a number), split apart.
+    const std::string text = "\xC2\xB2 1234567 a$+!!\n";
+    const std::vector<std::string> expected = {"\xC2", "\xB2", " ", "123", "456", "7", " a", "$+!!", "\n"};
+    auto pre = PreTokenizer::for_name("falcon");
+    REQUIRE(pre.has_value());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) == expected);
+}
+
+TEST_CASE("DBRX follows cl100k contractions, three-digit groups and trailing whitespace") {
+    const std::string text = "We're 2024!\n\n  ";
+    auto pre = PreTokenizer::for_name("dbrx");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    CHECK(std::vector<std::string>(pieces.begin(), pieces.end()) ==
+          std::vector<std::string>({"We", "'re", " ", "202", "4", "!\n\n", "  "}));
+}
+
+TEST_CASE("SentencePiece character maps preserve their trained normalization and reject invalid offsets") {
+    const auto data = SpmNormalizer::registered_map(find_architecture("orion")->spm_charsmap);
+    REQUIRE(!data.empty());
+    auto normalizer = SpmNormalizer::load(data);
+    REQUIRE(normalizer.has_value());
+    // This layer applies the map only. The tokenizer protects user-defined
+    // tabs/newlines before invoking it, as SentencePiece itself does.
+    CHECK(normalizer->normalize("cafe\u0301 １２３\n\nCittà\t～") == "café 123  Città ～");
+    CHECK(normalizer->normalize(std::string("a\x01") + "b\r\nc") == "ab  c");
+    CHECK(normalizer->normalize("a  b") == "a  b");
+    CHECK(normalizer->normalize("e\u0301") == "é");  // a multi-code-point rule
+    CHECK(SpmNormalizer::load({})->normalize("１２３") == "１２３");
+    auto invalid = std::vector<uint8_t>(data.begin(), data.end());
+    invalid[0] = invalid[1] = invalid[2] = invalid[3] = 0xff;
+    CHECK(!SpmNormalizer::load(invalid).has_value());
+    CHECK(!SpmNormalizer::load(data.first(7)).has_value());
+    invalid.assign(data.begin(), data.end());
+    std::fill(invalid.end() - 10, invalid.end(), 0xff);  // missing replacement terminators
+    CHECK(!SpmNormalizer::load(invalid).has_value());
+}
+
+TEST_CASE("GLM4 pre-tokenization keeps three-digit groups, contractions and Unicode words") {
+    auto pre = PreTokenizer::for_name("glm4");
+    REQUIRE(pre.has_value());
+    CHECK(!pre->nfc() && pre->ignore_merges());
+    const std::string text = "Hello 1234 can't\n世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Hello", " ", "123", "4", " can", "'t", "\n", "世界"};
+    CHECK(pieces == expected);
+}
+
+TEST_CASE("AFMoE aligns decimal groups on the right, including Unicode and long runs") {
+    auto pre = PreTokenizer::for_name("afmoe");
+    REQUIRE(pre.has_value());
+    const std::string text = "1234 １２３４ abc 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"1", "234", " ", "１", "２３４", " abc", " ", "世界"};
+    CHECK(pieces == expected);
+    const std::string digits(1021, '1');
+    pieces.clear();
+    pre->split(digits, pieces);
+    REQUIRE(pieces.size() == 341);
+    CHECK(pieces.front().size() == 1);
+    for (size_t i = 1; i < pieces.size(); ++i) CHECK(pieces[i].size() == 3);
+}
+
+TEST_CASE("EXAONE-MoE keeps spaces inside word runs and splits individual digits") {
+    auto pre = PreTokenizer::for_name("exaone-moe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "ab cd ef\n12/ 34";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"ab cd ef", "\n", "1", "2", "/", " ", "3", "4"};
+    CHECK(pieces == expected);
+}
+
+TEST_CASE("GLM uses Llama-3 splitting and merge rules") {
+    auto original = PreTokenizer::for_name("llama3");
+    auto glm = PreTokenizer::for_name("glm4");
+    REQUIRE(original.has_value() && glm.has_value());
+    for (const std::string text : {"Hello 1234567!\n", "你好 世界 カナ test's", "a\r\nb   c"}) {
+        std::vector<std::string_view> a, b;
+        original->split(text, a);
+        glm->split(text, b);
+        CHECK(a == b);
+    }
+    CHECK(!glm->nfc() && glm->ignore_merges());
+}
+
+TEST_CASE("Ling 2.0 keeps contractions, single digits and possessive symbol runs") {
+    auto pre = PreTokenizer::for_name("bailingmoe2");
+    REQUIRE(pre.has_value());
+    const std::string text = "Can't 12 !\nend";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Can", "'t", " ", "1", "2", " !\n", "end"};
+    CHECK(pieces == expected);
+    CHECK(pre->nfc() && !pre->ignore_merges());
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE tokenizer
 // ---------------------------------------------------------------------------
+TEST_CASE("SentencePiece-normalized BPE: explicit pair ranks override vocabulary scores") {
+    const std::string path = test::temp_dir() + "/liyab_ranked_spm_" + std::to_string(test::process_id()) + ".gguf";
+    GgufWriter writer;
+    writer.string("tokenizer.ggml.model", "gemma4");
+    writer.boolean("tokenizer.ggml.add_space_prefix", false);
+    writer.strings("tokenizer.ggml.tokens", {"a", "b", "c", "ab", "bc", "abc", "▁", "▁a", "<end>"});
+    writer.ints("tokenizer.ggml.token_type", {1, 1, 1, 1, 1, 1, 1, 1, 3});
+    writer.strings("tokenizer.ggml.merges", {"b c", "a b"});
+    REQUIRE(writer.write(path));
+    auto file = MmapLoader::open(path);
+    REQUIRE(file.has_value());
+    auto tokenizer = Tokenizer::load(**file);
+    REQUIRE(tokenizer.has_value());
+    auto abc = tokenizer->encode("abc", false);
+    REQUIRE(abc.has_value());
+    CHECK(*abc == (std::vector<int32_t>{0, 4}));
+    auto spaced = tokenizer->encode(" abc<end>ab", false);
+    REQUIRE(spaced.has_value());
+    CHECK(*spaced == (std::vector<int32_t>{6, 0, 4, 8, 3}));
+    CHECK(tokenizer->piece(6) == " ");
+    std::remove(path.c_str());
+}
+
 TEST_CASE("Byte-level BPE: merges by rank, NFC per family, ignore_merges, specials") {
     const BpeVocab v = bpe_vocab(false);
     const std::string G = byte_text(' ');
@@ -491,6 +724,44 @@ TEST_CASE("Byte-level BPE: merges by rank, NFC per family, ignore_merges, specia
         BpeTokenizer t("default", v, nullptr);  // no tokenizer.ggml.pre: GPT-2's scheme
         REQUIRE(t.tok.has_value());
         CHECK(t.encode("hello world") == (std::vector<int32_t>{v.id("hello"), v.id(G + "world")}));
+    }
+}
+
+TEST_CASE("NFKC byte-level BPE normalizes ordinary text, preserves specials and supports continuations") {
+    const BpeVocab v = bpe_vocab(false);
+    BpeTokenizer normalized("nfkc_digits", v, "gpt2-nfkc-digits");
+    BpeTokenizer plain("nfkc_expected", v, "default");
+    REQUIRE(normalized.tok && plain.tok);
+    const std::string source = "ｈｅｌｌｏ ｗｏｒｌｄ１２３, ﬃ e\u0301";
+    const std::string expected = "hello world123, ffi é";
+    CHECK(normalized.encode(source) == plain.encode(expected));
+    const std::string special = "ｈｅｌｌｏ<|im_end|>ｗｏｒｌｄ";
+    CHECK(normalized.encode(special) == plain.encode("hello<|im_end|>world"));
+    CHECK(normalized.tok->encode_continuation(source, 0).value() == normalized.encode(source));
+    std::vector<int32_t> ids;
+    std::vector<TokenSegment> segments;
+    const size_t cut = special.find('>') + 1;
+    REQUIRE(encode_segmented(*normalized.tok, special, 0,
+                            std::vector<PromptSegment>{{0, cut}, {cut, special.size()}}, false, ids, segments).is_ok());
+    CHECK(ids == normalized.encode(special));
+}
+
+TEST_CASE("Chat tool preprocessing follows the tokenizer family across architectures") {
+    const BpeVocab v = bpe_vocab(false);
+    const char* request = R"({"messages":[],"tools":[{"z":{"y":1,"a":2},"a":3}],"extra":{"z":1,"a":2}})";
+    for (const char* arch : {"kimi-linear", "deepseek2", "qwen2"}) {
+        for (const char* pre : {"kimi-k2", "qwen2"}) {
+            BpeTokenizer t(std::string("chat_sort_") + arch + pre, v, pre, arch);
+            REQUIRE(t.tok.has_value());
+            const bool sorted = std::string_view(pre) == "kimi-k2";
+            CHECK(t.tok->chat_sort_tools() == sorted);
+            auto chat = ChatTemplate::parse("{{ tools | tojson }}|{{ extra | tojson }}", t.tok->chat_sort_tools());
+            REQUIRE(chat.has_value());
+            auto text = chat->render_chat(request, jinja::Value::object());
+            REQUIRE(text.has_value());
+            CHECK(*text == (sorted ? R"([{"a": 3, "z": {"a": 2, "y": 1}}]|{"z": 1, "a": 2})"
+                                   : R"([{"z": {"y": 1, "a": 2}, "a": 3}]|{"z": 1, "a": 2})"));
+        }
     }
 }
 
@@ -528,6 +799,203 @@ TEST_CASE("Byte-level BPE: an unknown pre-tokenizer loads but cannot encode, nam
     CHECK(ids.status().message().find("qwen35") != std::string::npos);
 }
 
+TEST_CASE("Tokenizer loads the published converter's integer Tekken scores and rejects a short array") {
+    const BpeVocab v = bpe_vocab(false);
+    for (const bool short_scores : {false, true}) {
+        GgufWriter w;
+        w.string("tokenizer.ggml.model", "gpt2");
+        w.string("tokenizer.ggml.pre", "tekken");
+        w.strings("tokenizer.ggml.tokens", v.tokens);
+        w.ints("tokenizer.ggml.token_type", v.types);
+        w.strings("tokenizer.ggml.merges", v.merges);
+        w.ints("tokenizer.ggml.scores", std::vector<int32_t>(v.tokens.size() - (short_scores ? 1 : 0), -1000));
+        const std::string path = test::temp_dir() + "/liyab_integer_scores.gguf";
+        REQUIRE(w.write(path));
+        auto f = MmapLoader::open(path);
+        REQUIRE(f.has_value());
+        auto t = Tokenizer::load(**f);
+        CHECK(t.has_value() == !short_scores);
+        if (t) CHECK(t->encode("ab", false).has_value());
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("SentencePiece scheme prefixes stay outside reusable segments and are inserted once") {
+    for (const bool missing : {false, true}) {
+        GgufWriter w;
+        w.string("tokenizer.ggml.model", "llama");
+        w.string("tokenizer.ggml.pre", "chatglm-spm");
+        w.boolean("tokenizer.ggml.add_bos_token", false);
+        w.strings("tokenizer.ggml.tokens", {"<unk>", "[gMASK]", missing ? "missing" : "sop", "▁", "h", "i", "hi", "▁hi"});
+        w.ints("tokenizer.ggml.token_type", {2, 3, 3, 1, 1, 1, 1, 1});
+        w.ints("tokenizer.ggml.scores", {-100, -100, -100, -10, -10, -10, 0, 1});
+        const std::string path = test::temp_dir() + "/liyab_scheme_prefix.gguf";
+        REQUIRE(w.write(path));
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        if (missing) {
+            REQUIRE(!tok.has_value());
+            CHECK(tok.status().message().find("sop") != std::string::npos);
+        } else {
+            REQUIRE(tok.has_value());
+            CHECK(tok->add_bos_default());
+            CHECK(tok->encode("hi", true).value() == (std::vector<int32_t>{1, 2, 7}));
+            CHECK(tok->encode("hi", false).value() == (std::vector<int32_t>{7}));
+            CHECK(tok->encode("[gMASK]sophi", true).value() == (std::vector<int32_t>{1, 2, 7}));
+            CHECK(tok->encode_continuation("hi", 7).value() == (std::vector<int32_t>{6}));
+            CHECK(tok->encode_continuation("hi", 2).value() == (std::vector<int32_t>{7}));
+            std::vector<int32_t> tokens;
+            std::vector<TokenSegment> segments;
+            REQUIRE(encode_segmented(*tok, "hi", 0, std::vector<PromptSegment>{{0, 2}}, true, tokens, segments).is_ok());
+            CHECK(tokens == (std::vector<int32_t>{1, 2, 7}));
+            REQUIRE(segments.size() == 1);
+            CHECK(segments[0].begin == 2 && segments[0].end == 3);
+        }
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("Greedy SentencePiece matches longest prefixes independently of ranks and preserves byte fallback") {
+    for (const bool prefix : {false, true}) for (const bool scores : {false, true}) for (const bool missing : {false, true}) {
+        GgufWriter w;
+        std::vector<std::string> tokens = {"<unk>", "<c>"};
+        std::vector<int32_t> types = {2, 3};
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+            types.push_back(missing && b == 255 ? 5 : 6);
+        }
+        auto add = [&](std::string text) {
+            tokens.push_back(std::move(text)); types.push_back(1);
+            return static_cast<int32_t>(tokens.size() - 1);
+        };
+        const int32_t a = add("a"), b = add("b"), c = add("c"), ab = add("ab"), bc = add("bc");
+        const int32_t space = add("▁"), repeated = add("▁▁a"), word = add("abcdef");
+        add("abc<c>bc");  // a raw control token still splits the surrounding text
+        w.string("tokenizer.ggml.model", "llama");
+        w.string("tokenizer.ggml.pre", "spm-greedy");
+        w.boolean("tokenizer.ggml.add_space_prefix", prefix);
+        w.strings("tokenizer.ggml.tokens", tokens);
+        w.ints("tokenizer.ggml.token_type", types);
+        if (scores) {
+            std::vector<int32_t> ranks(tokens.size(), -2000000000);
+            ranks[static_cast<size_t>(bc)] = 2000000000;
+            w.ints("tokenizer.ggml.scores", ranks);
+        }
+        const std::string path = test::temp_dir() + "/liyab_spm_greedy.gguf";
+        REQUIRE(w.write(path));
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        if (missing) {
+            REQUIRE(!tok.has_value());
+            CHECK(tok.status().message().find("byte fallback") != std::string::npos);
+        } else {
+            REQUIRE(tok.has_value());
+            const std::vector<int32_t> start = prefix ? std::vector<int32_t>{space} : std::vector<int32_t>{};
+            auto expected = [&](std::initializer_list<int32_t> body) {
+                auto result = start; result.insert(result.end(), body); return result;
+            };
+            CHECK(tok->encode("abc", false).value() == expected({ab, c}));
+            CHECK(tok->encode("abcdef", false).value() == expected({word}));
+            CHECK(tok->encode("a🌍c", false).value() == expected({a, 2 + 0xf0, 2 + 0x9f, 2 + 0x8c, 2 + 0x8d, c}));
+            CHECK(tok->encode(prefix ? " a" : "  a", false).value() == (std::vector<int32_t>{repeated}));
+            auto joined = expected({ab, c, 1});
+            joined.insert(joined.end(), start.begin(), start.end()); joined.push_back(bc);
+            CHECK(tok->encode("abc<c>bc", false).value() == joined);
+            CHECK(tok->encode_continuation("bc", b).value() == (std::vector<int32_t>{bc}));
+            CHECK(tok->encode_continuation("bc", 1).value() == expected({bc}));
+            CHECK(tok->piece(space) == " ");
+            std::vector<int32_t> ids;
+            std::vector<TokenSegment> segments;
+            REQUIRE(encode_segmented(*tok, "abc<c>bc", 0, std::vector<PromptSegment>{{0, 3}, {6, 8}}, false,
+                                     ids, segments).is_ok());
+            CHECK(ids == joined);
+            CHECK(segments.size() == 2);
+        }
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("Unigram segmentation minimizes integer costs, keeps hard boundaries and falls back by byte") {
+    for (const bool tie : {false, true}) {
+        test::GgufWriter w;
+        std::vector<std::string> tokens = {"<|plamo:unk|>"};
+        std::vector<int32_t> types = {2};
+        std::vector<float> scores = {0};
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+            types.push_back(6);
+            scores.push_back(-100);
+        }
+        auto add = [&](std::string text, float score) {
+            tokens.push_back(std::move(text)); types.push_back(1); scores.push_back(score);
+            return static_cast<int32_t>(tokens.size() - 1);
+        };
+        const int32_t a = add("a", -1), b = add("b", -1), c = add("c", -1);
+        add("ab", -5);
+        const int32_t bc = add("bc", 0), abc = add("abc", tie ? -1 : -3);
+        const int32_t x = add("x", -1), y = add("y", -1), spaces = add("  ", -1);
+        add("x  y", 0);
+        const int32_t z = add("z", -1), repeated = add("aaaa", 0);
+        add("zaaaab", 0);
+        const int32_t special = add("<|plamo:test|>", 0);
+        add("x<|plamo:test|>y", 0);
+        const int32_t newlines = add("z\n\n\n\nb", 0);
+        w.add_string("tokenizer.ggml.model", "plamo3");
+        w.add_string_array("tokenizer.ggml.tokens", tokens);
+        w.add_i32_array("tokenizer.ggml.token_type", types);
+        w.add_f32_array("tokenizer.ggml.scores", scores);
+        const std::string path = test::temp_dir() + "/liyab_unigram.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        REQUIRE(tok.has_value());
+        CHECK(tok->encode("abc", false).value() == (tie ? std::vector<int32_t>{abc} : std::vector<int32_t>{a, bc}));
+        CHECK(tok->encode("a🌍c", false).value() == (std::vector<int32_t>{a, 1 + 0xf0, 1 + 0x9f, 1 + 0x8c, 1 + 0x8d, c}));
+        CHECK(tok->encode("x  y", false).value() == (std::vector<int32_t>{x, spaces, y}));
+        CHECK(tok->encode("zaaaab", false).value() == (std::vector<int32_t>{z, repeated, b}));
+        CHECK(tok->encode("x<|plamo:test|>y", false).value() == (std::vector<int32_t>{x, special, y}));
+        CHECK(tok->encode("z\n\n\n\nb", false).value() == (std::vector<int32_t>{newlines}));
+        CHECK(tok->encode("a\xee\xb8\x80" "b", false).value() == (std::vector<int32_t>{a, b}));
+        std::remove(path.c_str());
+    }
+}
+
+TEST_CASE("Unigram vocabularies reject invalid scores and missing fallback bytes") {
+    for (const bool bad_score : {false, true}) {
+        test::GgufWriter w;
+        std::vector<std::string> tokens;
+        std::vector<int32_t> types(256, 6);
+        std::vector<float> scores(256, -100);
+        for (int b = 0; b < 256; ++b) {
+            char piece[7];
+            std::snprintf(piece, sizeof piece, "<0x%02X>", b);
+            tokens.emplace_back(piece);
+        }
+        if (bad_score) scores[0] = std::numeric_limits<float>::infinity();
+        else types[0] = 5;
+        w.add_string("tokenizer.ggml.model", "plamo3");
+        w.add_string_array("tokenizer.ggml.tokens", tokens);
+        w.add_i32_array("tokenizer.ggml.token_type", types);
+        w.add_f32_array("tokenizer.ggml.scores", scores);
+        const std::string path = test::temp_dir() + "/liyab_bad_unigram.gguf";
+        w.write(path);
+        auto file = MmapLoader::open(path);
+        REQUIRE(file.has_value());
+        auto tok = Tokenizer::load(**file);
+        REQUIRE(!tok.has_value());
+        CHECK(tok.status().code() == ErrorCode::InvalidModel);
+        CHECK(tok.status().message().find(bad_score ? "score" : "byte fallback") != std::string::npos);
+        std::remove(path.c_str());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat templates
 // ---------------------------------------------------------------------------
@@ -560,6 +1028,28 @@ std::string first_difference(const std::string& got, const std::string& want) {
            "\n    want " + jinja::Value(want.substr(from, 100)).repr();
 }
 
+// Keep reference fixtures independent of the day and host time zone. Reuse
+// the interpreter's callable context rather than changing its runtime clock.
+jinja::Value chat_special(const jinja::Value& entry) {
+    auto special = jinja::Value::object();
+    special.fields().entries = entry.fields().find("special")->fields().entries;
+    if (const auto* clock = entry.fields().find("clock_utc")) {
+        const auto epoch = static_cast<std::time_t>(clock->as_int());
+        std::tm fixed{};
+#ifdef _WIN32
+        if (gmtime_s(&fixed, &epoch) != 0) throw std::runtime_error("invalid fixture clock_utc");
+#else
+        if (!gmtime_r(&epoch, &fixed)) throw std::runtime_error("invalid fixture clock_utc");
+#endif
+        special.fields().set("strftime_now", jinja::Value::callable("strftime_now", [fixed](jinja::Array& args, jinja::Kwargs&) {
+            char buffer[256];
+            const size_t n = std::strftime(buffer, sizeof buffer, args.empty() ? "%Y-%m-%d" : args[0].str().c_str(), &fixed);
+            return jinja::Value(std::string(buffer, n));
+        }));
+    }
+    return special;
+}
+
 }  // namespace
 
 TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_template") {
@@ -567,23 +1057,24 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
     if (!data) return;
     size_t rendered = 0, refused = 0;
     for (const auto& [name, entry] : data->fields().entries) {
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
-        if (!tmpl) std::printf("  %s: %s\n", name.c_str(), tmpl.status().message().c_str());
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
+        if (!tmpl) std::printf("  %s: %s\n", name.as_string().c_str(), tmpl.status().message().c_str());
         REQUIRE(tmpl.has_value());
-        const jinja::Value& special = *entry.fields().find("special");
+        const jinja::Value special = chat_special(entry);
         size_t index = 0;
         for (const jinja::Value& c : entry.fields().find("cases")->items()) {
             const std::string request = c.fields().find("request")->to_json();
             auto out = tmpl->render_chat(request, special);
             if (const jinja::Value* want = c.fields().find("output")) {
-                if (!out) std::printf("  %s case %zu: %s\n", name.c_str(), index, out.status().message().c_str());
+                if (!out) std::printf("  %s case %zu: %s\n", name.as_string().c_str(), index, out.status().message().c_str());
                 else if (*out != want->as_string()) {
-                    std::printf("  %s case %zu differs %s\n", name.c_str(), index, first_difference(*out, want->as_string()).c_str());
+                    std::printf("  %s case %zu differs %s\n", name.as_string().c_str(), index, first_difference(*out, want->as_string()).c_str());
                 }
                 CHECK(out.has_value() && *out == want->as_string());
                 ++rendered;
             } else {
-                if (out) std::printf("  %s case %zu: rendered, but transformers refused it\n", name.c_str(), index);
+                if (out) std::printf("  %s case %zu: rendered, but transformers refused it\n", name.as_string().c_str(), index);
                 CHECK(!out.has_value());
                 ++refused;
             }
@@ -599,8 +1090,9 @@ TEST_CASE("Chat templates: prefix stability and the layout of turns") {
     if (!data) return;
     auto format = [&](const char* name, const char* probe) {
         const jinja::Value& entry = *data->fields().find(name);
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
-        auto f = tmpl->format(probe, *entry.fields().find("special"));
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
+        auto f = tmpl->format(probe, chat_special(entry));
         if (!f) std::printf("  %s: %s\n", name, f.status().message().c_str());
         return f.has_value() ? *f : ChatFormat{};
     };
@@ -657,6 +1149,11 @@ TEST_CASE("Chat templates: Jinja semantics transformers relies on") {
     // Python's printing and arithmetic.
     CHECK(render(R"({{ none }}|{{ true }}|{{ 1.0 }}|{{ [1, "a", none] }}|{{ {"a": 1} }}|{{ 1/2 }}|{{ -7//2 }}|{{ -7 % 3 }}|{{ 1e20 }}|{{ 1e-05 }})") ==
           "None|True|1.0|[1, 'a', None]|{'a': 1}|0.5|-4|2|1e+20|1e-05");
+    CHECK(render(R"({% set d = {10: 'ten', 2: 'two', '2': 'string', true: 'one', 1: 'updated', none: 'nil'} %}{{ d[2] }}|{{ d.get('2') }}|{{ 10 in d }}|{{ d[true] }}|{{ d[none] }}|{{ d.keys() }})") ==
+          "two|string|True|updated|nil|[10, 2, '2', True, None]");
+    CHECK(render(R"({% for k,v in {1024: 256, 0: 0, 512: 128}|dictsort %}{{ k }}:{{ v }};{% endfor %})") ==
+          "0:0;512:128;1024:256;");
+    CHECK(render(R"({{ {2: 'two', 1: 'one'}|tojson(sort_keys=true) }})") == "{\"1\": \"one\", \"2\": \"two\"}");
     CHECK(render(R"({{ "abc"[::-1] }}{{ [1,2,3][-1] }}{{ "a b  c".split() }}{{ " x ".strip() }}{{ "a,b,c".split(",", 1) }})") ==
           "cba3['a', 'b', 'c']x['a', 'b,c']");
     // transformers' tojson: keys in order, non-ASCII kept, ", " / ": " separators.
@@ -809,3 +1306,95 @@ TEST_CASE("Engine and C API: the model's chat template renders, describes its tu
 }
 
 TEST_MAIN()
+
+TEST_CASE("Colliding export tags retain distinct whitespace splits and merge policies") {
+    const std::string text = "   \n\n  ";
+    auto dbrx = PreTokenizer::for_name("dbrx");
+    auto ordinary = PreTokenizer::for_name("llama-bpe-merges");
+    REQUIRE(dbrx && ordinary);
+    std::vector<std::string_view> a, b;
+    dbrx->split(text, a);
+    ordinary->split(text, b);
+    CHECK(a == std::vector<std::string_view>({"   \n\n  "}));
+    CHECK(b == std::vector<std::string_view>({"   \n\n", "  "}));
+    CHECK(dbrx->ignore_merges() && !ordinary->ignore_merges());
+}
+
+TEST_CASE("Ling pre-tokenization preserves contractions, NFC and individual digits") {
+    auto pre = PreTokenizer::for_name("bailingmoe");
+    REQUIRE(pre.has_value());
+    CHECK(pre->nfc() && !pre->ignore_merges());
+    const std::string text = "I'm can't WE'RE\n\n abc 1234 世界";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"I", "'m", " can", "'t", " WE", "'RE", "\n\n", " abc", " ",
+                                                     "1", "2", "3", "4", " 世界"};
+    CHECK(pieces == expected);
+}
+
+TEST_CASE("Unicode ranked BPE replaces spaces, merges by rank and falls back after whole characters") {
+    BpeVocab v;
+    v.tokens = {"a", "b", "c", "é", "▁", "ab", "bc", "▁é", "ab▁é"};
+    v.types.assign(v.tokens.size(), 1);
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        char name[8];
+        std::snprintf(name, sizeof name, "<0x%02X>", byte);
+        v.tokens.emplace_back(name);
+        v.types.push_back(6);
+    }
+    v.merges = {"a b", "b c", "▁ é", "ab ▁é"};
+    BpeTokenizer t("unicode_ranked", v, "sarvam-moe");
+    REQUIRE(t.tok.has_value());
+    CHECK(t.encode("abc") == std::vector<int32_t>({v.id("ab"), v.id("c")}));
+    CHECK(t.encode("ab é") == std::vector<int32_t>({v.id("ab▁é")}));
+    CHECK(t.encode(" é") == std::vector<int32_t>({v.id("▁é")}));
+    CHECK(t.encode("a  b") == std::vector<int32_t>({v.id("a"), v.id("▁"), v.id("▁"), v.id("b")}));
+    CHECK(t.encode("").empty());
+    const std::string text = "a🙂b";
+    const auto ids = t.encode(text);
+    REQUIRE(ids.size() == 6);
+    CHECK(ids == std::vector<int32_t>({v.id("a"), v.id("<0xF0>"), v.id("<0x9F>"),
+                                      v.id("<0x99>"), v.id("<0x82>"), v.id("b")}));
+    std::string decoded;
+    for (const auto id : ids) decoded += t.tok->piece(id);
+    CHECK(decoded == text);
+    CHECK(t.tok->piece(v.id("ab▁é")) == "ab é");
+    // No implicit leading space and no byte-level reinterpretation of é.
+    CHECK(t.encode("é") == std::vector<int32_t>({v.id("é")}));
+    CHECK(t.tok->piece(v.id("é")) == "é");
+}
+
+TEST_CASE("Channelized turns continue after a message and stop on return or tool handoff") {
+    for (const bool channel_turn : {false, true}) {
+        for (const bool explicit_message_stop : {false, true}) {
+            auto v = bpe_vocab(false);
+            for (const char* token : {"<|end|>", "<|return|>", "<|call|>"}) {
+                v.tokens.emplace_back(token);
+                v.types.push_back(3);
+            }
+            const std::string path = test::temp_dir() + "/liyab_channel_stops_" + std::to_string(channel_turn) + std::to_string(explicit_message_stop) + ".gguf";
+            test::GgufWriter w;
+            w.add_string("tokenizer.ggml.model", "gpt2");
+            w.add_string("tokenizer.ggml.pre", "default");
+            w.add_string_array("tokenizer.ggml.tokens", v.tokens);
+            w.add_i32_array("tokenizer.ggml.token_type", v.types);
+            w.add_string_array("tokenizer.ggml.merges", v.merges);
+            w.add_u32("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(v.id(channel_turn ? "<|return|>" : "<|end|>")));
+            if (explicit_message_stop) w.add_u32("tokenizer.ggml.eot_token_id", static_cast<uint32_t>(v.id("<|end|>")));
+            w.write(path);
+            auto file = MmapLoader::open(path);
+            REQUIRE(file.has_value());
+            auto tok = Tokenizer::load(**file);
+            REQUIRE(tok.has_value());
+            CHECK(tok->is_end_of_generation(v.id("<|end|>")) == (!channel_turn || explicit_message_stop));
+            CHECK(tok->is_end_of_generation(v.id("<|return|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|call|>")) == channel_turn);
+            CHECK(tok->is_end_of_generation(v.id("<|im_end|>")));
+            CHECK(tok->piece(v.id("<|end|>")).empty());
+            auto ids = tok->encode("hello<|end|>hello<|return|>", false);
+            REQUIRE(ids.has_value());
+            CHECK(*ids == std::vector<int32_t>({v.id("hello"), v.id("<|end|>"), v.id("hello"), v.id("<|return|>")}));
+            std::remove(path.c_str());
+        }
+    }
+}

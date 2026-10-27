@@ -1,0 +1,42 @@
+--- modeling_bailing_moe.py
++++ modeling_bailing_moe.py
+@@ -50,7 +50,7 @@
+     logging,
+     replace_return_docstrings,
+ )
+-from transformers.utils.import_utils import is_torch_fx_available
++from transformers.utils.import_utils import is_torch_available as is_torch_fx_available
+ from .configuration_bailing_moe import BailingMoeConfig
+ 
+ 
+@@ -420,7 +420,7 @@
+         self._init_rope()
+ 
+     def _init_rope(self):
+-        if self.config.rope_scaling is None:
++        if not self.config.rope_scaling or self.config.rope_scaling.get("rope_type") == "default":
+             self.rotary_emb = BailingMoeRotaryEmbedding(
+                 self.head_dim,
+                 max_position_embeddings=self.max_position_embeddings,
+@@ -964,6 +964,12 @@
+     _supports_cache_class = True
+ 
+     def _init_weights(self, module):
++        if isinstance(module, BailingMoeRotaryEmbedding):
++            # transformers 5 materializes unsaved buffers as zeros. Restore
++            # the constructor's nonpersistent RoPE tables after weight load.
++            inv_freq = 1.0 / (module.base ** (torch.arange(0, module.dim, 2, device=module.inv_freq.device).float() / module.dim))
++            module.register_buffer("inv_freq", inv_freq, persistent=False)
++            module._set_cos_sin_cache(module.max_position_embeddings, module.inv_freq.device, torch.get_default_dtype())
+         std = self.config.initializer_range
+         if isinstance(module, nn.Linear):
+             module.weight.data.normal_(mean=0.0, std=std)
+@@ -1228,7 +1234,7 @@
+ 
+ 
+ class BailingMoeForCausalLM(BailingMoePreTrainedModel):
+-    _tied_weights_keys = ["lm_head.weight"]
++    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+ 
+     def __init__(self, config: BailingMoeConfig):
+         super().__init__(config)

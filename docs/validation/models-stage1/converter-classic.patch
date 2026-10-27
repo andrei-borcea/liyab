@@ -1,0 +1,75 @@
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -183,6 +183,7 @@
+     "LlavaForConditionalGeneration": "llama",
+     "LlavaStableLMEpochForCausalLM": "stablelm",
+     "MPTForCausalLM": "mpt",
++    "MptForCausalLM": "mpt",
+     "MT5ForConditionalGeneration": "t5",
+     "MaincoderForCausalLM": "maincoder",
+     "Mamba2ForCausalLM": "mamba",
+--- a/conversion/gpt2.py
++++ b/conversion/gpt2.py
+@@ -27,7 +27,6 @@
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+         # we don't need these
+         if name.endswith((".attn.bias", ".attn.masked_bias")):
+-            yield from super().modify_tensors(data_torch, name, bid)
+             return
+ 
+         if name.endswith((".c_attn.weight", ".c_proj.weight", ".c_fc.weight", ".c_proj.weight")):
+--- a/conversion/gptneox.py
++++ b/conversion/gptneox.py
+@@ -23,7 +23,7 @@
+         self.gguf_writer.add_block_count(self.block_count)
+         self.gguf_writer.add_feed_forward_length(self.hparams["intermediate_size"])
+         self.gguf_writer.add_rope_dimension_count(
+-            int(self.hparams["rotary_pct"] * (self.hparams["hidden_size"] // self.hparams["num_attention_heads"])),
++            int(self.hparams.get("rotary_pct", self.rope_parameters.get("partial_rotary_factor", 1.0)) * (self.hparams["hidden_size"] // self.hparams["num_attention_heads"])),
+         )
+         self.gguf_writer.add_head_count(self.hparams["num_attention_heads"])
+         self.gguf_writer.add_parallel_residual(self.hparams.get("use_parallel_residual", True))
+--- a/conversion/mpt.py
++++ b/conversion/mpt.py
+@@ -8,7 +8,7 @@
+ from .base import ModelBase, TextModel, gguf
+ 
+ 
+-@ModelBase.register("MPTForCausalLM")
++@ModelBase.register("MPTForCausalLM", "MptForCausalLM")
+ @ModelBase.example("anas-awadalla/mpt-7b")
+ class MPTModel(TextModel):
+     model_arch = gguf.MODEL_ARCH.MPT
+--- a/conversion/stablelm.py
++++ b/conversion/stablelm.py
+@@ -53,7 +53,8 @@
+             self._q_norms[bid][name] = data_torch
+ 
+             if len(self._q_norms[bid]) >= n_head:
+-                return self._stack_qk_norm(bid, n_head, self._q_norms[bid], "q_layernorm")
++                yield from self._stack_qk_norm(bid, n_head, self._q_norms[bid], "q_layernorm")
++                return
+             else:
+                 return
+ 
+@@ -66,7 +67,8 @@
+             self._k_norms[bid][name] = data_torch
+ 
+             if len(self._k_norms[bid]) >= n_kv_head:
+-                return self._stack_qk_norm(bid, n_kv_head, self._k_norms[bid], "k_layernorm")
++                yield from self._stack_qk_norm(bid, n_kv_head, self._k_norms[bid], "k_layernorm")
++                return
+             else:
+                 return
+ 
+--- a/conversion/starcoder.py
++++ b/conversion/starcoder.py
+@@ -23,3 +23,8 @@
+ @ModelBase.example("bigcode/starcoder2-3b")
+ class StarCoder2Model(TextModel):
+     model_arch = gguf.MODEL_ARCH.STARCODER2
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        if self.hparams.get("sliding_window"):
++            self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])

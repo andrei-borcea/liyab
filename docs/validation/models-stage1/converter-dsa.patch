@@ -1,0 +1,22 @@
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -1814,7 +1814,7 @@
+         logger.debug(f"chktok: {chktok}")
+         logger.debug(f"chkhsh: {chkhsh}")
+ 
+-        res = None
++        res = "deepseek-llm" if chkhsh == "99ecacb482755b6abc6f96d6f278fa7f540b51d4549bcc0c5c068a60934d128c" else None
+ 
+         # NOTE: if you get an error here, you need to update the convert_hf_to_gguf_update.py script
+         #       or pull the latest version of the model from Huggingface
+--- a/conversion/deepseek.py
++++ b/conversion/deepseek.py
+@@ -506,7 +506,7 @@
+     def set_vocab(self):
+         from transformers import AutoTokenizer
+         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+-        assert getattr(tokenizer, "add_bos_token", False), "Change value of add_bos_token to true in tokenizer_config.json file."
++        # Official V3.2 may set add_bos_token=False; SpecialVocab preserves that rule.
+         self._set_vocab_gpt2()
+ 
+     def set_gguf_parameters(self):

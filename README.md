@@ -107,9 +107,14 @@ These rules decide what goes into the code:
 | Area | Status |
 | :--- | :--- |
 | GGUF v2/v3 loader: `mmap`, zero-copy, validated against malformed files; split models (`-00001-of-0000N.gguf`) | ✅ |
-| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Text architecture coverage | Classic, modern dense, MoE, recurrent and Gemma text paths; [coverage and validation tiers](#architecture-coverage-and-validation) distinguish trained checkpoints, tiny conformance and components |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
-| Tokenizers: SentencePiece and byte-level BPE, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM) | ✅ token-identical to each model's Hugging Face tokenizer |
+| Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
+| State-space mixers: `mamba` (Mamba-1, Falcon-Mamba) and `mamba2` (Mamba-2); mixer-only and FFN-only blocks planned from tensors | CPU selective scans and depthwise convolution, with NEON, AVX2/FMA and scalar paths; Metal/Vulkan use CPU scans with their normal projection routing. Validation: [model descriptions](docs/model-descriptions.md#state-space-mixers). |
+| Block-plan validation | Partial attention/FFN/SSM projections fail validation or binding instead of silently dropping a part; unsupported parallel attention/Mamba blocks are refused. |
+| Mamba pre-tokenizers: GPT-NeoX (`olmo`, NFC then GPT-2 rules) and Falcon-Mamba (`falcon`, punctuation then ByteLevel and digit groups) | Data in the same pre-tokenizer table |
+| SSM backend correctness | GPU prefill/decode projections are compared against CPU in an F32 graph; quantized projections and recurrent-state invariants are checked separately across all 26 formats using nonzero encoded fixtures and projection/state ablations (uniform RMS conditioning; [fixture recipe](docs/model-descriptions.md#state-space-mixers)). |
+| Recurrent timing | CLI phase reports use `recurrent`; the existing C/JSON `delta_net` counters include DeltaNet and Mamba mixers. The ABI and JSON keys are unchanged. |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
@@ -118,7 +123,8 @@ These rules decide what goes into the code:
 | Windows x64 port of the engine, `liyab-cli`, the tests and tools: file mapping, unbuffered direct reads, processor groups and hybrid cores, UTF-8 paths and console; MSVC or clang-cl | 🟡 written, not yet compiled or run on Windows ([Windows](#windows-x64)) |
 | GPU backends: Metal (zero-copy on unified memory), Vulkan (Adreno/Mali; native kernels for 23 formats on GPU-shared memory) | ✅ |
 | Paged KV cache (F16 / Q8_0 / Q4_0 / Q4_1) laid out per block (windowed blocks keep only their window), with per-channel key scaling, sliding window with attention sinks, grouped-query attention over spans, latent rows for multi-head latent attention, read in the absorbed form or, for long prefills, the expanded one (chosen by a threshold measured once per device) | ✅ |
-| Context kept between turns, recurrent-state snapshots for hybrid models, save/restore to disk | ✅ |
+| Context kept between turns, recurrent-state snapshots for DeltaNet and compressed attention, save/restore to disk | ✅ |
+| Shared K=V attention components: sliding + overlapping/nonoverlapping gated compression, compressed-key selection, grouped output, manifold-constrained residual streams | 🧪 CPU component checks pass; full DeepSeek-V4 also requires the MoE routing, clipping and learned-sink integration |
 | Several sequences decoded together: one pass over every sequence's rows, each sequence's own context, adapter and priority, each output what it gives alone | ✅ CPU and Metal backends |
 | Automatic context length from the KV cache's cost; cancellable, resumable chunked prefill | ✅ |
 | Prefix cache across conversations: a content-addressed store of KV chunks (shared prefixes kept once), in RAM and on storage across runs, capped, LRU | ✅ |
@@ -136,9 +142,178 @@ These rules decide what goes into the code:
 | Voice, actions (alarms, events, replies), local memory/RAG | 🔜 [Roadmap](#roadmap) |
 | Experimental: early exit, head pruning, EGLS, 2:4 sparsity, JIT unpacker, persistent KV prefix files, io_uring | 🧪 `LIYAB_ENABLE_EXPERIMENTAL` |
 
+SmolLM3 (`smaug-bpe`) uses Llama 3's split and whole-piece lookup; OLMo 2/3 needs the explicit
+`llama-bpe-merges` tag for that split with ordinary merge ranks (b11819 exports a colliding `dbrx` label). Granite (`refact`) and EXAONE 4 (`exaone4`) use GPT-2's ByteLevel rule. Seed-OSS (`seed-coder`)
+normalizes NFC and splits punctuation separately from following newlines. These tokenizers are checked against
+their Hugging Face token IDs on prose, edge cases and chat text. SmolLM3's own chat template is pinned in the
+template fixture, with 14 byte-identical reference renders.
+GLM-4's `glm4` pre-tokenizer uses the Llama-3 split and whole-piece vocabulary lookup without normalization.
+The tokenizer also reads the integer scores the converter writes for Tekken. The template fixture includes
+GLM-4, Gemma 1, Granite, OLMo 3, EXAONE 4 and Seed-OSS; scalar dictionary keys retain their Python types,
+including Seed-OSS's integer thinking-budget lookup. The reference tool disables the unused generation cache
+for its single teacher-forced pass.
+For old model classes with nonpersistent rotary buffers, `conform_reference.py --state-dict` constructs the local
+model on CPU and loads its safetensors directly, checking every parameter (including tied weights). Reference
+tracing can observe older models' native PyTorch SDPA calls when they predate transformers' attention interface.
+`describe_model.py --gate --reference-state-dict` uses that loader for a local checkpoint's conformance gate.
+Tiny-checkpoint JSON overrides pass through the configuration constructor, preserving nested block descriptions.
+The description tool measures scalar offsets in RMSNorm weights and verifies that conversion folds them into
+the stored weights. Native SDPA traces check causal/window masks and report additional score biases as unknown.
+`chat_template_reference.py --trust-remote-code` can record templates from trusted official custom tokenizers.
+The `chatglm-spm` tokenizer scheme adds its `[gMASK], sop` prefix when initial special tokens are requested,
+recognizes a prefix already written by a chat template, and keeps automatic prefix tokens outside reusable segments.
+Template fixtures also cover ChatGLM3, EXAONE 3.5, MiniCPM, Nemotron-NAS and IQuest-Coder (14 cases each).
+The `plamo3` tokenizer uses integer-score unigram segmentation with byte fallback, preserving raw spaces and
+Unicode. It keeps the authors' boundaries around special spellings, repeated characters and consecutive spaces.
+Norm vectors accept the converter's bare names as well as names ending in `.weight`, including PLaMo3's post norms.
+PLaMo3's two-block tiny case (local/global attention, an eight-token window) gives mean KL 0.00000 and 99.61% top-1.
+The real 610m-fin-instruct F16 checkpoint passes the gate at mean KL 0.00000 and 100% top-1. The eight-block tiny
+case gives 98.83% top-1 with F16 KV, below the tiny threshold.
+Reference tools offer `--slow-tokenizer` when a new library's fast conversion changes the authors' SentencePiece
+segmentation; `describe_model.py --reference-slow-tokenizer` applies that choice consistently throughout its gate.
+Reference tracing also observes legacy eager attention's paired matrix products, accepting their scale and mask
+only after recomputing the full softmax probabilities from the recorded queries and keys.
+Packed GQA projections are matched to their observed per-group Q/K/V rows; the file may split those projections.
+InternLM2's tiny checkpoint matches all three tokenizer texts with the original slow implementation and gives
+mean KL 0.00000 and 100% top-1. The description tool reports that dynamic RoPE growth beyond the original
+context is not implemented. For multimodal checkpoints such as Ministral 3, the reference tool selects
+transformers' image/text model class and runs the same text-only prompt, without images or added image tokens.
+InternLM2 and Ministral 3 each have 14 template fixtures. An explicit template file is rendered through
+transformers' Jinja renderer, including for tokenizers whose own chat formatter does not use Jinja.
+Reference tracing shortens a uniform configured attention window so its boundary occurs within the probe,
+verifies the actual mask there and reports the original configured size. Full conformance uses the original size.
+For a verified `scale_depth / sqrt(n_layers)` residual rule, it also reports the multiplier for the full layer
+count; reducing the tracing stack must not make a correct MiniCPM file appear to have the wrong multiplier.
+Both residual branches must be present and verified before this correction is applied.
+`gpt2-nfkc-digits` normalizes Unicode 9 NFKC, isolates every numeric character and then applies GPT-2 ByteLevel.
+It uses the existing canonical ordering/composition and additive Unicode 9 compatibility tables; existing NFC
+tables are unchanged. A converter that labels this source pipeline as plain ByteLevel needs a metadata-corrected
+copy. The description tool verifies the source JSON pipeline and refuses incompatible or unverified uses.
+Normalization and tokenization run on the CPU for every backend.
+Modern per-block geometry, scalar/rotation metadata, NoPE, post-only and whole-projection norm plans, and
+corrected `spm-greedy` / `gpt2-nfkc-digits` files hash the complete first GGUF header for saved contexts,
+key-scale/latent-form calibration and KV-store keys. Equal-sized metadata or tokenizer changes beyond the first MiB therefore invalidate incompatible contexts
+and derived calibrations. Legacy plans without these features retain their prior identities and state compatibility.
+If transformers reconstructs a fast tokenizer with a different normalizer or pre-tokenizer, reference tools
+reload the author's `tokenizer.json` through the existing `tokenizer_object` API. The tokenizer class, special
+configuration and chat template are retained; a class that discards the supplied pipeline is refused.
+EXAONE 3.5's F32 tiny checkpoint passes the complete strict gate only after correcting the converter's
+`tokenizer.ggml.pre` from `exaone4` to `gpt2-nfkc-digits`: mean/max KL 0.00000, top-1 100%, 512 conformance IDs
+and all three tokenizer texts identical (615/917/243). All 21 tensor payloads are byte-identical in that copy;
+its 14 template cases also match. The unmodified b11819 export fails the tokenizer gate. EXAONE 4 retains
+its existing plain ByteLevel rule. The full corrected-file result is recorded below.
+The explicit original slow-tokenizer path is unchanged.
+`python3 tests/test_reference_tokenizer.py` checks matching, missing and discarded serialized pipelines without weights.
+
+If a legacy reference omits its input-embedding accessor, the trace can use a unique embedding lookup observed
+on the actual token IDs before the first block. Ambiguous lookups remain unknown; the measured embedding scale
+must still explain the entire input to that block.
+The same rule applies to a missing output accessor: one observed linear projection after the blocks must have
+the logits' shape, and its input and full output must pass the norm and logit-transform checks.
+Gate logs escape invalid UTF-8 in byte-token mismatch diagnostics and preserve the failed check's exit status.
+SentencePiece files can select `tokenizer.ggml.pre=spm-greedy`: identity text normalization, escaped spaces and
+longest-prefix matching with byte fallback. This represents a source vocabulary whose ordinary pieces are all
+`USER_DEFINED`; the description tool verifies those flags through `sentencepiece` and `protobuf` before accepting
+the mode. The converter can discard the flags and incorrectly declare ordinary BPE; its space-prefix declaration
+can also disagree with the source model. `tools/gguf_set_keys.py` can correct those metadata keys in a copy.
+InternLM3's F32 tiny checkpoint passes with `spm-greedy` and `add_space_prefix=false`: mean KL 0.00000,
+top-1 100%, all three tokenizer texts identical (606/1,007/205 IDs), and 14 template renders identical.
+The original slow tokenizer is the reference. All 21 tensor payloads remain byte-identical after the metadata
+correction. This check stays within the declared 32,768-token context; dynamic-NTK extrapolation remains unsupported.
+DeciLM's three-block F32 tiny checkpoint (2/1/4 KV heads) passes the strict gate with mean/max KL 0.00000,
+top-1 100%, three tokenizer texts identical (629/1,032/279 IDs) and 14 template renders identical.
+For DeciLM-7B, b11819's `LlamaHfVocab` drops SentencePiece scores; a local converter override must use its native
+SentencePiece reader when `tokenizer.model` is present. All 30 tensor payloads are unchanged by that override.
+The separate eight-block Nemotron-NAS tiny case covers varied query heads, absent attention and FFN widths.
+The full F16 gate for `openbmb/MiniCPM-1B-sft-bf16` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (631/1049/248), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The legacy MiniCPM reference needs two local transformers 5 API adaptations: recognize its normalized default
+RoPE configuration as unscaled, and express its tied-weight declaration as a mapping. Its forward equations and
+checkpoint tensors are unchanged; the b11819 GGUF conversion is unmodified.
+The full F16 gate for `internlm/internlm2_5-1_8b-chat` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (575/989/190), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+This gate restores source EOS 2 and unknown token 0 in metadata, preserving the converter's chat terminator
+92542 as EOT. The original converter replaces EOS and omits unknown; all 219 tensor payloads are unchanged.
+
+The full F16 gate for `unsloth/gemma-1.1-2b-it` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (513/786/211), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (1 rendered, 13 correctly refused).
+The full F16 gate for `ibm-granite/granite-3.3-2b-instruct` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (625/971/247), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The full F16 gate for `mistralai/Ministral-3-3B-Instruct-2512-BF16` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (517/879/235), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+This corrected-file gate preserves the official authored template: b11819 otherwise selects a Devstral community fallback. The metadata-only correction leaves all 236 tensor descriptors and the entire tensor data section unchanged. Future conversion uses the native tekken vocabulary reader and the generic author-file precedence shim.
+The tokenizer exposes no Jinja template attribute; its shipped `chat_template.jinja` is rendered explicitly through transformers, matching the actual GGUF rendered bytes. Comments/code whitespace may differ; the Jinja AST is equivalent. This does not assert equivalence to its separate native chat formatter.
+The `ministral3` fixture tests the full official author template; `ministral3-real` tests its compact equivalent stored in the corrected GGUF.
+The full F16 gate for `LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct` passes with mean KL 0.00000, top-1 100.00%,
+identical tokenizer IDs on all three texts (615/917/243), and 512 BOS-inclusive conformance IDs.
+Its own template matches all 14 reference cases (14 rendered, 0 correctly refused).
+The b11819 tokenizer metadata needs the source-pipeline correction `gpt2-nfkc-digits`; this is a corrected-file gate, not a plug-and-play unmodified export. The metadata-only converter shim retains all tensor conversion code.
+Under transformers 5, the validation converter explicitly permits the pinned official configuration class during tokenizer loading; the generic configuration fallback cannot initialize its legacy RoPE fields. The source configuration and tensor conversion code are unchanged.
+Its 80-channel heads use the existing F16 KV fallback for Q8_0, Q4_0 and Q4_1 requests; all three produce the same full conformance result as the F16 request.
+GraniteSWA remains a later integration case: its reference always includes learned per-head attention sinks,
+in addition to interleaved windows, per-block RoPE choices and Granite's multipliers.
+
+The generic block planner also handles blocks without rotary positions, norms applied only after a residual branch,
+Q/K RMSNorm over a complete projection, and explicit embedding, residual and logit multipliers. YaRN can use the
+file's whole-dimension magnitude convention, and queries can take a position-dependent attention temperature.
+These operations run on the CPU on every backend; matrix projections retain the existing Metal/Vulkan routing.
+Quantized-key calibration bounds query ranges with the largest attention temperature in the covered context.
+Synthetic tests cover prefill, decode, rollback, sequences and KV reuse. The description tool checks these facts
+against the reference and file; candidate registry rows alone do not establish model conformance.
+A five-block Nemotron-NAS tiny case exercises two GQA ratios, a linear mixer, absent attention, a fully empty
+block and different FFN widths. Its exact registry row passes the strict F32 gate: mean/max KL 0.00000,
+top-1 99.80%, 499 conformance IDs and three tokenizer texts identical (498/797/202). The 14 template
+cases match the existing fixture. Regeneration from the original configuration produces identical tensor bytes;
+the official forward source is unchanged. The existing NAS golden case covers these numerical paths.
+A linear mixer is established by recomputing its entire observed output from a unique linear projection,
+including any bias. This also covers direct child `forward` calls that bypass module hooks. Ambiguous projections,
+additional transformations and shape changes remain unknown; both one-branch and two-branch blocks use this rule.
+`tests/test_reference_trace.py` checks these positive and negative cases with PyTorch and no model weights.
+Per-block head counts and FFN widths can be scalar metadata or integer arrays. Zero KV heads select a single
+linear mixer projection (positive query heads) or no mixer (zero query heads); a zero FFN width omits that branch.
+Attention uses each block's own grouping. The existing KV image layout reserves the maximum KV-head count for
+each attention block and zero-pads unused heads, preserving the same sequence, rollback and saved-context paths.
+Latent attention retains uniform head geometry; files that vary its head counts are refused with a precise reason.
+Saved states of models with per-block geometry or explicit modern scalars also check the model-file fingerprint,
+so equal dimensions cannot mix contexts computed with different layouts or scales. Empty blocks create no streaming I/O items.
+Per-block geometry is checked against an independent float reference on CPU and available GPU backends. Streamed
+block projections use the existing CPU route because their reused slot addresses cannot identify persistent GPU weights.
+
+The modern block changes pass all 14 host suites on native ARM64, Rosetta AVX2 and Rosetta scalar, plus the
+experimental Android arm64 build. All 111 earlier golden pins remain unchanged; 12 new cases are pinned on
+all three platforms. The three-model CPU/Metal comparison passes the symmetric ±3% bound after a separately
+recorded AC confirmation of its one affected configuration. The original timing outlier and the accepted
+[before/after measurements](docs/model-descriptions.md#modern-block-regression-check) are both retained.
+
 ---
 
 ## Quick start
+
+The model planner also recognizes Gemma 3n's AltUp residual streams, Laurel low-rank branches, per-layer token
+embeddings, Gaussian gate sparsity and shared keys/values. These compose with Gemma's existing GeGLU and sandwich
+norms. Gemma 4 adds optional key-as-value projections and block output scales; files with different local/global
+head geometry or different FFN widths are currently refused with an explicit reason. Gemma 3n E2B's BF16 conversion
+passes the real-model gate: mean KL 0.00000, top-1 100%, and identical token IDs on all three tokenizer texts.
+Gemma 4 remains limited to tiny checks with uniform geometry.
+The per-layer table stays memory-mapped and is read by token row; scratch holds only the current batch's per-layer
+inputs and residual streams. Dense projections use the existing CPU/Metal/Vulkan routing and CPU fallback; the
+small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional attention over each complete
+input, mean pooling, the GGUF's `dense_2`/`dense_3` projections, then optional truncation and L2 normalization.
+Bidirectional models reject incremental continuation, tree drafts and rolling caches; quantized-key calibration
+also reads its complete text in one pass. Shared key-as-value projections include their projection bias.
+The `gemma4` tokenizer uses SentencePiece space normalization with the file's explicit BPE merge priorities,
+which can differ from vocabulary scores. Existing SentencePiece tokenizers keep their score-based merges.
+Gemma 4's four-block test with uniform head geometry matches all 512 token IDs, mean KL 0.00000 and top-1 99.22%;
+the full checkpoints still need the generic per-block geometry work. Converter compatibility details are in
+[model descriptions](docs/model-descriptions.md#gemma-residual-and-embedding-parts).
+Text conformance of a multimodal checkpoint loads its registered text decoder alone; the reference tool infers
+the decoder namespace from the checkpoint's embedding key, without requiring unused vision/audio packages.
+Its `--config` overrides apply to the text configuration.
 
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
 iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,
@@ -169,14 +344,16 @@ scripts/build_android.sh                     # --experimental, --abi, --api, --n
 scripts/build_ios.sh
 
 # The Liyab app: builds libliyab first, then the release APK; --install waits while the app is in use
-scripts/build_flutter_app.sh --install
+scripts/build_flutter_app.sh --install --serial PHONE_SERIAL
 
 # The Liyab app for macOS (Apple silicon): app/build/macos/Build/Products/Release/Liyab.app
 scripts/build_flutter_app.sh --macos
 ```
 
-The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations. The
-`.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
+The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations.
+The Android build honors `CMAKE_BUILD_PARALLEL_LEVEL`; set it to limit concurrent jobs, for example
+`CMAKE_BUILD_PARALLEL_LEVEL=4 scripts/build_android.sh --experimental`. Unset uses the build generator's default.
+The `.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
 reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 
 ### Windows (x64)
@@ -267,7 +444,8 @@ What the port does differently from the POSIX platforms:
   CPU kernels read quantized blocks in place. On Apple Silicon each tensor is wrapped in an `MTLBuffer` with
   `newBufferWithBytesNoCopy`, so the GPU reads the page cache directly.
 * **One forward pass for every architecture.** The transformer is not written per model. For each block the loader
-  picks the token mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, `attn_kv_a_mqa` → multi-head latent
+  picks the token mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, `shortconv.conv` → ShortConv,
+  `ssm_conv1d_q` → KDA, `attn_kv_a_mqa` → multi-head latent
   attention, otherwise softmax attention) and detects optional pieces (QKV biases, Q/K norms, an attention output
   gate, the pre-FFN norm, norms after the attention and the FFN). The facts the tensors cannot tell are one row per
   architecture: whether Q/K norms come before or after RoPE, the FFN's activation (SwiGLU or GeGLU), whether
@@ -362,6 +540,43 @@ What the port does differently from the POSIX platforms:
 
 ## Supported models
 
+### Architecture coverage and validation
+
+The registry describes executable parts; a row alone does not prove every checkpoint in a family. Tiny gates use
+F32 weights, F16 KV, identical prompt IDs, mean KL ≤ 0.0001 and top-1 ≥ 99%. Trained-model gates use mean KL ≤ 0.01
+and top-1 ≥ 97%, plus source-tokenizer and template checks. Smoke replies and component tests are labelled separately.
+
+| Family / GGUF architecture | Evidence and scope |
+| :--- | :--- |
+| Existing attention and hybrids: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35`, `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `ernie4_5`, `gemma2`, `gemma3`, `phi3`, `deepseek2` | Trained-model and synthetic regression evidence in [Correctness](#correctness); family/quantization limits still apply |
+| Classic: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | 20 tiny cases across 16 families; nine trained-checkpoint gates. Phi-2/StarCoder2 failed Q8 controls remain disclosed; F16 passes |
+| Modern: `smollm3`, `olmo2` (OLMo 2/3), `exaone`, `exaone4`, `granite`, `minicpm`, `internlm2`, `gemma`, `mistral3`, `plamo3`, `seed_oss`, `glm4`, `deci` | 17 tiny recipes and ten trained gates across the section. Some source/export pairs require explicit metadata corrections; `seed_oss`, `glm4` and `deci` have tiny evidence |
+| MoE: `gpt-oss`, Mixtral (`llama`), `qwen2moe`, `deepseek`, `glm4moe`, `bailingmoe`, `dots1`, `ernie4_5-moe`, `hy_v3` | Nine passing tiny recipes; GPT-OSS-20B MXFP4 has resident/streamed real-model smoke and timing evidence, rather than a trained numerical gate |
+| State space: `mamba`, `mamba2` | Five tiny cases including Falcon-Mamba, grouped Mamba-2 and Codestral; trained Mamba-130M/370M and Mamba-2-130M gates |
+| Convolution/delta: `lfm2`, `lfm2moe`, `qwen3next`, `kimi-linear` | Four tiny gates; trained LFM2-350M/700M/1.2B gates. Large MoE/linear checkpoints are not full-weight numerical validations |
+| Gemma text/pooling: `gemma3n`, `gemma-embedding` | Gemma 3n E2B trained BF16 and tiny gates; EmbeddingGemma-300M checked on 39 inputs against independent pooling/sentence-transformers references |
+| `gemma4` | Two uniform-geometry tiny variants pass, including K=V; full heterogeneous-head Gemma 4 and its larger MoE variants remain stage 2 |
+| Sparse/grouped: `deepseek2` (V2/V3), `glm-dsa` (GLM-5/5.1/5.2), `deepseek32`, `bailingmoe2` | Canonical tiny gates, including genuinely sparse selections. V2-Lite has real streaming evidence; GLM-4.7-Flash has smoke evidence but fails the standard numerical gate |
+| `chatglm`, `deepseek4`, other proposed architectures | Partial/component coverage or failed conformance; registry entries and diagnostic successes do not establish model support |
+
+InternLM 3 exports as `llama`; Nemotron-NAS as `deci`. MiniCPM3 and architectures absent from this table are not
+implicitly covered by a related name. The detailed family tables, pinned revisions, failed controls and converter
+compatibility notes are in [model descriptions](docs/model-descriptions.md) and the
+[stage-1 validation report](docs/model-coverage-stage1.md).
+
+CPU is the numerical reference. LayerNorm, activations, router/sink operations, AltUp/Laurel and recurrent scans
+run on CPU; projections retain the existing CPU/Metal/Vulkan routing. Mamba scans, ShortConv/KDA and MXFP4 have
+NEON, AVX2/FMA and scalar paths where described. BF16 matrix operations on the Metal route use CPU fallback;
+F16 measurements identify actual Metal execution. Android compilation does not prove Vulkan runtime numerics.
+
+GGUF metadata is part of correctness: OLMo's `dbrx`, tiny StarCoder's `refact`, EXAONE 3.5's normalizer, InternLM 3's
+segmentation and Ministral's exported chat template have documented source/export conflicts. Correct copies
+explicitly and retain source/tensor identities; a model-name heuristic never overrides the file silently.
+
+Engine/CLI template rendering is broader than Flutter chat replay. Flutter uses a prefix-stable author template
+or a recognized ChatML/Llama 3 fallback; an incompatible author template refuses chat precisely while raw
+completion and pooling remain available. GPT-OSS Harmony currently has this Flutter replay limitation.
+
 * **Format:** GGUF v2/v3, a single file or split with `gguf-split`. Open part 1; the other parts must sit next to it
   under their original names.
 * **Architectures:**
@@ -384,6 +599,20 @@ What the port does differently from the POSIX platforms:
     norms, five sliding-window blocks (RoPE base 10,000) per global block (the file's base and scaling). The GGUF
     stores its RMSNorm weights as 1 + w already, for Gemma 2 too;
   * `phi3` (Phi-3, Phi-3.5, Phi-4-mini): fused `attn_qkv` and `[gate | up]` projections, partial rotation, LongRoPE;
+  * `smollm3` (SmolLM3-3B): every fourth block leaves Q/K unrotated; its `smaug-bpe` tokenizer and own chat
+    template match transformers. The real F16 checkpoint passes `describe_model.py --gate` with identical
+    498 prompt IDs, mean KL 0.00000 and 100% top-1 agreement; projections use the existing CPU/Metal/Vulkan routes;
+  * `plamo3` (PLaMo-3-610m-fin-instruct): fused QKV and gate/up projections, Q/K and sandwich RMSNorms,
+    seven local RoPE/windowed blocks per global YaRN block, raw unigram tokenizer. The real F16 checkpoint
+    passes the gate with identical 512 prompt IDs, mean KL 0.00000 and 100% top-1. Norms, RoPE and tokenization
+    run on the CPU; projections retain CPU/Metal/Vulkan routing;
+  * `olmo2` (OLMo-2-0425-1B): RMSNorm after each residual branch, Q/K RMSNorm over the entire projection,
+    and ordinary-merge Llama splitting. Its earlier real F16 gate passes with identical 512 prompt IDs,
+    mean KL 0.00000, maximum 0.00003 and 100% top-1. Norms run on the CPU; projections retain CPU/Metal/Vulkan routing;
+  * `exaone4` (EXAONE-4.0-1.2B): post-only branch norms, per-head Q/K RMSNorm and Llama 3 rotary frequency factors.
+    Its real F16 checkpoint passes the gate with identical 512 prompt IDs, mean KL 0.00001, maximum 0.00018
+    and 100% top-1. A separate four-block tiny case checks windowed rotary/global unrotated attention at a 64-token
+    window (99.80% top-1). Norms and rotation run on the CPU; projections retain CPU/Metal/Vulkan routing;
   * `ernie4_5` (ERNIE 4.5 dense: ERNIE-4.5-0.3B): a pre-norm block with SwiGLU, RoPE on adjacent pairs; the row was
     proposed and gated by `tools/describe_model.py` ([docs/model-descriptions.md](docs/model-descriptions.md)).
     The published GGUFs (unsloth, bartowski and mradermacher were checked) ask for a BOS token
@@ -397,7 +626,7 @@ What the port does differently from the POSIX platforms:
     tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gguf \
         --bool tokenizer.ggml.add_bos_token=false --bool tokenizer.ggml.add_space_prefix=false
     ```
-  * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with one expert group, and the models converted to
+  * `deepseek2` (DeepSeek-V2-Lite, DeepSeek-V3-structured models with group-limited expert routing, and the models converted to
     their architecture, such as Youtu-LLM-2B): multi-head latent attention, queries from one projection or a
     low-rank pair with its norm, dense FFNs in the leading blocks and MoE with shared experts in the others (from
     the tensors), YaRN with its log multiplier. The cache holds one row per position and block, `[k_pe | latent]`
@@ -431,9 +660,22 @@ What the port does differently from the POSIX platforms:
     `TransformerOptions::latent_form` / `EngineConfig::latent_form` pin one form. Queries are scaled for the
     per-head width the model was trained with (1/√192 there). Key scaling covers the latent too: the absorbed form
     multiplies the attention output back, the expanded one the latents before it expands them. Files converted
-    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
-    and so is group-limited expert routing
-    (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
+    before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are normalized at block acquisition: keys are decoded
+    and transposed to F32, value rows retain their quantization, with one block of temporary memory.
+    Group-limited routing scores groups by their maximum probability (V2), or by their two best biased
+    probabilities (V3/R1), then selects experts inside those groups. Weights use unbiased probabilities,
+    the declared renormalization and routed scale, identically for resident and streamed experts.
+  * `gemma3n` (Gemma 3n text): AltUp residual streams, Laurel, per-layer token embeddings, Gaussian gate
+    sparsity, normalized values and shared KV. The per-layer table is mapped and read by token row; only its
+    current batch is materialized. The loader may warm the mapping, and the memory plan conservatively counts
+    the whole file. Projections use the existing CPU kernels and GPU operation routing; AltUp's small router
+    and corrections run on CPU.
+  * `gemma-embedding` (EmbeddingGemma 300M): bidirectional attention, mean pooling and chained dense projections
+    before L2 normalization. Each complete input runs alone through attention, including in a batch of inputs.
+  * `bailingmoe2` (Ling 2.0): fused contiguous Q/K/V projections, per-head Q/K RMS norms before partial halves
+    RoPE, dense leading FFNs and grouped sigmoid MoE with selection bias, normalized routed weights and shared
+    experts. These reuse the generic attention and MoE paths; CPU is the reference and projections retain the
+    existing Metal/Vulkan routing. Its NFC BPE pre-tokenizer preserves single digits and possessive symbol runs.
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -454,7 +696,11 @@ What the port does differently from the POSIX platforms:
   * each expert's gate and up projections as two tensors or as one `[gate | up]` tensor (`ffn_gate_up_exps`,
     written by converters that fuse them); the fused rows are the split ones, so the logits are the same bits;
   * the tokens of a batch are grouped per expert, so each expert is read once.
-* **Hybrid models:** DeltaNet blocks keep a recurrent state: conv history plus one 128×128 matrix per value head.
+* **State-space memory:** Mamba blocks keep convolution history and `inner_size × state_size` floats per block,
+  independent of sequence length. Their state uses the existing recurrent snapshots, draft rollback, sequence
+  contexts and prefix/KV-store persistence. Pure SSM stacks reserve a minimal, unused paged-KV placeholder.
+* **Hybrid models:** recurrent blocks keep convolution history and, for DeltaNet and KDA, a matrix per value head
+  sized from their metadata (128×128 on Qwen3.5 and Kimi-Linear). ShortConv keeps only its convolution history.
   These models can roll back only:
   * inside a window of state checkpoints (used by speculative decoding), or
   * to one of four state snapshots (the oldest, the end of the last prompt, and the two newest others).
@@ -465,8 +711,11 @@ What the port does differently from the POSIX platforms:
   * IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS;
   * TQ1_0/TQ2_0, MXFP4, NVFP4.
 
-  Decoders are ported from llama.cpp's gguf-py reference, and `test_engine` checks all 24 formats bit-exactly against
-  `tests/data/quant_vectors.bin`.
+  Decoders are ported from llama.cpp's gguf-py reference, and `test_engine` checks the encoded quantized formats bit-exactly against
+  `tests/data/quant_vectors.bin`. Repeated SSM projections use a separate
+  `ssm_quant_vectors.bin` with uniformly conditioned scale fields; regenerate it with
+  `python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin` (gguf 0.19.0, NumPy).
+  The test writer refuses reader-only formats unless explicit encoded blocks are supplied.
 * **Kernels:**
   * Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 have NEON + SDOT kernels that unpack bits in registers.
   * K-quants, TQ2_0 and I-quants use NEON kernels adapted from llama.cpp (`src/core/quant_lowbit.cpp`) against
@@ -478,34 +727,46 @@ What the port does differently from the POSIX platforms:
     the same order. That holds on the file's layout or repacked, for one activation row or several. A row's result
     is then the same bits whichever kernel computed it, so logits depend neither on the batch size nor on the layout
     (tested for every format).
-* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3) and byte-level BPE (`gpt2`).
+* **Tokenizers:** SentencePiece (`llama`: Llama 2, Mistral, Gemma, Phi-3), byte-level BPE (`gpt2`) and raw unigram
+  (`plamo3`: integer-cost segmentation, longest-prefix ties and byte fallback).
   * **Pre-tokenizers are data.** Before merging, a byte-level BPE tokenizer cuts the text into pieces with regular
     expressions. Each scheme is one row of a table keyed by the GGUF's `tokenizer.ggml.pre`
     (`src/core/pre_tokenizer.cpp`): the patterns of the model's own `tokenizer.json`, NFC normalization where it
     asks for it (Qwen), and whole-piece vocabulary lookup before merging (Llama 3, Hunyuan, Tekken). Rows:
     `default` / `gpt-2` / `gpt2` / `phi-2`, `llama-bpe` / `llama3`, `qwen2` / `deepseek-r1-qwen`, `qwen35`,
-    `hunyuan`, `hunyuan-dense` / `deepseek-v3`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
+    `bloom`, `starcoder` (individual digits), `refact` (plain GPT-2), `olmo` (NFC), `stablelm2`, `falcon`, `command-r` (NFC), `dbrx` (cl100k),
+    `hunyuan`, `hunyuan-dense` / `deepseek-v3` / `joyai-llm`, `deepseek-llm`, `gpt-4o` (Phi-4-mini), `smollm` (SmolLM2: every
     digit alone, then GPT-2's split), `tekken` (Mistral-Nemo) and `youtu` (Youtu-LLM: Hangul, CJK punctuation,
     Bopomofo and Han/kana runs first; its `\p{Hangul}` is written out as the script's code-point ranges, since the
     regex engine has categories, not scripts). A GGUF without the key uses `default`. Any other value is an error
     naming it and the supported list; the model still loads and runs on token ids, with a quantized KV cache too
     (its keys then unscaled, see [key scaling](#architecture)).
+    Additional rows are `smaug-bpe`, `dbrx`, `refact`, `seed-coder`, `exaone4`, `glm4` and
+    `gpt2-nfkc-digits` (Unicode 9 NFKC, individual numbers, then GPT-2 ByteLevel). The latter requires the
+    corrected source-pipeline tag described in Correctness; EXAONE 4 keeps plain ByteLevel.
   * **Liyab's own regex engine** (`src/core/regex.cpp`) runs the patterns: Unicode general categories (`\p{L}`,
     `\p{Lu}`, `\P{N}`…), classes, alternation, greedy, lazy and possessive quantifiers, case-insensitive groups,
     lookahead and atomic groups. It decodes the text once into code points with a category key each, so a class
-    test is a bit lookup. The Unicode data (categories, NFC tables) is generated into `src/core/unicode_tables.inc`
+    test is a bit lookup. The Unicode data (categories, NFC and NFKC tables) is generated into `src/core/unicode_tables.inc`
     by `tools/gen_unicode_tables.py`.
   * **Special tokens** written in the text map to their ids, found in one pass over the text. Those of the Phi-3
     family (Phi-3/3.5, Phi-4-mini) swallow the white space after them, as their Hugging Face tokenizer does. A
     byte a vocabulary lacks (Hunyuan's dense models have no `\r`) is left out before merging, as there.
+    Nemotron's Metaspace `first` policy adds a dummy space only at the start of plain text; real spaces after
+    literal controls remain significant, including when matching saved contexts. Its absent BOS metadata
+    defaults to no BOS; an explicit file setting always wins.
+    SentencePiece compiled character maps run before BPE when the GGUF records one. Orion's converter omits
+    its map and initial-space policy, so its architecture row supplies the exact registered map and defaults;
+    this preserves its trained NMT-NFKC normalization, tabs and newlines without changing existing tokenizers.
+    Byte fallback follows BYTE token types; ordinary `<0xXX>` vocabulary entries retain their literal text.
   * **Checked token for token** against each model's Hugging Face tokenizer, special tokens, contractions,
     digits, white-space runs, composed and decomposed accents, CJK, emoji and right-to-left text included
     ([Correctness](#correctness)).
   * **Speed.** Tokenizing sits on the typing path (prompts are encoded while the user writes). Merges compare token
     ids through a heap, never strings, so a long piece costs O(n log n). On an Apple M4 Pro a 68 KB text encodes in
     2.4–3.6 ms (19–28 MB/s, Qwen3, Qwen3.5, Llama 3.2) and an 80 KB conversation full of special tokens in 2.5–3.2 ms.
-* **Chat templates from the model.** Every GGUF carries the Jinja chat template of its Hugging Face tokenizer
-  (`tokenizer.chat_template`). Liyab's own Jinja interpreter (`src/core/chat_template.cpp`) renders it the way
+* **Chat templates from the model.** When a GGUF carries the Jinja chat template of its Hugging Face tokenizer
+  (`tokenizer.chat_template`), Liyab's own Jinja interpreter (`src/core/chat_template.cpp`) renders it the way
   transformers' `apply_chat_template` does: the same whitespace rules, Python's printing, `tojson`,
   `raise_exception`, `strftime_now`, loops with `loop.previtem` / `nextitem`, macros, namespaces, string methods and
   the usual filters and tests, and the sandbox's refusal of methods that change a list or dict.
@@ -524,6 +785,8 @@ What the port does differently from the POSIX platforms:
     Hunyuan-0.5B, Hunyuan-A13B and DeepSeek V3.1: 165 renders identical, and the 3 conversations transformers
     refuses refused too (`tests/data/chat_templates.json`, written by `tools/chat_template_reference.py`). The
     templates the GGUFs themselves carry gave the same 168 results.
+    Clock-reading fixtures pin a UTC instant and supply it to both renderers, so their expected date is reproducible.
+    The C++ fixture helper uses the platform's thread-safe UTC conversion (`gmtime_s` on Windows).
 * **Prompts are used as given** by `generate()` and `prefill()`: render them with the template first (the app does).
 
 ---
@@ -571,6 +834,54 @@ available memory or of `memory_budget_mb`.
   With `requant_bits = -1` (the app's default), resident Q8_0 matrices are converted to Q5_K or Q4_K at load **only**
   when the expert cache would otherwise hold under 10% of the experts. That is the point where nearly every token
   would wait on storage.
+
+**GLM-5.2 laptop sizing.** Its official configuration (`cf457fa734ab149ffef225f80893eb38c6ff5cdc`) has 78 trunk
+blocks, 75 MoE blocks, 256 routed experts per MoE block and eight experts selected per token. The trunk contains
+724.776 billion routed-expert parameters and 18.600 billion other matrix parameters. These uniform-format
+tensor-payload estimates exclude MTP blocks, GGUF metadata/alignment and mixed-quantization choices:
+
+| Matrix format | Trunk file payload (GiB) | Resident weights (GiB) | Expert reads per cold decode token (GiB) | 3% expert cache (GiB) |
+| :--- | ---: | ---: | ---: | ---: |
+| BF16 / F16 | 1384.65 | 34.65 | 42.19 | 40.50 |
+| Q8_0 | 735.60 | 18.41 | 22.41 | 21.52 |
+| Q6_K | 567.93 | 14.21 | 17.30 | 16.61 |
+| Q5_K | 475.98 | 11.91 | 14.50 | 13.92 |
+| Q4_K | 389.44 | 9.75 | 11.87 | 11.39 |
+| Q3_K | 297.49 | 7.45 | 9.06 | 8.70 |
+| Q2_K | 227.17 | 5.69 | 6.92 | 6.64 |
+
+Cold reads are `75 × 8 × 3 × 6144 × 2048` parameters per decode token; cache hits reduce them, speculative
+prefetch can add reads. Main F16 latent keys plus F32 index keys currently reserve 129,792 bytes per position
+across all 78 blocks, including shared-indexer blocks: 0.25 GiB at 2,048 positions and 15.84 GiB at 131,072.
+Thus Q4_K with a 3% cache starts at about 21.4 GiB for weights/cache/a short context, or 37.0 GiB at 128K,
+before activations, allocator overhead and the OS. A 15% Q4_K expert cache alone takes 56.95 GiB. These are
+capacity estimates, not measured GLM-5.2 throughput or a full-model conformance result.
+
+A short GLM-4.7-Flash Q4_K_M CPU streaming run on an M4 Pro (four threads, F16 KV, 512-token context) used a
+435,191,808-byte expert cache, about 3% of the experts, and answered the capital-of-France prompt correctly.
+It generated seven tokens at 4.278 tok/s. Across 18 prompt plus seven generated tokens it recorded 56.45% ready
+cache hits, 16,606,912,512 bytes read (633.5 MiB per processed token) and 2,315.656 ms waiting for experts.
+These are aggregate prompt/decode counters from one short smoke run, not decode-only bandwidth measurements;
+the CLI labels the stall fraction as prefill plus decode. The file declares `deepseek2`; MTP blocks are skipped.
+
+DeepSeek-V2-Lite-Chat Q8_0 also runs through the legacy combined-MLA layout. On the same host, four CPU threads,
+F16 KV and no requantization, resident execution and two streamed-cache sizes gave byte-identical replies and
+counts (46 prompt tokens, 64 generated tokens). The published 16,702,518,016-byte file has 15,294,529,536 bytes
+of routed experts; the cache's minimum slot count raised the requested 256 MiB to 349,741,056 bytes (2.29%).
+
+| Expert cache | Decode (tok/s) | Ready hits | Bytes read per processed token (MiB) | Expert stalls (ms) | Peak RSS (MiB) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Resident | 6.237 | — | 0 | 0 | 11,679.9 |
+| 2.29% | 15.071 | 74.48% | 1,135.3 | 904.228 | 2,610.3 |
+| 10.47% | 13.794 | 86.55% | 845.7 | 256.222 | 3,954.9 |
+
+Reads and stalls aggregate prompt plus decode; ready hits include predictions that arrived before use.
+These are individual observations under shared-host activity, with the file already read and no OS-cache
+flush, not controlled speed comparisons or physical flash bandwidth. The smaller cache read 130,950,414,336
+bytes and evicted 3,439 loaded experts unused; the larger read 97,550,143,488 bytes and evicted 1,442 unused.
+Neither run skipped slow experts. The larger cache reduced read bytes by 25.5% and stalls by 71.7%; no
+expert-store correctness failure was observed, and these measurements do not establish full GLM-5 throughput.
+
 * **Optional lossy trade-offs**, all measured with `liyab-kl` (see [results](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)):
   * `requant_bits` 4/5: fewer resident bytes;
   * `moe_expert_mass`: run only the top experts covering a share of the router weight;
@@ -1168,6 +1479,14 @@ step, and speed-ups over plain decoding of 2.02× / 2.10×, 1.17× / 1.11×, 1.4
 
 ## Embeddings and reranking
 
+EmbeddingGemma (`gemma-embedding`, 300M) adds bidirectional attention and mean pooling with the model's two
+bias-free dense projections (768 → 3072 → 768). On CPU and Metal routes, a BF16 conversion of `unsloth/embeddinggemma-300m`
+matched all tokenizer IDs in the 39 pooling cases and reached cosine ≥ 0.99992651 against the float32 reference;
+all 39 vectors were bit-identical alone and in the batch. The independent reference agreed with
+sentence-transformers at cosine ≥ 0.9999998. Include the model card's task prefix in the input text.
+`tools/pooling_reference.py` reads mean-pooling and identity Dense modules from `modules.json`;
+`tools/tiny_checkpoint.py --base-model` saves embedding transformers without adding an LM head.
+
 Local memory and retrieval need two more kinds of model next to the generative one: an embedding model, which turns
 a text into a vector so similar texts lie close together, and a reranker, which scores how well a document answers a
 query. Decoder models fine-tuned for these jobs (Qwen3-Embedding, Qwen3-Reranker) run on the architectures above with
@@ -1275,9 +1594,11 @@ without one runs exactly as before.
   when the adapter is selected, 1 meaning as trained.
 * **Where it applies**: every matrix the forward pass multiplies whole: attention, DeltaNet and FFN projections
   (separate or fused), a mixture of experts' router, shared expert and routed experts (each expert its own slice, for
-  the tokens routed to it), latent attention's whole projections, and the LM head. Refused when loaded, naming the
+  the tokens routed to it), latent attention's whole projections, compression/indexer and residual-stream
+  projections, and the LM head. Refused when loaded, naming the
   tensor: adapters of the token embeddings (they change a lookup, not a matmul), of latent attention's per-head
-  `attn_k_b` / `attn_v_b`, activated LoRA (`adapter.alora.*`), and any matrix whose name or shape the model does not
+  `attn_k_b` / `attn_v_b` or combined `attn_kv_b`, shared-KV's grouped `attn_output_a`, activated LoRA
+  (`adapter.alora.*`), and any matrix whose name or shape the model does not
   have.
 * **How it is computed**: t = A·x is a matmul of `rank` rows, run by the CPU backend's kernels in the same parallel
   pass as the base matmuls sharing its input (Q/K/V, gate/up, one wave of experts), so it costs no fork/join of its
@@ -1863,7 +2184,7 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   [Look and feel](#look-and-feel).
 
 ```bash
-scripts/build_flutter_app.sh --install   # libliyab + release APK; never interrupts the app while it is in use
+scripts/build_flutter_app.sh --install --serial PHONE_SERIAL   # libliyab + release APK; never interrupts the app while it is in use
 scripts/build_flutter_app.sh --macos     # libliyab (static) + Liyab.app; then `flutter run -d macos` works too
 cd app && flutter analyze && flutter test
 ```
@@ -2095,13 +2416,29 @@ KV memory per token for a Llama-3-8B-class shape:
 
 ### Correctness
 
-Every one of the 24 tensor formats decodes bit-exactly like the GGUF reference decoder, and the tokenizers produce
+The stage-1 integration passes 16/16 native, 16/16 Rosetta scalar and 16/16 Rosetta AVX2 tests, preserving
+all 414 golden pins (138 cases per platform, including every original pin). All 66 merged-tree tiny recipes
+pass, including one 39-input embedding check; Android Release experimental builds and Flutter has 53 passing
+tests with two optional real-model skips. Independent reader proofs cover 520 recurrent and 104 mapped-table
+cases across 26 formats and four KV types. The final 72-pair performance comparison passes all 21 metrics
+(−2.088% to +0.617%) with identical CLI replies and token counts. Phone validation of the stage-1 changes is deferred; see the
+[validation report](docs/model-coverage-stage1.md). These host results do not imply new on-device throughput
+or compatibility figures.
+
+All 26 supported reader formats decode bit-exactly like the GGUF reference decoder, and the tokenizers produce
 the Hugging Face tokenizers' ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
-reference implementation with the same argmax at every position. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
+reference implementation in the earlier float checks. Per-checkpoint KL and argmax agreement are reported below;
+F16 KV rounding can change near-tied winners. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
 at 98.9% of positions, and the remaining differences are the reference's own second choice. Streamed and in-place
 weights, the file's layouts and the repacked ones, batched and token-by-token prefill, any thread count, and
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
+
+The classic transformer extension passes 20 tiny cases across 16 families and nine full-checkpoint gates.
+Its controlled main/branch comparison on the M4 Pro passes all 14 prefill/decode metrics within ±3%, using
+48 balanced pairs on AC power. BF16 Metal-route measurements include CPU matrix fallback; F16 measurements
+verify actual Metal attention and FFNs. [Classic validation](docs/model-descriptions.md#classic-performance-regression-check)
+records the method, measured rates and earlier failed attempts. No engine performance fix is claimed.
 
 **Against Hugging Face transformers.** `liyab-kl` compared BF16/F16 GGUFs with transformers' own implementation in
 float32 (`tools/conform_reference.py`) over `tests/data/conform_text.txt`, teacher-forced. Every supported tokenizer
@@ -2130,6 +2467,23 @@ cache the forward passes agree:
 | Youtu-LLM-2B, latent attention in the expanded form (passes of 512 tokens) | 512 | 0.00000 | 99.80% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
+| state-spaces/mamba-130m-hf (`mamba`, F16) | 512 | 0.00001 | 99.61% |
+| state-spaces/mamba-370m-hf (`mamba`, F16) | 512 | 0.00000 | 100.00% |
+| AntonV/mamba2-130m-hf (`mamba2`, F16) | 512 | 0.00000 | 100.00% |
+| Gemma-3n-E2B-it (`gemma3n`; unsloth checkpoint converted to BF16) | 512 | 0.00000 | 100.00% |
+
+Gemma 3n also passes against a BF16 transformers reference (mean KL 0.00168, top-1 98.24%); CPU and Metal routes
+give the same greedy reply to the checked chat prompt, "The capital of France is Paris." BF16 matmuls retain the
+existing per-operation CPU fallback. Its four-block F32 tiny checkpoint, including every new part and windows
+within the text, gives mean KL 0.00000 and top-1 99.41%. A deeper ten-block random diagnostic gives mean KL
+0.00001 but fails the 99% top-1 threshold (91.78%); adding F16 KV rounding to that reference improves it to
+98.83%, so precision accounts for most of that difference. That diagnostic is not a passing conformance case.
+
+Quiet baseline checks on Qwen3-0.6B and Llama-3.2-1B BF16 used six warmed pairs per configuration, alternating
+main/branch order. Median paired CPU prefill throughput changed by −0.34% / +0.27%; 64-token decode time changed
+by −0.74% / −0.42% on CPU and +1.07% / −0.17% on the Metal route. CLI prefill changes stayed within 0.11%.
+All 36 paired CLI replies were byte-identical. These BF16 Metal-route measurements use the existing CPU fallback
+for matrix operations; they do not measure native GPU matrix throughput.
 
 Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
 mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds
@@ -2139,8 +2493,8 @@ same build and an F16 cache, where the BF16 conversion measures 0.00000.
 
 The fused Huihui copy (written by `tools/gguf_fuse_experts.py`: the converter's `--fuse-gate-up-exps` does not
 cover `qwen3moe`), its experts streamed through a 128 MB cache, gave the split file's distributions exactly (KL 0,
-top-1 100%). DeepSeek-V2-Lite's own weights (31 GB) were not run: small random models built by transformers' own
-DeepSeek code with its structures, converted by llama.cpp's converter to F32, were compared instead (F16 KV, 511
+top-1 100%). Small random models built by transformers' own DeepSeek code with its structures, converted by
+llama.cpp's converter to F32, were also compared (F16 KV, 511
 positions; weights drawn wide, so attention and outputs are sharp and a wrong part shows):
 
 * DeepSeek-V2-Lite's structure (latent attention without low-rank queries, YaRN with factor 40 and its mscale, a
@@ -2151,6 +2505,116 @@ positions; weights drawn wide, so attention and outputs are sharp and a wrong pa
 * DeepSeek-V3's structure with one expert group (low-rank queries, sigmoid scores with a selection bias,
   renormalized top-3 scaled by 2.5, one shared expert): median KL 0.00001, top-1 99.80%; the mean, 0.0037, is one
   position whose expert choice flipped at a near-tie.
+
+Group-limited routing has synthetic logit hashes pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar for
+softmax group maxima and sigmoid groups scored by their two best biased probabilities, both in place and
+streamed. The existing dense and latent-attention hashes are unchanged.
+
+Canonical tiny checkpoints from the pinned official configurations also exercise the current converter layout.
+DeepSeek-V2-Lite-Chat (`85864749cd611b4353ce1decdb286193298f64c7`) preserves its original latent widths and
+single query projection: 512 identical token IDs, 511 positions, mean KL 0.00000 and top-1 99.80% with F32
+weights and F16 KV. DeepSeek-V3 (`e815299b0bcbac849fa540c768ef21845365c9eb`) includes three dense blocks and
+one grouped MoE block, selecting four of eight groups before eight of sixteen experts: 485 identical IDs,
+484 positions, mean KL 0.00000 and top-1 99.38%. Both propose the existing `deepseek2` row and match all three
+tokenizer texts. These checks use random weights. Separately, the published
+`mradermacher/DeepSeek-V2-Lite-Chat-GGUF` Q8_0 file at revision `9ee9f1f8f39f673e1022e176d586aef4228f630d`
+passed a coherent 64-token real smoke run and exact resident/streamed reply and count checks at both cache
+sizes reported above. Its tokenizer matches 617/1,013/241 IDs and its template matches all 14 reference
+renders. An earlier revision explicitly refuses its legacy combined layout, so this supplies real execution
+and mode-equivalence evidence without an earlier real-weight logit reference or a real KL claim.
+
+Older latent-attention files with combined `attn_kv_b` tensors use the same forward paths. Their expanded-head
+metadata is normalized to the latent cache layout. A block's key expansion is decoded and transposed to F32
+while its quantized value rows are copied unchanged; these temporary buffers live only while that block runs,
+including during layer streaming, and their peak bytes are reserved before sizing the expert cache.
+
+Shared K=V compression keeps bounded channelwise softmax accumulators and stores completed entries with their
+closing token in paged F32 auxiliary rows. Draft rollback, branch ancestry, sequences and saved prefixes carry
+both together. CPU fixtures cover sliding, overlapping CSA and nonoverlapping HCA attention, inverse output
+RoPE, grouped low-rank output and manifold-constrained residual streams. Against native transformers 5.19,
+the 512-token component stack at the trained head/index widths measures mean KL 0.00000065 and top-1 99.80%;
+an isolated first-layer CSA test matches all 512 top-2 selections. These fixtures explicitly use dense FFNs
+and omit learned sinks; they do not establish full DeepSeek-V4 support. Projections use the normal backend
+route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
+AVX2 and scalar). The F32 component fixture also routes projections through each available Metal/Vulkan
+backend and compares with the independent dense reference using the same error bound.
+Component projection tests cover all 26 storage formats and attention widths different
+from the residual width, using amplitude-balanced encoded block fixtures for formats without a writer.
+The Android regression runner includes `test_compression` when that executable is built.
+Raw rows remain allocated for the finite context, and auxiliary channels are reserved at
+every position in every block, including nonclosing positions; memory planning includes that cost.
+
+The final M4 Pro regression check used four CPU threads, F16 KV, one warmup and six balanced, back-to-back
+baseline/branch pairs per configuration. The 512-token CPU `liyab-bench` prefill medians were:
+
+| Original BF16 model | Saved baseline (tok/s) | Branch (tok/s) |
+| :--- | ---: | ---: |
+| Qwen3-0.6B | 87.95 | 88.00 |
+| Llama-3.2-1B-Instruct | 36.95 | 37.00 |
+| Qwen3.5-0.8B | 83.40 | 83.65 |
+
+CLI prefill/decode pairs also covered CPU, the BF16 Metal route with CPU matrix fallback, and actual Metal
+routes using F16 derivatives. An ordinary request rendered through each model's own template produced 128
+generated tokens in every measured turn; all 54 reply-byte/count pairs matched. Across 12 configurations,
+72 balanced pairs and 21 metrics, median paired speed ratios ranged from 0.993247 to 1.011333, within the
+unchanged ±3% gate. The six executable/library hashes stayed fixed, with no pacing, cancellation or thermal
+rerouting. Other model, build, test and download jobs were stopped for these measurements.
+
+GLM-4.7-Flash remains a real-model streaming smoke result, not a conformance claim. Its two-block F32 tiny
+checkpoint converted with b11819 matches 494 token IDs but fails numerically (mean KL 0.00019, top-1 58.22%).
+The export omits sigmoid `expert_gating_func`, and its `deepseek2` label does not distinguish the reference's
+1e-6 latent normalization from its 1e-5 block normalization. A diagnostic copy with sigmoid metadata and the
+derived latent-epsilon row reaches mean KL 0.00000 and top-1 100%; that changes the file and the scratch row,
+so it is not the branch's support gate. The published layout needs these facts represented unambiguously.
+
+The paged KV cache can carry auxiliary F32 index-key channels after each latent key row. They keep their original
+precision independently of F16, Q8_0, Q4_0 or Q4_1 main rows; each key row's byte size includes both encodings.
+Rounding an index score can change its discrete
+top-k selection. Page copies, rollback, context images and the prefix store carry these channels with the main
+row; key scaling leaves them unchanged. Their bytes count toward the memory budget and sequence context size.
+Mixed-format images use the store's raw-image fallback, including when lossy prefix compression is requested,
+so storage does not change index keys. Ordinary KV images retain their existing codecs and layout.
+
+**Sparse latent attention.** Lightning indexers project queries from the normalized query latent and keys from
+the block's normalized input, apply a separate key LayerNorm and RoPE, then combine rectified per-head dot
+products with learned signed weights. Each query attends only to its highest-scoring causal positions. Shared
+indexer blocks reuse the preceding full block's selected positions (`attention.indexer.types`). Main and indexer
+RoPE pairings are independent registry facts; GLM's latent RMS norms use epsilon 1e-6 independently of its block
+norm epsilon. With `index_topk` at least the visible context, attention is bit-identical to dense latent
+attention. Equal index scores select earlier positions first, preserving batching and rollback determinism.
+The description tool accepts F32 metadata rounding when comparing latent and block norm epsilons.
+The `deepseek32` row supplies the alternative indexer pairing. Its four-block tiny checkpoint at `index_topk=384`
+gives 485 identical token IDs, mean KL 0.00000 and top-1 99.59%; all 485 first-layer selections at top-k 8 match
+transformers exactly. Top-k 256 diagnostics at residual widths 256 and 512 both miss top-1 (98.76%).
+Pooled index keys are refused precisely, and sparse models currently refuse approximate segment relocation.
+Indexer scoring and both sparse attention forms use CPU scalar/NEON/AVX paths; projections use the existing
+operation routing, including Metal and Vulkan CPU fallbacks. The absorbed/expanded choice self-calibrates with
+valid synthetic index keys and accounts for the restricted absorbed attention work.
+
+A tiny GLM-5 checkpoint with all four blocks (three dense FFNs and one MoE), original latent/indexer widths and
+`index_topk=256` gives 494 identical token IDs, mean KL 0.00000 (maximum 0.00001), top-1 99.80% against transformers
+5.19 in F32, with F16 KV. At `index_topk=8`, all 494 first-layer position selections match transformers exactly.
+The full four-layer F32-reference diagnostics with top-k 8 and 32 fail the 99% top-1 gate (98.78% and 92.90%);
+top-k 32 compared against a diagnostic reference with the same F16 main-KV rounding reaches 99.59%. Those
+diagnostics expose numerical sensitivity at discrete selection boundaries and are not the support gate.
+The model's own chat template passes all 14 reference renders. Its `glm4` pre-tokenizer uses the Llama-3 split
+expression and merge rules. No real GLM-5 weights were loaded.
+
+GLM-5.2's four-block tiny checkpoint includes three full indexers and one shared-indexer/MoE block: 494 identical
+IDs, 493 positions, mean KL 0.00000, maximum 0.00008 and top-1 99.80% with the original latent/index widths and
+top-k 256. Its template passes 14 renders. Ling-mini-2.0's two-block F32 checkpoint covers fused QKV, partial RoPE,
+Q/K norms, dense and grouped MoE FFNs plus a shared expert: 512 identical IDs, mean KL 0.00000, maximum 0.00040,
+top-1 99.61% with F16 KV. Its older remote code requires transformers-5 compatibility shims, including restoring
+the nonpersistent RoPE buffer from its constructor formula after loading. Its template passes 14 renders.
+GLM-5.2 and Ling tokenizers match all three tokenizer texts. These are tiny-checkpoint results, without real
+weights. GLM-5.1's four-block checkpoint at top-k 256 gives 494 identical IDs, mean KL 0.00000, maximum 0.00001,
+top-1 99.80%, with all three tokenizer texts and 14 template renders matching.
+The description tool verifies individually observed expert calls, direct router linear operations and causal
+PyTorch SDPA or eager attention when an older implementation does not use transformers' attention registry.
+Eager scoring must match a scaled dot product with a full causal mask; unknown transforms are refused. Explicit
+`expert_weights_norm` metadata overrides the registry fallback, which the tool preserves for older files.
+Kimi K2's tiny numerical check on reference IDs gives mean KL 0.00000 and top-1 99.80%. Its `kimi-k2`
+pre-tokenizer and tokenizer-side tool sorting are integrated; complete cross-branch conformance remains to be established.
 
 **Latent attention's two forms.** The absorbed and the expanded form ([Supported models](#supported-models)) compute
 the same function and round differently, so their outputs are not bit-identical; each is bit-identical on its own
@@ -2320,7 +2784,7 @@ interpreter: `describe_model_registry`.
 | :--- | :--- |
 | `test_mmap` | Mapping, GGUF parsing and malformed-file rejection, split models, prefetcher, triple-buffer pipeline |
 | `test_device_detect` | SoC classification, backend ranking, sysfs thermal parsing, headroom bands, pacing, emergency guards, sampling only during work |
-| `test_text` | The regex engine, the pre-tokenizer table and NFC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
+| `test_text` | The regex engine, the pre-tokenizer table and NFC/NFKC against `tests/data/text_cases.txt` (Python's `regex` and `unicodedata`, cross-checked with the Hugging Face tokenizers' own splitting; NFKC matches its Unicode 9 normalizer); rejected regex syntax; byte-level BPE on generated vocabularies: merges, NFC per family, whole-piece lookup, missing bytes, Phi-3 special tokens, unknown pre-tokenizers; chat templates byte for byte against transformers (`tests/data/chat_templates.json`), Jinja semantics, layouts of turns and prefix stability, `render_chat` / `chat_format` through the engine and the C API, one BOS |
 | `test_engine` | All 24 quant formats bit-exact; kernels, each format the same bits for every batch size and layout; on x86-64 the AVX2 set against the scalar one in the same process (identical activation quantization and decodes, close dots, -128 weights); long-context attention the same bits for every batch split, thread count and KV cache type; tokenizers; transformer vs an independent float reference, for every query-group size; batching and rollback; MoE vs its dense twin; fused QKV and gate/up projections vs the separate matrices, bit for bit; block plans (windowed blocks from the architecture or the file, fused projections, LongRoPE, YaRN); streamed experts vs in-place reads; fused `[gate \| up]` experts vs the split tensors, bit for bit, in place and streamed (two reads per expert instead of three); latent attention (absorbed, over cached latents) vs an independent reference that expands per-head keys and values, batched equal to token by token, key scaling over latent rows (values included), through the engine with saved contexts and in every `latent_form`; its expanded form vs the absorbed form and the reference, the same bits for every split into passes and thread count over several tiles of expanded rows (F16, Q8_0 with key scaling, a sliding window with sinks), no further from an F16 cache than the absorbed form, absorbed decoding after an expanded prefill; the automatic form's work counts and threshold, calibrated once and then the same forms and bits while other threads load every core, the ratio kept in `cache_dir` (engines give the same sampled reply, models given the kept ratio the same logits bit for bit; damaged files measured again; in memory without a `cache_dir`); hybrid snapshots, also restored from a saved context; windowed blocks keeping only their window (Gemma 2 and 3, Phi-3, F16 and Q8_0) giving the logits of blocks keeping every position bit for bit over long prompts, decoding, rollback inside the margin and back to a snapshot, refused beyond it, in less memory; their saved contexts restored exactly, older files converted and other layouts refused; their conversations brought back by the prefix cache (replaced, edited back to a snapshot, saved as kept, from storage in a later engine) and their live context reused back to a snapshot; context reuse, also after cancelled work and saves and when a context's text ends inside a character; prefix cache in RAM and on storage (persisting for a later engine within its cap, a shared system prompt kept once and restored for a new conversation, a chat after a long system prompt set aside and restored while an edited draft is not, damaged files removed with the output unchanged, one engine per directory); key scaling (factor rule, Q8_0 against F16 on large key channels, saved contexts converted, factors kept in `cache_dir` and measured again when damaged; a model whose text cannot be encoded loads with keys unscaled and says so); cancelled prefill; forced continuations (one pass shared with the next token, the same output with or without speculative decoding, forced text cut inside a character); speculative decoding; suffix drafts (suffix arrays, the branch most occurrences agree on, earlier conversations stored once and within their caps, LRU, calibrated acceptance, draft length from acceptance and step cost, greedy and seeded sampling equal to plain decoding on attention-only and hybrid models, a stop inside a speculative step leaving the context plain decoding leaves); tree verification (the continuation tree likeliest first, siblings' probabilities within their parent's, calibrated from tree outcomes; a tree pass giving every branch a linear pass's bits and keep_path() that pass's context, rollbacks into it included, on dense, windowed, latent, hybrid and MoE models with Q8_0 and F16 caches; trees verified by the decoder giving plain decoding's tokens, greedy and seeded, and keeping a branch other than the likeliest); Metal vs CPU; C API |
 | `test_golden` | Every supported architecture's logits, pinned bit for bit per kernel set in `tests/data/golden_logits.txt` (the Mac and the Snapdragon phone give the same bits): one synthetic model per path of the forward pass (each architecture; QK norms before and after RoPE, gated attention, partial RoPE, `rope_freqs`, linear scaling, tied output; scaled embeddings, GeGLU, norms after the attention and the FFN, windowed and global blocks with their own RoPE bases, soft caps on the attention scores and the logits, the file's q·k scale; fused QKV and gate/up projections, LongRoPE short and long factors, YaRN (its own attention factor, and DeepSeek's log multiplier under key scaling); F16 KV, Q8_0 KV with key scaling (also measured through Q/K norms after RoPE and per-block RoPE tables), sliding window (also over windowed blocks); MoE with softmax or sigmoid gating, selection bias, shared expert and its gate, streamed experts, fused `[gate \| up]` experts in place and streamed (the split model's hashes); DeltaNet hybrids; latent attention with Q8_0 and F16 caches, key scaling over its keys and the values in them, low-rank queries, a dense leading block before MoE blocks with a shared expert, YaRN with DeepSeek's log multiplier, each in the absorbed and the expanded form, the expanded one also with a sliding window and sinks) |
 | `test_grammar` | Grammars for constrained decoding: grammar text (literals, UTF-8 classes, repetition, `%until`, `%json`, `%schema`, `%string`), JSON Schema accepted and refused (each refusal names the keyword and where), matching byte by byte with characters split anywhere, forced text stopping at choices and inside characters; masks over the vocabulary trie (split UTF-8 through byte tokens, end of generation only where the grammar accepts); generation on a random-weight model sampled hot, where every output parses and validates against its schema (checked by an independent validator); forced text with constrained spans, the same with plain, lookup and draft-model decoding; token healing (a forced token that a longer allowed token starts with is left to the model, one nothing extends stays forced); an XML call's bounded string value closing with the call (with `%string` it could run over the closing tag and keep the span open); determinism; unconstrained generation unchanged; the C API. With `LIYAB_GRAMMAR_MODEL=a.gguf,b.gguf`: tool-call arguments from real models and the cost of masking per token |
@@ -2333,6 +2797,7 @@ interpreter: `describe_model_registry`.
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
 | `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), each shape of a time read as local time, XML string values under a length bound or an unchecked format that cannot take in their closing tag, a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; with `LIYAB_TOOL_MODEL=a.gguf,b.gguf` on a Mac, real models answer questions for each tool through the app's prompt and structure, every call valid, and the grammar's cost per token is printed; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses; the local API's LoRA adapters (listed after the model by OpenAI, Anthropic and gRPC, selected by `model` or `adapter`, an unknown one refused); with `LIYAB_LIBRARY` and `LIYAB_TEST_MODEL=a.gguf`, the engine's lanes: an idle lane holding no sequence (the memory plan of no lane), a generation on the API's lane opening its sequence and running alongside the chat's, each reply what it is alone, the sequence closed once the lane is idle and opened again for the next request, one generation stopped without the other, the lanes closed with the model |
+| `test_ssm` | Mamba-1/Mamba-2 scans and convolution against independent scalar equations, SIMD tails, nonzero encoded projections in all 26 formats and four KV types, projection/scan-state ablations, prefill/decode/rollback logit and state invariants, repacked projections, Metal/Vulkan projection routing when available, incomplete block rejection and unsupported parallel attention/SSM refusal |
 
 Benchmarks and tools built with the tests:
 
@@ -2469,6 +2934,23 @@ Benchmarks and tools built with the tests:
   gives the model's own ids on three texts and `liyab-kl --kv f16` passes against transformers. How each fact is
   established and what the tool said about the supported architectures and others:
   [docs/model-descriptions.md](docs/model-descriptions.md).
+  Architecture traces use explicit causal masks so eager score implementations can be observed alongside
+  transformers' attention registry, observe the actual LayerNorm epsilon when it is a function argument,
+  and check scalar activation parameters against the checkpoint and GGUF.
+  Parallel blocks bind mixer and FFN norms independently, with a shared input norm when one tensor is absent.
+  Attention traces recognize repeated GQA keys and values before matching their source projections.
+  Observed GELU modes distinguish exact erf from tanh even when tiny inputs make their outputs nearly equal.
+  Classic host operations are checked with GPU projections through prefill, decode and rollback as well.
+  LayerNorm affine steps and ReLU/ReLU² have NEON, dispatched AVX2 and scalar paths; GELU/xIELU retain scalar
+  libm for their rounded transcendental functions.
+  Odd FFN widths exercise SIMD tails across batching and fused/split projections on every KV type.
+  Reference traces also bound typed child FFN/expert configurations, keeping original residual/head dimensions.
+  Unsupported gated xIELU FFNs are refused when describing the file.
+  Learned position embeddings combined with an embedding norm are refused, including bias-only norms.
+  Optional attention-output bias follows both ordinary and latent attention projections, in either latent form.
+  Local PyTorch `.bin` checkpoints, including indexed shards, use `weights_only` memory maps for tensor inspection;
+  remote inspection requires safetensors. `python tests/test_describe_model.py` checks both local readers with
+  the reference environment, including row bounds, saved gradient flags and lazy shard loading.
 
   ```bash
   tools/describe_model.py --self-test     # the registry parser and printer against architecture.cpp
@@ -2485,6 +2967,11 @@ Benchmarks and tools built with the tests:
   ```bash
   tools/tiny_checkpoint.py --model Qwen/Qwen3-0.6B --out tiny-qwen3
   ```
+* `tools/compression_reference.py PREFIX --out REPORT.json` compares a fixture emitted by
+  `build/test_compression --export-fixture PREFIX [--original-geometry] [--indexer-only]` with native transformers
+  shared-KV, compressor and residual modules. It reports logits and top-k selection agreement. The default
+  fixture retains all three attention kinds; `--indexer-only` isolates first-layer selection. This is component
+  evidence with dense FFNs and disabled sinks, not a full-model gate or a tokenizer check.
 * `tools/gen_text_tests.py` regenerates `tests/data/text_cases.txt` (needs `regex` and `tokenizers`), and
   `tools/chat_template_reference.py` regenerates `tests/data/chat_templates.json` from transformers.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
@@ -2576,7 +3063,7 @@ Implemented features are described above. These are next, in order:
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
    Youtu-LLM). A model's row is established from its Hugging Face implementation and a GGUF and verified by the
    conformance gate (`tools/describe_model.py`), which regenerates every row in the registry. Next:
-   * group-limited expert routing (DeepSeek-V3);
+   * sparse segment relocation (GLM-5 and DeepSeek-V3.2 have tiny sparse gates);
    * later, multimodal and classification models, and encoder-only embedding models (BERT, XLM-R: bidirectional
      attention, learned positions, LayerNorm with bias, WordPiece and Unigram vocabularies).
 2. **Op fusion and fewer synchronizations.** One command buffer per layer on Metal and Vulkan (today: per matmul),
@@ -2590,7 +3077,8 @@ Implemented features are described above. These are next, in order:
    for every sequence's KV cache, so a sequence's pages go back to the others when its context shrinks.
 6. **LoRA adapters, next.** [Adapters](#lora-adapters) for dense and MoE layers switched per request are in place.
    Next: the update computed on the GPU next to the base product (today the CPU adds it after an accelerator's
-   matmul), adapters of the token embeddings and of latent attention's per-head matrices, and a lower fixed cost per
+   matmul), adapters of the token embeddings, latent attention's separate/combined per-head matrices and
+   shared-KV's grouped first output projection, and a lower fixed cost per
    adapted matmul at low rank.
 7. **Local memory and retrieval** on the [pooling models](#embeddings-and-reranking): an index over the user's own
    data, an intent router, and an embedding model kept loaded next to the generative one; several inputs in one
@@ -2657,12 +3145,11 @@ Implemented features are described above. These are next, in order:
     locked in RAM;
   * the tests and tools rely on their manifest's UTF-8 code page (Windows 10 1903 and later) for non-ASCII paths
     of their own, such as a temporary directory under a user name with accents.
-* **Architectures not supported yet:** Gemma 3n, Phi-1/2 and Phi MoE; DeepSeek-V2 236B, V3 and R1 (group-limited
-  expert routing), V3.2 and V4. BPE pre-tokenizers beyond those of [Supported models](#supported-models) are not
-  supported either (a new one is a table row): such a model runs on token ids only, and a quantized KV cache stores
-  its keys unscaled (the key scales are measured on a text it cannot encode).
-  `tools/describe_model.py` lists what each model lacks; for OLMo 2, Granite and SmolLM3, see
-  [docs/model-descriptions.md](docs/model-descriptions.md#models-liyab-does-not-run).
+* **Architecture limits:** registry presence is not a full-model conformance claim. Full heterogeneous Gemma 4,
+  DeepSeek-V4, ChatGLM 3, IQuest-Coder, Sarvam-MoE and cross-family stage-2 compositions remain unverified or
+  incomplete; see [the coverage tiers](#architecture-coverage-and-validation). Group routing, Gemma 3n and Phi-2
+  are implemented and have the evidence recorded above. Exported tokenizer and chat metadata can still be wrong:
+  the engine follows the file, and `tools/describe_model.py --gate` checks it against the source.
 * **Latent attention:** the automatic form's threshold is the device's own, so two devices can round a long
   prompt's attention differently (each repeats its own bits run after run). A pass's form also follows its
   shape, so the same token can round differently when a prompt reaches the engine split into other passes
@@ -2678,7 +3165,7 @@ Implemented features are described above. These are next, in order:
   cache, a prompt that leaves a stored context inside a page restores to that page's start or to a snapshot
   (at most 63 tokens processed again that a model without windowed blocks would restore). With `segment_reuse`
   on they keep every position, at full attention's memory. The prefix cache is off for a model whose windowed
-  blocks have several windows or sit next to recurrent blocks (no such model is supported yet). Window pages are
+  blocks have several windows or sit next to recurrent blocks (including the new recurrent/windowed combinations). Window pages are
   stored raw on storage (the lossless chunk coding is not applied to them yet).
 * **Gemma 2 and 3:** Gemma 2 27B and Gemma 3 27B scale their
   queries by 1/√(d/heads), which their GGUFs do not record: they are not supported (they run with 1/√head_dim,
@@ -2691,7 +3178,8 @@ Implemented features are described above. These are next, in order:
   multiply row by row on the CPU (no tiled float kernel yet), which makes their files several times slower to embed
   with than Q8_0 ones.
 * **LoRA adapters:** the update runs on the CPU, also when the base matmuls run on a GPU. Refused: adapters of the
-  token embeddings, of latent attention's per-head `attn_k_b` / `attn_v_b`, and activated LoRA. Segment reuse is off
+  token embeddings, of latent attention's per-head `attn_k_b` / `attn_v_b` or combined `attn_kv_b`, of shared-KV's
+  grouped `attn_output_a`, and activated LoRA. Segment reuse is off
   while an adapter is selected. A draft model drafts without the adapter. On small models the update's fixed cost
   per matmul shows at low rank (+6% per token at rank 8 on a 0.5B model, see [LoRA adapters](#lora-adapters)).
 * **Constrained decoding:** object properties are written in the order the schema lists them; `oneOf` is matched as

@@ -39,12 +39,13 @@ constexpr uint32_t kLCount = 19, kVCount = 21, kTCount = 28, kNCount = kVCount *
 constexpr size_t kDecompositionCount = std::size(kDecompositions) / 3;
 constexpr uint32_t kComposesFlag = 0x80000000u;
 
-// Index of `cp` in kDecompositions, or -1.
-std::ptrdiff_t find_decomposition(uint32_t cp) noexcept {
-    size_t lo = 0, hi = kDecompositionCount;
+// Index of `cp` in a decomposition table of triples, or -1.
+template <size_t N>
+std::ptrdiff_t find_decomposition(uint32_t cp, const uint32_t (&rows)[N]) noexcept {
+    size_t lo = 0, hi = N / 3;
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
-        const uint32_t at = kDecompositions[mid * 3] & ~kComposesFlag;
+        const uint32_t at = rows[mid * 3] & ~kComposesFlag;
         if (at < cp) lo = mid + 1;
         else if (at > cp) hi = mid;
         else return static_cast<std::ptrdiff_t>(mid);
@@ -70,7 +71,33 @@ const std::unordered_map<uint64_t, uint32_t>& compositions() {
 // valid code point, combining class 0, no decomposition or composition.
 constexpr uint32_t kRawByte = 0x40000000u;
 
-void decompose(uint32_t cp, std::vector<uint32_t>& out) {
+// Normalization must preserve malformed bytes without consuming a later
+// valid character (which may itself compose). General regex decoding has
+// a different fast path; keep this validation local to normalization.
+uint32_t normalization_cp(std::string_view text, size_t& at) noexcept {
+    const auto lead = static_cast<unsigned char>(text[at]);
+    if (lead < 0x80) { ++at; return lead; }
+    const size_t length = utf8_length(lead);
+    auto raw = [&] { ++at; return kRawByte | lead; };
+    if (length == 1 || length > text.size() - at) return raw();
+    uint32_t cp = lead & (0x7F >> length);
+    for (size_t i = 1; i < length; ++i) {
+        const auto byte = static_cast<unsigned char>(text[at + i]);
+        if ((byte & 0xC0) != 0x80) return raw();
+        cp = (cp << 6) | (byte & 0x3F);
+    }
+    if ((length == 2 && cp < 0x80) || (length == 3 && cp < 0x800) ||
+        (length == 4 && cp < 0x10000) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return raw();
+    at += length;
+    return cp;
+}
+
+bool nfkc_assigned(uint32_t cp) noexcept {
+    return cp < kRawByte && run_value(kNfkcAssignedRuns, cp) != 0;
+}
+
+void decompose(uint32_t cp, std::vector<uint32_t>& out, bool compatibility) {
+    if (compatibility && !nfkc_assigned(cp)) { out.push_back(cp); return; }
     if (cp >= kSBase && cp < kSBase + kSCount) {
         const uint32_t s = cp - kSBase;
         out.push_back(kLBase + s / kNCount);
@@ -78,13 +105,22 @@ void decompose(uint32_t cp, std::vector<uint32_t>& out) {
         if (s % kTCount != 0) out.push_back(kTBase + s % kTCount);
         return;
     }
-    const std::ptrdiff_t i = cp < 0xC0 || cp >= kRawByte ? -1 : find_decomposition(cp);
+    if (compatibility && cp >= kCompatibilityDecompositions[0] && cp < kRawByte) {
+        const auto index = find_decomposition(cp, kCompatibilityDecompositions);
+        if (index >= 0) {
+            const size_t offset = kCompatibilityDecompositions[index * 3 + 1];
+            const size_t count = kCompatibilityDecompositions[index * 3 + 2];
+            for (size_t part = 0; part < count; ++part) decompose(kCompatibilityParts[offset + part], out, true);
+            return;
+        }
+    }
+    const std::ptrdiff_t i = cp < 0xC0 || cp >= kRawByte ? -1 : find_decomposition(cp, kDecompositions);
     if (i < 0) {
         out.push_back(cp);
         return;
     }
-    decompose(kDecompositions[i * 3 + 1], out);
-    if (const uint32_t second = kDecompositions[i * 3 + 2]) decompose(second, out);
+    decompose(kDecompositions[i * 3 + 1], out, compatibility);
+    if (const uint32_t second = kDecompositions[i * 3 + 2]) decompose(second, out, compatibility);
 }
 
 uint8_t ccc(uint32_t cp) noexcept { return cp < 0x300 || cp >= kRawByte ? 0 : run_value(kCombiningClassRuns, cp); }
@@ -180,40 +216,38 @@ void append_utf8(std::string& out, uint32_t cp) {
 
 bool nfc_quick_check(std::string_view text) noexcept {
     for (size_t i = 0; i < text.size();) {
-        if (static_cast<unsigned char>(text[i]) < 0xCC) {  // below U+0300: never changed by NFC
-            i += utf8_length(static_cast<unsigned char>(text[i]));
+        if (static_cast<unsigned char>(text[i]) < 0x80) {
+            ++i;
             continue;
         }
-        const uint32_t cp = decode_utf8(text, i);
-        if (run_value(kNfcMaybeRuns, cp) != 0) return false;
+        const uint32_t cp = normalization_cp(text, i);
+        if (cp >= kRawByte || (cp >= 0x300 && run_value(kNfcMaybeRuns, cp) != 0)) return false;
     }
     return true;
 }
 
-std::string to_nfc(std::string_view text) {
-    if (nfc_quick_check(text)) return std::string(text);
+static std::string to_composed(std::string_view text, bool compatibility) {
     // Full canonical decomposition, keeping malformed bytes as they are.
     std::vector<uint32_t> cps;
     cps.reserve(text.size());
     for (size_t i = 0; i < text.size();) {
-        const size_t at = i;
-        const uint32_t cp = decode_utf8(text, i);
-        if (cp == 0xFFFD && i == at + 1 && static_cast<unsigned char>(text[at]) >= 0x80) {
-            cps.push_back(kRawByte | static_cast<unsigned char>(text[at]));
-        } else {
-            decompose(cp, cps);
-        }
+        const uint32_t cp = normalization_cp(text, i);
+        if (cp >= kRawByte) cps.push_back(cp);
+        else decompose(cp, cps, compatibility);
     }
+    const auto combining = [compatibility](uint32_t cp) {
+        return compatibility && !nfkc_assigned(cp) ? uint8_t{0} : ccc(cp);
+    };
     // Canonical ordering: each run of non-starters, stably by combining class.
     for (size_t i = 0; i < cps.size();) {
-        if (ccc(cps[i]) == 0) {
+        if (combining(cps[i]) == 0) {
             ++i;
             continue;
         }
         size_t end = i;
-        while (end < cps.size() && ccc(cps[end]) != 0) ++end;
+        while (end < cps.size() && combining(cps[end]) != 0) ++end;
         std::stable_sort(cps.begin() + static_cast<std::ptrdiff_t>(i), cps.begin() + static_cast<std::ptrdiff_t>(end),
-                         [](uint32_t a, uint32_t b) { return ccc(a) < ccc(b); });
+                         [&](uint32_t a, uint32_t b) { return combining(a) < combining(b); });
         i = end;
     }
     // Canonical composition: a character joins the last starter unless a
@@ -223,9 +257,10 @@ std::string to_nfc(std::string_view text) {
     std::ptrdiff_t starter = -1;
     uint8_t last_class = 0;  // class of the last character kept after the starter (0: none)
     for (const uint32_t cp : cps) {
-        const uint8_t cls = ccc(cp);
+        const uint8_t cls = combining(cp);
         if (starter >= 0 && (last_class == 0 || last_class < cls)) {
-            if (const uint32_t c = compose(composed[static_cast<size_t>(starter)], cp)) {
+            if (const uint32_t c = compose(composed[static_cast<size_t>(starter)], cp);
+                c != 0 && (!compatibility || nfkc_assigned(c))) {
                 composed[static_cast<size_t>(starter)] = c;
                 continue;
             }
@@ -245,6 +280,15 @@ std::string to_nfc(std::string_view text) {
         else append_utf8(out, cp);
     }
     return out;
+}
+
+std::string to_nfc(std::string_view text) {
+    return nfc_quick_check(text) ? std::string(text) : to_composed(text, false);
+}
+
+std::string to_nfkc(std::string_view text) {
+    const bool ascii = std::all_of(text.begin(), text.end(), [](unsigned char byte) { return byte < 0x80; });
+    return ascii ? std::string(text) : to_composed(text, true);
 }
 
 }  // namespace liyab::unicode

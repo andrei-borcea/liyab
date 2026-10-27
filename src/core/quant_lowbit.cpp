@@ -1103,6 +1103,43 @@ float dot_codebook4_q8_0(const Block* x, const BlockQ8_0* y, int64_t nb, const i
     return sumf;
 }
 
+// Share nibble lookup and exponent conversion across activation rows. Keep
+// the paired-block epilogue of the decode kernel so batching preserves bits.
+template <int NR>
+void dot_mxfp4_rows_neon(const BlockMxfp4* w, const BlockQ8_0* const* x, int64_t nb, float* out) noexcept {
+    const int8x16_t values = vld1q_s8(kMxfp4Values);
+    const uint8x16_t mask = vdupq_n_u8(15);
+    float sum[NR]{};
+    int64_t b = 0;
+    for (; b + 1 < nb; b += 2) {
+        const uint8x16_t a = vld1q_u8(w[b].qs), z = vld1q_u8(w[b + 1].qs);
+        const int8x16_t lo = vqtbl1q_s8(values, vandq_u8(a, mask));
+        const int8x16_t hi = vqtbl1q_s8(values, vshrq_n_u8(a, 4));
+        const int8x16_t lo2 = vqtbl1q_s8(values, vandq_u8(z, mask));
+        const int8x16_t hi2 = vqtbl1q_s8(values, vshrq_n_u8(z, 4));
+        const float d = e8m0_to_fp32_half(w[b].e), d2 = e8m0_to_fp32_half(w[b + 1].e);
+        for (int r = 0; r < NR; ++r) {
+            const auto* y = x[r];
+            const int32x4_t p = vdot(vdot(vdupq_n_s32(0), lo, vld1q_s8(y[b].qs)), hi, vld1q_s8(y[b].qs + 16));
+            const int32x4_t p2 = vdot(vdot(vdupq_n_s32(0), lo2, vld1q_s8(y[b + 1].qs)), hi2, vld1q_s8(y[b + 1].qs + 16));
+            sum[r] += d * h2f(y[b].d) * static_cast<float>(vaddvq_s32(p)) +
+                      d2 * h2f(y[b + 1].d) * static_cast<float>(vaddvq_s32(p2));
+        }
+    }
+    for (; b < nb; ++b) {
+        const float d = e8m0_to_fp32_half(w[b].e);
+        for (int r = 0; r < NR; ++r) {
+            int32_t v = 0;
+            for (int j = 0; j < 16; ++j) {
+                v += x[r][b].qs[j] * kMxfp4Values[w[b].qs[j] & 15] +
+                     x[r][b].qs[j + 16] * kMxfp4Values[w[b].qs[j] >> 4];
+            }
+            sum[r] += d * h2f(x[r][b].d) * static_cast<float>(v);
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
 #endif  // LIYAB_LOWBIT_NEON
 
 }  // namespace
@@ -1284,6 +1321,25 @@ float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
                               [](const BlockMxfp4& b) { return e8m0_to_fp32_half(b.e); });
 #else
     return dot_ext_q8_0(DType::MXFP4, row, x, n);
+#endif
+}
+
+void dot_mxfp4_q8_0_rows(const void* row, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept {
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled()) return x86::dot_mxfp4_q8_0_rows(row, x, rows, n, out);
+#endif
+#if defined(LIYAB_LOWBIT_NEON)
+    const auto* w = static_cast<const BlockMxfp4*>(row);
+    int32_t r = 0;
+    for (; r + 4 <= rows; r += 4) dot_mxfp4_rows_neon<4>(w, x + r, n / kBlock, out + r);
+    switch (rows - r) {
+        case 3: dot_mxfp4_rows_neon<3>(w, x + r, n / kBlock, out + r); break;
+        case 2: dot_mxfp4_rows_neon<2>(w, x + r, n / kBlock, out + r); break;
+        case 1: out[r] = dot_mxfp4_q8_0(row, x[r], n); break;
+        default: break;
+    }
+#else
+    for (int32_t r = 0; r < rows; ++r) out[r] = dot_mxfp4_q8_0(row, x[r], n);
 #endif
 }
 

@@ -51,7 +51,8 @@ WORK = PHONE_DIR + "/reg"  # this script's binaries and scratch files
 APP = "com.liyab.chat"
 API_PORT = 8642
 TESTS = ["test_mmap", "test_device_detect", "test_kv_cache", "test_backends", "test_engine", "test_text",
-         "test_golden", "test_grammar", "test_experimental", "test_pooling", "test_kv_reuse", "test_sequences"]
+         "test_golden", "test_grammar", "test_experimental", "test_pooling", "test_kv_reuse", "test_sequences",
+         "test_lora", "test_ssm", "test_compression"]
 MAX_TOKENS = 64  # per turn
 # The app's defaults (Settings): CPU, Balanced, 50 °C skin limit, 5500 MiB budget, automatic requantization. Like
 # the app, the CLI keeps what it measures once per model (the KV cache's key scales) in a cache directory (run_cli),
@@ -519,7 +520,7 @@ def main():
     parser.add_argument("--app-model", default="moe.gguf", help="the CLI model file that holds the app's model, whose "
                         "replies the app's must equal (default moe.gguf)")
     parser.add_argument("--no-build", action="store_true", help="use the binaries in build/android as they are")
-    parser.add_argument("--no-tests", action="store_true", help="skip the unit tests")
+    parser.add_argument("--no-tests", action="store_true", help="skip the unit tests (otherwise every test binary must be present)")
     parser.add_argument("--no-cli", action="store_true", help="skip the CLI runs")
     parser.add_argument("--no-app", action="store_true", help="skip the app")
     parser.add_argument("--accept", action="store_true", help="store this run's replies as the references")
@@ -539,11 +540,13 @@ def main():
         note("building for Android (scripts/build_android.sh --experimental)")
         subprocess.run([os.path.join(ROOT, "scripts", "build_android.sh"), "--experimental"], check=True,
                        stdout=subprocess.DEVNULL)
-    files = ["libliyab.so", "liyab-cli"] + ([] if args.no_tests else [t for t in TESTS
-                                                                      if os.path.exists(os.path.join(BUILD, t))])
+    files = ["libliyab.so", "liyab-cli"] + ([] if args.no_tests else TESTS)
+    missing = [name for name in files if not os.path.isfile(os.path.join(BUILD, name))]
+    if missing:
+        parser.error("Android build is incomplete; missing: " + ", ".join(missing))
     phone.shell(f"mkdir -p {WORK}/data")
     phone.adb("push", *[os.path.join(BUILD, f) for f in files], WORK, timeout=600)
-    for data in ("quant_vectors.bin", "golden_logits.txt", "text_cases.txt", "chat_templates.json"):
+    for data in ("quant_vectors.bin", "ssm_quant_vectors.bin", "golden_logits.txt", "text_cases.txt", "chat_templates.json"):
         phone.adb("push", os.path.join(ROOT, "tests", "data", data), WORK + "/data")
 
     references = load_json(REFERENCES, {})

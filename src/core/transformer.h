@@ -7,14 +7,17 @@
 // mixer — softmax attention (GQA, separate or fused QKV projections, RoPE in
 // either pairing with a per-block table, LongRoPE factors or YaRN, optional QKV
 // bias, per-head Q/K norm before or after RoPE, optional sigmoid output gate,
-// optional sliding window, optional soft cap), multi-head latent attention
+// optional sliding window, optional soft cap, optional sink logit per head,
+// optional output bias), multi-head latent attention
 // (absorbed queries over one cached [RoPE key | latent] row per position,
-// see LatentAttention) or a Gated DeltaNet linear-attention recurrence —
-// followed by a gated dense FFN (SwiGLU or GeGLU, separate or fused gate and
-// up projections) or a mixture of experts (router + top-k routed experts +
+// see LatentAttention) a Gated DeltaNet, Mamba, short-convolution or Kimi Delta Attention recurrence —
+// followed by a gated dense FFN (SwiGLU, GeGLU or gpt-oss's clamped SwiGLU,
+// separate or fused gate and up projections) or a mixture of experts (router,
+// optionally with a bias, + top-k routed experts, optionally with biases, +
 // optional gated shared expert), each optionally followed by its own norm
-// before the residual add. So hybrid models (Qwen3.5: three DeltaNet blocks
-// per attention block), models that alternate windowed and global attention
+// before the residual add. So hybrid models (Qwen3.5 and Qwen3-Next: three
+// DeltaNet blocks per attention block; LFM2: short convolutions and
+// attention), models that alternate windowed and global attention
 // (Gemma 2 and 3), models with fused projections (Phi-3), latent attention
 // (DeepSeek) and plain transformers (Llama, Mistral, Qwen2/3) share one
 // forward pass. Tensor precision is per
@@ -178,6 +181,28 @@ struct TransformerOptions {
     LatentForm latent_form = LatentForm::Auto;
 };
 
+// Owns the split execution views of one old combined MLA projection.
+// bind() validates [head][nope + value][rank], decodes/transposes only keys
+// to F32 and copies value bytes unchanged. Source bytes are needed only
+// during bind(); its name must outlive these views. Views remain valid
+// until the next bind() or destruction. Single-thread ownership; do not
+// bind while another thread reads its views. InvalidModel for bad shapes,
+// Unsupported for formats that are not ordinary on-disk weight rows.
+class CombinedLatentWeights {
+public:
+    Status bind(const TensorView& source, const LatentAttention& geometry, int32_t heads);
+    [[nodiscard]] const TensorView& key() const noexcept { return key_; }
+    [[nodiscard]] const TensorView& value() const noexcept { return value_; }
+    CombinedLatentWeights() = default;
+    CombinedLatentWeights(const CombinedLatentWeights&) = delete;
+    CombinedLatentWeights& operator=(const CombinedLatentWeights&) = delete;
+
+private:
+    std::vector<float> keys_;
+    std::vector<uint8_t> values_;
+    TensorView key_, value_;
+};
+
 class Transformer {
 public:
     // One sequence's state; see "Several sequences" below.
@@ -187,6 +212,12 @@ public:
 
     [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
     [[nodiscard]] const MmapLoader& file() const noexcept { return *file_; }
+    // Stable model identity for derived calibration and cache files. New plan
+    // features hash the complete first GGUF header; legacy plans retain the
+    // size/first-MiB identity. Constant after load, safe for concurrent reads.
+    [[nodiscard]] uint64_t file_fingerprint() const noexcept {
+        return variant_fingerprint_ != 0 ? variant_fingerprint_ : model_fingerprint(file_->file());
+    }
     [[nodiscard]] MmapLoader& mutable_file() noexcept { return *file_; }
     [[nodiscard]] const KvCache& kv_cache() const noexcept { return *kv_; }
     [[nodiscard]] int32_t context_length() const noexcept { return context_length_; }
@@ -208,7 +239,7 @@ public:
     // itself) alone followed the context: at position n_past() + its depth,
     // attending to the context and to its ancestors only (the same visible
     // positions, in the same order and spans, as a linear pass over its
-    // branch), recurrent (DeltaNet) blocks continuing from the state after
+    // branch), stateful (DeltaNet or compression) blocks continuing from the state after
     // its parent. So its row of logits (one per token, in token order, as
     // Logits::All) has the bits a linear pass over its branch gives it
     // (attention never depends on the batch; the CPU backend's matmuls give a
@@ -301,7 +332,7 @@ public:
     static constexpr int32_t kLatentTileMin = 16;
     static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
-    // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
+    // Bytes held by the recurrent (DeltaNet, Mamba, ShortConv, Kda and compression) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     // The most a context made now (make_context()) holds besides its KV
     // pages, which it maps as it uses them: its recurrent states, its
@@ -313,7 +344,7 @@ public:
     // exactly as it always has.
     [[nodiscard]] size_t context_state_bytes() const noexcept;
     // Whether the context carries a state bound to its position, beyond KV
-    // rows any prefix of it can be cut from: recurrent (DeltaNet) states, or
+    // rows any prefix of it can be cut from: recurrent (DeltaNet or compression) states, or
     // the rows of the last window of windowed attention blocks, whose older
     // rows the cache lets go (KvCache::layer_windows). Such a context returns
     // only to where that state is kept (snapshots, the rollback margin).
@@ -327,7 +358,7 @@ public:
     // block, a few hundred per token: noise next to the matmuls they time.
     struct PhaseTimes {
         double attention = 0.0;      // softmax-attention mixers, projections included
-        double delta_net = 0.0;      // Gated DeltaNet mixers, projections included
+        double delta_net = 0.0;      // recurrent mixers (Gated DeltaNet, Mamba, ShortConv, Kda), projections included
         double router = 0.0;         // MoE routers, top-k selection and expert prediction
         double experts = 0.0;        // routed experts, waits for streamed ones included
         double shared_expert = 0.0;  // MoE shared expert
@@ -380,7 +411,7 @@ public:
     // positions, as long as the windowed blocks still hold the rows of the
     // window before n (the rollback margin kept behind the end, a snapshot's
     // pinned window: InvalidArgument otherwise, see KvCache::truncate()).
-    // Recurrent (DeltaNet) states cannot be rewound, so hybrid models restore
+    // Recurrent (DeltaNet or compression) states cannot be rewound, so hybrid models restore
     // a copy instead: they accept n == 0, n == n_past(), any n whose position
     // n - 1 is still inside the rollback window, or the position of a state
     // snapshot (Unsupported otherwise). Snapshots past n are discarded.
@@ -457,7 +488,7 @@ public:
         int32_t n = 0;
         std::function<const uint8_t*(int32_t page)> page;
         std::function<const uint8_t*(int32_t page)> window_page;  // windowed blocks only
-        std::span<const float> state;  // empty without recurrent blocks
+        std::span<const float> state;  // recurrent_state_bytes() / sizeof(float), possibly zero
         std::vector<SnapshotImage> snapshots;
     };
     // Writes `image` in write_state()'s format, as if it were the context
@@ -499,6 +530,7 @@ public:
     // state image in order ([conv | ssm] of each recurrent block; one part
     // for a snapshot), read in place: written to storage without a copy.
     // Valid until the context changes; empty for another position.
+    // Empty components are omitted, including a stateless one-tap mixer.
     [[nodiscard]] std::vector<std::span<const float>> kept_state_parts(int32_t pos) const;
 
     // Float storage for recurrent-state images that is not zero-filled when
@@ -534,6 +566,7 @@ public:
     // for one snapshot image (a kept one, else a new one, not zero-filled).
     // adopt_context() then makes positions [0, n) the context.
     void begin_restore();
+    // Empty components are omitted: every returned span is safe to copy.
     [[nodiscard]] std::vector<std::span<float>> recurrent_parts();
     [[nodiscard]] StateBuffer take_snapshot_buffer();
     struct OwnedSnapshot {
@@ -639,6 +672,11 @@ public:
     // they meet (a latent-attention head's absorbed query). Valid until the
     // next pass.
     [[nodiscard]] std::span<const float> last_queries() const noexcept { return q_; }
+    // Sparse cache-row indices selected for each query of the last block's
+    // pass, empty for dense attention. Valid until the next mixer pass.
+    [[nodiscard]] std::span<const std::vector<int32_t>> last_index_positions() const noexcept {
+        return index_positions_;
+    }
 
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as
@@ -734,6 +772,7 @@ private:
     enum WeightRole : size_t {
         kQ, kK, kV, kO,              // attention (kQ yields [q | gate] per head when gated)
         kQkv, kZ, kAlpha, kBeta, kSsmOut,  // DeltaNet: conv input, output gate, decay, write strength, output
+                                        // kZ also holds a separate softmax-attention output gate
         kGate, kUp, kDown,           // SwiGLU FFN
         kRouter, kGateExps, kUpExps, kDownExps,  // MoE: router [n_embd x n_expert], experts stacked on dim 2
                                                  // (fused_gate_up: kUpExps holds [gate | up], no kGateExps)
@@ -742,29 +781,83 @@ private:
         // attn_q_a / attn_q_b, attn_kv_a_mqa [n_embd x (kv_rank + rope_dim)], and per head
         // attn_k_b [nope_dim -> kv_rank] (absorbs a query) and attn_v_b [kv_rank -> v_dim] (expands a value)
         kQa, kQb, kKvA, kKb, kVb,
+        // Mamba (kSsmOut: out_proj): in_proj, Mamba-1's x_proj [d_inner -> dt_rank + 2 d_state] and dt_proj
+        // [dt_rank -> d_inner]
+        kSsmIn, kSsmX, kSsmDt,
+        // LFM2 short convolution: shortconv.in_proj [d -> 3d: B | C | x] and shortconv.out_proj
+        kConvIn, kConvOut,
+        // Qwen3-Next DeltaNet: ssm_ba [d -> 2 x value heads], beta and alpha interleaved per key head
+        kBa,
+        // Kimi Delta Attention (kQ, kK, kV its projections, kBeta the write strength, kSsmOut attn_output):
+        // the low-rank projections of the per-channel decay (ssm_f_a, ssm_f_b) and of the output gate
+        // (ssm_g_a, ssm_g_b)
+        kFa, kFb, kGa, kGb,
+        // Laurel's low-rank branch [n_embd -> rank -> n_embd]; per-layer embeddings' gate
+        // [n_embd -> ple_dim] and projection back [ple_dim -> n_embd] (ModelConfig::ple_dim)
+        kLaurelL, kLaurelR, kPleGate, kPleProj,
+        kIndexQ, kIndexK, kIndexWeights,  // DSA indexer projections
+        kKvB,  // older MLA files: combined per-head [key | value] expansion
+        kSharedKv, kOutputA, kOutputB,
+        kCompressKv, kCompressGate, kIndexCompressKv, kIndexCompressGate,
+        kHcAttn, kHcFfn,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
     struct Layer {
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
-        int32_t state_slot = -1;  // index into states_ (DeltaNet)
+        int32_t state_slot = -1;  // index into states_ (recurrent mixer or compression)
         int32_t window = 0;       // attention: visible positions (BlockPlan::windowed); 0: all
         int32_t rope_table = 0;   // attention: index into rope_tables_
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
+        std::vector<float> index_norm, index_bias;  // index-key LayerNorm (epsilon 1e-6)
         std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
         std::vector<float> conv1d;   // [channel][kernel] taps
-        std::vector<float> ssm_a;    // per value head: -exp(A_log)
-        std::vector<float> ssm_dt;   // per value head: decay bias
-        std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
+        std::vector<float> ssm_a;    // -exp(A_log): per value head (DeltaNet, Mamba-2), per [channel][state] (Mamba-1)
+        std::vector<float> ssm_dt;   // dt bias: per value head (DeltaNet, Mamba-2), per channel (Mamba-1)
+        std::vector<float> ssm_norm; // gated RMSNorm weight: per head dim (DeltaNet), per channel (Mamba-2)
+        // Mamba: the convolution's bias per channel, the D skip per channel
+        // (Mamba-1) or head (Mamba-2), optional in_proj / out_proj biases
+        // and Mamba-1's optional weighted norms of dt, B and C (empty: none).
+        std::vector<float> conv_bias, ssm_d, ssm_in_bias, ssm_out_bias, dt_norm, b_norm, c_norm;
+        std::vector<float> in_bias, out_bias;  // ShortConv projection biases
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
+        // Optional LayerNorm biases (ArchSpec::norm Layer) of attn_norm, ffn_norm and the Q/K norms. With
+        // per-head Q/K norm weights (StableLM 2 12B, Command-R+) q_norm / k_norm hold one head_dim row per
+        // head; a parallel block without an FFN norm of its own has an empty ffn_norm (it shares attn_norm's).
+        std::vector<float> attn_norm_b, ffn_norm_b, q_norm_b, k_norm_b;
+        // Optional projection biases, added after their matmuls: attention output, FFN gate, up and down.
+        std::vector<float> bo, b_gate, b_up, b_down;
+        // Optional: attn_sinks, one learned logit per query head that joins
+        // the softmax's denominator (attention()).
+        std::vector<float> sinks;
+        std::vector<float> router_bias;   // optional: ffn_gate_inp.bias, added to the router's logits
+        // Optional per-expert biases of the experts' projections, [expert][rows]
+        // (ffn_gate_exps.bias, ffn_up_exps.bias, ffn_down_exps.bias), each
+        // added after its projection.
+        std::vector<float> gate_exps_bias, up_exps_bias, down_exps_bias;
+        std::vector<float> laurel_norm;   // Laurel: norm of its branch's output
+        // AltUp (ModelConfig::altup_streams K): the router [K][n_embd] and its
+        // input norm, the prediction coefficients [K * K][K] and the
+        // correction coefficients [K][K] (rows of the converter's matrices),
+        // and the optional scale of the corrected active stream.
+        std::vector<float> altup_router, altup_router_norm, altup_predict, altup_correct, altup_correct_scale;
+        std::vector<float> ple_norm;      // per-layer embeddings: norm after their projection (post_norm)
+        float output_scale = 1.0f;        // layer_output_scale: multiplies the residual stream after the block
+        std::vector<float> compress_bias, compress_norm, index_compress_bias, index_compress_norm;
+        std::vector<float> hc_attn_base, hc_attn_scale, hc_ffn_base, hc_ffn_scale;
     };
-    // Recurrent memory of one DeltaNet block.
+    // Stateful memory: recurrent mixers and compression share checkpoints and context images.
     struct RecurrentState {
+        // Compression stores bounded softmax accumulators in conv, with ssm empty.
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
-        std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
+        // DeltaNet: per value head a [head_dim (value) x head_dim (key)]
+        // matrix. Mamba-1: per channel d_state values; Mamba-2: per head a
+        // [head_dim x d_state] matrix.
+        // ShortConv has no scan state; Kda keeps one square state per head.
+        std::vector<float> ssm;
         // Rollback ring: slot s holds [conv | ssm] after the token at the
         // position checkpoint_pos_[s] (slot = position % rollback window).
         std::vector<float> checkpoints;
@@ -789,6 +882,12 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
+    void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table, RopeLayout layout) const;
+    Status indexer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    std::vector<float> index_q_, index_k_, index_weights_;
+    // Per batch row: selected physical cache positions, in causal order.
+    // Empty outside indexed blocks; keys themselves live in the paged cache.
+    std::vector<std::vector<int32_t>> index_positions_;
     // One sequence's part of the current pass (segs_): its tokens are rows
     // [first, first + n) of the batch, and the state they read and write is
     // its context's, the live one's (forward(), and every pass of a single
@@ -843,11 +942,44 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // Mamba-1 and Mamba-2 (ModelConfig::mamba; see the definitions).
+    Status mamba_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status mamba2_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // Mamba: the causal convolution of `channels` channels starting at
+    // column `col` of the rows of `in` (row stride `in_stride`), each
+    // segment's tokens continuing its own history (bias, SiLU), into the same
+    // columns of `out` (row stride `out_stride`; it may be `in`), with the
+    // rollback checkpoints and tree branches of delta_net_mixer().
+    void mamba_conv(const Layer& L, const float* in, size_t in_stride, float* out, size_t out_stride, size_t col,
+                    size_t channels, ThreadPool& pool);
+    // A recurrent block's rollback checkpoint after token i of segment s
+    // ([conv | ssm] of `st`, ring slot (n_past + i) % rollback), or nullptr
+    // when that token records none (only the segment's last `rollback`
+    // tokens do, and only when it checkpoints).
+    [[nodiscard]] static float* checkpoint_slot(const Segment& s, RecurrentState& st, size_t i) noexcept;
+    // Tree pass (forward_tree): whether token i continues another token than
+    // the one before it, and so starts from its parent's checkpoint.
+    [[nodiscard]] bool tree_branches(size_t i) const noexcept {
+        return !tree_depth_.empty() && i > 0 && tree_parent_[i] != static_cast<int32_t>(i) - 1;
+    }
+    // LFM2's gated short convolution (MixerKind::ShortConv) and Kimi Delta
+    // Attention (MixerKind::Kda): recurrent mixers that continue each
+    // segment's state, record its checkpoints and start tree branches from
+    // their parents' as delta_net_mixer() does.
+    Status short_conv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status kda_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                           const uint8_t* head_mask);
+    Status hyper_collapse(const TensorView& projection, const std::vector<float>& base,
+                          const std::vector<float>& scale, int32_t n, const Route& route);
+    void hyper_add(int32_t n);
+    Status hyper_head(int32_t n, const Route& route);
     // Multi-head latent attention (ModelConfig::mla), in the form forward()
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
     // or keys and values expanded per head from the cached latents
-    // (latent_expanded()); then attn_output.
+    // (latent_expanded()); then attn_output and its optional output bias,
+    // just as for ordinary attention.
     Status latent_attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
                                   ThreadPool& pool, const uint8_t* head_mask);
     // Latent attention's projections of the n normalized rows in xb_: each
@@ -882,7 +1014,7 @@ private:
     Status per_head_matmul(const Route& route, const TensorView& stacked, const float* in, float* out, int32_t n);
     // BlockPlan::fused_qkv: projects xb_ through the block's attn_qkv on
     // `backend` and splits each token's [q | k | v] into q_, k_ and v_.
-    Status project_fused_qkv(const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
+    Status project_fused_qkv(const Layer& layer, const Route& route, Backend* backend, const BlockWeights& w, int32_t n);
     // FFNs: read the normalized input from xb_, leave the output in xb_.
     Status dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, FfnMatmulHook* hook);
     Status moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, const Route& route);
@@ -905,20 +1037,34 @@ private:
     // values of attention block `kv_slot`, each segment's tokens over its own
     // cache (segments in the expanded latent form are left out: see
     // latent_expanded); `window` > 0 limits each query to its last `window`
-    // positions (within what the KV cache keeps visible). Leaves each
+    // positions (within what the KV cache keeps visible). Layer::sinks joins
+    // each head softmax denominator without a value contribution. Leaves each
     // token's heads in att_, value_dim channels per head.
-    void attention(int32_t kv_slot, int32_t window, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    void attention(const Layer& layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
-    // nullptr: none) and keys (n_head_kv heads), where the block has them.
+    // nullptr: none) and keys (n_head_kv heads; nullptr: none), where the block has them.
     void qk_norm(const Layer& L, float* q, float* k) const;
+    // One row of n values through the model's norm (ArchSpec::norm) with
+    // weight `w` and bias `b` (nullptr: none; RMSNorm always has a weight),
+    // epsilon ModelConfig::rms_eps. `out` may be `x`.
+    void norm_row(const float* x, const float* w, const float* b, float* out, int32_t n) const;
+    // Adds the learned absolute position embedding of each batch row's
+    // position (pos_of) to x_; no-op without position_embd. ContextFull for
+    // a position past its rows.
+    Status add_positions(int32_t n);
+    // Clamps n values to [-ModelConfig::clamp_kqv, clamp_kqv] (no-op at 0).
+    void clamp_kqv(float* x, size_t n) const;
     // Calibration (key_ranges_ set): one token's unrotated queries and keys of
     // block `L`, as the ranges need them whatever the Q/K norm order.
     void add_key_ranges(const Layer& L, const float* q, const float* k);
     // Divides one token's keys (n_head_kv heads) by the key scales of
     // attention block `kv_slot` and multiplies its queries (n_head heads;
     // nullptr: none) by them. No-op without scales.
-    void scale_keys(int32_t kv_slot, float* q, float* k) const;
+    void scale_keys(const Layer& layer, float* q, float* k) const;
+    // Store only this block's real heads and zero-pad the fixed KV image's
+    // remaining heads. Every forward and early-exit path shares this rule.
+    void store_kv(const Layer& layer, KvCache& cache, int32_t pos, const float* k, const float* v);
     Status matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y, int32_t n);
     // Grouped variant (shared input); falls back to the CPU as a whole group.
     Status matmul_group(const Route& route, Backend* backend, std::span<const TensorView* const> ws, const float* x,
@@ -933,9 +1079,28 @@ private:
     // Final norm + LM head over `rows` hidden rows starting at `first_row` of
     // x_, then the final soft-cap (if any) on `pool`.
     Status compute_logits(const Route& route, size_t first_row, int32_t rows, ThreadPool& pool);
+    // After the LM head's matmul into the first `rows` rows of logits_: adds
+    // the head's bias (output.bias) and multiplies by ModelConfig::logit_scale.
+    void finish_logits(int32_t rows);
     // The same over the hidden rows `rows` of x_ (any order), into logits_
     // rows 0, 1, ... (forward_batch()).
     Status compute_logits_rows(const Route& route, std::span<const int32_t> rows, ThreadPool& pool);
+    // Before the first block of a pass whose embeddings are in x_ (n rows of
+    // `tokens`): each token's per-layer embeddings (ple_) and AltUp's streams
+    // (streams_). No-op for models without them.
+    Status enter_blocks(std::span<const int32_t> tokens, const Route& route);
+    // After the last block: AltUp's streams merged into x_ (the final hidden
+    // states before the output norm). No-op without AltUp.
+    Status leave_blocks(int32_t n, const Route& route);
+    // AltUp around block `layer`: predict() makes every stream's prediction
+    // from all of them and leaves the active one in x_; correct() spreads
+    // what the block changed in x_ to every stream. n rows.
+    void altup_predict(const Layer& L, int32_t n);
+    void altup_correct(const Layer& L, int32_t n);
+    // The block's per-layer embeddings after its FFN, gated by `gate_in`
+    // (the active stream, or x_ without AltUp; n rows), projected back and
+    // added to the residual stream: x_, or every AltUp stream but the first.
+    Status per_layer_input(int32_t layer, const BlockWeights& w, const float* gate_in, int32_t n, const Route& route);
     // Early exit: writes K/V for blocks [from, n_layers) of the single token
     // at `pos` from the current hidden state, so later tokens stay coherent.
     Status propagate_kv(const Route& route, int32_t from, int32_t pos);
@@ -980,10 +1145,34 @@ private:
     TripleBufferLoader* layer_source_ = nullptr;
     std::vector<int32_t> layer_items_;
     bool layer_shared_ = false;
+    // New geometry/scalar metadata and plan features can change a model
+    // without changing global dimensions, file size or the first MiB.
+    // A complete first-header fingerprint protects states, raw text and
+    // all derived cache keys; other legacy layouts keep 0.
+    uint64_t variant_fingerprint_ = 0;
 
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
+    // Per-layer embeddings (ModelConfig::ple_dim): the token table [n_layers *
+    // ple_dim per token], read row by row through the mapping like
+    // token_embd (no copied table; the loader may warm the mapping when the
+    // whole file fits in RAM), the projection of the embeddings and its
+    // per-block norm. The memory estimate conservatively includes the whole
+    // mapped file; per-pass scratch is batch * n_layers * ple_dim floats.
+    const TensorView* ple_embd_ = nullptr;
+    const TensorView* ple_model_proj_ = nullptr;
+    std::vector<float> ple_proj_norm_;
+    // AltUp: views of the K - 1 projections making the streams and merging
+    // them back (slices of altup_proj / altup_unembd_proj).
+    std::vector<TensorView> altup_proj_, altup_unembd_;
     std::vector<float> output_norm_;
+    std::vector<float> output_norm_b_;               // optional LayerNorm bias of the final norm
+    std::vector<float> output_bias_;                 // optional bias of the LM head (Phi-2)
+    std::vector<float> embd_norm_, embd_norm_b_;     // optional LayerNorm of the embeddings (BLOOM)
+    const TensorView* position_embd_ = nullptr;      // learned absolute positions (GPT-2), or nullptr
+    std::vector<float> alibi_slopes_;                // ALiBi: per query head (ModelConfig::alibi_bias); empty: none
+    const TensorView* hc_head_ = nullptr;
+    std::vector<float> hc_head_base_, hc_head_scale_;
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
@@ -1033,6 +1222,7 @@ private:
 
     // Scratch, sized for the current batch.
     std::vector<float> x_, xb_, q_, k_, v_, att_, hb_, hb2_, logits_;
+    std::vector<float> padded_k_, padded_v_; // one KV row, only for blocks narrower than the cache layout
     std::vector<float> part_max_, part_sum_, part_out_;  // attention: partial softmax per span (attention())
     std::vector<KvCache::RowView> row_views_;           // attention: each segment's rows of the block
     std::vector<int32_t> attn_rows_;                    // attention: the rows attending, when not every row
@@ -1055,11 +1245,20 @@ private:
     LatentStats latent_stats_;
     bool latent_expanded_ = false;  // the current pass's form
     double latent_ms_ = 0.0;        // the current pass's form-dependent time, every latent block
-    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
+    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output (Mamba: in_proj, gate, output)
+    std::vector<float> ssm_xc_, ssm_dbc_, ssm_dtl_, ssm_dt_;  // Mamba-1: convolved x, [dt | B | C], dt, dt per channel
+    std::vector<float> ba_, low_a_, low_b_;  // fused DeltaNet strengths and Kda low-rank projections
+    std::vector<float> compress_kv_, compress_gate_, index_compress_kv_, index_compress_gate_;
+    std::vector<float> compression_scratch_;
+    std::vector<float> hc_streams_, hc_normalized_, hc_coefficients_, hc_post_, hc_comb_, hc_next_;
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
+    std::vector<float> par_in_;      // parallel blocks: the FFN's normed input while the mixer runs
+    // Gemma 3n / 4 parts: per-layer embeddings [token][block][ple_dim], AltUp
+    // streams [token][stream][n_embd] and its scratch, Laurel's branch.
+    std::vector<float> ple_, streams_, altup_tmp_, laurel_, laurel_mid_, ple_hidden_;
     // The active adapter (set_adapter): its targets by base tensor name, with
     // their scales; empty when none (the only check a pass pays then).
     struct BoundAdapter {
