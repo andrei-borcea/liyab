@@ -179,6 +179,8 @@ abstract class ApiBackend {
   /// The LoRA adapters loaded next to the model, by name (listed by /v1/models after it). A request selects one
   /// by naming it as its `model` or `adapter`; valid once ensureLoaded() returned.
   List<String> get adapters;
+  /// Chat capability only: may throw ApiError(400) for an incompatible format.
+  /// Raw completions and pooling must not read it.
   ChatTemplate get template;
   bool get thinkingSupported;
 

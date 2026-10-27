@@ -93,7 +93,10 @@ class FakeBackend implements ApiBackend {
   @override
   String get servedModel => 'test-model.gguf';
   @override
-  ChatTemplate get template => ChatTemplate.chatml;
+  ChatTemplate get template => chatUnavailable
+      ? throw const ApiError(400, 'Unsupported chat format')
+      : ChatTemplate.chatml;
+  bool chatUnavailable = false;
   @override
   bool get thinkingSupported => true;
   @override
@@ -227,6 +230,18 @@ void main() {
     // Tool results need a model with a tool-call format.
     final plain = FakeBackend()..dialect = ToolDialect.none;
     expect(() => ApiCore(plain).prompt(const ApiRequest(messages: [ApiMessage('tool', 'x')])), throwsA(isA<ApiError>()));
+  });
+
+  test('a chat-only capability refusal preserves raw completions and pooling', () async {
+    final backend = FakeBackend()..chatUnavailable = true;
+    final core = ApiCore(backend);
+    expect(() => core.prompt(const ApiRequest(messages: [ApiMessage('user', 'Hi')])),
+        throwsA(isA<ApiError>().having((e) => e.status, 'status', 400)));
+    expect(core.prompt(const ApiRequest(prompt: 'raw prompt')).$1, 'raw prompt');
+    backend.pooling = LiyabPooling.mean;
+    final vectors = await core.embed(['document']);
+    expect(vectors.vectors, hasLength(1));
+    expect(backend.embedCalls, hasLength(1));
   });
 
   test('tool-call grammars, as the engine checks them (tests/test_grammar.cpp has the same texts)', () {

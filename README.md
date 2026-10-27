@@ -3407,3 +3407,5 @@ balanced followups and before/after numbers are recorded in [model descriptions]
 Recurrent reader-format validation uses independent nonzero encoded blocks for Mamba, Mamba-2, ShortConv, KDA and Qwen3-Next projection bindings across all 26 weight formats and all four KV types. It checks decoded rows, projection and carried-state ablations, decode/prefill agreement and rollback, without changing pinned golden hashes.
 
 Mapped per-layer embedding tables are also checked in all 26 reader formats and four KV types against independent decoded F32 tables in otherwise identical complete models. A zero-table control verifies their contribution; rollback must reproduce identical logits.
+
+Flutter chat uses the author template when replay preserves the processed prompt, or a recognized ChatML/Llama 3 fallback. A present incompatible template without such a fallback now refuses chat explicitly instead of guessing Zephyr. Models remain loaded for raw completions and pooling. This includes the current Harmony replay limitation; engine/CLI template support is broader than Flutter chat support.
