@@ -1,6 +1,6 @@
 // Liyab — decoder-only transformer over memory-mapped GGUF weights (internal).
 //
-// What the model is comes from describe_model() (core/architecture.h): the
+// What the model is comes from describe_model() (compat/architecture.h): the
 // architecture's row of facts the tensors cannot tell, the hyperparameters,
 // and one BlockPlan per block resolved from the tensors present. This class
 // binds the weights to those plans and runs them: each block has a token
@@ -37,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-#include "core/architecture.h"
+#include "compat/architecture.h"
 #include "core/expert_store.h"
 #include "core/key_scaling.h"
 #include "core/lora.h"

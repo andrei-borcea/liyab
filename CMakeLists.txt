@@ -111,6 +111,11 @@ endif()
 # --------------------------------------------------------------------------
 # Core library (object library shared by libliyab and the tests)
 # --------------------------------------------------------------------------
+# Model/file adaptation is separate from numerical execution. The engine, tests
+# and tools link the same compatibility objects; there is no second registry.
+add_library(liyab-compat OBJECT src/compat/architecture.cpp)
+target_include_directories(liyab-compat PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+
 add_library(liyab_core OBJECT
   src/core/types.cpp
   src/core/log.cpp
@@ -141,7 +146,6 @@ add_library(liyab_core OBJECT
   src/core/json_schema.cpp
   src/core/moe_routing.cpp
   src/core/compression.cpp
-  src/core/architecture.cpp
   src/core/key_scaling.cpp
   src/core/portable_math.cpp
   src/core/ssm_scan.cpp
@@ -192,14 +196,18 @@ endforeach()
 # Warnings. -ffast-math is deliberately never used: the fp16 conversions and
 # softmax rely on IEEE semantics (nor /fp:fast with MSVC).
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-  target_compile_options(liyab_core PRIVATE -Wall -Wextra -Wno-unused-parameter
-    $<$<CONFIG:Release>:-ffunction-sections -fdata-sections>)
+  foreach(target liyab_core liyab-compat)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wno-unused-parameter
+      $<$<CONFIG:Release>:-ffunction-sections -fdata-sections>)
+  endforeach()
 elseif(MSVC)
   # cl.exe and clang-cl (which reads -Wall as -Weverything). C4251 / C4275:
   # exported classes hold standard-library members and derive from unexported
   # hook interfaces, which is sound because a user of the C++ API must share
   # liyab.dll's C++ runtime anyway (the C API has no such constraint).
-  target_compile_options(liyab_core PRIVATE /W3 /wd4251 /wd4275)
+  foreach(target liyab_core liyab-compat)
+    target_compile_options(${target} PRIVATE /W3 /wd4251 /wd4275)
+  endforeach()
 endif()
 
 # ARM SIMD. On AArch64 (arm64-v8a, Apple arm64) NEON/ASIMD is part of the base
@@ -314,19 +322,20 @@ else()
 endif()
 # Linking an OBJECT library pulls its objects into libliyab (and only there)
 # plus its usage requirements (include dirs, definitions, system libraries).
-target_link_libraries(liyab PUBLIC liyab_core)
+target_link_libraries(liyab PUBLIC liyab_core PRIVATE liyab-compat)
 set_target_properties(liyab PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 if(WIN32 AND LIYAB_BUILD_SHARED)
   # A DLL exports what is marked (LIYAB_API / LIYAB_C_API): dllexport while its
   # sources compile, dllimport for the targets that link liyab.dll. The tests
   # and tools link the objects themselves and need neither.
   target_compile_definitions(liyab_core PRIVATE LIYAB_DLL_EXPORT)
+  target_compile_definitions(liyab-compat PRIVATE LIYAB_DLL_EXPORT)
   target_compile_definitions(liyab INTERFACE LIYAB_DLL_IMPORT)
 endif()
 
 if(LIYAB_BUILD_SHARED)
   # Only LIYAB_API / LIYAB_C_API symbols are exported.
-  set_target_properties(liyab_core PROPERTIES CXX_VISIBILITY_PRESET hidden OBJCXX_VISIBILITY_PRESET hidden
+  set_target_properties(liyab_core liyab-compat PROPERTIES CXX_VISIBILITY_PRESET hidden OBJCXX_VISIBILITY_PRESET hidden
                                               VISIBILITY_INLINES_HIDDEN ON)
   if(ANDROID)
     # 16 KB page alignment is required for Android 15+ devices with 16 KB pages.
@@ -370,43 +379,43 @@ if(LIYAB_BUILD_TESTS)
   foreach(name ${_liyab_tests})
     add_executable(${name} tests/${name}.cpp tests/test_model.cpp)
     # Tests use internal headers, so they link the object library directly.
-    target_link_libraries(${name} PRIVATE liyab_core)
+    target_link_libraries(${name} PRIVATE liyab_core liyab-compat)
     target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests)
     target_compile_definitions(${name} PRIVATE LIYAB_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
     add_test(NAME ${name} COMMAND ${name})
   endforeach()
   # Kernel throughput benchmark (internal headers, like the tests; not a test).
   add_executable(liyab-bench tools/liyab_bench.cpp)
-  target_link_libraries(liyab-bench PRIVATE liyab_core)
+  target_link_libraries(liyab-bench PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Quality cost of lossy options: KL / top-1 / perplexity against a saved reference.
   add_executable(liyab-kl tools/liyab_kl.cpp)
-  target_link_libraries(liyab-kl PRIVATE liyab_core)
+  target_link_libraries(liyab-kl PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-kl PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Routed experts of a MoE model: routing/activation capture, a Q8_0-expert copy of a GGUF,
   # dequantization (the cold-expert study, docs/research/cold-experts.md).
   add_executable(liyab-experts tools/liyab_experts.cpp)
-  target_link_libraries(liyab-experts PRIVATE liyab_core)
+  target_link_libraries(liyab-experts PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-experts PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Speculative decoding without a draft model on assistant tasks: plain vs lookup vs suffix drafts.
   add_executable(liyab-spec-bench tools/liyab_spec_bench.cpp)
-  target_link_libraries(liyab-spec-bench PRIVATE liyab_core)
+  target_link_libraries(liyab-spec-bench PRIVATE liyab_core liyab-compat)
   # A tokenizer on its own: ids, comparison with reference ids, encoding speed.
   add_executable(liyab-tok tools/liyab_tok.cpp)
-  target_link_libraries(liyab-tok PRIVATE liyab_core)
+  target_link_libraries(liyab-tok PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-tok PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Segment reuse (KV reused away from its prefix): KL / top-1 against a full prefill and time to the first
   # token on RAG-shaped prompts; the cost of turning keys alone.
   add_executable(liyab-reuse tools/liyab_reuse.cpp)
-  target_link_libraries(liyab-reuse PRIVATE liyab_core)
+  target_link_libraries(liyab-reuse PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-reuse PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Pooling models: embeddings and reranker scores against a Hugging Face reference, and their throughput.
   add_executable(liyab-embed tools/liyab_embed.cpp)
-  target_link_libraries(liyab-embed PRIVATE liyab_core)
+  target_link_libraries(liyab-embed PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-embed PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Several sequences decoded together: tok/s per sequence and in total for 1..4, against taking turns.
   add_executable(liyab-seq-bench tools/liyab_seq_bench.cpp)
-  target_link_libraries(liyab-seq-bench PRIVATE liyab_core)
+  target_link_libraries(liyab-seq-bench PRIVATE liyab_core liyab-compat)
   # tools/describe_model.py reads the registry and prints rows the way architecture.cpp writes them: every
   # row must round-trip. Standard-library Python only; registered when a Python 3 interpreter is found.
   find_package(Python3 COMPONENTS Interpreter QUIET)

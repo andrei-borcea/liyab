@@ -323,7 +323,7 @@ workers get fewer cores or slower ones, or other threads (Flutter's UI and raste
 Implemented features are described above. These are next, in order:
 
 1. **Model support as data** (in progress). In place: an architecture is one row of facts its tensors cannot tell
-   (`src/core/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
+   (`src/compat/architecture.cpp`) and every block gets a plan from the tensors present, so a model made of existing
    pieces needs no engine code; every architecture is pinned bit for bit (`test_golden`) and checked against
    Hugging Face (`liyab-kl`); YaRN RoPE and logit soft-capping are read from the file (Gemma 2 runs), and experts
    may come as fused `[gate | up]` tensors; multi-head latent attention caches latents (DeepSeek-V2-Lite,
@@ -475,7 +475,8 @@ Implemented features are described above. These are next, in order:
 
 ```
 include/liyab/          public headers: C++ API, C ABI (liyab_c_api.h), experimental/
-src/core/               engine, architecture registry and model description, transformer, pooling models
+src/compat/             liyab-compat: architecture facts, model adaptation, validation and block plans
+src/core/               engine, transformer, pooling models
                         (embeddings, reranking), loader, KV cache and
                         its key scaling, expert store, direct I/O, triple buffer, quant kernels, tokenizer
                         (pre-tokenizer table, regex engine, Unicode tables), chat template interpreter,
@@ -522,7 +523,7 @@ Liyab is meant to be the engine anyone can run on any device, and to stay easy t
   * Documentation changes in the same commit as the code it describes: this README, the headers in
     `include/liyab/`, and `--help` texts.
 * **Adding a model.** An architecture whose blocks are made of the pieces above (attention, multi-head latent
-  attention or Gated DeltaNet, dense or MoE FFN) needs only a row in the registry of `src/core/architecture.cpp`:
+  attention or Gated DeltaNet, dense or MoE FFN) needs only a row in the registry of `src/compat/architecture.cpp`:
   how RoPE pairs dimensions, the names of the norms before the FFN and after the attention and the FFN, the MoE
   renormalization default, whether Q/K norms come before or after RoPE, the FFN's activation, whether embeddings are
   scaled, which blocks use the sliding window and their RoPE base. `describe_model()` plans each block from the

@@ -1,7 +1,7 @@
 # Describing a model automatically
 
 Liyab runs a model when two things are known about it: the facts about its architecture that its tensors cannot
-tell (one row of `ArchSpec` in `src/core/architecture.cpp`), and a plan for each block, which the engine makes from
+tell (one row of `ArchSpec` in `src/compat/architecture.cpp`), and a plan for each block, which the engine makes from
 the tensors present. `tools/describe_model.py` establishes the first from the model's Hugging Face implementation
 and a GGUF of it, and verifies it:
 

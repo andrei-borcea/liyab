@@ -12,6 +12,9 @@ Commands and source paths in examples are relative to the repository root.
 
 ## Architecture
 
+[`liyab-compat`](../liyab-compat.md) now owns the registry, metadata normalization and tensor-driven block plans.
+The runtime consumes those plans; existing numerical operators and backends stay in the core.
+
 ```
    Liyab app (Flutter, dart:ffi) · Kotlin (JNI) · Swift · C++ · other apps via the local API
                                      │

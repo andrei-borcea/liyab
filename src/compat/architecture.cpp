@@ -1,4 +1,4 @@
-#include "core/architecture.h"
+#include "compat/architecture.h"
 
 #include <algorithm>
 #include <cmath>

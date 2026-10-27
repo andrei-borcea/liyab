@@ -200,7 +200,7 @@ remain incomplete.
 | Layer | Responsibility |
 | :--- | :--- |
 | C++ / C ABI / JNI / Swift / Dart FFI | Engine access from applications |
-| Architecture registry + block plans | Metadata and present tensors select mixers, norms, projections and FFNs |
+| [`liyab-compat`](docs/liyab-compat.md) | Load-time metadata/tensor adaptation, architecture facts, validation and block plans |
 | Context manager | KV pages, recurrent state, saved contexts, prefix reuse and sequence scheduling |
 | Storage | Mapped GGUF tensors, dense block pipeline and bounded expert cache |
 | Backends | Per-operation routing, with CPU fallback for unsupported accelerator operations |

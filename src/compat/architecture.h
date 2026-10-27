@@ -1,4 +1,8 @@
-// Liyab — what a model is, read from its GGUF file (internal).
+// liyab-compat — load-time model adaptation and execution planning (internal).
+//
+// This layer owns format/architecture facts and planning. The core executes
+// the resulting plan; it does not maintain a parallel model registry.
+// Planning performs no downloads and never rewrites the source GGUF.
 //
 // A model is described in two layers, both resolved once at load, so the
 // forward pass never looks anything up by name:
@@ -26,8 +30,8 @@
 // describe_model() is a pure function of the file: it reads metadata and
 // tensor names, never weights, so a model can be described (and refused with
 // a precise reason) before anything is loaded.
-#ifndef LIYAB_CORE_ARCHITECTURE_H
-#define LIYAB_CORE_ARCHITECTURE_H
+#ifndef LIYAB_COMPAT_ARCHITECTURE_H
+#define LIYAB_COMPAT_ARCHITECTURE_H
 
 #include <cstdint>
 #include <span>
@@ -611,4 +615,4 @@ Result<ModelConfig> describe_model(const MmapLoader& file);
 
 }  // namespace liyab
 
-#endif  // LIYAB_CORE_ARCHITECTURE_H
+#endif  // LIYAB_COMPAT_ARCHITECTURE_H

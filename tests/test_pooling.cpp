@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#include "core/architecture.h"
+#include "compat/architecture.h"
 #include "core/pooling.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"

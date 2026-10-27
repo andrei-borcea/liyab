@@ -12,7 +12,7 @@
 #include <unordered_set>
 
 #include "core/log.h"
-#include "core/architecture.h"
+#include "compat/architecture.h"
 #include "core/unicode.h"
 
 namespace liyab {

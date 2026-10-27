@@ -4,6 +4,7 @@
 
 | Guide | Contents |
 | :--- | :--- |
+| [liyab-compat](../liyab-compat.md) | Model/file adaptation, block planning and small-checkpoint validation |
 | [Project overview](overview.md) | Why Liyab, Design principles, What it does today |
 | [Build and run](building.md) | Quick start |
 | [Engine architecture](architecture.md) | Architecture |

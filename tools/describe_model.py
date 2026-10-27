@@ -4,7 +4,7 @@
     tools/describe_model.py --model Qwen/Qwen2.5-1.5B-Instruct --gguf Qwen2.5-1.5B-Instruct-f16.gguf --gate
     tools/describe_model.py --model unsloth/gemma-2-2b-it --gguf hf://bartowski/gemma-2-2b-it-GGUF/gemma-2-2b-it-Q8_0.gguf
 
-Liyab describes an architecture by one row of facts its tensors cannot tell (src/core/architecture.cpp, ArchSpec)
+Liyab describes an architecture by one row of facts its tensors cannot tell (src/compat/architecture.cpp, ArchSpec)
 and plans each block from the tensors present. This tool establishes those facts for a model and either prints the
 registry row it needs or the precise list of parts Liyab does not implement yet. It never guesses: a fact it cannot
 establish is reported as unknown, and no row is proposed. Where this GGUF disagrees with the reference (other
@@ -389,7 +389,7 @@ class Engine:
     def __init__(self, root):
         self.root = root
         read = lambda p: open(os.path.join(root, p), encoding="utf-8").read()
-        header = read("src/core/architecture.h")
+        header = read("src/compat/architecture.h")
         self.enums = {}
         for m in re.finditer(r"enum class (\w+)\s*:\s*\w+\s*\{(.*?)\};", header, re.S):
             self.enums[m.group(1)] = [v.strip() for v in _strip_comments(m.group(2)).split(",") if v.strip()]
@@ -406,7 +406,7 @@ class Engine:
                 raise ValueError(f"architecture.h: cannot read the ArchSpec field '{decl}'")
             ftype, name, default = m.groups()
             self.fields.append((name, ftype, None if default is None else self.parse_value(ftype, default)))
-        cpp = read("src/core/architecture.cpp")
+        cpp = read("src/compat/architecture.cpp")
         # What describe_model() reads from a file: its metadata keys (key("...") and require_int("...")) and
         # the RoPE scaling types it accepts. Features the engine takes from the file (an attention scale, soft
         # caps, YaRN) are supported exactly when it reads them.
@@ -2315,7 +2315,7 @@ def gate(args, d, row_text, arch, engine):
     results = {"log": log, "checks": []}
     print(f"\nConformance gate (scratch tree {scratch}, log {log})", flush=True)
     sync_tree(args.source, src)
-    target = os.path.join(src, "src/core/architecture.cpp")
+    target = os.path.join(src, "src/compat/architecture.cpp")
     original = open(target, encoding="utf-8").read()
     exists = arch in engine.rows
     same = exists and engine.rows[arch][0] == engine.parse_row(Engine._entries(row_text)[0])
@@ -2445,7 +2445,7 @@ def print_description(d, engine, arch):
         for n in dict.fromkeys(d.unknown):
             print("  - " + n)
     if d.row and d.ok:
-        print("\nRegistry row (src/core/architecture.cpp, kArchitectures):\n" + d.row)
+        print("\nRegistry row (src/compat/architecture.cpp, kArchitectures):\n" + d.row)
         if d.registry and d.registry.get("exists"):
             if d.registry["identical"]:
                 print(f"The registry's row for {arch} is this row.")

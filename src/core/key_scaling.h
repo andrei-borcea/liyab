@@ -39,7 +39,7 @@
 #include <string_view>
 #include <vector>
 
-#include "core/architecture.h"
+#include "compat/architecture.h"
 
 namespace liyab {
 

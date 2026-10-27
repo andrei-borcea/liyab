@@ -17,7 +17,7 @@
 #include <string_view>
 #include <vector>
 
-#include "core/architecture.h"
+#include "compat/architecture.h"
 #include "liyab/backend.h"
 #include "liyab/engine.h"
 #include "liyab/experimental/forward_hooks.h"

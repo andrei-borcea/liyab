@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
-#include "core/architecture.h"
+#include "compat/architecture.h"
 #include "core/kv_reuse.h"
 #include "core/pre_tokenizer.h"
 #include "core/regex.h"
