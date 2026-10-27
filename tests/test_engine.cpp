@@ -1716,7 +1716,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
     }
     {
         test::TinyModelSpec spec;
-        spec.arch = "gemma3n";
+        spec.arch = "unsupported-test-architecture";
         auto file = MmapLoader::open(model_path("describe_unknown", spec));
         REQUIRE(file.has_value());
         auto described = describe_model(**file);
@@ -1724,7 +1724,7 @@ TEST_CASE("describe_model plans every block from the tensors present, and names 
         CHECK(described.status().code() == ErrorCode::Unsupported);
         // The message names the architecture and every supported one.
         const std::string message = described.status().to_string();
-        CHECK(message.find("'gemma3n'") != std::string::npos);
+        CHECK(message.find("'unsupported-test-architecture'") != std::string::npos);
         for (const ArchSpec& a : architectures()) CHECK(message.find(std::string(a.name)) != std::string::npos);
     }
 }

@@ -741,7 +741,9 @@ public:
     // reranker. Thread-safe.
     [[nodiscard]] Pooling pooling() const noexcept;
     // Values per vector embed() returns without EmbedOptions::dimensions: the
-    // model's hidden size (1024 for Qwen3-Embedding-0.6B). Thread-safe.
+    // model's hidden size (1024 for Qwen3-Embedding-0.6B), or the width of
+    // the dense projections the GGUF applies after pooling (dense_2 /
+    // dense_3: 768 for EmbeddingGemma). Thread-safe.
     [[nodiscard]] int32_t embedding_size() const noexcept;
     // One vector per text, in order. Each text is encoded as generate()
     // encodes a prompt (special tokens written in it map to their ids, BOS
@@ -752,12 +754,16 @@ public:
     //  * every input holds at least one token and at most context_length()
     //    positions (else InvalidArgument naming it, unless options.truncate);
     //  * vectors have embedding_size() values (options.dimensions when set),
-    //    unit length unless options.normalize is false;
+    //    unit length unless options.normalize is false; the pooled states go
+    //    through the model's dense projections first when it has them;
     //  * the texts run one after another in the context, sorted so that those
     //    sharing a token prefix (an instruction) are neighbours: each keeps
     //    the KV of the prefix it shares with the one before and processes
-    //    only the rest (Last pooling, attention-only models). On the CPU
-    //    backend a vector is the same bits whatever the batch around it;
+    //    only the rest (Last pooling, attention-only causal models; a
+    //    bidirectional model such as EmbeddingGemma reads each text whole in
+    //    one pass; token generation on such a model returns Unsupported).
+    //    On the CPU backend a vector is the same bits whatever the
+    //    batch around it;
     //  * the context is used and left empty: a conversation in progress is
     //    set aside in the prefix cache when one is configured (prefix_cache_mb
     //    or prefix_cache_disk_mb), as when another prompt replaces it, and is

@@ -552,6 +552,7 @@ tools/gguf_set_keys.py ERNIE-4.5-0.3B-PT-F16.gguf ERNIE-4.5-0.3B-PT-F16-fixed.gg
 EXAONE-4.0-1.2B uses full rotary attention throughout. Its row also describes hybrid configurations with windowed
 rotary blocks and global unrotated blocks; the four-block/window-64 tiny case exercises both kinds with mean
 KL 0.00000 and 99.80% top-1. The real gate and tiny hybrid check the same post-only norms and per-head Q/K norms.
+| Gemma 3n E2B it (unsloth, converted BF16) | registry's `gemma3n` | 523 / 801 / 211, identical | 511 positions, mean KL 0.00000, maximum 0.00001, top-1 100.00% | accepted |
 
 ### Models Liyab does not run
 
@@ -628,6 +629,68 @@ original metrics remain accepted, and all 21 effective metrics are within ±3% (
 All 60 measured CLI reply pairs and six work counts agree across the original and confirmation runs.
 
 ## Limits
+
+### Gemma residual and embedding parts
+
+`gemma3n` plans AltUp from `altup_proj` and its stream-count/active-index metadata, Laurel from each block's
+`laurel_l`, per-layer token inputs from `embedding_length_per_layer_input` and `per_layer_token_embd`, and gate
+sparsity from the converter's per-block Gaussian standard-deviation multipliers. `attention.shared_kv_layers`
+maps each final block to the last non-sharing block with the same window kind. Only source blocks allocate KV
+slots; sharing blocks contribute their query ranges to those slots during quantized-cache calibration.
+Per-layer tables remain in the file mapping; each pass materializes only its token rows and projected inputs.
+
+`gemma4` also plans absent value projections as values from the key projection, before normalization and RoPE,
+and binds optional `layer_output_scale`. Different local/global head geometry and different per-block FFN widths
+are explicitly rejected pending their generic implementation; the row does not assert support for such files.
+Its tokenizer applies the explicit `tokenizer.ggml.merges` ranks after SentencePiece space normalization, rather
+than selecting merges by vocabulary score.
+With uniform local/global geometry, the four-block Gemma 4 tiny check gives mean KL 0.00000, maximum KL 0.00006,
+top-1 agreement 99.22%, and 512 identical token IDs; the conformance, edge and chat tokenizer texts also match.
+For this check only, a copy of converter b11819 accepts transformers 5.19's homogeneous configuration serialization
+(`head_dim` without `global_head_dim` or explicit per-layer overrides) and records the tokenizer's actual BOS rule.
+The stock converter forces BOS where that tokenizer export has no BOS postprocessor. Liyab follows the GGUF's BOS
+flag; it does not override a published file's metadata. The shared converter is unchanged.
+For text conformance of multimodal checkpoints, `conform_reference.py` uses the text configuration's registered
+causal LM and matches its input-embedding parameter suffix to the checkpoint keys to establish the namespace.
+An ambiguous match is refused. Vision/audio towers and their optional dependencies are not instantiated;
+`--config` changes the selected text configuration.
+
+`gemma-embedding` uses bidirectional attention. Pooling runs an entire input in one pass and shares no prefix
+because every hidden state depends on later tokens. Windowed blocks see half the stored window on each side.
+Incremental continuation, causal tree drafts and rolling caches are refused; calibration of quantized keys reads
+the complete calibration input in one pass too.
+The pooling layer validates and applies optional `dense_2.weight` and `dense_3.weight` in order before truncation
+and normalization; `Engine::embedding_size()` reports the projected width. Biases on these dense layers are
+explicitly refused. Its BF16 real-model check covers 39 inputs: identical tokenizations and minimum cosine
+0.99992651 against the independent float32 reference on CPU and Metal.
+
+The description tool establishes direction from the traced attention contract, unscaled scores from the actual
+attention scale, and value normalization by matching projected values with and without unweighted RMS norm.
+The trace reconstructs AltUp predictions from the coefficient projections, checks the corrected stream outputs
+and per-layer residual additions, identifies Laurel in the mixer residual, and matches shared KV to an earlier
+attention call. A topology it cannot establish is reported as unknown and no row is proposed.
+
+The four-block Gemma 3n tiny check exercises all these paths: 512 identical token IDs, mean KL 0.00000,
+maximum KL 0.00001 and top-1 agreement 99.41% with F32 weights/F16 KV. EmbeddingGemma's BF16 conversion matches
+all 39 pooling-case tokenizations on CPU and Metal (minimum cosine 0.99992651 against float32); the independent
+reference matches sentence-transformers at minimum cosine 0.9999998. Gemma 3n E2B it, converted from unsloth
+revision `c4291af6285b4f90d88bdf6f9a634a8d2f262cc8` to BF16, also passes the real-model gate: the tool proposes
+exactly the registered row, all three tokenizer texts match, and the 512-token float32-reference comparison gives
+mean KL 0.00000, maximum 0.00001 and top-1 100.00%. Gemma 4's heterogeneous geometry remains pending in the
+generic per-block geometry work. The separate K-equals-V/no-per-layer-input Gemma 4 tiny case gives mean KL
+0.00000, maximum 0.00002, top-1 99.02%, and 512 identical IDs.
+The additional Gemma 3n BF16-reference comparison gives mean KL 0.00168, maximum 0.02824 and top-1 98.24%.
+CPU and Metal routes both greedily answer the checked chat prompt with "The capital of France is Paris."
+The deeper ten-block random diagnostic is retained as a failure: mean KL 0.00001, maximum 0.00064 and top-1
+91.78%. Rounding its reference keys and values to F16 improves top-1 to 98.83% (maximum KL 0.00006), which
+accounts for most, but not all, of its precision sensitivity. It is not counted as passing conformance.
+
+Existing Qwen3-0.6B and Llama-3.2-1B BF16 outputs remain unchanged in 36 paired CLI comparisons. In the quiet
+performance check, six warmed pairs per configuration with alternating main/branch order kept every median
+prefill/decode change within ±3% (largest measured median change: +1.07% decode time on Qwen's Metal route).
+The CPU prefill tool processed 512 tokens; CLI prefill used 380/407-token prompts, and decode used 64-token replies.
+Llama ended the first request after seven tokens, so its decode check also used an ordinary short question;
+both sets of measurements are retained. BF16 matrix operations on the Metal route use the CPU fallback.
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
@@ -1146,3 +1209,5 @@ Metal projections; attention and recurrent operations continue using their exist
 | Qwen3.5-0.8B | CPU BF16 | 84.00 → 83.90 | 53.329 → 53.348 | -0.12% / +0.04% |
 | Qwen3.5-0.8B | Metal BF16 (CPU matrix fallback) | 84.09 → 84.10 | 53.114 → 53.288 | +0.00% / +0.33% |
 | Qwen3.5-0.8B | Metal F16 (GPU projections) | 274.58 → 275.07 | 34.028 → 34.256 | +0.18% / +0.67% |
+
+Shared-KV consumers must match their source block's query and KV head counts and rotation plan; incompatible files are refused before binding. Integration tests combine shared KV with per-block head and FFN widths across prefill, decode, rollback, tree drafts, serialized state and parked sequences for all four KV types.

@@ -208,6 +208,13 @@ def blocks_to_trace(cfg):
         sparse = [i for i in range(n) if i not in mlp_only]
         if dense and sparse:
             want = max(want, max(dense[0], sparse[0]) + 1)
+    # A shared-KV suffix needs a source block of every attention kind before
+    # it starts. Keep the declared suffix and that shortest source prefix.
+    shared = getattr(cfg, "num_kv_shared_layers", 0) or 0
+    kinds = getattr(cfg, "layer_types", None)
+    if shared and kinds:
+        first_of_kind = max(kinds.index(t) + 1 for t in set(kinds))
+        want = max(want, shared + first_of_kind)
     return min(n, max(want, 2))
 
 
@@ -235,6 +242,8 @@ def reduced_config(config):
             setattr(cfg, k, 0)
     if getattr(cfg, "vocab_size", 0) > VOCAB:
         cfg.vocab_size = VOCAB
+    if getattr(cfg, "vocab_size_per_layer_input", 0) > VOCAB:
+        cfg.vocab_size_per_layer_input = VOCAB
     for k, v in list(vars(cfg).items()):
         if k.endswith("token_id") and isinstance(v, int) and v >= VOCAB:
             setattr(cfg, k, None)
@@ -882,8 +891,29 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     value = None
     for call, how, v, rows in views_for(n_kv, n_q + n_kv) if hd_v == hd else []:
         if close(v, value_states):
-            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows}
+            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows, "rms_norm": False}
             break
+        # Some architectures normalize values per head without a learned
+        # weight. Establish that formula from the projection and observed
+        # values, rather than from a family or module name.
+        normalized = v * torch.rsqrt(v.float().square().mean(-1, keepdim=True) + eps)
+        if close(normalized, value_states):
+            value = {"projection": call.path, "projection_layout": how, "projection_rows": rows, "rms_norm": True}
+            break
+    if key is None and value is None:
+        # Shared KV is observed as the exact earlier attention's K/V, with
+        # no local projections. Reuse that source's established formula.
+        for previous in trace.attn:
+            if previous is a:
+                break
+            if close(previous.key, a.key) and close(previous.value, a.value):
+                source = next((c.path for c in trace.calls if c.module is previous.module), None)
+                if source:
+                    prior = analyze_attention(trace, source, trace.calls, freqs, eps)
+                    if prior and prior.get("key") and prior.get("value"):
+                        key, value = prior["key"], prior["value"]
+                        f["shared_kv_source"] = source
+                        break
     f["key"] = key
     f["query"] = query
     f["value"] = value
@@ -1013,9 +1043,16 @@ def analyze_dense_ffn(ffn_call, block_calls):
     for act_name, act in ACTIVATIONS.items():
         for g in first:
             for u in first:
-                if g is not u and activation_allowed(act_name, g.output, u.output) and close(activate(act, g.output.float(), u.output.float()), d_in):
+                gate = g.output.float()
+                sparsity = getattr(ffn_call.module, "activation_sparsity", 0.0)
+                if sparsity > 0.0:
+                    multiplier = torch.distributions.Normal(0.0, 1.0).icdf(torch.tensor(sparsity))
+                    gate = torch.relu(gate - (gate.mean(-1, keepdim=True) +
+                                             gate.std(-1, keepdim=True, correction=0) * multiplier))
+                if g is not u and activation_allowed(act_name, gate, u.output) and close(activate(act, gate, u.output.float()), d_in):
                     return Facts(kind="dense", gated=True, fused_gate_up=False, activation=act_name,
-                                 gate=g.path, up=u.path, down=down.path, clamp=limit,
+                                 gate=g.path, up=u.path, down=down.path,
+                                 activation_sparsity=float(sparsity), clamp=limit,
                                  biases=any(getattr(c.module, "bias", None) is not None for c in (g, u, down)),
                                  unknown=[])
         for c in first:
@@ -1258,6 +1295,9 @@ def analyze(trace):
     # embedding module may scale its own output.
     emb_mod = _input_embedding(trace, layer_calls[0])
     h0 = layer_calls[0].input
+    streams = h0 is not None and h0.dim() == 4
+    if streams:
+        h0 = h0[0]  # the embedding stream; projections make the others
     facts["embedding_scale"] = None
     if emb_mod is None:
         facts["unknown"].append("the reference's input embedding table cannot be identified uniquely from its calls")
@@ -1292,6 +1332,24 @@ def analyze(trace):
     head_mod = head.module if head is not None else None
     after = [c for c in calls if c.order > last.order and not _is_descendant(c.path, trace.layers_path)]
     final_norm = next((c for c in after if _norm_like(c) and close(c.input, last.output)), None)
+    if streams and head is not None:
+        # AltUp merges its final streams through the unembedding projections,
+        # matching their magnitudes to stream zero, then takes their mean.
+        candidates = [c for c in after if _norm_like(c) and close(c.output, head.input)]
+        for candidate in candidates:
+            st = last.output
+            merged = st[0].float().clone()
+            magnitude = st[0].float().square().mean(-1, keepdim=True).sqrt()
+            for i in range(1, st.shape[0]):
+                projection = next((c for c in after if isinstance(c.module, nn.Linear) and close(c.input, st[i])), None)
+                if projection is None:
+                    break
+                x = projection.output.float()
+                merged += x * magnitude / x.square().mean(-1, keepdim=True).clamp(min=1e-5).sqrt()
+            else:
+                if close(merged / st.shape[0], candidate.input):
+                    final_norm = candidate
+                    break
     facts["final_norm"] = None
     if final_norm is not None:
         facts["final_norm"] = norm_fact(final_norm, eps)
@@ -1495,6 +1553,37 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
                      norm_before_ffn=branch_norm(before) if is_ffn and before else None,
                      norm_after_ffn=branch_norm(after) if is_ffn and after else None)
             return b
+    predicted = None
+    laurel = None
+    if h_in is not None and h_in.dim() == 4:
+        k = h_in.shape[0]
+        coefficients = next((c for c in _linears(block_calls, path)
+                             if c.output.shape[-1] == k * k and c.input.shape[-1] == k), None)
+        if coefficients is not None:
+            coef = coefficients.output.reshape(1, SEQ, k, k).transpose(-1, -2)
+            predicted = torch.matmul(h_in.permute(1, 2, 3, 0), coef).permute(3, 0, 1, 2) + h_in
+            mixer = next((c for c in direct if any(a.module is c.module for a in trace.attn)), None)
+            ffn = next((c for c in direct if len(_linears(block_calls, c.path)) == 3 and
+                        analyze_dense_ffn(c, block_calls).get("activation") is not None), None)
+            pre = next((n for n in norms if mixer is not None and close(n.output, mixer.input)), None)
+            active = next((i for i in range(k) if pre is not None and close(predicted[i], pre.input)), None)
+            if active is not None and mixer is not None and ffn is not None:
+                b["altup"] = {"streams": k, "active": active}
+                h_in = predicted[active]
+                others = [mixer, ffn]
+                laurel = next((c for c in direct if c not in others and
+                               close(c.input, pre.output) and c.output is not None and
+                               len(_linears(block_calls, c.path)) == 2), None)
+    elif len(others) > 2:
+        # A per-layer token-input branch adds two direct projections beside
+        # the mixer and gated FFN. Identify the latter by their observed
+        # attention and activation equations, leaving the branch for the
+        # output check below.
+        mixer = next((c for c in direct if any(a.module is c.module for a in trace.attn)), None)
+        ffn = next((c for c in direct if len(_linears(block_calls, c.path)) == 3 and
+                    analyze_dense_ffn(c, block_calls).get("activation") is not None), None)
+        if mixer is not None and ffn is not None:
+            others = [mixer, ffn]
     if len(others) != 2:
         b["unknown"].append(f"the block runs {len(others)} sub-modules besides its norms "
                             f"({', '.join(c.path.rsplit('.', 1)[-1] for c in others)}), not a mixer and an FFN")
@@ -1525,6 +1614,9 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
             c.output.shape == h_in.shape and close(c.output + h_in, m_out) for c in _linears(block_calls, mixer.path)):
         m_out = m_out.float() - h_in.float()
     h_mid = h_in.float() + m_out.float()
+    if predicted is not None and laurel is not None:
+        h_mid = (h_mid + laurel.output.float()) / math.sqrt(2)
+        b["laurel"] = True
     b["parallel"] = False
     b["residual"] = "sequential"
     if pre_mixer is not None and close(ffn.input, pre_mixer.output):
@@ -1555,6 +1647,39 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     f_out = (post_ffn.output if post_ffn else ffn.output).float()
     if any(c.output.shape == h_mid.shape and close(c.output + h_mid, f_out) for c in _linears(block_calls, ffn.path)):
         f_out = f_out - h_mid
+    if b.get("altup"):
+        # Verify the correction and per-layer residual against the complete
+        # observed stream output; the ordinary block below ends before them.
+        core_out = h_mid + f_out
+        k, active = b["altup"]["streams"], b["altup"]["active"]
+        coefficients = next((c for c in _linears(block_calls, path)
+                             if c.output.shape[-1] == k and c.input.shape[-1] == k), None)
+        corrected = None
+        if coefficients is not None:
+            coefs = (coefficients.output + 1).permute(2, 0, 1).unsqueeze(-1)
+            corrected = predicted + (core_out - predicted[active]).unsqueeze(0) * coefs
+        per_layer_norms = [n for n in norms if post_ffn is not None and n.order > post_ffn.order]
+        if corrected is None or len(per_layer_norms) != 1:
+            b["unknown"].append("could not establish the multi-stream correction and per-layer residual")
+        else:
+            corrected[1:] += per_layer_norms[0].output
+            if not close(corrected, h_out):
+                b["unknown"].append("the stream output does not match prediction, correction and per-layer residual")
+        h_out = core_out
+        norms = [n for n in norms if n not in per_layer_norms]
+    elif post_ffn is not None:
+        per_layer_norms = [n for n in norms if n.order > post_ffn.order]
+        if len(per_layer_norms) == 1:
+            core_out = h_mid + f_out
+            branch = per_layer_norms[0].output
+            combined = core_out + branch
+            scale = float((h_out.float() / torch.where(combined.abs() > 1e-6, combined,
+                                                      torch.ones_like(combined))).median())
+            if close(combined * scale, h_out):
+                b["per_layer_input"] = True
+                b["output_scale"] = scale
+                h_out = core_out
+                norms = [n for n in norms if n not in per_layer_norms]
     extra = [n for n in norms if n not in (pre_mixer, post_mixer, pre_ffn, post_ffn)]
     if extra:
         b["unknown"].append("norms with no place in the block: " + ", ".join(n.path for n in extra))

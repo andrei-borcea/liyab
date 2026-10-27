@@ -57,7 +57,10 @@ TOKENIZER_FILES = ("tokenizer*", "vocab*", "merges.txt", "special_tokens_map.jso
 
 def first(cfg, keys):
     for k in keys:
-        v = getattr(cfg, k, None)
+        # This is the global baseline. Explicit per-layer overrides remain
+        # in the serialized config, so heterogeneous models keep their own
+        # head geometry instead of invoking an ambiguous global property.
+        v = vars(cfg).get(k)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
             return k, v
     return None, None
@@ -180,10 +183,12 @@ def main():
     parser.add_argument("--experts", type=int, default=16, help="routed experts (default 16)")
     parser.add_argument("--config", help="JSON fields applied after reduction through the configuration constructor")
     parser.add_argument("--seed", type=int, default=1234, help="seed of the random weights (default 1234)")
+    parser.add_argument("--base-model", action="store_true",
+                        help="save AutoModel without an LM head (embedding checkpoints; copy pooling modules separately)")
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
     from transformers.utils import logging as hf_logging
 
     hf_logging.set_verbosity_error()
@@ -203,7 +208,8 @@ def main():
     canonical_rope_config(cfg)
 
     torch.manual_seed(args.seed)
-    model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)
+    factory = AutoModel if args.base_model else AutoModelForCausalLM
+    model = factory.from_config(cfg, trust_remote_code=args.trust_remote_code, dtype=torch.float32)
     model.eval()
     _randomize(model)  # seeded: the same arguments give the same checkpoint
     os.makedirs(args.out)

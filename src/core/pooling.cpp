@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 #include "core/quant.h"
@@ -44,6 +45,28 @@ Result<PoolingModel> read_pooling_model(const MmapLoader& f, const ModelConfig& 
         for (const std::string_view label : v->strings) m.labels.emplace_back(label);
     }
     if (const auto tmpl = f.get_string("tokenizer.chat_template.rerank")) m.rerank_template = std::string(*tmpl);
+
+    // Dense projections after pooling: each [in -> out], chained from n_embd.
+    m.embedding_width = c.n_embd;
+    for (const char* name : {"dense_2.weight", "dense_3.weight"}) {
+        const TensorView* t = f.tensor(name);
+        if (t == nullptr) {
+            if (f.tensor("dense_3.weight") != nullptr) {
+                return Status(ErrorCode::InvalidModel, "dense_3.weight without dense_2.weight");
+            }
+            break;
+        }
+        if (t->n_dims != 2 || t->cols() != m.embedding_width || t->rows() < 1 ||
+            t->rows() > std::numeric_limits<int32_t>::max()) {
+            return Status(ErrorCode::InvalidModel, std::string(name) + " does not continue the pooled vector's width " +
+                                                       std::to_string(m.embedding_width));
+        }
+        if (f.tensor(std::string(name, std::string_view(name).size() - 6) + "bias") != nullptr) {
+            return Status(ErrorCode::Unsupported, std::string(name) + ": dense projections with a bias are not supported");
+        }
+        m.dense.push_back(t);
+        m.embedding_width = static_cast<int32_t>(t->rows());
+    }
 
     const TensorView* head = f.tensor(kHeadWeight);
     if (head == nullptr) {
@@ -121,7 +144,7 @@ Result<PooledRun> run_pooled(Transformer& model, std::span<const std::vector<int
         if (id < 0 || id >= c.n_vocab) return Status(ErrorCode::InvalidArgument, "run_pooled: label token out of range");
     }
     const size_t width = logits ? target.logit_ids.size() : d;
-    const auto step = static_cast<size_t>(std::max(chunk, 1));
+    const bool causal = c.causal;
 
     PooledRun run;
     run.values.assign(sequences.size() * width, 0.0f);
@@ -150,7 +173,7 @@ Result<PooledRun> run_pooled(Transformer& model, std::span<const std::vector<int
         // The KV of the prefix shared with the sequence before stays; the
         // last token is always run, as its row is what is pooled.
         size_t keep = 0;
-        if (previous != nullptr && !mean) {
+        if (previous != nullptr && !mean && causal) {
             const size_t most = std::min(previous->size(), seq.size() - 1);
             size_t common = 0;
             while (common < most && (*previous)[common] == seq[common]) ++common;
@@ -165,6 +188,8 @@ Result<PooledRun> run_pooled(Transformer& model, std::span<const std::vector<int
         run.reused += static_cast<int64_t>(keep);
         std::fill(sum.begin(), sum.end(), 0.0);
         float* out = run.values.data() + index * width;
+        // A bidirectional model reads the sequence in one pass.
+        const size_t step = causal ? static_cast<size_t>(std::max(chunk, 1)) : seq.size();
         for (size_t i = keep; i < seq.size(); i += step) {
             const size_t n = std::min(step, seq.size() - i);
             const bool last_pass = i + n == seq.size();
@@ -233,6 +258,23 @@ std::vector<float> label_scores(std::span<const float> logits, size_t labels) {
         scores.push_back(static_cast<float>(1.0 / sum));
     }
     return scores;
+}
+
+Result<std::vector<float>> project_pooled(const PoolingModel& model, Backend& cpu, std::span<const float> pooled,
+                                          int32_t n_embd) {
+    if (n_embd <= 0 || pooled.size() % static_cast<size_t>(n_embd) != 0) {
+        return Status(ErrorCode::InvalidArgument, "project_pooled: incomplete pooled vectors");
+    }
+    std::vector<float> values(pooled.begin(), pooled.end());
+    auto width = static_cast<size_t>(n_embd);
+    const size_t n = width == 0 ? 0 : pooled.size() / width;
+    for (const TensorView* t : model.dense) {
+        std::vector<float> out(n * static_cast<size_t>(t->rows()));
+        if (n > 0) LIYAB_RETURN_IF_ERROR(cpu.matmul(*t, values.data(), out.data(), static_cast<int32_t>(n)));
+        values = std::move(out);
+        width = static_cast<size_t>(t->rows());
+    }
+    return values;
 }
 
 Result<std::vector<float>> head_scores(const PoolingModel& model, Backend& cpu, std::span<const float> hidden,

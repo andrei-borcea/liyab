@@ -3614,6 +3614,9 @@ Result<GenerationStats> Engine::Impl::generate_tokens_on(Seq& q, std::span<const
 Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> prompt, const SamplingParams& params,
                                                const TokenCallback& on_token, const std::string_view* text,
                                                const ForceCallback* force, const GenerateOptions* options) {
+    if (!target->config().causal) {
+        return Status(ErrorCode::Unsupported, "a bidirectional embedding model cannot generate tokens");
+    }
     if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
     if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
 
@@ -4321,7 +4324,11 @@ Result<std::string> Engine::render_chat(std::string_view request_json) const {
 
 Pooling Engine::pooling() const noexcept { return impl_->pooling.declared; }
 
-int32_t Engine::embedding_size() const noexcept { return impl_->target->config().n_embd; }
+int32_t Engine::embedding_size() const noexcept {
+    // After the model's dense projections, when it has them (EmbeddingGemma).
+    const int32_t width = impl_->pooling.embedding_width;
+    return width > 0 ? width : impl_->target->config().n_embd;
+}
 
 Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::string_view> texts,
                                                       const EmbedOptions& options, PoolingStats* stats) {
@@ -4351,7 +4358,7 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
     } else if (pooling != Pooling::Mean && pooling != Pooling::Last) {
         return Status(ErrorCode::InvalidArgument, "EmbedOptions::pooling must be Auto, Mean or Last");
     }
-    const int32_t size = s.target->config().n_embd;
+    const int32_t size = embedding_size();
     if (options.dimensions < 0 || options.dimensions > size) {
         return Status(ErrorCode::InvalidArgument,
                       "EmbedOptions::dimensions must be between 0 and " + std::to_string(size));
@@ -4367,7 +4374,10 @@ Result<std::vector<std::vector<float>>> Engine::embed(std::span<const std::strin
     target.pooling = pooling;
     auto run = s.run_pooling(sequences, target);
     if (!run) return run.status();
-    auto vectors = finish_embeddings(run->values, static_cast<size_t>(size), options.dimensions, options.normalize);
+    // The pooled states through the model's dense projections (none: as they are).
+    auto projected = project_pooled(s.pooling, *s.cpu, run->values, s.target->config().n_embd);
+    if (!projected) return projected.status();
+    auto vectors = finish_embeddings(*projected, static_cast<size_t>(size), options.dimensions, options.normalize);
     const double ms = ms_since(t_start);
     LIYAB_LOG_INFO("embed: %zu inputs, %lld tokens (%lld shared) in %.0f ms", texts.size(),
                    static_cast<long long>(run->tokens), static_cast<long long>(run->reused), ms);

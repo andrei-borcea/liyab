@@ -34,6 +34,7 @@ public:
     // already spells them (a rendered chat template wrote them). Usually
     // this is one BOS; chatglm-spm uses [gMASK], sop instead.
     // SentencePiece vocabularies ("llama": Llama 2, Mistral, Gemma, Phi-3)
+    // and SentencePiece-normalized BPE with explicit merge ranks ("gemma4")
     // and byte-level or Unicode-symbol ranked BPE ("gpt2") with the pre-tokenizers of
     // PreTokenizer::supported_names(); a BPE vocabulary with another
     // tokenizer.ggml.pre returns Unsupported naming it and the supported
@@ -144,6 +145,7 @@ private:
     std::vector<int32_t> initial_tokens_;
     std::string initial_text_;  // their literal spelling, when all are special
     bool chat_sort_tools_ = false;
+    bool ranked_spm_ = false;  // SentencePiece normalization, tokenizer.ggml.merges priorities rather than scores
 };
 
 }  // namespace liyab

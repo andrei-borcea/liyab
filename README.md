@@ -113,6 +113,7 @@ These rules decide what goes into the code:
 | Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
 | Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Additional recurrent layouts: `lfm2`, `lfm2moe`, `qwen3next`, `kimi-linear` | CPU recurrent mixers; projections use the selected backend; validation details in [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts) |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention), `gemma3n`, `gemma-embedding` (bidirectional pooling) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | State-space mixers: `mamba` (Mamba-1, Falcon-Mamba) and `mamba2` (Mamba-2); mixer-only and FFN-only blocks planned from tensors | CPU selective scans and depthwise convolution, with NEON, AVX2/FMA and scalar paths; Metal/Vulkan use CPU scans with their normal projection routing. Validation: [model descriptions](docs/model-descriptions.md#state-space-mixers). |
@@ -297,6 +298,27 @@ recorded AC confirmation of its one affected configuration. The original timing 
 ---
 
 ## Quick start
+
+The model planner also recognizes Gemma 3n's AltUp residual streams, Laurel low-rank branches, per-layer token
+embeddings, Gaussian gate sparsity and shared keys/values. These compose with Gemma's existing GeGLU and sandwich
+norms. Gemma 4 adds optional key-as-value projections and block output scales; files with different local/global
+head geometry or different FFN widths are currently refused with an explicit reason. Gemma 3n E2B's BF16 conversion
+passes the real-model gate: mean KL 0.00000, top-1 100%, and identical token IDs on all three tokenizer texts.
+Gemma 4 remains limited to tiny checks with uniform geometry.
+The per-layer table stays memory-mapped and is read by token row; scratch holds only the current batch's per-layer
+inputs and residual streams. Dense projections use the existing CPU/Metal/Vulkan routing and CPU fallback; the
+small AltUp router and corrections run on CPU. EmbeddingGemma runs bidirectional attention over each complete
+input, mean pooling, the GGUF's `dense_2`/`dense_3` projections, then optional truncation and L2 normalization.
+Bidirectional models reject incremental continuation, tree drafts and rolling caches; quantized-key calibration
+also reads its complete text in one pass. Shared key-as-value projections include their projection bias.
+The `gemma4` tokenizer uses SentencePiece space normalization with the file's explicit BPE merge priorities,
+which can differ from vocabulary scores. Existing SentencePiece tokenizers keep their score-based merges.
+Gemma 4's four-block test with uniform head geometry matches all 512 token IDs, mean KL 0.00000 and top-1 99.22%;
+the full checkpoints still need the generic per-block geometry work. Converter compatibility details are in
+[model descriptions](docs/model-descriptions.md#gemma-residual-and-embedding-parts).
+Text conformance of a multimodal checkpoint loads its registered text decoder alone; the reference tool infers
+the decoder namespace from the checkpoint's embedding key, without requiring unused vision/audio packages.
+Its `--config` overrides apply to the text configuration.
 
 Requirements: CMake ≥ 3.22, a C++20 compiler (Clang 17+ / Apple Clang 15+), Ninja recommended. Android: NDK r26+.
 iOS: Xcode 15+. Windows: Visual Studio 2022 with its C++ tools (MSVC, or its clang-cl). The app: Flutter 3.x,
@@ -609,6 +631,13 @@ What the port does differently from the POSIX platforms:
     before `attn_kv_b` was split into `attn_k_b` and `attn_v_b` are refused with a request to convert them again,
     and so is group-limited expert routing
     (`expert_group_count` > 1: DeepSeek-V2 236B, V3 and R1).
+  * `gemma3n` (Gemma 3n text): AltUp residual streams, Laurel, per-layer token embeddings, Gaussian gate
+    sparsity, normalized values and shared KV. The per-layer table is mapped and read by token row; only its
+    current batch is materialized. The loader may warm the mapping, and the memory plan conservatively counts
+    the whole file. Projections use the existing CPU kernels and GPU operation routing; AltUp's small router
+    and corrections run on CPU.
+  * `gemma-embedding` (EmbeddingGemma 300M): bidirectional attention, mean pooling and chained dense projections
+    before L2 normalization. Each complete input runs alone through attention, including in a batch of inputs.
 
   Linear RoPE scaling, Llama 3.x `rope_freqs`, LongRoPE and YaRN are supported, and windowed blocks can rotate with
   a RoPE base of their own. LongRoPE picks its factors once, from the configured context: the short ones up to the
@@ -1364,6 +1393,14 @@ step, and speed-ups over plain decoding of 2.02× / 2.10×, 1.17× / 1.11×, 1.4
 ---
 
 ## Embeddings and reranking
+
+EmbeddingGemma (`gemma-embedding`, 300M) adds bidirectional attention and mean pooling with the model's two
+bias-free dense projections (768 → 3072 → 768). On CPU and Metal routes, a BF16 conversion of `unsloth/embeddinggemma-300m`
+matched all tokenizer IDs in the 39 pooling cases and reached cosine ≥ 0.99992651 against the float32 reference;
+all 39 vectors were bit-identical alone and in the batch. The independent reference agreed with
+sentence-transformers at cosine ≥ 0.9999998. Include the model card's task prefix in the input text.
+`tools/pooling_reference.py` reads mean-pooling and identity Dense modules from `modules.json`;
+`tools/tiny_checkpoint.py --base-model` saves embedding transformers without adding an LM head.
 
 Local memory and retrieval need two more kinds of model next to the generative one: an embedding model, which turns
 a text into a vector so similar texts lie close together, and a reranker, which scores how well a document answers a
@@ -2336,6 +2373,20 @@ cache the forward passes agree:
 | state-spaces/mamba-130m-hf (`mamba`, F16) | 512 | 0.00001 | 99.61% |
 | state-spaces/mamba-370m-hf (`mamba`, F16) | 512 | 0.00000 | 100.00% |
 | AntonV/mamba2-130m-hf (`mamba2`, F16) | 512 | 0.00000 | 100.00% |
+| Gemma-3n-E2B-it (`gemma3n`; unsloth checkpoint converted to BF16) | 512 | 0.00000 | 100.00% |
+
+Gemma 3n also passes against a BF16 transformers reference (mean KL 0.00168, top-1 98.24%); CPU and Metal routes
+give the same greedy reply to the checked chat prompt, "The capital of France is Paris." BF16 matmuls retain the
+existing per-operation CPU fallback. Its four-block F32 tiny checkpoint, including every new part and windows
+within the text, gives mean KL 0.00000 and top-1 99.41%. A deeper ten-block random diagnostic gives mean KL
+0.00001 but fails the 99% top-1 threshold (91.78%); adding F16 KV rounding to that reference improves it to
+98.83%, so precision accounts for most of that difference. That diagnostic is not a passing conformance case.
+
+Quiet baseline checks on Qwen3-0.6B and Llama-3.2-1B BF16 used six warmed pairs per configuration, alternating
+main/branch order. Median paired CPU prefill throughput changed by −0.34% / +0.27%; 64-token decode time changed
+by −0.74% / −0.42% on CPU and +1.07% / −0.17% on the Metal route. CLI prefill changes stayed within 0.11%.
+All 36 paired CLI replies were byte-identical. These BF16 Metal-route measurements use the existing CPU fallback
+for matrix operations; they do not measure native GPU matrix throughput.
 
 Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
 mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds

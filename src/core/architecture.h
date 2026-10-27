@@ -201,6 +201,17 @@ struct ArchSpec {
     // h % key heads, the tiled order the Qwen3.5 converter reorders the value
     // heads into.
     bool ssm_grouped_heads = false;
+    // false: attention is bidirectional (EmbeddingGemma): a query sees every
+    // position of its pass, later ones included, and a windowed block the
+    // positions at most half its window away on either side.
+    // <arch>.attention.causal, when present, overrides it.
+    bool causal = true;
+    // q·k is not scaled when the file states no <arch>.attention.scale: the
+    // weights of the Q norm carry the scale (Gemma 3n, Gemma 4).
+    bool unscaled_scores = false;
+    // Values are RMS-normalized per head, without a weight, before they are
+    // cached (Gemma 3n, Gemma 4: a norm the tensors cannot show).
+    bool value_norm = false;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -277,6 +288,26 @@ struct BlockPlan {
     bool fused_gate_up = false;
     // Moe: an always-active shared expert next to the routed ones.
     bool shared_expert = false;
+    // Attention: the block computes queries only and attends over the keys
+    // and values that block kv_source (an earlier attention block of the same
+    // kind, windowed or not) cached in the same pass: KV sharing, the last
+    // <arch>.attention.shared_kv_layers blocks of Gemma 3n / Gemma 4. -1:
+    // the block keeps keys and values of its own.
+    int32_t kv_source = -1;
+    // Attention: no attn_v; each head's values are its keys' projection,
+    // taken before the key norm and RoPE (Gemma 4's attention_k_eq_v).
+    bool values_from_keys = false;
+    // Laurel (laurel_l present, Gemma 3n): a low-rank branch of the
+    // normalized block input, x_n + norm(laurel_r · laurel_l · x_n), joins
+    // the mixer's residual add: x = (x + mixer + laurel) / sqrt(2).
+    bool laurel = false;
+    // Dense FFN: the gate's Gaussian top-k (Gemma 3n's activation sparsity,
+    // <arch>.activation_sparsity_scale finite for the block): before its
+    // activation, each token's gate projection g becomes
+    // relu(g - (mean(g) + gate_sparsity * std(g))), so only the values above
+    // that cutoff (the top 5% of a normal distribution at 1.645) remain.
+    bool sparse_gate = false;
+    float gate_sparsity = 0.0f;
     // The mixer and the FFN both read the block input (ArchSpec::
     // parallel_residual, <arch>.use_parallel_residual): the FFN through the
     // block's own FFN norm when bound (GPT-NeoX's post_attention_layernorm,
@@ -384,7 +415,10 @@ struct ModelConfig {
     const ArchSpec* spec = nullptr;  // registry row (static lifetime)
     std::string arch;                // spec->name
     int32_t n_layers = 0;       // executed blocks (excludes multi-token-prediction heads)
-    int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention (they own the KV cache)
+    int32_t n_attn_layers = 0;  // blocks with MixerKind::Attention
+    // Attention blocks keeping keys and values of their own: the KV cache's
+    // layers (n_attn_layers less the blocks sharing another's, kv_source).
+    int32_t n_kv_layers = 0;
     int32_t n_embd = 0;
     int32_t n_ff = 0;       // maximum block FFN width (individual widths in blocks)
     int32_t n_head = 0;     // maximum query heads, at least one for scratch sizing
@@ -475,6 +509,30 @@ struct ModelConfig {
     MoeGating moe_gating = MoeGating::Softmax;
     bool moe_norm_weights = true;  // renormalize the top-k weights to sum to 1
     float moe_weights_scale = 1.0f;
+
+    // AltUp (Gemma 3n): the residual stream is altup_streams streams
+    // (<arch>.altup.num_inputs; 0: one stream, no AltUp). The first is the
+    // scaled embedding, the others its projections through altup_proj
+    // rescaled to its magnitude. Each block predicts every stream from all
+    // of them (coefficients from a router over the active stream), runs on
+    // the active one's prediction (<arch>.altup.active_idx), and corrects
+    // every stream by what the block changed in it; after the last block the
+    // streams other than the first go back through altup_unembd_proj and
+    // their mean is the final hidden state.
+    int32_t altup_streams = 0;
+    int32_t altup_active = 0;
+    // Per-layer embeddings (Gemma 3n, Gemma 4; 0: none): every token gets
+    // ple_dim values per block (<arch>.embedding_length_per_layer_input),
+    // its row of per_layer_token_embd (scaled by sqrt(ple_dim)) plus the
+    // normalized projection of its embedding through per_layer_model_proj,
+    // times 1/sqrt(2). After its FFN, each block gates them with its own
+    // output (inp_gate, the FFN's activation), projects them back (proj,
+    // post_norm) and adds the result to the residual stream (with AltUp: to
+    // every stream but the first).
+    int32_t ple_dim = 0;
+    // false: bidirectional attention (ArchSpec::causal, or the file's
+    // <arch>.attention.causal). Such a model reads a text in one pass.
+    bool causal = true;
 
     // > 0: queries, keys and values are clamped to [-clamp_kqv, clamp_kqv]
     // after their projections and biases (<arch>.attention.clamp_kqv: MPT,

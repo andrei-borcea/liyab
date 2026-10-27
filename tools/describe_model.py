@@ -422,7 +422,8 @@ class Engine:
         norms = set(re.findall(r'block_norm_tensor\(\s*\w+\s*,\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
         self.block_tensors |= norms | {name + ".weight" for name in norms}
         self.block_tensors |= set(re.findall(r'experts\(\s*"([^"]+)"', transformer))
-        literals = set(re.findall(r'"([a-z][a-z0-9_]*\.(?:weight|bias))"', transformer))
+        literals = set(re.findall(r'"([a-z][a-z0-9_]*\.(?:weight|bias))"',
+                                  transformer + read("src/core/pooling.cpp")))
         self.global_tensors = {t for t in literals if t not in self.block_tensors}
         pre = read("src/core/pre_tokenizer.cpp")
         table = re.search(r"table\(\)\s*\{(.*?)\n\}", pre, re.S)
@@ -532,7 +533,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped", "output_norm", "ssm_grouped_heads")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped", "output_norm", "ssm_grouped_heads", "causal", "unscaled_scores", "value_norm")
 
 
 def _close(a, b, rel=1e-5):
@@ -777,6 +778,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     head_dim = int(g.key("attention.key_length", n_embd // max(n_head, 1)))
     rope_dim = int(g.key("rope.dimension_count", head_dim))
     n_ff = max(block_ff, default=0)
+    for key, expected in (("attention.key_length_swa", head_dim), ("attention.value_length_swa", head_dim),
+                          ("rope.dimension_count_swa", rope_dim)):
+        if g.key(key) is not None and int(g.key(key)) != expected:
+            d.missing.append(f"windowed blocks of other head or rotation sizes ({key}) are not supported yet")
     eps = float(g.key("attention.layer_norm_epsilon", g.key("attention.layer_norm_rms_epsilon", 1e-5)))
     if n_layers != facts["blocks"]:
         d.file_issues.append(f"the GGUF has {n_layers} blocks, the reference {facts['blocks']}")
@@ -850,6 +855,35 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
 
     # --- the reference, block by block ---
     bf = facts["block_facts"]
+    # Residual-stream parts come from observed equations in reference_trace;
+    # their sizes and the shared suffix must agree with the file's metadata.
+    shared = int(cfg.get("num_kv_shared_layers", 0) or 0)
+    if int(g.key("attention.shared_kv_layers", 0) or 0) != shared:
+        d.file_issues.append("attention.shared_kv_layers differs from the reference configuration")
+    ple = int(cfg.get("hidden_size_per_layer_input", 0) or 0)
+    if int(g.key("embedding_length_per_layer_input", 0) or 0) != ple:
+        d.file_issues.append("embedding_length_per_layer_input differs from the reference configuration")
+    if ple:
+        d.parts.append(f"per-layer token inputs: {ple} values per token and block, memory-mapped table")
+    if shared:
+        d.parts.append(f"last {shared} blocks reuse the last source KV of their window kind")
+    sparsity = g.key("activation_sparsity_scale")
+    for block in bf:
+        i = block["index"]
+        if block.get("altup"):
+            streams = block["altup"]
+            if (g.key("altup.num_inputs") != streams["streams"] or g.key("altup.active_idx") != streams["active"]):
+                d.file_issues.append(f"block {i}: AltUp stream count or active index differs from the observed equation")
+            d.parts.append(f"AltUp: {streams['streams']} residual streams, active {streams['active']}")
+        if block.get("laurel"):
+            d.parts.append("Laurel: normalized low-rank branch of the normalized block input")
+        probability = block.get("ffn", {}).get("activation_sparsity", 0.0)
+        if probability:
+            from statistics import NormalDist
+            expected = NormalDist().inv_cdf(probability)
+            if sparsity is None or len(sparsity) <= i or not _close(float(sparsity[i]), expected):
+                d.file_issues.append(f"block {i}: activation_sparsity_scale differs from the observed Gaussian cutoff")
+            d.parts.append(f"Gaussian gate sparsity: probability {probability:g}")
     att_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "attention"]
     rec_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "recurrent"]
     ssm_blocks = [b for b in bf if b.get("mixer", {}).get("kind") in ("mamba", "mamba2")]
@@ -1090,7 +1124,15 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         else:
             inv = [float(np.float32(rope_base ** (-2.0 * i / rope_dim))) for i in range(rope_dim // 2)]
             mag, how = 1.0, f"base {rope_base:g}, unscaled"
-        if len(inv) != len(ref) or not all(_close(a, b, 2e-5) for a, b in zip(inv, ref)):
+        # Proportional RoPE keeps the pairing across the full head while
+        # leaving some pairs still. GGUF encodes those exact zero frequencies
+        # with 1e30 divisors; report the representation without claiming the
+        # engine's tiny nonzero frequency is literally zero.
+        inactive = set()
+        if rope_base is None and "rope_freqs.weight" in g.tensors:
+            divisors = g.values("rope_freqs.weight").reshape(-1)
+            inactive = {i for i, x in enumerate(divisors) if float(x) >= 1e30 and i < len(ref) and ref[i] == 0}
+        if len(inv) != len(ref) or not all(i in inactive or _close(a, b, 2e-5) for i, (a, b) in enumerate(zip(inv, ref))):
             worst = max(range(min(len(inv), len(ref))), key=lambda i: abs(inv[i] - ref[i]) / max(ref[i], 1e-30))
             d.missing.append(f"{label}: the reference's RoPE frequencies are not the engine's from the file "
                              f"({how}): pair {worst} turns {ref[worst]:.6g} rad/position there, "
@@ -1102,6 +1144,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                                  f"{mag:.6g} from the file (rope.scaling.attn_factor)")
             return False
         d.parts.append(f"{label}: RoPE frequencies from the file match the reference ({how})")
+        if inactive:
+            d.notes.append(f"{label}: {len(inactive)} zero-frequency pairs represented by the GGUF's 1e30 factors")
         return True
 
     # The table every block rotates with unless windowed blocks have one of their own (when every attention
@@ -1189,10 +1233,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             elif fw is None:
                 d.file_issues.append(f"the reference attends through a {w}-position window in blocks "
                                      f"{_ranges(win)}; the GGUF does not record it (attention.sliding_window)")
-            elif w is not None and int(fw) != int(w):
+            elif w is not None and (int(fw) if all(b["mixer"].get("causal", True) for b in att_blocks)
+                                   else int(fw) // 2 + 1) != int(w):
                 d.file_issues.append(f"window {w} in the reference, {fw} in the file")
             else:
-                d.parts.append(f"windowed blocks {_ranges(win)}: the last {fw} positions")
+                bidirectional = not all(b["mixer"].get("causal", True) for b in att_blocks)
+                d.parts.append(f"windowed blocks {_ranges(win)}: " +
+                               (f"{int(fw) // 2} positions on either side" if bidirectional else f"the last {fw} positions"))
         if period == 0:
             why = "no block attends through a window"
         elif period == 1 and set(win) == set(att_idx):
@@ -1300,10 +1347,27 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             d.unknown.append("attention has linear position slopes that do not follow the ALiBi construction")
     elif alibi:
         d.missing.append("ALiBi in only some attention blocks")
+    directions = {b["mixer"].get("causal", True) for b in att_blocks}
+    if len(directions) <= 1:
+        d.set("causal", next(iter(directions), True), "the traced attention modules' is_causal contract")
+    else:
+        d.unknown.append("attention direction differs between blocks")
+    scales = {b["mixer"]["scale"] for b in att_blocks}
+    unscaled = bool(scales) and all(_close(s, 1.0) for s in scales)
+    d.set("unscaled_scores", unscaled, "the traced attention receives scale 1" if unscaled else
+          "the traced attention uses the usual head scale or the file's explicit scale")
+    value_norms = {b["mixer"]["value"]["rms_norm"] for b in att_blocks if b["mixer"].get("value") is not None}
+    if len(value_norms) == 1:
+        d.set("value_norm", next(iter(value_norms)), "values matched against the projection and its unweighted RMS norm")
+    elif not att_blocks:
+        d.set("value_norm", False, "no attention blocks")
+    else:
+        d.unknown.append("could not establish one value-normalization rule across attention blocks")
     # The q.k scale the engine uses: the file's attention.scale when it reads that key, else 1/sqrt(head_dim);
     # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
     file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
-    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(max(head_dim, 1)))) * qk_factor ** 2
+    engine_scale = (float(file_scale) if file_scale is not None else 1.0 if unscaled else
+                    _f32(1.0 / math.sqrt(max(head_dim, 1)))) * qk_factor ** 2
     file_cap = g.key("attn_logit_softcapping") if "attn_logit_softcapping" in engine.file_keys else None
     for b in att_blocks:
         m = b["mixer"]
@@ -1349,7 +1413,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             else:
                 d.parts.append(f"block {i}: learned sink logits in the attention softmax denominator")
         if not m.get("causal", True):
-            d.missing.append(f"block {i}: non-causal attention")
+            d.parts.append(f"block {i}: bidirectional attention; windowed blocks see half the window on either side")
         if m["head_dim"] != head_dim or m["heads"] != block_heads[i] or m["kv_heads"] != block_kv_heads[i]:
             d.file_issues.append(f"block {i}: {m['heads']}/{m['kv_heads']} heads of {m['head_dim']} in the "
                                  f"reference, {block_heads[i]}/{block_kv_heads[i]} of {head_dim} in the file")

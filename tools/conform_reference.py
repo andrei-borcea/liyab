@@ -41,8 +41,10 @@ buffers are not preserved by transformers' meta-device pretrained loader.
 The model's forward implementation and checkpoint tensors are unchanged.
 --slow-tokenizer selects the authors' slow tokenizer when a newer fast
 conversion does not preserve their SentencePiece model's segmentation.
-For a multimodal checkpoint, the library's image/text model class runs the
-same text-only input, without images or image tokens added by the tool.
+For a multimodal checkpoint, only its registered text decoder is loaded.
+Its checkpoint namespace is inferred from a unique input-embedding key;
+an ambiguous match is refused. --config applies to that text configuration.
+Unused vision/audio towers and their optional packages are not required.
 
 --lora applies a PEFT LoRA adapter (a directory with adapter_config.json, or
 a Hugging Face id) with PEFT, for the conformance of Liyab's LoRA adapters:
@@ -53,6 +55,7 @@ convert the same adapter to GGUF and pass it to liyab-kl --lora. Needs peft
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 
@@ -96,9 +99,34 @@ def main():
         sys.exit("the text must encode to at least 2 tokens")
 
     config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=args.trust_remote_code)
+    text_config = config.get_text_config()
     for field, value in json.loads(args.config or "{}").items():
-        setattr(config, field, value)
+        setattr(text_config, field, value)
     extra = {"attn_implementation": args.attn_implementation} if args.attn_implementation else {}
+    if text_config is not config:
+        # Load only the registered text decoder from a multimodal checkpoint.
+        # Infer its namespace by matching the input embedding's parameter
+        # suffix against checkpoint keys; never instantiate unused vision or
+        # audio towers or require their optional packages. Ambiguity is an
+        # error rather than a guessed prefix.
+        from describe_model import Checkpoint
+
+        config = text_config
+        with torch.device("meta"):
+            skeleton = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
+        weight = skeleton.get_input_embeddings().weight
+        target = next(name for name, parameter in skeleton.named_parameters() if parameter is weight)
+        prefix = skeleton.base_model_prefix + "."
+        suffix = target.removeprefix(prefix)
+        keys = Checkpoint(args.model, args.revision).index
+        candidates = [name for name in keys if name == suffix or name.endswith("." + suffix)]
+        if len(candidates) != 1:
+            raise ValueError(f"cannot identify one text embedding ending in {suffix}: {candidates}")
+        source_prefix = candidates[0][:-len(suffix)]
+        target_prefix = target[:-len(suffix)]
+        if source_prefix != target_prefix:
+            extra["key_mapping"] = {"^" + re.escape(source_prefix): target_prefix}
+        del skeleton
     model_class = AutoModelForCausalLM
     if type(config) not in AutoModelForCausalLM._model_mapping and hasattr(config, "text_config"):
         from transformers import AutoModelForImageTextToText

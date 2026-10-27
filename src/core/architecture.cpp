@@ -344,7 +344,59 @@ constexpr ArchSpec kArchitectures[] = {
      .rope = RopeLayout::Adjacent,
      .ffn_norm = "ffn_norm",
      .moe_norm_weights = true,
-     .nope_period = 1},
+     .nope_period = 1},    // Gemma 3n text models: Gemma 3's block (scaled embeddings, GeGLU,
+    // sandwich norms, Q/K norms, windowed blocks with RoPE base 10000) with
+    // unscaled q·k and values normalized per head, inside AltUp's residual
+    // streams, with Laurel, per-layer embeddings, the Gaussian top-k of the
+    // first blocks' FFN gates and the last blocks sharing earlier blocks'
+    // keys and values: each planned from its tensors and metadata. Every
+    // fifth block attends globally unless the file lists the windowed ones.
+    // The converter stores the norm weights as they are (no 1 + w).
+    {.name = "gemma3n",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 5,
+     .rope_base_swa = 10000.0f,
+     .unscaled_scores = true,
+     .value_norm = true},
+    // Gemma 4 text models: Gemma 3n's attention (unscaled q·k, value norm,
+    // KV sharing) and per-layer embeddings without AltUp or Laurel, a
+    // per-block output scale (layer_output_scale), global blocks whose
+    // values may be their keys, and partial "proportional" RoPE in the global
+    // blocks (rope_freqs keeps a quarter of the pairs turning). Every sixth
+    // block attends globally unless the file lists the windowed ones.
+    {.name = "gemma4",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 6,
+     .rope_base_swa = 10000.0f,
+     .unscaled_scores = true,
+     .value_norm = true},
+    // EmbeddingGemma: Gemma 3's blocks (norm weights stored as 1 + w) with
+    // bidirectional attention, the windowed blocks seeing half their window
+    // on either side; mean pooling and the dense projections come from the
+    // file (core/pooling.h).
+    {.name = "gemma-embedding",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .ffn_activation = FfnActivation::GeluTanh,
+     .post_mixer_norm = "post_attention_norm",
+     .post_ffn_norm = "post_ffw_norm",
+     .scale_embeddings = true,
+     .swa_period = 6,
+     .rope_base_swa = 10000.0f,
+     .causal = false},
 };
 
 }  // namespace
@@ -400,6 +452,116 @@ std::string block_norm_tensor(const MmapLoader& file, int32_t block, std::string
     const std::string bare = block_tensor(block, suffix);
     return file.tensor(weighted) != nullptr || file.tensor(bare) == nullptr ? weighted : bare;
 }
+
+namespace {
+
+// The parts Gemma 3n and Gemma 4 add to Gemma 3's blocks, from the metadata
+// and the tensors (BlockPlan / ModelConfig say what each does), and the
+// attention's direction. Called once the blocks are planned; sets
+// n_kv_layers. `key` prefixes a metadata key with the architecture.
+template <typename Key>
+Status describe_gemma_parts(const MmapLoader& f, ModelConfig& c, const Key& key) {
+    c.causal = c.spec->causal;
+    if (const GgufValue* v = f.metadata(key("attention.causal"))) {
+        const auto causal = v->as_bool();
+        if (!causal) return Status(ErrorCode::InvalidModel, "invalid " + key("attention.causal"));
+        c.causal = *causal;
+    }
+
+    // KV sharing: the last shared_kv_layers blocks attend over the keys and
+    // values of the last block of their kind (windowed or global) before
+    // them that keeps its own.
+    if (const auto* v = f.metadata(key("attention.shared_kv_layers")); v && !v->as_int()) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("attention.shared_kv_layers"));
+    }
+    const int64_t shared = f.get_int(key("attention.shared_kv_layers")).value_or(0);
+    if (shared < 0 || shared >= c.n_layers) return Status(ErrorCode::InvalidModel, "invalid " + key("attention.shared_kv_layers"));
+    const auto first_shared = static_cast<int32_t>(c.n_layers - shared);
+    for (int32_t l = first_shared; l < c.n_layers; ++l) {
+        BlockPlan& b = c.blocks[static_cast<size_t>(l)];
+        if (b.mixer != MixerKind::Attention || b.latent) {
+            return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + " shares keys and values (" +
+                                                       key("attention.shared_kv_layers") + ") but is not attention");
+        }
+        for (int32_t s = first_shared - 1; s >= 0 && b.kv_source < 0; --s) {
+            const BlockPlan& src = c.blocks[static_cast<size_t>(s)];
+            if (src.mixer == MixerKind::Attention && !src.latent && src.windowed == b.windowed) b.kv_source = s;
+        }
+        if (b.kv_source < 0) {
+            return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + " shares keys and values with no "
+                                                       "earlier block of its kind");
+        }
+        const BlockPlan& source = c.blocks[static_cast<size_t>(b.kv_source)];
+        if (source.n_head != b.n_head || source.n_head_kv != b.n_head_kv || source.rope != b.rope) {
+            return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                              " shares keys and values with incompatible head geometry or rotation");
+        }
+        b.values_from_keys = false;  // it computes none
+    }
+    for (const BlockPlan& b : c.blocks) c.n_kv_layers += b.mixer == MixerKind::Attention && b.kv_source < 0 ? 1 : 0;
+
+    // AltUp: several residual streams, with the projections that make and
+    // merge them.
+    if (const TensorView* proj = f.tensor("altup_proj.weight")) {
+        const int64_t streams = f.get_int(key("altup.num_inputs")).value_or(0);
+        const int64_t active = f.get_int(key("altup.active_idx")).value_or(0);
+        const TensorView* unembd = f.tensor("altup_unembd_proj.weight");
+        if (streams < 2 || streams > 16 || active < 0 || active >= streams || unembd == nullptr) {
+            return Status(ErrorCode::InvalidModel, "AltUp tensors without valid " + key("altup.num_inputs") + " / " +
+                                                       key("altup.active_idx") + " or altup_unembd_proj");
+        }
+        for (const TensorView* t : {proj, unembd}) {
+            if (t->ne[0] != c.n_embd || t->ne[1] != c.n_embd || t->ne[2] != streams - 1 || t->ne[3] != 1) {
+                return Status(ErrorCode::InvalidModel, std::string(t->name) + " is not [n_embd, n_embd, streams - 1]");
+            }
+        }
+        c.altup_streams = static_cast<int32_t>(streams);
+        c.altup_active = static_cast<int32_t>(active);
+    } else if (f.tensor("altup_unembd_proj.weight") != nullptr || f.get_int(key("altup.num_inputs")).value_or(0) > 1) {
+        return Status(ErrorCode::InvalidModel, "AltUp requires altup_proj.weight");
+    }
+
+    // Per-layer embeddings.
+    if (const auto* v = f.metadata(key("embedding_length_per_layer_input")); v && !v->as_int()) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("embedding_length_per_layer_input"));
+    }
+    const int64_t ple = f.get_int(key("embedding_length_per_layer_input")).value_or(0);
+    if (ple < 0 || ple > (int64_t{1} << 16)) {
+        return Status(ErrorCode::InvalidModel, "invalid " + key("embedding_length_per_layer_input"));
+    }
+    if (ple > 0) {
+        if (f.tensor("per_layer_token_embd.weight") == nullptr) {
+            return Status(ErrorCode::InvalidModel, "per-layer embeddings require per_layer_token_embd.weight");
+        }
+        c.ple_dim = static_cast<int32_t>(ple);
+    } else if (f.tensor("per_layer_token_embd.weight") != nullptr) {
+        return Status(ErrorCode::InvalidModel, "per-layer token table without " + key("embedding_length_per_layer_input"));
+    }
+
+    // The Gaussian top-k of the FFN gates: a standard-deviation multiplier per
+    // block, -inf (no sparsity) for the others.
+    if (const GgufValue* v = f.metadata(key("activation_sparsity_scale"))) {
+        if (v->type != GgufValue::Type::Array || v->array_type != GgufValue::Type::F32 ||
+            v->array_size < static_cast<uint64_t>(c.n_layers)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("activation_sparsity_scale"));
+        }
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            float k = 0.0f;
+            std::memcpy(&k, v->array_data + 4 * static_cast<size_t>(l), 4);
+            BlockPlan& b = c.blocks[static_cast<size_t>(l)];
+            if (std::isnan(k) || k == INFINITY) return Status(ErrorCode::InvalidModel, "invalid " + key("activation_sparsity_scale"));
+            if (k == -INFINITY) continue;
+            if (b.ffn != FfnKind::Dense || b.fused_gate_up) {
+                return Status(ErrorCode::Unsupported, "activation sparsity outside a dense FFN with its own gate");
+            }
+            b.sparse_gate = true;
+            b.gate_sparsity = k;
+        }
+    }
+    return Status::ok();
+}
+
+}  // namespace
 
 Result<ModelConfig> describe_model(const MmapLoader& f) {
     ModelConfig c;
@@ -555,6 +717,20 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         }
     } else if (value_length && *value_length != c.head_dim) {
         return Status(ErrorCode::Unsupported, "key_length != value_length is not supported");
+    }
+    // Windowed blocks with heads or a rotation of other sizes than the
+    // global ones (Gemma 4: 256-wide windowed heads, 512-wide global ones)
+    // need per-block geometry.
+    for (const char* swa : {"attention.key_length_swa", "attention.value_length_swa", "rope.dimension_count_swa"}) {
+        const auto v = f.get_int(key(swa));
+        const int32_t global = std::string_view(swa).starts_with("rope") ? static_cast<int32_t>(
+                                                                                 f.get_int(key("rope.dimension_count")).value_or(c.head_dim))
+                                                                         : c.head_dim;
+        if (v && *v != global) {
+            return Status(ErrorCode::Unsupported, "windowed blocks of other head or rotation sizes than the global "
+                                                  "ones (" + key(swa) + " " + std::to_string(*v) + ", global " +
+                                                      std::to_string(global) + ") are not supported yet");
+        }
     }
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
@@ -729,6 +905,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (!(c.attn_scale > 0.0f) || !std::isfinite(c.attn_scale)) {
             return Status(ErrorCode::InvalidModel, "invalid " + key("attention.scale"));
         }
+    } else if (c.spec->unscaled_scores) {
+        c.attn_scale = 1.0f;  // the Q norm's weights carry the scale
     } else if (attends) {
         const int32_t scored = c.mla.kv_rank > 0 ? c.mla.nope_dim + c.rope_dim : c.head_dim;
         c.attn_scale = 1.0f / std::sqrt(static_cast<float>(scored));
@@ -882,6 +1060,9 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             }
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
+            b.values_from_keys = !b.latent && !b.fused_qkv && f.tensor(block_tensor(l, "attn_k.weight")) != nullptr &&
+                                 f.tensor(block_tensor(l, "attn_v.weight")) == nullptr;
+
             b.rope = rotated[static_cast<size_t>(l)];
             // Q/K norms over the whole projection (one weight per channel of
             // every head) rather than one head's weights shared by all heads.
@@ -919,6 +1100,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             }
         }
         b.parallel = parallel;
+        b.laurel = f.tensor(block_tensor(l, "laurel_l.weight")) != nullptr;
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             const bool gate = f.tensor(block_tensor(l, "ffn_gate.weight")) != nullptr;
             b.fused_gate_up = !gate && up->rows() == 2 * int64_t{b.n_ff};
@@ -993,6 +1175,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                                                       ": attention sinks with latent attention are not supported");
         }
     }
+    LIYAB_RETURN_IF_ERROR(describe_gemma_parts(f, c, key));
     c.n_recurrent_layers = static_cast<int32_t>(std::count_if(c.blocks.begin(), c.blocks.end(),
         [](const BlockPlan& b) { return keeps_state(b.mixer); }));
     auto has_mixer = [&](MixerKind kind) {

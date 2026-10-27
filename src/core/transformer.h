@@ -765,6 +765,9 @@ private:
         // the low-rank projections of the per-channel decay (ssm_f_a, ssm_f_b) and of the output gate
         // (ssm_g_a, ssm_g_b)
         kFa, kFb, kGa, kGb,
+        // Laurel's low-rank branch [n_embd -> rank -> n_embd]; per-layer embeddings' gate
+        // [n_embd -> ple_dim] and projection back [ple_dim -> n_embd] (ModelConfig::ple_dim)
+        kLaurelL, kLaurelR, kPleGate, kPleProj,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
@@ -802,6 +805,14 @@ private:
         // (ffn_gate_exps.bias, ffn_up_exps.bias, ffn_down_exps.bias), each
         // added after its projection.
         std::vector<float> gate_exps_bias, up_exps_bias, down_exps_bias;
+        std::vector<float> laurel_norm;   // Laurel: norm of its branch's output
+        // AltUp (ModelConfig::altup_streams K): the router [K][n_embd] and its
+        // input norm, the prediction coefficients [K * K][K] and the
+        // correction coefficients [K][K] (rows of the converter's matrices),
+        // and the optional scale of the corrected active stream.
+        std::vector<float> altup_router, altup_router_norm, altup_predict, altup_correct, altup_correct_scale;
+        std::vector<float> ple_norm;      // per-layer embeddings: norm after their projection (post_norm)
+        float output_scale = 1.0f;        // layer_output_scale: multiplies the residual stream after the block
     };
     // Recurrent memory of one recurrent block, sized for its mixer.
     struct RecurrentState {
@@ -984,7 +995,7 @@ private:
     void attention(const Layer& layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
-    // nullptr: none) and keys (n_head_kv heads), where the block has them.
+    // nullptr: none) and keys (n_head_kv heads; nullptr: none), where the block has them.
     void qk_norm(const Layer& L, float* q, float* k) const;
     // One row of n values through the model's norm (ArchSpec::norm) with
     // weight `w` and bias `b` (nullptr: none; RMSNorm always has a weight),
@@ -1026,6 +1037,22 @@ private:
     // The same over the hidden rows `rows` of x_ (any order), into logits_
     // rows 0, 1, ... (forward_batch()).
     Status compute_logits_rows(const Route& route, std::span<const int32_t> rows, ThreadPool& pool);
+    // Before the first block of a pass whose embeddings are in x_ (n rows of
+    // `tokens`): each token's per-layer embeddings (ple_) and AltUp's streams
+    // (streams_). No-op for models without them.
+    Status enter_blocks(std::span<const int32_t> tokens, const Route& route);
+    // After the last block: AltUp's streams merged into x_ (the final hidden
+    // states before the output norm). No-op without AltUp.
+    Status leave_blocks(int32_t n, const Route& route);
+    // AltUp around block `layer`: predict() makes every stream's prediction
+    // from all of them and leaves the active one in x_; correct() spreads
+    // what the block changed in x_ to every stream. n rows.
+    void altup_predict(const Layer& L, int32_t n);
+    void altup_correct(const Layer& L, int32_t n);
+    // The block's per-layer embeddings after its FFN, gated by `gate_in`
+    // (the active stream, or x_ without AltUp; n rows), projected back and
+    // added to the residual stream: x_, or every AltUp stream but the first.
+    Status per_layer_input(int32_t layer, const BlockWeights& w, const float* gate_in, int32_t n, const Route& route);
     // Early exit: writes K/V for blocks [from, n_layers) of the single token
     // at `pos` from the current hidden state, so later tokens stay coherent.
     Status propagate_kv(const Route& route, int32_t from, int32_t pos);
@@ -1078,6 +1105,18 @@ private:
 
     const TensorView* token_embd_ = nullptr;
     const TensorView* output_ = nullptr;
+    // Per-layer embeddings (ModelConfig::ple_dim): the token table [n_layers *
+    // ple_dim per token], read row by row through the mapping like
+    // token_embd (no copied table; the loader may warm the mapping when the
+    // whole file fits in RAM), the projection of the embeddings and its
+    // per-block norm. The memory estimate conservatively includes the whole
+    // mapped file; per-pass scratch is batch * n_layers * ple_dim floats.
+    const TensorView* ple_embd_ = nullptr;
+    const TensorView* ple_model_proj_ = nullptr;
+    std::vector<float> ple_proj_norm_;
+    // AltUp: views of the K - 1 projections making the streams and merging
+    // them back (slices of altup_proj / altup_unembd_proj).
+    std::vector<TensorView> altup_proj_, altup_unembd_;
     std::vector<float> output_norm_;
     std::vector<float> output_norm_b_;               // optional LayerNorm bias of the final norm
     std::vector<float> output_bias_;                 // optional bias of the LM head (Phi-2)
@@ -1164,6 +1203,9 @@ private:
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch
     std::vector<float> x_block_in_;  // residual entering the block (FFN-skip hook only)
     std::vector<float> par_in_;      // parallel blocks: the FFN's normed input while the mixer runs
+    // Gemma 3n / 4 parts: per-layer embeddings [token][block][ple_dim], AltUp
+    // streams [token][stream][n_embd] and its scratch, Laurel's branch.
+    std::vector<float> ple_, streams_, altup_tmp_, laurel_, laurel_mid_, ple_hidden_;
     // The active adapter (set_adapter): its targets by base tensor name, with
     // their scales; empty when none (the only check a pass pays then).
     struct BoundAdapter {

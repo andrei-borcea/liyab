@@ -34,6 +34,7 @@ KeyRanges::KeyRanges(KeyScalingShape shape)
 
 void KeyRanges::update(const float* rows, int32_t heads, float* max, const float* speed, double magnitude,
                        const float* gain, double row_scale) const {
+    if (rows == nullptr) return;  // shared-KV blocks contribute queries only
     const auto hd = static_cast<size_t>(shape_.head_dim);
     const int32_t half = shape_.rope_dim / 2;
     const double last = std::max(shape_.positions - 1, 0);
