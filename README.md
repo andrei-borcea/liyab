@@ -3413,3 +3413,5 @@ Flutter chat uses the author template when replay preserves the processed prompt
 Android app installation requires an explicit `--serial` (or `ANDROID_SERIAL`) and uses that device for every check and installation. Native app builds respect `CMAKE_BUILD_PARALLEL_LEVEL`. Phone regression includes LoRA, SSM and compression tests and both independent quantization fixtures; an incomplete Android test build is refused instead of silently skipping binaries.
 
 The description tool checks optional affine biases of registry-selected final LayerNorms and records inactive recurrent-norm switches explicitly when tracing attention-only models.
+
+Reference-tokenizer validation compares pipelines after parsing with the installed tokenizer runtime, preserving implicit serialized defaults while still rejecting changed normalization or splitting.

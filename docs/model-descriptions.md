@@ -1449,3 +1449,5 @@ The merged recurrent-format test reuses `ssm_quant_vectors.bin` for all five mix
 Mapped PLE validation varies only the token table's dtype. Independent `gguf-py` fixture values form an F32 table in a second otherwise identical graph, and a zero-table control verifies that the table contributes. All four KV types and rollback are covered; no new format encoder is introduced.
 
 Final norms selected by `ArchSpec::output_norm` bind their `.weight` and, for LayerNorm, optional `.bias` tensors. The description tool recognizes these dynamic names and proves recurrent-norm switches inactive when the corresponding mixer operation is absent; it does not mistake an affine output norm for an unused tensor.
+
+Reference pipeline comparisons parse the source JSON through the same tokenizer runtime as the loaded backend. Omitted default fields, such as ByteLevel `use_regex=true`, are equivalent to explicit defaults; different normalization or splitting still triggers source restoration or a precise refusal.

@@ -32,15 +32,18 @@ def load_tokenizer(model, revision=None, trust_remote_code=False, slow=False):
                 path = hf_hub_download(model, "tokenizer.json", revision=revision)
             except Exception:  # no JSON: the declared tokenizer class owns its construction
                 return tokenizer
-        with open(path, encoding="utf-8") as source:
-            serialized = json.load(source)
+        from tokenizers import Tokenizer
+
+        # Parse both pipelines through the same runtime: older JSON omits
+        # default fields (for example ByteLevel.use_regex=true). Comparing raw
+        # JSON would mistake those equivalent defaults for changed splitting.
+        source_backend = Tokenizer.from_file(path)
+        serialized = json.loads(source_backend.to_str())
         fields = ("normalizer", "pre_tokenizer")
         actual = json.loads(backend.to_str())
         if all(actual.get(field) == serialized.get(field) for field in fields):
             return tokenizer
-        from tokenizers import Tokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(model, tokenizer_object=Tokenizer.from_file(path), **options)
+        tokenizer = AutoTokenizer.from_pretrained(model, tokenizer_object=source_backend, **options)
         backend = getattr(tokenizer, "backend_tokenizer", None)
         actual = json.loads(backend.to_str()) if backend is not None else {}
         if backend is None or any(actual.get(field) != serialized.get(field) for field in fields):

@@ -49,6 +49,14 @@ class SerializedPipeline(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][1], {"revision": "pinned", "trust_remote_code": False})
 
+    def test_implicit_runtime_defaults_do_not_change_the_pipeline(self):
+        canonical = {**self.source, "pre_tokenizer": {"type": "ByteLevel", "use_regex": True}}
+        self.actual = canonical
+        with patch.dict(sys.modules, {"tokenizers": types.SimpleNamespace(Tokenizer=types.SimpleNamespace(
+                from_file=lambda path: self.backend(canonical)))}):
+            load_tokenizer(str(self.path))
+        self.assertEqual(len(self.calls), 1)
+
     def test_lost_normalizer_reloads_the_source_object(self):
         self.actual = {**self.source, "normalizer": None}
         result = load_tokenizer(str(self.path), revision="pinned", trust_remote_code=True)
