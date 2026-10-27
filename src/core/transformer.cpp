@@ -24,6 +24,11 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(LIYAB_USE_AVX2)
+#include <immintrin.h>
+
+#include "core/quant_x86.h"
+#endif
 
 namespace liyab {
 
@@ -309,6 +314,132 @@ void delta_rule_step(float* S, const float* q, const float* k, const float* v, f
         }
         o[j] = oq * q_scale;
     }
+}
+
+// Kimi Delta Attention's epsilon of the L2 norms of its queries and keys: the
+// reference kernels' own constant (FLA's l2norm), not the model's RMSNorm
+// epsilon (1e-5 on Kimi-Linear).
+constexpr float kKdaL2Eps = 1e-6f;
+
+// One token of Kimi Delta Attention's gated delta rule for one head, S
+// [hd x hd] row j mapping keys to value component j:
+//   S = S diag(decay);  S += strength * (v - S k) k^T;  o = (S q) * q_scale
+// delta_rule_step() with a decay per key channel instead of one per head.
+// Rows are independent: each is decayed and read against k, corrected, then
+// read against q, in two passes over its hd values. The SIMD paths keep a
+// fixed set of accumulators per row (results do not depend on the thread
+// count); each kernel set (NEON, AVX2, scalar) rounds its own way.
+void kda_rule_step_scalar(float* S, const float* q, const float* k, const float* v, const float* decay,
+                          float strength, float q_scale, float* o, size_t hd, size_t row_count) {
+    for (size_t j = 0; j < row_count; ++j) {
+        float* row = S + j * hd;
+        float sk = 0.0f;
+        for (size_t i = 0; i < hd; ++i) {
+            row[i] *= decay[i];
+            sk += row[i] * k[i];
+        }
+        const float delta = (v[j] - sk) * strength;
+        float oq = 0.0f;
+        for (size_t i = 0; i < hd; ++i) {
+            row[i] += k[i] * delta;
+            oq += row[i] * q[i];
+        }
+        o[j] = oq * q_scale;
+    }
+}
+
+#if defined(LIYAB_USE_AVX2)
+#if defined(__GNUC__) || defined(__clang__)
+#define LIYAB_KDA_AVX2 __attribute__((target("avx2,fma")))
+#else
+#define LIYAB_KDA_AVX2
+#endif
+// Horizontal sum of 8 lanes in a fixed order.
+LIYAB_KDA_AVX2 inline float kda_hsum(__m256 v) {
+    const __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    const __m128 pairs = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    return _mm_cvtss_f32(_mm_add_ss(pairs, _mm_shuffle_ps(pairs, pairs, 1)));
+}
+// AVX2 + FMA, two accumulators of 8 lanes per dot (hd a multiple of 16).
+LIYAB_KDA_AVX2 void kda_rule_step_avx2(float* S, const float* q, const float* k, const float* v,
+                                       const float* decay, float strength, float q_scale, float* o, size_t hd, size_t row_count) {
+    for (size_t j = 0; j < row_count; ++j) {
+        float* row = S + j * hd;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        for (size_t i = 0; i < hd; i += 16) {
+            const __m256 r0 = _mm256_mul_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(decay + i));
+            const __m256 r1 = _mm256_mul_ps(_mm256_loadu_ps(row + i + 8), _mm256_loadu_ps(decay + i + 8));
+            _mm256_storeu_ps(row + i, r0);
+            _mm256_storeu_ps(row + i + 8, r1);
+            a0 = _mm256_fmadd_ps(r0, _mm256_loadu_ps(k + i), a0);
+            a1 = _mm256_fmadd_ps(r1, _mm256_loadu_ps(k + i + 8), a1);
+        }
+        const float sk = kda_hsum(_mm256_add_ps(a0, a1));
+        const __m256 delta = _mm256_set1_ps((v[j] - sk) * strength);
+        a0 = _mm256_setzero_ps();
+        a1 = _mm256_setzero_ps();
+        for (size_t i = 0; i < hd; i += 16) {
+            const __m256 r0 = _mm256_fmadd_ps(_mm256_loadu_ps(k + i), delta, _mm256_loadu_ps(row + i));
+            const __m256 r1 = _mm256_fmadd_ps(_mm256_loadu_ps(k + i + 8), delta, _mm256_loadu_ps(row + i + 8));
+            _mm256_storeu_ps(row + i, r0);
+            _mm256_storeu_ps(row + i + 8, r1);
+            a0 = _mm256_fmadd_ps(r0, _mm256_loadu_ps(q + i), a0);
+            a1 = _mm256_fmadd_ps(r1, _mm256_loadu_ps(q + i + 8), a1);
+        }
+        o[j] = kda_hsum(_mm256_add_ps(a0, a1)) * q_scale;
+    }
+}
+#endif
+
+void kda_rule_step(float* S, const float* q, const float* k, const float* v, const float* decay, float strength,
+                   float q_scale, float* o, size_t hd, size_t row_count) {
+#if defined(__ARM_NEON)
+    if (hd % 16 == 0) {
+        for (size_t j = 0; j < row_count; ++j) {
+            float* row = S + j * hd;
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+            for (size_t i = 0; i < hd; i += 16) {
+                const float32x4_t r0 = vmulq_f32(vld1q_f32(row + i), vld1q_f32(decay + i));
+                const float32x4_t r1 = vmulq_f32(vld1q_f32(row + i + 4), vld1q_f32(decay + i + 4));
+                const float32x4_t r2 = vmulq_f32(vld1q_f32(row + i + 8), vld1q_f32(decay + i + 8));
+                const float32x4_t r3 = vmulq_f32(vld1q_f32(row + i + 12), vld1q_f32(decay + i + 12));
+                vst1q_f32(row + i, r0);
+                vst1q_f32(row + i + 4, r1);
+                vst1q_f32(row + i + 8, r2);
+                vst1q_f32(row + i + 12, r3);
+                a0 = vfmaq_f32(a0, r0, vld1q_f32(k + i));
+                a1 = vfmaq_f32(a1, r1, vld1q_f32(k + i + 4));
+                a2 = vfmaq_f32(a2, r2, vld1q_f32(k + i + 8));
+                a3 = vfmaq_f32(a3, r3, vld1q_f32(k + i + 12));
+            }
+            const float sk = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+            const float32x4_t delta = vdupq_n_f32((v[j] - sk) * strength);
+            a0 = a1 = a2 = a3 = vdupq_n_f32(0.0f);
+            for (size_t i = 0; i < hd; i += 16) {
+                const float32x4_t r0 = vfmaq_f32(vld1q_f32(row + i), vld1q_f32(k + i), delta);
+                const float32x4_t r1 = vfmaq_f32(vld1q_f32(row + i + 4), vld1q_f32(k + i + 4), delta);
+                const float32x4_t r2 = vfmaq_f32(vld1q_f32(row + i + 8), vld1q_f32(k + i + 8), delta);
+                const float32x4_t r3 = vfmaq_f32(vld1q_f32(row + i + 12), vld1q_f32(k + i + 12), delta);
+                vst1q_f32(row + i, r0);
+                vst1q_f32(row + i + 4, r1);
+                vst1q_f32(row + i + 8, r2);
+                vst1q_f32(row + i + 12, r3);
+                a0 = vfmaq_f32(a0, r0, vld1q_f32(q + i));
+                a1 = vfmaq_f32(a1, r1, vld1q_f32(q + i + 4));
+                a2 = vfmaq_f32(a2, r2, vld1q_f32(q + i + 8));
+                a3 = vfmaq_f32(a3, r3, vld1q_f32(q + i + 12));
+            }
+            o[j] = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))) * q_scale;
+        }
+        return;
+    }
+#elif defined(LIYAB_USE_AVX2)
+    if (hd % 16 == 0 && quant::x86::avx2_enabled()) {
+        kda_rule_step_avx2(S, q, k, v, decay, strength, q_scale, o, hd, row_count);
+        return;
+    }
+#endif
+    kda_rule_step_scalar(S, q, k, v, decay, strength, q_scale, o, hd, row_count);
 }
 
 // Adds the wall time of its scope to `total_ms` (Transformer::PhaseTimes).
@@ -829,8 +960,15 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.mla.q_rank > 0 ? ", low-rank queries" : "");
     }
     if (c.ssm_v_heads > 0) {
-        LIYAB_LOG_INFO("DeltaNet: %d recurrent blocks, %d/%d heads x %d, conv %d, state %.1f MiB", c.n_layers - c.n_attn_layers,
-                       c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
+        LIYAB_LOG_INFO("DeltaNet: %d/%d heads x %d, conv %d", c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim,
+                       c.ssm_conv_kernel);
+    }
+    if (c.shortconv_l_cache > 0) LIYAB_LOG_INFO("short convolution: %d taps", c.shortconv_l_cache);
+    if (c.kda_heads > 0) {
+        LIYAB_LOG_INFO("Kimi Delta Attention: %d heads x %d, conv %d", c.kda_heads, c.kda_head_dim, c.ssm_conv_kernel);
+    }
+    if (c.hybrid()) {
+        LIYAB_LOG_INFO("%d recurrent blocks, state %.1f MiB", c.n_recurrent_layers,
                        static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
     }
     if (c.mamba.d_inner > 0) {
@@ -903,11 +1041,13 @@ Status Transformer::bind_weights() {
     // RMSNorm requires weights. Each LayerNorm independently allows an
     // optional scale and offset, including OLMo's non-parametric norms.
     const bool norm_weights = c.spec->norm == NormKind::Rms;
-    LIYAB_RETURN_IF_ERROR(vec("output_norm.weight", c.n_embd, norm_weights, output_norm_));
-    LIYAB_RETURN_IF_ERROR(vec("output_norm.bias", c.n_embd, false, output_norm_b_));
+    LIYAB_RETURN_IF_ERROR(vec(std::string(c.spec->output_norm) + ".weight", c.n_embd, norm_weights, output_norm_));
+    LIYAB_RETURN_IF_ERROR(vec(std::string(c.spec->output_norm) + ".bias", c.n_embd, false, output_norm_b_));
     LIYAB_RETURN_IF_ERROR(vec("output.bias", c.n_vocab, false, output_bias_));
-    LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.weight", c.n_embd, false, embd_norm_));
-    LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.bias", c.n_embd, false, embd_norm_b_));
+    if (c.spec->output_norm != "token_embd_norm") {
+        LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.weight", c.n_embd, false, embd_norm_));
+        LIYAB_RETURN_IF_ERROR(vec("token_embd_norm.bias", c.n_embd, false, embd_norm_b_));
+    }
     if (c.spec->norm == NormKind::Rms && !embd_norm_b_.empty()) {
         return Status(ErrorCode::InvalidModel, "an RMS embedding norm with a bias");
     }
@@ -932,7 +1072,12 @@ Status Transformer::bind_weights() {
 
     layers_.resize(static_cast<size_t>(c.n_layers));
     int32_t kv_slots = 0;
-    int32_t state_slots = 0;
+    // Each recurrent block's state sizes, in state-slot order: [conv | ssm] floats.
+    std::vector<std::pair<size_t, size_t>> state_sizes;
+    auto add_state = [&](Layer& L, size_t conv, size_t ssm) {
+        L.state_slot = static_cast<int32_t>(state_sizes.size());
+        state_sizes.emplace_back(conv, ssm);
+    };
     for (int32_t l = 0; l < c.n_layers; ++l) {
         Layer& L = layers_[static_cast<size_t>(l)];
         const BlockPlan& plan = c.blocks[static_cast<size_t>(l)];
@@ -1029,7 +1174,7 @@ Status Transformer::bind_weights() {
             const int64_t channels = v2 ? di + 2 * int64_t{m.n_groups} * ns : di;
             const int64_t in_rows = v2 ? di + channels + m.n_heads : 2 * di;
             const int64_t per_head = v2 ? m.n_heads : di;  // A, D and the dt bias
-            L.state_slot = state_slots++;
+            add_state(L, static_cast<size_t>(channels * (m.conv_kernel - 1)), static_cast<size_t>(di * ns));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_in.weight"), c.n_embd, in_rows, L.w[kSsmIn]));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_in.bias"), in_rows, false, L.ssm_in_bias));
             LIYAB_RETURN_IF_ERROR(
@@ -1056,12 +1201,56 @@ Status Transformer::bind_weights() {
             }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_out.weight"), di, c.n_embd, L.w[kSsmOut]));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_out.bias"), c.n_embd, false, L.ssm_out_bias));
+        } else if (plan.mixer == MixerKind::ShortConv) {
+            // in_proj [B | C | x], each n_embd wide; the convolution's taps per channel.
+            const int64_t d = c.n_embd;
+            const int64_t taps = c.shortconv_l_cache;
+            add_state(L, static_cast<size_t>(d * (taps - 1)), 0);
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "shortconv.in_proj.weight"), d, 3 * d, L.w[kConvIn]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "shortconv.out_proj.weight"), d, d, L.w[kConvOut]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "shortconv.conv.weight"), d * taps, true, L.conv1d));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "shortconv.conv.bias"), d, false, L.conv_bias));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "shortconv.in_proj.bias"), 3 * d, false, L.in_bias));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "shortconv.out_proj.bias"), d, false, L.out_bias));
+        } else if (plan.mixer == MixerKind::Kda) {
+            const int64_t hd = c.kda_head_dim;
+            const int64_t qkv = int64_t{c.kda_heads} * hd;
+            const int64_t taps = c.ssm_conv_kernel;
+            add_state(L, static_cast<size_t>(3 * qkv * (taps - 1)), static_cast<size_t>(qkv * hd));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_q.weight"), c.n_embd, qkv, L.w[kQ]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_k.weight"), c.n_embd, qkv, L.w[kK]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_v.weight"), c.n_embd, qkv, L.w[kV]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_beta.weight"), c.n_embd, c.kda_heads, L.w[kBeta]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_f_a.weight"), c.n_embd, hd, L.w[kFa]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_f_b.weight"), hd, qkv, L.w[kFb]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_g_a.weight"), c.n_embd, hd, L.w[kGa]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_g_b.weight"), hd, qkv, L.w[kGb]));
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), qkv, c.n_embd, L.w[kSsmOut]));
+            // The three convolutions' taps, one after another: q, k, then v channels.
+            std::vector<float> taps_q, taps_k, taps_v;
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_conv1d_q.weight"), qkv * taps, true, taps_q));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_conv1d_k.weight"), qkv * taps, true, taps_k));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_conv1d_v.weight"), qkv * taps, true, taps_v));
+            L.conv1d = std::move(taps_q);
+            L.conv1d.insert(L.conv1d.end(), taps_k.begin(), taps_k.end());
+            L.conv1d.insert(L.conv1d.end(), taps_v.begin(), taps_v.end());
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_a"), c.kda_heads, true, L.ssm_a));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt.bias"), qkv, true, L.ssm_dt));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), hd, true, L.ssm_norm));
         } else if (plan.mixer == MixerKind::DeltaNet) {
-            L.state_slot = state_slots++;
+            add_state(L, static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1),
+                      static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) * static_cast<size_t>(c.ssm_head_dim));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_gate.weight"), c.n_embd, dn_value, L.w[kZ]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_alpha.weight"), c.n_embd, c.ssm_v_heads, L.w[kAlpha]));
-            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_beta.weight"), c.n_embd, c.ssm_v_heads, L.w[kBeta]));
+            if (f.tensor(block_tensor(l, "ssm_ba.weight")) != nullptr) {
+                // Qwen3-Next: beta and alpha in one projection, [beta | alpha] of each key head's value heads.
+                LIYAB_RETURN_IF_ERROR(
+                    matrix(block_tensor(l, "ssm_ba.weight"), c.n_embd, 2 * int64_t{c.ssm_v_heads}, L.w[kBa]));
+            } else {
+                LIYAB_RETURN_IF_ERROR(
+                    matrix(block_tensor(l, "ssm_alpha.weight"), c.n_embd, c.ssm_v_heads, L.w[kAlpha]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_beta.weight"), c.n_embd, c.ssm_v_heads, L.w[kBeta]));
+            }
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_out.weight"), dn_value, c.n_embd, L.w[kSsmOut]));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_conv1d.weight"), conv_dim * c.ssm_conv_kernel, true, L.conv1d));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_a"), c.ssm_v_heads, true, L.ssm_a));
@@ -1158,26 +1347,10 @@ Status Transformer::bind_weights() {
         }
     }
 
-    // Each recurrent block's state, sized for its mixer: the convolution's
-    // history ([channel][kernel - 1]) and the scan's state.
-    states_.resize(static_cast<size_t>(state_slots));
-    for (int32_t l = 0; l < c.n_layers; ++l) {
-        const Layer& L = layers_[static_cast<size_t>(l)];
-        if (L.state_slot < 0) continue;
-        RecurrentState& st = states_[static_cast<size_t>(L.state_slot)];
-        const MixerKind mixer = c.blocks[static_cast<size_t>(l)].mixer;
-        if (mixer == MixerKind::DeltaNet) {
-            st.conv.assign(static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1), 0.0f);
-            st.ssm.assign(static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) *
-                              static_cast<size_t>(c.ssm_head_dim),
-                          0.0f);
-        } else {  // Mamba: one state of d_state values per channel of x, in heads for Mamba-2
-            const MambaGeometry& m = c.mamba;
-            const auto channels = static_cast<size_t>(
-                mixer == MixerKind::Mamba2 ? m.d_inner + 2 * m.n_groups * m.d_state : m.d_inner);
-            st.conv.assign(channels * static_cast<size_t>(m.conv_kernel - 1), 0.0f);
-            st.ssm.assign(static_cast<size_t>(m.d_inner) * static_cast<size_t>(m.d_state), 0.0f);
-        }
+    states_.resize(state_sizes.size());
+    for (size_t i = 0; i < states_.size(); ++i) {
+        states_[i].conv.assign(state_sizes[i].first, 0.0f);
+        states_[i].ssm.assign(state_sizes[i].second, 0.0f);
     }
     return Status::ok();
 }
@@ -1301,8 +1474,8 @@ void Transformer::snapshot_state(bool pin) {
     snap.data.resize(recurrent_state_bytes() / sizeof(float));
     float* out = snap.data.data();
     for (const RecurrentState& st : states_) {
-        out = std::copy(st.conv.begin(), st.conv.end(), out);
-        out = std::copy(st.ssm.begin(), st.ssm.end(), out);
+        if (!st.conv.empty()) out = std::copy(st.conv.begin(), st.conv.end(), out);
+        if (!st.ssm.empty()) out = std::copy(st.ssm.begin(), st.ssm.end(), out);
     }
     snapshots_.push_back(std::move(snap));
     pin_snapshots();
@@ -1379,13 +1552,13 @@ std::vector<std::span<const float>> Transformer::kept_state_parts(int32_t pos) c
     if (states_.empty()) return parts;
     if (pos == n_past_) {
         for (const RecurrentState& st : states_) {
-            parts.emplace_back(st.conv);
-            parts.emplace_back(st.ssm);
+            if (!st.conv.empty()) parts.emplace_back(st.conv);
+            if (!st.ssm.empty()) parts.emplace_back(st.ssm);
         }
         return parts;
     }
     for (const StateSnapshot& snap : snapshots_) {
-        if (snap.pos == pos) parts.emplace_back(snap.data);
+        if (snap.pos == pos && !snap.data.empty()) parts.emplace_back(snap.data);
     }
     return parts;
 }
@@ -1404,8 +1577,8 @@ void Transformer::begin_restore() {
 std::vector<std::span<float>> Transformer::recurrent_parts() {
     std::vector<std::span<float>> parts;
     for (RecurrentState& st : states_) {
-        parts.emplace_back(st.conv);
-        parts.emplace_back(st.ssm);
+        if (!st.conv.empty()) parts.emplace_back(st.conv);
+        if (!st.ssm.empty()) parts.emplace_back(st.ssm);
     }
     return parts;
 }
@@ -1493,19 +1666,28 @@ Status Transformer::write_image(std::ostream& out, int32_t n, const std::functio
     for (const RecurrentState& st : states_) {
         put(out, static_cast<uint64_t>(st.conv.size()));
         put(out, static_cast<uint64_t>(st.ssm.size()));
-        const float* conv = live ? st.conv.data() : from;
-        const float* ssm = live ? st.ssm.data() : from + st.conv.size();
-        out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
-        out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
-        if (!live) from += st.conv.size() + st.ssm.size();
+        // ShortConv has no matrix state; a one-tap convolution has no
+        // history either. Keep their zero lengths in the format without
+        // passing null buffers to streams or doing pointer arithmetic on them.
+        if (!st.conv.empty()) {
+            const float* conv = live ? st.conv.data() : from;
+            out.write(reinterpret_cast<const char*>(conv), static_cast<std::streamsize>(st.conv.size() * sizeof(float)));
+        }
+        if (!st.ssm.empty()) {
+            const float* ssm = live ? st.ssm.data() : from + st.conv.size();
+            out.write(reinterpret_cast<const char*>(ssm), static_cast<std::streamsize>(st.ssm.size() * sizeof(float)));
+        }
+        if (!live && (!st.conv.empty() || !st.ssm.empty())) from += st.conv.size() + st.ssm.size();
     }
     put(out, static_cast<int32_t>(snapshots.size()));
     for (const SnapshotImage& snap : snapshots) {
         put(out, snap.pos);
         put(out, static_cast<uint8_t>(snap.pinned));
         put(out, static_cast<uint64_t>(snap.data.size()));
-        out.write(reinterpret_cast<const char*>(snap.data.data()),
-                  static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
+        if (!snap.data.empty()) {
+            out.write(reinterpret_cast<const char*>(snap.data.data()),
+                      static_cast<std::streamsize>(snap.data.size() * sizeof(float)));
+        }
     }
     // Windowed blocks: every page of the window before the end and before
     // each snapshot kept, whole (out of the live pages, or the image's window
@@ -1602,8 +1784,8 @@ Status Transformer::read_state(std::istream& in) {
     for (RecurrentState& st : states_) {
         uint64_t conv = 0, ssm = 0;
         if (!get(in, conv) || !get(in, ssm) || conv != st.conv.size() || ssm != st.ssm.size() ||
-            !in.read(reinterpret_cast<char*>(st.conv.data()), static_cast<std::streamsize>(conv * sizeof(float))) ||
-            !in.read(reinterpret_cast<char*>(st.ssm.data()), static_cast<std::streamsize>(ssm * sizeof(float)))) {
+            (conv > 0 && !in.read(reinterpret_cast<char*>(st.conv.data()), static_cast<std::streamsize>(conv * sizeof(float)))) ||
+            (ssm > 0 && !in.read(reinterpret_cast<char*>(st.ssm.data()), static_cast<std::streamsize>(ssm * sizeof(float))))) {
             return fail(ErrorCode::IoError, "the state's recurrent states are truncated");
         }
     }
@@ -1623,7 +1805,7 @@ Status Transformer::read_state(std::istream& in) {
         }
         snap.pinned = pinned != 0;
         snap.data.resize(floats);
-        if (!in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
+        if (size > 0 && !in.read(reinterpret_cast<char*>(snap.data.data()), static_cast<std::streamsize>(size * sizeof(float)))) {
             return fail(ErrorCode::IoError, "the state's snapshots are truncated");
         }
         if (convert) {
@@ -3049,6 +3231,7 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
                                            ThreadPool& pool, const uint8_t* head_mask) {
     using Clock = std::chrono::steady_clock;
     const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(layer)];
     const Layer& L = layers_[static_cast<size_t>(layer)];
     const LatentAttention& m = c.mla;
     const auto un = static_cast<size_t>(n);
@@ -3076,14 +3259,18 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
             if (s.expanded) {
                 // Queries stay [q_nope | q_pe] per head; only q_pe turns. Keys are
                 // stored scaled as in the absorbed form (the cache is shared).
-                rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
-                rope(k, 1, pos, rope_table);
+                if (plan.rope) {
+                    rope(mla_q_.data() + t * heads * qk + nope, c.n_head, qk, pos, rope_table);
+                    rope(k, 1, pos, rope_table);
+                }
                 scale_keys(L, nullptr, k);
             } else {
                 float* q = q_.data() + t * heads * kd;
                 if (key_ranges_ != nullptr) add_key_ranges(L, q, k);  // unrotated: ranges cover every position
-                rope(q, c.n_head, pos, rope_table);
-                rope(k, 1, pos, rope_table);
+                if (plan.rope) {
+                    rope(q, c.n_head, pos, rope_table);
+                    rope(k, 1, pos, rope_table);
+                }
                 scale_keys(L, q, k);
             }
             s.kv->store(L.kv_slot, row_of(s, static_cast<int32_t>(t)), k, nullptr);  // the values are this row's latent channels
@@ -3145,7 +3332,11 @@ Status Transformer::latent_attention_mixer(int32_t layer, const BlockWeights& w,
 //   decay = exp(softplus(W_a x + dt_bias) * A),  b = sigmoid(W_b x)
 //   S = decay * S;  S += b * (v - S k) k^T;  o = S q
 //   out = W_out (RMSNorm(o) * SiLU(W_z x))      (per value head)
-// Key/query heads are shared by value heads modulo their count (ggml's layout).
+// Key/query heads are shared by value heads modulo their count (ggml's layout,
+// into which the Qwen3.5 converter reorders the value heads), or, with
+// ArchSpec::ssm_grouped_heads, by consecutive value heads (the reference's
+// order, which Qwen3-Next's files keep). Qwen3-Next projects beta and alpha
+// with one matrix (ssm_ba): per key head, [beta | alpha] of its value heads.
 // A batch takes two parallel passes whatever its length: the convolution by
 // channel heads through all tokens, then the recurrence by value head through
 // all tokens (both are independent across their tasks, sequential in time).
@@ -3170,11 +3361,27 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
     alpha_.resize(un * hv);
     beta_.resize(un * hv);
     dn_.resize(un * value_dim);
-    {
+    if (L.w[kBa] != nullptr) {
+        ba_.resize(un * 2 * hv);
+        const TensorView* proj[] = {&w[kQkv], &w[kZ], &w[kBa]};
+        float* outs[] = {mix_.data(), z_.data(), ba_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
+        const size_t per_key = hv / hk;  // value heads per key head
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t h = 0; h < hv; ++h) {
+                const size_t g = h / per_key, j = h % per_key;
+                beta_[t * hv + h] = ba_[t * 2 * hv + g * 2 * per_key + j];
+                alpha_[t * hv + h] = ba_[t * 2 * hv + g * 2 * per_key + per_key + j];
+            }
+        }
+    } else {
         const TensorView* proj[] = {&w[kQkv], &w[kZ], &w[kAlpha], &w[kBeta]};
         float* outs[] = {mix_.data(), z_.data(), alpha_.data(), beta_.data()};
         LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
     }
+    const size_t per_key_head = hv / hk;
+    const bool grouped = c.spec->ssm_grouped_heads;
+    auto key_head = [&](size_t h) { return grouped ? h / per_key_head : h % hk; };
 
     // Each segment continues its own states (segments_ in order: tasks below
     // are (segment, head) pairs; a segment's token i is batch row first + i).
@@ -3253,8 +3460,8 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
                 }
                 const size_t t = first + i;
                 const float* m = mix_.data() + t * conv_dim;
-                const float* q = m + (h % hk) * hd;
-                const float* k = m + key_dim + (h % hk) * hd;
+                const float* q = m + key_head(h) * hd;
+                const float* k = m + key_dim + key_head(h) * hd;
                 const float* v = m + 2 * key_dim + h * hd;
                 const float decay = std::exp(softplus(alpha_[t * hv + h] + L.ssm_dt[h]) * L.ssm_a[h]);
                 const float strength = sigmoid(beta_[t * hv + h]);
@@ -3537,9 +3744,245 @@ Status Transformer::mamba2_mixer(int32_t layer, const BlockWeights& w, int32_t n
     return Status::ok();
 }
 
-// Expert streaming: the routed experts stay on storage and are read on
-// demand into a fixed RAM cache; every other tensor stays resident in the
-// mapping (paged in now, never swept by the streaming window).
+
+// LFM2's gated short convolution:
+//   [B | C | x] = W_in h (+ b_in);  y = C * (conv(B * x) + b_conv);  out = W_out y (+ b_out)
+// conv: causal depthwise over the last l_cache positions of B * x, without an
+// activation. Channels are independent, so a batch takes one parallel pass:
+// one task per segment and run of kShortConvChannels channels through all of
+// the segment's tokens (tokens are not independent). The convolution costs
+// 3 l_cache operations per channel and token, next to the 4 n_embd of the two
+// projections: plain loops, whatever the CPU.
+Status Transformer::short_conv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                     ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto d = static_cast<size_t>(c.n_embd);
+    const auto taps = static_cast<size_t>(c.shortconv_l_cache);
+    const size_t history = taps - 1;
+    mix_.resize(un * 3 * d);
+    dn_.resize(un * d);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kConvIn], xb_.data(), mix_.data(), n));
+    if (!L.in_bias.empty()) {
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t i = 0; i < 3 * d; ++i) mix_[t * 3 * d + i] += L.in_bias[i];
+        }
+    }
+    // Checkpoints and tree branches as in delta_net_mixer(): slot layout [conv].
+    auto state_of = [&](const Segment& s) -> RecurrentState& { return (*s.states)[static_cast<size_t>(L.state_slot)]; };
+    auto slot_of = [&](const Segment& s, RecurrentState& st, size_t i) -> float* {
+        if (!s.checkpoint || i + static_cast<size_t>(s.rollback) < static_cast<size_t>(s.n)) return nullptr;
+        return st.checkpoints.data() + static_cast<size_t>((s.n_past + static_cast<int32_t>(i)) % s.rollback) *
+                                           (st.conv.size() + st.ssm.size());
+    };
+    const int32_t* parent = tree_depth_.empty() ? nullptr : tree_parent_.data();
+    auto branches = [&](size_t i) { return parent != nullptr && i > 0 && parent[i] != static_cast<int32_t>(i) - 1; };
+    constexpr size_t kShortConvChannels = 64;
+    const size_t runs = (d + kShortConvChannels - 1) / kShortConvChannels;
+    const auto tasks = static_cast<int64_t>(runs);
+    pool.parallel_for(tasks * static_cast<int64_t>(segs_.size()), [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / tasks)];
+            RecurrentState& st = state_of(s);
+            const size_t ch0 = static_cast<size_t>(job % tasks) * kShortConvChannels;
+            const size_t ch1 = std::min(d, ch0 + kShortConvChannels);
+            const auto first = static_cast<size_t>(s.first);
+            for (size_t ch = ch0; ch < ch1; ++ch) {
+                float* hist = history > 0 ? st.conv.data() + ch * history : nullptr;
+                const float* tap = L.conv1d.data() + ch * taps;
+                const float bias = L.conv_bias.empty() ? 0.0f : L.conv_bias[ch];
+                for (size_t i = 0; i < static_cast<size_t>(s.n); ++i) {
+                    if (history > 0 && branches(i)) {
+                        const float* from = slot_of(s, st, static_cast<size_t>(parent[i])) + ch * history;
+                        std::copy(from, from + history, hist);
+                    }
+                    const float* m = mix_.data() + (first + i) * 3 * d;
+                    const float bx = m[ch] * m[2 * d + ch];
+                    float acc = 0.0f;
+                    for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
+                    acc += bx * tap[history];
+                    for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
+                    if (history > 0) hist[history - 1] = bx;
+                    dn_[(first + i) * d + ch] = m[d + ch] * (acc + bias);
+                    if (history > 0) {
+                        if (float* slot = slot_of(s, st, i)) std::copy(hist, hist + history, slot + ch * history);
+                    }
+                }
+            }
+        }
+    });
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kConvOut], dn_.data(), xb_.data(), n));
+    if (!L.out_bias.empty()) {
+        for (size_t t = 0; t < un; ++t) {
+            for (size_t i = 0; i < d; ++i) xb_[t * d + i] += L.out_bias[i];
+        }
+    }
+    return Status::ok();
+}
+
+// Kimi Delta Attention (Kimi-Linear), per head h of hd key and value channels:
+//   q, k, v = SiLU(causal_conv1d(W_q x)), SiLU(conv(W_k x)), SiLU(conv(W_v x));
+//   q, k L2-normalized (kKdaL2Eps), q scaled by 1/sqrt(hd)
+//   decay_i = exp(A_h softplus((W_fb W_fa x)_i + dt_bias_i))   per key channel i
+//   b = sigmoid(W_beta x)_h
+//   S = S diag(decay);  S += b (v - S k) k^T;  o = S q
+//   out = W_o (RMSNorm(o) * sigmoid(W_gb W_ga x))
+// The reference prefills with a chunked form of the same recurrence (and
+// decodes with the step); here every pass runs the step, one task per
+// segment and head through all of its tokens, so a token's state and output
+// do not depend on how the tokens were batched (prefill, decoding, tree
+// verification and several sequences give the same bits) at O(hd^2) per
+// token and head, like decoding. Prefill chunks the token scan and partitions
+// independent value rows across the active pool; it does not reassociate
+// the recurrence as an algebraic parallel scan. The convolutions run first,
+// one task per segment and head of q, k or v channels.
+Status Transformer::kda_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto hd = static_cast<size_t>(c.kda_head_dim);
+    const auto heads = static_cast<size_t>(c.kda_heads);
+    const size_t qkv = heads * hd;
+    const auto taps = static_cast<size_t>(c.ssm_conv_kernel);
+    const size_t history = taps - 1;
+    // q, k and v rows one projection after another (each un x qkv), as the
+    // convolution's channels are ordered.
+    mix_.resize(3 * un * qkv);
+    z_.resize(un * qkv);
+    alpha_.resize(un * qkv);
+    beta_.resize(un * heads);
+    dn_.resize(un * qkv);
+    low_a_.resize(un * hd);
+    low_b_.resize(un * hd);
+    {
+        const TensorView* proj[] = {&w[kQ], &w[kK], &w[kV], &w[kBeta], &w[kFa], &w[kGa]};
+        float* outs[] = {mix_.data(), mix_.data() + un * qkv, mix_.data() + 2 * un * qkv, beta_.data(),
+                         low_a_.data(), low_b_.data()};
+        LIYAB_RETURN_IF_ERROR(matmul_group(route, route.attention, proj, xb_.data(), outs, n));
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kFb], low_a_.data(), alpha_.data(), n));
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kGb], low_b_.data(), z_.data(), n));
+
+    // Checkpoints and tree branches as in delta_net_mixer(): slot layout [conv | ssm].
+    auto state_of = [&](const Segment& s) -> RecurrentState& { return (*s.states)[static_cast<size_t>(L.state_slot)]; };
+    auto slot_of = [&](const Segment& s, RecurrentState& st, size_t i) -> float* {
+        if (!s.checkpoint || i + static_cast<size_t>(s.rollback) < static_cast<size_t>(s.n)) return nullptr;
+        return st.checkpoints.data() + static_cast<size_t>((s.n_past + static_cast<int32_t>(i)) % s.rollback) *
+                                           (st.conv.size() + st.ssm.size());
+    };
+    const int32_t* parent = tree_depth_.empty() ? nullptr : tree_parent_.data();
+    auto branches = [&](size_t i) { return parent != nullptr && i > 0 && parent[i] != static_cast<int32_t>(i) - 1; };
+    const auto segments = static_cast<int64_t>(segs_.size());
+
+    // 1. The causal convolutions and SiLU, then the L2 norms of q and k: one
+    //    task per segment and head of q (task < heads), k or v channels.
+    const auto conv_tasks = static_cast<int64_t>(3 * heads);
+    pool.parallel_for(conv_tasks * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / conv_tasks)];
+            RecurrentState& st = state_of(s);
+            const auto task = static_cast<size_t>(job % conv_tasks);
+            const size_t part = task / heads;          // 0 q, 1 k, 2 v
+            const size_t col0 = (task % heads) * hd;   // the head's first channel within its projection
+            float* rows = mix_.data() + part * un * qkv;
+            const auto first = static_cast<size_t>(s.first);
+            const auto count = static_cast<size_t>(s.n);
+            for (size_t col = col0; col < col0 + hd; ++col) {
+                const size_t ch = part * qkv + col;
+                float* hist = st.conv.data() + ch * history;
+                const float* tap = L.conv1d.data() + ch * taps;
+                for (size_t i = 0; i < count; ++i) {
+                    if (branches(i)) {
+                        const float* from = slot_of(s, st, static_cast<size_t>(parent[i])) + ch * history;
+                        std::copy(from, from + history, hist);
+                    }
+                    float& x = rows[(first + i) * qkv + col];
+                    float acc = x * tap[history];
+                    for (size_t j = 0; j < history; ++j) acc += hist[j] * tap[j];
+                    for (size_t j = 0; j + 1 < history; ++j) hist[j] = hist[j + 1];
+                    hist[history - 1] = x;
+                    x = silu(acc);
+                    if (float* slot = slot_of(s, st, i)) std::copy(hist, hist + history, slot + ch * history);
+                }
+            }
+            if (part < 2) {
+                for (size_t i = 0; i < count; ++i) {
+                    l2norm(rows + (first + i) * qkv + col0, static_cast<int32_t>(hd), kKdaL2Eps);
+                }
+            }
+        }
+    });
+
+    // 2. Decays and write strengths are shared by every value row of a head.
+    // Compute them once before splitting the independent state rows into
+    // tasks. Time remains ordered inside each row, including tree branches.
+    for (size_t t = 0; t < un; ++t) {
+        for (size_t h = 0; h < heads; ++h) {
+            float* decay = alpha_.data() + t * qkv + h * hd;
+            const float* dt = L.ssm_dt.data() + h * hd;
+            for (size_t j = 0; j < hd; ++j) decay[j] = std::exp(L.ssm_a[h] * softplus(decay[j] + dt[j]));
+            beta_[t * heads + h] = sigmoid(beta_[t * heads + h]);
+        }
+    }
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    // Prefill chunks the independent value rows so even a few heads can use
+    // the pool, keeping a task's rows hot over a token chunk. The partition
+    // follows the active pool size, never a device/model name. Every row
+    // runs exactly the decoding operations in token order: chunk boundaries,
+    // thread counts and checkpoints cannot change its bits. Decoding needs
+    // no temporary state whose size grows with the preceding context.
+    const size_t slices = n == 1 ? 1 : std::min(hd, std::max(size_t{1},
+        (static_cast<size_t>(pool.active_threads()) + heads - 1) / heads));
+    const size_t rows_per_slice = (hd + slices - 1) / slices;
+    const auto head_tasks = static_cast<int64_t>(heads * slices);
+    constexpr size_t kTokenChunk = 64;
+    pool.parallel_for(head_tasks * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / head_tasks)];
+            RecurrentState& st = state_of(s);
+            const size_t task = static_cast<size_t>(job % head_tasks);
+            const size_t h = task / slices;
+            const size_t row0 = (task % slices) * rows_per_slice;
+            if (row0 >= hd) continue;
+            const size_t row_count = std::min(rows_per_slice, hd - row0);
+            const auto first = static_cast<size_t>(s.first);
+            const size_t state_offset = h * hd * hd + row0 * hd;
+            float* S = st.ssm.data() + state_offset;
+            for (size_t chunk = 0; chunk < static_cast<size_t>(s.n); chunk += kTokenChunk) {
+                const size_t last = std::min(static_cast<size_t>(s.n), chunk + kTokenChunk);
+                for (size_t i = chunk; i < last; ++i) {
+                    if (branches(i)) {
+                        const float* from = slot_of(s, st, static_cast<size_t>(parent[i])) + st.conv.size() + state_offset;
+                        std::copy(from, from + row_count * hd, S);
+                    }
+                    const size_t t = first + i;
+                    const float* q = mix_.data() + t * qkv + h * hd;
+                    const float* k = mix_.data() + un * qkv + t * qkv + h * hd;
+                    const float* v = mix_.data() + 2 * un * qkv + t * qkv + h * hd + row0;
+                    const float* decay = alpha_.data() + t * qkv + h * hd;
+                    float* o = dn_.data() + t * qkv + h * hd + row0;
+                    kda_rule_step(S, q, k, v, decay, beta_[t * heads + h], q_scale, o, hd, row_count);
+                    if (float* slot = slot_of(s, st, i)) {
+                        std::copy(S, S + row_count * hd, slot + st.conv.size() + state_offset);
+                    }
+                }
+            }
+        }
+    });
+    // A head's norm reduces all value rows, after the row tasks have joined.
+    pool.parallel_for(static_cast<int64_t>(un * heads), [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            float* o = dn_.data() + static_cast<size_t>(job) * hd;
+            const float* gate = z_.data() + static_cast<size_t>(job) * hd;
+            rmsnorm(o, L.ssm_norm.data(), o, static_cast<int32_t>(hd), c.rms_eps);
+            for (size_t j = 0; j < hd; ++j) o[j] *= sigmoid(gate[j]);
+        }
+    });
+    return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
+}
+
+
 Status Transformer::attach_expert_store(int64_t budget_option, uint64_t memory_budget, size_t reserve,
                                         int32_t requant_bits, bool repack) {
     if (budget_option == 0) return Status::ok();
@@ -4290,6 +4733,12 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     } else if (plan.mixer == MixerKind::Mamba2) {
         const PhaseTimer timer(phases_.delta_net);
         LIYAB_RETURN_IF_ERROR(mamba2_mixer(l, w, n, block_route, pool));
+    } else if (plan.mixer == MixerKind::ShortConv) {
+        const PhaseTimer timer(phases_.delta_net);  // the recurrent mixers' phase
+        LIYAB_RETURN_IF_ERROR(short_conv_mixer(l, w, n, block_route, pool));
+    } else if (plan.mixer == MixerKind::Kda) {
+        const PhaseTimer timer(phases_.delta_net);
+        LIYAB_RETURN_IF_ERROR(kda_mixer(l, w, n, block_route, pool));
     } else if (plan.latent) {
         const PhaseTimer timer(phases_.attention);
         LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,
@@ -4723,7 +5172,7 @@ Status Transformer::keep_path(std::span<const int32_t> path) {
         const auto to_slot = static_cast<size_t>(to % rollback_window_);
         for (RecurrentState& st : states_) {
             const size_t per_state = st.conv.size() + st.ssm.size();
-            if (from_slot != to_slot) {
+            if (per_state > 0 && from_slot != to_slot) {
                 std::copy_n(st.checkpoints.data() + from_slot * per_state, per_state,
                             st.checkpoints.data() + to_slot * per_state);
             }
@@ -4804,9 +5253,9 @@ Status Transformer::abandon_pass() {
     LIYAB_RETURN_IF_ERROR(kv_->truncate(n_past_));
     const float* saved = snap->data.data();
     for (RecurrentState& st : states_) {
-        std::copy_n(saved, st.conv.size(), st.conv.begin());
-        std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
-        saved += st.conv.size() + st.ssm.size();
+        if (!st.conv.empty()) std::copy_n(saved, st.conv.size(), st.conv.begin());
+        if (!st.ssm.empty()) std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+        if (!st.conv.empty() || !st.ssm.empty()) saved += st.conv.size() + st.ssm.size();
     }
     return Status::ok();
 }
@@ -4836,9 +5285,10 @@ Status Transformer::truncate(int32_t n) {
         LIYAB_RETURN_IF_ERROR(kv_->truncate(n));
         const float* saved = in_ring ? nullptr : snap->data.data();
         for (RecurrentState& st : states_) {
+            if (st.conv.empty() && st.ssm.empty()) continue;
             if (in_ring) saved = st.checkpoints.data() + static_cast<size_t>(slot) * (st.conv.size() + st.ssm.size());
-            std::copy_n(saved, st.conv.size(), st.conv.begin());
-            std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
+            if (!st.conv.empty()) std::copy_n(saved, st.conv.size(), st.conv.begin());
+            if (!st.ssm.empty()) std::copy_n(saved + st.conv.size(), st.ssm.size(), st.ssm.begin());
             if (!in_ring) saved += st.conv.size() + st.ssm.size();
         }
         // Checkpoints and snapshots of the discarded positions describe a

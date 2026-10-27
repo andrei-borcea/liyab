@@ -71,6 +71,25 @@ CASES = [
 ]
 
 
+def tool_sorting(tokenizer):
+    """Observe tokenizer-side tool sorting separately from Jinja's tojson filter."""
+    from transformers import PreTrainedTokenizerBase
+
+    messages = [U1]
+    template = "{{ tools | tojson }}"
+    actual = tokenizer.apply_chat_template(messages, tools=TOOLS, chat_template=template, tokenize=False,
+                                           add_generation_prompt=False)
+    def base(tools):
+        return PreTrainedTokenizerBase.apply_chat_template(tokenizer, messages, tools=tools,
+            chat_template=template, tokenize=False, add_generation_prompt=False)
+    if actual == base(TOOLS):
+        return False
+    sorted_tools = json.loads(json.dumps(TOOLS, sort_keys=True))
+    if actual == base(sorted_tools):
+        return True
+    raise ValueError("tokenizer-side chat preprocessing is neither identity nor recursive tool-key sorting")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", action="append", required=True, help="NAME=TOKENIZER[:TEMPLATE]")
@@ -119,6 +138,8 @@ def main():
         out[name] = {"template": template, "special": special, "cases": cases}
         if "strftime_now" in template:
             out[name]["clock_utc"] = CLOCK_UTC
+        if tool_sorting(tok):
+            out[name]["sort_tools"] = True
         print(f"{name}: {sum('output' in c for c in cases)} rendered, {sum('error' in c for c in cases)} refused")
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)

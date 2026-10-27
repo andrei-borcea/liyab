@@ -2456,9 +2456,10 @@ Value Interpreter::filter(const std::string& name, Value input, Array& args, Kwa
 // ---------------------------------------------------------------------------
 // ChatTemplate
 // ---------------------------------------------------------------------------
-Result<ChatTemplate> ChatTemplate::parse(std::string_view source) {
+Result<ChatTemplate> ChatTemplate::parse(std::string_view source, bool sort_tools) {
     try {
         ChatTemplate t;
+        t.sort_tools_ = sort_tools;
         t.body_ = std::make_shared<const std::vector<Node>>(TemplateParser(split_template(source)).parse());
         return t;
     } catch (const TemplateError& e) {
@@ -2499,7 +2500,15 @@ Result<std::string> ChatTemplate::render_chat(std::string_view request_json, con
     Object& c = context.fields();
     c.set("messages", *messages);
     const Value* tools = request->fields().find("tools");
-    c.set("tools", tools ? *tools : Value::none());
+    if (tools != nullptr && sort_tools_) {
+        // Value's serializer already owns recursive key ordering. Parsing
+        // the ordered copy avoids mutating the caller's shared objects.
+        auto ordered = jinja::parse_json(tools->to_json(-1, false, {}, {}, true));
+        if (!ordered) return ordered.status();
+        c.set("tools", *ordered);
+    } else {
+        c.set("tools", tools ? *tools : Value::none());
+    }
     const Value* documents = request->fields().find("documents");
     c.set("documents", documents ? *documents : Value::none());
     const Value* agp = request->fields().find("add_generation_prompt");

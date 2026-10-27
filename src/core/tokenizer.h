@@ -82,6 +82,10 @@ public:
     // completes a channelized turn; its <|end|> continues to the next message,
     // and <|call|> stops for a tool handoff. Explicit metadata stays authoritative;
     // other formats keep their existing stop fallbacks.
+    // The tokenizer family recursively sorts tool-object keys before chat
+    // rendering. Other request values retain insertion order. This belongs
+    // to the tokenizer, independently of the model's architecture or template.
+    [[nodiscard]] bool chat_sort_tools() const noexcept { return chat_sort_tools_; }
     [[nodiscard]] bool is_end_of_generation(int32_t id) const;
 
 private:
@@ -139,6 +143,7 @@ private:
     bool spm_greedy_ = false;
     std::vector<int32_t> initial_tokens_;
     std::string initial_text_;  // their literal spelling, when all are special
+    bool chat_sort_tools_ = false;
 };
 
 }  // namespace liyab

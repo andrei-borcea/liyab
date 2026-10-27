@@ -87,6 +87,10 @@ constexpr RstripRule kRstripRules[] = {
     {"phi3", {"<unk>", "<s>", "<|endoftext|>", "<|endofprompt|>"}},
 };
 
+// Tokenizer-side chat preprocessing absent from GGUF's template string.
+// Kimi K2 and Kimi-Linear use this tokenizer family with different architectures.
+constexpr std::string_view kChatSortToolsTokenizers[] = {"kimi-k2"};
+
 }  // namespace
 
 Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
@@ -189,6 +193,9 @@ Result<Tokenizer> Tokenizer::load(const MmapLoader& model) {
     if (tok.kind_ == Kind::Gpt2) {
         // A GGUF without tokenizer.ggml.pre predates the key: GPT-2's scheme, as the format defines.
         const auto pre = model.get_string("tokenizer.ggml.pre");
+        if (pre) {
+            for (const auto name : kChatSortToolsTokenizers) tok.chat_sort_tools_ |= *pre == name;
+        }
         auto scheme = PreTokenizer::for_name(pre ? *pre : std::string_view("default"));
         if (scheme) {
             tok.pre_.emplace(std::move(scheme).value());

@@ -111,6 +111,8 @@ These rules decide what goes into the code:
 | Additional architecture coverage on tiny checkpoints: `seed_oss`, `glm4`; the new `deci` paths also use tiny checkpoints | ✅ F32 conformance, tokenizer IDs and template fixtures; no full-weight checkpoint measured for these families |
 | Classic transformer parts: LayerNorm, optional projection biases, ungated GELU/ReLU²/xIELU FFNs, parallel residuals, learned positions, ALiBi, Q/K/V clamping and output scaling | Implemented on CPU; family conformance is tracked in [model descriptions](docs/model-descriptions.md#classic-transformer-parts) |
 | Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
+| Architectures: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen35` (hybrid Gated DeltaNet + attention), `qwen3moe`, `qwen35moe`, `hunyuan-dense`, `gemma2`, `gemma3`, `phi3`, `deepseek2` (multi-head latent attention) | ✅ cross-checked against llama.cpp or Hugging Face transformers |
+| Additional recurrent layouts: `lfm2`, `lfm2moe`, `qwen3next`, `kimi-linear` | CPU recurrent mixers; projections use the selected backend; validation details in [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts) |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
 | State-space mixers: `mamba` (Mamba-1, Falcon-Mamba) and `mamba2` (Mamba-2); mixer-only and FFN-only blocks planned from tensors | CPU selective scans and depthwise convolution, with NEON, AVX2/FMA and scalar paths; Metal/Vulkan use CPU scans with their normal projection routing. Validation: [model descriptions](docs/model-descriptions.md#state-space-mixers). |
@@ -331,8 +333,10 @@ scripts/build_flutter_app.sh --install
 scripts/build_flutter_app.sh --macos
 ```
 
-The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations. The
-`.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
+The Android NDK is located from `--ndk`, `$ANDROID_NDK_HOME`, or the newest NDK in the usual SDK locations.
+The Android build honors `CMAKE_BUILD_PARALLEL_LEVEL`; set it to limit concurrent jobs, for example
+`CMAKE_BUILD_PARALLEL_LEVEL=4 scripts/build_android.sh --experimental`. Unset uses the build generator's default.
+The `.so` is linked with 16 KB page alignment, which Android 15+ devices with 16 KB pages require. If `xcodebuild`
 reports missing components, run `sudo xcodebuild -runFirstLaunch` once.
 
 ### Windows (x64)
@@ -423,7 +427,8 @@ What the port does differently from the POSIX platforms:
   CPU kernels read quantized blocks in place. On Apple Silicon each tensor is wrapped in an `MTLBuffer` with
   `newBufferWithBytesNoCopy`, so the GPU reads the page cache directly.
 * **One forward pass for every architecture.** The transformer is not written per model. For each block the loader
-  picks the token mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, `attn_kv_a_mqa` → multi-head latent
+  picks the token mixer from the tensors present (`ssm_conv1d` → Gated DeltaNet, `shortconv.conv` → ShortConv,
+  `ssm_conv1d_q` → KDA, `attn_kv_a_mqa` → multi-head latent
   attention, otherwise softmax attention) and detects optional pieces (QKV biases, Q/K norms, an attention output
   gate, the pre-FFN norm, norms after the attention and the FFN). The facts the tensors cannot tell are one row per
   architecture: whether Q/K norms come before or after RoPE, the FFN's activation (SwiGLU or GeGLU), whether
@@ -628,6 +633,8 @@ What the port does differently from the POSIX platforms:
   independent of sequence length. Their state uses the existing recurrent snapshots, draft rollback, sequence
   contexts and prefix/KV-store persistence. Pure SSM stacks reserve a minimal, unused paged-KV placeholder.
 * **Hybrid models:** DeltaNet blocks keep a recurrent state: conv history plus one 128×128 matrix per value head.
+* **Hybrid models:** recurrent blocks keep convolution history and, for DeltaNet and KDA, a matrix per value head
+  sized from their metadata (128×128 on Qwen3.5 and Kimi-Linear). ShortConv keeps only its convolution history.
   These models can roll back only:
   * inside a window of state checkpoints (used by speculative decoding), or
   * to one of four state snapshots (the oldest, the end of the last prompt, and the two newest others).
@@ -3110,3 +3117,55 @@ download was permitted during the coordinated CPU/GPU slot. MXFP4 four-row prefi
 1.20× on AVX2 than four separate decode dots, with identical bits; scalar fallback is unchanged (1.001×).
 These are component speedups, not a measured whole-model GPT-OSS speedup. The full paired results and method
 are recorded in [Model descriptions](docs/model-descriptions.md).
+### Additional recurrent mixers
+
+LFM2's `ShortConv` projects each token to `[B | C | x]`, convolves `B * x` causally per channel, gates it with `C`,
+and projects it back to the residual stream. Its state holds the last `L_cache - 1` convolution inputs per channel.
+Kimi Delta Attention (`Kda`) uses a chunked recurrent prefill (independent value rows split across the active
+thread pool, token chunks preserving decoding arithmetic), with context-independent decoding work. It convolves Q/K/V, L2-normalizes Q/K and applies a delta rule with decay per key channel,
+then a sigmoid-gated per-head RMSNorm. Its state holds the three convolution histories and a key/value matrix
+per head. Qwen3-Next uses the existing Gated DeltaNet with consecutive value heads sharing a key head and a fused
+beta/alpha projection; Qwen3.5's existing head order stays unchanged. Kimi's latent-attention blocks keep their
+positional channels unrotated. Per-block KV-head metadata may list zero for recurrent blocks.
+
+These recurrent operations run on the CPU (KDA has NEON, AVX2/FMA and scalar kernels); Metal and Vulkan continue
+routing supported projections to their backend. State sizing, independent sequences, snapshots, draft rollback,
+tree branches and saved prefix images use the same `[convolution history | recurrent matrix]` ownership as DeltaNet.
+The LFM2 pre-tokenizer uses Llama 3's splits with ordinary BPE merges. Kimi K2/Linear isolates Han runs before
+its case-aware words. `chat_template_reference.py --trust-remote-code` loads official Python tokenizers when needed. The final norm tensor is an architecture fact:
+LFM2 uses `token_embd_norm` after the last block. See the measured scope and tool limitations in
+[model descriptions](docs/model-descriptions.md#additional-recurrent-layouts).
+
+Kimi's tokenizer sorts nested tool-object keys before chat rendering. `Tokenizer::chat_sort_tools()` selects this
+behavior from `tokenizer.ggml.pre`, including Kimi K2 and Kimi-Linear independently of their architecture;
+only the tools value is ordered, and the original template and other request values keep their order.
+The reference-template tool probes this preprocessing separately from the Jinja renderer.
+
+Fresh tiny F32 LFM2, LFM2-MoE, Qwen3-Next and Kimi-Linear checkpoints each measure mean KL 0.00000 and top-1
+100% against transformers. Real LFM2-350M, 700M and 1.2B BF16 files pass the description gate with matching
+tokenizer IDs, mean KL 0.00000 and top-1 100%, 99.80% and 99.80%, respectively. Their chat templates match
+transformers; [model descriptions](docs/model-descriptions.md#additional-recurrent-layouts) records the scope,
+perplexities and converter compatibility details.
+
+On an M4 Pro with four CPU workers, BF16 weights and F16 KV, LFM2-350M measures **111.9 tok/s decode** and
+**145.5 tok/s prefill**; LFM2-1.2B measures **30.9 tok/s decode** and **35.3 tok/s prefill**. Decode uses 64 greedy
+tokens after the model's own chat template; prefill uses 512 tokens in one batch, the best of three runs of
+`liyab-bench --prefill`. Both models give coherent replies to the sky-color prompt. These are host CPU numbers;
+phone throughput remains to be measured.
+
+The recurrent regression cases exercise all four KV types, independent sequences, draft rollback, alternative
+tree branches, bounded prefix images restored by another engine, and CPU/GPU projection routing. A KDA check
+compares one worker with eight workers, including rollback and tree retention, to cover value-row partitioning.
+
+Recurrent-state fragments omit empty components before storage copies. ShortConv therefore stores no matrix
+fragment, and a one-tap convolution stores no history; state files retain the same zero-length fields and format.
+
+The additional recurrent paths have 13 golden cases on each of `arm64-neon-dotprod`, `x86_64-avx2` and
+`x86_64-scalar` (50 paths per platform). All 111 existing hashes retain their values and order. The full native,
+Rosetta AVX2 and Rosetta scalar suites each pass 14/14 tests, including actual Metal access on the host; the
+experimental Android build also passes with `CMAKE_BUILD_PARALLEL_LEVEL=4`.
+
+Quiet main/branch measurements of Qwen3-0.6B, Llama-3.2-1B and Qwen3.5-0.8B pass the ±3% prefill/decode gate on
+CPU and the Metal route; 33 paired CLI replies retain identical bytes. Metal's BF16 matrices fall back to the
+CPU in both revisions, so separate F16 files establish actual GPU projection timings. The protocols, warmed
+balanced followups and before/after numbers are recorded in [model descriptions](docs/model-descriptions.md#host-throughput-and-validation).

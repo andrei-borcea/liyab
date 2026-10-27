@@ -1037,3 +1037,112 @@ of the four independent decode dots. NEON's paired median speedup is 1.652249× 
 Rosetta 1.196605× (683.064 → 570.839 ms), and scalar under Rosetta 1.001263× (1241.818 → 1239.361 ms). Scalar
 retains its single-row implementation; no scalar speedup or whole-model GPT-OSS speedup is inferred. Earlier
 noisy trials and pre-Harmony-fix measurements are retained separately and are not used for this final gate.
+## Additional recurrent layouts
+
+The registry adds `lfm2`, `lfm2moe`, `qwen3next` and `kimi-linear`. Blocks are planned from the file's tensors:
+`shortconv.conv` selects LFM2's gated depthwise convolution; `ssm_conv1d_q` selects Kimi Delta Attention;
+`ssm_conv1d` retains Gated DeltaNet. The metadata supplies `shortconv.l_cache`, `ssm.conv_kernel`, and `kda.head_dim`;
+KDA heads come from its query projection. Per-block `attention.head_count_kv` arrays may contain zero in recurrent
+blocks; attention blocks must share one cache layout. Kimi's expanded head count is normalized to the one shared
+latent row in the absorbed cache.
+
+New architecture facts are `output_norm` (the tensor holding the final RMSNorm), `ssm_grouped_heads` (whether
+consecutive DeltaNet value heads share keys) and the shared NoPE plan (`nope_period = 1` for unrotated latent channels). The trace
+recomputes the ShortConv formula and records delta-rule operands to establish head sharing. The description tool
+compares the final norm's weights with global tensors and recognizes per-block KV counts and the new mixers.
+It refuses a row if it cannot establish a fact: latent-attention decomposition and KDA's complete recurrence are
+not yet numerically described by this tool. DeltaNet's converter head order is checked against the output projection's columns. Engine
+conformance is measured separately; a registry entry alone is not a conformance result.
+
+Fresh tiny F32 checkpoints regenerated from pinned public revisions measure mean KL 0.00000 and top-1 100.00%:
+LFM2, LFM2-MoE and Qwen3-Next each run 512 identical reference token IDs; Kimi's full hybrid model runs 503.
+The three tokenizer texts match at 535 / 937 / 198 IDs for LFM2 and LFM2-MoE, 524 / 804 / 179 for Qwen3-Next,
+and 503 / 798 / 201 for Kimi. Kimi also matches 172 IDs on an additional rare-Han edge text.
+
+The real LiquidAI/LFM2-350M checkpoint, converted with b11819 to BF16, passes the description gate: exactly the
+registered row, identical IDs on all three texts (535 / 937 / 198), mean KL 0.00000 and top-1 100.00% on 512 tokens.
+Its perplexity is 36.473 → 36.471 (reference → engine). LFM2-700M BF16 also passes: the same three tokenizer
+counts, mean KL 0.00000, top-1 99.80%, perplexity 28.968 → 28.970. LFM2-1.2B BF16 passes the same gate with
+mean KL 0.00000, top-1 99.80%, perplexity 28.375 → 28.379. All three gates propose exactly the registered row.
+Their identical chat template (SHA-1 283ce60a51b5e134bf6abcea2b1d71c13244a45a) matches transformers on fourteen
+conversations, as do the LFM2-MoE, Qwen3-Next and Kimi templates.
+
+Qwen3-Next conversion uses b11819's `--no-mtp`. For Kimi with transformers 5.19, the tiny checkpoint preparation
+renames the leading dense FFN's `.block_sparse_moe.{gate,up,down}_proj` keys to the official `.mlp.*` names,
+without changing values. A local Python-only b11819 converter copy memoizes transformers' pure 256-byte
+`bytes_to_unicode()` map: the unmodified converter exceeded 900 seconds repeatedly rebuilding that map.
+The cached conversion preserves its tensor and vocabulary algorithms; the resulting F32 hybrid passes the
+independent reference comparison above. Kimi uses the official tokenizer implementation for reference checks.
+
+ShortConv state is `embedding_length * (l_cache - 1)` floats per convolution block. KDA state is
+`3 * heads * head_dim * (conv_kernel - 1) + heads * head_dim * head_dim` floats per KDA block. Rollback rings and
+snapshots multiply those sizes just as they do for DeltaNet; the memory plan and lazy sequence allocation take
+these actual per-block sizes. On-disk state/prefix storage retains its existing bounds and eviction policy.
+
+KDA prefill splits independent value rows across the active pool and scans token chunks in causal order. This
+keeps decoding arithmetic (including rollback and tree paths) bit-identical across batch sizes. It is a chunked
+recurrent scan, not an algebraically reassociated parallel scan. Decode holds one fixed-size matrix per head; its
+work and state do not grow with context length. All reduction kernels have NEON, AVX2/FMA and scalar paths.
+
+`Tokenizer::chat_sort_tools()` records tokenizer-side recursive ordering of tool-object keys, selected by the
+`kimi-k2` tokenizer family for both Kimi K2 and Kimi-Linear rather than by architecture. Both description and chat
+fixture tools probe `apply_chat_template` against the base renderer with unsorted and sorted tools, refusing
+unrecognized preprocessing. The description tool checks this behavior against the engine's tokenizer-family
+table. The engine and tokenizer CLI pass this fact when loading the model's unmodified template.
+
+The synthetic KDA row-partition test runs the same prefill, rollback, branched verification and retained path
+with one and eight workers, requiring identical logits. The prefix-image tests use prompts above the store's
+existing 128-token minimum so that reuse is actually exercised.
+
+ShortConv's empty matrix state, and a one-tap convolution's empty history, are omitted from the fragment views
+used by prefix storage. Snapshot, rollback and file I/O skip empty buffers while retaining their zero lengths
+in the existing file format. This avoids null-buffer copies without changing serialized bytes.
+
+### Host throughput and validation
+
+The real LFM2 BF16 files were measured on an M4 Pro with four CPU workers and F16 KV. Decode uses 64 greedy
+tokens after the official chat template (the sky-color question); both replies coherently explain Rayleigh
+scattering. Prefill is `liyab-bench --prefill`, 512 tokens, batch 512, best of three runs. Peak RSS is the CLI's
+process peak, including the model and context.
+
+| Model | CPU decode (tok/s) | CPU prefill (tok/s) | Peak RSS (MiB) |
+| :--- | ---: | ---: | ---: |
+| LiquidAI/LFM2-350M | 111.881 | 145.5 | 706.8 |
+| LiquidAI/LFM2-1.2B | 30.917 | 35.3 | 2264.7 |
+
+The final full suites pass 14/14 on native arm64, 14/14 under Rosetta with `ROSETTA_ADVERTISE_AVX=1`, and 14/14
+under Rosetta without it. Their elapsed times were 145.88, 346.22 and 254.71 seconds, respectively. Metal tests
+ran outside the workspace sandbox so they used the actual GPU. The experimental Android script build passes
+with `CMAKE_BUILD_PARALLEL_LEVEL=4`; its dry run selects Ninja `-j 4`, while unset retains the generator's default.
+No C ABI or app sources changed, so Flutter was not run. Phone validation is performed separately.
+
+Each platform pins 50 golden paths, including 13 new recurrent cases (39 added platform/case hashes); all 111
+previous hashes and their order are unchanged. Beyond logits, regressions check KDA's one/eight-worker results,
+rollback and retained tree paths, and ShortConv's one/three-tap live/external state images, empty fields and
+restored checkpoint rings. Earlier contended x86 calibration waits exceeded the existing five-minute deadline;
+all three final suites pass without changing that deadline.
+
+Quiet baseline-main/branch comparisons use four workers, F16 KV and context 1024. CPU prefill below is
+`liyab-bench --prefill`, 512 seeded token IDs, batch 512, best of three runs; CPU decode uses CLI statistics.
+Metal prefill and decode both use CLI statistics: the complete conformance text has 524 / 499 / 524 prompt
+tokens for Qwen3 / Llama / Qwen3.5. Decode uses 64 greedy tokens, except the Qwen CPU followup's 256 tokens.
+The initial matrix alternates main/branch order over three pairs. Longer, warmed, evenly counterbalanced
+six-pair followups resolve the initial Qwen CPU decode and Llama direct-prefill run/order spread; their medians
+are used below. All initial and followup raw runs are retained. All 33 measured CLI pairs have identical output
+bytes, and every final prefill/decode comparison satisfies ±3%.
+
+Metal initializes on the actual GPU outside the workspace sandbox. It has no BF16 matrix kernel in either
+revision, so those projections fall back to CPU. The shared read-only F16 copies separately exercise actual
+Metal projections; attention and recurrent operations continue using their existing CPU routes.
+
+| Model | Route / weights | Prefill main → branch (tok/s) | Decode main → branch (tok/s) | Change prefill / decode |
+| :--- | :--- | ---: | ---: | ---: |
+| Qwen3-0.6B | CPU BF16 | 87.90 → 87.90 | 50.945 → 51.101 | +0.00% / +0.31% |
+| Qwen3-0.6B | Metal BF16 (CPU matrix fallback) | 88.37 → 87.40 | 52.449 → 53.034 | -1.10% / +1.12% |
+| Qwen3-0.6B | Metal F16 (GPU projections) | 249.84 → 249.53 | 27.516 → 27.479 | -0.12% / -0.13% |
+| Llama-3.2-1B-Instruct | CPU BF16 | 36.70 → 36.75 | 27.711 → 27.738 | +0.14% / +0.10% |
+| Llama-3.2-1B-Instruct | Metal BF16 (CPU matrix fallback) | 37.35 → 37.33 | 27.880 → 27.830 | -0.05% / -0.18% |
+| Llama-3.2-1B-Instruct | Metal F16 (GPU projections) | 150.07 → 150.18 | 32.562 → 32.662 | +0.08% / +0.31% |
+| Qwen3.5-0.8B | CPU BF16 | 84.00 → 83.90 | 53.329 → 53.348 | -0.12% / +0.04% |
+| Qwen3.5-0.8B | Metal BF16 (CPU matrix fallback) | 84.09 → 84.10 | 53.114 → 53.288 | +0.00% / +0.33% |
+| Qwen3.5-0.8B | Metal F16 (GPU projections) | 274.58 → 275.07 | 34.028 → 34.256 | +0.18% / +0.67% |

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 #include "liyab/engine.h"
 
@@ -302,6 +303,48 @@ constexpr ArchSpec kArchitectures[] = {
     // (planned from ssm_d without ssm_x), heads and groups from the file.
     {.name = "mamba2", .rope = RopeLayout::Halves, .ffn_norm = "", .moe_norm_weights = false,
      .ssm_norm_grouped = false},
+    // LFM2 (LiquidAI): gated short-convolution blocks (shortconv.*, planned
+    // from the tensors) and attention blocks with per-head Q/K norms before
+    // RoPE, which pairs halves; SwiGLU FFNs. head_count_kv is per block (0 in
+    // the convolution blocks). The final norm, which the reference names
+    // embedding_norm, is the converter's token_embd_norm. Row proposed and
+    // gated by tools/describe_model.py (docs/model-descriptions.md).
+    {.name = "lfm2",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = false,
+     .output_norm = "token_embd_norm"},
+    // LFM2-MoE (LFM2-8B-A1B): LFM2's blocks, dense FFNs in the leading blocks
+    // and sigmoid-routed experts in the others (the gating and the selection
+    // bias exp_probs_b from the file); the top-k weights are renormalized
+    // (the reference's norm_topk_prob, which the converter does not write).
+    {.name = "lfm2moe",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = true,
+     .output_norm = "token_embd_norm"},
+    // Qwen3-Next: Qwen3.5-MoE's parts (Gated DeltaNet blocks, gated attention
+    // with Q/K norms and partial RoPE, experts with a gated shared expert) in
+    // Qwen3-Next's file layout: DeltaNet value heads in the reference's
+    // grouped order, and beta and alpha in one ssm_ba projection (planned
+    // from the tensors). The converter stores its (1 + w) norms as 1 + w.
+    {.name = "qwen3next",
+     .rope = RopeLayout::Halves,
+     .ffn_norm = "post_attention_norm",
+     .moe_norm_weights = true,
+     .ssm_grouped_heads = true},
+    // Kimi-Linear: Kimi Delta Attention blocks (ssm_conv1d_q/k/v, planned from
+    // the tensors), latent attention blocks without positional rotation
+    // (nope_period = 1), a dense
+    // leading FFN, then sigmoid-routed experts with a selection bias, the
+    // file's weight scale and an ungated shared expert; the top-k weights
+    // are renormalized (moe_renormalize). The RoPE pairing is DeepSeek's
+    // convention for latent attention; no block rotates with it.
+    {.name = "kimi-linear",
+     .rope = RopeLayout::Adjacent,
+     .ffn_norm = "ffn_norm",
+     .moe_norm_weights = true,
+     .nope_period = 1},
 };
 
 }  // namespace
@@ -320,6 +363,31 @@ std::string supported_architectures() {
     for (const ArchSpec& a : kArchitectures) out += (out.empty() ? "" : ",") + std::string(a.name);
     return out;
 }
+
+namespace {
+
+// Element i of an integer array value (any integer element type), or nullopt.
+std::optional<int64_t> array_int(const GgufValue& v, uint64_t i) {
+    if (v.type != GgufValue::Type::Array || i >= v.array_size || v.array_data == nullptr) return std::nullopt;
+    auto read = [&](auto zero) -> int64_t {
+        decltype(zero) x;
+        std::memcpy(&x, v.array_data + i * sizeof x, sizeof x);
+        return static_cast<int64_t>(x);
+    };
+    switch (v.array_type) {
+        case GgufValue::Type::U8: return read(uint8_t{});
+        case GgufValue::Type::I8: return read(int8_t{});
+        case GgufValue::Type::U16: return read(uint16_t{});
+        case GgufValue::Type::I16: return read(int16_t{});
+        case GgufValue::Type::U32: return read(uint32_t{});
+        case GgufValue::Type::I32: return read(int32_t{});
+        case GgufValue::Type::U64: return read(uint64_t{});
+        case GgufValue::Type::I64: return read(int64_t{});
+        default: return std::nullopt;
+    }
+}
+
+}  // namespace
 
 std::string block_tensor(int32_t block, std::string_view suffix) {
     char buf[96];
@@ -363,6 +431,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // come from ssm_x, else Gated DeltaNet), attention projections make it
     // attention, and a block with neither has no mixer (its FFN alone).
     auto mixer_of = [&](int32_t l) {
+        // Specific recurrent layouts precede the shared partial-SSM markers.
+        if (f.tensor(block_tensor(l, "shortconv.conv.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "shortconv.in_proj.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "shortconv.out_proj.weight")) != nullptr) return MixerKind::ShortConv;
+        if (f.tensor(block_tensor(l, "ssm_conv1d_q.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_conv1d_k.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_conv1d_v.weight")) != nullptr) return MixerKind::Kda;
         if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr ||
             f.tensor(block_tensor(l, "ssm_in.weight")) != nullptr ||
             f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ||
@@ -420,10 +495,11 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 return Status(ErrorCode::InvalidModel, "expected one 32-bit integer per block in " + key(suffix));
             }
             for (size_t l = 0; l < out.size(); ++l) {
-                uint32_t v = 0;
-                std::memcpy(&v, value->array_data + l * sizeof(v), sizeof(v));
-                if (v > (uint32_t{1} << 24)) return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
-                out[l] = static_cast<int32_t>(v);
+                const auto v = array_int(*value, l);
+                if (!v || *v < 0 || *v > (int64_t{1} << 24)) {
+                    return Status(ErrorCode::InvalidModel, "invalid " + key(suffix));
+                }
+                out[l] = static_cast<int32_t>(*v);
             }
         } else {
             const auto v = value->as_int();
@@ -466,7 +542,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         m.q_rank = static_cast<int32_t>(f.get_int(key("attention.q_lora_rank")).value_or(0));
         m.nope_dim = static_cast<int32_t>(*key_mla - c.rope_dim);
         m.v_dim = static_cast<int32_t>(*value_mla);
-        c.value_dim = static_cast<int32_t>(value_length.value_or(0));
+        // Values in an absorbed cache are the latent itself. Some GGUF
+        // converters write the ordinary per-head value_length here; only
+        // value_length_mla describes its expansion into values.
+        c.value_dim = m.kv_rank;
+        // Some converters report the expanded heads here. The absorbed
+        // cache stores one shared latent row, irrespective of that count.
+        if (c.n_head_kv == c.n_head) c.n_head_kv = 1;
         if (c.n_head_kv != 1 || c.head_dim != m.kv_rank + c.rope_dim || c.value_dim != m.kv_rank ||
             m.nope_dim <= 0 || m.v_dim <= 0 || m.q_rank < 0 || *kv_rank > (int64_t{1} << 20)) {
             return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
@@ -724,7 +806,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
 
     // Block plans, from the tensors present: a block with a DeltaNet
-    // convolution is recurrent, every other block is attention; a router
+    // convolution, LFM2's short convolution or Kimi Delta Attention's
+    // convolutions is recurrent, every other block is attention; a router
     // makes the FFN a mixture of experts.
     // Parallel blocks: the file's flag (GPT-NeoX, StableLM), else the architecture's.
     const GgufValue* parallel_key = f.metadata(key("use_parallel_residual"));
@@ -800,10 +883,6 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             b.fused_qkv = wq == nullptr && f.tensor(block_tensor(l, "attn_qkv.weight")) != nullptr;
             b.windowed = windowed[static_cast<size_t>(l)];
             b.rope = rotated[static_cast<size_t>(l)];
-            if (!b.rope && b.latent) {
-                return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
-                                                          ": latent attention without RoPE is not supported");
-            }
             // Q/K norms over the whole projection (one weight per channel of
             // every head) rather than one head's weights shared by all heads.
             const TensorView* qn = f.tensor(block_tensor(l, "attn_q_norm.weight"));
@@ -913,6 +992,31 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
                                                       ": attention sinks with latent attention are not supported");
         }
+    }
+    c.n_recurrent_layers = static_cast<int32_t>(std::count_if(c.blocks.begin(), c.blocks.end(),
+        [](const BlockPlan& b) { return keeps_state(b.mixer); }));
+    auto has_mixer = [&](MixerKind kind) {
+        return std::any_of(c.blocks.begin(), c.blocks.end(), [kind](const BlockPlan& b) { return b.mixer == kind; });
+    };
+    if (has_mixer(MixerKind::ShortConv)) {
+        LIYAB_RETURN_IF_ERROR(require_int("shortconv.l_cache", c.shortconv_l_cache));
+    }
+    if (has_mixer(MixerKind::Kda)) {
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", c.ssm_conv_kernel));
+        LIYAB_RETURN_IF_ERROR(require_int("kda.head_dim", c.kda_head_dim));
+        // Heads from the first Kda block's query projection (the same in every
+        // block: bind_weights() checks each against it).
+        for (int32_t l = 0; l < c.n_layers && c.kda_heads == 0; ++l) {
+            if (c.blocks[static_cast<size_t>(l)].mixer != MixerKind::Kda) continue;
+            const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
+            if (wq == nullptr || wq->rows() % c.kda_head_dim != 0 || wq->rows() == 0) {
+                return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                                           ": Kimi Delta Attention without a whole number of heads "
+                                                           "in attn_q (" + key("kda.head_dim") + ")");
+            }
+            c.kda_heads = static_cast<int32_t>(wq->rows() / c.kda_head_dim);
+        }
+        if (c.ssm_conv_kernel < 2) return Status(ErrorCode::InvalidModel, "invalid " + key("ssm.conv_kernel"));
     }
     if (c.n_expert > 0 && c.n_ff_expert <= 0 &&
         std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.ffn == FfnKind::Moe; })) {

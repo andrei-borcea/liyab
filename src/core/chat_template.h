@@ -129,7 +129,10 @@ namespace liyab {
 class ChatTemplate {
 public:
     // Parses `source`. InvalidArgument names the problem and its line.
-    static Result<ChatTemplate> parse(std::string_view source);
+    // sort_tools reproduces a reference tokenizer's recursive ordering of
+    // tool-object keys before render_chat(); other request values keep their
+    // order. Immutable after parsing; rendering owns its request values.
+    static Result<ChatTemplate> parse(std::string_view source, bool sort_tools = false);
 
     // Renders with `context` (an object: messages, tools, add_generation_prompt...).
     // A template's raise_exception() and every evaluation error come back as
@@ -156,6 +159,7 @@ public:
 
 private:
     std::shared_ptr<const std::vector<Node>> body_;
+    bool sort_tools_ = false;
 };
 
 }  // namespace liyab

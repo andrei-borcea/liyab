@@ -435,6 +435,8 @@ class Engine:
         tokenizer = read("src/core/tokenizer.cpp")
         self.tokenizer_kinds = re.findall(r'\*kind == "(\w+)"', tokenizer)
         self.spm_greedy = bool(re.search(r'\*spm_pre\s*==\s*"spm-greedy"', _strip_comments(tokenizer)))
+        sorting = re.search(r'kChatSortToolsTokenizers\[\]\s*=\s*\{(.*?)\}', read("src/core/tokenizer.cpp"), re.S)
+        self.chat_sort_tools_tokenizers = re.findall(r'"([^"]+)"', sorting.group(1)) if sorting else []
 
     @staticmethod
     def _entries(text):
@@ -530,7 +532,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped", "output_norm", "ssm_grouped_heads")
 
 
 def _close(a, b, rel=1e-5):
@@ -809,7 +811,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     for b in range(n_layers):
         ts = blocks.get(b, set())
         p = {"n_head": block_heads[b], "n_head_kv": block_kv_heads[b], "n_ff": block_ff[b]}
-        if {"ssm_conv1d.weight", "ssm_in.weight", "ssm_x.weight", "ssm_out.weight", "ssm_a", "ssm_d"} & ts:
+        if {"shortconv.conv.weight", "shortconv.in_proj.weight", "shortconv.out_proj.weight"} & ts:
+            p["mixer"] = "shortconv"
+        elif {"ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"} & ts:
+            p["mixer"] = "kda"
+        elif {"ssm_conv1d.weight", "ssm_in.weight", "ssm_x.weight", "ssm_out.weight", "ssm_a", "ssm_d"} & ts:
             p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if {"ssm_d", "ssm_in.weight", "ssm_x.weight"} & ts else "deltanet"
             if p["mixer"] in ("mamba", "mamba2") and "attn_output.weight" in ts:
                 d.missing.append(f"block {b}: parallel attention and Mamba mixers in one block")
@@ -892,11 +898,30 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             kind = b.get("mixer", {}).get("kind")
             if kind == "attention" and plans[i]["mixer"] != "attention":
                 d.file_issues.append(f"block {i}: the reference attends, the GGUF has a recurrent block")
-            if kind == "recurrent" and plans[i]["mixer"] != "deltanet":
+            if kind == "recurrent" and plans[i]["mixer"] not in ("deltanet", "shortconv", "kda"):
                 d.unknown.append(f"block {i}: no standard attention calculation was captured for the token mixer "
                                  f"({', '.join(b['mixer'].get('classes', []))}); its computation is not established")
             if kind in ("none", "linear") and plans[i]["mixer"] != kind:
                 d.file_issues.append(f"block {i}: {kind} mixer in the reference, {plans[i]['mixer']} in the file")
+
+    # Recurrent head sharing: observed operands, then the converter's layout.
+    delta = [b for b in rec_blocks if plans[b["index"]]["mixer"] == "deltanet"]
+    if not delta:
+        d.set("ssm_grouped_heads", False, "no Gated DeltaNet blocks")
+    elif all(b["mixer"].get("grouped_heads") for b in delta):
+        if all("ssm_ba.weight" in blocks[b["index"]] for b in delta):
+            d.set("ssm_grouped_heads", True, "recorded delta-rule queries and keys repeat consecutive heads; fused ssm_ba preserves that order")
+        else:
+            pass  # Compare the output projection's head columns below, once the checkpoint is open.
+    else:
+        d.unknown.append("DeltaNet query/key head sharing could not be recomputed")
+    for b in rec_blocks:
+        i = b["index"]
+        if plans[i]["mixer"] == "shortconv":
+            if b["mixer"].get("operation") != "shortconv":
+                d.unknown.append(f"block {i}: short convolution formula could not be recomputed")
+            elif g.key("shortconv.l_cache") != b["mixer"]["taps"]:
+                d.file_issues.append(f"block {i}: shortconv.l_cache differs from the reference's kernel width")
 
     # Unknown mixers: say what the file holds, e.g. latent attention.
     for b in att_blocks:
@@ -927,7 +952,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     rotated = {(m.get(side) or {}).get("rope") is not None for b in att_blocks for m in [b["mixer"]]
                for side in ("key", "query") if m.get(side) is not None}
     if len(rotated) == 1:
-        d.set("rotary", next(iter(rotated)), "queries and keys are rotated" if True in rotated else
+        d.set("rotary", True if any(mla & ts for ts in blocks.values()) else next(iter(rotated)), "queries and keys are rotated" if True in rotated else
               "queries and keys are passed without rotation")
         if False in rotated:
             d.set("rope", engine.enums["RopeLayout"][0], "no rotary dimensions (layout is unused)")
@@ -948,6 +973,29 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         """'model.layers.3.self_attn.k_proj' -> 'layers.3.self_attn.k_proj' (checkpoint names vary in prefix)."""
         m = re.search(r"(?:^|\.)([^.]+\.\d+\..+)$", path)
         return m.group(1) if m else path
+
+    if delta and "ssm_grouped_heads" not in d.fields and ckpt is not None:
+        orders = set()
+        for b in delta:
+            m = b["mixer"]
+            hname = ckpt.find(layer_suffix(m.get("output_projection") or "") + ".weight")
+            gname = f"blk.{b['index']}.ssm_out.weight"
+            if hname is None or not m.get("grouped_heads"):
+                continue
+            hk, hv, hd = m["key_heads"], m["value_heads"], m["head_dim"]
+            hf = ckpt.tensor(hname, rows=2).reshape(2, hv, hd)
+            gg = g.values(gname, rows=2).reshape(2, hv, hd)
+            tiled = hf[:, np.arange(hv).reshape(hk, hv // hk).T.reshape(-1)]
+            if _rel_err(gg, tiled) < 1e-2:
+                orders.add(False)
+            elif _rel_err(gg, hf) < 1e-2:
+                orders.add(True)
+            else:
+                d.file_issues.append(f"{gname} matches neither reference value-head order")
+        if len(orders) == 1:
+            d.set("ssm_grouped_heads", orders.pop(), "the output projection's columns establish whether the converter tiled value heads")
+        else:
+            d.unknown.append("the DeltaNet converter's value-head permutation could not be established consistently")
 
     file_layout = None
     rope_tables = {t["name"]: t for t in facts["rope_tables"]}
@@ -1085,7 +1133,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                 traced_types.setdefault(layer_types[b["index"]], set()).add(windows[b["index"]] is not None)
         if all(len(v) == 1 for v in traced_types.values()):
             flags = [next(iter(traced_types[t])) if t in traced_types else False for t in layer_types]
-            missing_types = {t for t in layer_types if t not in traced_types and t != "linear_attention"}
+            recurrent_types = {layer_types[b["index"]] for b in rec_blocks}
+            missing_types = {t for t in layer_types if t not in traced_types and t not in recurrent_types}
             if missing_types:
                 d.unknown.append(f"blocks of type {sorted(missing_types)} were not traced")
         else:
@@ -1201,7 +1250,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     full_rotation = [bool(v) for v in configured] if isinstance(configured, list) and len(configured) == n_layers else None
     if full_rotation is not None and any(full_rotation[i] != v for i, v in rotation.items()):
         d.unknown.append("the configuration's no_rope_layers flags disagree with observed Q/K rotation")
-    no_rotation = [i for i, v in rotation.items() if not v]
+    # Classic positionless attention has no rotary channels at all. Latent
+    # NoPE keeps its channel geometry and selects unrotated blocks here.
+    no_rotation = [i for i, v in rotation.items() if not v] if d.fields.get("rotary", (True,))[0] else []
     global_nope = bool(no_rotation and flags and g.key("attention.sliding_window", 0) and
                        all(v == bool(flags[i]) for i, v in rotation.items()))
     if no_rotation:
@@ -1474,15 +1525,19 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                 if have.shape != want.shape or _rel_err(have, want) > 1e-2:
                     d.file_issues.append(f"{gname} does not hold the reference's {hname}"
                                          + (" as 1 + w" if norm["formula"] == "rms_1p" else ""))
-    if facts.get("final_norm") and ckpt is not None and "output_norm.weight" in g.tensors:
+    if facts.get("final_norm") and ckpt is not None:
         fn = facts["final_norm"]
         hname = ckpt.find(fn["module"].split(".", 1)[-1] + ".weight") or ckpt.find(fn["module"] + ".weight")
         if hname is not None:
             w = ckpt.tensor(hname).reshape(-1)
             want = w + fn.get("weight_offset", 1.0 if fn["formula"] in ("rms_1p", "layer_1p") else 0.0)
-            if _rel_err(g.values("output_norm.weight").reshape(-1), want) > 1e-2:
-                d.file_issues.append(f"output_norm.weight does not hold the reference's {hname}"
-                                     + (" as 1 + w" if fn["formula"] == "rms_1p" else ""))
+            hits = [name for name in globals_ if name.endswith(".weight")
+                    and tuple(g.tensors[name]["dims"]) == (n_embd,)
+                    and _rel_err(g.values(name).reshape(-1), want) < 1e-2]
+            if len(hits) == 1:
+                d.set("output_norm", hits[0][:-len(".weight")], f"{hits[0]} holds the final norm {hname}")
+            else:
+                d.unknown.append(f"final norm {hname} does not identify exactly one global tensor: {hits}")
 
     # --- FFN ---
     acts = set()
@@ -1697,11 +1752,14 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             d.missing.append(f"tensor {s} (blocks {_ranges(bl)}) is not used by the engine")
     else:
         d.unknown.append("which block tensors the engine would bind (the norms' names are not established)")
-    for name in sorted(globals_ - engine.global_tensors):
+    for name in sorted(globals_ - engine.global_tensors - {str(row.get("output_norm", "output_norm")) + ".weight"}):
         d.missing.append(f"tensor {name} is not used by the engine")
     rec = [i for i, p in enumerate(plans) if p["mixer"] == "deltanet"]
     for i in rec:
-        lacking = DELTANET_TENSORS - blocks.get(i, set())
+        required = DELTANET_TENSORS
+        if "ssm_ba.weight" in blocks.get(i, set()):
+            required = required - {"ssm_alpha.weight", "ssm_beta.weight"} | {"ssm_ba.weight"}
+        lacking = required - blocks.get(i, set())
         if lacking:
             d.missing.append(f"block {i}: a recurrent mixer without the Gated DeltaNet tensors {sorted(lacking)}")
             break
@@ -1720,6 +1778,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             mix = "linear mixer (one residual projection)"
         elif p["mixer"] in ("mamba", "mamba2"):
             mix = {"mamba": "Mamba-1", "mamba2": "Mamba-2"}[p["mixer"]]
+        elif p["mixer"] in ("shortconv", "kda"):
+            mix = {"shortconv": "gated short convolution", "kda": "Kimi Delta Attention"}[p["mixer"]]
         else:
             mix = "attention" + ("".join(f", {t}" for t, on in (("fused QKV", p["fused_qkv"]),
                                                                 ("QKV biases", p["qkv_bias"]),
@@ -1746,6 +1806,20 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         d.missing.append("greedy SentencePiece matching (tokenizer.ggml.pre=spm-greedy)")
     else:
         d.parts.append(f"tokenizer {kind}" + (f", pre-tokenizer {pre}" if kind == "gpt2" or pre == "spm-greedy" else ""))
+    try:
+        from reference_tokenizer import load_tokenizer
+        from chat_template_reference import tool_sorting
+        tokenizer = load_tokenizer(model, revision=revision, trust_remote_code=trust_remote_code, slow=slow_tokenizer)
+        sorts_tools = tool_sorting(tokenizer)
+        expected = kind == "gpt2" and pre in engine.chat_sort_tools_tokenizers
+        if sorts_tools != expected:
+            d.missing.append(f"tokenizer '{pre}' tool-key sorting: reference {sorts_tools}, engine {expected}")
+        else:
+            d.notes.append("tokenizer.apply_chat_template tool-key preprocessing matches the tokenizer family: "
+                           + ("recursive sorting" if sorts_tools else "insertion order"))
+    except Exception as e:
+        d.unknown.append(f"chat tool-key preprocessing could not be established: {type(e).__name__}: {e}")
+
 
     d.merge_blocks()
     if complete and not d.unknown:
@@ -2096,7 +2170,7 @@ def gate(args, d, row_text, arch, engine):
             if code != 0:
                 results["checks"].append({"check": "configure", "pass": False})
                 return False, results
-        code, _ = run(["cmake", "--build", build, "--target", "liyab-kl", "liyab-tok"], log)
+        code, _ = run(["cmake", "--build", build, "--target", "liyab-kl", "liyab-tok", "-j", "4"], log)
         if code != 0:
             results["checks"].append({"check": "build", "pass": False})
             return False, results

@@ -78,6 +78,8 @@ YOUTU_CJK = (r"[\x{1100}-\x{11FF}\x{302E}\x{302F}\x{3131}-\x{318E}\x{3200}-\x{32
 YOUTU_WORDS = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+KIMI_HAN = r"[\x{2E80}-\x{2E99}\x{2E9B}-\x{2EF3}\x{2F00}-\x{2FD5}\x{3005}\x{3007}\x{3021}-\x{3029}\x{3038}-\x{303B}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FA6D}\x{FA70}-\x{FAD9}\x{16FE2}-\x{16FE3}\x{16FF0}-\x{16FF6}\x{20000}-\x{2A6DF}\x{2A700}-\x{2B81E}\x{2B820}-\x{2CEAD}\x{2CEB0}-\x{2EBE0}\x{2EBF0}-\x{2EE5D}\x{2F800}-\x{2FA1D}\x{30000}-\x{3134A}\x{31350}-\x{33479}]+"
+KIMI_WORDS = GPT4O.replace(r"[\r\n/]*", r"[\r\n]*")
 PRE_TOKENIZERS = {
     "default": ([(GPT2, True)], False),
     "llama3": ([(LLAMA3, True)], False),
@@ -91,6 +93,8 @@ PRE_TOKENIZERS = {
     "smollm": ([(r"\p{N}", True), (GPT2, True)], False),
     "tekken": ([(TEKKEN, True)], False),
     "youtu": ([(YOUTU_CJK, True), (YOUTU_WORDS, True)], False),
+    "lfm2": ([(LLAMA3, True)], False),
+    "kimi-k2": ([(KIMI_HAN, True), (KIMI_WORDS, True)], False),
 }
 
 # Engine features beyond the table's patterns: (pattern, keep_gaps, text).

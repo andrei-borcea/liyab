@@ -6013,6 +6013,7 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         s.arch = arch;
         cases.push_back({arch, s});
     }
+    for (const auto& spec : test::recurrent_model_specs()) cases.push_back({"tree_" + spec.arch, spec});
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
     const std::vector<std::vector<int32_t>> paths = {{0, 4, 8}, {0, 1, 2, 3}, {0}, {0, 1, 6, 7}, {0, 4, 5}};
@@ -6282,6 +6283,134 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
             std::printf("  %s, temperature %.1f: %d drafts, %d accepted, %d tree steps, %d kept another branch\n",
                         c.name.c_str(), temperature, decoder.proposed(), decoder.accepted(), decoder.tree_steps(),
                         decoder.side_branches());
+        }
+    }
+}
+
+TEST_CASE("New recurrent mixers preserve checkpoints, snapshots and saved state for every KV type") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 12, 99};
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("state_" + spec.arch, spec);
+        for (auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            TransformerOptions options;
+            options.kv_type = kv;
+            options.expert_cache_bytes = spec.n_expert > 0 ? 1 : 0;
+            auto model = load_transformer(path, options);
+            auto reference = load_transformer(path, options);
+            REQUIRE(model && reference);
+            const auto floats = model->recurrent_state_bytes() / sizeof(float);
+            size_t parts = 0;
+            for (auto part : model->recurrent_parts()) parts += part.size();
+            CHECK(parts == floats);
+            CHECK(model->context_state_bytes() >= model->recurrent_state_bytes());
+            REQUIRE(model->forward(std::span(tokens).first(5), Transformer::Logits::None, route, pool));
+            model->snapshot_state(true);
+            std::stringstream saved(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(model->write_state(saved).is_ok());
+            REQUIRE(reference->read_state(saved).is_ok());
+            model->set_rollback_window(8);
+            auto expected = reference->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(expected);
+            const std::vector<float> rows(expected->begin(), expected->end());
+            auto actual = model->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(actual);
+            CHECK(max_abs_diff(*actual, rows) == 0.0);
+            REQUIRE(model->truncate(7).is_ok());
+            auto replay = model->forward(std::span(tokens).subspan(7), Transformer::Logits::All, route, pool);
+            REQUIRE(replay);
+            CHECK(max_abs_diff(*replay, std::vector<float>(rows.begin() + 2 * model->config().n_vocab, rows.end())) == 0.0);
+            REQUIRE(model->truncate(5).is_ok());
+            auto restored = model->forward(std::span(tokens).subspan(5), Transformer::Logits::All, route, pool);
+            REQUIRE(restored);
+            CHECK(max_abs_diff(*restored, rows) == 0.0);
+        }
+    }
+}
+
+TEST_CASE("New recurrent models reuse bounded prefix images across engines and verify suffix drafts") {
+    for (const auto& spec : test::recurrent_model_specs()) {
+        const auto& path = model_path("prefix_recurrent_" + spec.arch, spec);
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        config.expert_cache_mb = spec.n_expert > 0 ? 1 : 0;
+        const std::string dir = temp_path("prefix_" + spec.arch);
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_mb = 0;
+        config.prefix_cache_disk_mb = 8;
+        config.prefix_cache_dir = dir;
+        auto generate = [](Engine& engine, const std::string& prompt) {
+            std::string reply;
+            auto status = engine.generate(prompt, greedy(8), [&](std::string_view piece, int32_t) {
+                reply += piece;
+                return true;
+            });
+            return status ? reply : std::string("<error>");
+        };
+        auto fresh_config = config;
+        fresh_config.prefix_cache_disk_mb = 0;
+        fresh_config.prefix_cache_dir.clear();
+        auto reference = Engine::create(fresh_config);
+        REQUIRE(reference);
+        std::string a, b;
+        for (int i = 0; i < 70; ++i) {
+            a += "hello world hello ";
+            b += "world world hello ";
+        }
+        const auto prompt_ids = (*reference)->tokenize(a, true);
+        REQUIRE(prompt_ids && prompt_ids->size() >= 128);  // the store ignores shorter contexts
+        const std::string expected = generate(**reference, a);
+        REQUIRE(expected != "<error>");
+        {
+            auto cached = Engine::create(config);
+            REQUIRE(cached);
+            CHECK(generate(**cached, a) == expected);
+            REQUIRE(generate(**cached, b) != "<error>");
+            CHECK(generate(**cached, a) == expected);
+            CHECK((*cached)->prefix_cache_stats().restores > 0);
+            CHECK((*cached)->prefix_cache_stats().storage_bytes <= (uint64_t{8} << 20));
+        }
+        {
+            auto later = Engine::create(config);
+            REQUIRE(later);
+            CHECK(generate(**later, a) == expected);
+            CHECK((*later)->prefix_cache_stats().restores > 0);
+        }
+        std::filesystem::remove_all(dir);
+        fresh_config.lookup_drafts = true;
+        fresh_config.draft_tokens = 4;
+        fresh_config.adaptive_drafts = false;
+        auto drafted = Engine::create(fresh_config);
+        REQUIRE(drafted);
+        CHECK(generate(**drafted, a) == expected);
+    }
+}
+
+TEST_CASE("New recurrent mixers route projections to available GPU backends with CPU state updates") {
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route reference_route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+    for (auto make : {make_metal_backend, make_vulkan_backend}) {
+        auto gpu = make();
+        if (!gpu) continue;
+        const Route route{gpu->get(), gpu->get(), cpu.get()};
+        for (auto spec : test::recurrent_model_specs()) {
+            spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+            const auto& path = model_path("gpu_recurrent_" + spec.arch, spec);
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            auto reference = load_transformer(path, options);
+            auto model = load_transformer(path, options);
+            REQUIRE(reference && model);
+            auto expected = reference->forward(tokens, Transformer::Logits::All, reference_route, pool);
+            REQUIRE(expected);
+            const std::vector<float> rows(expected->begin(), expected->end());
+            auto actual = model->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(actual);
+            CHECK(max_abs_diff(*actual, rows) < 1e-3);
         }
     }
 }

@@ -324,6 +324,54 @@ TinyModelSpec nas_spec() {
     return s;
 }
 
+std::vector<TinyModelSpec> recurrent_model_specs() {
+    std::vector<TinyModelSpec> out;
+    TinyModelSpec s;
+    s.arch = "lfm2";
+    s.n_layers = 3;
+    s.short_conv_interval = 3;
+    s.shortconv_bias = true;
+    s.qk_norm = true;
+    out.push_back(s);
+    s.arch = "lfm2moe";
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.expert_bias = true;
+    s.sigmoid_gating = true;
+    s.dense_lead = 1;
+    out.push_back(s);
+    s = {};
+    s.arch = "qwen3next";
+    s.n_layers = 4;
+    s.delta_net_interval = 2;
+    s.fused_ssm_ba = true;
+    s.qk_norm = true;
+    s.attn_gate = true;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_ff_shared = 96;
+    s.shared_gate = true;
+    out.push_back(s);
+    s = {};
+    s.arch = "kimi-linear";
+    s.n_layers = 4;
+    s.kda_interval = 4;
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    s.dense_lead = 1;
+    s.n_ff_shared = 64;
+    out.push_back(s);
+    return out;
+}
+
 void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     const std::vector<std::string> vocab = tiny_vocab();
     const auto n_vocab = static_cast<int64_t>(vocab.size());
@@ -350,7 +398,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     else w.add_i32_array(a + ".feed_forward_length", s.block_ff);
     if (s.block_heads.empty()) w.add_u32(a + ".attention.head_count", static_cast<uint32_t>(s.n_head));
     else w.add_i32_array(a + ".attention.head_count", s.block_heads);
-    if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    if (s.short_conv_interval > 0 || s.kda_interval > 0) {
+        const int32_t interval = s.short_conv_interval > 0 ? s.short_conv_interval : s.kda_interval;
+        std::vector<int32_t> heads(static_cast<size_t>(s.n_layers));
+        for (int32_t l = 0; l < s.n_layers; ++l) heads[static_cast<size_t>(l)] = (l + 1) % interval == 0 ? s.n_head_kv : 0;
+        w.add_i32_array(a + ".attention.head_count_kv", heads);
+    } else if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
     else w.add_i32_array(a + ".attention.head_count_kv", s.block_kv_heads);
     if (!s.block_heads.empty() && s.mla_kv_rank == 0) {
         w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
@@ -393,6 +446,11 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".ssm.group_count", static_cast<uint32_t>(ssm_hk));
         w.add_u32(a + ".ssm.time_step_rank", static_cast<uint32_t>(ssm_hv));
         w.add_u32(a + ".ssm.inner_size", static_cast<uint32_t>(ssm_hv * ssm_hd));
+    }
+    if (s.short_conv_interval > 0) w.add_u32(a + ".shortconv.l_cache", static_cast<uint32_t>(s.shortconv_taps));
+    if (s.kda_interval > 0) {
+        w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(ssm_kernel));
+        w.add_u32(a + ".kda.head_dim", static_cast<uint32_t>(s.kda_head_dim));
     }
     w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
     if (s.norm_bias || s.no_norm_weights) w.add_f32(a + ".attention.layer_norm_epsilon", 1e-5f);
@@ -493,7 +551,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     };
     const std::vector<float> embd = random(d * n_vocab, 0.5f);
     w.add_tensor("token_embd.weight", {d, n_vocab}, s.embd_type, embd);
-    if (!s.no_norm_weights) w.add_tensor("output_norm.weight", {d}, DType::F32, norm_weights(d));
+    if (!s.no_norm_weights) w.add_tensor((a == "lfm2" || a == "lfm2moe") ? "token_embd_norm.weight" : "output_norm.weight", {d}, DType::F32, norm_weights(d));
     bias("output_norm.bias", d, s.norm_bias);
     bias("output.bias", n_vocab, s.projection_bias);
     if (s.embedding_norm) {
@@ -605,13 +663,45 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             continue;  // a mixer-only block
         } else if (s.mamba_topology && l % 3 == 2) {
             // No mixer tensors: the block below is an FFN alone.
+        } else if (s.short_conv_interval > 0 && (l + 1) % s.short_conv_interval != 0) {
+            w.add_tensor(p + "shortconv.in_proj.weight", {d, 3 * d}, s.attn_type, random(3 * d * d, s.weight_scale));
+            w.add_tensor(p + "shortconv.out_proj.weight", {d, d}, s.attn_type, random(d * d, s.weight_scale));
+            w.add_tensor(p + "shortconv.conv.weight", {s.shortconv_taps, d}, DType::F32,
+                         random(s.shortconv_taps * d, 0.3f));
+            if (s.shortconv_bias) {
+                w.add_tensor(p + "shortconv.in_proj.bias", {3 * d}, DType::F32, random(3 * d, 0.1f));
+                w.add_tensor(p + "shortconv.out_proj.bias", {d}, DType::F32, random(d, 0.1f));
+                w.add_tensor(p + "shortconv.conv.bias", {d}, DType::F32, random(d, 0.1f));
+            }
+        } else if (s.kda_interval > 0 && (l + 1) % s.kda_interval != 0) {
+            const int64_t channels = ssm_hv * s.kda_head_dim;
+            for (const char* part : {"q", "k", "v"}) {
+                w.add_tensor(p + "attn_" + part + ".weight", {d, channels}, s.attn_type, random(d * channels, s.weight_scale));
+                w.add_tensor(p + "ssm_conv1d_" + part + ".weight", {ssm_kernel, channels}, DType::F32,
+                             random(ssm_kernel * channels, 0.3f));
+            }
+            w.add_tensor(p + "ssm_beta.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
+            for (const char* part : {"f", "g"}) {
+                w.add_tensor(p + "ssm_" + part + "_a.weight", {d, s.kda_head_dim}, s.attn_type, random(d * s.kda_head_dim, s.weight_scale));
+                w.add_tensor(p + "ssm_" + part + "_b.weight", {s.kda_head_dim, channels}, DType::F32, random(s.kda_head_dim * channels, s.weight_scale));
+            }
+            auto a_neg = random(ssm_hv, 0.5f);
+            for (float& x : a_neg) x = -std::exp(x);
+            w.add_tensor(p + "ssm_a", {ssm_hv}, DType::F32, a_neg);
+            w.add_tensor(p + "ssm_dt.bias", {channels}, DType::F32, random(channels, 0.5f));
+            w.add_tensor(p + "ssm_norm.weight", {s.kda_head_dim}, DType::F32, norm_weights(s.kda_head_dim));
+            w.add_tensor(p + "attn_output.weight", {channels, d}, s.attn_type, random(channels * d, s.weight_scale));
         } else if (s.delta_net_interval > 0 && (l + 1) % s.delta_net_interval != 0) {
             const int64_t key_dim = ssm_hk * ssm_hd, value_dim = ssm_hv * ssm_hd;
             const int64_t conv_dim = 2 * key_dim + value_dim;
             w.add_tensor(p + "attn_qkv.weight", {d, conv_dim}, s.attn_type, random(d * conv_dim, s.weight_scale));
             w.add_tensor(p + "attn_gate.weight", {d, value_dim}, s.attn_type, random(d * value_dim, s.weight_scale));
+            if (s.fused_ssm_ba) {
+                w.add_tensor(p + "ssm_ba.weight", {d, 2 * ssm_hv}, DType::F32, random(d * 2 * ssm_hv, s.weight_scale));
+            } else {
             w.add_tensor(p + "ssm_alpha.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
             w.add_tensor(p + "ssm_beta.weight", {d, ssm_hv}, DType::F32, random(d * ssm_hv, s.weight_scale));
+            }
             w.add_tensor(p + "ssm_out.weight", {value_dim, d}, s.attn_type, random(value_dim * d, s.weight_scale));
             w.add_tensor(p + "ssm_conv1d.weight", {ssm_kernel, conv_dim}, DType::F32,
                          random(ssm_kernel * conv_dim, 0.3f));
@@ -734,7 +824,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "attn_v.bias", {kv}, DType::F32, random(kv, 0.1f));
         }
         // Qwen3.5 names the pre-FFN norm after the attention it follows (as its GGUFs do).
-        const bool post_attention = a == "qwen35" || a == "qwen35moe" || a == "seed_oss" || a == "gpt-oss" || a == "glm4moe";
+        const bool post_attention = a == "qwen35" || a == "qwen35moe" || a == "seed_oss" || a == "gpt-oss" || a == "glm4moe" || a == "qwen3next";
         const std::string ffn_norm = a == "falcon" ? "attn_norm" : a == "dbrx" ? "attn_output_norm" :
                                      post_attention ? "post_attention_norm" : "ffn_norm";
         if (!s.shared_parallel_norm && !s.post_only_norms && (ff > 0 || s.n_expert > 0)) {

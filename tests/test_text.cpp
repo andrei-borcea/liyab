@@ -685,6 +685,25 @@ TEST_CASE("NFKC byte-level BPE normalizes ordinary text, preserves specials and 
     CHECK(ids == normalized.encode(special));
 }
 
+TEST_CASE("Chat tool preprocessing follows the tokenizer family across architectures") {
+    const BpeVocab v = bpe_vocab(false);
+    const char* request = R"({"messages":[],"tools":[{"z":{"y":1,"a":2},"a":3}],"extra":{"z":1,"a":2}})";
+    for (const char* arch : {"kimi-linear", "deepseek2", "qwen2"}) {
+        for (const char* pre : {"kimi-k2", "qwen2"}) {
+            BpeTokenizer t(std::string("chat_sort_") + arch + pre, v, pre, arch);
+            REQUIRE(t.tok.has_value());
+            const bool sorted = std::string_view(pre) == "kimi-k2";
+            CHECK(t.tok->chat_sort_tools() == sorted);
+            auto chat = ChatTemplate::parse("{{ tools | tojson }}|{{ extra | tojson }}", t.tok->chat_sort_tools());
+            REQUIRE(chat.has_value());
+            auto text = chat->render_chat(request, jinja::Value::object());
+            REQUIRE(text.has_value());
+            CHECK(*text == (sorted ? R"([{"a": 3, "z": {"a": 2, "y": 1}}]|{"z": 1, "a": 2})"
+                                   : R"([{"z": {"y": 1, "a": 2}, "a": 3}]|{"z": 1, "a": 2})"));
+        }
+    }
+}
+
 TEST_CASE("Byte-level BPE: a byte the vocabulary lacks is left out before merging") {
     const BpeVocab v = bpe_vocab(true);  // no "\r"
     BpeTokenizer t("no_cr", v, "qwen2");
@@ -977,7 +996,8 @@ TEST_CASE("Chat templates render byte for byte like transformers' apply_chat_tem
     if (!data) return;
     size_t rendered = 0, refused = 0;
     for (const auto& [name, entry] : data->fields().entries) {
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
         if (!tmpl) std::printf("  %s: %s\n", name.as_string().c_str(), tmpl.status().message().c_str());
         REQUIRE(tmpl.has_value());
         const jinja::Value special = chat_special(entry);
@@ -1009,7 +1029,8 @@ TEST_CASE("Chat templates: prefix stability and the layout of turns") {
     if (!data) return;
     auto format = [&](const char* name, const char* probe) {
         const jinja::Value& entry = *data->fields().find(name);
-        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string());
+        const auto* sorted = entry.fields().find("sort_tools");
+        auto tmpl = ChatTemplate::parse(entry.fields().find("template")->as_string(), sorted != nullptr && sorted->truthy());
         auto f = tmpl->format(probe, chat_special(entry));
         if (!f) std::printf("  %s: %s\n", name, f.status().message().c_str());
         return f.has_value() ? *f : ChatFormat{};

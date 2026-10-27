@@ -7,12 +7,15 @@
 //    (how RoPE pairs a head's dimensions, which tensors hold the norms before
 //    the FFN and after the mixer and the FFN, the FFN's activation, where Q/K
 //    norms sit relative to RoPE, whether embeddings are scaled, which blocks
-//    attend through a sliding window, a default the metadata may omit). One
+//    attend through a sliding window, which tensor holds the final norm, how
+//    DeltaNet value heads share key heads, a default the metadata may omit). One
 //    row per architecture in architecture.cpp: a model whose blocks are built
 //    from parts the engine already runs needs only its row.
 //  * ModelConfig and one BlockPlan per block: the hyperparameters from the
 //    metadata, and each block's structure from the tensors present (which
-//    token mixer, fused or separate projections, a gated attention output,
+//    token mixer: attention, Gated DeltaNet, LFM2's short convolution or
+//    Kimi Delta Attention; fused or separate projections, a gated attention
+//    output,
 //    a windowed attention, a dense or mixture-of-experts FFN, a shared
 //    expert). Optional per-element tensors (QKV biases, the attention output
 //    bias, attention sinks, Q/K norms, the norms after the mixer and the FFN,
@@ -187,6 +190,17 @@ struct ArchSpec {
     // The converter reshapes both forms identically, so this is a reference
     // implementation fact rather than something the tensor shape tells us.
     bool ssm_norm_grouped = true;
+    // Name of the norm applied to the last block's output before the LM head
+    // (<output_norm>.weight). LFM2's reference calls its final norm
+    // embedding_norm, which the converter stores as token_embd_norm: there
+    // it is the final norm, not a norm of the embeddings.
+    std::string_view output_norm = "output_norm";
+    // Gated DeltaNet: value head h reads key head h / (value heads / key
+    // heads): consecutive value heads share a key head, the reference's
+    // order, which the converter keeps (Qwen3-Next). false: key head
+    // h % key heads, the tiled order the Qwen3.5 converter reorders the value
+    // heads into.
+    bool ssm_grouped_heads = false;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -212,12 +226,22 @@ enum class MixerKind : uint8_t {
     Linear,     // one normalized residual projection, no attention or KV rows
     Mamba,      // Mamba-1 selective scan: causal conv + a diagonal state per channel, no KV cache
     Mamba2,     // Mamba-2 (SSD): causal conv + a scalar-decay state per head, no KV cache
+    // LFM2's gated short convolution: in_proj to [B | C | x], a causal
+    // depthwise convolution of B * x over the last ModelConfig::
+    // shortconv_l_cache positions, C * conv, out_proj. Its state is the
+    // convolution's inputs at the last l_cache - 1 positions.
+    ShortConv,
+    // Kimi Delta Attention (Kimi-Linear): the gated delta rule with a decay
+    // per key channel (not one per head), causal convolutions of q, k and v,
+    // and the output gated through a per-head RMSNorm. Its state is the
+    // three convolutions' last inputs and one key x value matrix per head.
+    Kda,
 };
 
 // Whether a block with this mixer keeps a recurrent state (every mixer but
 // softmax attention and none).
 [[nodiscard]] constexpr bool keeps_state(MixerKind m) noexcept {
-    return m == MixerKind::DeltaNet || m == MixerKind::Mamba || m == MixerKind::Mamba2;
+    return m == MixerKind::DeltaNet || m == MixerKind::Mamba || m == MixerKind::Mamba2 || m == MixerKind::ShortConv || m == MixerKind::Kda;
 }
 
 // Feed-forward network of one block.
@@ -424,11 +448,21 @@ struct ModelConfig {
     std::vector<BlockPlan> blocks;  // per executed block
 
     // Gated DeltaNet geometry (zero when every block is attention).
-    int32_t ssm_conv_kernel = 0;  // causal depthwise conv width
+    int32_t ssm_conv_kernel = 0;  // causal depthwise conv width (DeltaNet and Kda blocks)
     int32_t ssm_head_dim = 0;     // key and value head size (ssm.state_size)
     int32_t ssm_k_heads = 0;      // query/key heads (ssm.group_count)
     int32_t ssm_v_heads = 0;      // value heads = recurrent states per block (ssm.time_step_rank)
     MambaGeometry mamba;  // d_inner 0: no Mamba block
+    // LFM2 short convolution (0 without ShortConv blocks): taps of its causal
+    // depthwise convolution (<arch>.shortconv.l_cache).
+    int32_t shortconv_l_cache = 0;
+    // Kimi Delta Attention (0 without Kda blocks): the key and value head
+    // size (<arch>.kda.head_dim) and the heads (a Kda block's attn_q rows over
+    // it). Its convolutions are ssm_conv_kernel wide.
+    int32_t kda_head_dim = 0;
+    int32_t kda_heads = 0;
+    // Blocks whose mixer keeps a recurrent state (DeltaNet, ShortConv, Kda).
+    int32_t n_recurrent_layers = 0;
 
     // Mixture of experts (zero when every FFN is dense).
     int32_t n_expert = 0;        // routed experts per MoE block

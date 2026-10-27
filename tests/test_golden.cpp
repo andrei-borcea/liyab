@@ -488,6 +488,54 @@ std::vector<GoldenCase> cases() {
     s.identical_experts = false;
     add("ssm-attention-moe-only", s);
     add("ssm-attention-moe-only-streamed", s, streamed);
+    s = {};
+    s.arch = "lfm2";
+    s.n_layers = 3;
+    s.short_conv_interval = 3;
+    s.qk_norm = true;
+    s.tied_output = true;
+    add("lfm2-shortconv", s);
+    add("lfm2-shortconv-f16kv", s, f16_kv);
+    s.shortconv_bias = true;
+    add("lfm2-shortconv-bias", s);
+    s.shortconv_taps = 1;
+    add("lfm2-shortconv-one-tap", s);
+    s = moe_spec("lfm2moe");
+    s.n_layers = 3;
+    s.short_conv_interval = 3;
+    s.qk_norm = true;
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    s.dense_lead = 1;
+    add("lfm2moe", s);
+    add("lfm2moe-streamed", s, streamed);
+    s = moe_spec("qwen3next");
+    s.n_layers = 4;
+    s.delta_net_interval = 2;
+    s.fused_ssm_ba = true;
+    s.attn_gate = true;
+    s.qk_norm = true;
+    s.n_ff_shared = 96;
+    s.shared_gate = true;
+    add("qwen3next", s);
+    add("qwen3next-streamed", s, streamed);
+    s = moe_spec("kimi-linear");
+    s.n_layers = 4;
+    s.kda_interval = 4;
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    s.dense_lead = 1;
+    s.n_ff_shared = 64;
+    add("kimi-kda-nope", s, absorbed);
+    add("kimi-kda-nope-expanded", s, expanded);
+    add("kimi-kda-nope-f16kv", s, absorbed_f16);
+    add("kimi-kda-nope-streamed", s, streamed);
+    s.kda_head_dim = 7;  // scalar recurrence tail, with unquantized narrow low-rank projections
+    s.attn_type = DType::F32;
+    add("kimi-kda-scalar-tail", s, absorbed);
     return out;
 }
 
@@ -625,3 +673,116 @@ TEST_CASE("Every architecture's logits match the hashes pinned for this platform
 }
 
 TEST_MAIN()
+
+TEST_CASE("KDA chunked prefill keeps its bits when value rows are split across workers") {
+    test::TinyModelSpec spec;
+    spec.arch = "kimi-linear";
+    spec.n_layers = 2;
+    spec.kda_interval = 2;
+    spec.n_head_kv = 1;
+    spec.rope_dim = 32;
+    spec.mla_kv_rank = 64;
+    const auto path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_kda_rows.gguf";
+    test::write_tiny_model(path, spec);
+    struct Remove {
+        const std::string& path;
+        ~Remove() { std::remove(path.c_str()); }
+    } remove{path};
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto load = [&]() -> std::unique_ptr<Transformer> {
+        auto file = MmapLoader::open(path);
+        if (!file) return nullptr;
+        auto model = Transformer::load(std::move(*file), options);
+        return model ? std::move(*model) : nullptr;
+    };
+    auto serial = load(), parallel = load();
+    REQUIRE(serial && parallel);
+    ThreadPool one(1), eight(8);  // four heads: the latter splits each head's value rows
+    auto cpu1 = make_cpu_backend(one), cpu8 = make_cpu_backend(eight);
+    const Route r1{cpu1.get(), cpu1.get(), cpu1.get()}, r8{cpu8.get(), cpu8.get(), cpu8.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+    serial->set_rollback_window(8);
+    parallel->set_rollback_window(8);
+    auto a = serial->forward(tokens, Transformer::Logits::All, r1, one);
+    auto b = parallel->forward(tokens, Transformer::Logits::All, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    REQUIRE(serial->truncate(3).is_ok());
+    REQUIRE(parallel->truncate(3).is_ok());
+    const std::vector<int32_t> parents = {-1, 0, 0, 2};
+    a = serial->forward_tree(std::span(tokens).first(4), parents, r1, one);
+    b = parallel->forward_tree(std::span(tokens).first(4), parents, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    REQUIRE(serial->keep_path(std::vector<int32_t>{0, 2, 3}).is_ok());
+    REQUIRE(parallel->keep_path(std::vector<int32_t>{0, 2, 3}).is_ok());
+    a = serial->forward(std::span(tokens).first(1), Transformer::Logits::Last, r1, one);
+    b = parallel->forward(std::span(tokens).first(1), Transformer::Logits::Last, r8, eight);
+    REQUIRE(a && b);
+    CHECK(std::equal(a->begin(), a->end(), b->begin()));
+}
+
+TEST_CASE("ShortConv state images omit empty fragments and preserve zero-length fields") {
+    for (const int32_t taps : {1, 3}) {
+        test::TinyModelSpec spec;
+        spec.arch = "lfm2";
+        spec.short_conv_interval = 3;  // both blocks are convolutions
+        spec.shortconv_taps = taps;
+        const auto path = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) + "_shortconv_state.gguf";
+        test::write_tiny_model(path, spec);
+        struct Remove {
+            const std::string& path;
+            ~Remove() { std::remove(path.c_str()); }
+        } remove{path};
+        auto load = [&]() -> std::unique_ptr<Transformer> {
+            auto file = MmapLoader::open(path);
+            if (!file) return nullptr;
+            auto result = Transformer::load(std::move(*file), {});
+            return result ? std::move(*result) : nullptr;
+        };
+        auto model = load(), restored = load();
+        REQUIRE(model && restored);
+        ThreadPool pool(3);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77};
+        model->set_rollback_window(4);
+        REQUIRE(model->forward(std::span(tokens).first(4), Transformer::Logits::None, route, pool));
+        model->snapshot_state(true);
+        REQUIRE(model->forward(std::span(tokens).subspan(4), Transformer::Logits::None, route, pool));
+        std::vector<float> live, snapshot;
+        for (auto part : model->recurrent_parts()) {
+            CHECK(!part.empty());
+            live.insert(live.end(), part.begin(), part.end());
+        }
+        for (auto part : model->kept_state_parts(4)) {
+            CHECK(!part.empty());
+            snapshot.insert(snapshot.end(), part.begin(), part.end());
+        }
+        CHECK(live.size() * sizeof(float) == model->recurrent_state_bytes());
+        CHECK((taps == 1) == live.empty());
+        Transformer::ContextImage image;
+        image.n = model->n_past();
+        image.state = live;
+        image.snapshots.push_back({4, true, snapshot});
+        auto& kv = model->kv_cache();
+        std::vector<uint8_t> scratch(kv.page_bytes());
+        image.page = [&](int32_t page) -> const uint8_t* {
+            if (const auto* data = kv.page_data(page)) return data;
+            return kv.read_rows(page, kv.config().page_tokens, scratch.data()).is_ok() ? scratch.data() : nullptr;
+        };
+        std::stringstream current(std::ios::in | std::ios::out | std::ios::binary);
+        std::stringstream external(std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(model->write_state(current).is_ok());
+        REQUIRE(model->write_state(external, image).is_ok());
+        CHECK(current.str() == external.str());
+        REQUIRE(restored->read_state(external).is_ok());
+        REQUIRE(model->truncate(4).is_ok());  // the rollback ring
+        REQUIRE(restored->truncate(4).is_ok());  // the snapshot read from storage
+        auto a = model->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        auto b = restored->forward(std::span(tokens).subspan(4), Transformer::Logits::All, route, pool);
+        REQUIRE(a && b);
+        CHECK(std::equal(a->begin(), a->end(), b->begin()));
+    }
+}

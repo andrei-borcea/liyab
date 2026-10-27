@@ -2202,7 +2202,7 @@ struct Engine::Impl {
         special("eos_token", id_of("tokenizer.ggml.eos_token_id"));
         special("unk_token", id_of("tokenizer.ggml.unknown_token_id"));
         special("pad_token", id_of("tokenizer.ggml.padding_token_id"));
-        auto parsed = ChatTemplate::parse(*source);
+        auto parsed = ChatTemplate::parse(*source, tokenizer->chat_sort_tools());
         if (!parsed) {
             chat_template_error = parsed.status();
             LIYAB_LOG_WARN("%s", parsed.status().message().c_str());
@@ -2954,6 +2954,9 @@ std::string Engine::describe() const {
                 case MixerKind::DeltaNet: return "DeltaNet";
                 case MixerKind::Mamba: return "Mamba-1";
                 case MixerKind::Mamba2: return "Mamba-2";
+                case MixerKind::ShortConv: return "short convolution";
+                case MixerKind::Kda: return "Kimi Delta Attention";
+                case MixerKind::Linear: return "linear";
                 case MixerKind::None: return "FFN-only";
                 default: return "other";
             }

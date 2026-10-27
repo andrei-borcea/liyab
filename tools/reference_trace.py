@@ -26,6 +26,8 @@ What cannot be recomputed is reported as unknown, never guessed. Needs torch and
 import argparse
 import copy
 import json
+import functools
+import inspect
 import math
 import sys
 from dataclasses import dataclass, field
@@ -94,6 +96,7 @@ class AttnCall:
 class Recorder:
     calls: list = field(default_factory=list)
     attn: list = field(default_factory=list)
+    recurrences: list = field(default_factory=list)
     counter: int = 0
     clamps: list = field(default_factory=list)
     norm_eps: dict = field(default_factory=dict)
@@ -459,6 +462,7 @@ class Trace:
     logits: torch.Tensor
     class_name: str
     clamps: list = field(default_factory=list)
+    recurrences: list = field(default_factory=list)
 
 
 class NativeAttentionTrace(TorchFunctionMode):
@@ -585,6 +589,27 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     _randomize(model)
     layers_path, layers = _decoder_layers(model, keep)
 
+    # Record algorithm operands as well as module boundaries. These functions
+    # are operations (shared by several architectures), not model-name rules.
+    originals = []
+    namespaces = {id(type(m).forward.__globals__): type(m).forward.__globals__
+                  for m in model.modules() if hasattr(type(m).forward, "__globals__")}
+    for namespace in namespaces.values():
+        for name, fn in list(namespace.items()):
+            if not callable(fn) or "chunk" not in name or not any(t in name for t in ("delta_rule", "delta_attention")):
+                continue
+            signature = inspect.signature(fn)
+            if not {"query", "key", "value"}.issubset(signature.parameters):
+                continue
+            @functools.wraps(fn)
+            def recorded(*args, _fn=fn, _sig=signature, **kwargs):
+                bound = _sig.bind(*args, **kwargs).arguments
+                values = {k: v.detach().clone() for k, v in bound.items() if torch.is_tensor(v)}
+                RECORDER.recurrences.append(values)
+                return _fn(*args, **kwargs)
+            originals.append((namespace, name, fn))
+            namespace[name] = recorded
+    RECORDER.recurrences.clear()
     RECORDER.calls.clear()
     RECORDER.attn.clear()
     RECORDER.clamps.clear()
@@ -626,9 +651,11 @@ def run_trace(model_id, revision=None, trust_remote_code=False):
     finally:
         for h in handles:
             h.remove()
+        for namespace, name, fn in originals:
+            namespace[name] = fn
     logits = out.logits.detach() if hasattr(out, "logits") else _tensors(out)[0]
     return Trace(text, reduced, n, keep, model, layers_path, layers, list(RECORDER.calls), list(RECORDER.attn), ids,
-                 logits, type(model).__name__, list(RECORDER.clamps))
+                 logits, type(model).__name__, list(RECORDER.clamps), list(RECORDER.recurrences))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1311,6 +1338,74 @@ def analyze(trace):
     return facts
 
 
+def analyze_recurrent(trace, mixer, block_calls):
+    """Prove short convolution and the query/key head sharing of delta-rule operations."""
+    calls = [c for c in block_calls if _is_descendant(c.path, mixer.path)]
+    result = Facts(kind="recurrent", unknown=[], classes=sorted({type(c.module).__name__ for c in calls}))
+    d = mixer.input.shape[-1]
+    linears = [c for c in calls if isinstance(c.module, nn.Linear)]
+    convs = [c.module for c in calls if isinstance(c.module, nn.Conv1d)]
+    # Functional convolution kernels may bypass nn.Conv1d.forward; its weights
+    # remain owned by the mixer and are inspected without invoking that kernel.
+    convs += [m for m in mixer.module.modules() if isinstance(m, nn.Conv1d) and m not in convs]
+    for projected in linears:
+        if projected.output.shape[-1] != 3 * d:
+            continue
+        B, C, x = projected.output.chunk(3, dim=-1)
+        for conv in convs:
+            if conv.in_channels != d or conv.groups != d:
+                continue
+            y = torch.nn.functional.conv1d((B * x).transpose(1, 2), conv.weight, conv.bias,
+                                           padding=conv.kernel_size[0] - 1, groups=d)[..., :SEQ].transpose(1, 2) * C
+            if any(close(c.input, y) and close(c.output, mixer.output) for c in linears):
+                result.update(operation="shortconv", taps=conv.kernel_size[0],
+                              formula="out_proj(C * causal_depthwise_conv(B * x)); in_proj = [B | C | x]")
+                return result
+    # A convolution's SiLU output is what the delta rule receives before
+    # repeating query/key heads. Match both sharing orders numerically.
+    for conv in convs:
+        if conv.bias is not None or conv.groups != conv.in_channels:
+            continue
+        for projected in linears:
+            raw = projected.output
+            if raw.ndim != 3:
+                continue
+            candidates = [raw]
+            # A projection can group [q | k | v | gate] by key head. Its
+            # ordering method is exercised with recorded inputs, never named
+            # by architecture or trusted from a class-name assertion.
+            ordering = getattr(mixer.module, "fix_query_key_value_ordering", None)
+            if callable(ordering):
+                for other in linears:
+                    try:
+                        q, k, v, *_ = ordering(raw, other.output)
+                        candidates.append(torch.cat([t.reshape(1, SEQ, -1) for t in (q, k, v)], dim=-1))
+                    except (RuntimeError, ValueError):
+                        pass
+            for raw_qkv in candidates:
+                if raw_qkv.shape[-1] != conv.in_channels:
+                    continue
+                y = torch.nn.functional.silu(torch.nn.functional.conv1d(raw_qkv.transpose(1, 2), conv.weight,
+                    padding=conv.kernel_size[0] - 1, groups=conv.groups)[..., :SEQ].transpose(1, 2))
+                for rec in trace.recurrences:
+                    q, k, v = (rec[t] for t in ("query", "key", "value"))
+                    hv, hd = v.shape[-2:]
+                    key_dim = (conv.in_channels - hv * v.shape[-1]) // 2
+                    if key_dim <= 0 or key_dim % hd or hv % (key_dim // hd):
+                        continue
+                    hk = key_dim // hd
+                    q0, k0, v0 = y.split((key_dim, key_dim, hv * v.shape[-1]), dim=-1)
+                    if not close(v0, v):
+                        continue
+                    q0, k0 = (t.reshape(1, SEQ, hk, hd) for t in (q0, k0))
+                    if close(q0.repeat_interleave(hv // hk, dim=2), q) and close(k0.repeat_interleave(hv // hk, dim=2), k):
+                        out_proj = next((c.path for c in linears if close(c.output, mixer.output)), None)
+                        result.update(operation="deltanet", grouped_heads=True, key_heads=hk, value_heads=hv,
+                                      head_dim=hd, output_projection=out_proj)
+                        return result
+    return result
+
+
 def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     b = Facts(index=index, unknown=[], absent=[])
     h_in, h_out = layer_call.input, layer_call.output
@@ -1482,9 +1577,7 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
     if mixer_facts is None:
         mixer_facts = analyze_linear_mixer(mixer)
         if mixer_facts is None:
-            mixer_facts = Facts(kind="recurrent", unknown=[],
-                                classes=sorted({type(c.module).__name__ for c in block_calls
-                                                if _is_descendant(c.path, mixer.path) or c.path == mixer.path}))
+            mixer_facts = analyze_recurrent(trace, mixer, block_calls)
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)
