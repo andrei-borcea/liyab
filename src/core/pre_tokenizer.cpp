@@ -37,6 +37,9 @@ constexpr const char* kQwen2 =
 // Qwen3.5 / Qwen3.6: combining marks belong to words.
 constexpr const char* kQwen35 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Ling 2.0: single digits, possessive word/symbol prefixes and one newline per match.
+constexpr const char* kBailingMoe2 =
+    R"('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)";
 // GPT-4o (o200k; Phi-4-mini): upper/lower case aware words with contractions attached.
 constexpr const char* kGpt4o =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
@@ -100,14 +103,16 @@ struct Row {
     bool right_digits3 = false;
 };
 
-const std::array<Row, 27>& table() {
-    static const std::array<Row, 27> rows = {{
+const std::array<Row, 28>& table() {
+    static const std::array<Row, 28> rows = {{
         {{"default", "gpt-2", "gpt2", "phi-2", "exaone4", "refact"}, {{kGpt2, true}}, false, false},
         {{"llama-bpe", "llama3", "smaug-bpe", "glm4"}, {{kLlama3, true}}, false, true},
         {{"qwen2", "deepseek-r1-qwen"}, {{kQwen2, true}}, true, false},
         {{"qwen35"}, {{kQwen35, true}}, true, false},
         {{"hunyuan"}, {{kQwen2, true}}, false, true},
-        {{"deepseek-v3", "hunyuan-dense"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
+        // "joyai-llm": the name the converter gives DeepSeek-V3's own tokenizer under transformers 5 (the same
+        // pre_tokenizer, normalizer and merges as DeepSeek-V3's tokenizer.json; JoyAI-LLM reuses it).
+        {{"deepseek-v3", "hunyuan-dense", "joyai-llm"}, {{kDigits3, true}, {kHanKana, true}, {kDeepSeekV3Words, true}}, false, false},
         {{"deepseek-llm"},
          {{kNewline, true}, {kDeepSeekLetters, true}, {kDeepSeekPunct, true}, {kTrailingSpace, true},
           {kDeepSeekCjk, true}, {kEachDigit, true}},
@@ -140,6 +145,7 @@ const std::array<Row, 27>& table() {
         // LFM2 / LFM2.5 (LiquidAI): Llama 3's split, merges applied to every piece (no ignore_merges).
         {{"lfm2"}, {{kLlama3, true}}, false, false},
         {{"kimi-k2"}, {{kKimiHan, true}, {kKimiWords, true}}, false, false},
+        {{"bailingmoe2"}, {{kBailingMoe2, true}}, true, false},
     }};
     return rows;
 }

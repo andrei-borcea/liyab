@@ -35,6 +35,11 @@ public:
     // false for a missing tensor or an empty/incomplete block pattern. Opt-in:
     // the ordinary writer and every existing golden fixture stay unchanged.
     bool set_tensor_block_pattern(const std::string& name, std::span<const uint8_t> pattern);
+    // Supplies valid encoded blocks for matrix tensors of one type that has
+    // no encoder. add_tensor() distributes these blocks by tensor and row, instead
+    // of quantizing values. Copies the bytes; other types and vectors keep
+    // their ordinary values. Empty or incomplete blocks abort the fixture.
+    void set_tensor_block_pattern(DType type, const std::vector<uint8_t>& blocks);
     // Writes the file; aborts the test binary on I/O failure.
     void write(const std::string& path) const;
 
@@ -48,6 +53,8 @@ private:
     std::vector<uint8_t> kv_;
     uint64_t n_kv_ = 0;
     std::vector<Tensor> tensors_;
+    DType block_pattern_type_ = DType::F32;
+    std::vector<uint8_t> block_pattern_;
 };
 
 struct TinyModelSpec {
@@ -169,7 +176,7 @@ struct TinyModelSpec {
     int32_t mla_q_rank = 0;
     int32_t mla_nope = 32;
     int32_t mla_v = 32;
-    bool mla_legacy = false;  // no *_mla keys, as in files converted before attn_kv_b was split
+    bool mla_legacy = false;  // expanded-head metadata and combined attn_kv_b, before the converter split it
     // MoE models: this many leading blocks keep a dense FFN (DeepSeek's
     // leading_dense_block_count; the plan follows the tensors).
     int32_t dense_lead = 0;
@@ -256,6 +263,34 @@ struct TinyModelSpec {
     float layer_output_scale = 0.0f;  // > 0: layer_output_scale.weight in every block (varied per block)
     int32_t causal = -1;            // >= 0: attention.causal
     std::vector<int32_t> dense_widths;  // pooling: dense_2 (and dense_3) projections of these output widths
+
+    // MoE: group-limited expert selection (DeepSeek-V3, Ling 2.0): > 0 writes
+    // expert_group_count and expert_group_used_count. Metadata only.
+    int32_t n_expert_groups = 0;
+    int32_t n_expert_groups_used = 0;
+    // DSA tensors and metadata; the indexer has an independent random stream
+    // so the main weights match a dense twin exactly.
+    int32_t index_dim = 0;
+    int32_t index_heads = 2;
+    int32_t index_topk = 4;
+    std::vector<bool> index_full;  // empty: every indexed block has its own projections
+    // Shared K=V attention fixtures: the converter's grouped output layout,
+    // sliding-only (0), nonoverlapping and overlapping compressed blocks.
+    int32_t shared_output_groups = 2;
+    int32_t shared_output_rank = 32;
+    int32_t shared_head_dim = 0;  // 0: n_embd / n_head; otherwise independent attention width
+    std::vector<int32_t> compression_strides;
+    std::vector<bool> compression_overlap;
+    int32_t hc_count = 0;
+    float rms_eps = 1e-5f;
+    float compress_rope_base = 12345.0f;
+    // Optional encoded block pattern for attn_type matrices; supports reader
+    // formats without a quantizer. Empty preserves all existing fixtures.
+    std::vector<uint8_t> attention_block_pattern;
+    // Shared-KV fixtures: scale the input, query-latent and key/compressor
+    // norms to balance reader-only blocks against ordinary weight amplitude.
+    // Output/FFN norms stay unchanged. One preserves existing fixture bytes.
+    float attention_norm_scale = 1.0f;
 };
 
 // A representative classic block layout, shared by the cache, sequence and
@@ -275,6 +310,10 @@ TinyModelSpec nas_spec();
 std::vector<TinyModelSpec> recurrent_model_specs();
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& spec = {});
+// Component fixture with sliding, CSA and HCA blocks plus four residual
+// streams. Dense FFNs and no learned sinks: it does not stand in for a full
+// V4 conformance checkpoint, whose MoE/sink parts are integrated separately.
+TinyModelSpec compressed_spec();
 
 // Encoded GGML blocks and independently decoded values from gguf-py. Reads
 // tests/data/quant_vectors.bin (LIYAB_TEST_DATA overrides the directory).

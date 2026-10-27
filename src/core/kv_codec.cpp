@@ -759,18 +759,19 @@ KvRowLayout kv_row_layout(const KvCacheConfig& config) noexcept {
                    : static_cast<int32_t>(std::count(config.layer_windows.begin(), config.layer_windows.end(), 0));
     l.heads = config.n_head_kv;
     l.head_dim = config.head_dim;
+    l.auxiliary_dim = config.auxiliary_dim;
     return l;
 }
 
 bool KvRowLayout::valid() const noexcept {
-    if (planes < 1 || planes > 2 || layers <= 0 || heads <= 0 || head_dim <= 0) return false;
+    if (planes < 1 || planes > 2 || layers <= 0 || heads <= 0 || head_dim <= 0 || auxiliary_dim < 0) return false;
     const Blocks b = blocks_of(type);
     return head_dim % b.values == 0;
 }
 
 size_t KvRowLayout::row_bytes() const noexcept {
     const Blocks b = blocks_of(type);
-    return static_cast<size_t>(head_dim / b.values) * b.bytes();
+    return static_cast<size_t>(head_dim / b.values) * b.bytes() + static_cast<size_t>(auxiliary_dim) * sizeof(float);
 }
 
 size_t KvRowLayout::image_bytes(int32_t slots) const noexcept {
@@ -780,6 +781,7 @@ size_t KvRowLayout::image_bytes(int32_t slots) const noexcept {
 
 bool kv_encode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, std::span<const uint8_t> image,
                std::vector<uint8_t>& out, ThreadPool* pool, const KvCodecCosts* costs) {
+    if (layout.auxiliary_dim > 0) return false;  // existing raw-image fallback preserves F32 index keys
     Runs r;
     if (!runs_of(layout, slots, r) || image.size() != layout.image_bytes(slots)) return false;
     switch (encoding) {
@@ -792,6 +794,7 @@ bool kv_encode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, st
 
 bool kv_decode(KvEncoding encoding, const KvRowLayout& layout, int32_t slots, std::span<const uint8_t> in,
                std::span<uint8_t> out, ThreadPool* pool) {
+    if (layout.auxiliary_dim > 0) return false;
     Runs r;
     if (!runs_of(layout, slots, r) || out.size() != layout.image_bytes(slots)) return false;
     switch (encoding) {
@@ -889,6 +892,7 @@ bool kv_decode_chunk(KvEncoding encoding, const KvRowLayout& layout, int32_t pag
 }
 
 double kv_calibrate_decode(const KvRowLayout& layout, int32_t slots, ThreadPool* pool) {
+    if (layout.auxiliary_dim > 0) return 0;  // mixed-format images use the raw store path
     Runs r;
     if (!runs_of(layout, slots, r)) return 0;
     // Rows shaped like keys and values: channels of their own magnitude, so

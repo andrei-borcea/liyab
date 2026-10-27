@@ -273,6 +273,10 @@ TEST_CASE("Sequences together: dense attention models give each sequence its bit
         KvCacheType kv;
     };
     std::vector<Spec> specs;
+    specs.push_back({"compressed-q8", test::compressed_spec(), KvCacheType::Q8_0});
+    specs.push_back({"compressed-f16", test::compressed_spec(), KvCacheType::F16});
+    specs.push_back({"compressed-q4", test::compressed_spec(), KvCacheType::Q4_0});
+    specs.push_back({"compressed-q4-1", test::compressed_spec(), KvCacheType::Q4_1});
     specs.push_back({"llama-q8", {}, KvCacheType::Q8_0});
     {
         test::TinyModelSpec s;
@@ -462,6 +466,13 @@ TEST_CASE("Sequences together: latent attention takes each sequence's own form, 
             const char* names[] = {"auto", "absorbed", "expanded"};
             CHECK(check_schedule(std::string("latent ") + names[static_cast<int>(form)], path, options, mixed_plans()));
         }
+        s.mla_legacy = true;
+        const std::string& combined = model_path("latent_combined_q" + std::to_string(q_rank), s);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+            TransformerOptions options;
+            options.latent_form = form;
+            CHECK(check_schedule("latent combined", combined, options, mixed_plans()));
+        }
     }
 }
 
@@ -510,6 +521,23 @@ std::string write_adapter(const std::string& name, const std::string& model_path
 }
 
 }  // namespace
+
+TEST_CASE("Sequences together: sparse index keys belong to each sequence in both latent forms") {
+    test::TinyModelSpec s;
+    s.arch = "glm-dsa";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_q_rank = 64;
+    s.index_dim = 64;
+    s.index_topk = 4;
+    const std::string path = model_path("indexed_sequences", s);
+    for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded, LatentForm::Auto}) {
+        TransformerOptions options;
+        options.latent_form = form;
+        CHECK(check_schedule("indexed sequences", path, options, mixed_plans()));
+    }
+}
 
 TEST_CASE("Sequences together: each sequence applies its own LoRA adapter, or none") {
     // Dense: attention, FFN and the LM head adapted.
@@ -813,12 +841,13 @@ test::TinyModelSpec moe_spec() {
     return s;
 }
 
-test::TinyModelSpec latent_spec() {
+test::TinyModelSpec latent_spec(bool combined = false) {
     test::TinyModelSpec s;
     s.arch = "deepseek2";
     s.n_head_kv = 1;
     s.rope_dim = 32;
     s.mla_kv_rank = 64;
+    s.mla_legacy = combined;
     return s;
 }
 
@@ -836,7 +865,8 @@ TEST_CASE("Engine sequences generate together, each one's output what it gives a
     windowed.sliding_window = 16;
     windowed.post_norms = true;
     for (const Model& m : {Model{"llama", {}}, Model{"hybrid", hybrid_spec()}, Model{"moe streamed", moe_spec(), 1},
-                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed}}) {
+                           Model{"latent", latent_spec()}, Model{"gemma2 windowed", windowed},
+                           Model{"latent combined", latent_spec(true)}}) {
         EngineConfig config = engine_config(model_path(std::string("engine_") + m.name, m.spec), 4);
         config.expert_cache_mb = m.expert_cache_mb;
         Engine::SchedulerStats st;

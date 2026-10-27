@@ -10,6 +10,7 @@
 
 #include "core/quant.h"
 #include "core/quant_tables.h"
+#include "test_util.h"
 
 namespace liyab::test {
 
@@ -133,6 +134,26 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
         }
         return;
     }
+    if (!block_pattern_.empty() && type == block_pattern_type_ && t.ne.size() > 1) {
+        const auto traits = dtype_traits(type);
+        if (row % traits.block_size != 0) std::abort();
+        const size_t blocks = block_pattern_.size() / static_cast<size_t>(traits.block_bytes);
+        const size_t per_row = static_cast<size_t>(row / traits.block_size);
+        // A short cyclic pattern repeats at head/group boundaries and could
+        // hide an incorrect grouped-output slice. Vary blocks independently
+        // across rows and projections, deterministically from the tensor name.
+        std::seed_seq seed(name.begin(), name.end());
+        std::mt19937_64 pattern_rng(seed);
+        for (size_t r = 0; r < static_cast<size_t>(rows); ++r) {
+            for (size_t b = 0; b < per_row; ++b) {
+                std::memcpy(t.data.data() + (r * per_row + b) * static_cast<size_t>(traits.block_bytes),
+                            block_pattern_.data() + pattern_rng() % blocks * static_cast<size_t>(traits.block_bytes),
+                            static_cast<size_t>(traits.block_bytes));
+            }
+        }
+        tensors_.push_back(std::move(t));
+        return;
+    }
     if (type == DType::MXFP4) {
         // Test-only nearest-grid encoding. The production engine reads this
         // format; it does not expose an MXFP4 quantizer.
@@ -184,6 +205,13 @@ void GgufWriter::add_tensor(const std::string& name, std::vector<int64_t> ne, DT
         quant::quantize_row(type, values.data() + r * row, t.data.data() + static_cast<size_t>(r) * row_bytes, row);
     }
     tensors_.push_back(std::move(t));
+}
+
+void GgufWriter::set_tensor_block_pattern(DType type, const std::vector<uint8_t>& blocks) {
+    const auto traits = dtype_traits(type);
+    if (blocks.empty() || blocks.size() % static_cast<size_t>(traits.block_bytes) != 0) std::abort();
+    block_pattern_type_ = type;
+    block_pattern_ = blocks;
 }
 
 void GgufWriter::write(const std::string& path) const {
@@ -386,6 +414,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
 
     GgufWriter w;
+    if (!s.attention_block_pattern.empty()) w.set_tensor_block_pattern(s.attn_type, s.attention_block_pattern);
     const std::string& a = s.arch;
     const int32_t mamba = s.mamba > 0 ? s.mamba : a == "mamba" ? 1 : a == "mamba2" ? 2 : 0;
     const int64_t mamba_rank = std::max(32, dtype_traits(s.attn_type).block_size);
@@ -403,7 +432,7 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         std::vector<int32_t> heads(static_cast<size_t>(s.n_layers));
         for (int32_t l = 0; l < s.n_layers; ++l) heads[static_cast<size_t>(l)] = (l + 1) % interval == 0 ? s.n_head_kv : 0;
         w.add_i32_array(a + ".attention.head_count_kv", heads);
-    } else if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.n_head_kv));
+    } else if (s.block_kv_heads.empty()) w.add_u32(a + ".attention.head_count_kv", static_cast<uint32_t>(s.mla_legacy ? s.n_head : s.n_head_kv));
     else w.add_i32_array(a + ".attention.head_count_kv", s.block_kv_heads);
     if (!s.block_heads.empty() && s.mla_kv_rank == 0) {
         w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.n_embd / s.n_head));
@@ -417,6 +446,10 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         if (s.expert_weights_norm >= 0) w.add_bool(a + ".expert_weights_norm", s.expert_weights_norm != 0);
         if (s.n_ff_shared > 0) w.add_u32(a + ".expert_shared_feed_forward_length", static_cast<uint32_t>(s.n_ff_shared));
         if (s.sigmoid_gating) w.add_u32(a + ".expert_gating_func", 2);
+        if (s.n_expert_groups > 0) {
+            w.add_u32(a + ".expert_group_count", static_cast<uint32_t>(s.n_expert_groups));
+            w.add_u32(a + ".expert_group_used_count", static_cast<uint32_t>(s.n_expert_groups_used));
+        }
     }
     if (s.dense_lead > 0) w.add_u32(a + ".leading_dense_block_count", static_cast<uint32_t>(s.dense_lead));
     if (s.expert_swiglu_clamp > 0) w.add_f32_array(a + ".swiglu_clamp_exp", std::vector<float>(static_cast<size_t>(s.n_layers), s.expert_swiglu_clamp));
@@ -424,12 +457,25 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     if (s.mla_kv_rank > 0) {  // as the converter writes deepseek2 since it splits attn_k_b / attn_v_b
         w.add_u32(a + ".attention.kv_lora_rank", static_cast<uint32_t>(s.mla_kv_rank));
         if (s.mla_q_rank > 0) w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
-        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.mla_kv_rank + s.rope_dim));
-        w.add_u32(a + ".attention.value_length", static_cast<uint32_t>(s.mla_kv_rank));
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>((s.mla_legacy ? s.mla_nope : s.mla_kv_rank) + s.rope_dim));
+        w.add_u32(a + ".attention.value_length", static_cast<uint32_t>(s.mla_legacy ? s.mla_v : s.mla_kv_rank));
         if (!s.mla_legacy) {
             w.add_u32(a + ".attention.key_length_mla", static_cast<uint32_t>(s.mla_nope + s.rope_dim));
             w.add_u32(a + ".attention.value_length_mla", static_cast<uint32_t>(s.mla_v));
         }
+    }
+    if (a == "deepseek4") {
+        w.add_u32(a + ".attention.key_length", static_cast<uint32_t>(s.shared_head_dim > 0 ? s.shared_head_dim : s.n_embd / s.n_head));
+        w.add_u32(a + ".attention.q_lora_rank", static_cast<uint32_t>(s.mla_q_rank));
+        w.add_u32(a + ".attention.output_group_count", static_cast<uint32_t>(s.shared_output_groups));
+        w.add_u32(a + ".attention.output_lora_rank", static_cast<uint32_t>(s.shared_output_rank));
+        w.add_f32(a + ".attention.compress_rope_freq_base", s.compress_rope_base);
+        w.add_i32_array(a + ".attention.compress_ratios", s.compression_strides);
+    }
+    if (s.hc_count > 0) {
+        w.add_u32(a + ".hyper_connection.count", static_cast<uint32_t>(s.hc_count));
+        w.add_u32(a + ".hyper_connection.sinkhorn_iterations", 20);
+        w.add_f32(a + ".hyper_connection.epsilon", 1e-6f);
     }
     const int64_t ssm_hd = 16, ssm_hk = 2, ssm_hv = 4, ssm_kernel = 4;
     if (mamba > 0) {
@@ -452,8 +498,8 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_u32(a + ".ssm.conv_kernel", static_cast<uint32_t>(ssm_kernel));
         w.add_u32(a + ".kda.head_dim", static_cast<uint32_t>(s.kda_head_dim));
     }
-    w.add_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
-    if (s.norm_bias || s.no_norm_weights) w.add_f32(a + ".attention.layer_norm_epsilon", 1e-5f);
+    w.add_f32(a + ".attention.layer_norm_rms_epsilon", s.rms_eps);
+    if (s.norm_bias || s.no_norm_weights) w.add_f32(a + ".attention.layer_norm_epsilon", s.rms_eps);
     if (s.clamp_kqv > 0.0f) w.add_f32(a + ".attention.clamp_kqv", s.clamp_kqv);
     if (s.parallel_residual >= 0) w.add_bool(a + ".use_parallel_residual", s.parallel_residual != 0);
     if (a == "apertus") {
@@ -474,6 +520,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         w.add_bool_array(a + ".attention.sliding_window_pattern", s.swa_layers);
     } else if (s.swa_pattern > 0) {
         w.add_u32(a + ".attention.sliding_window_pattern", static_cast<uint32_t>(s.swa_pattern));
+    }
+    if (s.index_dim > 0) {
+        w.add_u32(a + ".attention.indexer.head_count", static_cast<uint32_t>(s.index_heads));
+        w.add_u32(a + ".attention.indexer.key_length", static_cast<uint32_t>(s.index_dim));
+        w.add_u32(a + ".attention.indexer.top_k", static_cast<uint32_t>(s.index_topk));
+        if (!s.index_full.empty()) w.add_bool_array(a + ".attention.indexer.types", s.index_full);
     }
     if (s.rope_dim > 0) w.add_u32(a + ".rope.dimension_count", static_cast<uint32_t>(s.rope_dim));
     if (s.rope_scale > 0.0f) {
@@ -547,9 +599,14 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         for (float& x : v) x += 1.0f;
         return v;
     };
+    auto attention_norm_weights = [&](int64_t n) {
+        auto v = norm_weights(n);
+        for (float& x : v) x *= s.attention_norm_scale;
+        return v;
+    };
 
     const int64_t d = s.n_embd;
-    const int64_t hd = s.head_dim > 0 ? s.head_dim : d / s.n_head;
+    const int64_t hd = s.head_dim > 0 ? s.head_dim : a == "deepseek4" && s.shared_head_dim > 0 ? s.shared_head_dim : d / s.n_head;
     const int64_t q_dim = hd * s.n_head;
     const int64_t kv = hd * s.n_head_kv;
     std::mt19937_64 classic_rng(s.seed ^ 0xc1a551c);
@@ -573,6 +630,12 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
     }
     if (s.learned_positions) {
         w.add_tensor("position_embd.weight", {d, s.context_length}, s.embd_type, extra(d * s.context_length));
+    }
+    if (s.hc_count > 0) {
+        const int64_t h = s.hc_count;
+        w.add_tensor("output_hc_fn.weight", {h * d, h}, DType::F32, random(h * d * h, 0.01f));
+        w.add_tensor("output_hc_base.weight", {h}, DType::F32, random(h, 0.1f));
+        w.add_tensor("output_hc_scale.weight", {1}, DType::F32, {0.1f});
     }
     std::vector<float> output;  // the LM head's values (the embeddings when tied)
     if (!s.tied_output) {
@@ -629,8 +692,17 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
         const int64_t kv = kv_heads * hd;
         const int64_t ff = s.block_ff.empty() ? s.n_ff : s.block_ff[static_cast<size_t>(l)];
         const std::string attn_norm = a == "falcon" && !s.shared_parallel_norm ? "attn_norm_2" : "attn_norm";
-        if (!s.post_only_norms && (mamba > 0 || heads > 0 || kv_heads > 0) && !s.no_norm_weights) w.add_tensor(p + attn_norm + ".weight", {d}, DType::F32, norm_weights(d));
+        if (!s.post_only_norms && (mamba > 0 || heads > 0 || kv_heads > 0) && !s.no_norm_weights) w.add_tensor(p + attn_norm + ".weight", {d}, DType::F32, attention_norm_weights(d));
         bias(p + attn_norm + ".bias", d, s.norm_bias && !s.post_only_norms && (heads > 0 || kv_heads > 0));
+        if (s.hc_count > 0) {
+            const int64_t h = s.hc_count, width = h * (2 + h);
+            for (const char* part : {"hc_attn", "hc_ffn"}) {
+                const std::string prefix = p + part;
+                w.add_tensor(prefix + "_fn.weight", {h * d, width}, DType::F32, random(h * d * width, 0.01f));
+                w.add_tensor(prefix + "_base.weight", {width}, DType::F32, random(width, 0.2f));
+                w.add_tensor(prefix + "_scale.weight", {3}, DType::F32, {0.1f, 0.2f, 0.3f});
+            }
+        }
         if (mamba > 0 && (!s.mamba_topology || l % 3 == 0)) {
             const bool v2 = mamba == 2;
             const int64_t di = 2 * d, ns = 16, heads = 4, rank = mamba_rank;
@@ -723,6 +795,35 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
             w.add_tensor(p + "ssm_a", {ssm_hv}, DType::F32, a_neg);
             w.add_tensor(p + "ssm_dt.bias", {ssm_hv}, DType::F32, random(ssm_hv, 0.5f));
             w.add_tensor(p + "ssm_norm.weight", {ssm_hd}, DType::F32, norm_weights(ssm_hd));
+        } else if (a == "deepseek4") {
+            const int64_t qr = s.mla_q_rank, groups = s.shared_output_groups, rank = s.shared_output_rank;
+            w.add_tensor(p + "attn_q_a.weight", {d, qr}, s.attn_type, random(d * qr, s.weight_scale));
+            w.add_tensor(p + "attn_q_a_norm.weight", {qr}, DType::F32, attention_norm_weights(qr));
+            w.add_tensor(p + "attn_q_b.weight", {qr, s.n_head * hd}, s.attn_type, random(qr * s.n_head * hd, s.weight_scale));
+            w.add_tensor(p + "attn_kv.weight", {d, hd}, s.attn_type, random(d * hd, s.weight_scale));
+            w.add_tensor(p + "attn_kv_a_norm.weight", {hd}, DType::F32, attention_norm_weights(hd));
+            w.add_tensor(p + "attn_output_a.weight", {s.n_head * hd / groups, groups * rank}, s.attn_type,
+                         random(s.n_head * hd * rank, s.weight_scale));
+            w.add_tensor(p + "attn_output_b.weight", {groups * rank, d}, s.attn_type, random(groups * rank * d, s.weight_scale));
+            const int64_t stride = s.compression_strides[static_cast<size_t>(l)];
+            if (stride > 0) {
+                const bool overlap = s.compression_overlap[static_cast<size_t>(l)];
+                const int64_t width = hd * (overlap ? 2 : 1);
+                w.add_tensor(p + "attn_compressor_kv.weight", {d, width}, s.attn_type, random(d * width, s.weight_scale));
+                w.add_tensor(p + "attn_compressor_gate.weight", {d, width}, s.attn_type, random(d * width, s.weight_scale));
+                w.add_tensor(p + "attn_compressor_ape.weight", {width, stride}, DType::F32, random(width * stride, 0.1f));
+                w.add_tensor(p + "attn_compressor_norm.weight", {hd}, DType::F32, attention_norm_weights(hd));
+                if (overlap) {
+                    const int64_t id = s.index_dim;
+                    w.add_tensor(p + "indexer_compressor_kv.weight", {d, 2 * id}, s.attn_type, random(d * 2 * id, s.weight_scale));
+                    w.add_tensor(p + "indexer_compressor_gate.weight", {d, 2 * id}, s.attn_type, random(d * 2 * id, s.weight_scale));
+                    w.add_tensor(p + "indexer_compressor_ape.weight", {2 * id, stride}, DType::F32, random(2 * id * stride, 0.1f));
+                    w.add_tensor(p + "indexer_compressor_norm.weight", {id}, DType::F32, attention_norm_weights(id));
+                    w.add_tensor(p + "indexer.attn_q_b.weight", {qr, s.index_heads * id}, s.attn_type,
+                                 random(qr * s.index_heads * id, s.weight_scale));
+                    w.add_tensor(p + "indexer.proj.weight", {d, s.index_heads}, s.attn_type, random(d * s.index_heads, s.weight_scale));
+                }
+            }
         } else if (s.mla_kv_rank > 0) {  // multi-head latent attention, per-head key and value expansions split
             const int64_t rank = s.mla_kv_rank, rd = s.rope_dim, heads = s.n_head;
             const int64_t q_rows = heads * (s.mla_nope + rd);  // per head [q_nope | q_pe]
@@ -742,10 +843,25 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                 kv_norm[static_cast<size_t>(rank - 3)] = s.k_norm_outlier;
             }
             w.add_tensor(p + "attn_kv_a_norm.weight", {rank}, DType::F32, kv_norm);
-            w.add_tensor(p + "attn_k_b.weight", {s.mla_nope, rank, heads}, s.attn_type,
-                         random(s.mla_nope * rank * heads, s.weight_scale));
-            w.add_tensor(p + "attn_v_b.weight", {rank, s.mla_v, heads}, s.attn_type,
-                         random(rank * s.mla_v * heads, s.weight_scale));
+            const auto kb = random(s.mla_nope * rank * heads, s.weight_scale);
+            const auto vb = random(rank * s.mla_v * heads, s.weight_scale);
+            if (s.mla_legacy) {
+                std::vector<float> combined(static_cast<size_t>(heads * (s.mla_nope + s.mla_v) * rank));
+                for (int64_t h = 0; h < heads; ++h) {
+                    for (int64_t i = 0; i < s.mla_nope; ++i) {
+                        for (int64_t r = 0; r < rank; ++r) {
+                            combined[static_cast<size_t>((h * (s.mla_nope + s.mla_v) + i) * rank + r)] =
+                                kb[static_cast<size_t>((h * rank + r) * s.mla_nope + i)];
+                        }
+                    }
+                    std::copy_n(vb.data() + h * s.mla_v * rank, s.mla_v * rank,
+                                combined.data() + (h * (s.mla_nope + s.mla_v) + s.mla_nope) * rank);
+                }
+                w.add_tensor(p + "attn_kv_b.weight", {rank, heads * (s.mla_nope + s.mla_v)}, s.attn_type, combined);
+            } else {
+                w.add_tensor(p + "attn_k_b.weight", {s.mla_nope, rank, heads}, s.attn_type, kb);
+                w.add_tensor(p + "attn_v_b.weight", {rank, s.mla_v, heads}, s.attn_type, vb);
+            }
             w.add_tensor(p + "attn_output.weight", {heads * s.mla_v, d}, s.attn_type,
                          random(heads * s.mla_v * d, s.weight_scale));
             bias(p + "attn_output.bias", d, s.projection_bias || s.attn_output_bias);
@@ -1002,6 +1118,26 @@ void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
                      gemma_extra(in * out, 1.0f / std::sqrt(static_cast<float>(in))));
         in = out;
     }
+    if (s.index_dim > 0 && a != "deepseek4") {
+        std::mt19937_64 index_rng(s.seed ^ 0xd5a);
+        std::normal_distribution<float> index_normal(0.0f, 0.1f);
+        auto weights = [&](int64_t count, bool norm = false) {
+            std::vector<float> out(static_cast<size_t>(count));
+            for (float& value : out) value = index_normal(index_rng) + (norm ? 1.0f : 0.0f);
+            return out;
+        };
+        for (int32_t l = 0; l < s.n_layers; ++l) {
+            if (!s.index_full.empty() && !s.index_full[static_cast<size_t>(l)]) continue;
+            const std::string p = "blk." + std::to_string(l) + ".indexer.";
+            const int64_t dim = s.index_dim, heads = s.index_heads;
+            w.add_tensor(p + "attn_q_b.weight", {s.mla_q_rank, dim * heads}, s.attn_type,
+                         weights(s.mla_q_rank * dim * heads));
+            w.add_tensor(p + "attn_k.weight", {d, dim}, s.attn_type, weights(d * dim));
+            w.add_tensor(p + "proj.weight", {d, heads}, s.attn_type, weights(d * heads));
+            w.add_tensor(p + "k_norm.weight", {dim}, DType::F32, weights(dim, true));
+            w.add_tensor(p + "k_norm.bias", {dim}, DType::F32, weights(dim));
+        }
+    }
     w.write(path);
 }
 
@@ -1031,6 +1167,24 @@ TinyModelSpec classic_model_spec(const std::string& arch) {
         s.n_expert_used = 2;
         s.identical_experts = false;
     }
+    return s;
+}
+
+TinyModelSpec compressed_spec() {
+    TinyModelSpec s;
+    s.arch = "deepseek4";
+    s.n_layers = 3;
+    s.n_head_kv = 1;
+    s.mla_q_rank = 32;
+    s.rope_dim = 16;
+    s.index_dim = 32;
+    s.index_topk = 2;
+    s.sliding_window = 7;
+    s.compression_strides = {0, 4, 8};
+    s.compression_overlap = {false, true, false};
+    s.hc_count = 4;
+    s.weight_scale = 0.02f;
+    s.attn_type = s.ffn_type = s.embd_type = s.output_type = DType::F32;
     return s;
 }
 

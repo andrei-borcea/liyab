@@ -9,6 +9,8 @@ and plans each block from the tensors present. This tool establishes those facts
 registry row it needs or the precise list of parts Liyab does not implement yet. It never guesses: a fact it cannot
 establish is reported as unknown, and no row is proposed. Where this GGUF disagrees with the reference (other
 weights, a window or BOS rule it does not record), that is reported as a problem of the file, apart from the row.
+An explicit expert_weights_norm value is verified against the router and preserves an existing registry's unused
+fallback: a file overriding that default provides no evidence for changing other files' behavior.
 
 Where the facts come from:
 
@@ -421,7 +423,7 @@ class Engine:
         self.block_tensors = set(re.findall(r'block_tensor\(\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
         norms = set(re.findall(r'block_norm_tensor\(\s*\w+\s*,\s*\w+\s*,\s*"([^"]+)"\s*\)', transformer))
         self.block_tensors |= norms | {name + ".weight" for name in norms}
-        self.block_tensors |= set(re.findall(r'experts\(\s*"([^"]+)"', transformer))
+        self.block_tensors |= set(re.findall(r'(?:experts|per_head)\(\s*"([^"]+)"', transformer))
         literals = set(re.findall(r'"([a-z][a-z0-9_]*\.(?:weight|bias))"',
                                   transformer + read("src/core/pooling.cpp")))
         self.global_tensors = {t for t in literals if t not in self.block_tensors}
@@ -533,7 +535,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped", "output_norm", "ssm_grouped_heads", "causal", "unscaled_scores", "value_norm")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped", "output_norm", "ssm_grouped_heads", "causal", "unscaled_scores", "value_norm", "indexer_rope", "latent_norm_eps", "shared_kv")
 
 
 def _close(a, b, rel=1e-5):
@@ -789,7 +791,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     if n_embd != ref_embd:
         d.file_issues.append(f"embedding_length {n_embd}, the reference's residual width {ref_embd}")
     vlen = g.key("attention.value_length")
-    if vlen is not None and int(vlen) != head_dim:
+    latent_rank = int(g.key("attention.kv_lora_rank", 0) or 0)
+    scored_dim = int(g.key("attention.key_length_mla", head_dim)) if latent_rank else head_dim
+    if vlen is not None and int(vlen) != head_dim and not latent_rank:
         d.missing.append(f"value heads of {vlen} dimensions with key heads of {head_dim} "
                          f"(attention.value_length != key_length)")
 
@@ -825,7 +829,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             if p["mixer"] in ("mamba", "mamba2") and "attn_output.weight" in ts:
                 d.missing.append(f"block {b}: parallel attention and Mamba mixers in one block")
         elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight", "attn_k.weight",
-                  "attn_v.weight", "attn_output.weight"} & ts:
+                  "attn_v.weight", "attn_output.weight", "attn_kv.weight", "attn_q_a.weight",
+                  "attn_q_b.weight", "attn_output_a.weight", "attn_output_b.weight"} & ts:
             p["mixer"] = "none"
         elif block_kv_heads[b] == 0:
             p["mixer"] = "none" if block_heads[b] == 0 else "linear"
@@ -965,13 +970,54 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     mla = {"attn_kv_a_mqa.weight", "attn_kv_b.weight", "attn_k_b.weight", "attn_v_b.weight", "attn_q_a.weight"}
     if any(mla & blocks.get(i, set()) for i in range(n_layers)):
         if "attn_kv_a_mqa.weight" in engine.block_tensors:
-            # The engine runs latent attention from the file's tensors and geometry, but this tool has no rule
-            # comparing them with the reference's: it cannot say the model runs, so it proposes no row.
-            d.unknown.append("multi-head latent attention: the engine runs it, but its facts are not compared with "
-                             "the reference by this tool; check the model with liyab-kl")
+            for b in att_blocks:
+                latent = b["mixer"].get("latent")
+                if latent is None:
+                    d.unknown.append(f"block {b['index']}: shared key/value latent was not established")
+                    continue
+                expected = (latent_rank, int(g.key("attention.q_lora_rank", 0) or 0), scored_dim - rope_dim,
+                            int(g.key("attention.value_length_mla", vlen or 0)))
+                observed = tuple(latent[k] for k in ("kv_rank", "q_rank", "nope_dim", "v_dim"))
+                key_mla = g.key("attention.key_length_mla")
+                value_mla = g.key("attention.value_length_mla")
+                geometry = ((n_head_kv == n_head and vlen == expected[-1]) if key_mla is None and value_mla is None
+                            else (key_mla is not None and value_mla is not None and n_head_kv == 1 and
+                                  head_dim == latent_rank + rope_dim and vlen == latent_rank))
+                if observed != expected or not geometry:
+                    d.file_issues.append(f"block {b['index']}: inconsistent shared key/value latent geometry")
+            d.parts.append("multi-head latent attention: reconstructed expanded keys and values from the normalized shared latent")
         else:
             d.missing.append("multi-head latent attention: keys and values decompressed from a shared latent "
                              "(attn_kv_a_mqa, attn_kv_a_norm, attn_kv_b), with a separate rotary part")
+
+    indexers = [b["mixer"]["indexer"] for b in bf if b.get("mixer", {}).get("indexer")]
+    if indexers:
+        for index in indexers:
+            d.unknown.extend(index.get("unknown", []))
+            for attr, key_ in (("heads", "head_count"), ("head_dim", "key_length"), ("topk", "top_k")):
+                if attr in index and index[attr] != g.key("attention.indexer." + key_):
+                    d.file_issues.append(f"indexer {attr}: reference {index[attr]}, file "
+                                         f"{g.key('attention.indexer.' + key_)}")
+        layouts_ = {x["rope"] for x in indexers if x.get("rope")}
+        if len(layouts_) == 1:
+            d.set("indexer_rope", LAYOUT_ENUM[layouts_.pop()],
+                  "recomputed ReLU-weighted head scores give the reference indexer's position selection")
+    else:
+        d.set("indexer_rope", "Halves", "no lightning indexer (its RoPE pairing does not apply)")
+    latent_eps = {b["mixer"]["latent"]["norm_eps"] for b in att_blocks if b["mixer"].get("latent")}
+    if any(b["mixer"].get("shared_key_value") for b in att_blocks):
+        d.unknown.append("shared K=V was observed, but its unweighted query-head norm, trailing RoPE, inverse output "
+                         "rotation and grouped projection have not all been reconstructed; no shared_kv row is proposed")
+    elif att_blocks:
+        d.set("shared_kv", False, "observed attention reads distinct key and value tensors")
+    else:
+        inactive("shared_kv", "no attention blocks; shared K=V is inactive")
+    if not latent_rank:
+        d.set("latent_norm_eps", 0.0, "no latent projections")
+    elif len(latent_eps) == 1:
+        value = latent_eps.pop()
+        d.set("latent_norm_eps", 0.0 if _close(value, eps) else value,
+              "recomputed RMS normalization of the shared key/value latent")
 
     # --- RoPE: pairing (reference + converter), frequencies, NoPE blocks ---
     layouts = set()
@@ -1037,25 +1083,38 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     if first_att is not None and ref_layout is not None:
         key = first_att["mixer"]["key"]
         i = first_att["index"]
-        gname = f"blk.{i}.attn_k.weight" if f"blk.{i}.attn_k.weight" in g.tensors else f"blk.{i}.attn_qkv.weight"
+        gname = (f"blk.{i}.attn_kv_a_mqa.weight" if first_att["mixer"].get("latent") else
+                 f"blk.{i}.attn_k.weight" if f"blk.{i}.attn_k.weight" in g.tensors else f"blk.{i}.attn_qkv.weight")
         hname = ckpt.find(layer_suffix(key["projection"]) + ".weight") if ckpt else None
         if gname in g.tensors and hname is not None:
             # Two heads tell the row order (and whether the weights are the same); the rest would only cost
             # downloads.
-            heads = min(block_kv_heads[i], 2)
-            source_rows = key["projection_rows"][:heads * head_dim]
-            # Converters may split a packed source projection. Compare the
-            # measured source rows with the key rows in the file independently.
-            hf = np.concatenate([ckpt.tensor(hname, source_rows[h * head_dim], head_dim)
-                                 for h in range(heads)])
-            first = block_heads[i] * head_dim if gname.endswith("attn_qkv.weight") else 0
-            gg = g.values(gname, first, heads * head_dim)
-            perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
+            projection_dim = head_dim
+            if first_att["mixer"].get("latent"):
+                heads = min(n_head_kv, 2)
+                projection_dim = latent_rank + rope_dim if first_att["mixer"].get("latent") else head_dim
+                first = q_dim if key["projection_layout"].startswith("fused") else 0
+                hf = ckpt.tensor(hname, first, heads * projection_dim)
+                gg = g.values(gname, first, heads * projection_dim)
+                if first_att["mixer"].get("latent"):
+                    perm = ("identity", _rel_err(gg, hf), float("inf")) if hf.shape == gg.shape and _rel_err(gg, hf) < 0.02 else None
+                else:
+                    perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
+            else:
+                heads = min(block_kv_heads[i], 2)
+                source_rows = key["projection_rows"][:heads * head_dim]
+                # Converters may split a packed source projection. Compare the
+                # measured source rows with the key rows in the file independently.
+                hf = np.concatenate([ckpt.tensor(hname, source_rows[h * head_dim], head_dim)
+                                     for h in range(heads)])
+                first = block_heads[i] * head_dim if gname.endswith("attn_qkv.weight") else 0
+                gg = g.values(gname, first, heads * head_dim)
+                perm = rope_permutation(gg, hf, heads, head_dim) if hf.shape == gg.shape else None
             if perm is None:
                 d.file_issues.append(f"{gname} does not hold the reference's {hname} in any row order: the GGUF "
                                      f"was converted from other weights")
             else:
-                file_layout = pairing_in_file(ref_layout, perm[0], key["rope"]["dims"], head_dim)
+                file_layout = pairing_in_file(ref_layout, perm[0], key["rope"]["dims"], projection_dim)
                 order = {"identity": "in the reference's order", "interleave": "interleaved per head (each "
                          "reference pair (i, i + d/2) stored at (2i, 2i + 1))",
                          "deinterleave": "de-interleaved per head"}[perm[0]]
@@ -1356,7 +1415,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     unscaled = bool(scales) and all(_close(s, 1.0) for s in scales)
     d.set("unscaled_scores", unscaled, "the traced attention receives scale 1" if unscaled else
           "the traced attention uses the usual head scale or the file's explicit scale")
-    value_norms = {b["mixer"]["value"]["rms_norm"] for b in att_blocks if b["mixer"].get("value") is not None}
+    value_norms = {b["mixer"]["value"].get("rms_norm", False) for b in att_blocks if b["mixer"].get("value") is not None}
     if len(value_norms) == 1:
         d.set("value_norm", next(iter(value_norms)), "values matched against the projection and its unweighted RMS norm")
     elif not att_blocks:
@@ -1367,7 +1426,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
     file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
     engine_scale = (float(file_scale) if file_scale is not None else 1.0 if unscaled else
-                    _f32(1.0 / math.sqrt(max(head_dim, 1)))) * qk_factor ** 2
+                    _f32(1.0 / math.sqrt(max(scored_dim, 1)))) * qk_factor ** 2
     file_cap = g.key("attn_logit_softcapping") if "attn_logit_softcapping" in engine.file_keys else None
     for b in att_blocks:
         m = b["mixer"]
@@ -1414,7 +1473,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                 d.parts.append(f"block {i}: learned sink logits in the attention softmax denominator")
         if not m.get("causal", True):
             d.parts.append(f"block {i}: bidirectional attention; windowed blocks see half the window on either side")
-        if m["head_dim"] != head_dim or m["heads"] != block_heads[i] or m["kv_heads"] != block_kv_heads[i]:
+        if m["head_dim"] != scored_dim or m["heads"] != block_heads[i] or m["kv_heads"] != (block_heads[i] if latent_rank else block_kv_heads[i]):
             d.file_issues.append(f"block {i}: {m['heads']}/{m['kv_heads']} heads of {m['head_dim']} in the "
                                  f"reference, {block_heads[i]}/{block_kv_heads[i]} of {head_dim} in the file")
         for side in ("key", "query"):
@@ -1655,6 +1714,15 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
                 d.file_issues.append(f"block {i}: a router logit bias in one of the reference and the file only")
             if bool(f.get("expert_biases")) != bool(plan.get("expert_biases")):
                 d.file_issues.append(f"block {i}: expert projection biases in one of the reference and the file only")
+            groups = int(g.key("expert_group_count", 1) or 1)
+            used = int(g.key("expert_group_used_count", groups) or groups)
+            actual = (groups, used) if used < groups else (1, 1)
+            if actual != (f.get("groups", 1), f.get("groups_used", 1)):
+                d.file_issues.append(f"block {i}: expert groups {actual} from the file, "
+                                     f"{f.get('groups', 1), f.get('groups_used', 1)} observed in the reference")
+            if f.get("group_score") and f["group_score"] != ("top2" if f.get("selection_bias") else "max"):
+                d.missing.append(f"block {i}: group score {f['group_score']} with "
+                                 f"{'a' if f.get('selection_bias') else 'no'} selection bias")
             fnorm = g.key("expert_weights_norm")
             if fnorm is not None and bool(fnorm) != bool(f["norm_topk"]):
                 d.file_issues.append(f"block {i}: expert_weights_norm {fnorm} in the file, the reference "
@@ -1698,12 +1766,22 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
         norms_ = {f.get("norm_topk") for f in moe_facts if "norm_topk" in f}
         if len(norms_) == 1:
             v = norms_.pop()
-            d.set("moe_norm_weights", bool(v), f"the router {'renormalizes' if v else 'does not renormalize'} "
-                                                f"the top-k weights")
+            if g.key("expert_weights_norm") is not None and arch in engine.rows:
+                # This file overrides the fallback. It says nothing about
+                # other files of the same architecture which omit the key.
+                fallback = engine.rows[arch][0]["moe_norm_weights"]
+                d.set("moe_norm_weights", fallback, f"expert_weights_norm in the file specifies "
+                      f"{'renormalization' if v else 'no renormalization'} (verified against the router); "
+                      "the existing registry fallback is not used by this file")
+            else:
+                d.set("moe_norm_weights", bool(v), f"the router {'renormalizes' if v else 'does not renormalize'} "
+                                                    f"the top-k weights")
         if any(f.get("gating") for f in moe_facts):
             f = next(f for f in moe_facts if f.get("gating"))
             d.parts.append(f"MoE: {f['gating']} routing, top {g.key('expert_used_count')} of "
                            f"{g.key('expert_count')} experts" + (", selection bias" if f.get("selection_bias") else "")
+                           + (f", {f['groups_used']} of {f['groups']} groups ({f['group_score']})"
+                              if f.get("groups", 1) > 1 else "")
                            + (f", weights scaled by {f['scale']:g}" if not _close(f['scale'], 1.0) else "")
                            + (", a shared expert" + (" with a sigmoid gate" if f["shared_expert"].get("gate") else "")
                               if f.get("shared_expert") else ""))

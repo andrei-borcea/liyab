@@ -344,7 +344,8 @@ constexpr ArchSpec kArchitectures[] = {
      .rope = RopeLayout::Adjacent,
      .ffn_norm = "ffn_norm",
      .moe_norm_weights = true,
-     .nope_period = 1},    // Gemma 3n text models: Gemma 3's block (scaled embeddings, GeGLU,
+     .nope_period = 1},
+    // Gemma 3n text models: Gemma 3's block (scaled embeddings, GeGLU,
     // sandwich norms, Q/K norms, windowed blocks with RoPE base 10000) with
     // unscaled q·k and values normalized per head, inside AltUp's residual
     // streams, with Laurel, per-layer embeddings, the Gaussian top-k of the
@@ -397,6 +398,12 @@ constexpr ArchSpec kArchitectures[] = {
      .swa_period = 6,
      .rope_base_swa = 10000.0f,
      .causal = false},
+    {"deepseek32", RopeLayout::Adjacent, "ffn_norm", true},
+    {.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+     .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f},
+    {"bailingmoe2", RopeLayout::Halves, "ffn_norm", true},
+    {.name = "deepseek4", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+     .swa_period = 1, .shared_kv = true},
 };
 
 }  // namespace
@@ -611,7 +618,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             return f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ? MixerKind::Mamba : MixerKind::Mamba2;
         }
         for (const char* t : {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight",
-                              "attn_k.weight", "attn_v.weight", "attn_output.weight"}) {
+                              "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_kv.weight",
+                              "attn_q_a.weight", "attn_q_b.weight", "attn_output_a.weight", "attn_output_b.weight"}) {
             if (f.tensor(block_tensor(l, t)) != nullptr) return MixerKind::Attention;
         }
         return MixerKind::None;
@@ -621,6 +629,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
+        if (c.spec->shared_kv) {
+            return Status(ErrorCode::Unsupported,
+                          "shared K=V MoE needs hash/sqrtsoftplus routing, clipped SwiGLU and learned sinks (MoE integration)");
+        }
         LIYAB_RETURN_IF_ERROR(require_int("expert_used_count", c.n_expert_used));
         // Absent (Mixtral, written by the llama converter): from the experts' tensors, below.
         if (f.get_int(key("expert_feed_forward_length"))) {
@@ -637,13 +649,21 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         c.moe_weights_scale = static_cast<float>(f.get_float(key("expert_weights_scale")).value_or(1.0));
         if (c.moe_weights_scale == 0.0f) c.moe_weights_scale = 1.0f;
         if (c.n_expert_used > c.n_expert) return Status(ErrorCode::InvalidModel, "expert_used_count > expert_count");
-        // Group-limited routing (DeepSeek-V3: top-k only among the best
-        // groups of experts) is not implemented: plain top-k would choose
-        // other experts.
+        // Group-limited selection (ModelConfig::n_expert_groups): the top-k
+        // among the experts of the best groups only. Every group used means
+        // plain top-k.
         const int64_t groups = f.get_int(key("expert_group_count")).value_or(1);
-        if (groups > 1 && f.get_int(key("expert_group_used_count")).value_or(groups) < groups) {
-            return Status(ErrorCode::Unsupported, "group-limited expert routing (" + key("expert_group_count") +
-                                                      " " + std::to_string(groups) + ") is not supported yet");
+        const int64_t used = f.get_int(key("expert_group_used_count")).value_or(groups);
+        if (groups < 1 || groups > c.n_expert || c.n_expert % groups != 0 || used < 1 || used > groups ||
+            used * (c.n_expert / groups) < c.n_expert_used) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("expert_group_count") + " / " +
+                                                       key("expert_group_used_count") + " for " +
+                                                       std::to_string(c.n_expert) + " experts, top-" +
+                                                       std::to_string(c.n_expert_used));
+        }
+        if (used < groups) {
+            c.n_expert_groups = static_cast<int32_t>(groups);
+            c.n_expert_groups_used = static_cast<int32_t>(used);
         }
     }
     auto block_values = [&](const char* suffix, const std::vector<int32_t>& fallback,
@@ -687,30 +707,54 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.value_dim = c.head_dim;
     c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
     const auto value_length = f.get_int(key("attention.value_length"));
+    if (c.spec->shared_kv) {
+        LIYAB_RETURN_IF_ERROR(require_int("attention.q_lora_rank", c.shared_q_rank));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.output_group_count", c.output_groups));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.output_lora_rank", c.output_rank));
+        if (c.n_head_kv != 1 || c.output_groups > c.n_head || c.n_head % c.output_groups != 0 ||
+            value_length.value_or(c.head_dim) != c.head_dim ||
+            f.get_int(key("attention.kv_lora_rank")).value_or(0) != 0) {
+            return Status(ErrorCode::InvalidModel, "shared K=V needs one KV head and whole output head groups");
+        }
+        c.compress_rope_base = static_cast<float>(f.get_float(key("attention.compress_rope_freq_base")).value_or(0.0));
+        if (!(c.compress_rope_base > 0.0f) || !std::isfinite(c.compress_rope_base)) {
+            return Status(ErrorCode::InvalidModel, "invalid " + key("attention.compress_rope_freq_base"));
+        }
+    }
     if (const auto kv_rank = f.get_int(key("attention.kv_lora_rank")); kv_rank && *kv_rank > 0) {
         // Multi-head latent attention. The converter states the absorbed
         // geometry (one KV head of [k_pe | latent], values the latent) and
-        // the per-head one apart (*_mla): files from before it split
-        // attn_kv_b into attn_k_b / attn_v_b have neither.
+        // the per-head one apart (*_mla). Older files describe the expanded
+        // head instead and keep attn_kv_b combined. Normalize both metadata
+        // layouts here; the block plan still records the tensor's layout.
         LatentAttention& m = c.mla;
         const auto key_mla = f.get_int(key("attention.key_length_mla"));
         const auto value_mla = f.get_int(key("attention.value_length_mla"));
-        if (!key_mla || !value_mla) {
-            return Status(ErrorCode::Unsupported,
-                          "this " + c.arch + " file predates split attn_k_b / attn_v_b tensors (no " +
-                              key("attention.key_length_mla") + "): convert the model again with a current converter");
+        if (key_mla.has_value() != value_mla.has_value()) {
+            return Status(ErrorCode::InvalidModel, "latent attention needs both key_length_mla and value_length_mla");
+        }
+        const int64_t trained_key = key_mla.value_or(c.head_dim);
+        const int64_t trained_value = value_mla.value_or(value_length.value_or(0));
+        const int64_t query_rank = f.get_int(key("attention.q_lora_rank")).value_or(0);
+        if (*kv_rank > (int64_t{1} << 20) || c.rope_dim <= 0 || int64_t{c.rope_dim} + *kv_rank > INT32_MAX ||
+            trained_key <= c.rope_dim || trained_key > INT32_MAX || trained_value <= 0 || trained_value > INT32_MAX ||
+            query_rank < 0 || query_rank > INT32_MAX) {
+            return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
         }
         m.kv_rank = static_cast<int32_t>(*kv_rank);
-        m.q_rank = static_cast<int32_t>(f.get_int(key("attention.q_lora_rank")).value_or(0));
-        m.nope_dim = static_cast<int32_t>(*key_mla - c.rope_dim);
-        m.v_dim = static_cast<int32_t>(*value_mla);
-        // Values in an absorbed cache are the latent itself. Some GGUF
-        // converters write the ordinary per-head value_length here; only
-        // value_length_mla describes its expansion into values.
+        m.q_rank = static_cast<int32_t>(query_rank);
+        m.nope_dim = static_cast<int32_t>(trained_key - c.rope_dim);
+        m.v_dim = static_cast<int32_t>(trained_value);
         c.value_dim = m.kv_rank;
-        // Some converters report the expanded heads here. The absorbed
-        // cache stores one shared latent row, irrespective of that count.
-        if (c.n_head_kv == c.n_head) c.n_head_kv = 1;
+        if (key_mla && c.n_head_kv == c.n_head) c.n_head_kv = 1;
+        if (!key_mla) {
+            if (c.n_head_kv != c.n_head) {
+                return Status(ErrorCode::InvalidModel, "combined latent attention must describe one expanded KV head per query head");
+            }
+            c.n_head_kv = 1;
+            c.head_dim = m.kv_rank + c.rope_dim;
+            c.value_dim = m.kv_rank;
+        }
         if (c.n_head_kv != 1 || c.head_dim != m.kv_rank + c.rope_dim || c.value_dim != m.kv_rank ||
             m.nope_dim <= 0 || m.v_dim <= 0 || m.q_rank < 0 || *kv_rank > (int64_t{1} << 20)) {
             return Status(ErrorCode::InvalidModel, "inconsistent latent attention dimensions (" + key("attention.*") + ")");
@@ -732,6 +776,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                                                       std::to_string(global) + ") are not supported yet");
         }
     }
+    if (f.get_int(key("attention.indexer.head_count")).value_or(0) != 0) {
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.head_count", c.index_heads));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.key_length", c.index_dim));
+        LIYAB_RETURN_IF_ERROR(require_int("attention.indexer.top_k", c.index_topk));
+        if ((c.mla.q_rank <= 0 && c.shared_q_rank <= 0) || c.index_dim < c.rope_dim) {
+            return Status(ErrorCode::InvalidModel, "DSA needs low-rank queries and index keys at least rope.dimension_count wide");
+        }
+        if (f.get_int(key("attention.indexer.kpool")).value_or(1) > 1) {
+            return Status(ErrorCode::Unsupported, "pooled DSA index keys are not supported");
+        }
+    }
     c.n_ctx_train = static_cast<int32_t>(f.get_int(key("context_length")).value_or(0));
     c.rms_eps = static_cast<float>(f.get_float(key("attention.layer_norm_rms_epsilon")).value_or(1e-5));
     if (c.spec->norm == NormKind::Layer) {  // LayerNorm architectures state their epsilon under its own key
@@ -743,6 +798,14 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     // Architectures without rotary embeddings rotate nothing, whatever the
     // file says of RoPE: their positions come from learned embeddings or ALiBi.
     if (!c.spec->rotary) c.rope_dim = 0;
+    if (f.tensor("output_hc_fn.weight") != nullptr) {
+        LIYAB_RETURN_IF_ERROR(require_int("hyper_connection.count", c.hc_count));
+        LIYAB_RETURN_IF_ERROR(require_int("hyper_connection.sinkhorn_iterations", c.hc_iterations));
+        c.hc_eps = static_cast<float>(f.get_float(key("hyper_connection.epsilon")).value_or(0.0));
+        if (c.hc_count > 64 || c.hc_iterations > 1024 || !(c.hc_eps > 0.0f) || !std::isfinite(c.hc_eps)) {
+            return Status(ErrorCode::InvalidModel, "invalid hyper-connection geometry or epsilon");
+        }
+    }
     c.rope_base = static_cast<float>(f.get_float(key("rope.freq_base")).value_or(10000.0));
     // LongRoPE: frequency factors for short and long contexts (Phi-3), and the
     // attention factor that comes with them.
@@ -793,7 +856,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             // reference's mscale_all_dim m instead: the rotation's magnitude
             // is (0.1 ln(factor) + 1) / (0.1 m ln(factor) + 1) and q·k keeps
             // its scale (Ministral 3: m = 1, a magnitude of 1).
-            double magnitude = attn_factor ? *attn_factor : log_mul ? 1.0 : 0.1 * ln_factor + 1.0;
+            double magnitude = attn_factor ? *attn_factor : (log_mul || c.spec->shared_kv) ? 1.0 : 0.1 * ln_factor + 1.0;
             if (log_mul && c.spec->yarn_mscale_all_dim) {
                 if (!attn_factor) magnitude = (0.1 * ln_factor + 1.0) / (0.1 * *log_mul * ln_factor + 1.0);
             } else if (log_mul) {
@@ -1009,7 +1072,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     for (int32_t l = 0; l < c.n_layers; ++l) {
         BlockPlan& b = c.blocks[static_cast<size_t>(l)];
         b.n_head = block_heads[static_cast<size_t>(l)];
-        b.n_head_kv = block_kv_heads[static_cast<size_t>(l)];
+        b.n_head_kv = c.mla.kv_rank > 0 ? 1 : block_kv_heads[static_cast<size_t>(l)];
         b.n_ff = block_ff[static_cast<size_t>(l)];
         const int64_t q_dim = int64_t{b.n_head} * c.head_dim;
         LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_exp", l, b.expert_swiglu_clamp));
@@ -1052,6 +1115,31 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
                                                           ": per-block latent attention head counts are not supported");
             }
+            b.latent_combined = f.tensor(block_tensor(l, "attn_kv_b.weight")) != nullptr;
+            const bool split_key = f.tensor(block_tensor(l, "attn_k_b.weight")) != nullptr;
+            const bool split_value = f.tensor(block_tensor(l, "attn_v_b.weight")) != nullptr;
+            if (b.latent && (b.latent_combined ? (split_key || split_value) : (!split_key || !split_value))) {
+                return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                    ": latent attention needs either combined attn_kv_b or both split expansion tensors");
+            }
+            b.indexed = f.tensor(block_tensor(l, "indexer.attn_k.weight")) != nullptr;
+            if (b.indexed && (!b.latent || c.index_heads == 0)) {
+                return Status(ErrorCode::InvalidModel, "indexer tensors need latent attention and attention.indexer metadata");
+            }
+            if (c.index_heads > 0 && !c.spec->shared_kv) {
+                const GgufValue* types = f.metadata(key("attention.indexer.types"));
+                if (types != nullptr) {
+                    if (types->type != GgufValue::Type::Array || types->array_type != GgufValue::Type::Bool ||
+                        types->array_size < static_cast<uint64_t>(c.n_layers)) {
+                        return Status(ErrorCode::InvalidModel, "invalid " + key("attention.indexer.types"));
+                    }
+                    b.index_reuse = types->array_data[l] == 0;
+                }
+                if (!b.latent || (b.index_reuse == b.indexed) || (b.index_reuse && l == 0)) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                        ": indexer tensors disagree with full/shared indexer metadata");
+                }
+            }
             const TensorView* wq = f.tensor(block_tensor(l, "attn_q.weight"));
             b.attn_gate = !b.latent && wq != nullptr && wq->rows() == 2 * q_dim;
             if (!b.latent && f.tensor(block_tensor(l, "attn_gate.weight")) != nullptr) {
@@ -1087,6 +1175,38 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 }
                 if (b.qk_norm_whole && c.spec->qk_norm == QkNormOrder::AfterRope) {
                     return Status(ErrorCode::Unsupported, "Q/K norms over the whole projection after RoPE");
+                }
+            }
+            if (c.spec->shared_kv) {
+                if (!b.windowed) {
+                    return Status(ErrorCode::InvalidModel, "shared K=V attention needs a sliding window in every block");
+                }
+                if (f.tensor(block_tensor(l, "attn_sinks.weight")) != nullptr || f.tensor(block_tensor(l, "attn_sinks")) != nullptr) {
+                    return Status(ErrorCode::Unsupported, "shared K=V attention needs learned attention sinks (MoE integration)");
+                }
+                const GgufValue* ratios = f.metadata(key("attention.compress_ratios"));
+                if (ratios == nullptr || ratios->type != GgufValue::Type::Array ||
+                    (ratios->array_type != GgufValue::Type::I32 && ratios->array_type != GgufValue::Type::U32) ||
+                    ratios->array_size < static_cast<uint64_t>(c.n_layers)) {
+                    return Status(ErrorCode::InvalidModel, "invalid " + key("attention.compress_ratios"));
+                }
+                uint32_t stride;
+                std::memcpy(&stride, ratios->array_data + static_cast<size_t>(l) * sizeof(stride), sizeof(stride));
+                const TensorView* projection = f.tensor(block_tensor(l, "attn_compressor_kv.weight"));
+                if (stride > (1u << 20) || (stride > 0) != (projection != nullptr)) {
+                    return Status(ErrorCode::InvalidModel, "compressor tensors disagree with attention.compress_ratios");
+                }
+                if (projection != nullptr) {
+                    if (projection->cols() != c.n_embd ||
+                        (projection->rows() != c.head_dim && projection->rows() != 2 * int64_t{c.head_dim})) {
+                        return Status(ErrorCode::InvalidModel, "invalid compressor projected width");
+                    }
+                    b.compression = {c.head_dim, static_cast<int32_t>(stride), projection->rows() != c.head_dim};
+                    b.indexed = f.tensor(block_tensor(l, "indexer_compressor_kv.weight")) != nullptr;
+                    if (b.indexed != b.compression.overlap || (b.indexed && c.index_heads <= 0)) {
+                        return Status(ErrorCode::InvalidModel, "overlapping compression needs its own indexer");
+                    }
+                    ++c.compressed_layers;
                 }
             }
         }
@@ -1177,7 +1297,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     }
     LIYAB_RETURN_IF_ERROR(describe_gemma_parts(f, c, key));
     c.n_recurrent_layers = static_cast<int32_t>(std::count_if(c.blocks.begin(), c.blocks.end(),
-        [](const BlockPlan& b) { return keeps_state(b.mixer); }));
+        [](const BlockPlan& b) { return keeps_state(b.mixer) || b.compression.stride > 0; }));
     auto has_mixer = [&](MixerKind kind) {
         return std::any_of(c.blocks.begin(), c.blocks.end(), [kind](const BlockPlan& b) { return b.mixer == kind; });
     };

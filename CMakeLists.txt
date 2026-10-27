@@ -139,6 +139,8 @@ add_library(liyab_core OBJECT
   src/core/grammar.cpp
   src/core/grammar_text.cpp
   src/core/json_schema.cpp
+  src/core/moe_routing.cpp
+  src/core/compression.cpp
   src/core/architecture.cpp
   src/core/key_scaling.cpp
   src/core/portable_math.cpp
@@ -157,6 +159,9 @@ add_library(liyab_core OBJECT
   src/backends/vulkan/vulkan_backend.cpp
   src/c_api/liyab_c_api.cpp
 )
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  set_source_files_properties(src/core/compression.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 if(LIYAB_ENABLE_EXPERIMENTAL)
   target_sources(liyab_core PRIVATE
     src/experimental/early_exit.cpp
@@ -358,6 +363,7 @@ if(LIYAB_BUILD_TESTS)
   list(APPEND _liyab_tests test_lora)
   list(APPEND _liyab_tests test_sequences)
   list(APPEND _liyab_tests test_ssm)
+  list(APPEND _liyab_tests test_compression)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()

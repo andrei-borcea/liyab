@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "core/draft_budget.h"
+#include "core/moe_routing.h"
 #include "core/quant.h"
 #include "core/quant_blocks.h"
 #include "core/sampling.h"
@@ -262,8 +263,10 @@ public:
         rank_ = static_cast<int>(*f.get_int("deepseek2.attention.kv_lora_rank"));
         q_rank_ = static_cast<int>(f.get_int("deepseek2.attention.q_lora_rank").value_or(0));
         rd_ = static_cast<int>(*f.get_int("deepseek2.rope.dimension_count"));
-        nope_ = static_cast<int>(*f.get_int("deepseek2.attention.key_length_mla")) - rd_;
-        vd_ = static_cast<int>(*f.get_int("deepseek2.attention.value_length_mla"));
+        nope_ = static_cast<int>(f.get_int("deepseek2.attention.key_length_mla").value_or(
+            *f.get_int("deepseek2.attention.key_length"))) - rd_;
+        vd_ = static_cast<int>(f.get_int("deepseek2.attention.value_length_mla").value_or(
+            *f.get_int("deepseek2.attention.value_length")));
     }
 
     std::vector<std::vector<float>> logits(const std::vector<int32_t>& tokens) const {
@@ -275,8 +278,24 @@ public:
         for (int l = 0; l < layers_; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
             const auto kv_a = weights(p + "attn_kv_a_mqa.weight");
-            const auto kb = weights(p + "attn_k_b.weight");  // [head][rank][nope]
-            const auto vb = weights(p + "attn_v_b.weight");  // [head][v][rank]
+            std::vector<float> kb, vb;
+            if (f_.tensor(p + "attn_kv_b.weight")) {
+                const auto combined = weights(p + "attn_kv_b.weight");
+                kb.resize(static_cast<size_t>(heads_ * rank_ * nope_));
+                vb.resize(static_cast<size_t>(heads_ * vd_ * rank_));
+                for (int h = 0; h < heads_; ++h) {
+                    for (int j = 0; j < nope_ + vd_; ++j) {
+                        for (int r = 0; r < rank_; ++r) {
+                            const float v = combined[static_cast<size_t>((h * (nope_ + vd_) + j) * rank_ + r)];
+                            if (j < nope_) kb[static_cast<size_t>((h * rank_ + r) * nope_ + j)] = v;
+                            else vb[static_cast<size_t>((h * vd_ + j - nope_) * rank_ + r)] = v;
+                        }
+                    }
+                }
+            } else {
+                kb = weights(p + "attn_k_b.weight");  // [head][rank][nope]
+                vb = weights(p + "attn_v_b.weight");  // [head][v][rank]
+            }
             std::vector<std::vector<float>> q(n), keys(n), values(n);  // per token: [head][qk], [head][qk], [head][v]
             for (int t = 0; t < n; ++t) {
                 const auto h = norm(x[t], weights(p + "attn_norm.weight"));
@@ -1863,13 +1882,14 @@ TEST_CASE("describe_model: windowed blocks from the architecture or the file, fu
             CHECK(c.blocks[l].ffn == (l == 0 ? FfnKind::Dense : FfnKind::Moe));
             CHECK(c.blocks[l].shared_expert == (l > 0));
         }
-        s.mla_legacy = true;  // attn_kv_b era: refused with what to do about it
+        s.mla_legacy = true;  // attn_kv_b era: normalized to the same cached-latent geometry
         auto file = MmapLoader::open(model_path("describe_deepseek2_legacy", s));
         REQUIRE(file.has_value());
         auto legacy = describe_model(**file);
-        REQUIRE(!legacy.has_value());
-        CHECK(legacy.status().code() == ErrorCode::Unsupported);
-        CHECK(legacy.status().to_string().find("convert") != std::string::npos);
+        REQUIRE(legacy.has_value());
+        CHECK(legacy->head_dim == c.head_dim && legacy->value_dim == c.value_dim && legacy->n_head_kv == 1);
+        CHECK(legacy->mla.nope_dim == c.mla.nope_dim && legacy->mla.v_dim == c.mla.v_dim);
+        for (const BlockPlan& b : legacy->blocks) CHECK(b.latent && b.latent_combined);
     }
     {
         test::TinyModelSpec s;  // YaRN with the reference's defaults
@@ -2012,13 +2032,14 @@ test::TinyModelSpec outlier_spec() {
 
 namespace {
 
-test::TinyModelSpec latent_spec(int32_t q_rank) {
+test::TinyModelSpec latent_spec(int32_t q_rank, bool combined = false) {
     test::TinyModelSpec spec;
     spec.arch = "deepseek2";
     spec.n_head_kv = 1;
     spec.rope_dim = 32;    // the shared RoPE key
     spec.mla_kv_rank = 64;  // cached rows [k_pe | latent] of 96 values, values from channel 32
     spec.mla_q_rank = q_rank;
+    spec.mla_legacy = combined;
     return spec;
 }
 
@@ -2165,6 +2186,165 @@ size_t argmax_differences(const std::vector<float>& a, const std::vector<float>&
 
 }  // namespace
 
+TEST_CASE("Combined latent expansion normalizes to split weights in every KV format") {
+    ThreadPool pool(4);
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280, 33, 120, 7, 260};
+    for (const int32_t q_rank : {0, 64}) {
+        auto spec = latent_spec(q_rank);
+        spec.attn_type = DType::F32;
+        const auto split_path = model_path("latent_split_layout_q" + std::to_string(q_rank), spec);
+        spec.mla_legacy = true;
+        const auto legacy_path = model_path("latent_combined_layout_q" + std::to_string(q_rank), spec);
+        for (const auto kv : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+            for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+                TransformerOptions options;
+                options.kv_type = kv;
+                options.latent_form = form;
+                auto split = load_transformer(split_path, options);
+                auto legacy = load_transformer(legacy_path, options);
+                REQUIRE(split && legacy);
+                const auto expected = latent_pass_logits(*split, tokens, {tokens.size()}, pool);
+                REQUIRE(!expected.empty());
+                CHECK(latent_pass_logits(*legacy, tokens, {tokens.size()}, pool) == expected);
+                // Single-token passes use absorption even when expanded
+                // prefill is pinned. Compare the same execution schedule.
+                const auto chunked = latent_pass_logits(*split, tokens, {3, 1, 5}, pool);
+                CHECK(latent_pass_logits(*legacy, tokens, {3, 1, 5}, pool) == chunked);
+                if (q_rank == 0 && kv == KvCacheType::F16) {
+                    std::vector<TripleBufferLoader::Item> items;
+                    for (int32_t l = 0; l < legacy->config().n_layers; ++l) {
+                        const auto [begin, end] = legacy->file().layer_range(l);
+                        REQUIRE(end > begin);
+                        items.push_back({begin, end - begin});
+                    }
+                    const auto& mapped = legacy->file().file();
+                    auto source = TripleBufferLoader::create(std::move(items),
+                        [&](uint64_t offset, size_t length, uint8_t* dst) {
+                            std::memset(dst, 0, length);
+                            if (offset < mapped.size()) {
+                                std::memcpy(dst, mapped.data() + offset,
+                                            std::min(length, mapped.size() - static_cast<size_t>(offset)));
+                            }
+                            return Status::ok();
+                        });
+                    REQUIRE(source.has_value());
+                    legacy->set_layer_source(source->get());
+                    CHECK(latent_pass_logits(*legacy, tokens, {3, 1, 5}, pool) == chunked);
+                    legacy->set_layer_source(nullptr);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Combined quantized latent expansion matches an independent per-head reference") {
+    ThreadPool pool(4);
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    for (const auto type : {DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4_0, DType::Q4_1,
+                            DType::Q4_K, DType::Q5_K}) {
+        auto spec = latent_spec(0);
+        spec.n_embd = spec.n_ff = spec.mla_kv_rank = 256;
+        spec.mla_v = 64;
+        spec.mla_legacy = true;
+        spec.attn_type = type;
+        spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+        spec.weight_scale = 0.02f;
+        const auto path = model_path("latent_combined_quant_" + std::to_string(static_cast<int>(type)), spec);
+        auto reference = MmapLoader::open(path);
+        REQUIRE(reference.has_value());
+        const auto expected = LatentReference(**reference).logits(tokens);
+        for (const auto form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            TransformerOptions options;
+            options.kv_type = KvCacheType::F16;
+            options.latent_form = form;
+            options.repack_cpu = quant::repack_kernels_available();
+            auto model = load_transformer(path, options);
+            REQUIRE(model);
+            CHECK(model->file().tensor("blk.0.attn_kv_b.weight")->type == type);
+            const auto actual = latent_pass_logits(*model, tokens, {tokens.size()}, pool);
+            REQUIRE(actual.size() == tokens.size() * static_cast<size_t>(model->config().n_vocab));
+            double worst = 0.0;
+            for (size_t t = 0; t < tokens.size(); ++t) {
+                worst = std::max(worst, max_abs_diff(std::span<const float>(actual).subspan(
+                    t * expected[t].size(), expected[t].size()), expected[t]));
+            }
+            std::printf("  combined latent %s, form %d: max |diff| %g\n",
+                        std::string(dtype_traits(type).name).c_str(), static_cast<int>(form), worst);
+            CHECK(worst < 3e-2);
+        }
+    }
+}
+
+TEST_CASE("Combined latent weight views preserve every GGML format's decoded keys and raw values") {
+    std::vector<QuantVector> vectors;
+    REQUIRE(load_quant_vectors(vectors));
+    for (const DType type : {DType::F32, DType::F16}) {
+        QuantVector v;
+        v.type = type;
+        v.n = 256;
+        std::vector<float> values(256);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(static_cast<float>(i));
+        v.blocks.resize(dtype_row_bytes(type, v.n));
+        quant::quantize_row(type, values.data(), v.blocks.data(), v.n);
+        vectors.push_back(std::move(v));
+    }
+    LatentAttention geometry;
+    geometry.kv_rank = 256;
+    geometry.nope_dim = 3;
+    geometry.v_dim = 5;
+    constexpr int32_t heads = 2;
+    const int64_t rows = heads * (geometry.nope_dim + geometry.v_dim);
+    size_t checked = 0;
+    for (const auto& qv : vectors) {
+        const auto traits = dtype_traits(qv.type);
+        const size_t row_bytes = dtype_row_bytes(qv.type, geometry.kv_rank);
+        std::vector<uint8_t> raw(static_cast<size_t>(rows) * row_bytes);
+        std::vector<float> decoded(static_cast<size_t>(rows) * geometry.kv_rank);
+        const size_t blocks = qv.blocks.size() / static_cast<size_t>(traits.block_bytes);
+        for (size_t row = 0; row < static_cast<size_t>(rows); ++row) {
+            for (size_t b = 0; b < static_cast<size_t>(geometry.kv_rank / traits.block_size); ++b) {
+                const size_t source_block = (row + b) % blocks;
+                std::memcpy(raw.data() + row * row_bytes + b * static_cast<size_t>(traits.block_bytes),
+                            qv.blocks.data() + source_block * static_cast<size_t>(traits.block_bytes),
+                            static_cast<size_t>(traits.block_bytes));
+            }
+            // Preserve this engine's decoded bits, including IQ1's existing
+            // rounding convention and signed zero, through the transpose.
+            quant::dequantize_row(qv.type, raw.data() + row * row_bytes,
+                                 decoded.data() + row * geometry.kv_rank, geometry.kv_rank);
+        }
+        TensorView source;
+        source.name = "blk.0.attn_kv_b.weight";
+        source.type = qv.type;
+        source.n_dims = 2;
+        source.ne = {geometry.kv_rank, rows, 1, 1};
+        source.data = raw.data();
+        source.nbytes = raw.size();
+        CombinedLatentWeights split;
+        REQUIRE(split.bind(source, geometry, heads).is_ok());
+        const auto* key = reinterpret_cast<const float*>(split.key().data);
+        for (int32_t h = 0; h < heads; ++h) {
+            for (int32_t j = 0; j < geometry.nope_dim; ++j) {
+                for (int32_t r = 0; r < geometry.kv_rank; ++r) {
+                    const size_t src = static_cast<size_t>((h * (geometry.nope_dim + geometry.v_dim) + j) * geometry.kv_rank + r);
+                    const size_t dst = static_cast<size_t>((h * geometry.kv_rank + r) * geometry.nope_dim + j);
+                    CHECK(std::memcmp(key + dst, decoded.data() + src, sizeof(float)) == 0);
+                }
+            }
+            CHECK(std::memcmp(split.value().data + static_cast<size_t>(h * geometry.v_dim) * row_bytes,
+                              source.row(h * (geometry.nope_dim + geometry.v_dim) + geometry.nope_dim),
+                              static_cast<size_t>(geometry.v_dim) * row_bytes) == 0);
+        }
+        source.ne[0] -= 1;
+        CHECK(split.bind(source, geometry, heads).code() == ErrorCode::InvalidModel);
+        source.ne[0] += 1;
+        source.type = DType::Q8_0_R4;
+        CHECK(split.bind(source, geometry, heads).code() == ErrorCode::Unsupported);
+        ++checked;
+    }
+    CHECK(checked == 26);
+}
+
 // The expanded form (per-head keys and values expanded from the cached
 // latents, for prefills) computes the absorbed form's function, rounded
 // differently: both must match the explicit reference, the expanded form must
@@ -2239,6 +2419,79 @@ TEST_CASE("Latent attention in the expanded form matches the absorbed form and t
 // before the expansion; calibration itself runs absorbed), and a sliding window
 // with attention sinks, where tokens see different positions; and close to the
 // absorbed form throughout.
+TEST_CASE("Sparse latent attention: dense identity, causal batching and saved contexts in every KV format") {
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t t = 0; t < 33; ++t) tokens.push_back(3 + (37 * t) % 250);
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        auto dense = latent_spec(64);
+        dense.arch = "glm-dsa";
+        auto indexed = dense;
+        indexed.index_dim = 64;
+        indexed.index_topk = 128;
+        indexed.index_full.assign(static_cast<size_t>(indexed.n_layers), false);
+        indexed.index_full[0] = true;
+        const std::string plain_path = model_path("dsa_dense", dense);
+        const std::string all_path = model_path("dsa_all", indexed);
+        indexed.index_topk = 4;
+        const std::string sparse_path = model_path("dsa_sparse", indexed);
+        for (const LatentForm form : {LatentForm::Absorbed, LatentForm::Expanded}) {
+            TransformerOptions options;
+            options.kv_type = type;
+            options.latent_form = form;
+            auto plain = load_transformer(plain_path, options);
+            auto all = load_transformer(all_path, options);
+            auto sparse = load_transformer(sparse_path, options);
+            REQUIRE(plain != nullptr && all != nullptr && sparse != nullptr);
+            CHECK(sparse->config().blocks[0].indexed);
+            CHECK(sparse->kv_cache().config().auxiliary_dim == 64);
+            auto a = plain->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(a.has_value());
+            const std::vector<float> expected(a->begin(), a->end());
+            auto b = all->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(b.has_value());
+            CHECK(max_abs_diff(*b, expected) == 0.0f);  // index_topk >= context is dense, bit for bit
+            auto c = sparse->forward(tokens, Transformer::Logits::All, route, pool);
+            REQUIRE(c.has_value());
+            const std::vector<float> batched(c->begin(), c->end());
+            CHECK(max_abs_diff(*c, expected) > 0.0f);  // the sparse selection actually runs
+            sparse->reset();
+            if (form == LatentForm::Absorbed) {
+                std::vector<float> decoded;
+                for (const int32_t token : tokens) {
+                    auto row = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                    REQUIRE(row.has_value());
+                    decoded.insert(decoded.end(), row->begin(), row->end());
+                }
+                CHECK(max_abs_diff(decoded, batched) == 0.0f);
+            } else {
+                REQUIRE(sparse->forward(tokens, Transformer::Logits::None, route, pool).has_value());
+            }
+            std::stringstream image(std::ios::in | std::ios::out | std::ios::binary);
+            REQUIRE(sparse->write_state(image).is_ok());
+            auto restored = load_transformer(sparse_path, options);
+            REQUIRE(restored != nullptr);
+            REQUIRE(restored->read_state(image).is_ok());
+            for (const int32_t token : {71, 5, 250}) {
+                auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+                REQUIRE(left.has_value() && right.has_value());
+                CHECK(left->size() == right->size());
+                CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+            }
+            REQUIRE(sparse->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            REQUIRE(restored->truncate(static_cast<int32_t>(tokens.size())).is_ok());
+            const int32_t token = 42;
+            auto left = sparse->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto right = restored->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(left.has_value() && right.has_value());
+            CHECK(std::memcmp(left->data(), right->data(), left->size_bytes()) == 0);
+        }
+    }
+}
+
 TEST_CASE("Expanded latent attention over many tiles: every split the same bits, close to the absorbed form") {
     test::TinyModelSpec spec = latent_spec(64);
     spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
@@ -2300,6 +2553,27 @@ TEST_CASE("Expanded latent attention over many tiles: every split the same bits,
         CHECK(err_expanded <= std::max(1e-3, 1.25 * err_absorbed));
         CHECK(flips_expanded <= std::max<size_t>(flips_absorbed, tokens.size() / 100));
     }
+}
+
+TEST_CASE("Sparse latent form calibration uses valid index keys and leaves an empty context") {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    auto model = load_transformer(model_path("indexed_calibration", spec));
+    REQUIRE(model != nullptr);
+    ThreadPool pool(2);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    auto ratio = model->calibrate_latent_form(route, pool);
+    REQUIRE(ratio.has_value());
+    CHECK(*ratio >= LatentFormChooser::kMinRatio && *ratio <= LatentFormChooser::kMaxRatio);
+    CHECK(model->latent_chooser().ratio() == *ratio);
+    CHECK(model->n_past() == 0);
+    const std::vector<int32_t> tokens = {1, 3, 7, 9};
+    auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(logits.has_value());
+    for (const float value : *logits) CHECK(std::isfinite(value));
 }
 
 // The automatic choice: work counted per form, and a threshold set by one
@@ -2737,6 +3011,77 @@ TEST_CASE("A model whose text cannot be encoded loads with a quantized KV cache,
     CHECK(with_scales.value()->describe().find("Keys:") == std::string::npos);
     CHECK(!std::filesystem::is_empty(dir));
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Group-limited routing scores groups before selecting experts") {
+    // Max scoring chooses group 0; the sum of the top two chooses group 1.
+    // Negative biased scores stay eligible: masking by multiplication would
+    // incorrectly prefer a zero from a group that was excluded.
+    const float scores[] = {-0.1f, -0.9f, -0.3f, -0.4f, -0.8f, -0.8f, -0.8f, -0.8f};
+    std::vector<uint8_t> allowed;
+    select_expert_groups(scores, 8, 4, 1, false, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 1, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{0, 1, 0, 0}));
+    select_expert_groups(scores, 8, 4, 3, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 0}));  // tied groups: lower first
+    select_expert_groups(scores, 8, 8, 2, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 0, 1, 0, 0, 0, 0, 0}));
+    select_expert_groups(scores, 8, 4, 4, true, allowed);
+    CHECK(allowed == (std::vector<uint8_t>{1, 1, 1, 1}));
+}
+
+TEST_CASE("Group-limited routing validates metadata and streamed experts keep its logits") {
+    test::TinyModelSpec s;
+    s.arch = "deepseek2";
+    s.n_expert = 8;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    for (int mode = 0; mode < 2; ++mode) {
+        s.sigmoid_gating = mode != 0;
+        s.expert_bias = mode != 0;
+        const std::string path = model_path("grouped_" + std::to_string(mode), s);
+        TransformerOptions opts;
+        auto a = load_transformer(path, opts);
+        opts.expert_cache_bytes = 1;
+        auto b = load_transformer(path, opts);
+        REQUIRE(a != nullptr && b != nullptr);
+        CHECK(a->config().n_expert_groups == 4);
+        CHECK(a->config().n_expert_groups_used == 2);
+        ThreadPool pool(2);
+        auto cpu = make_cpu_backend(pool);
+        const Route route{cpu.get(), cpu.get(), cpu.get()};
+        const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+        auto first = a->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(first.has_value());
+        const std::vector<float> expected(first->begin(), first->end());
+        auto second = b->forward(tokens, Transformer::Logits::All, route, pool);
+        REQUIRE(second.has_value());
+        CHECK(max_abs_diff(*second, expected) == 0.0f);
+        a->reset();
+        b->reset();
+        for (const int32_t token : tokens) {
+            auto la = a->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            auto lb = b->forward({&token, 1}, Transformer::Logits::Last, route, pool);
+            REQUIRE(la.has_value() && lb.has_value());
+            CHECK(la->size() == lb->size());
+            CHECK(std::memcmp(la->data(), lb->data(), la->size_bytes()) == 0);
+        }
+    }
+    const std::pair<int32_t, int32_t> invalid[] = {{3, 1}, {4, 0}, {4, 5}, {16, 1}, {8, 1}};
+    for (const auto [groups, used] : invalid) {
+        s.n_expert_groups = groups;
+        s.n_expert_groups_used = used;
+        auto file = MmapLoader::open(model_path("bad_groups_" + std::to_string(groups) + "_" +
+                                              std::to_string(used), s));
+        REQUIRE(file.has_value());
+        auto result = describe_model(**file);
+        REQUIRE(!result.has_value());
+        CHECK(result.status().code() == ErrorCode::InvalidModel);
+        CHECK(result.status().to_string().find("expert_group") != std::string::npos);
+    }
 }
 
 TEST_CASE("Mixture of experts with identical experts equals its dense twin (routing, top-k, renormalization)") {
@@ -4162,6 +4507,64 @@ uint64_t dir_bytes(const std::string& dir) {
 
 }  // namespace
 
+TEST_CASE("Sparse index keys survive storage prefix reuse and an engine restart in every KV format") {
+    for (const bool compressed : {false, true}) {
+    auto spec = latent_spec(64);
+    spec.arch = "glm-dsa";
+    spec.index_dim = 64;
+    spec.index_topk = 8;
+    spec.index_full = {true, false};
+    if (compressed) spec = test::compressed_spec();
+    const std::string path = model_path(compressed ? "compressed_prefix" : "indexed_prefix", spec);
+    std::string a, b;
+    for (int i = 0; i < 200; ++i) {
+        a += i % 3 ? " hello" : " world";
+        b += i % 2 ? " world" : " hello world";
+    }
+    auto run = [](Engine& engine, const std::string& prompt, GenerationStats* stats = nullptr) {
+        std::string text;
+        auto result = engine.generate(prompt, greedy(6), [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        CHECK(result.has_value());
+        if (result && stats != nullptr) *stats = *result;
+        return text;
+    };
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0, KvCacheType::Q4_1}) {
+        EngineConfig config = engine_config(path);
+        config.backend = BackendKind::Cpu;
+        config.kv_cache_type = type;
+        auto reference = Engine::create(config);
+        REQUIRE(reference.has_value());
+        const std::string expected = run(*reference.value(), a);
+        const std::string dir = test::temp_dir() + "/liyab_" + std::to_string(test::process_id()) +
+                                "_indexed_prefix_" + std::to_string(static_cast<int>(type));
+        std::filesystem::remove_all(dir);
+        config.prefix_cache_dir = dir;
+        config.prefix_cache_disk_mb = 4;
+        config.prefix_cache_lossy = true;  // F32 index images must use the exact raw fallback
+        {
+            auto cached = Engine::create(config);
+            REQUIRE(cached.has_value());
+            CHECK(run(*cached.value(), a) == expected);
+            run(*cached.value(), b);
+            GenerationStats restored{};
+            CHECK(run(*cached.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        {
+            auto restarted = Engine::create(config);
+            REQUIRE(restarted.has_value());
+            GenerationStats restored{};
+            CHECK(run(*restarted.value(), a, &restored) == expected);
+            CHECK(restored.cached_prefix_tokens >= 128);
+        }
+        std::filesystem::remove_all(dir);
+    }
+    }
+}
+
 TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later engines too") {
     test::TinyModelSpec spec;
     spec.arch = "qwen35";
@@ -4945,7 +5348,10 @@ TEST_CASE("A saved context restores in a new engine, exactly, and only for the s
                                    model_path("saved_gpt2", test::classic_model_spec("gpt2")),
                                    model_path("saved_bloom", test::classic_model_spec("bloom")),
                                    model_path("saved_command-r", test::classic_model_spec("command-r")),
-                                   model_path("saved_nemotron", test::classic_model_spec("nemotron"))}) {
+                                   model_path("saved_nemotron", test::classic_model_spec("nemotron")),
+                                   model_path("latent_combined_state", latent_spec(64, true)),
+                                   model_path("compressed_state", test::compressed_spec())}) {
+
         EngineConfig config = engine_config(path);
         config.backend = BackendKind::Cpu;
         auto saver = Engine::create(config);
@@ -5978,7 +6384,8 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         test::TinyModelSpec spec;
     };
     std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")},
-                               {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)}};
+                               {"windowed_gemma2", windowed_spec("gemma2")}, {"latent", latent_spec(64)},
+                               {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
     for (const std::string arch : {"gpt2", "gptneox", "bloom", "olmo", "stablelm", "command-r", "apertus"}) {
         cases.push_back({"tree_classic_" + arch, test::classic_model_spec(arch)});
     }
@@ -6014,6 +6421,13 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         cases.push_back({arch, s});
     }
     for (const auto& spec : test::recurrent_model_specs()) cases.push_back({"tree_" + spec.arch, spec});
+    {
+        auto s = latent_spec(64);
+        s.arch = "glm-dsa";
+        s.index_dim = 64;
+        s.index_topk = 4;
+        cases.push_back({"tree_dsa", s});
+    }
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};
     const std::vector<std::vector<int32_t>> paths = {{0, 4, 8}, {0, 1, 2, 3}, {0}, {0, 1, 6, 7}, {0, 4, 5}};
@@ -6164,7 +6578,8 @@ TEST_CASE("Suffix drafts verified as a tree give plain decoding's tokens, and ke
         std::string name;
         test::TinyModelSpec spec;
     };
-    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)}};
+    std::vector<Case> cases = {{"mixed", {}}, {"windowed_gemma3", windowed_spec("gemma3")}, {"latent", latent_spec(64)},
+                              {"latent_combined", latent_spec(64, true)}, {"compressed", test::compressed_spec()}};
     {
         test::TinyModelSpec s;
         s.arch = "qwen35";

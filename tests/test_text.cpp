@@ -474,6 +474,20 @@ TEST_CASE("Pre-tokenizer table: every row splits like the Hugging Face Split seq
     CHECK(checked > 200);
 }
 
+TEST_CASE("The converter's joyai-llm alias uses DeepSeek-V3 splitting") {
+    auto original = PreTokenizer::for_name("deepseek-v3");
+    auto alias = PreTokenizer::for_name("joyai-llm");
+    REQUIRE(original.has_value() && alias.has_value());
+    for (const std::string text : {"Hello 1234567!\n", "你好 世界 カナ test's", "a\r\nb   c"}) {
+        std::vector<std::string_view> a, b;
+        original->split(text, a);
+        alias->split(text, b);
+        CHECK(a == b);
+    }
+    CHECK(original->nfc() == alias->nfc());
+    CHECK(original->ignore_merges() == alias->ignore_merges());
+}
+
 TEST_CASE("Pre-tokenizer table: names, flags and the error for an unknown name") {
     const std::string names = PreTokenizer::supported_names();
     size_t count = 0;
@@ -629,6 +643,30 @@ TEST_CASE("EXAONE-MoE keeps spaces inside word runs and splits individual digits
     pre->split(text, pieces);
     const std::vector<std::string_view> expected = {"ab cd ef", "\n", "1", "2", "/", " ", "3", "4"};
     CHECK(pieces == expected);
+}
+
+TEST_CASE("GLM uses Llama-3 splitting and merge rules") {
+    auto original = PreTokenizer::for_name("llama3");
+    auto glm = PreTokenizer::for_name("glm4");
+    REQUIRE(original.has_value() && glm.has_value());
+    for (const std::string text : {"Hello 1234567!\n", "你好 世界 カナ test's", "a\r\nb   c"}) {
+        std::vector<std::string_view> a, b;
+        original->split(text, a);
+        glm->split(text, b);
+        CHECK(a == b);
+    }
+    CHECK(!glm->nfc() && glm->ignore_merges());
+}
+
+TEST_CASE("Ling 2.0 keeps contractions, single digits and possessive symbol runs") {
+    auto pre = PreTokenizer::for_name("bailingmoe2");
+    REQUIRE(pre.has_value());
+    const std::string text = "Can't 12 !\nend";
+    std::vector<std::string_view> pieces;
+    pre->split(text, pieces);
+    const std::vector<std::string_view> expected = {"Can", "'t", " ", "1", "2", " !\n", "end"};
+    CHECK(pieces == expected);
+    CHECK(pre->nfc() && !pre->ignore_merges());
 }
 
 // ---------------------------------------------------------------------------

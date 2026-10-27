@@ -14,7 +14,8 @@ recomputing them, never from class or module names:
 * how keys and queries are rotated (which dimensions are paired, how many, with which frequencies), whether their
   norms come before or after the rotation, and over how many dimensions those norms reach;
 * the attention scale, window and soft-cap, and whether the attention output is gated;
-* the FFN's form and activation, and a mixture of experts' routing (probabilities, selection bias, top-k,
+* the FFN's form and activation, and a mixture of experts' routing (fused or individually observed experts,
+  logits from a module or a direct linear operation, probabilities, selection bias, top-k,
   renormalization, scale, shared expert and its gate);
 * how the embeddings enter the first block and how the logits leave the last one.
 
@@ -289,6 +290,8 @@ def reduced_config(config):
                 groups = getattr(child, "n_group", None) or 1
                 count = max(EXPERTS, child_top_k + 1)
                 setattr(child, key, min(value, ((count + groups - 1) // groups) * groups))
+    if isinstance(getattr(cfg, "index_topk", None), int):
+        cfg.index_topk = min(cfg.index_topk, SEQ // 2)  # select within the short trace
     return cfg, keep, n
 
 
@@ -494,7 +497,16 @@ class NativeAttentionTrace(TorchFunctionMode):
         if any(rec.module is module for rec in RECORDER.attn):
             return out  # AttentionInterface already recorded this invocation.
         name = func.__name__
-        if name == "gelu":
+        if name == "linear" and not isinstance(module, nn.Linear):
+            source = args[0] if args else kwargs["input"]
+            weight = args[1] if len(args) > 1 else kwargs["weight"]
+            own = getattr(module, "weight", None)
+            if torch.is_tensor(own) and own.dim() == 2 and torch.equal(weight, own):
+                # A parameter-owning router may call functional linear rather
+                # than a child module. Record the observed logits directly.
+                RECORDER.calls.append(Call(RECORDER.next(), self.stack[-1][0], module,
+                                           [source.detach().clone()], {}, [out.detach().clone()]))
+        elif name == "gelu":
             approximate = kwargs.get("approximate", args[1] if len(args) > 1 else "none")
             if approximate in ("none", "tanh"):
                 source = args[0] if args else kwargs["input"]
@@ -819,6 +831,138 @@ def _match_rotated(target, raw_views, norm_calls, freqs, heads, head_dim, eps):
     return None
 
 
+def analyze_indexer(trace, mixer_path, block_calls, freqs):
+    """Recompute the observed integer position selection from the indexer's own projections."""
+    cfg = trace.reduced
+    heads, dim = getattr(cfg, "index_n_heads", 0), getattr(cfg, "index_head_dim", 0)
+    if not heads or not dim:
+        return None
+    for call in block_calls:
+        if not _is_descendant(call.path, mixer_path):
+            continue
+        outputs = [t for t in call.outputs if not t.is_floating_point() and t.dim() == 3 and t.shape[1] == SEQ]
+        if not outputs:
+            continue
+        args = [t for t in list(call.args) + list(call.kwargs.values())
+                if torch.is_tensor(t) and t.is_floating_point() and t.dim() == 3]
+        if len(args) < 2:
+            continue
+        hidden, residual = args[:2]
+        linears = _linears(block_calls, call.path)
+        q = next((c for c in linears if close(c.input, residual) and c.output.shape[-1] == heads * dim), None)
+        key = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == dim), None)
+        weight = next((c for c in linears if close(c.input, hidden) and c.output.shape[-1] == heads), None)
+        norm = next((c for c in block_calls if _is_descendant(c.path, call.path) and _norm_like(c)
+                     and key is not None and close(c.input, key.output)), None)
+        if q is None or key is None or weight is None or norm is None:
+            return Facts(unknown=["indexer projections and key norm could not be established"])
+        form = norm_formula(norm, 1e-6)
+        if not form or form[0] != "layer" or not math.isclose(form[1], 1e-6):
+            return Facts(unknown=[f"indexer key norm is {form}, not LayerNorm with epsilon 1e-6"])
+        observed = outputs[0][0]
+        raw_q, raw_k = _as_heads(q.output, heads, dim), _as_heads(norm.output, 1, dim)
+        matched = []
+        for name, inv, magnitude in freqs:
+            if 2 * inv.numel() > dim:
+                continue
+            for layout in ("adjacent", "halves"):
+                qr, kr = rope(raw_q, inv, layout, magnitude), rope(raw_k, inv, layout, magnitude)
+                scores = torch.relu(qr @ kr.transpose(-1, -2) / math.sqrt(dim))
+                scores = (scores * weight.output.transpose(1, 2).unsqueeze(-1) / math.sqrt(heads)).sum(1)
+                scores = scores.masked_fill(torch.ones(SEQ, SEQ, dtype=torch.bool).triu(1), -torch.inf)
+                ok = True
+                for t in range(SEQ):
+                    count = min(observed.shape[-1], t + 1)
+                    expected = scores[0, t].topk(count).indices.sort().values
+                    actual = observed[t][observed[t] <= t].long().sort().values
+                    if not torch.equal(expected, actual):
+                        ok = False
+                        break
+                if ok:
+                    matched.append((name, layout, int(inv.numel() * 2)))
+        layouts = {m[1] for m in matched}
+        if len(layouts) != 1:
+            return Facts(unknown=["indexer RoPE pairing is not uniquely established by position selection"])
+        return Facts(unknown=[], rope=matched[0][1], table=matched[0][0], rope_dim=matched[0][2],
+                     heads=heads, head_dim=dim, topk=int(getattr(trace.config, "index_topk", 0)),
+                     query=q.path, key=key.path, weights=weight.path, key_norm=norm.path)
+    mixer = next((c for c in block_calls if c.path == mixer_path), None)
+    attention = next((a for a in trace.attn if mixer is not None and a.module is mixer.module), None)
+    indices = attention.kwargs.get("indices") if attention is not None else None
+    if torch.is_tensor(indices):
+        earlier = [a for a in trace.attn if a.order < attention.order]
+        if earlier and torch.is_tensor(earlier[-1].kwargs.get("indices")) and torch.equal(
+                indices, earlier[-1].kwargs["indices"]):
+            return Facts(unknown=[], shared=True)
+    return Facts(unknown=["no indexer's integer position selection was observed"])
+
+
+def analyze_latent_attention(att, linears, norms, freqs, eps, cfg):
+    """Establish MLA by reconstructing both expanded tensors from the observed shared latent.
+
+    The rotary result may be returned in halves even when its input pairs are adjacent;
+    that simultaneous output permutation changes neither query/key dots nor the GGUF row contract.
+    """
+    rank = getattr(cfg, "kv_lora_rank", 0)
+    rd = getattr(cfg, "qk_rope_head_dim", 0)
+    if not rank or not rd:
+        return None
+    heads, hd, vd = att.query.shape[1], att.query.shape[-1], att.value.shape[-1]
+    nope = hd - rd
+    for kv in linears:
+        if kv.output.shape[-1] != rank + rd:
+            continue
+        norm = next((n for n in norms if close(n.input, kv.output[..., :rank])), None)
+        form = norm_formula(norm, eps) if norm is not None else None
+        if not form or form[0] != "rms":
+            continue
+        expanded = next((p for p in linears if close(p.input, norm.output)
+                         and p.output.shape[-1] == heads * (nope + vd)), None)
+        if expanded is None:
+            continue
+        parts = _as_heads(expanded.output, heads, nope + vd)
+        if not close(parts[..., nope:], att.value):
+            continue
+        for query in linears:
+            if query.output.shape[-1] != heads * hd:
+                continue
+            qrank = 0
+            if not close(query.input, kv.input):
+                qnorm = next((n for n in norms if close(n.output, query.input)), None)
+                qform = norm_formula(qnorm, eps) if qnorm is not None else None
+                qa = next((p for p in linears if qnorm is not None and close(p.output, qnorm.input)
+                           and close(p.input, kv.input)), None)
+                if qa is None or qform != form:
+                    continue
+                qrank = query.input.shape[-1]
+            raw_q = _as_heads(query.output, heads, hd)
+            raw_k = kv.output[..., rank:].unsqueeze(1)
+            for name, inv, magnitude in freqs:
+                if 2 * inv.numel() != rd:
+                    continue
+                for layout in ("adjacent", "halves"):
+                    qr = rope(raw_q[..., nope:], inv, layout, magnitude)
+                    kr = rope(raw_k, inv, layout, magnitude)
+                    for permuted in (False, True) if layout == "adjacent" else (False,):
+                        qrot, krot = qr, kr
+                        if permuted:
+                            qrot = torch.cat([qr[..., ::2], qr[..., 1::2]], -1)
+                            krot = torch.cat([kr[..., ::2], kr[..., 1::2]], -1)
+                        q = torch.cat([raw_q[..., :nope], qrot], -1)
+                        k = torch.cat([parts[..., :nope], krot.expand(-1, heads, -1, -1)], -1)
+                        if close(q, att.query) and close(k, att.key):
+                            r = {"table": name, "layout": layout, "dims": rd, "magnitude": magnitude}
+                            return {"kv_rank": rank, "q_rank": qrank, "nope_dim": nope, "v_dim": vd,
+                                    "norm_eps": form[1],
+                                    "kv_projection": kv.path, "kv_norm": norm.path,
+                                    "key": {"projection": kv.path, "projection_layout": "latent", "rope": r,
+                                            "norm": None},
+                                    "query": {"projection": query.path, "projection_layout": "latent", "rope": r,
+                                              "norm": None},
+                                    "value": {"projection": expanded.path, "projection_layout": "latent"}}
+    return None
+
+
 def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
     att = [a for a in trace.attn if any(c.module is a.module for c in block_calls if c.path == mixer_path
                                          or _is_descendant(c.path, mixer_path))]
@@ -844,6 +988,7 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                 break
     hd_v = a.value.shape[-1]
     f.update(heads=n_q, kv_heads=n_kv, head_dim=hd, value_head_dim=hd_v, unknown=[])
+    f["shared_key_value"] = close(a.key, a.value)
     linears = _linears(block_calls, mixer_path)
     norms = [c for c in block_calls if _is_descendant(c.path, mixer_path) and _norm_like(c)]
     fused_total = n_q + 2 * n_kv
@@ -914,6 +1059,10 @@ def analyze_attention(trace, mixer_path, block_calls, freqs, eps):
                         key, value = prior["key"], prior["value"]
                         f["shared_kv_source"] = source
                         break
+    latent = analyze_latent_attention(a, linears, norms, freqs, eps, trace.reduced)
+    if latent is not None:
+        key, query, value = latent["key"], latent["query"], latent["value"]
+        f["latent"] = latent
     f["key"] = key
     f["query"] = query
     f["value"] = value
@@ -1086,8 +1235,55 @@ def analyze_moe(ffn_call, block_calls, cfg):
             experts_call = (c, ints[0], floats[0])
             break
     if experts_call is None:
-        f["unknown"].append("no experts call with routed indices and weights was observed")
-        return f
+        # Older modules return routing from a gate and call ModuleList
+        # experts individually. Reconstruct their weighted sum from observed
+        # inputs/outputs, checking the router's token ordering for every call.
+        for gate in inside:
+            indices = next((a for a in gate.outputs if not a.is_floating_point() and a.dim() == 2
+                            and a.shape[0] == n_tokens), None)
+            weights = next((a for a in gate.outputs if a.is_floating_point() and indices is not None
+                            and a.shape == indices.shape), None)
+            if indices is None or weights is None:
+                continue
+            count = max([getattr(cfg, key) for key in EXPERT_COUNT_KEYS
+                         if isinstance(getattr(cfg, key, None), int)] or [0])
+            for name, module in ffn_call.module.named_children():
+                if not isinstance(module, nn.ModuleList) or len(module) != count:
+                    continue
+                order = indices.flatten().argsort()
+                flat_ids = indices.flatten()[order]
+                x = ffn_call.input.reshape(n_tokens, -1)
+                flat_out = torch.empty(indices.numel(), x.shape[-1], dtype=x.dtype)
+                activation = set()
+                observed = []
+                for expert, item in enumerate(module):
+                    slots = order[flat_ids == expert]
+                    if slots.numel() == 0:
+                        continue
+                    calls = [call for call in inside if call.module is item]
+                    if len(calls) != 1 or not close(calls[0].input, x[slots // indices.shape[1]]):
+                        break
+                    call = calls[0]
+                    facts = analyze_dense_ffn(call, block_calls)
+                    if facts.get("unknown") or not facts.get("gated"):
+                        break
+                    activation.add(facts["activation"])
+                    flat_out[slots] = call.output
+                    observed.append(call)
+                else:
+                    if len(activation) != 1 or not observed:
+                        continue
+                    total = (flat_out.reshape(*indices.shape, -1) * weights.unsqueeze(-1)).sum(1)
+                    aggregate = Call(max(c.order for c in observed), ffn_call.path + "." + name, module,
+                                     [x, indices, weights], {}, [total.reshape(ffn_call.output.shape)])
+                    experts_call = (aggregate, indices, weights)
+                    f["expert_activation"] = activation.pop()
+                    break
+            if experts_call is not None:
+                break
+        if experts_call is None:
+            f["unknown"].append("no experts call or verified per-expert routed outputs were observed")
+            return f
     ecall, idx, wts = experts_call
     k = idx.shape[1]
     # The expert count: the leading dimension of the experts' 3-D weights, else the configuration's.
@@ -1123,18 +1319,36 @@ def analyze_moe(ffn_call, block_calls, cfg):
     found = None
     for gating in ("softmax", "sigmoid"):
         probs = torch.softmax(logits, -1) if gating == "softmax" else torch.sigmoid(logits)
-        for bias_name, bias in [(None, None)] + biases:
+        for bias_name, bias in biases + [(None, None)]:
             sel = probs + (bias if bias is not None else 0.0)
-            top = torch.topk(sel, k, dim=-1).indices
-            if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
-                continue
-            chosen = torch.gather(probs, -1, idx.long())
-            for norm in (False, True):
-                w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
-                ratio = (wts.float() / w)
-                scale = float(ratio.mean())
-                if close(w * scale, wts.float()):
-                    found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale}
+            groups = getattr(cfg, "n_group", 1) or 1
+            used = getattr(cfg, "topk_group", groups) or groups
+            # Test the grouping rule against the expert indices actually
+            # observed. Configuration supplies geometry, never the rule.
+            candidates = [(1, 1, None, sel)]
+            if 1 <= used < groups and n_exp % groups == 0:
+                grouped = sel.reshape(n_tokens, groups, n_exp // groups)
+                for rule in ("max", "top2"):
+                    scores = (grouped.max(-1).values if rule == "max" else
+                              grouped.topk(min(2, n_exp // groups), dim=-1).values.sum(-1))
+                    keep = scores.topk(used, dim=-1).indices
+                    mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, keep, True)
+                    candidates.append((groups, used, rule,
+                                       sel.masked_fill(~mask.repeat_interleave(n_exp // groups, -1), -torch.inf)))
+            for groups_, used_, rule, selection in candidates:
+                top = torch.topk(selection, k, dim=-1).indices
+                if not torch.equal(torch.sort(top, -1).values, torch.sort(idx.long(), -1).values):
+                    continue
+                chosen = torch.gather(probs, -1, idx.long())
+                for norm in (False, True):
+                    w = chosen / chosen.sum(-1, keepdim=True) if norm else chosen
+                    ratio = (wts.float() / w)
+                    scale = float(ratio.mean())
+                    if close(w * scale, wts.float()):
+                        found = {"gating": gating, "selection_bias": bias_name, "norm_topk": norm, "scale": scale,
+                                 "groups": groups_, "groups_used": used_, "group_score": rule}
+                        break
+                if found:
                     break
             if found:
                 break
@@ -1142,7 +1356,7 @@ def analyze_moe(ffn_call, block_calls, cfg):
             break
     if found is None:
         f["unknown"].append("routing is not top-k over softmax or sigmoid probabilities (with an optional "
-                            "selection bias, renormalization and scale), e.g. group-limited routing")
+                            "selection bias, group maximum or top-two sum, renormalization and scale)")
         return f
     f.update(found)
     # Shared expert: a sub-module reading the block input whose output is added (gated or not) to the experts'.
@@ -1173,7 +1387,7 @@ def analyze_moe(ffn_call, block_calls, cfg):
     params = dict(ecall.module.named_parameters(recurse=False))
     gu, dn = params.get("gate_up_proj"), params.get("down_proj")
     gb, db = params.get("gate_up_proj_bias"), params.get("down_proj_bias")
-    f["expert_activation"] = None
+    f.setdefault("expert_activation", None)
     if gu is not None and dn is not None and gu.dim() == 3 and dn.dim() == 3:
         x = ecall.input.reshape(n_tokens, -1).float()
         target = ecall.output.reshape(n_tokens, -1).float()
@@ -1703,10 +1917,11 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
         mixer_facts = analyze_linear_mixer(mixer)
         if mixer_facts is None:
             mixer_facts = analyze_recurrent(trace, mixer, block_calls)
+    mixer_facts["indexer"] = analyze_indexer(trace, mixer.path, block_calls, freqs)
     b["mixer"] = mixer_facts
     is_moe = any(not a.is_floating_point() and a.dim() == 2
                  for c in block_calls if _is_descendant(c.path, ffn.path)
-                 for a in list(c.args) + list(c.kwargs.values()) if torch.is_tensor(a))
+                 for a in list(c.args) + list(c.kwargs.values()) + c.outputs if torch.is_tensor(a))
     b["ffn"] = analyze_moe(ffn, block_calls, trace.reduced) if is_moe else analyze_dense_ffn(ffn, block_calls)
     return b
 

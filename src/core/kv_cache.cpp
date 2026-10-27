@@ -36,7 +36,8 @@ size_t KvCache::bytes_per_token(int32_t n_layers, int32_t n_head_kv, int32_t hea
 
 size_t KvCache::bytes_per_token(const KvCacheConfig& config) noexcept {
     const size_t both = bytes_per_token(config.n_layers, config.n_head_kv, config.head_dim, config.type);
-    return config.values_in_keys ? both / 2 : both;
+    return (config.values_in_keys ? both / 2 : both) + static_cast<size_t>(config.n_layers) *
+        static_cast<size_t>(config.n_head_kv) * static_cast<size_t>(config.auxiliary_dim) * sizeof(float);
 }
 
 size_t KvCache::kept_bytes(const KvCacheConfig& config, int32_t positions, int32_t keep_back) noexcept {
@@ -76,6 +77,10 @@ Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
          (quant::is_block_quantized(dtype) && config.value_offset % quant::kBlock != 0))) {
         return Status(ErrorCode::InvalidArgument, "values in keys need a block-aligned value_offset inside the row");
     }
+    if (config.auxiliary_dim < 0 || config.auxiliary_dim > (1 << 20) ||
+        (config.auxiliary_dim > 0 && !config.values_in_keys)) {
+        return Status(ErrorCode::InvalidArgument, "auxiliary keys need values_in_keys and a valid dimension");
+    }
     if (config.window > 0 && config.sink_tokens > config.page_tokens) {
         return Status(ErrorCode::InvalidArgument, "sink_tokens must fit in the first page");
     }
@@ -88,7 +93,7 @@ Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
     KvCache& kv = *cache;
     kv.config_ = config;
     kv.dtype_ = dtype;
-    kv.row_bytes_ = dtype_row_bytes(dtype, config.head_dim);
+    kv.row_bytes_ = dtype_row_bytes(dtype, config.head_dim) + static_cast<size_t>(config.auxiliary_dim) * sizeof(float);
     kv.value_skip_ = config.values_in_keys ? dtype_row_bytes(dtype, config.value_offset) : 0;
     kv.slot_bytes_ = static_cast<size_t>(config.n_head_kv) * kv.row_bytes_;
     kv.planes_ = config.values_in_keys ? 1 : 2;
@@ -137,11 +142,17 @@ Result<std::unique_ptr<KvCache>> KvCache::create(const KvCacheConfig& config) {
         if (g.window == 0) continue;
         kv.window_page_bytes_ += planes * g.members.size() * tokens * kv.slot_bytes_;
     }
-    if (kv.windowed_groups_ > 0) {
+    if (kv.windowed_groups_ > 0 || config.auxiliary_dim > 0) {
         uint64_t h = 0xcbf29ce484222325ULL;  // FNV-1a over the windows, layer by layer
         for (const int32_t w : windows) {
             for (int b = 0; b < 4; ++b) {
                 h ^= static_cast<uint64_t>((static_cast<uint32_t>(w) >> (8 * b)) & 0xFFu);
+                h *= 0x100000001b3ULL;
+            }
+        }
+        if (config.auxiliary_dim > 0) {
+            for (int b = 0; b < 4; ++b) {
+                h ^= static_cast<uint64_t>((static_cast<uint32_t>(config.auxiliary_dim) >> (8 * b)) & 0xFFu);
                 h *= 0x100000001b3ULL;
             }
         }
@@ -311,9 +322,25 @@ uint8_t* KvCache::row(int32_t layer, int32_t pos, int32_t kv_head, bool value) c
 void KvCache::store(int32_t layer, int32_t pos, const float* k, const float* v) {
     for (int32_t g = 0; g < config_.n_head_kv; ++g) {
         quant::quantize_row(dtype_, k + g * config_.head_dim, row(layer, pos, g, false), config_.head_dim);
+        if (config_.auxiliary_dim > 0) {
+            const size_t main_bytes = dtype_row_bytes(dtype_, config_.head_dim);
+            std::memset(row(layer, pos, g, false) + main_bytes, 0, row_bytes_ - main_bytes);
+        }
         if (config_.values_in_keys) continue;
         quant::quantize_row(dtype_, v + g * config_.head_dim, row(layer, pos, g, true), config_.head_dim);
     }
+}
+
+void KvCache::store_auxiliary(int32_t layer, int32_t pos, const float* keys) {
+    const size_t offset = dtype_row_bytes(dtype_, config_.head_dim);
+    for (int32_t g = 0; g < config_.n_head_kv; ++g) {
+        std::memcpy(row(layer, pos, g, false) + offset, keys + g * config_.auxiliary_dim,
+                    static_cast<size_t>(config_.auxiliary_dim) * sizeof(float));
+    }
+}
+
+const uint8_t* KvCache::auxiliary_key(int32_t layer, int32_t pos, int32_t kv_head) const noexcept {
+    return row(layer, pos, kv_head, false) + dtype_row_bytes(dtype_, config_.head_dim);
 }
 
 KvCache::RowView KvCache::row_view(int32_t layer) const noexcept {

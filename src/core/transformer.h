@@ -181,6 +181,28 @@ struct TransformerOptions {
     LatentForm latent_form = LatentForm::Auto;
 };
 
+// Owns the split execution views of one old combined MLA projection.
+// bind() validates [head][nope + value][rank], decodes/transposes only keys
+// to F32 and copies value bytes unchanged. Source bytes are needed only
+// during bind(); its name must outlive these views. Views remain valid
+// until the next bind() or destruction. Single-thread ownership; do not
+// bind while another thread reads its views. InvalidModel for bad shapes,
+// Unsupported for formats that are not ordinary on-disk weight rows.
+class CombinedLatentWeights {
+public:
+    Status bind(const TensorView& source, const LatentAttention& geometry, int32_t heads);
+    [[nodiscard]] const TensorView& key() const noexcept { return key_; }
+    [[nodiscard]] const TensorView& value() const noexcept { return value_; }
+    CombinedLatentWeights() = default;
+    CombinedLatentWeights(const CombinedLatentWeights&) = delete;
+    CombinedLatentWeights& operator=(const CombinedLatentWeights&) = delete;
+
+private:
+    std::vector<float> keys_;
+    std::vector<uint8_t> values_;
+    TensorView key_, value_;
+};
+
 class Transformer {
 public:
     // One sequence's state; see "Several sequences" below.
@@ -217,7 +239,7 @@ public:
     // itself) alone followed the context: at position n_past() + its depth,
     // attending to the context and to its ancestors only (the same visible
     // positions, in the same order and spans, as a linear pass over its
-    // branch), recurrent (DeltaNet) blocks continuing from the state after
+    // branch), stateful (DeltaNet or compression) blocks continuing from the state after
     // its parent. So its row of logits (one per token, in token order, as
     // Logits::All) has the bits a linear pass over its branch gives it
     // (attention never depends on the batch; the CPU backend's matmuls give a
@@ -310,7 +332,7 @@ public:
     static constexpr int32_t kLatentTileMin = 16;
     static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
-    // Bytes held by the recurrent (DeltaNet, Mamba, ShortConv, Kda) states; 0 for plain transformers.
+    // Bytes held by the recurrent (DeltaNet, Mamba, ShortConv, Kda and compression) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     // The most a context made now (make_context()) holds besides its KV
     // pages, which it maps as it uses them: its recurrent states, its
@@ -322,7 +344,7 @@ public:
     // exactly as it always has.
     [[nodiscard]] size_t context_state_bytes() const noexcept;
     // Whether the context carries a state bound to its position, beyond KV
-    // rows any prefix of it can be cut from: recurrent (DeltaNet) states, or
+    // rows any prefix of it can be cut from: recurrent (DeltaNet or compression) states, or
     // the rows of the last window of windowed attention blocks, whose older
     // rows the cache lets go (KvCache::layer_windows). Such a context returns
     // only to where that state is kept (snapshots, the rollback margin).
@@ -389,7 +411,7 @@ public:
     // positions, as long as the windowed blocks still hold the rows of the
     // window before n (the rollback margin kept behind the end, a snapshot's
     // pinned window: InvalidArgument otherwise, see KvCache::truncate()).
-    // Recurrent (DeltaNet) states cannot be rewound, so hybrid models restore
+    // Recurrent (DeltaNet or compression) states cannot be rewound, so hybrid models restore
     // a copy instead: they accept n == 0, n == n_past(), any n whose position
     // n - 1 is still inside the rollback window, or the position of a state
     // snapshot (Unsupported otherwise). Snapshots past n are discarded.
@@ -650,6 +672,11 @@ public:
     // they meet (a latent-attention head's absorbed query). Valid until the
     // next pass.
     [[nodiscard]] std::span<const float> last_queries() const noexcept { return q_; }
+    // Sparse cache-row indices selected for each query of the last block's
+    // pass, empty for dense attention. Valid until the next mixer pass.
+    [[nodiscard]] std::span<const std::vector<int32_t>> last_index_positions() const noexcept {
+        return index_positions_;
+    }
 
     // Streams transformer blocks through `source` instead of reading the
     // mapping in place. Block l is item `items[l]` of the source (laid out as
@@ -768,17 +795,23 @@ private:
         // Laurel's low-rank branch [n_embd -> rank -> n_embd]; per-layer embeddings' gate
         // [n_embd -> ple_dim] and projection back [ple_dim -> n_embd] (ModelConfig::ple_dim)
         kLaurelL, kLaurelR, kPleGate, kPleProj,
+        kIndexQ, kIndexK, kIndexWeights,  // DSA indexer projections
+        kKvB,  // older MLA files: combined per-head [key | value] expansion
+        kSharedKv, kOutputA, kOutputB,
+        kCompressKv, kCompressGate, kIndexCompressKv, kIndexCompressGate,
+        kHcAttn, kHcFfn,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
     struct Layer {
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
-        int32_t state_slot = -1;  // index into states_ (DeltaNet, Mamba)
+        int32_t state_slot = -1;  // index into states_ (recurrent mixer or compression)
         int32_t window = 0;       // attention: visible positions (BlockPlan::windowed); 0: all
         int32_t rope_table = 0;   // attention: index into rope_tables_
         std::array<const TensorView*, kWeightRoles> w{};
         std::vector<float> attn_norm, ffn_norm, q_norm, k_norm, bq, bk, bv;
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
+        std::vector<float> index_norm, index_bias;  // index-key LayerNorm (epsilon 1e-6)
         std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
         std::vector<float> conv1d;   // [channel][kernel] taps
         std::vector<float> ssm_a;    // -exp(A_log): per value head (DeltaNet, Mamba-2), per [channel][state] (Mamba-1)
@@ -813,9 +846,12 @@ private:
         std::vector<float> altup_router, altup_router_norm, altup_predict, altup_correct, altup_correct_scale;
         std::vector<float> ple_norm;      // per-layer embeddings: norm after their projection (post_norm)
         float output_scale = 1.0f;        // layer_output_scale: multiplies the residual stream after the block
+        std::vector<float> compress_bias, compress_norm, index_compress_bias, index_compress_norm;
+        std::vector<float> hc_attn_base, hc_attn_scale, hc_ffn_base, hc_ffn_scale;
     };
-    // Recurrent memory of one recurrent block, sized for its mixer.
+    // Stateful memory: recurrent mixers and compression share checkpoints and context images.
     struct RecurrentState {
+        // Compression stores bounded softmax accumulators in conv, with ssm empty.
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
         // DeltaNet: per value head a [head_dim (value) x head_dim (key)]
         // matrix. Mamba-1: per channel d_state values; Mamba-2: per head a
@@ -846,6 +882,12 @@ private:
     // The same over heads `stride` floats apart (rope_dim channels rotated at
     // the start of each): latent attention's expanded queries.
     void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table) const;
+    void rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, const RopeTable& table, RopeLayout layout) const;
+    Status indexer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    std::vector<float> index_q_, index_k_, index_weights_;
+    // Per batch row: selected physical cache positions, in causal order.
+    // Empty outside indexed blocks; keys themselves live in the paged cache.
+    std::vector<std::vector<int32_t>> index_positions_;
     // One sequence's part of the current pass (segs_): its tokens are rows
     // [first, first + n) of the batch, and the state they read and write is
     // its context's, the live one's (forward(), and every pass of a single
@@ -926,6 +968,12 @@ private:
     // their parents' as delta_net_mixer() does.
     Status short_conv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
     Status kda_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status shared_kv_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
+                           const uint8_t* head_mask);
+    Status hyper_collapse(const TensorView& projection, const std::vector<float>& base,
+                          const std::vector<float>& scale, int32_t n, const Route& route);
+    void hyper_add(int32_t n);
+    Status hyper_head(int32_t n, const Route& route);
     // Multi-head latent attention (ModelConfig::mla), in the form forward()
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
@@ -1123,6 +1171,8 @@ private:
     std::vector<float> embd_norm_, embd_norm_b_;     // optional LayerNorm of the embeddings (BLOOM)
     const TensorView* position_embd_ = nullptr;      // learned absolute positions (GPT-2), or nullptr
     std::vector<float> alibi_slopes_;                // ALiBi: per query head (ModelConfig::alibi_bias); empty: none
+    const TensorView* hc_head_ = nullptr;
+    std::vector<float> hc_head_base_, hc_head_scale_;
     std::vector<Layer> layers_;
     std::vector<RecurrentState> states_;
     std::unique_ptr<ExpertStore> expert_store_;
@@ -1198,6 +1248,9 @@ private:
     std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output (Mamba: in_proj, gate, output)
     std::vector<float> ssm_xc_, ssm_dbc_, ssm_dtl_, ssm_dt_;  // Mamba-1: convolved x, [dt | B | C], dt, dt per channel
     std::vector<float> ba_, low_a_, low_b_;  // fused DeltaNet strengths and Kda low-rank projections
+    std::vector<float> compress_kv_, compress_gate_, index_compress_kv_, index_compress_gate_;
+    std::vector<float> compression_scratch_;
+    std::vector<float> hc_streams_, hc_normalized_, hc_coefficients_, hc_post_, hc_comb_, hc_next_;
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch

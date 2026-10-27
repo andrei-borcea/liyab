@@ -164,7 +164,11 @@ block the configuration lists), the vocabulary is 512 tokens, the FFNs 64 wide a
 random, with norm weights drawn away from 0 and 1 so that a norm multiplying by `w` and one multiplying by `1 + w`
 differ. One pass over 13 tokens is recorded: every module's inputs and outputs (forward hooks), and the queries,
 keys and values each attention receives with its arguments, through an attention function registered with
-transformers. Each fact is then recomputed from the records, never read from a class or module name:
+transformers. Older remote implementations dispatching directly through PyTorch SDPA or eager matmuls/softmax are
+observed at those operations instead; only verified scaled dot products with full causal masks are accepted.
+Direct router linear operations owned by a module are recorded with that module's actual inputs and outputs.
+Each fact is then recomputed from the
+records, never read from a class or module name:
 
 | Fact | How it is established |
 | :--- | :--- |
@@ -174,7 +178,7 @@ transformers. Each fact is then recomputed from the records, never read from a c
 | Q/K norms | A norm reading the projection and feeding the rotation sits before RoPE; one reading the rotated projection and giving the keys sits after it. Its weight's size says whether it spans one head or all of them. |
 | Attention | The `scaling`, `sliding_window`, `softcap` and sink arguments the attention receives; whether the output projection reads the attention output or `output * sigmoid(gate)` with the gate taken from `[q | gate]` heads. |
 | FFN | Which of `silu`, `gelu` (tanh or erf), `relu`, `relu²`, quick GELU makes `act(gate) * up` equal the down projection's input, for separate or fused `[gate | up]` projections; `act(up)` is a non-gated FFN. |
-| MoE routing | The router's logits and the indices and weights the experts receive: top-k over softmax or sigmoid probabilities, with or without a selection bias, renormalization and a scale; a shared expert, with or without a sigmoid gate, from how the block output is composed; the experts' activation from their weights. |
+| MoE routing | The router's logits and the indices and weights the experts receive: top-k over softmax or sigmoid probabilities, with or without a selection bias, group-limited selection (group maximum or sum of the best two selection scores, recomputed against the observed expert indices), renormalization and a scale; a shared expert, with or without a sigmoid gate, from how the block output is composed; the experts' activation from their weights. |
 | Embeddings, logits | Block 0's input against the embedding table's rows (a scale of 1 or √d); the logits against the output projection's output (a scale or a soft-cap); whether the output matrix is the embedding table. |
 
 **The GGUF.** Its metadata and tensor names and shapes give the hyperparameters, how the file encodes RoPE (base,
@@ -579,9 +583,11 @@ tool now reproduces the registry's `gemma2` row exactly. Mistral-Nemo-Instruct-2
 in it for their pre-tokenizers alone (`tekken`, `smollm`), which are table rows now: described again (Nemo from
 bartowski's Q8_0 header, SmolLM2 from bartowski's f16), both give the registry's `llama` row with nothing missing
 (Nemo's head size 128 from `key_length`). SmolLM2's f16 file then gave transformers' ids on the whole text and mean KL
-0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention it reports an unknown rather than a
-row: the engine runs it from the file's tensors, but the tool does not compare its facts with the reference, so
-such a model is checked with `liyab-kl` instead ([README, Correctness](../README.md#correctness)).
+0.00000, top-1 100.00% with `liyab-kl --kv f16` (511 positions). For latent attention the tool reconstructs expanded
+keys and values from the observed normalized shared latent, the query's low-rank path and rotary suffix, and
+checks the absorbed GGUF geometry separately from the expanded reference geometry. It compares the combined
+KV projection's rows with the checkpoint before proposing the RoPE pairing. Numerical conformance still uses
+`liyab-kl` ([README, Correctness](../README.md#correctness)).
 
 ### Modern block regression check
 
@@ -694,13 +700,15 @@ both sets of measurements are retained. BF16 matrix operations on the Metal rout
 
 * **Transformers must run the model.** The trace and the gate need the model's implementation in transformers
   (or its own code with `--trust-remote-code`). Modeling code that does not call transformers' attention functions
-  leaves the attention facts unknown.
+  leaves the attention facts unknown unless its direct PyTorch SDPA or eager operations can be observed and its
+  scores and causal mask verified.
 * **A prefix of the blocks is traced.** The shortest prefix holding every kind of block the configuration lists per
   block (`layer_types` and similar lists, the first MoE block, a full-attention interval), at least 2. Which blocks
   attend through a window comes from `layer_types` when the configuration has it; otherwise every traced block
   must agree, and the tool says it assumed the rest do too.
-* **Experts' weights.** The experts' activation is recomputed from transformers' fused 3-D expert weights; other
-  layouts leave it to the dense blocks' activation.
+* **Experts' weights.** The experts' activation is recomputed from transformers' fused 3-D expert weights or
+  individually observed ModuleList experts whose routed inputs and weighted sum can be verified; unknown layouts
+  remain unknown.
 * **What the tool knows of the engine.** Row fields come from `architecture.h` and need a rule each in the tool (it
   refuses rows while one has none). Features the engine takes from the file are recognized by the metadata keys
   `describe_model()` reads: an attention scale (`attention.scale`), soft caps (`attn_logit_softcapping`,
@@ -1211,3 +1219,227 @@ Metal projections; attention and recurrent operations continue using their exist
 | Qwen3.5-0.8B | Metal F16 (GPU projections) | 274.58 → 275.07 | 34.028 → 34.256 | +0.18% / +0.67% |
 
 Shared-KV consumers must match their source block's query and KV head counts and rotation plan; incompatible files are refused before binding. Integration tests combine shared KV with per-block head and FFN widths across prefill, decode, rollback, tree drafts, serialized state and parked sequences for all four KV types.
+### Group-limited expert routing
+
+The engine reads `expert_group_count` and `expert_group_used_count`, validates equal group sizes and enough
+eligible experts for top-k, then limits expert selection to those groups. With a selection bias, groups score the
+sum of their best two biased probabilities (one for a one-expert group); without it, the maximum probability.
+Biases affect selection only. `reference_trace.py` tests both group-score formulas against the indices supplied
+to the reference's experts; `describe_model.py` checks the observed geometry and formula against the GGUF.
+A rule it cannot establish still prevents proposing a registry row. No new `ArchSpec` field is needed.
+When `expert_weights_norm` explicitly specifies the behavior, the verified file value wins and an existing
+registry's unused fallback stays unchanged. Such a file cannot establish the default of older files omitting it.
+`tiny_checkpoint.py` removes a published checkpoint's quantization configuration before saving its random F32
+weights, since those tensors are not quantized.
+The group-routing golden cases are pinned on ARM64 NEON dotprod, x86 AVX2 and x86 scalar; streamed and resident
+biased routing agree exactly on each platform.
+
+Pinned official DeepSeek-V2-Lite-Chat (`85864749cd611b4353ce1decdb286193298f64c7`) and DeepSeek-V3
+(`e815299b0bcbac849fa540c768ef21845365c9eb`) configurations produce the unchanged row:
+
+```cpp
+    {"deepseek2", RopeLayout::Adjacent, "ffn_norm", false},
+```
+
+At residual width 256, V2-Lite keeps its original 512-wide latent, single query projection and dense/MoE
+blocks; its F32 checkpoint gives 512 identical IDs, 511 positions, mean KL 0.00000 and top-1 99.80% with F16 KV.
+V3 keeps its original 1,536-wide query latent and 512-wide KV latent, three dense blocks and one MoE block with
+sixteen experts in eight groups, four selected groups and eight selected experts. It gives 485 identical IDs,
+484 positions, mean KL 0.00000 and top-1 99.38%. Both tokenizers match all three texts (617/1,013/241 IDs for V2,
+485/783/217 for V3). The b11819 converter needs a local exact-fingerprint registration for the older V2 tokenizer;
+the existing `deepseek-llm` pre-tokenizer then reproduces its IDs. No reference forward implementation is patched.
+These are random-weight numerical checks. The published `DeepSeek-V2-Lite-Chat.Q8_0.gguf` from
+`mradermacher/DeepSeek-V2-Lite-Chat-GGUF` at revision `9ee9f1f8f39f673e1022e176d586aef4228f630d` separately
+passed real execution and resident/streamed mode equivalence: 46 prompt tokens and 64 generated tokens, with
+byte-identical replies and counts for resident, 2.29% and 10.47% expert caches, F16 KV and no requantization.
+The 16,702,518,016-byte source verifies SHA256
+`78a1a180db56416782f71cd7e019ea3d7227cf11a918de9ca1d50f038caba0ec`; its tokenizer matches 617/1,013/241 IDs
+and its template all 14 reference renders. The saved earlier revision explicitly refuses the missing split-MLA
+metadata, so it cannot provide an earlier real-weight comparison. No real HF logit reference or KL gate is
+claimed for this file. README records the observed cache/read/stall counters and their timing limits; used
+weights were removed after preserving the evidence.
+
+The final unchanged-output performance check uses Qwen3-0.6B, Llama-3.2-1B-Instruct and the recurrent
+Qwen3.5-0.8B on an M4 Pro: original BF16 CPU and Metal/CPU-matrix-fallback routes, F16 actual Metal routes,
+and 512-token CPU `liyab-bench` prefill. One warmup precedes six balanced pairs per configuration. All 108
+measured CLI turns generated 128 tokens, with byte-identical replies and all four token counts equal in
+each pair. All 21 median paired speed ratios across 12 configurations and 72 pairs fall in
+0.993247–1.011333, passing the unchanged ±3% gate with frozen executables/libraries and no competing jobs.
+README records the three CPU prefill medians. These baseline-model timings are distinct from architecture
+conformance and from the individual real V2 streaming observations above.
+
+Files predating split MLA projections describe the expanded head with `attention.key_length`, `value_length`
+and one KV head per query head. `describe_model()` normalizes those dimensions to the cached latent and plans
+`BlockPlan::latent_combined` from `attn_kv_b.weight`; ambiguous combined/split tensors are refused. The description
+tool compares the corresponding expanded dimensions to the observed reference geometry. At block acquisition,
+the key rows are dequantized and transposed to F32 and value rows retain their original bytes, then both use
+the existing absorbed or expanded forward pass. These copies are bounded by one block, work after rebasing a
+streaming slot, and count toward the expert-cache planning margin.
+
+### Auxiliary index-key storage
+
+`KvCacheConfig::auxiliary_dim` adds F32 channels after each cached latent key row. `head_row_bytes()` includes
+the main row in its cache format and those F32 channels. These channels are owned by
+the paged cache and copied, saved and released with the main row. They are not attention values and do not take
+part in per-channel main-key scaling. `KvCache::bytes_per_token()` and the image layout include their bytes;
+the layout fingerprint separates these contexts from ordinary KV images. Mixed-format rows remain raw in the
+prefix store so a codec cannot round an index key and change a later position selection. The cache tests cover
+all four main KV types, page images, position copies, scaling and rollback.
+
+### Sparse latent attention
+
+`attention.indexer.head_count`, `key_length` and `top_k` describe the lightning indexer; tensors bind its query,
+key and signed head-weight projections plus the key LayerNorm. `attention.indexer.types` distinguishes full
+indexers from blocks sharing the preceding selection. The engine validates these flags against tensor presence
+and refuses a shared first block. `attention.indexer.kpool > 1` is explicitly unsupported.
+
+`reference_trace.py` recomputes the indexer's rectified, weighted causal scores and tests both rotary pairings
+against its observed integer position selections. `ArchSpec::indexer_rope` records that pairing independently of
+the main attention's, and `latent_norm_eps` records a latent RMS epsilon differing from the block norms.
+The epsilon comparison permits GGUF's F32 metadata rounding, as the other scalar comparisons do.
+Shared layers must pass the preceding layer's indices unchanged. The trace reconstructs query and KV latent
+normalization and expanded MLA keys/values; the description compares both their geometry and attention scale
+with the GGUF's split absorbed/expanded metadata. On the tiny GLM-5 checkpoint it proposes exactly:
+
+```cpp
+{.name = "glm-dsa", .rope = RopeLayout::Adjacent, .ffn_norm = "ffn_norm", .moe_norm_weights = true,
+ .indexer_rope = RopeLayout::Adjacent, .latent_norm_eps = 1e-06f}
+```
+
+The standard F32 reference gate uses the original latent/indexer geometry, four blocks and `index_topk=256`:
+493 scored positions, identical 494 token IDs, mean KL 0.00000, maximum 0.00001, top-1 99.80%. A separate
+`index_topk=8` first-layer comparison checks all 494 causal selections exactly. The smaller full-layer top-k 8/32
+diagnostics fail top-1 and remain numerical limitations, as recorded in the README; a rounded-KV diagnostic is
+kept separate from the standard reference gate. No registry row is proposed when the latent decomposition or
+indexer pairing cannot be established.
+
+DeepSeek-V3.2 (`a7e62ac04ecb2c0a54d736dc46601c5606cf10a6`) is checked with four blocks, residual width 256,
+original query/KV/indexer widths and `index_topk=384`: 485 identical IDs, 484 scored positions, mean KL 0.00000,
+maximum 0.00074, top-1 99.59%. At top-k 8 all 485 first-layer selections match the reference. The description
+proposes exactly `{"deepseek32", RopeLayout::Adjacent, "ffn_norm", true}`. The converter's BOS assertion had to
+be removed in a local copy because this official tokenizer explicitly sets `add_bos_token=false`; that rule
+is preserved in both the reference and GGUF. This revision supplies no Jinja chat template. Top-k 256 diagnostics
+at widths 256 and 512 give top-1 98.76% and remain below the required gate.
+
+GLM-5.2 at revision `cf457fa734ab149ffef225f80893eb38c6ff5cdc` proposes the same `glm-dsa` row. Its four-block
+tiny checkpoint keeps the original latent/index widths and top-k 256, with three full indexers and a shared
+fourth block: 494 identical IDs, 493 positions, mean KL 0.00000, maximum 0.00008, top-1 99.80%. Its own template
+passes 14 reference renders and its tokenizer matches the three tokenizer texts.
+
+GLM-5.1 (`26e1bd6e011feb778d25ae34b09b07074139d92d`) also proposes the same row. Its four-block checkpoint at
+top-k 256 gives 494 identical IDs, mean KL 0.00000, maximum 0.00001, top-1 99.80%, plus all three tokenizer texts
+and 14 template renders matching.
+
+Kimi K2 (`moonshotai/Kimi-K2-Instruct`, revision `fd1984e2b7a3350dbf7305fe73a4ede25c14de50`) uses the existing
+`deepseek2` parts. Its older code's eager attention and direct `F.linear` router are observed and verified. A
+two-block, width-256 checkpoint keeping the original latent widths gives mean KL 0.00000, maximum 0.00016 and
+top-1 99.80% on 502 positions using reference IDs; the reference disables its obsolete cache API. This numerical
+result is not a tokenizer/template gate: the `kimi-k2` pre-tokenizer and tokenizer-side tool sorting are an
+integration dependency. The description correctly refuses support while that pre-tokenizer is absent.
+
+Ling-mini-2.0 (`inclusionAI/Ling-mini-2.0`, revision `a810f6416bc4e1e29c9d7f271dd2fa7e56e71eab`) proposes
+`{"bailingmoe2", RopeLayout::Halves, "ffn_norm", true}`. Individual ModuleList expert calls are verified against
+the router's token ordering and their weighted outputs reconstructed; each used expert's activation must agree.
+The two-block tiny checkpoint uses width 512, four query/two KV heads of 128 channels, 64 rotary channels,
+16 experts/top-8 and four of eight groups: F32 reference, F16 KV, 512 identical IDs, mean KL 0.00000, maximum
+0.00040, top-1 99.61%. Fourteen template renders and all three tokenizer texts match. Its transformers-4-era
+remote code needs compatibility for removed helpers, RoPE initialization and tied-weight metadata. Transformers 5
+also materializes its nonpersistent RoPE buffer without calling the old constructor rule; the reference driver
+restores that exact rule after loading. A reference with the resulting zero frequencies failed (KL 0.00470,
+top-1 5.87%) and is retained separately from the corrected reference evidence. No engine numerical patch was
+needed. Golden cases cover resident and streamed fused-QKV, Q/K-norm and grouped-routing execution.
+
+The README's GLM-5.2 capacity estimates use the official configuration revision
+`cf457fa734ab149ffef225f80893eb38c6ff5cdc`, without downloading its weights. There are 21 full indexers and
+57 shared-indexer blocks. Matrix counts include untied embedding/output matrices, MLA projections, dense FFNs,
+shared experts, routers and full indexer projections. Norms and router selection biases remain F32 in the
+estimate. Routed expert parameters are `75 × 256 × 3 × 6144 × 2048`; a cold decode token reads eight of the
+256 experts per MoE block. Format byte rates are F16/BF16 2, Q8_0 34/32, and Q2_K/Q3_K/Q4_K/Q5_K/Q6_K
+84/110/144/176/210 bytes per 256 parameters. Actual GGUF sizes depend on their mixed tensor formats and whether
+they include unexecuted MTP tensors. The current uniform cache layout reserves auxiliary channels in shared
+blocks too; the estimate includes that allocation rather than assuming only full indexers consume key memory.
+
+### Shared K=V compression components
+
+The `deepseek4` component row records shared K=V, unweighted query-head RMSNorm, trailing adjacent-pair partial
+RoPE and inverse output RoPE. `attention.q_lora_rank`, `output_group_count`, `output_lora_rank`,
+`compress_rope_freq_base` and per-block `compress_ratios` describe geometry. Compressor tensor widths select
+one series or two overlapping series; overlapping blocks require their own compressed-key indexer. No tensor
+or metadata rule depends on a model's name. Learned sinks and the full V4 MoE variant are refused precisely
+until their separately owned operations are integrated; this row is not a full V4 support claim.
+
+Compression keeps channelwise stable-softmax maxima, denominators and weighted sums, not historical source
+projections. Nonoverlapping state uses `3 * head_dim` floats; overlapping state uses `9 * head_dim` plus
+`9 * index_dim` for its independent indexer. Existing recurrent snapshots/checkpoints carry these bounded
+arrays through rollback, draft trees, sequences and context images. A closed window's normalized/rotated
+entry follows its closing source token in the paged auxiliary-key image. Tree queries resolve that token
+through their ancestry before reading the entry. Index head weights remain signed; only query/key dot scores
+are rectified.
+Public context and prefix-cache contracts include compression in their stateful snapshot/rollback rules.
+
+This first layout retains raw shared-KV rows for the finite context, applying the model's sliding mask during
+attention. It reserves `head_dim + index_dim` F32 auxiliary channels in each attention block at every position,
+including unused nonclosing positions. Memory planning includes those bytes; this is not a compact strided
+allocation or a physically bounded sliding cache. An engine-level sliding window and segment relocation are
+refused because they would discard entries or change compressor phase. Key-only scaling is inapplicable to
+shared K=V values and is not calibrated. Projections use the ordinary Metal/Vulkan/CPU routing; normalization,
+attention, index scoring, residual mixing and grouped output slices use existing CPU kernels. The compressor
+recurrence has NEON, runtime-dispatched AVX2 and scalar channelwise arithmetic.
+
+The manifold-constrained residual path infers coefficients from normalized parallel streams, applies sigmoid
+pre/post weights and the file's Sinkhorn iteration count, consumes the mixing matrix transposed and collapses
+the final streams before output normalization. Expert lookahead is disabled for these streams: the collapsed
+input is not a prediction of the next block's parallel residuals. Component fixtures keep dense FFNs and omit
+sinks explicitly; they cannot establish full V4 conformance.
+The description tool observes shared key/value tensors but refuses a row until it also reconstructs all four
+shared-attention facts; it does not infer them from the family name. Its ordinary Q/K/V trace does not yet
+decompose the compressors, grouped output or mHC. Consequently it cannot independently validate the new
+`q_lora_rank`, output group/rank, compression ratio/base or hyper-connection count/iteration/epsilon metadata
+against that trace. The component runner below supplies those dimensions directly to native modules and
+does not substitute for that full-model description gate.
+
+`test_compression` independently recomputes whole windows and dense attention (including F16 main-cache
+rounding), exercises all 26 storage formats with attention and residual widths independent, and checks
+decode splits, rollback and saved images in
+all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
+The F32 whole-component reference also checks available Metal/Vulkan projection routes with and without
+parallel residual streams, keeping the CPU fallback for other operations and the same logit error bound.
+The shared test writer tiles encoded reference blocks for reader-only formats; their projection reference
+multiplies decoded weights and Q8-rounded activations directly, without calling the backend's dot kernels.
+Their attention norms balance the encoded blocks' measured RMS against the fixture's ordinary weight scale;
+output/FFN norms, the eight writable-format controls and the logit error bound remain unchanged.
+The Android regression runner includes this suite and supplies its encoded quantization fixtures.
+LoRA targets for whole compression, indexer and residual-stream projections, including the final stream
+collapse, use the normal adapter-aware matmul path. The grouped first output projection and legacy combined
+latent expansion return `Unsupported` when selected as adapter targets, naming the tensor; their slices do
+not share one input row. Tests compare supported F32/F16/BF16/Q8_0 adapters with merged weights through
+prefill, decode, tree verification and rollback, and check explicit refusal on F32 and Q8_0 base matrices.
+`tools/compression_reference.py` uses native transformers 5.19 modules without rounding their main keys:
+
+| Component fixture | Tokens | Mean / max KL | Top-1 | CSA top-2 selections |
+|---|---:|---:|---:|---:|
+| Three kinds + mHC, head/index 32 | 83 | 0.000000219 / 0.00000573 | 100% | 79/83 |
+| Three kinds + mHC + YaRN, trained head/index widths 512/128 | 512 | 0.000000647 / 0.00029766 | 99.80% | 511/512 |
+| Isolated first CSA block, trained widths | 512 | 0.000000054 / 0.00000037 | 100% | 512/512 |
+
+The isolated selection test excludes changes to the source hidden state caused by earlier layers' F16 main
+cache. The complete component fixture retains sliding, CSA and HCA blocks; none is removed to claim a model
+gate. Three synthetic golden cases pin compression with and without mHC and with YaRN on NEON, AVX2 and
+scalar. Every previously pinned case remains unchanged.
+
+### GLM-4.7-Flash export facts
+
+The official `glm4_moe_lite` configuration has dense and sparse blocks, sigmoid routing, block RMS epsilon
+1e-5 and separately constructed query/KV latent RMS epsilon 1e-6. The b11819 `Glm4MoeLiteModel` converter
+writes `deepseek2` and the block epsilon, but omits `expert_gating_func`; the engine's documented file default
+is softmax. The description tool reports that routing mismatch and proposes a latent-epsilon row different
+from the existing `deepseek2` row. The file cannot select both latent normalization contracts unambiguously
+from its architecture label and existing normalization metadata.
+
+An official-configuration random F32 tiny with one dense and one sparse block (trained query/KV/head widths,
+four attention heads, residual/FFN widths 256/128, 16 experts) gives 494 identical IDs / 493 positions, mean
+KL 0.00019, max 0.00185 and top-1 58.22% on the branch. All three tokenizer texts match (494/783/204 IDs),
+and fourteen chat-template cases render exactly. A diagnostic GGUF copy adding sigmoid gating plus the
+tool's scratch-only latent-epsilon row gives mean/max KL 0.00000 and top-1 100%. It uses the same unmodified
+native F32 reference. This isolates the missing export facts; it is not a standard converter gate, and no
+name-based engine exception or global change to existing DeepSeek normalization is made.

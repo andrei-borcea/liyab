@@ -171,7 +171,7 @@ void print_stats(const liyab_generation_stats& stats) {
     if (const int32_t used = stats.expert_hits + stats.expert_late + stats.expert_misses; used > 0) {
         std::fprintf(stderr,
                      "experts: %d used, %.0f%% cached, %.0f%% prefetched late, %.0f%% missed; %.1f MiB/token read, "
-                     "%.0f ms waiting (%.0f%% of decode)\n",
+                     "%.0f ms waiting (%.0f%% of prefill + decode)\n",
                      used, 100.0 * stats.expert_hits / used, 100.0 * stats.expert_late / used,
                      100.0 * stats.expert_misses / used,
                      static_cast<double>(stats.expert_bytes_read) / (1024.0 * 1024.0) /

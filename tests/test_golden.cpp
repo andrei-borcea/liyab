@@ -391,6 +391,49 @@ std::vector<GoldenCase> cases() {
     s = {};
     s.projection_bias = s.fused_gate_up = true;
     add("dense-fused-bias", s);
+    // Group-limited expert selection: 8 experts in 4 groups, top-2 within the
+    // 2 best groups. With a selection bias a group scores its two best biased
+    // scores (DeepSeek-V3, Ling 2.0), without one its best probability
+    // (DeepSeek-V2); streamed experts follow the same choice.
+    s = moe_spec("qwen3moe");
+    s.n_expert = 8;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    add("qwen3moe-grouped-softmax", s);
+    s.sigmoid_gating = true;
+    s.expert_bias = true;
+    add("qwen3moe-grouped-sigmoid-bias", s);
+    add("qwen3moe-grouped-sigmoid-bias-streamed", s, streamed);
+    s = {};
+    s.arch = "deepseek32";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_q_rank = 64;
+    s.index_dim = 64;
+    s.index_topk = 4;
+    add("deepseek32-indexed", s);
+    s.arch = "glm-dsa";
+    add("glm-dsa-indexed", s);
+    TransformerOptions expanded_index;
+    expanded_index.latent_form = LatentForm::Expanded;
+    add("glm-dsa-indexed-expanded", s, expanded_index);
+    s.index_full = {true, false};
+    s.mla_v = 128;  // output heads wider than the cached head
+    add("glm-dsa-shared-indexed", s);
+    s = {};
+    s.arch = "bailingmoe2";
+    s.fused_qkv = true;
+    s.qk_norm = true;
+    s.rope_dim = 32;
+    s.n_expert = 16;
+    s.n_expert_used = 4;
+    s.n_expert_groups = 4;
+    s.n_expert_groups_used = 2;
+    s.expert_bias = true;
+    s.sigmoid_gating = true;
+    add("bailingmoe2-fused-qk-norm-grouped", s);
+    add("bailingmoe2-fused-qk-norm-grouped-streamed", s, streamed);
     s = {};
     s.arch = "deepseek2";
     s.n_head_kv = 1;
@@ -578,6 +621,22 @@ std::vector<GoldenCase> cases() {
     s.sliding_window = 8;
     s.swa_layers = {true, false};
     add("embeddinggemma-bidirectional", s, f16_kv);
+    s = {};
+    s.arch = "deepseek2";
+    s.n_head_kv = 1;
+    s.rope_dim = 32;
+    s.mla_kv_rank = 64;
+    s.mla_legacy = true;
+    add("deepseek2-combined-mla", s, absorbed);
+    add("deepseek2-combined-mla-expanded", s, expanded);
+    s = test::compressed_spec();
+    s.hc_count = 0;
+    add("shared-kv-compression", s);
+    s.hc_count = 4;
+    add("shared-kv-compression-mhc", s);
+    s.yarn_factor = 16;
+    s.yarn_ctx = 32;
+    add("shared-kv-compression-mhc-yarn", s);
     return out;
 }
 

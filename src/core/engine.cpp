@@ -2731,7 +2731,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
-        // Rejected drafts are rolled back; recurrent (DeltaNet) states need a
+        // Rejected drafts are rolled back; recurrent (DeltaNet or compression) states need a
         // checkpoint per position of a verification batch (k + 1).
         impl->target->set_rollback_window(config.draft_tokens + 1);
         draft.value()->set_rollback_window(config.draft_tokens + 1);
@@ -2977,6 +2977,10 @@ std::string Engine::describe() const {
         std::snprintf(mix, sizeof mix, "Mixers:     %s blocks, recurrent state %.1f MiB\n", blocks.c_str(),
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
+    }
+    if (c.compressed_layers > 0) {
+        out += "Compression: " + std::to_string(c.compressed_layers) + " attention blocks, bounded recurrent window state, " +
+               std::to_string(impl_->target->recurrent_state_bytes()) + " bytes\n";
     }
     if (kv.has_windowed_layers()) {  // per-block KV: windowed blocks keep their window only
         int32_t every = 0;

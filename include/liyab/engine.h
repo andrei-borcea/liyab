@@ -120,7 +120,7 @@ struct EngineConfig {
     // cache layout, key scales, kernels and the LoRA adapter selected (see
     // AdapterInfo), so a prefix conversations share
     // (system prompt, tools) is stored once and any prompt starting with it
-    // restores it; recurrent mixer states are kept as images at the
+    // restores it; recurrent mixer and compression states are kept as images at the
     // positions the context's state snapshots hold, and a hybrid model
     // restores up to the deepest one its prompt reaches. Least recently used chunks out first. Taken out
     // of memory_budget_mb; on a MoE whose experts stream, only as far as the
@@ -419,10 +419,12 @@ struct PromptSegment {
 //  * s = scale · alpha / rank (scale from set_adapter, 1 by default; each
 //    matrix's own rank; alpha 0 or absent: s = scale), as PEFT computes it.
 //  * Dense matrices of every block (attention, recurrent mixers, FFN, the shared
-//    expert, the router, latent attention's whole projections) and the LM
+//    expert, the router, latent attention's whole projections, compression,
+//    indexer and residual-stream projections) and the LM
 //    head; a mixture of experts' per-expert stacks (each expert its slice).
 //    Refused: adapters of the token embeddings, of latent attention's
-//    per-head attn_k_b / attn_v_b, activated LoRA, other adapter types.
+//    per-head attn_k_b / attn_v_b or combined attn_kv_b, shared-KV's grouped
+//    attn_output_a, activated LoRA, other adapter types.
 //  * Contexts are kept apart by adapter (and scale): one computed with
 //    adapter X is never continued with Y or without it. Selecting another
 //    adapter sets the live context aside in the prefix cache under X (when
@@ -574,7 +576,7 @@ public:
     // A prompt that leaves that text partway keeps its tokens up to the last
     // one whose text it still starts with. Otherwise the longest common token
     // prefix is kept: any length on
-    // attention-only models; on recurrent models (DeltaNet or Mamba), whose
+    // attention-only models; on models with recurrent mixers or compression, whose
     // states cannot rewind, up to the nearest state snapshot, taken at the end
     // of every prompt and prefill (Transformer::snapshot_state), so an edited
     // last reply or a dropped turn recomputes only what follows that point.

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from reference_trace import Call, analyze_block, analyze_linear_mixer
+from reference_trace import Call, NativeAttentionTrace, RECORDER, analyze_block, analyze_linear_mixer
 
 
 class DirectForward(nn.Module):
@@ -80,6 +80,31 @@ class LinearMixerFacts(unittest.TestCase):
     def test_incompatible_projection_is_unknown(self):
         module = nn.Linear(5, 7)
         self.assertIsNone(self.fact(module, self.x))
+
+
+class ParameterRouterTrace(unittest.TestCase):
+    def test_functional_projection_records_the_owners_logits(self):
+        router = nn.Module()
+        router.weight = nn.Parameter(torch.arange(21, dtype=torch.float32).reshape(3, 7) / 10)
+        x = torch.arange(14, dtype=torch.float32).reshape(2, 7) / 7
+        calls, attention = list(RECORDER.calls), list(RECORDER.attn)
+        RECORDER.calls.clear()
+        RECORDER.attn.clear()
+        try:
+            with NativeAttentionTrace([("block.router", router)]):
+                logits = torch.nn.functional.linear(x, router.weight)
+                torch.nn.functional.linear(input=x, weight=router.weight)
+                torch.nn.functional.linear(x, router.weight + 1)  # a different parameter is not the router
+            self.assertEqual(len(RECORDER.calls), 2)
+            self.assertTrue(torch.equal(RECORDER.calls[1].output, logits))
+            observed = RECORDER.calls[0]
+            self.assertEqual(observed.path, "block.router")
+            self.assertIs(observed.module, router)
+            self.assertTrue(torch.equal(observed.input, x))
+            self.assertTrue(torch.equal(observed.output, logits))
+        finally:
+            RECORDER.calls[:] = calls
+            RECORDER.attn[:] = attention
 
 
 if __name__ == "__main__":
