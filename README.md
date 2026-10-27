@@ -3411,3 +3411,5 @@ Mapped per-layer embedding tables are also checked in all 26 reader formats and 
 Flutter chat uses the author template when replay preserves the processed prompt, or a recognized ChatML/Llama 3 fallback. A present incompatible template without such a fallback now refuses chat explicitly instead of guessing Zephyr. Models remain loaded for raw completions and pooling. This includes the current Harmony replay limitation; engine/CLI template support is broader than Flutter chat support.
 
 Android app installation requires an explicit `--serial` (or `ANDROID_SERIAL`) and uses that device for every check and installation. Native app builds respect `CMAKE_BUILD_PARALLEL_LEVEL`. Phone regression includes LoRA, SSM and compression tests and both independent quantization fixtures; an incomplete Android test build is refused instead of silently skipping binaries.
+
+The description tool checks optional affine biases of registry-selected final LayerNorms and records inactive recurrent-norm switches explicitly when tracing attention-only models.

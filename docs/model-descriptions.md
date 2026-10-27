@@ -1447,3 +1447,5 @@ name-based engine exception or global change to existing DeepSeek normalization 
 The merged recurrent-format test reuses `ssm_quant_vectors.bin` for all five mixer layouts (26 formats × five mixers × four KV types). Test-only head geometry aligns projection rows to the formats' 256-value blocks; all ordinary fixture defaults and random streams are preserved. Nonzero projection and carried-state ablations prevent zero weights or unused bindings from counting as coverage.
 
 Mapped PLE validation varies only the token table's dtype. Independent `gguf-py` fixture values form an F32 table in a second otherwise identical graph, and a zero-table control verifies that the table contributes. All four KV types and rollback are covered; no new format encoder is introduced.
+
+Final norms selected by `ArchSpec::output_norm` bind their `.weight` and, for LayerNorm, optional `.bias` tensors. The description tool recognizes these dynamic names and proves recurrent-norm switches inactive when the corresponding mixer operation is absent; it does not mistake an affine output norm for an unused tensor.

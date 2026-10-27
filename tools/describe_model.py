@@ -892,6 +892,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     att_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "attention"]
     rec_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "recurrent"]
     ssm_blocks = [b for b in bf if b.get("mixer", {}).get("kind") in ("mamba", "mamba2")]
+    if not any(b["mixer"]["dt_b_c_rms"] for b in ssm_blocks):
+        inactive("ssm_dt_b_c_eps", "no weightless dt/B/C mixer norms")
+    if not any(b["mixer"]["kind"] == "mamba2" for b in ssm_blocks):
+        inactive("ssm_norm_grouped", "no Mamba-2 gated norm")
     for b in ssm_blocks:
         m = b["mixer"]
         i = b["index"]
@@ -1894,7 +1898,11 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             d.missing.append(f"tensor {s} (blocks {_ranges(bl)}) is not used by the engine")
     else:
         d.unknown.append("which block tensors the engine would bind (the norms' names are not established)")
-    for name in sorted(globals_ - engine.global_tensors - {str(row.get("output_norm", "output_norm")) + ".weight"}):
+    # The final norm's name is registry data, so its optional affine bias
+    # cannot be found by scanning literal tensor names in bind_weights().
+    suffixes = (".weight", ".bias") if row.get("norm") == "Layer" else (".weight",)
+    final_norm_tensors = {str(row.get("output_norm", "output_norm")) + suffix for suffix in suffixes}
+    for name in sorted(globals_ - engine.global_tensors - final_norm_tensors):
         d.missing.append(f"tensor {name} is not used by the engine")
     rec = [i for i, p in enumerate(plans) if p["mixer"] == "deltanet"]
     for i in rec:
