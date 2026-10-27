@@ -2051,6 +2051,18 @@ def check_tokenizer_settings(d, g, model, revision, trust_remote_code, engine, s
             normalization = source_tokenizer.get("normalizer") or {}
             pre = source_tokenizer.get("pre_tokenizer") or {}
             steps = pre.get("pretokenizers", []) if pre.get("type") == "Sequence" else []
+            individual_digits = (not normalization and len(steps) == 2 and
+                                 steps[0].get("type") == "Digits" and
+                                 steps[0].get("individual_digits") is True and
+                                 steps[1].get("type") == "ByteLevel" and
+                                 steps[1].get("add_prefix_space") is False and
+                                 steps[1].get("use_regex", True) is True)
+            if mode == "refact" and individual_digits:
+                d.file_issues.append("the refact export label collides with an individual-digit tokenizer; "
+                                     "this source requires tokenizer.ggml.pre=starcoder")
+            elif mode == "starcoder" and not individual_digits:
+                d.file_issues.append("starcoder requires source individual Digits followed by ByteLevel "
+                                     "without normalization or a space prefix")
             requires_nfkc = (normalization.get("type") == "NFKC" and len(steps) == 2 and
                              steps[0].get("type") == "Digits" and steps[0].get("individual_digits") is True and
                              steps[1].get("type") == "ByteLevel" and steps[1].get("add_prefix_space") is False and
