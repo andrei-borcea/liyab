@@ -10,13 +10,36 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from describe_model import Checkpoint, FormatError  # noqa: E402
+from describe_model import Checkpoint, FormatError, Description, check_tokenizer_settings  # noqa: E402
+
+
+class TokenizerExportTest(unittest.TestCase):
+    def test_digit_split_export_collision(self):
+        byte_level = {"type": "ByteLevel", "add_prefix_space": False, "use_regex": True}
+        digit_split = {"type": "Sequence", "pretokenizers": [
+            {"type": "Digits", "individual_digits": True}, byte_level]}
+        engine = SimpleNamespace(rows={}, llama_bpe_pattern="unused")
+        tokenizer = lambda text, **options: {"input_ids": [1, 2]}
+        with tempfile.TemporaryDirectory() as directory:
+            for pipeline, mode, conflict in [(digit_split, "refact", True), (digit_split, "starcoder", False),
+                                             (byte_level, "refact", False), (byte_level, "starcoder", True)]:
+                with self.subTest(pipeline=pipeline, mode=mode):
+                    (Path(directory) / "tokenizer.json").write_text(json.dumps({"pre_tokenizer": pipeline}))
+                    description = Description()
+                    file = SimpleNamespace(arch="fixture", metadata={"tokenizer.ggml.model": "gpt2",
+                                                                     "tokenizer.ggml.pre": mode})
+                    with patch("reference_tokenizer.load_tokenizer", return_value=tokenizer):
+                        check_tokenizer_settings(description, file, directory, None, False, engine)
+                    self.assertEqual(bool(description.file_issues), conflict)
+                    self.assertFalse(description.unknown)
 
 
 class CheckpointTest(unittest.TestCase):

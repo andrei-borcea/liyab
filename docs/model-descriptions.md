@@ -573,7 +573,8 @@ SmolLM3 moved out of this table after adding its unrotated blocks and `smaug-bpe
 proposes its registered row exactly and its full F16 checkpoint passes the gate above; its 14 chat-template
 fixtures also render byte for byte like transformers.
 
-OLMo 2 moved out after adding post-only branch norms, whole-projection Q/K norms and the `dbrx` pre-tokenizer.
+OLMo 2 moved out after adding post-only branch norms and whole-projection Q/K norms. The original gates used
+the colliding `dbrx` export; source-verified copies need `llama-bpe-merges` as explained below.
 The real OLMo-2-0425-1B F16 checkpoint reproduces the registered row exactly and passes the gate above. This base
 checkpoint has no chat template. OLMo 3's local/global window pattern is covered separately by tiny conformance.
 
@@ -1046,10 +1047,10 @@ Unicode characters initialize the ranked-merge heap, and absent characters remai
 fallback. Decoding reverses the space replacement and fallback. A synthetic vocabulary checks rank ordering,
 multibyte tokens, repeated spaces, no implicit prefix and an absent emoji. Sarvam's generic attention and
 sigmoid routing match a reference (diagnostic provisional row, KL 0.00000, top-1 100.00%), but the published
-converter supplies BOS 6 while tokenizer.json inserts BOS 2. No `bailingmoe2` row is admitted: the required
-same-token gate fails on the first ID. Its old weight-alias list and nonpersistent RoPE buffer also need
+converter supplies BOS 6 while tokenizer.json inserts BOS 2. No Sarvam support is inferred from the `bailingmoe2` row used by Ling 2.0: the required
+same-token gate for Sarvam fails on the first ID. Its old weight-alias list and nonpersistent RoPE buffer also need
 local transformers 5 reference compatibility repairs, preserved with the report. This is independent of
-the stage-2 group-limited Ling 2.0 family.
+the separately validated group-limited Ling 2.0 family.
 
 Final validation includes the published GPT-OSS-20B MXFP4 file, using its official Harmony rendering: resident
 F16 KV and forced triple-buffered Q8_0 KV return the same coherent greedy reply. Its numerical gate remains the

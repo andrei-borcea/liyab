@@ -765,8 +765,8 @@ completion and pooling remain available. GPT-OSS Harmony currently has this Flut
   * **Speed.** Tokenizing sits on the typing path (prompts are encoded while the user writes). Merges compare token
     ids through a heap, never strings, so a long piece costs O(n log n). On an Apple M4 Pro a 68 KB text encodes in
     2.4–3.6 ms (19–28 MB/s, Qwen3, Qwen3.5, Llama 3.2) and an 80 KB conversation full of special tokens in 2.5–3.2 ms.
-* **Chat templates from the model.** Every GGUF carries the Jinja chat template of its Hugging Face tokenizer
-  (`tokenizer.chat_template`). Liyab's own Jinja interpreter (`src/core/chat_template.cpp`) renders it the way
+* **Chat templates from the model.** When a GGUF carries the Jinja chat template of its Hugging Face tokenizer
+  (`tokenizer.chat_template`), Liyab's own Jinja interpreter (`src/core/chat_template.cpp`) renders it the way
   transformers' `apply_chat_template` does: the same whitespace rules, Python's printing, `tojson`,
   `raise_exception`, `strftime_now`, loops with `loop.previtem` / `nextitem`, macros, namespaces, string methods and
   the usual filters and tests, and the sandbox's refusal of methods that change a list or dict.
@@ -2418,7 +2418,8 @@ KV memory per token for a Llama-3-8B-class shape:
 
 All 26 supported reader formats decode bit-exactly like the GGUF reference decoder, and the tokenizers produce
 the Hugging Face tokenizers' ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
-reference implementation with the same argmax at every position. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
+reference implementation in the earlier float checks. Per-checkpoint KL and argmax agreement are reported below;
+F16 KV rounding can change near-tied winners. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
 at 98.9% of positions, and the remaining differences are the reference's own second choice. Streamed and in-place
 weights, the file's layouts and the repacked ones, batched and token-by-token prefill, any thread count, and
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
