@@ -1,2 +1,5 @@
 # Byte-exact test texts: the edge-case corpus keeps its "\r\n" line endings.
 tests/data/tokenizer_edge.txt -text
+
+# Empty unified-diff context lines carry a significant leading space.
+docs/validation/models-stage1/*.patch whitespace=-blank-at-eol

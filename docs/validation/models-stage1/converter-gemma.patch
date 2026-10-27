@@ -1,0 +1,33 @@
+--- a/conversion/gemma.py
++++ b/conversion/gemma.py
+@@ -666,7 +666,11 @@
+         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+         special_vocab.add_to_gguf(self.gguf_writer)
+         self.gguf_writer.add_add_space_prefix(False)
+-        self.gguf_writer.add_add_bos_token(True)
++        # Transformers 5.19 tokenizer exports can omit the BOS postprocessor.
++        from transformers import AutoTokenizer
++        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
++        sample_ids = tokenizer("test", add_special_tokens=True)["input_ids"]
++        self.gguf_writer.add_add_bos_token(bool(sample_ids and sample_ids[0] == tokenizer.bos_token_id))
+ 
+     def set_gguf_parameters(self):
+         super().set_gguf_parameters()
+@@ -683,7 +687,7 @@
+ 
+         per_layer_config = self.hparams.get("per_layer_config")
+         layer_types = self.hparams.get("layer_types", [])
+-        if (head_dim_full := self.hparams.get("global_head_dim")) is None and per_layer_config is not None:
++        if (head_dim_full := (self.hparams.get("global_head_dim") or (self.hparams.get("head_dim") if not self.hparams.get("per_layer_config") else None))) is None and per_layer_config is not None:
+             for layer_idx, layer_config in per_layer_config.items():
+                 layer_idx = int(layer_idx)
+                 if layer_idx < len(layer_types):
+@@ -743,7 +747,7 @@
+         assert rope_params_full["rope_type"] == "proportional"
+ 
+         per_layer_config = self.hparams.get("per_layer_config")
+-        if (head_dim_full := self.hparams.get("global_head_dim")) is None and per_layer_config is not None:
++        if (head_dim_full := (self.hparams.get("global_head_dim") or (self.hparams.get("head_dim") if not self.hparams.get("per_layer_config") else None))) is None and per_layer_config is not None:
+             layer_types = self.hparams.get("layer_types", [])
+             for layer_idx, layer_config in per_layer_config.items():
+                 layer_idx = int(layer_idx)

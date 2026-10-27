@@ -16,9 +16,9 @@ have passed. Recipes use random-weight tiny checkpoints unless explicitly labell
 | Flutter with integrated native library | 53 passed, two optional real-model tests skipped; analyze reports no issues |
 | Independent recurrent reader proofs | 520 cases: 26 formats × five mixers × four KV types; maximum logit/state error zero on all three host targets |
 | Mapped per-layer embeddings | 104 cases: 26 formats × four KV types; maximum error versus independently decoded F32 control zero on all three host targets |
-| Merged-tree tiny replay | Classic 20/20 pass, with source-verified StarCoder metadata correction; remaining sections in progress |
-| Final paired performance versus main | Pending |
-| Phone regression and four new trained CLI models | Pending; required serial `aca7d42d` was disconnected at the latest check |
+| Merged-tree tiny replay | 66/66 recipes: classic 20, modern 17, MoE 9, SSM 5, conv/KDA 4, Gemma 4 (including one embedding case), sparse/grouped 7 |
+| Final paired performance versus main | PASS: 72 measured balanced pairs, 12 warmup pairs, 21 metrics; paired median changes −2.088% to +0.617%; 54 measured CLI reply/count pairs identical |
+| Phone regression and four new trained CLI models | Deferred by the owner for this merge. Serial `aca7d42d` was disconnected; no installation or on-device engine run performed |
 
 Reader proofs use nonzero encoded rows, independent decoding and projection/state/table ablations, not merely
 successful loading. The original golden pins are not regenerated to accommodate integration differences.
@@ -35,8 +35,57 @@ successful loading. The original golden pins are not regenerated to accommodate 
 | Gemma | Gemma 3n tiny 99.41%; Gemma 4 uniform 99.22%, K=V 99.02% | Gemma 3n BF16: displayed KL zero/100%; separate BF16 reference 0.00168/98.24%. EmbeddingGemma: 39 identical ID sequences, minimum trained-vector cosine 0.99992651 |
 | Sparse/group routing | V2 99.80%, V3 99.38%, GLM-5/5.1/5.2 99.80%, V3.2 99.59%, Ling 2.0 99.61%; displayed mean KL zero | Genuinely sparse top-k 256/493 and 384/484. GLM-4.7-Flash standard tiny gate fails at 58.22%; corrected diagnostic 100% is not support |
 
+The merged-tree [recipe and result archive](validation/models-stage1/README.md) retains effective configurations,
+upstream pins, result lines, commands, export corrections and small compatibility patches without weights.
+The replay regenerated and then deleted 41,355,255,384 bytes of GGUF/checkpoint artifacts cumulatively; this is
+not an estimate of net free-space gain. The existing Qwen3 baseline remains KL 0.00000/top-1 100% on 512 IDs.
+
 Each percentage measures teacher-forced argmax agreement, not task accuracy. Displayed KL zero is rounded, not
 proof of exact equality. See [model descriptions](model-descriptions.md) for model IDs, revisions, recipes and controls.
+
+## Final integration performance and cleanup
+
+The M4 Pro stayed on AC power. Both cohorts ran from the same neutral executable pathname with identical argv,
+working directory and environment; SHA-256 and the loaded library UUID verified the original matching binaries.
+Each configuration used a separate warmup pair and six balanced measured pairs. CPU bench used 512 tokens,
+batch 512, four workers and one internal repeat; CLI requested 128 natural tokens and required at least 64.
+No EOS suppression, forced continuation, discarded sample or threshold relaxation was used. All paired CLI reply
+bytes and prompt/cached/generated/forced token counts match. BF16 Metal-route matrix work falls back to CPU;
+F16 rows separately prove Metal attention/FFN execution. Independent recomputation confirms every paired median.
+
+| Model | Route / weights | Prefill main → integrated (tok/s) | Decode main → integrated (tok/s) |
+| --- | --- | ---: | ---: |
+| Qwen3-0.6B | cpu BF16 512-token bench | 86.800 → 85.850 | — |
+| Qwen3-0.6B | cpu BF16 CLI | 94.355 → 94.030 | 61.560 → 61.782 |
+| Qwen3-0.6B | metal-route/CPU-fallback BF16 CLI | 95.230 → 93.985 | 61.520 → 61.845 |
+| Qwen3-0.6B | metal F16 CLI | 260.059 → 253.452 | 33.645 → 33.571 |
+| Llama-3.2-1B-Instruct | cpu BF16 512-token bench | 36.800 → 36.650 | — |
+| Llama-3.2-1B-Instruct | cpu BF16 CLI | 38.462 → 38.395 | 28.818 → 28.846 |
+| Llama-3.2-1B-Instruct | metal-route/CPU-fallback BF16 CLI | 38.411 → 38.425 | 28.809 → 28.788 |
+| Llama-3.2-1B-Instruct | metal F16 CLI | 134.685 → 135.307 | 32.070 → 32.052 |
+| Qwen3.5-0.8B | cpu BF16 512-token bench | 83.950 → 83.750 | — |
+| Qwen3.5-0.8B | cpu BF16 CLI | 85.311 → 84.981 | 53.766 → 53.384 |
+| Qwen3.5-0.8B | metal-route/CPU-fallback BF16 CLI | 85.157 → 85.541 | 53.385 → 53.263 |
+| Qwen3.5-0.8B | metal F16 CLI | 236.980 → 235.037 | 34.224 → 34.523 |
+
+[All paired metrics and identity checks](validation/models-stage1/performance.json) are retained without reply
+transcripts. Paired-ratio medians need not equal the ratio of independently summarized throughput medians.
+
+Final cleanup removed 6,535,429,968 additional bytes: the three verified temporary F16 derivatives, duplicated
+replay tokenizers, Python/Numba caches and the already-tested Mamba-130M GGUF. Free space after cleanup was
+59,182,452,736 bytes (about 55.1 GiB). Shared original BF16 models and unrelated application/VM data were untouched.
+The owner subsequently requested deletion of all remaining model files, including the shared baselines, and
+explicitly deferred phone validation for this merge. That authorized cleanup deleted another 52 files totaling
+35,801,674,208 bytes (33.343 GiB): the five phone inputs, three shared BF16 baselines and vocabulary-only GGUF
+copies. No model weights remain in the inventoried wave/model directories. Free space is now about 88.46 GiB.
+Configuration, tokenizer metadata, reference summaries, recipes and the small validation archive remain; models
+must be downloaded again before rerunning weight-dependent checks. Unrelated application/VM data was untouched.
+No model download was performed during this integration replay.
+
+All seven feature branches were rechecked clean and published through the personal SSH remote, with owner-only
+author/committer identity and no attribution trailers. They are merged into `feat/models-stage1-merge` in the
+required order. The main merge is authorized, with phone testing explicitly waived for this closure. Host proof
+is complete; device runtime validation remains a disclosed omission. No stage-2 or separate CI task was started.
 
 ## Stage 2 and later work
 
@@ -48,6 +97,25 @@ alone do not establish those architectures. Full Gemma 4 still needs heterogeneo
 trained gate; larger variants also need MoE-specific norms/scales. Full DeepSeek-V4 lacks hash/tid2eid routing,
 sqrt-softplus/clipped SwiGLU and shared-attention sink integration despite passing compression/mHC components.
 Sarvam has an unresolved converter/source BOS mismatch. MiniCPM3 and other unmeasured variants remain deferred.
+
+The remaining integration work is more specific than reimplementing those primitives:
+
+| Architecture | Remaining proof or operation |
+| --- | --- |
+| Flint | Source configuration adapter for the installed reference, then full composition gate; NoPE/window patterns, sinks and expert bias already exist |
+| AFMoE / EXAONE-MoE | Gate their combination with the integrated unrotated global blocks |
+| MiMo-V2 / Step-3.5 | Unequal QK/value geometry and scaling / per-block partial rotation; resolve converter head-count and 45-versus-48 layer-description conflicts respectively |
+| Hunyuan-MoE / Hy4 | Dynamic NTK beyond 32,768 / sparse-latent composition validation |
+| MiniCPM3 | Combined MLA is integrated; converter omits embedding/depth multipliers, so export repair and a full gate are still required |
+| Pangu-Embedded / GraniteSWA | Attention-output bias / sinks are integrated; run model gates and audit Granite's per-block rotary metadata |
+| Jamba / Bamba | Weighted mixer norms and full attention/SSM/MoE composition proofs; per-block KV arrays and NoPE primitives already exist |
+| Falcon-H1 | Parallel attention and SSM, partial SSM widths, D layouts and baked multipliers |
+| Granite 4 / Nemotron-H and H-MoE | Full hybrid/expert composition gates; scalars, ReLU-squared FFNs, per-block head counts, grouped scan norms and group routing are available |
+| PLaMo2 | Distinct headwise B/C, dt/B/C normalization/projection and recurrent-state layout |
+| Gemma 4 | Distinct per-block head/value widths; larger MoE variants additionally need router-input and expert/parallel-branch norms/scales |
+| DeepSeek-V4 | Hash/tid2eid routing, sqrt-softplus/clipped SwiGLU, shared-attention sinks, native source/export and full-model gate |
+| Kimi K2 | Tokenizer/tool-order primitives are integrated; complete cross-branch numerical/tokenizer/template gate remains pending |
+| GLM-4.7-Flash / Sarvam | Source/export gating and latent-epsilon distinction / BOS-ID conflict; corrected diagnostics do not establish standard-export support |
 
 Architectures without a supported converter require a later conversion project. Multimodal input is a separate
 subsystem. Native Windows/Linux CI and release packaging are a separate task; no new CI or stage-2 work is

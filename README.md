@@ -2416,6 +2416,15 @@ KV memory per token for a Llama-3-8B-class shape:
 
 ### Correctness
 
+The stage-1 integration passes 16/16 native, 16/16 Rosetta scalar and 16/16 Rosetta AVX2 tests, preserving
+all 414 golden pins (138 cases per platform, including every original pin). All 66 merged-tree tiny recipes
+pass, including one 39-input embedding check; Android Release experimental builds and Flutter has 53 passing
+tests with two optional real-model skips. Independent reader proofs cover 520 recurrent and 104 mapped-table
+cases across 26 formats and four KV types. The final 72-pair performance comparison passes all 21 metrics
+(−2.088% to +0.617%) with identical CLI replies and token counts. Phone validation of the stage-1 changes is deferred; see the
+[validation report](docs/model-coverage-stage1.md). These host results do not imply new on-device throughput
+or compatibility figures.
+
 All 26 supported reader formats decode bit-exactly like the GGUF reference decoder, and the tokenizers produce
 the Hugging Face tokenizers' ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
 reference implementation in the earlier float checks. Per-checkpoint KL and argmax agreement are reported below;
