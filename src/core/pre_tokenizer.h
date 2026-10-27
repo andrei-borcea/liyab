@@ -12,6 +12,9 @@
 //     "Removed" with invert, which keeps only the matches);
 //   * NFC normalization of the text first (the Qwen tokenizers), or NFKC
 //     before individual digits and ByteLevel (gpt2-nfkc-digits);
+//   * whether a step runs on ByteLevel's encoded byte alphabet. Such steps
+//     return byte boundaries, including boundaries inside UTF-8 characters;
+//   * NFC normalization of the text first (the Qwen tokenizers);
 //   * `ignore_merges`: a piece that is a vocabulary entry as a whole is that
 //     token, without merging (Llama 3, SmolLM3, GLM-4, Hunyuan, Tekken). OLMo's
 //     dbrx uses Llama 3's split with ordinary merge ranks; refact and exaone4
@@ -42,10 +45,6 @@ public:
     static Result<PreTokenizer> for_name(std::string_view name);
     // Every supported tokenizer.ggml.pre value, comma-separated.
     static std::string supported_names();
-    // GPT-2 ByteLevel's fixed printable alphabet for one byte. Shared with
-    // the BPE encoder/decoder; pure and safe to call from any thread.
-    static uint32_t byte_codepoint(uint8_t byte) noexcept;
-
     // Appends the pieces of `text` (already normalized) to `pieces`, as byte
     // ranges of `text`, in order. Every byte of `text` is in exactly one
     // piece unless a step drops what lies between its matches. A step after

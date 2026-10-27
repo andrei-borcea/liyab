@@ -13,6 +13,7 @@
 #include "core/log.h"
 #include "core/portable_math.h"
 #include "core/quant.h"
+#include "core/ssm_scan.h"
 #include "core/thread_pool.h"
 
 #if defined(LIYAB_USE_AVX2)
@@ -610,13 +611,16 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
 
     LIYAB_RETURN_IF_ERROR(model->bind_weights());
     const Layer& first = model->layers_[0];
-    const TensorView* ffn_weight = c.blocks[0].ffn == FfnKind::Moe ? first.w[kUpExps] : first.w[kUp];
-    if (ffn_weight == nullptr) ffn_weight = model->token_embd_; // the first block can have no FFN
-    const auto delta_blocks = std::count_if(c.blocks.begin(), c.blocks.end(),
-                                          [](const BlockPlan& b) { return b.mixer == MixerKind::DeltaNet; });
-    LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d, %d attention + %d DeltaNet blocks)", c.n_layers,
-                   std::string(dtype_traits(ffn_weight->type).name).c_str(), c.arch.c_str(), c.head_dim,
-                   c.n_attn_layers, static_cast<int>(delta_blocks));
+    // The precision of block 0's largest matrix: its FFN's, else its mixer's input projection.
+    const TensorView* typical = nullptr;
+    for (const WeightRole role : {kUpExps, kUp, kSsmIn, kQkv, kQ, kQa}) {
+        if (typical == nullptr) typical = first.w[role];
+    }
+    LIYAB_LOG_INFO("bound %d blocks of %s weights (%s, head_dim %d, %d attention + %d recurrent blocks)", c.n_layers,
+                   typical != nullptr ? std::string(dtype_traits(typical->type).name).c_str() : "?", c.arch.c_str(),
+                   c.head_dim, c.n_attn_layers,
+                   static_cast<int>(std::count_if(c.blocks.begin(), c.blocks.end(),
+                                                  [](const BlockPlan& b) { return keeps_state(b.mixer); })));
     if (c.n_expert > 0) {
         LIYAB_LOG_INFO("MoE: %d experts, top-%d, expert ff %d, shared ff %d, %s gating%s", c.n_expert, c.n_expert_used,
                        c.n_ff_expert, c.n_ff_shared, c.moe_gating == MoeGating::Softmax ? "softmax" : "sigmoid",
@@ -633,8 +637,10 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // Only attention blocks have keys and values (at least one slot keeps the
     // cache well-formed for purely recurrent stacks).
     kv.n_layers = std::max(c.n_attn_layers, 1);
-    kv.n_head_kv = c.n_head_kv;
-    kv.head_dim = c.head_dim;
+    // Without attention (Mamba), the one slot is an unused placeholder with
+    // one quantization-block-wide head, valid for every KV storage type.
+    kv.n_head_kv = c.n_attn_layers > 0 ? c.n_head_kv : 1;
+    kv.head_dim = c.n_attn_layers > 0 ? c.head_dim : quant::kBlock;
     kv.type = options.kv_type;
     // Latent attention: one row [k_pe | latent] per position and block, its
     // latent channels serving as the values (ModelConfig::mla).
@@ -822,10 +828,19 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                        c.mla.kv_rank, c.rope_dim, c.n_head, c.mla.nope_dim, c.rope_dim, c.mla.v_dim,
                        c.mla.q_rank > 0 ? ", low-rank queries" : "");
     }
-    if (c.hybrid()) {
+    if (c.ssm_v_heads > 0) {
         LIYAB_LOG_INFO("DeltaNet: %d recurrent blocks, %d/%d heads x %d, conv %d, state %.1f MiB", c.n_layers - c.n_attn_layers,
                        c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
                        static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
+    }
+    if (c.mamba.d_inner > 0) {
+        const MambaGeometry& m = c.mamba;
+        LIYAB_LOG_INFO("Mamba-%d: %zu recurrent blocks, d_inner %d, state %d per channel%s, conv %d, state %.1f MiB",
+                       m.n_heads > 0 ? 2 : 1, model->states_.size(), m.d_inner, m.d_state,
+                       m.n_heads > 0 ? (", " + std::to_string(m.n_heads) + " heads, " + std::to_string(m.n_groups) +
+                                        " groups").c_str()
+                                     : "",
+                       m.conv_kernel, static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
     }
     // CPU-only models: the resident Q4_K / Q5_K / Q6_K / Q8_0 matrices in the
     // layout of the i8mm batched kernels (a lossless rearrangement, same
@@ -1005,6 +1020,42 @@ Status Transformer::bind_weights() {
                 LIYAB_RETURN_IF_ERROR(qk_vec(block_tensor(l, "attn_k_norm.bias"), plan.n_head_kv, L.k_norm_b));
             }
             }
+        } else if (plan.mixer == MixerKind::Mamba || plan.mixer == MixerKind::Mamba2) {
+            // in_proj gives [x | z] (Mamba-1) or [z | x B C | dt] (Mamba-2); the
+            // convolution runs over x, or over [x | B | C].
+            const MambaGeometry& m = c.mamba;
+            const bool v2 = plan.mixer == MixerKind::Mamba2;
+            const int64_t di = m.d_inner, ns = m.d_state;
+            const int64_t channels = v2 ? di + 2 * int64_t{m.n_groups} * ns : di;
+            const int64_t in_rows = v2 ? di + channels + m.n_heads : 2 * di;
+            const int64_t per_head = v2 ? m.n_heads : di;  // A, D and the dt bias
+            L.state_slot = state_slots++;
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_in.weight"), c.n_embd, in_rows, L.w[kSsmIn]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_in.bias"), in_rows, false, L.ssm_in_bias));
+            LIYAB_RETURN_IF_ERROR(
+                vec(block_tensor(l, "ssm_conv1d.weight"), channels * m.conv_kernel, true, L.conv1d));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_conv1d.bias"), channels, false, L.conv_bias));
+            if (L.conv_bias.empty()) L.conv_bias.assign(static_cast<size_t>(channels), 0.0f);
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_a"), v2 ? per_head : di * ns, true, L.ssm_a));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_d"), per_head, true, L.ssm_d));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt.bias"), per_head, true, L.ssm_dt));
+            if (v2) {
+                // The gated norm's weight, one group of d_inner / n_groups channels after another.
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_norm.weight"), di, true, L.ssm_norm));
+            } else {
+                const int64_t r = m.dt_rank;
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_x.weight"), di, r + 2 * ns, L.w[kSsmX]));
+                LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_dt.weight"), r, di, L.w[kSsmDt]));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_dt_norm.weight"), m.dt_b_c_rms ? di : r, false, L.dt_norm));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_b_norm.weight"), ns, false, L.b_norm));
+                LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_c_norm.weight"), ns, false, L.c_norm));
+                if (L.dt_norm.empty() != L.b_norm.empty() || L.dt_norm.empty() != L.c_norm.empty()) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                                               ": ssm_dt_norm, ssm_b_norm and ssm_c_norm go together");
+                }
+            }
+            LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "ssm_out.weight"), di, c.n_embd, L.w[kSsmOut]));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ssm_out.bias"), c.n_embd, false, L.ssm_out_bias));
         } else if (plan.mixer == MixerKind::DeltaNet) {
             L.state_slot = state_slots++;
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_qkv.weight"), c.n_embd, conv_dim, L.w[kQkv]));
@@ -1019,10 +1070,15 @@ Status Transformer::bind_weights() {
         } else if (plan.mixer == MixerKind::Linear) {
             LIYAB_RETURN_IF_ERROR(matrix(block_tensor(l, "attn_output.weight"), c.n_embd, c.n_embd, L.w[kO]));
         }
+        if (plan.mixer == MixerKind::None && plan.ffn != FfnKind::None &&
+            f.tensor(block_norm_tensor(f, l, c.spec->ffn_norm)) == nullptr) {
+            L.ffn_norm = L.attn_norm;
+            L.ffn_norm_b = L.attn_norm_b;
+        }
         // A parallel block may have no FFN norm of its own: its FFN reads the mixer's normed input.
         if (!plan.parallel || attn_norm != c.spec->ffn_norm) {
             LIYAB_RETURN_IF_ERROR(vec(block_norm_tensor(f, l, c.spec->ffn_norm), c.n_embd,
-                                      norm_weights && plan.norm_before_ffn && !plan.parallel, L.ffn_norm));
+                                      norm_weights && plan.norm_before_ffn && !plan.parallel && L.ffn_norm.empty(), L.ffn_norm));
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, std::string(c.spec->ffn_norm) + ".bias"), c.n_embd, false, L.ffn_norm_b));
         }
         if (!c.spec->post_mixer_norm.empty()) {
@@ -1102,12 +1158,26 @@ Status Transformer::bind_weights() {
         }
     }
 
+    // Each recurrent block's state, sized for its mixer: the convolution's
+    // history ([channel][kernel - 1]) and the scan's state.
     states_.resize(static_cast<size_t>(state_slots));
-    for (RecurrentState& st : states_) {
-        st.conv.assign(static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1), 0.0f);
-        st.ssm.assign(static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) *
-                          static_cast<size_t>(c.ssm_head_dim),
-                      0.0f);
+    for (int32_t l = 0; l < c.n_layers; ++l) {
+        const Layer& L = layers_[static_cast<size_t>(l)];
+        if (L.state_slot < 0) continue;
+        RecurrentState& st = states_[static_cast<size_t>(L.state_slot)];
+        const MixerKind mixer = c.blocks[static_cast<size_t>(l)].mixer;
+        if (mixer == MixerKind::DeltaNet) {
+            st.conv.assign(static_cast<size_t>(conv_dim) * static_cast<size_t>(c.ssm_conv_kernel - 1), 0.0f);
+            st.ssm.assign(static_cast<size_t>(c.ssm_v_heads) * static_cast<size_t>(c.ssm_head_dim) *
+                              static_cast<size_t>(c.ssm_head_dim),
+                          0.0f);
+        } else {  // Mamba: one state of d_state values per channel of x, in heads for Mamba-2
+            const MambaGeometry& m = c.mamba;
+            const auto channels = static_cast<size_t>(
+                mixer == MixerKind::Mamba2 ? m.d_inner + 2 * m.n_groups * m.d_state : m.d_inner);
+            st.conv.assign(channels * static_cast<size_t>(m.conv_kernel - 1), 0.0f);
+            st.ssm.assign(static_cast<size_t>(m.d_inner) * static_cast<size_t>(m.d_state), 0.0f);
+        }
     }
     return Status::ok();
 }
@@ -3200,6 +3270,273 @@ Status Transformer::delta_net_mixer(int32_t layer, const BlockWeights& w, int32_
     return matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n);
 }
 
+float* Transformer::checkpoint_slot(const Segment& s, RecurrentState& st, size_t i) noexcept {
+    if (!s.checkpoint || i + static_cast<size_t>(s.rollback) < static_cast<size_t>(s.n)) return nullptr;
+    return st.checkpoints.data() +
+           static_cast<size_t>((s.n_past + static_cast<int32_t>(i)) % s.rollback) * (st.conv.size() + st.ssm.size());
+}
+
+// Mamba's causal depthwise convolution, one task per (segment, channel): the
+// channel's history and its inputs through the segment's tokens are gathered
+// into one run and convolved at once (ssm::causal_conv, vectorized over the
+// tokens), then go through SiLU. The history after token i is the run's
+// values i + 1 .. i + kernel - 1, which the checkpoints copy. A tree pass,
+// whose tokens may continue another branch from its parent's checkpointed
+// history, goes token by token.
+void Transformer::mamba_conv(const Layer& L, const float* in, size_t in_stride, float* out, size_t out_stride,
+                             size_t col, size_t channels, ThreadPool& pool) {
+    const auto taps = static_cast<size_t>(config_.mamba.conv_kernel);
+    const size_t history = taps - 1;
+    const auto segments = static_cast<int64_t>(segs_.size());
+    const bool tree = !tree_depth_.empty();
+    pool.parallel_for(static_cast<int64_t>(channels) * segments, [&](int64_t begin, int64_t end) {
+        std::vector<float> seq, conv;
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / static_cast<int64_t>(channels))];
+            RecurrentState& st = (*s.states)[static_cast<size_t>(L.state_slot)];
+            const auto ch = static_cast<size_t>(job % static_cast<int64_t>(channels));
+            const auto first = static_cast<size_t>(s.first);
+            const auto count = static_cast<size_t>(s.n);
+            float* hist = history > 0 ? st.conv.data() + ch * history : nullptr;
+            const float* tap = L.conv1d.data() + ch * taps;
+            seq.resize(history + count);
+            conv.resize(count);
+            if (history > 0) std::copy_n(hist, history, seq.begin());
+            for (size_t i = 0; i < count; ++i) seq[history + i] = in[(first + i) * in_stride + col + ch];
+            if (!tree) {
+                ssm::causal_conv(seq.data(), tap, L.conv_bias[ch], taps, count, conv.data());
+                if (history > 0) std::copy(seq.end() - static_cast<std::ptrdiff_t>(history), seq.end(), hist);
+                for (size_t i = 0; i < count; ++i) {
+                    if (float* slot = checkpoint_slot(s, st, i)) {
+                        std::copy_n(seq.data() + i + 1, history, slot + ch * history);
+                    }
+                }
+            } else {
+                // hist holds the history before token i; a token continuing
+                // another branch takes its parent's instead.
+                for (size_t i = 0; i < count; ++i) {
+                    if (history > 0 && tree_branches(i)) {
+                        const float* from =
+                            checkpoint_slot(s, st, static_cast<size_t>(tree_parent_[i])) + ch * history;
+                        std::copy(from, from + history, hist);
+                    }
+                    const float x = seq[history + i];
+                    float acc = L.conv_bias[ch];
+                    for (size_t j = 0; j < history; ++j) acc = std::fma(tap[j], hist[j], acc);
+                    conv[i] = std::fma(tap[history], x, acc);
+                    if (history > 0) {
+                        std::copy(hist + 1, hist + history, hist);
+                        hist[history - 1] = x;
+                    }
+                    if (history > 0) {
+                        if (float* slot = checkpoint_slot(s, st, i)) std::copy_n(hist, history, slot + ch * history);
+                    }
+                }
+            }
+            ssm::silu(conv.data(), conv.data(), count);
+            for (size_t i = 0; i < count; ++i) out[(first + i) * out_stride + col + ch] = conv[i];
+        }
+    });
+}
+
+// Mamba-1 (Mamba, Falcon-Mamba), per token:
+//   [x | z] = W_in u;  x = SiLU(conv1d(x) + b_conv)
+//   [dt | B | C] = W_x x  (Falcon-Mamba: each RMS-normalized, without weights)
+//   dt = softplus(W_dt dt + b_dt)                     (one per channel)
+//   h[c][j] = exp(dt[c] A[c][j]) h[c][j] + dt[c] x[c] B[j]
+//   y[c] = (C . h[c] + D[c] x[c]) SiLU(z[c]);  out = W_out y
+// The convolution, then the scan, run as one task per (segment, channel)
+// through all of the segment's tokens; the projections between them run over
+// the whole batch.
+Status Transformer::mamba_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const MambaGeometry& m = c.mamba;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto di = static_cast<size_t>(m.d_inner);
+    const auto ns = static_cast<size_t>(m.d_state);
+    const auto rank = static_cast<size_t>(m.dt_rank);
+    const size_t dbc = rank + 2 * ns;
+    mix_.resize(un * 2 * di);
+    ssm_xc_.resize(un * di);
+    ssm_dbc_.resize(un * dbc);
+    ssm_dtl_.resize(un * rank);
+    ssm_dt_.resize(un * di);
+    z_.resize(un * di);
+    dn_.resize(un * di);
+
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmIn], xb_.data(), mix_.data(), n));
+    for (size_t t = 0; t < un && !L.ssm_in_bias.empty(); ++t) {
+        for (size_t i = 0; i < 2 * di; ++i) mix_[t * 2 * di + i] += L.ssm_in_bias[i];
+    }
+    mamba_conv(L, mix_.data(), 2 * di, ssm_xc_.data(), di, 0, di, pool);
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmX], ssm_xc_.data(), ssm_dbc_.data(), n));
+    // Norms of dt, B and C: weightless (ArchSpec::ssm_dt_b_c_eps) or with
+    // weights of their own (the file's epsilon).
+    for (size_t t = 0; t < un; ++t) {
+        float* row = ssm_dbc_.data() + t * dbc;
+        if (m.dt_b_c_rms) {
+            for (const auto& [at, len] : {std::pair{size_t{0}, rank}, std::pair{rank, ns}, std::pair{rank + ns, ns}}) {
+                const float scale = rms_scale(row + at, static_cast<int32_t>(len), c.spec->ssm_dt_b_c_eps);
+                for (size_t i = at; i < at + len; ++i) row[i] *= scale;
+            }
+        } else if (!L.dt_norm.empty()) {
+            rmsnorm(row, L.dt_norm.data(), row, static_cast<int32_t>(rank), c.rms_eps);
+            rmsnorm(row + rank, L.b_norm.data(), row + rank, static_cast<int32_t>(ns), c.rms_eps);
+            rmsnorm(row + rank + ns, L.c_norm.data(), row + rank + ns, static_cast<int32_t>(ns), c.rms_eps);
+        }
+        std::copy_n(row, rank, ssm_dtl_.data() + t * rank);
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmDt], ssm_dtl_.data(), ssm_dt_.data(), n));
+    // The gate and the step size, token by token.
+    pool.parallel_for(n, [&](int64_t begin, int64_t end) {
+        for (auto t = static_cast<size_t>(begin); t < static_cast<size_t>(end); ++t) {
+            ssm::silu(mix_.data() + t * 2 * di + di, z_.data() + t * di, di);
+            float* dt = ssm_dt_.data() + t * di;
+            for (size_t i = 0; i < di; ++i) dt[i] = softplus(dt[i] + L.ssm_dt[i]);
+        }
+    });
+
+    // The scan, one task per (segment, channel). Tokens that record no
+    // checkpoint go through the kernel in one run (a tree pass checkpoints
+    // every token).
+    const auto segments = static_cast<int64_t>(segs_.size());
+    pool.parallel_for(static_cast<int64_t>(di) * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / static_cast<int64_t>(di))];
+            RecurrentState& st = (*s.states)[static_cast<size_t>(L.state_slot)];
+            const auto ch = static_cast<size_t>(job % static_cast<int64_t>(di));
+            const auto first = static_cast<size_t>(s.first);
+            const auto count = static_cast<size_t>(s.n);
+            float* h = st.ssm.data() + ch * ns;
+            const float* a = L.ssm_a.data() + ch * ns;
+            auto scan = [&](size_t i, size_t tokens) {
+                const size_t t = first + i;
+                ssm::mamba_scan(h, a, ns, ssm_dt_.data() + t * di + ch, ssm_xc_.data() + t * di + ch, di,
+                                ssm_dbc_.data() + t * dbc + rank, dbc, dn_.data() + t * di + ch, tokens);
+            };
+            const size_t recorded = s.checkpoint ? std::min(count, static_cast<size_t>(s.rollback)) : 0;
+            const size_t plain = count - recorded;  // tokens before these record no checkpoint
+            if (plain > 0) scan(0, plain);
+            for (size_t i = plain; i < count; ++i) {
+                if (tree_branches(i)) {
+                    const float* from =
+                        checkpoint_slot(s, st, static_cast<size_t>(tree_parent_[i])) + st.conv.size() + ch * ns;
+                    std::copy(from, from + ns, h);
+                }
+                scan(i, 1);
+                if (float* slot = checkpoint_slot(s, st, i)) std::copy(h, h + ns, slot + st.conv.size() + ch * ns);
+            }
+            for (size_t i = 0; i < count; ++i) {
+                const size_t at = (first + i) * di + ch;
+                dn_[at] = (dn_[at] + L.ssm_d[ch] * ssm_xc_[at]) * z_[at];
+            }
+        }
+    });
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n));
+    const auto d = static_cast<size_t>(c.n_embd);
+    for (size_t t = 0; t < un && !L.ssm_out_bias.empty(); ++t) {
+        for (size_t i = 0; i < d; ++i) xb_[t * d + i] += L.ssm_out_bias[i];
+    }
+    return Status::ok();
+}
+
+// Mamba-2 (SSD: Mamba-2, Mamba-Codestral), per token, with H heads of P
+// channels and G groups of heads sharing B and C:
+//   [z | x B C | dt] = W_in u;  [x | B | C] = SiLU(conv1d([x | B | C]) + b_conv)
+//   dt_h = softplus(dt_h + dt_bias_h);  decay_h = exp(dt_h A_h)   (A_h < 0)
+//   H_h = decay_h H_h + dt_h x_h B_g^T;  y_h = H_h C_g + D_h x_h  (H_h: P x N)
+//   y = RMSNorm_g(y SiLU(z)) w   (over each group of d_inner / G channels)
+//   out = W_out y
+// The scan runs as the recurrence it is, one task per (segment, head), every
+// token an O(P N) step in place on the head's state: a prefill does exactly
+// the work of its decoding steps, and every token's state is there for the
+// rollback checkpoints and tree branches. The norm spans each group or the
+// complete inner stream according to ArchSpec::ssm_norm_grouped: the
+// converter reshapes the weights identically for both reference contracts.
+Status Transformer::mamba2_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route,
+                                 ThreadPool& pool) {
+    const ModelConfig& c = config_;
+    const MambaGeometry& m = c.mamba;
+    const Layer& L = layers_[static_cast<size_t>(layer)];
+    const auto un = static_cast<size_t>(n);
+    const auto di = static_cast<size_t>(m.d_inner);
+    const auto ns = static_cast<size_t>(m.d_state);
+    const auto heads = static_cast<size_t>(m.n_heads);
+    const auto groups = static_cast<size_t>(m.n_groups);
+    const size_t hd = di / heads;
+    const size_t channels = di + 2 * groups * ns;  // [x | B | C]
+    const size_t row = di + channels + heads;      // [z | x B C | dt]
+    mix_.resize(un * row);
+    z_.resize(un * di);
+    dn_.resize(un * di);
+
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmIn], xb_.data(), mix_.data(), n));
+    for (size_t t = 0; t < un && !L.ssm_in_bias.empty(); ++t) {
+        for (size_t i = 0; i < row; ++i) mix_[t * row + i] += L.ssm_in_bias[i];
+    }
+    mamba_conv(L, mix_.data(), row, mix_.data(), row, di, channels, pool);
+
+    const auto segments = static_cast<int64_t>(segs_.size());
+    const size_t per_group = heads / groups;
+    pool.parallel_for(static_cast<int64_t>(heads) * segments, [&](int64_t begin, int64_t end) {
+        for (int64_t job = begin; job < end; ++job) {
+            const Segment& s = segs_[static_cast<size_t>(job / static_cast<int64_t>(heads))];
+            RecurrentState& st = (*s.states)[static_cast<size_t>(L.state_slot)];
+            const auto h = static_cast<size_t>(job % static_cast<int64_t>(heads));
+            const auto first = static_cast<size_t>(s.first);
+            const size_t g = h / per_group;
+            float* state = st.ssm.data() + h * hd * ns;
+            for (size_t i = 0; i < static_cast<size_t>(s.n); ++i) {
+                if (tree_branches(i)) {
+                    const float* from = checkpoint_slot(s, st, static_cast<size_t>(tree_parent_[i])) +
+                                        st.conv.size() + h * hd * ns;
+                    std::copy(from, from + hd * ns, state);
+                }
+                const size_t t = first + i;
+                const float* r = mix_.data() + t * row;
+                const float* x = r + di + h * hd;
+                const float* b = r + 2 * di + g * ns;
+                const float* cc = r + 2 * di + groups * ns + g * ns;
+                const float dt = softplus(r[di + channels + h] + L.ssm_dt[h]);
+                float* y = dn_.data() + t * di + h * hd;
+                ssm::mamba2_step(state, hd, ns, std::exp(dt * L.ssm_a[h]), dt, x, b, cc, y);
+                for (size_t p = 0; p < hd; ++p) y[p] += L.ssm_d[h] * x[p];
+                if (float* slot = checkpoint_slot(s, st, i)) {
+                    std::copy(state, state + hd * ns, slot + st.conv.size() + h * hd * ns);
+                }
+            }
+        }
+    });
+    // The gated norm, token by token: y SiLU(z), then RMSNorm per group.
+    const size_t norm_groups = c.spec->ssm_norm_grouped ? groups : 1;
+    const size_t group = di / norm_groups;
+    auto gate_norm = [&](int64_t begin, int64_t end) {
+        for (auto t = static_cast<size_t>(begin); t < static_cast<size_t>(end); ++t) {
+            float* y = dn_.data() + t * di;
+            float* z = z_.data() + t * di;
+            ssm::silu(mix_.data() + t * row, z, di);
+            for (size_t i = 0; i < di; ++i) y[i] *= z[i];
+            for (size_t k = 0; k < norm_groups; ++k) {
+                rmsnorm(y + k * group, L.ssm_norm.data() + k * group, y + k * group, static_cast<int32_t>(group),
+                        c.rms_eps);
+            }
+        }
+    };
+    if (n > 1) {
+        pool.parallel_for(n, gate_norm);
+    } else {
+        gate_norm(0, n);
+    }
+    LIYAB_RETURN_IF_ERROR(matmul(route, route.attention, w[kSsmOut], dn_.data(), xb_.data(), n));
+    const auto d = static_cast<size_t>(c.n_embd);
+    for (size_t t = 0; t < un && !L.ssm_out_bias.empty(); ++t) {
+        for (size_t i = 0; i < d; ++i) xb_[t * d + i] += L.ssm_out_bias[i];
+    }
+    return Status::ok();
+}
+
 // Expert streaming: the routed experts stay on storage and are read on
 // demand into a fixed RAM cache; every other tensor stays resident in the
 // mapping (paged in now, never swept by the streaming window).
@@ -3920,7 +4257,7 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     // one block ahead, see predict_experts) ---
     if (expert_store_ != nullptr && l == 0) predict_experts(0, n, route);
 
-    // --- token mixer (attention or DeltaNet) ---
+    // --- token mixer (attention, DeltaNet or Mamba; none in an FFN-only block) ---
     if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
     for (size_t t = 0; t < un; ++t) {
         if (plan.norm_before_mixer) norm_row(x_.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), xb_.data() + t * d, c.n_embd);
@@ -3947,6 +4284,12 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     } else if (plan.mixer == MixerKind::DeltaNet) {
         const PhaseTimer timer(phases_.delta_net);
         LIYAB_RETURN_IF_ERROR(delta_net_mixer(l, w, n, block_route, pool));
+    } else if (plan.mixer == MixerKind::Mamba) {
+        const PhaseTimer timer(phases_.delta_net);
+        LIYAB_RETURN_IF_ERROR(mamba_mixer(l, w, n, block_route, pool));
+    } else if (plan.mixer == MixerKind::Mamba2) {
+        const PhaseTimer timer(phases_.delta_net);
+        LIYAB_RETURN_IF_ERROR(mamba2_mixer(l, w, n, block_route, pool));
     } else if (plan.latent) {
         const PhaseTimer timer(phases_.attention);
         LIYAB_RETURN_IF_ERROR(latent_attention_mixer(l, w, n, block_route, pool,

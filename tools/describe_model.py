@@ -530,7 +530,7 @@ DELTANET_TENSORS = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "
 DERIVED_FIELDS = ("name", "rope", "ffn_norm", "moe_norm_weights", "qk_norm", "ffn_activation", "post_mixer_norm",
                   "post_ffn_norm", "scale_embeddings", "swa_period", "rope_base_swa", "norm", "parallel_residual",
                   "rotary", "alibi_bias", "sliding_window_default", "spm_prefix_after_control", "spm_add_bos_default",
-                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate")
+                  "spm_add_space_prefix_default", "spm_charsmap", "spm_user_defined", "attn_norm", "nope_period", "nope_global", "swa_rope_unscaled", "logit_scale_divides", "yarn_mscale_all_dim", "yarn_truncate", "ssm_dt_b_c_eps", "ssm_norm_grouped")
 
 
 def _close(a, b, rel=1e-5):
@@ -809,8 +809,13 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     for b in range(n_layers):
         ts = blocks.get(b, set())
         p = {"n_head": block_heads[b], "n_head_kv": block_kv_heads[b], "n_ff": block_ff[b]}
-        if "ssm_conv1d.weight" in ts:
-            p["mixer"] = "deltanet"
+        if {"ssm_conv1d.weight", "ssm_in.weight", "ssm_x.weight", "ssm_out.weight", "ssm_a", "ssm_d"} & ts:
+            p["mixer"] = ("mamba" if "ssm_x.weight" in ts else "mamba2") if {"ssm_d", "ssm_in.weight", "ssm_x.weight"} & ts else "deltanet"
+            if p["mixer"] in ("mamba", "mamba2") and "attn_output.weight" in ts:
+                d.missing.append(f"block {b}: parallel attention and Mamba mixers in one block")
+        elif not {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight", "attn_k.weight",
+                  "attn_v.weight", "attn_output.weight"} & ts:
+            p["mixer"] = "none"
         elif block_kv_heads[b] == 0:
             p["mixer"] = "none" if block_heads[b] == 0 else "linear"
         else:
@@ -827,17 +832,49 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             p["router_bias"] = "ffn_gate_inp.bias" in ts
             p["expert_biases"] = bool({"ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"} & ts)
             p["fused_experts"] = "ffn_gate_up_exps.weight" in ts
-        elif block_ff[b] == 0 and "ffn_up.weight" not in ts:
-            p["ffn"] = "none"
-        else:
+        elif {"ffn_up.weight", "ffn_gate.weight", "ffn_down.weight"} & ts:
             p["ffn"] = "dense"
             p["fused_gate_up"] = "ffn_gate.weight" not in ts and suffix_rows(b, "ffn_up.weight") == 2 * block_ff[b]
+        else:
+            p["ffn"] = "none"
+        if "ffn_gate_inp.weight" not in ts and {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight",
+                                                "ffn_gate_up_exps.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"} & ts:
+            d.file_issues.append(f"block {b}: expert projections require ffn_gate_inp.weight")
         plans.append(p)
 
     # --- the reference, block by block ---
     bf = facts["block_facts"]
     att_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "attention"]
     rec_blocks = [b for b in bf if b.get("mixer", {}).get("kind") == "recurrent"]
+    ssm_blocks = [b for b in bf if b.get("mixer", {}).get("kind") in ("mamba", "mamba2")]
+    for b in ssm_blocks:
+        m = b["mixer"]
+        i = b["index"]
+        if plans[i]["mixer"] != m["kind"] or plans[i]["ffn"] != "none":
+            d.file_issues.append(f"block {i}: SSM topology differs from the reference")
+        # The reduced trace preserves scalar settings; geometry is compared
+        # to the full configuration because width/head count were reduced.
+        for key, want in (("ssm.conv_kernel", cfg.get("conv_kernel")),
+                          ("ssm.inner_size", cfg.get("intermediate_size")),
+                          ("ssm.state_size", cfg.get("state_size")),
+                          ("ssm.time_step_rank", cfg.get("num_heads") if m["kind"] == "mamba2" else cfg.get("time_step_rank"))):
+            if want is not None and g.key(key) != want:
+                d.file_issues.append(f"{key}: {g.key(key)} in the file, {want} in the reference")
+        if m["activation"] != "silu":
+            d.missing.append(f"SSM activation {m['activation']} (the engine implements SiLU)")
+        if bool(g.key("ssm.dt_b_c_rms", False)) != bool(m["dt_b_c_rms"]):
+            d.file_issues.append("ssm.dt_b_c_rms disagrees with the reference's mixer norms")
+        if m["dt_b_c_rms"]:
+            d.set("ssm_dt_b_c_eps", m["dt_b_c_eps"], "the reference mixer's weightless dt/B/C norm epsilon; not written by converter b11819")
+        if m["dt_limit"] != [0.0, float("inf")]:
+            d.missing.append(f"SSM dt limits {m['dt_limit']}: converter b11819 does not write them")
+        if m["kind"] == "mamba2" and int(g.key("ssm.group_count", 1)) != int(cfg.get("n_groups", 1)):
+            d.file_issues.append("ssm.group_count disagrees with the reference")
+        if m["kind"] == "mamba2":
+            d.set("ssm_norm_grouped", m["norm_grouped"], "the reference gated norm's observed grouping (the converter reshapes both forms identically)")
+    if ssm_blocks and not att_blocks:
+        d.set("rope", "Halves", "no attention or rotary embedding in an SSM-only stack; pairing is unused")
+        d.set("ffn_norm", "", "mixer-only blocks have no FFN norm")
     for b in bf:
         for u in b.get("unknown", []):
             d.unknown.append(f"block {b['index']}: {u}")
@@ -896,6 +933,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             d.set("rope", engine.enums["RopeLayout"][0], "no rotary dimensions (layout is unused)")
     elif rotated:
         d.set("rotary", True, "rotary attention is present; per-block NoPE is established separately below")
+    else:
+        inactive("rotary", "no attention projection in the traced blocks")
     ref_layout = layouts.pop() if len(layouts) == 1 else None
     if len(layouts) > 0:
         d.unknown.append("the reference pairs RoPE dimensions differently in different blocks")
@@ -1191,7 +1230,9 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     # --- attention arguments ---
     qk_orders, qk_spans = set(), set()
     alibi = [b["mixer"].get("alibi_slopes") for b in att_blocks]
-    if alibi and all(slopes is None for slopes in alibi):
+    if not alibi:
+        inactive("alibi_bias", "no softmax attention in the traced blocks")
+    elif all(slopes is None for slopes in alibi):
         d.set("alibi_bias", 0.0, "no linear per-head position bias in the attention scores")
     elif alibi and all(slopes is not None for slopes in alibi):
         slopes = alibi[0]
@@ -1211,7 +1252,7 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     # The q.k scale the engine uses: the file's attention.scale when it reads that key, else 1/sqrt(head_dim);
     # times YaRN's q.k factor squared. Soft caps likewise come from the file when the engine reads them.
     file_scale = g.key("attention.scale") if "attention.scale" in engine.file_keys else None
-    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(head_dim))) * qk_factor ** 2
+    engine_scale = (float(file_scale) if file_scale is not None else _f32(1.0 / math.sqrt(max(head_dim, 1)))) * qk_factor ** 2
     file_cap = g.key("attn_logit_softcapping") if "attn_logit_softcapping" in engine.file_keys else None
     for b in att_blocks:
         m = b["mixer"]
@@ -1329,6 +1370,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     norm_names = {}
     b0 = next((b for b in bf if b.get("mixer", {}).get("kind") not in (None, "none") and
                b.get("ffn", {}).get("kind") not in (None, "none") and b["index"] < n_layers), None)
+    if b0 is None:
+        b0 = next((b for b in bf if b["index"] < n_layers and any(b.get(role) for role in roles)), None)
     if b0 is not None and ckpt is not None:
         i = b0["index"]
         candidates = {s: g.values(f"blk.{i}.{s}").reshape(-1) for s in blocks.get(i, set())
@@ -1388,6 +1431,10 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             d.file_issues.append(f"the FFN shares its attention norm, but the file has an extra {name}")
         else:
             d.set("ffn_norm", name, "the parallel FFN shares the mixer's norm (no separate FFN norm tensors)")
+    elif placement.get("norm_after_ffn"):
+        d.set("ffn_norm", "ffn_norm", "no norm before the FFN; the conventional absent tensor name is unused")
+    elif all(b.get("ffn", {}).get("kind") == "none" for b in bf):
+        d.set("ffn_norm", existing_norms.get("ffn_norm", ""), "no FFN branch; its norm name is inactive")
     parallels = {bool(b.get("parallel")) for b in bf if "mixer" in b}
     if len(parallels) == 1:
         parallel = next(iter(parallels))
@@ -1399,10 +1446,6 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
               "attention and FFN read the block input" if parallel else "the FFN follows the attention residual")
     elif parallels:
         d.missing.append("parallel residuals in only some blocks")
-    elif placement.get("norm_after_ffn"):
-        d.set("ffn_norm", "ffn_norm", "no norm before the FFN; the conventional absent tensor name is unused")
-    elif all(b.get("ffn", {}).get("kind") == "none" for b in bf):
-        d.set("ffn_norm", "ffn_norm", "no FFN branch; its conventional norm name is inactive")
     for r, field in (("norm_after_mixer", "post_mixer_norm"), ("norm_after_ffn", "post_ffn_norm")):
         if not placement.get(r):
             d.set(field, "", f"no norm after the {'mixer' if 'mixer' in r else 'FFN'}")
@@ -1548,8 +1591,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
     elif bf:
         # A dense checkpoint cannot establish an expert-routing default. Keep
         # a registered family's value: e.g. llama also names Mixtral files.
-        inactive = engine.rows.get(arch, ({}, ""))[0].get("moe_norm_weights", False)
-        d.set("moe_norm_weights", inactive, "dense FFNs: inactive; preserve the registered family's MoE default "
+        moe_default = engine.rows.get(arch, ({}, ""))[0].get("moe_norm_weights", False)
+        d.set("moe_norm_weights", moe_default, "dense FFNs: inactive; preserve the registered family's MoE default "
                                              "(unmeasurable without an expert checkpoint)")
 
     # --- embeddings and logits ---
@@ -1675,6 +1718,8 @@ def describe(model, gguf_spec, engine, revision=None, trust_remote_code=False, s
             mix = "no mixer"
         elif p["mixer"] == "linear":
             mix = "linear mixer (one residual projection)"
+        elif p["mixer"] in ("mamba", "mamba2"):
+            mix = {"mamba": "Mamba-1", "mamba2": "Mamba-2"}[p["mixer"]]
         else:
             mix = "attention" + ("".join(f", {t}" for t, on in (("fused QKV", p["fused_qkv"]),
                                                                 ("QKV biases", p["qkv_bias"]),
@@ -1959,8 +2004,11 @@ def run(cmd, log, cwd=None, env=None):
     with open(log, "a") as out:
         out.write("$ " + " ".join(cmd) + "\n")
         out.flush()
+        # Tokenizer diagnostics can include raw byte-token pieces that are not
+        # UTF-8 by themselves. Preserve those bytes as escapes in the gate log;
+        # token-id comparison must not fail while decoding its diagnostics.
         p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, encoding="utf-8", errors="replace")
+                           text=True, errors="backslashreplace")
         out.write(p.stdout)
     return p.returncode, p.stdout
 

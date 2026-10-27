@@ -30,7 +30,7 @@ const std::unordered_map<int32_t, uint8_t>& gpt2_byte_decoder() {
     static const std::unordered_map<int32_t, uint8_t> table = [] {
         std::unordered_map<int32_t, uint8_t> m;
         for (int32_t b = 0; b < 256; ++b) {
-            m[static_cast<int32_t>(PreTokenizer::byte_codepoint(static_cast<uint8_t>(b)))] = static_cast<uint8_t>(b);
+            m[static_cast<int32_t>(unicode::gpt2_byte_codepoint(static_cast<uint8_t>(b)))] = static_cast<uint8_t>(b);
         }
         return m;
     }();
@@ -42,7 +42,7 @@ const std::array<std::string, 256>& gpt2_byte_encoder() {
     static const std::array<std::string, 256> table = [] {
         std::array<std::string, 256> t;
         for (int32_t b = 0; b < 256; ++b) {
-            const uint32_t cp = PreTokenizer::byte_codepoint(static_cast<uint8_t>(b));
+            const uint32_t cp = unicode::gpt2_byte_codepoint(static_cast<uint8_t>(b));
             std::string utf8;
             if (cp < 0x80) {
                 utf8 += static_cast<char>(cp);

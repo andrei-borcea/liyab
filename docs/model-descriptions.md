@@ -25,6 +25,135 @@ Liyab: the 4 GB of float32 weights of a 1B model, 13 GB for a 3B one.
 * [The conformance gate](#the-conformance-gate)
 * [Validation](#validation)
 * [Limits](#limits)
+* [State-space mixers](#state-space-mixers)
+
+## State-space mixers
+
+The `mamba` and `mamba2` rows describe stacks without an FFN. A block with
+`ssm_conv1d` and `ssm_d` is Mamba-1 when it also has `ssm_x`, otherwise
+Mamba-2. `ssm_conv1d` without `ssm_d` remains Gated DeltaNet. Attention
+projections select attention; an FFN without mixer tensors is an FFN-only
+block. The loader rejects empty blocks and mixed SSM geometries.
+Any attention projection identifies attention, including K/V/output: an
+incomplete set fails binding rather than silently becoming an FFN-only block.
+Likewise, a partial FFN or SSM projection set remains that part and fails
+validation/binding; expert projections require a router. Parallel attention
+and Mamba tensors in one block are explicitly refused until that topology
+is implemented.
+
+Mamba-1 uses the file's convolution, input, selective, time-step and output
+projections; `ssm_a` already holds `-exp(A_log)`, as converter b11819 writes
+it. Mamba-2 splits the inner stream into heads, with groups sharing B/C,
+per-head decay and D skip, then gated RMS normalization. Both use existing
+matmuls for every projection format. Scans and convolution run on CPU
+(NEON, AVX2/FMA or scalar); GPU routes can still project on Metal/Vulkan.
+
+Falcon-Mamba's `ssm.dt_b_c_rms` enables weightless dt/B/C RMS norms. The
+epsilon is `ArchSpec::ssm_dt_b_c_eps` (1e-6); b11819 does not write
+`mixer_rms_eps`. Current transformers' saved norm weights are dummy tensors
+and do not affect these norms. Other weighted dt/B/C norms use the file's
+RMS epsilon. Nondefault dt clipping is not expressible by b11819 and the
+description tool refuses to propose a row for it. `ssm_norm_grouped`
+distinguishes a gated norm over each group from transformers Mamba-2's norm
+over all inner channels. The trace recomputes the gated norm to establish
+this fact; the converter reshapes both forms identically.
+
+The reference trace recognizes the projections and state tensors, observes
+the mixer-only residual, and compares SSM geometry, activation and norm
+settings with metadata. A pure SSM trace reduces its residual width while
+preserving expansion and head/group divisibility, as does
+`tiny_checkpoint.py --width`. `test_ssm` checks scans
+against independent scalar equations and compares prefill, decode and
+rollback for all 26 projection formats and four KV cache types. Reader-only
+formats use `ssm_quant_vectors.bin`, derived from the existing independent
+`quant_vectors.bin` blocks through an opt-in test-writer replacement. Every
+block uses the same RMS target, `0.5 / sqrt(256)`, before scale rounding;
+integer codes/grids are preserved. This bounds repeated correlated rows
+without changing tolerances or selecting a rule by format or platform.
+Normal synthetic fixtures, original quant vectors and golden hashes remain
+unchanged. Regenerate with
+`python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin`
+using gguf 0.19.0 and NumPy. The generator
+checks the source reference values and independently decodes the scaled
+blocks with gguf-py. The ordinary writer still uses its eight implemented
+encoders and aborts with a named diagnostic when a reader-only format lacks
+an explicit encoded payload; production quantization behavior is unchanged.
+Tests require nonzero decoded weights,
+projection outputs, convolution history and scan state, and verify that
+ablating each projection or the carried scan state changes the logits. Existing
+context, tree-draft and prefix-cache tests also exercise Mamba states.
+Synthetic golden cases combine SSM, attention and FFN-only blocks, including
+MoE FFNs with in-place and streamed experts.
+GPU prefill and decode projection checks use F32 throughout, keeping projection roundoff
+separate from discrete Q8 activation rounding in the output head. Each GPU
+backend is destroyed before the model mappings whose buffers it wraps.
+The CLI labels their phase `recurrent`. The C API field `delta_net_ms` and
+JSON key `phases_ms.delta_net` keep their names and include all recurrent
+mixers; neither the ABI layout nor existing JSON keys change.
+
+Rows established against transformers 5.19.0 and converter b11819:
+
+```cpp
+{"mamba", RopeLayout::Halves, "", false},
+{.name = "mamba2", .rope = RopeLayout::Halves, .ffn_norm = "", .moe_norm_weights = false,
+ .ssm_norm_grouped = false},
+```
+
+The following comparisons use 511 prediction positions and F16 KV. Every
+case has identical token IDs. The real checkpoints also pass
+`describe_model.py --gate`, including its three tokenizer texts and the
+exact registry-row comparison.
+
+| Checkpoint / tiny configuration | GGUF | Mean KL | Top-1 |
+| :--- | :--- | ---: | ---: |
+| Tiny `state-spaces/mamba-130m-hf` | F32 | 0.00000 | 100% |
+| Tiny `tiiuae/falcon-mamba-7b`, weightless mixer norms | F32 | 0.00000 | 100% |
+| Tiny `AntonV/mamba2-130m-hf` | F32 | 0.00000 | 100% |
+| Tiny Mamba-2, two B/C groups and projection biases | F32 | 0.00000 | 100% |
+| Tiny `mistralai/Mamba-Codestral-7B-v0.1`, two groups | F32 | 0.00000 | 100% |
+| `state-spaces/mamba-130m-hf` | F16 | 0.00001 | 99.61% |
+| `state-spaces/mamba-370m-hf` | F16 | 0.00000 | 100% |
+| `AntonV/mamba2-130m-hf` | F16 | 0.00000 | 100% |
+
+The AntonV configuration omits `architectures`; the validation copy adds
+`["Mamba2ForCausalLM"]` before conversion. Its weights and forward settings
+are unchanged. No converter code is patched. Tiny widths are 64, inner
+widths 128, and two blocks; Mamba-1 has dt rank 8, Mamba-2 has four 32-wide
+heads, state size 16 and reference chunk size 16. SSM goldens cover both
+norm groupings, weighted and weightless dt/B/C norms, convolution without
+history, biases and mixed topology on ARM NEON, x86 AVX2 and x86 scalar.
+Nine SSM golden cases are pinned on each platform; all 111 pre-existing
+hashes remain unchanged. The README correctness table includes the three
+real F16 checkpoints above; its testing table lists the focused `test_ssm`
+suite. The final experimental release passes all 15 test modules on native
+ARM64 and Rosetta x86-64 with AVX2 enabled and disabled, with actual Metal
+access. The Android ARM64 experimental build also passes; Vulkan execution
+remains an on-device integration check.
+
+The converter calls the GPT-NeoX/Mamba ByteLevel tokenizer `olmo` (the
+existing GPT-2 regex after NFC). Falcon-Mamba's `falcon` pipeline isolates contiguous
+punctuation, applies ByteLevel, isolates number runs, then ASCII triples.
+The last two steps classify ByteLevel's encoded bytes, so the table marks
+them as byte-alphabet steps. They may split inside an original UTF-8
+character; the BPE encoder receives the exact resulting byte ranges.
+`tools/gen_text_tests.py` checks both against the Rust tokenizer pipelines;
+the resulting split records are appended to `tests/data/text_cases.txt`.
+These base checkpoints supply no chat template; no template is invented.
+The gate escapes non-UTF-8 byte-token diagnostics instead of failing while
+decoding a tokenizer tool's output; token IDs are still compared exactly.
+
+The next hybrid families remain separate validation work. This section does
+not register them merely because they contain an SSM:
+
+| Family | Remaining parts and ownership |
+| :--- | :--- |
+| Jamba | Per-block KV-head arrays and attention without RoPE (modern); architecture facts and conformance of weighted dt/B/C norms and dense/MoE combinations (ssm/moe). |
+| Falcon-H1 | Attention and SSM in parallel inside one block, partial SSM widths and D layouts (ssm); verify the converter's baked multipliers against the reference. |
+| Granite 4 hybrid | Per-block head arrays and NoPE (modern); embedding/residual/logit multipliers (classic/modern), then shared/routed-expert conformance (moe). |
+| Nemotron-H | Ungated ReLU-squared FFN (classic), per-block head metadata (modern); grouped SSM norm is implemented here. |
+| Nemotron-H-MoE | Nemotron-H parts plus its expert/routing variants (moe; group-limited selection deepseek-dsa). |
+| Plamo2 | Per-block head arrays (modern); its distinct headwise B/C, dt/B/C normalization and SSM projection/state layout (ssm). |
+| Bamba | Its converter uses `granitehybrid` with per-block KV-head arrays (modern); register only after its full hybrid facts and conformance are established. |
 
 ## Where the facts come from
 

@@ -70,6 +70,11 @@ const std::string& model_path(const std::string& name, const test::TinyModelSpec
 
 const std::string& mixed_model() { return model_path("mixed", {}); }
 const std::string& f32_model() { return model_path("f32", f32_spec()); }
+const std::string& ssm_model(const char* arch) {
+    test::TinyModelSpec s;
+    s.arch = arch;
+    return model_path(arch, s);
+}
 
 std::unique_ptr<Transformer> load_transformer(const std::string& path, TransformerOptions options = {}, LoaderOptions loader = {}) {
     auto file = MmapLoader::open(path, loader);
@@ -543,53 +548,8 @@ TEST_CASE("K-quant and Q5 dot kernels equal the dot of their dequantized rows") 
     }
 }
 
-// One entry of tests/data/quant_vectors.bin (written by tools/gen_quant_vectors.py):
-// encoded blocks of a GGML format and the values llama.cpp's reference decodes.
-struct QuantVector {
-    DType type{};
-    int64_t n = 0;  // values
-    std::vector<uint8_t> blocks;
-    std::vector<float> expected;
-};
-
-// Reads every entry; false (with a "skipped" note) when the file is absent.
-bool load_quant_vectors(std::vector<QuantVector>& out) {
-    std::string dir = LIYAB_TEST_DATA_DIR;
-    if (const char* env = std::getenv("LIYAB_TEST_DATA")) dir = env;
-    std::FILE* f = std::fopen((dir + "/quant_vectors.bin").c_str(), "rb");
-    if (f == nullptr) {
-        std::printf("  skipped: %s/quant_vectors.bin not found (set LIYAB_TEST_DATA)\n", dir.c_str());
-        return false;
-    }
-    std::vector<uint8_t> file;
-    uint8_t chunk[4096];
-    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
-    std::fclose(f);
-    CHECK(file.size() > 12 && std::memcmp(file.data(), "LYQV", 4) == 0);
-    if (file.size() <= 12) return false;
-    size_t pos = 12;
-    uint32_t count = 0;
-    std::memcpy(&count, file.data() + 8, 4);
-    for (uint32_t e = 0; e < count; ++e) {
-        uint32_t ggml = 0, n_blocks = 0;
-        std::memcpy(&ggml, file.data() + pos, 4);
-        std::memcpy(&n_blocks, file.data() + pos + 4, 4);
-        pos += 8;
-        QuantVector v;
-        const bool known = dtype_from_ggml(ggml, v.type);
-        CHECK(known);
-        if (!known) return false;
-        const DTypeTraits t = dtype_traits(v.type);
-        v.n = static_cast<int64_t>(n_blocks) * t.block_size;
-        v.blocks.assign(file.data() + pos, file.data() + pos + static_cast<size_t>(n_blocks) * t.block_bytes);
-        pos += v.blocks.size();
-        v.expected.resize(static_cast<size_t>(v.n));
-        std::memcpy(v.expected.data(), file.data() + pos, v.expected.size() * 4);
-        pos += v.expected.size() * 4;
-        out.push_back(std::move(v));
-    }
-    return true;
-}
+using test::QuantVector;
+using test::load_quant_vectors;
 
 TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/data/quant_vectors.bin)") {
     std::vector<QuantVector> vectors;
@@ -3476,11 +3436,12 @@ TEST_CASE("Modern block plans preserve batching and rollback for every KV format
 }
 
 TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactly") {
+    for (const char* arch : {"qwen35", "mamba", "mamba2"}) {
     test::TinyModelSpec spec;
-    spec.arch = "qwen35";
+    spec.arch = arch;
     spec.n_layers = 4;
-    spec.delta_net_interval = 2;  // DeltaNet, attention, DeltaNet, attention
-    const std::string& path = model_path("hybrid", spec);
+    if (std::string_view(arch) == "qwen35") spec.delta_net_interval = 2;  // DeltaNet, attention, DeltaNet, attention
+    const std::string& path = model_path(std::string("rollback_") + arch, spec);
     ThreadPool pool(4);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -3523,6 +3484,7 @@ TEST_CASE("Hybrid (DeltaNet) models roll back inside the rollback window, exactl
     auto again = model->forward(std::span<const int32_t>(tokens).subspan(5), Transformer::Logits::All, route, pool);
     REQUIRE(again.has_value());
     CHECK(max_abs_diff(*again, rows(5)) < 1e-4);
+    }
 }
 
 // A model with `ffn` FFNs and Q8_0 attention / output: repacked, it computes
@@ -4007,7 +3969,7 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
     // cut buffer), one with a whole "é".
     const ForcePlan plan = {{1, " world hello"}, {3, " hel\xC3"}, {4, " w\xC3\xA9rld"}, {6, " hello"}};
     constexpr int32_t kMaxTokens = 16;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto reference_engine = Engine::create(plain);
@@ -4080,8 +4042,8 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
 }
 
 TEST_CASE("The prefix cache brings back a conversation another one replaced, exactly") {
-    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r", "nemotron"}) {
-        test::TinyModelSpec spec = std::string(arch) == "llama" || std::string(arch) == "qwen35"
+    for (const char* arch : {"llama", "qwen35", "gpt2", "bloom", "gptneox", "command-r", "nemotron", "mamba", "mamba2"}) {
+        test::TinyModelSpec spec = std::string(arch) == "llama" || std::string(arch) == "qwen35" || std::string(arch) == "mamba" || std::string(arch) == "mamba2"
                                        ? test::TinyModelSpec{} : test::classic_model_spec(arch);
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4331,7 +4293,7 @@ TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later 
 }
 
 TEST_CASE("Conversations sharing a system prompt keep it once, and a new one restores it exactly") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4395,14 +4357,14 @@ TEST_CASE("Conversations sharing a system prompt keep it once, and a new one res
         REQUIRE(fresh.value()->load_state(file).has_value());
         CHECK(out == run(*fresh.value(), next));
         CHECK(st.cached_prefix_tokens >= system_tokens);
-        if (std::string(arch) == "qwen35") CHECK(st.cached_prefix_tokens == system_tokens);  // its state image
+        if (std::string(arch) != "llama") CHECK(st.cached_prefix_tokens == system_tokens);  // its state image
         CHECK(e.prefix_cache_stats().restores == restores + 1);
         std::remove(file.c_str());
     }
 }
 
 TEST_CASE("A chat after a long shared system prompt is set aside and comes back; an edited draft is not") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4468,12 +4430,12 @@ TEST_CASE("A chat after a long shared system prompt is set aside and comes back;
         CHECK(out3 == run(*reference.value(), a3));
         CHECK(st.cached_prefix_tokens >= static_cast<int32_t>(e.tokenize(a1, true)->size()) + 5);
         CHECK(e.prefix_cache_stats().restores == restores + 1);
-        CHECK(e.prefix_cache_stats().set_asides == aside + (std::string(arch) == "qwen35" ? 1 : 0));
+        CHECK(e.prefix_cache_stats().set_asides == aside + (std::string(arch) != "llama" ? 1 : 0));
     }
 }
 
 TEST_CASE("A later engine restores the prefix an earlier one left on storage") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4745,7 +4707,7 @@ TEST_CASE("After cancelled work a turn still reuses a context whose text re-enco
 }
 
 TEST_CASE("The prefix cache brings back a conversation whose text re-encodes differently") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -4803,7 +4765,7 @@ TEST_CASE("The prefix cache brings back a conversation whose text re-encodes dif
 // and from the prefix cache alike; it used to be re-encoded whole, which on a
 // hybrid model processed the conversation again.
 TEST_CASE("A conversation whose last token ends inside a character is reused, live or from the prefix cache") {
-    for (const char* arch : {"llama", "qwen35"}) {
+    for (const char* arch : {"llama", "qwen35", "mamba", "mamba2"}) {
         test::TinyModelSpec spec;
         spec.arch = arch;
         spec.n_layers = 4;
@@ -5215,7 +5177,7 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
     hybrid.arch = "qwen35";
     hybrid.n_layers = 4;
     hybrid.delta_net_interval = 2;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto base_engine = Engine::create(plain);
@@ -5436,7 +5398,7 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
     sampled.temperature = 0.9f;
     sampled.seed = 1234;
     sampled.max_tokens = 40;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         auto base_engine = Engine::create(plain);
@@ -5493,7 +5455,7 @@ TEST_CASE("A speculative turn that stops partway through a step leaves the conte
     hybrid.arch = "qwen35";
     hybrid.n_layers = 4;
     hybrid.delta_net_interval = 2;
-    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid)}) {
+    for (const std::string& path : {mixed_model(), model_path("hybrid", hybrid), ssm_model("mamba"), ssm_model("mamba2")}) {
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         EngineConfig suffix = plain;
@@ -6045,6 +6007,11 @@ TEST_CASE("Tree passes give every branch a linear pass's bits, and keep_path lea
         s.arch = "smollm3";
         s.n_layers = 4;
         cases.push_back({"tree_nope", s});
+    }
+    for (const char* arch : {"mamba", "mamba2"}) {
+        test::TinyModelSpec s;
+        s.arch = arch;
+        cases.push_back({arch, s});
     }
     // Depths 0 1 2 3 1 2 2 3 2: the first branch, then others off the root and off token 1.
     const std::vector<int32_t> parents = {-1, 0, 1, 2, 0, 4, 1, 6, 4};

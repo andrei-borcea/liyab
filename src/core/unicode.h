@@ -15,6 +15,15 @@
 
 namespace liyab::unicode {
 
+// GPT-2 ByteLevel's printable stand-in for one byte. The three printable
+// ranges retain their code points; other bytes map, in order, from U+0100.
+// Shared by vocabulary encoding/decoding and pre-tokenizer steps that run
+// after ByteLevel (which can split inside an original UTF-8 character).
+[[nodiscard]] constexpr uint32_t gpt2_byte_codepoint(uint8_t b) noexcept {
+    const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174;
+    return printable ? b : 256u + (b < 33 ? b : b < 173 ? b - 94u : 67u);
+}
+
 // Unicode general categories. The order is the one of
 // tools/gen_unicode_tables.py (CATEGORIES); a regex character class keeps one
 // bit per category, so the count must stay below 32.

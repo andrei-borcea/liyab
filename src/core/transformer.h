@@ -309,7 +309,7 @@ public:
     static constexpr int32_t kLatentTileMin = 16;
     static constexpr int32_t kLatentTileMax = 256;
     [[nodiscard]] ExpertStore* expert_store() noexcept { return expert_store_.get(); }
-    // Bytes held by the recurrent (DeltaNet) states; 0 for plain transformers.
+    // Bytes held by the recurrent (DeltaNet, Mamba) states; 0 for plain transformers.
     [[nodiscard]] size_t recurrent_state_bytes() const noexcept;
     // The most a context made now (make_context()) holds besides its KV
     // pages, which it maps as it uses them: its recurrent states, its
@@ -335,7 +335,7 @@ public:
     // block, a few hundred per token: noise next to the matmuls they time.
     struct PhaseTimes {
         double attention = 0.0;      // softmax-attention mixers, projections included
-        double delta_net = 0.0;      // Gated DeltaNet mixers, projections included
+        double delta_net = 0.0;      // recurrent mixers (Gated DeltaNet, Mamba), projections included
         double router = 0.0;         // MoE routers, top-k selection and expert prediction
         double experts = 0.0;        // routed experts, waits for streamed ones included
         double shared_expert = 0.0;  // MoE shared expert
@@ -751,12 +751,15 @@ private:
         // attn_q_a / attn_q_b, attn_kv_a_mqa [n_embd x (kv_rank + rope_dim)], and per head
         // attn_k_b [nope_dim -> kv_rank] (absorbs a query) and attn_v_b [kv_rank -> v_dim] (expands a value)
         kQa, kQb, kKvA, kKb, kVb,
+        // Mamba (kSsmOut: out_proj): in_proj, Mamba-1's x_proj [d_inner -> dt_rank + 2 d_state] and dt_proj
+        // [dt_rank -> d_inner]
+        kSsmIn, kSsmX, kSsmDt,
         kWeightRoles
     };
     // The bound weights of one block (its structure is config_.blocks[layer]).
     struct Layer {
         int32_t kv_slot = -1;     // layer index inside the KV cache (attention)
-        int32_t state_slot = -1;  // index into states_ (DeltaNet)
+        int32_t state_slot = -1;  // index into states_ (DeltaNet, Mamba)
         int32_t window = 0;       // attention: visible positions (BlockPlan::windowed); 0: all
         int32_t rope_table = 0;   // attention: index into rope_tables_
         std::array<const TensorView*, kWeightRoles> w{};
@@ -764,9 +767,13 @@ private:
         std::vector<float> post_mixer_norm, post_ffn_norm;  // optional (ArchSpec): applied before each residual add
         std::vector<float> q_a_norm, kv_a_norm;  // latent attention: norms of the low-rank query and of the latent
         std::vector<float> conv1d;   // [channel][kernel] taps
-        std::vector<float> ssm_a;    // per value head: -exp(A_log)
-        std::vector<float> ssm_dt;   // per value head: decay bias
-        std::vector<float> ssm_norm; // gated RMSNorm weight, per head dim
+        std::vector<float> ssm_a;    // -exp(A_log): per value head (DeltaNet, Mamba-2), per [channel][state] (Mamba-1)
+        std::vector<float> ssm_dt;   // dt bias: per value head (DeltaNet, Mamba-2), per channel (Mamba-1)
+        std::vector<float> ssm_norm; // gated RMSNorm weight: per head dim (DeltaNet), per channel (Mamba-2)
+        // Mamba: the convolution's bias per channel, the D skip per channel
+        // (Mamba-1) or head (Mamba-2), optional in_proj / out_proj biases
+        // and Mamba-1's optional weighted norms of dt, B and C (empty: none).
+        std::vector<float> conv_bias, ssm_d, ssm_in_bias, ssm_out_bias, dt_norm, b_norm, c_norm;
         std::vector<float> shared_gate;   // optional: sigmoid(shared_gate . x) scales the shared expert
         std::vector<float> expert_bias;   // optional: added to probabilities for selection only
         // Optional LayerNorm biases (ArchSpec::norm Layer) of attn_norm, ffn_norm and the Q/K norms. With
@@ -784,10 +791,13 @@ private:
         // added after its projection.
         std::vector<float> gate_exps_bias, up_exps_bias, down_exps_bias;
     };
-    // Recurrent memory of one DeltaNet block.
+    // Recurrent memory of one DeltaNet or Mamba block, sized for its mixer.
     struct RecurrentState {
         std::vector<float> conv;  // last (kernel - 1) inputs per channel, oldest first: [channel][kernel - 1]
-        std::vector<float> ssm;   // per value head a [head_dim (value) x head_dim (key)] matrix
+        // DeltaNet: per value head a [head_dim (value) x head_dim (key)]
+        // matrix. Mamba-1: per channel d_state values; Mamba-2: per head a
+        // [head_dim x d_state] matrix.
+        std::vector<float> ssm;
         // Rollback ring: slot s holds [conv | ssm] after the token at the
         // position checkpoint_pos_[s] (slot = position % rollback window).
         std::vector<float> checkpoints;
@@ -866,6 +876,26 @@ private:
     Status attention_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool,
                            const uint8_t* head_mask);
     Status delta_net_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // Mamba-1 and Mamba-2 (ModelConfig::mamba; see the definitions).
+    Status mamba_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    Status mamba2_mixer(int32_t layer, const BlockWeights& w, int32_t n, const Route& route, ThreadPool& pool);
+    // Mamba: the causal convolution of `channels` channels starting at
+    // column `col` of the rows of `in` (row stride `in_stride`), each
+    // segment's tokens continuing its own history (bias, SiLU), into the same
+    // columns of `out` (row stride `out_stride`; it may be `in`), with the
+    // rollback checkpoints and tree branches of delta_net_mixer().
+    void mamba_conv(const Layer& L, const float* in, size_t in_stride, float* out, size_t out_stride, size_t col,
+                    size_t channels, ThreadPool& pool);
+    // A recurrent block's rollback checkpoint after token i of segment s
+    // ([conv | ssm] of `st`, ring slot (n_past + i) % rollback), or nullptr
+    // when that token records none (only the segment's last `rollback`
+    // tokens do, and only when it checkpoints).
+    [[nodiscard]] static float* checkpoint_slot(const Segment& s, RecurrentState& st, size_t i) noexcept;
+    // Tree pass (forward_tree): whether token i continues another token than
+    // the one before it, and so starts from its parent's checkpoint.
+    [[nodiscard]] bool tree_branches(size_t i) const noexcept {
+        return !tree_depth_.empty() && i > 0 && tree_parent_[i] != static_cast<int32_t>(i) - 1;
+    }
     // Multi-head latent attention (ModelConfig::mla), in the form forward()
     // chose for the pass (latent_expanded_): absorbed queries against the
     // cached [k_pe | latent] rows and the weighted latent expanded per head,
@@ -1107,7 +1137,8 @@ private:
     LatentStats latent_stats_;
     bool latent_expanded_ = false;  // the current pass's form
     double latent_ms_ = 0.0;        // the current pass's form-dependent time, every latent block
-    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output
+    std::vector<float> mix_, z_, alpha_, beta_, dn_;  // DeltaNet projections and output (Mamba: in_proj, gate, output)
+    std::vector<float> ssm_xc_, ssm_dbc_, ssm_dtl_, ssm_dt_;  // Mamba-1: convolved x, [dt | B | C], dt, dt per channel
     std::vector<float> router_, moe_out_, ein_, eout_, eh_, eh2_, shared_out_, shared_scale_;  // MoE scratch
     std::vector<float> ranked_out_;  // MoE: weighted output of each (token, top-k rank), summed in rank order
     std::vector<float> pred_in_, pred_logits_;                       // expert prediction scratch

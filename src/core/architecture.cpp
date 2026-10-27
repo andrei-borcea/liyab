@@ -291,6 +291,17 @@ constexpr ArchSpec kArchitectures[] = {
     {"hy_v3", RopeLayout::Halves, "ffn_norm", true},
     {"deepseek", RopeLayout::Adjacent, "ffn_norm", false},
     {"bailingmoe", RopeLayout::Adjacent, "ffn_norm", true},
+    // Mamba-1 and Falcon-Mamba: every block is a Mamba-1 mixer alone
+    // (planned from ssm_x and ssm_d) after attn_norm, with no FFN and no
+    // attention (the RoPE pairing is unused). Falcon-Mamba's weightless
+    // norms of dt, B and C are switched on by the file (ssm.dt_b_c_rms),
+    // with ssm_dt_b_c_eps (the default, its reference's mixer_rms_eps).
+    // Rows proposed and gated by tools/describe_model.py.
+    {"mamba", RopeLayout::Halves, "", false},
+    // Mamba-2 and Mamba-Codestral: every block is a Mamba-2 mixer alone
+    // (planned from ssm_d without ssm_x), heads and groups from the file.
+    {.name = "mamba2", .rope = RopeLayout::Halves, .ffn_norm = "", .moe_norm_weights = false,
+     .ssm_norm_grouped = false},
 };
 
 }  // namespace
@@ -347,6 +358,29 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.n_layers -= static_cast<int32_t>(f.get_int(key("nextn_predict_layers")).value_or(0));
     if (c.n_layers <= 0) return Status(ErrorCode::InvalidModel, "invalid nextn_predict_layers");
     LIYAB_RETURN_IF_ERROR(require_int("embedding_length", c.n_embd));
+    // Each block's token mixer, from its tensors: a causal convolution makes
+    // it recurrent (with the D skip a Mamba mixer, Mamba-1 when dt, B and C
+    // come from ssm_x, else Gated DeltaNet), attention projections make it
+    // attention, and a block with neither has no mixer (its FFN alone).
+    auto mixer_of = [&](int32_t l) {
+        if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_in.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_out.weight")) != nullptr ||
+            f.tensor(block_tensor(l, "ssm_a")) != nullptr || f.tensor(block_tensor(l, "ssm_d")) != nullptr) {
+            if (f.tensor(block_tensor(l, "ssm_d")) == nullptr &&
+                f.tensor(block_tensor(l, "ssm_in.weight")) == nullptr &&
+                f.tensor(block_tensor(l, "ssm_x.weight")) == nullptr) return MixerKind::DeltaNet;
+            return f.tensor(block_tensor(l, "ssm_x.weight")) != nullptr ? MixerKind::Mamba : MixerKind::Mamba2;
+        }
+        for (const char* t : {"attn_q.weight", "attn_qkv.weight", "attn_kv_a_mqa.weight",
+                              "attn_k.weight", "attn_v.weight", "attn_output.weight"}) {
+            if (f.tensor(block_tensor(l, t)) != nullptr) return MixerKind::Attention;
+        }
+        return MixerKind::None;
+    };
+    bool attends = false;
+    for (int32_t l = 0; l < c.n_layers && !attends; ++l) attends = mixer_of(l) == MixerKind::Attention;
     // Mixture of experts: dense FFN size is optional when every FFN is MoE.
     c.n_expert = static_cast<int32_t>(f.get_int(key("expert_count")).value_or(0));
     if (c.n_expert > 0) {
@@ -408,11 +442,10 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
     c.n_ff = *std::max_element(block_ff.begin(), block_ff.end());
     c.n_head = std::max(*std::max_element(block_heads.begin(), block_heads.end()), 1);
     c.n_head_kv = std::max(*std::max_element(block_kv_heads.begin(), block_kv_heads.end()), 1);
-    if (f.metadata(key("attention.head_count")) == nullptr ||
-        (f.metadata(key("feed_forward_length")) == nullptr && c.n_expert == 0)) {
-        return Status(ErrorCode::InvalidModel, "missing attention.head_count or feed_forward_length");
+    if (attends && f.metadata(key("attention.head_count")) == nullptr) {
+        return Status(ErrorCode::InvalidModel, "missing attention.head_count");
     }
-    c.head_dim = static_cast<int32_t>(f.get_int(key("attention.key_length")).value_or(c.n_embd / c.n_head));
+    c.head_dim = attends ? static_cast<int32_t>(f.get_int(key("attention.key_length")).value_or(c.n_embd / c.n_head)) : 0;
     c.value_dim = c.head_dim;
     c.rope_dim = static_cast<int32_t>(f.get_int(key("rope.dimension_count")).value_or(c.head_dim));
     const auto value_length = f.get_int(key("attention.value_length"));
@@ -601,7 +634,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
             if (c.spec->nope_global && c.sliding_window > 0 && !windowed[i]) rotated[i] = false;
         }
     }
-    if (c.head_dim <= 0 || (c.rope_dim <= 0 && c.spec->rotary) || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0) {
+    if (attends && (c.head_dim <= 0 || (c.rope_dim <= 0 && c.spec->rotary) || c.rope_dim > c.head_dim || c.rope_dim % 2 != 0)) {
         return Status(ErrorCode::InvalidModel, "invalid head / rope dimensions");
     }
     // The q·k scale: the file's, else 1/sqrt(head_dim) (computed as the
@@ -614,7 +647,7 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         if (!(c.attn_scale > 0.0f) || !std::isfinite(c.attn_scale)) {
             return Status(ErrorCode::InvalidModel, "invalid " + key("attention.scale"));
         }
-    } else {
+    } else if (attends) {
         const int32_t scored = c.mla.kv_rank > 0 ? c.mla.nope_dim + c.rope_dim : c.head_dim;
         c.attn_scale = 1.0f / std::sqrt(static_cast<float>(scored));
     }
@@ -720,8 +753,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         const int64_t q_dim = int64_t{b.n_head} * c.head_dim;
         LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_exp", l, b.expert_swiglu_clamp));
         LIYAB_RETURN_IF_ERROR(block_clamp("swiglu_clamp_shexp", l, b.shared_swiglu_clamp));
-        if (f.tensor(block_tensor(l, "ssm_conv1d.weight")) != nullptr) {
-            b.mixer = MixerKind::DeltaNet;
+        b.mixer = mixer_of(l);
+        if ((b.mixer == MixerKind::Mamba || b.mixer == MixerKind::Mamba2) &&
+            f.tensor(block_tensor(l, "attn_output.weight")) != nullptr) {
+            return Status(ErrorCode::Unsupported, "block " + std::to_string(l) +
+                              ": parallel attention and Mamba mixers in one block are not supported");
+        }
+        if (keeps_state(b.mixer)) {
+            // Recurrent geometry comes from ssm.*, not attention head arrays.
+        } else if (b.mixer == MixerKind::None) {
+            // Tensor-planned FFN-only blocks have no mixer even when other
+            // blocks supply a uniform positive attention geometry.
         } else if (b.n_head_kv == 0) {
             b.mixer = b.n_head == 0 ? MixerKind::None : MixerKind::Linear;
             if (f.tensor(block_tensor(l, "attn_q.weight")) != nullptr ||
@@ -788,13 +830,24 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 }
             }
         }
+        if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr) {
+            for (const char* name : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight",
+                                     "ffn_gate_up_exps.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"}) {
+                if (f.tensor(block_tensor(l, name)) != nullptr) {
+                    return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) +
+                                      ": expert projections require ffn_gate_inp.weight");
+                }
+            }
+        }
         b.parallel = parallel;
         if (const TensorView* up = f.tensor(block_tensor(l, "ffn_up.weight"))) {  // dense FFN: one or two matrices
             const bool gate = f.tensor(block_tensor(l, "ffn_gate.weight")) != nullptr;
             b.fused_gate_up = !gate && up->rows() == 2 * int64_t{b.n_ff};
             // No gate and up as tall as the FFN: down(act(up)).
             if (!gate && up->rows() == int64_t{b.n_ff}) b.ffn = FfnKind::Ungated;
-        } else if (b.n_ff == 0 && f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr) {
+        } else if (f.tensor(block_tensor(l, "ffn_gate_inp.weight")) == nullptr &&
+                   f.tensor(block_tensor(l, "ffn_gate.weight")) == nullptr &&
+                   f.tensor(block_tensor(l, "ffn_down.weight")) == nullptr) {
             b.ffn = FfnKind::None;
             const std::string prefix = block_tensor(l, "ffn_");
             for (const TensorView& tensor : f.tensors()) {
@@ -818,6 +871,13 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 c.n_ff_expert = static_cast<int32_t>(down->ne[0]);
             }
         }
+        if (b.ffn != FfnKind::None && b.ffn != FfnKind::Moe && b.n_ff <= 0) {
+            return Status(ErrorCode::InvalidModel, "missing or invalid " + key("feed_forward_length"));
+        }
+        if (b.mixer == MixerKind::None && b.ffn == FfnKind::None &&
+            (b.n_head != 0 || b.n_head_kv != 0 || b.n_ff != 0)) {
+            return Status(ErrorCode::InvalidModel, "block " + std::to_string(l) + " has no projections");
+        }
         if (c.spec->ffn_activation == FfnActivation::XIelu && b.ffn != FfnKind::Ungated) {
             return Status(ErrorCode::Unsupported, "gated xIELU FFN in block " + std::to_string(l) + " is not implemented");
         }
@@ -833,7 +893,8 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         b.norm_before_mixer = b.mixer != MixerKind::None &&
             (parameterless || has(c.spec->attn_norm) || (b.parallel && has(c.spec->ffn_norm)));
         b.norm_before_ffn = b.ffn != FfnKind::None &&
-            (parameterless || has(c.spec->ffn_norm) || b.parallel);
+            (parameterless || has(c.spec->ffn_norm) || b.parallel ||
+             (b.mixer == MixerKind::None && has(c.spec->attn_norm)));
         if ((b.mixer == MixerKind::None && (b.norm_before_mixer || has(c.spec->post_mixer_norm))) ||
             (b.ffn == FfnKind::None && (b.norm_before_ffn || has(c.spec->post_ffn_norm)))) {
             return Status(ErrorCode::InvalidModel, "normalization tensor for an absent branch in block " + std::to_string(l));
@@ -857,7 +918,40 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
         std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.ffn == FfnKind::Moe; })) {
         return Status(ErrorCode::InvalidModel, "missing or invalid " + key("expert_feed_forward_length"));
     }
-    if (std::any_of(c.blocks.begin(), c.blocks.end(), [](const BlockPlan& b) { return b.mixer == MixerKind::DeltaNet; })) {
+    bool delta_net = false, mamba1 = false, mamba2 = false;
+    for (const BlockPlan& b : c.blocks) {
+        delta_net = delta_net || b.mixer == MixerKind::DeltaNet;
+        mamba1 = mamba1 || b.mixer == MixerKind::Mamba;
+        mamba2 = mamba2 || b.mixer == MixerKind::Mamba2;
+    }
+    if (int{delta_net} + int{mamba1} + int{mamba2} > 1) {
+        // The ssm.* keys describe one kind of recurrent mixer.
+        return Status(ErrorCode::Unsupported, "a model mixing Gated DeltaNet, Mamba-1 and Mamba-2 blocks is not supported");
+    }
+    if (mamba1 || mamba2) {
+        // Mamba: in_proj gives [x | z] (Mamba-1) or [z | x B C | dt]
+        // (Mamba-2); the convolution runs over x (Mamba-1) or [x | B | C].
+        MambaGeometry& m = c.mamba;
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", m.conv_kernel));
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.inner_size", m.d_inner));
+        LIYAB_RETURN_IF_ERROR(require_int("ssm.state_size", m.d_state));
+        if (mamba1) {
+            LIYAB_RETURN_IF_ERROR(require_int("ssm.time_step_rank", m.dt_rank));
+            const GgufValue* norms = f.metadata(key("ssm.dt_b_c_rms"));
+            if (norms != nullptr && !norms->as_bool()) {
+                return Status(ErrorCode::InvalidModel, "invalid " + key("ssm.dt_b_c_rms"));
+            }
+            m.dt_b_c_rms = norms != nullptr && *norms->as_bool();
+        } else {
+            LIYAB_RETURN_IF_ERROR(require_int("ssm.time_step_rank", m.n_heads));
+            LIYAB_RETURN_IF_ERROR(require_int("ssm.group_count", m.n_groups));
+            if (m.d_inner % m.n_heads != 0 || m.n_heads % m.n_groups != 0) {
+                return Status(ErrorCode::InvalidModel, "inconsistent Mamba-2 (ssm.*) dimensions: heads must divide "
+                                                       "inner_size, and groups the heads");
+            }
+        }
+    }
+    if (delta_net) {
         LIYAB_RETURN_IF_ERROR(require_int("ssm.conv_kernel", c.ssm_conv_kernel));
         LIYAB_RETURN_IF_ERROR(require_int("ssm.state_size", c.ssm_head_dim));
         LIYAB_RETURN_IF_ERROR(require_int("ssm.group_count", c.ssm_k_heads));

@@ -175,6 +175,18 @@ struct ArchSpec {
     // YaRN correction-range rounding when the GGUF omits yarn_truncate.
     // gpt-oss uses fractional endpoints; explicit file metadata overrides it.
     bool yarn_truncate = true;
+    // Mamba-1 blocks whose file sets <arch>.ssm.dt_b_c_rms (Falcon-Mamba):
+    // the epsilon of the weightless RMS norms of dt, B and C, which the
+    // converter does not write (the reference's mixer_rms_eps; Falcon-Mamba's
+    // configuration keeps its default). Norms of dt, B and C with weights of
+    // their own (ssm_dt_norm, ssm_b_norm, ssm_c_norm) use the file's
+    // layer_norm_rms_epsilon instead.
+    float ssm_dt_b_c_eps = 1e-6f;
+    // Mamba-2's gated RMS norm: true spans each B/C group separately;
+    // false spans the complete inner stream (transformers Mamba-2/Bamba).
+    // The converter reshapes both forms identically, so this is a reference
+    // implementation fact rather than something the tensor shape tells us.
+    bool ssm_norm_grouped = true;
 };
 
 // Every architecture Liyab runs, in registry order.
@@ -198,7 +210,15 @@ enum class MixerKind : uint8_t {
     DeltaNet,   // Gated DeltaNet: causal conv + delta-rule recurrent state, no KV cache
     None,       // no mixer branch (zero query and KV heads in per-block metadata)
     Linear,     // one normalized residual projection, no attention or KV rows
+    Mamba,      // Mamba-1 selective scan: causal conv + a diagonal state per channel, no KV cache
+    Mamba2,     // Mamba-2 (SSD): causal conv + a scalar-decay state per head, no KV cache
 };
+
+// Whether a block with this mixer keeps a recurrent state (every mixer but
+// softmax attention and none).
+[[nodiscard]] constexpr bool keeps_state(MixerKind m) noexcept {
+    return m == MixerKind::DeltaNet || m == MixerKind::Mamba || m == MixerKind::Mamba2;
+}
 
 // Feed-forward network of one block.
 enum class FfnKind : uint8_t {
@@ -317,6 +337,25 @@ struct LatentAttention {
     int32_t v_dim = 0;     // per-head value width once expanded: <arch>.attention.value_length_mla
 };
 
+// Mamba (selective state space) geometry, from the ssm.* keys as the
+// converter writes them for Mamba-1 (`mamba`) and Mamba-2 (`mamba2`). Each
+// block's scanned stream x has d_inner channels; every channel keeps a state
+// of d_state values. Mamba-1 gives each (channel, state) pair its own decay
+// exp(dt A) and projects dt through a rank-dt_rank bottleneck; Mamba-2 splits
+// the channels into n_heads heads of d_inner / n_heads, each with one scalar
+// decay per token, and n_groups groups of heads share their B and C.
+struct MambaGeometry {
+    int32_t d_inner = 0;      // ssm.inner_size: channels of x (and of the gate z); 0: no Mamba block
+    int32_t d_state = 0;      // ssm.state_size: state values per channel (B and C width)
+    int32_t conv_kernel = 0;  // ssm.conv_kernel: taps of the causal depthwise convolution
+    int32_t dt_rank = 0;      // Mamba-1: ssm.time_step_rank, the rank of dt's projection
+    int32_t n_heads = 0;      // Mamba-2: ssm.time_step_rank, heads of d_inner / n_heads channels
+    int32_t n_groups = 0;     // Mamba-2: ssm.group_count, groups of heads sharing B and C
+    // Mamba-1: ssm.dt_b_c_rms, weightless RMS norms of dt, B and C before the
+    // scan (Falcon-Mamba; epsilon ArchSpec::ssm_dt_b_c_eps).
+    bool dt_b_c_rms = false;
+};
+
 struct ModelConfig {
     const ArchSpec* spec = nullptr;  // registry row (static lifetime)
     std::string arch;                // spec->name
@@ -389,6 +428,7 @@ struct ModelConfig {
     int32_t ssm_head_dim = 0;     // key and value head size (ssm.state_size)
     int32_t ssm_k_heads = 0;      // query/key heads (ssm.group_count)
     int32_t ssm_v_heads = 0;      // value heads = recurrent states per block (ssm.time_step_rank)
+    MambaGeometry mamba;  // d_inner 0: no Mamba block
 
     // Mixture of experts (zero when every FFN is dense).
     int32_t n_expert = 0;        // routed experts per MoE block
@@ -418,9 +458,15 @@ struct ModelConfig {
     // FfnActivation::XIelu: one entry per executed block.
     std::vector<XIeluScalars> xielu;
 
-    // True when some block keeps a recurrent state: such models cannot roll
-    // back to an arbitrary earlier position (only to 0 or the current one).
-    [[nodiscard]] bool hybrid() const noexcept { return ssm_v_heads > 0; }
+    // True when some block keeps a recurrent state (keeps_state()): such
+    // models cannot roll back to an arbitrary earlier position (only to 0,
+    // the current one, a rollback checkpoint or a state snapshot).
+    [[nodiscard]] bool hybrid() const noexcept {
+        for (const BlockPlan& b : blocks) {
+            if (keeps_state(b.mixer)) return true;
+        }
+        return false;
+    }
 };
 
 // Reads the model's hyperparameters and plans its blocks. Errors:

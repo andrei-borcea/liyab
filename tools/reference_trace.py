@@ -242,6 +242,16 @@ def reduced_config(config):
             setattr(cfg, k, FFN)
         elif "intermediate_size" in k and isinstance(v, (list, tuple)):
             setattr(cfg, k, type(v)(min(x, FFN) if isinstance(x, int) and x > 0 else x for x in v))
+    # Pure SSM stacks have no attention head geometry to preserve. Keep the
+    # expansion and head/group divisibility, with a small residual stream.
+    if hasattr(cfg, "state_size") and hasattr(cfg, "conv_kernel") and not hasattr(cfg, "num_attention_heads"):
+        cfg.hidden_size = 128
+        cfg.intermediate_size = int(getattr(cfg, "expand", 2)) * cfg.hidden_size
+        if hasattr(cfg, "num_heads"):
+            groups = int(getattr(cfg, "n_groups", 1))
+            cfg.num_heads = max(groups, cfg.intermediate_size // cfg.head_dim)
+            cfg.intermediate_size = cfg.num_heads * cfg.head_dim
+            cfg.hidden_size = cfg.intermediate_size // int(getattr(cfg, "expand", 2))
     top_k = max([getattr(cfg, k) for k in TOP_K_KEYS if isinstance(getattr(cfg, k, None), int)] or [0])
     for k in EXPERT_COUNT_KEYS:
         v = getattr(cfg, k, None)
@@ -1309,6 +1319,48 @@ def analyze_block(trace, index, path, layer_call, block_calls, freqs, eps):
               if not (not any(True for _ in c.module.parameters()) and close(c.input, c.output))]
     norms = [c for c in block_calls if c.input is not None and c.input.shape == h_in.shape and _norm_like(c)]
     others = [c for c in direct if not _norm_like(c)]
+    if len(others) == 1:
+        mixer = others[0]
+        m = mixer.module
+        # Identify the SSM by its projections and state tensors, independent
+        # of model/class names. Unknown one-part blocks still refuse a row.
+        if all(hasattr(m, k) for k in ("in_proj", "conv1d", "A_log", "D", "out_proj")):
+            pre = next((c for c in norms if close(c.input, h_in) and close(c.output, mixer.input)), None)
+            form = norm_formula(pre, eps) if pre else None
+            b["norm_before_mixer"] = ({"module": pre.path, "formula": form[0] if form else None,
+                                       "eps": form[1] if form else None, "size": pre.module.weight.numel()}
+                                      if pre else None)
+            if pre is None:
+                b["unknown"].append("SSM mixer has no identified input norm")
+            if not close(h_in.float() + mixer.output.float(), h_out):
+                b["unknown"].append("SSM block output is not its input plus the mixer output")
+            v2 = not hasattr(m, "x_proj")
+            b["mixer"] = Facts(kind="mamba2" if v2 else "mamba", unknown=[],
+                inner=m.intermediate_size, state=m.ssm_state_size, kernel=m.conv1d.kernel_size[0],
+                rank=m.num_heads if v2 else m.time_step_rank, groups=m.n_groups if v2 else 1,
+                activation=m.activation, dt_b_c_rms=hasattr(m, "dt_layernorm"),
+                dt_b_c_eps=float(getattr(m, "rms_eps", 1e-6)),
+                dt_limit=list(getattr(m, "time_step_limit", (0.0, float("inf")))))
+            if v2:
+                nc = next((c for c in block_calls if c.module is m.norm), None)
+                group_size = int(getattr(m.norm, "group_size", m.intermediate_size))
+                b["mixer"]["norm_grouped"] = group_size < m.intermediate_size
+                # Verify the observed norm, including gating order. A module
+                # that does anything else leaves the SSM fact unknown.
+                if nc is None or len(nc.args) < 2:
+                    b["unknown"].append("SSM gated norm invocation was not recorded")
+                else:
+                    z = nc.input.float() * torch.nn.functional.silu(nc.args[1].float())
+                    z = z.reshape(*z.shape[:-1], -1, group_size)
+                    e = float(getattr(m.norm, "variance_epsilon", eps))
+                    want = (z * torch.rsqrt(z.square().mean(-1, keepdim=True) + e)).reshape(nc.input.shape)
+                    want = want * m.norm.weight.detach()
+                    if not close(want, nc.output):
+                        b["unknown"].append("SSM gated norm is not gate-then-RMSNorm with the declared grouping")
+            b["ffn"] = Facts(kind="none")
+            b["residual"] = "sequential"
+            return b
+
     def branch_norm(c):
         return {**norm_fact(c, eps), "size": int(c.input.shape[-1]),
                 "weighted": getattr(c.module, "weight", None) is not None}

@@ -113,6 +113,11 @@ These rules decide what goes into the code:
 | Classic families: `gpt2`, `gptneox`, `falcon`, `bloom`, `mpt`, `starcoder`, `starcoder2`, `phi2`, `stablelm`, `orion`, `olmo`, `command-r`, `nemotron`, `apertus`, `arcee`, `dbrx` | F32 tiny conformance and nine real-checkpoint gates against transformers; [measured family gates](docs/model-descriptions.md#classic-conformance) distinguish real checkpoints from tiny checks and document converter and quantization limitations |
 | Every GGML tensor format (F32/F16/BF16, legacy Q4–Q8, K-quants, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4) | ✅ bit-exact against llama.cpp's reference decoder |
 | Tokenizers: SentencePiece, byte-level BPE and raw unigram, pre-tokenizers as data (Qwen, Llama 3, GPT-2, DeepSeek, Hunyuan, Phi, Gemma, Mistral-Nemo, SmolLM2, Youtu-LLM, SmolLM3, OLMo 2/3, Granite, Seed-OSS, EXAONE 4, PLaMo 3) | ✅ token-identical to each model's Hugging Face tokenizer |
+| State-space mixers: `mamba` (Mamba-1, Falcon-Mamba) and `mamba2` (Mamba-2); mixer-only and FFN-only blocks planned from tensors | CPU selective scans and depthwise convolution, with NEON, AVX2/FMA and scalar paths; Metal/Vulkan use CPU scans with their normal projection routing. Validation: [model descriptions](docs/model-descriptions.md#state-space-mixers). |
+| Block-plan validation | Partial attention/FFN/SSM projections fail validation or binding instead of silently dropping a part; unsupported parallel attention/Mamba blocks are refused. |
+| Mamba pre-tokenizers: GPT-NeoX (`olmo`, NFC then GPT-2 rules) and Falcon-Mamba (`falcon`, punctuation then ByteLevel and digit groups) | Data in the same pre-tokenizer table |
+| SSM backend correctness | GPU prefill/decode projections are compared against CPU in an F32 graph; quantized projections and recurrent-state invariants are checked separately across all 26 formats using nonzero encoded fixtures and projection/state ablations (uniform RMS conditioning; [fixture recipe](docs/model-descriptions.md#state-space-mixers)). |
+| Recurrent timing | CLI phase reports use `recurrent`; the existing C/JSON `delta_net` counters include DeltaNet and Mamba mixers. The ABI and JSON keys are unchanged. |
 | Chat templates: the GGUF's Jinja template rendered by Liyab's own interpreter; layout of turns and prefix stability for context reuse | ✅ byte-identical to transformers' `apply_chat_template` |
 | Models larger than RAM: dense blocks streamed by parallel `O_DIRECT` reads; MoE experts streamed into an LFU cache with router-predicted prefetch | ✅ automatic |
 | Memory planning: per-app budget, automatic requantization only when the expert cache would be too small, recommended budget reported | ✅ |
@@ -619,6 +624,9 @@ What the port does differently from the POSIX platforms:
   * each expert's gate and up projections as two tensors or as one `[gate | up]` tensor (`ffn_gate_up_exps`,
     written by converters that fuse them); the fused rows are the split ones, so the logits are the same bits;
   * the tokens of a batch are grouped per expert, so each expert is read once.
+* **State-space memory:** Mamba blocks keep convolution history and `inner_size × state_size` floats per block,
+  independent of sequence length. Their state uses the existing recurrent snapshots, draft rollback, sequence
+  contexts and prefix/KV-store persistence. Pure SSM stacks reserve a minimal, unused paged-KV placeholder.
 * **Hybrid models:** DeltaNet blocks keep a recurrent state: conv history plus one 128×128 matrix per value head.
   These models can roll back only:
   * inside a window of state checkpoints (used by speculative decoding), or
@@ -631,7 +639,10 @@ What the port does differently from the POSIX platforms:
   * TQ1_0/TQ2_0, MXFP4, NVFP4.
 
   Decoders are ported from llama.cpp's gguf-py reference, and `test_engine` checks all 24 formats bit-exactly against
-  `tests/data/quant_vectors.bin`.
+  `tests/data/quant_vectors.bin`. Repeated SSM projections use a separate
+  `ssm_quant_vectors.bin` with uniformly conditioned scale fields; regenerate it with
+  `python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin` (gguf 0.19.0, NumPy).
+  The test writer refuses reader-only formats unless explicit encoded blocks are supplied.
 * **Kernels:**
   * Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 have NEON + SDOT kernels that unpack bits in registers.
   * K-quants, TQ2_0 and I-quants use NEON kernels adapted from llama.cpp (`src/core/quant_lowbit.cpp`) against
@@ -2315,6 +2326,9 @@ cache the forward passes agree:
 | Youtu-LLM-2B, latent attention in the expanded form (passes of 512 tokens) | 512 | 0.00000 | 99.80% |
 | Huihui-MoE-1.2B-A0.6B (`qwen3moe`, Qwen3-0.6B upcycled into 3 experts) | 512 | 0.00000 | 99.61% |
 | Huihui-MoE-1.2B-A0.6B, its experts fused into `ffn_gate_up_exps` | 512 | 0.00000 | 99.61% |
+| state-spaces/mamba-130m-hf (`mamba`, F16) | 512 | 0.00001 | 99.61% |
+| state-spaces/mamba-370m-hf (`mamba`, F16) | 512 | 0.00000 | 100.00% |
+| AntonV/mamba2-130m-hf (`mamba2`, F16) | 512 | 0.00000 | 100.00% |
 
 Youtu-LLM-2B now encodes the text itself (its `youtu` pre-tokenizer), so its Q8_0 cache gets measured key scales:
 mean KL 0.00065, top-1 97.65% (0.00115, 97.26% with keys as computed). Tencent's own `Youtu-LLM-2B-F16.gguf` holds
@@ -2518,6 +2532,7 @@ interpreter: `describe_model_registry`.
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
 | `app/test` | Tool-call formats; the app's own tool calls: each tool's call grammar in both formats, the system prompt that describes the tools pinned byte for byte, every tool's calls admitted by its grammar and read back valid (checked apart from the grammar), what a call cannot be (another tool, undeclared, missing or reordered parameters, times out of shape), each shape of a time read as local time, XML string values under a length bound or an unchecked format that cannot take in their closing tag, a scripted model calling through the structure the app generates with (reasoning first, a reply without a call untouched, the structure run on another isolate), the step log's cost line; with the engine built on the host (`build/libliyab.dylib`, or `LIYAB_LIBRARY`) the engine itself compiles and matches those grammars, else those tests are skipped; with `LIYAB_TOOL_MODEL=a.gguf,b.gguf` on a Mac, real models answer questions for each tool through the app's prompt and structure, every call valid, and the grammar's cost per token is printed; chat history replay; typing ahead (when words, the whole message and pastes are prepared); prompts from a model template's pieces (Qwen3.6's equal the built-in ChatML; Gemma's first turn); the local API's OpenAI, Anthropic and gRPC servers over real sockets, with tools: call grammars in both formats (the same texts `test_grammar` checks against the engine), when calls are spans and when they are forced, calls split from text as they stream, `tool_calls` / `tool_use` with streamed deltas, history with calls and results, `tool_choice`, `parallel_tool_calls`, `response_format`, and what is refused; embeddings (one call per request, floats and base64, `dimensions`, usage) and reranking (sorted results, `top_n`, documents echoed or not, every path) over real sockets, and what a pooling model or another model refuses; the local API's LoRA adapters (listed after the model by OpenAI, Anthropic and gRPC, selected by `model` or `adapter`, an unknown one refused); with `LIYAB_LIBRARY` and `LIYAB_TEST_MODEL=a.gguf`, the engine's lanes: an idle lane holding no sequence (the memory plan of no lane), a generation on the API's lane opening its sequence and running alongside the chat's, each reply what it is alone, the sequence closed once the lane is idle and opened again for the next request, one generation stopped without the other, the lanes closed with the model |
+| `test_ssm` | Mamba-1/Mamba-2 scans and convolution against independent scalar equations, SIMD tails, nonzero encoded projections in all 26 formats and four KV types, projection/scan-state ablations, prefill/decode/rollback logit and state invariants, repacked projections, Metal/Vulkan projection routing when available, incomplete block rejection and unsupported parallel attention/SSM refusal |
 
 Benchmarks and tools built with the tests:
 

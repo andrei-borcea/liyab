@@ -69,6 +69,9 @@ constexpr const char* kYoutuCjk =
 constexpr const char* kYoutuWords =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
+// Falcon-Mamba: Punctuation(Contiguous), ByteLevel, Digits(false), then
+// isolated ASCII triples. HF Punctuation includes ASCII symbols and P*.
+
 struct StepSpec {
     const char* pattern;
     bool keep_gaps;  // Split "Isolated"; false: "Removed" with invert (only the matches are kept)
@@ -143,18 +146,6 @@ struct Decoded {
 
 }  // namespace
 
-uint32_t PreTokenizer::byte_codepoint(uint8_t byte) noexcept {
-    static constexpr auto table = [] {
-        std::array<uint32_t, 256> out{};
-        uint32_t extra = 0;
-        for (uint32_t b = 0; b < 256; ++b) {
-            const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-            out[b] = printable ? b : 256 + extra++;
-        }
-        return out;
-    }();
-    return table[byte];
-}
 
 std::string PreTokenizer::supported_names() {
     std::string out;
@@ -179,7 +170,10 @@ Result<PreTokenizer> PreTokenizer::for_name(std::string_view name) {
         pre.nfkc_ = row.nfkc;
         pre.right_digits3_ = row.right_digits3;
         pre.metaspace_bpe_ = row.metaspace_bpe;
+        bool encoded = false;
         for (const StepSpec& step : row.steps) {
+            if (encoded && !step.byte_level) return Status(ErrorCode::Internal, "raw split after encoded-byte split");
+            encoded = step.byte_level;
             auto regex = Regex::compile(step.pattern);
             if (!regex) return Status(ErrorCode::Internal, "pre-tokenizer '" + pre.name_ + "': " + regex.status().message());
             pre.steps_.push_back({std::move(regex).value(), step.keep_gaps, step.byte_level});
@@ -240,7 +234,7 @@ void PreTokenizer::split(std::string_view text, std::vector<std::string_view>& p
             bytes.cps.resize(text.size());
             bytes.keys.resize(text.size());
             for (size_t i = 0; i < text.size(); ++i) {
-                bytes.cps[i] = byte_codepoint(static_cast<uint8_t>(text[i]));
+                bytes.cps[i] = unicode::gpt2_byte_codepoint(static_cast<uint8_t>(text[i]));
                 bytes.keys[i] = regex_key(bytes.cps[i]);
             }
             byte_level = true;

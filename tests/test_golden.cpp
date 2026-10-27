@@ -458,6 +458,36 @@ std::vector<GoldenCase> cases() {
         }
         add(name, scaled, kv, type != KvCacheType::F16);
     }
+    s = {};
+    s.arch = "mamba";
+    add("mamba", s);
+    s.mamba_norms = true;
+    s.mamba_bias = true;
+    add("mamba-weightless-norms-bias", s);
+    s.mamba_norms = false;
+    s.mamba_weighted_norms = true;
+    add("mamba-weighted-norms-bias", s);
+    s = {};
+    s.arch = "mamba";
+    s.mamba_kernel = 1;
+    add("mamba-conv1", s);
+    s = {};
+    s.arch = "mamba2";
+    add("mamba2", s);
+    s.mamba_groups = 2;
+    s.mamba_bias = true;
+    add("mamba2-groups-bias", s);
+    s.arch = "llama";
+    s.n_layers = 3;
+    s.mamba = 2;
+    s.mamba_topology = true;
+    add("ssm-attention-ffn-only", s);
+    s.arch = "qwen3moe";
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.identical_experts = false;
+    add("ssm-attention-moe-only", s);
+    add("ssm-attention-moe-only-streamed", s, streamed);
     return out;
 }
 

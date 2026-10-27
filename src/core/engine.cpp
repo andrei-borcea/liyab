@@ -2947,9 +2947,31 @@ std::string Engine::describe() const {
     out += "FFN:        " + route.ffn->description() + "\n";
     if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
     if (c.hybrid()) {
-        char mix[160];
-        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
-                      c.n_attn_layers, c.n_layers - c.n_attn_layers,
+        // Blocks by token mixer, in the order the kinds first appear (FFN-only blocks have none).
+        auto name = [](MixerKind m) -> std::string {
+            switch (m) {
+                case MixerKind::Attention: return "attention";
+                case MixerKind::DeltaNet: return "DeltaNet";
+                case MixerKind::Mamba: return "Mamba-1";
+                case MixerKind::Mamba2: return "Mamba-2";
+                case MixerKind::None: return "FFN-only";
+                default: return "other";
+            }
+        };
+        std::vector<std::pair<std::string, int32_t>> kinds;
+        for (const BlockPlan& b : c.blocks) {
+            const std::string k = name(b.mixer);
+            auto it = std::find_if(kinds.begin(), kinds.end(), [&](const auto& e) { return e.first == k; });
+            if (it == kinds.end()) {
+                kinds.emplace_back(k, 1);
+            } else {
+                ++it->second;
+            }
+        }
+        std::string blocks;
+        for (const auto& [k, count] : kinds) blocks += (blocks.empty() ? "" : " + ") + std::to_string(count) + " " + k;
+        char mix[200];
+        std::snprintf(mix, sizeof mix, "Mixers:     %s blocks, recurrent state %.1f MiB\n", blocks.c_str(),
                       static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
         out += mix;
     }
