@@ -29,6 +29,14 @@ Outputs:
 
 Android updates must use the same `build/liyab-debug.keystore` as the installed app. Restore the existing key before building an update; a newly generated key cannot update an installation signed with another key. The installation mode waits while Liyab is on screen or running a foreground work service. See `scripts/build_flutter_app.sh --help` for installation options.
 
+To install an update, specify the intended phone explicitly:
+
+```sh
+CMAKE_BUILD_PARALLEL_LEVEL=4 scripts/build_flutter_app.sh --install --serial PHONE_SERIAL
+```
+
+`ANDROID_SERIAL` can supply the same serial. Every device check and installation uses it; no install starts without a selected device.
+
 Android opens `libliyab.so` from the APK. macOS and iOS resolve C ABI symbols from the application process. The repository includes an iOS project; native framework instructions are in the [project quick start](../README.md#quick-start).
 
 ## Test

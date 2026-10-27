@@ -351,7 +351,7 @@ scripts/build_android.sh                     # --experimental, --abi, --api, --n
 scripts/build_ios.sh
 
 # The Liyab app: builds libliyab first, then the release APK; --install waits while the app is in use
-scripts/build_flutter_app.sh --install
+scripts/build_flutter_app.sh --install --serial PHONE_SERIAL
 
 # The Liyab app for macOS (Apple silicon): app/build/macos/Build/Products/Release/Liyab.app
 scripts/build_flutter_app.sh --macos
@@ -2161,7 +2161,7 @@ curl http://127.0.0.1:8642/v1/chat/completions \
   [Look and feel](#look-and-feel).
 
 ```bash
-scripts/build_flutter_app.sh --install   # libliyab + release APK; never interrupts the app while it is in use
+scripts/build_flutter_app.sh --install --serial PHONE_SERIAL   # libliyab + release APK; never interrupts the app while it is in use
 scripts/build_flutter_app.sh --macos     # libliyab (static) + Liyab.app; then `flutter run -d macos` works too
 cd app && flutter analyze && flutter test
 ```
@@ -3409,3 +3409,5 @@ Recurrent reader-format validation uses independent nonzero encoded blocks for M
 Mapped per-layer embedding tables are also checked in all 26 reader formats and four KV types against independent decoded F32 tables in otherwise identical complete models. A zero-table control verifies their contribution; rollback must reproduce identical logits.
 
 Flutter chat uses the author template when replay preserves the processed prompt, or a recognized ChatML/Llama 3 fallback. A present incompatible template without such a fallback now refuses chat explicitly instead of guessing Zephyr. Models remain loaded for raw completions and pooling. This includes the current Harmony replay limitation; engine/CLI template support is broader than Flutter chat support.
+
+Android app installation requires an explicit `--serial` (or `ANDROID_SERIAL`) and uses that device for every check and installation. Native app builds respect `CMAKE_BUILD_PARALLEL_LEVEL`. Phone regression includes LoRA, SSM and compression tests and both independent quantization fixtures; an incomplete Android test build is refused instead of silently skipping binaries.
