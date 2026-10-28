@@ -56,7 +56,7 @@ result counts. Delete generated weights after recording results and source ident
 | Quantized KV | Logical heads use whole quantization blocks; other widths select F16 |
 | Calibration and relocated keys | Sample and rotate only active channels; padded scale factors stay 1 |
 | Dense and routed FFNs in parallel | Independent branch norms, then the outer FFN norm and residual add |
-| Learned router channel/expert scales | Normalize the residual independently of expert inputs; scale selected weights after top-k normalization |
+| Learned router channel/expert scales | Normalize the residual independently of expert inputs; apply separate output gains after top-k normalization, or read gains already folded into down weights |
 
 The planner reads explicit sliding-window patterns even when the architecture has no default
 window. A bare window key retains the existing architecture-specific behavior.
@@ -186,6 +186,14 @@ Existing golden pins remain unchanged. Trained-model throughput and quality rema
 record the scope of these results. Generated weights and temporary reference tooling can be removed after
 saving that evidence; the fixture scripts recreate them offline with the recorded dependencies.
 
-Cleanup removed the generated checkpoints, temporary reference environment/converter and 610 stale test GGUF
-files (1.09 GiB logical). The native build remains available. The final disk snapshot shows 88.9 GiB free;
+Cleanup removed the generated checkpoints, reference-model dependencies/converter and 610 stale test GGUF
+files (1.09 GiB logical). The native build and a small CMake-only tool environment remain available. The final disk snapshot shows 88.9 GiB free;
 owner downloads were left untouched.
+
+The parallel-FFN profile requires `ffn_gate_inp.scale` to specify its independent RMS-normalized router input.
+Per-expert `ffn_down_exps.scale` is optional: an exporter can bake that gain into the down projection, including
+NVFP4 secondary scales. A layout-equivalence test folds the gains into F32 down weights and compares all logits;
+a negative case removes the router input signal and verifies an explicit refusal.
+
+After the folded-scale adapter, native engine/golden pass 2/2 (16.77 s), and Android library/CLI rebuild.
+The full-text checks above use explicit source scales and retain their recorded behavior.

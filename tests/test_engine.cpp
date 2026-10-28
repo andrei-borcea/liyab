@@ -7164,5 +7164,85 @@ TEST_CASE("Equal-sized hash-table edits beyond the first MiB invalidate saved co
     REQUIRE(first->write_state(state).is_ok());
     CHECK(other->read_state(state).code() == ErrorCode::InvalidArgument);
     CHECK(other->n_past() == 0);
+    other.reset();
     std::filesystem::remove(other_path);
+}
+
+
+TEST_CASE("Parallel MoE accepts per-expert scales folded into down projections") {
+    test::TinyModelSpec spec;
+    spec.arch = "gemma4";
+    spec.n_expert = 4;
+    spec.n_expert_used = 2;
+    spec.parallel_experts = spec.post_norms = spec.qk_norm = true;
+    spec.identical_experts = false;
+    spec.attn_type = spec.ffn_type = spec.embd_type = spec.output_type = DType::F32;
+    const auto& original_path = model_path("compat_separate_expert_scale", spec);
+    TransformerOptions options;
+    options.kv_type = KvCacheType::F16;
+    auto original = load_transformer(original_path, options);
+    REQUIRE(original != nullptr);
+    std::ifstream input(original_path, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(input)), {});
+    for (int32_t l = 0; l < spec.n_layers; ++l) {
+        const std::string name = block_tensor(l, "ffn_down_exps.scale");
+        const TensorView* scale = original->file().tensor(name);
+        const TensorView* down = original->file().tensor(block_tensor(l, "ffn_down_exps.weight"));
+        REQUIRE(scale && down && down->type == DType::F32);
+        const size_t count = static_cast<size_t>(down->ne[0] * down->ne[1]);
+        for (size_t e = 0; e < static_cast<size_t>(spec.n_expert); ++e) {
+            float gain;
+            std::memcpy(&gain, scale->data + e * sizeof(float), sizeof(float));
+            for (size_t i = 0; i < count; ++i) {
+                const size_t at = static_cast<size_t>(down->file_offset) + (e * count + i) * sizeof(float);
+                float value;
+                std::memcpy(&value, bytes.data() + at, sizeof(value));
+                value *= gain;
+                std::memcpy(bytes.data() + at, &value, sizeof(value));
+            }
+        }
+        // Keep the file size fixed while removing the separate scale from
+        // its recognized role. The renamed auxiliary tensor is unused.
+        const size_t at = bytes.find(name);
+        REQUIRE(at != std::string::npos);
+        bytes.replace(at, name.size(), block_tensor(l, "ffn_down_exps.baked"));
+    }
+    const std::string folded_path = temp_path("compat_folded_expert_scale.gguf");
+    {
+        std::ofstream output(folded_path, std::ios::binary);
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        REQUIRE(output.good());
+    }
+    auto folded = load_transformer(folded_path, options);
+    REQUIRE(folded != nullptr);
+    ThreadPool pool(3);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    const std::vector<int32_t> tokens = {1, 270, 300, 5, 290, 77, 310, 280};
+    auto a = original->forward(tokens, Transformer::Logits::All, route, pool);
+    auto b = folded->forward(tokens, Transformer::Logits::All, route, pool);
+    REQUIRE(a.has_value() && b.has_value());
+    CHECK(max_abs_diff(*a, *b) < 2e-3);
+    folded.reset();
+    // Without the input scale the file no longer specifies the independent
+    // router normalization. Reject it instead of routing the expert input.
+    for (int32_t l = 0; l < spec.n_layers; ++l) {
+        const std::string name = block_tensor(l, "ffn_gate_inp.scale");
+        const size_t at = bytes.find(name);
+        REQUIRE(at != std::string::npos);
+        bytes.replace(at, name.size(), block_tensor(l, "ffn_gate_inp.baked"));
+    }
+    {
+        std::ofstream output(folded_path, std::ios::binary);
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        REQUIRE(output.good());
+    }
+    {
+        auto file = MmapLoader::open(folded_path);
+        REQUIRE(file.has_value());
+        auto config = describe_model(**file);
+        REQUIRE(!config.has_value());
+        CHECK(config.status().code() == ErrorCode::Unsupported);
+    }
+    std::filesystem::remove(folded_path);
 }

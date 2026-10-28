@@ -182,7 +182,7 @@ gates, tiny checkpoints, smoke runs, failed controls and incomplete variants.
 **Export caveats:** OLMo, StarCoder, EXAONE 3.5, InternLM 3 and Ministral have documented tokenizer/template
 metadata conflicts. Check the [source/export notes](docs/guide/models.md) before choosing a file.
 [`liyab-compat`](docs/liyab-compat.md) adds heterogeneous Gemma 4 text/MoE and DeepSeek-V4 text execution,
-checked against generated upstream checkpoints. Trained quality, production tokenizer/export checks and the
+including expert output scales folded into weights, checked against generated upstream checkpoints. Trained quality, production tokenizer/export checks and the
 [remaining combinations](docs/model-coverage-stage1.md#stage-2-and-later-work) need further validation.
 
 <a id="architecture"></a>

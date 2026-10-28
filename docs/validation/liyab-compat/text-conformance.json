@@ -562,7 +562,15 @@
     ],
     "android": "library and CLI cross-build; device check waived",
     "goldens": "existing pins unchanged",
-    "trained_performance": "not measured"
+    "trained_performance": "not measured",
+    "folded_scale_followup": {
+      "native_engine_golden": [
+        "100% tests passed out of 2",
+        "Total Test time (real) =  16.77 sec"
+      ],
+      "android": "library and CLI rebuild pass",
+      "scope": "Folded expert output scales accepted; missing router input signal rejected. Existing full-text checkpoint paths retain their explicit scales."
+    }
   },
   "source_sha256": {
     "fixture": "b1d2f4a349866850c1f7358002a501e7ebffecac08c56573d8fec4682a047302",
@@ -576,9 +584,10 @@
     "temporary_test_gguf_files_removed": 610,
     "temporary_test_gguf_bytes_removed": 1172512520,
     "generated_fixtures_removed": true,
-    "temporary_reference_environment_and_converter_removed": true,
     "native_build_retained": true,
     "scope": "Dead-process temporary test GGUF files and this task's generated fixtures/tooling. Owner downloads untouched.",
-    "free_disk_gib": 88.9
+    "free_disk_gib": 88.1,
+    "reference_model_dependencies_and_converter_removed": true,
+    "cmake_only_build_tools_retained": true
   }
 }

@@ -1390,7 +1390,7 @@ Status Transformer::bind_weights() {
         }
         if (plan.router_input_rms) {
             LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_gate_inp.scale"), c.n_embd, true, L.router_scale));
-            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down_exps.scale"), c.n_expert, true, L.expert_scale));
+            LIYAB_RETURN_IF_ERROR(vec(block_tensor(l, "ffn_down_exps.scale"), c.n_expert, false, L.expert_scale));
         }
         auto experts = [&](const char* suffix, int64_t cols, int64_t rows, const TensorView*& out) -> Status {
             const std::string name = block_tensor(l, suffix);

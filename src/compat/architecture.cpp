@@ -1286,11 +1286,17 @@ Result<ModelConfig> describe_model(const MmapLoader& f) {
                 }
             }
             b.router_input_rms = f.tensor(block_tensor(l, "ffn_gate_inp.scale")) != nullptr;
+            if (b.parallel_ffn && !b.router_input_rms) {
+                return Status(ErrorCode::Unsupported, "parallel dense/expert branches need an explicit router input scale");
+            }
             if (b.router_input_rms) {
                 for (const auto& entry : {std::pair{"ffn_gate_inp.scale", c.n_embd},
                                           std::pair{"ffn_down_exps.scale", c.n_expert}}) {
                     const TensorView* scale = f.tensor(block_tensor(l, entry.first));
-                    if (scale == nullptr || scale->n_dims != 1 || scale->elements() != entry.second) {
+                    // Exporters may fold per-expert output gains into the
+                    // down projection (including NVFP4's secondary scales).
+                    // The input scale exists by router_input_rms discovery.
+                    if (scale != nullptr && (scale->n_dims != 1 || scale->elements() != entry.second)) {
                         return Status(ErrorCode::InvalidModel, "invalid router scale '" + block_tensor(l, entry.first) + "'");
                     }
                 }
