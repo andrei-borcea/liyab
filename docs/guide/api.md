@@ -272,7 +272,7 @@ liyab-cli -m model.gguf -p "..." --profile low_power        # performance | bala
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
 liyab-cli -m model.gguf -p "$TURN1" --then "$TURN2"           # a follow-up turn that reuses the context, as a chat does
-liyab-cli -m model.gguf -p "..." --json                     # one JSON line per turn (stats, peak RSS, reply) for scripts
+liyab-cli -m model.gguf -p "..." --json                     # load line: memory/weight layout; turn lines: stats, GPU/I/O counters, peak RSS, reply
 liyab-cli -m model.gguf -p "..." --lora adapter.gguf --lora-scale 0.5  # a LoRA adapter applied to every turn
 liyab-cli --help                                            # every option
 ```

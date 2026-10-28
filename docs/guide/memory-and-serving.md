@@ -13,8 +13,13 @@ Commands and source paths in examples are relative to the repository root.
 
 ## Models larger than RAM
 
-Streaming switches on automatically when a model does not fit, that is, when the file is larger than 80% of the
-available memory or of `memory_budget_mb`.
+Liyab streams dense weights when a GGUF exceeds usable memory after a 1 GiB reserve for context, activations and
+the host app. `memory_budget_mb` caps usable memory when set. The mmap loader and block pipeline share this
+threshold. If Liyab streams blocks, it reserves three slots before choosing resident blocks.
+
+`liyab_engine_weight_layout` reports file size, streamed bytes and streamed block count. Use
+`liyab_engine_memory_plan` for MoE experts. On desktop, Liyab checks the loaded layout before raising its cap. It
+saves the chat between requests and commits the new cap only after a successful reload.
 
 * **Storage that is fast only when used right.** UFS 4 reaches ~4.4 GB/s with 2–4 direct requests of ≥ 256 KiB in
   flight, random or sequential alike, but stays under 1.2 GB/s with 16 KiB requests (see the

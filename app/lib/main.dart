@@ -6,7 +6,9 @@ import 'package:flutter/services.dart';
 
 import 'assist/assist_sheet.dart';
 import 'assist/command_bar.dart';
-import 'chat/chat_screen.dart';
+import 'ui/app_shell.dart';
+import 'ui/resource_notices.dart';
+import 'desktop/desktop_host.dart';
 import 'state/app_state.dart';
 import 'ui/living_flame.dart';
 import 'ui/theme.dart';
@@ -18,6 +20,7 @@ import 'ui/welcome_page.dart';
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   final hidden = args.contains('hidden');
+  await DesktopHost.initialize();
   void edgeToEdge() => SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   if (hidden) {
     // The system UI mode belongs to a window: set once one shows Liyab
@@ -33,7 +36,10 @@ Future<void> main(List<String> args) async {
   }
   // Created here, not by a widget: without a window no frame may ever build
   // the tree, and the local API must start all the same.
-  runApp(LiyabApp(app: AppState.create(hidden: hidden)));
+  final app = AppState.create(hidden: hidden);
+  // A failed engine initialization must still leave a usable window and Quit.
+  app.then(DesktopHost.attach, onError: (Object error, StackTrace stack) {});
+  runApp(LiyabApp(app: app));
 }
 
 class LiyabApp extends StatefulWidget {
@@ -53,6 +59,7 @@ class _LiyabAppState extends State<LiyabApp> {
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'Liyab',
+        navigatorKey: DesktopHost.navigatorKey,
         debugShowCheckedModeBanner: false,
         theme: liyabTheme(Brightness.light),
         darkTheme: liyabTheme(Brightness.dark),
@@ -65,17 +72,21 @@ class _LiyabAppState extends State<LiyabApp> {
           future: _app,
           builder: (context, snap) {
             final app = snap.data;
+            if (snap.hasError) {
+              return Scaffold(body: Center(child: Padding(padding: const EdgeInsets.all(32),
+                child: SelectableText('Could not start the local engine.\n${snap.error}'))));
+            }
             if (app == null) {
               return const Scaffold(body: Center(child: LivingFlame(size: 140, state: FlameState.thinking)));
             }
-            return ListenableBuilder(
+            return ResourceNotices(app: app, child: ListenableBuilder(
               listenable: Listenable.merge([app, _assist]),
               builder: (context, _) => _assist.value
                   ? (Platform.isAndroid ? AssistSheet(app: app, mode: _assist) : CommandBar(app: app, mode: _assist))
-                  : app.welcomed
-                      ? ChatScreen(app: app)
+                  : (app.welcomed || DesktopHost.supported)
+                      ? AppShell(app: app)
                       : WelcomePage(app: app),
-            );
+            ));
           },
         ),
       );

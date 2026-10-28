@@ -59,6 +59,14 @@ TEST_CASE("MappedFile maps a file read-only and returns its bytes") {
     std::remove(path.c_str());
 }
 
+TEST_CASE("Resident weight capacity preserves runtime headroom") {
+    constexpr uint64_t gib = uint64_t{1} << 30;
+    CHECK(resident_weight_capacity_bytes(0) == 0);
+    CHECK(resident_weight_capacity_bytes(gib) == 0);
+    CHECK(resident_weight_capacity_bytes(2 * gib) == gib);
+    CHECK(resident_weight_capacity_bytes(16 * gib) == 15 * gib);
+}
+
 TEST_CASE("MappedFile reports missing and empty files") {
     auto missing = MappedFile::open(temp_path("does-not-exist.bin"));
     CHECK(!missing.has_value());

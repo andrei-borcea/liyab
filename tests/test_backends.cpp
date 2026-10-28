@@ -300,4 +300,132 @@ TEST_CASE("Final logit soft-cap: same bits for 1 and N threads, and its cost per
                 many.max_threads());
 }
 
+TEST_CASE("Metal K-quants match dequantized float reference in refillable shared regions") {
+    auto made = make_metal_backend();
+    if (!made) {
+        std::printf("  skipped: %s\n", made.status().to_string().c_str());
+        return;
+    }
+    auto& metal = *made.value();
+    uint32_t seed = 97;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
+    for (DType type : {DType::Q4_K, DType::Q5_K, DType::Q6_K}) {
+        REQUIRE(metal.supports(type));
+        for (int64_t cols : {256, 768}) {
+            const int64_t rows = 7;
+            TensorView w;
+            w.type = type;
+            w.n_dims = 2;
+            w.ne = {cols, rows, 1, 1};
+            w.nbytes = w.row_bytes() * static_cast<size_t>(rows);
+            uint8_t* region = metal.allocate_shared(w.nbytes + 64);
+            REQUIRE(region != nullptr);
+            w.data = region + 32;  // GGUF alignment, not page aligned
+            for (int refill = 0; refill < 2; ++refill) {
+                for (int64_t row = 0; row < rows; ++row) {
+                    uint8_t* dst = region + 32 + row * w.row_bytes();
+                    if (type == DType::Q6_K) {
+                        for (int64_t b = 0; b < cols / 256; ++b) {
+                            quant::BlockQ6_K block{};
+                            for (auto& v : block.ql) v = static_cast<uint8_t>(rnd() >> 16);
+                            for (auto& v : block.qh) v = static_cast<uint8_t>(rnd() >> 16);
+                            for (auto& v : block.scales) v = static_cast<int8_t>(static_cast<int>(rnd() % 255) - 127);
+                            block.d = quant::fp32_to_fp16(0.0007f);
+                            std::memcpy(dst + b * sizeof block, &block, sizeof block);
+                        }
+                    } else {
+                        std::vector<float> values(static_cast<size_t>(cols));
+                        for (int64_t j = 0; j < cols; ++j) values[static_cast<size_t>(j)] =
+                            (static_cast<float>(rnd() >> 8) / 16777216.0f - 0.4f) * (1 + j / 32);
+                        quant::quantize_row(type, values.data(), dst, cols);
+                    }
+                }
+                std::vector<float> decoded(static_cast<size_t>(cols * rows));
+                for (int64_t row = 0; row < rows; ++row) quant::dequantize_row(type,
+                    w.data + row * w.row_bytes(), decoded.data() + row * cols, cols);
+                for (int n : {1, 3}) {
+                    std::vector<float> x(static_cast<size_t>(n * cols)), result(static_cast<size_t>(n * rows));
+                    for (float& v : x) v = static_cast<float>(rnd() >> 8) / 16777216.0f - 0.5f;
+                    REQUIRE(metal.matmul(w, x.data(), result.data(), n).is_ok());
+                    std::vector<float> grouped_a(result.size()), grouped_b(result.size());
+                    const TensorView* together[] = {&w, &w};
+                    float* outputs[] = {grouped_a.data(), grouped_b.data()};
+                    REQUIRE(metal.matmul_group(together, x.data(), outputs, n).is_ok());
+                    CHECK(grouped_a == result);
+                    CHECK(grouped_b == result);
+                    for (int t = 0; t < n; ++t) for (int64_t row = 0; row < rows; ++row) {
+                        double reference = 0;
+                        for (int64_t j = 0; j < cols; ++j) reference +=
+                            static_cast<double>(decoded[static_cast<size_t>(row * cols + j)]) * x[static_cast<size_t>(t * cols + j)];
+                        CHECK(std::fabs(result[static_cast<size_t>(t * rows + row)] - reference) < 2e-4 * (1 + std::fabs(reference)));
+                    }
+                }
+            }
+            metal.free_shared(region);
+        }
+    }
+    CHECK(metal.busy_ms() > 0);
+}
+
+TEST_CASE("Metal fused SiLU FFN matches separate K-quant projections and supports in-place output") {
+    auto made = make_metal_backend();
+    if (!made) return;
+    auto& metal = *made.value();
+    constexpr int64_t width = 256, hidden = 256, output = 128;
+    uint32_t seed = 703;
+    auto rnd = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f;
+    };
+    auto make_weight = [&](int64_t cols, int64_t rows, uint8_t* storage) {
+        TensorView w;
+        w.type = DType::Q4_K;
+        w.n_dims = 2;
+        w.ne = {cols, rows, 1, 1};
+        w.nbytes = w.row_bytes() * static_cast<size_t>(rows);
+        w.data = storage;
+        std::vector<float> values(static_cast<size_t>(cols));
+        for (int64_t row = 0; row < rows; ++row) {
+            for (float& v : values) v = rnd();
+            quant::quantize_row(w.type, values.data(), storage + row * w.row_bytes(), cols);
+        }
+        return w;
+    };
+    TensorView shape;
+    shape.type = DType::Q4_K;
+    shape.n_dims = 2;
+    shape.ne = {width, hidden, 1, 1};
+    const size_t hidden_weight_bytes = shape.row_bytes() * static_cast<size_t>(hidden);
+    const size_t output_weight_bytes = shape.row_bytes() * static_cast<size_t>(output);
+    uint8_t* gate_storage = metal.allocate_shared(hidden_weight_bytes);
+    uint8_t* up_storage = metal.allocate_shared(hidden_weight_bytes);
+    uint8_t* down_storage = metal.allocate_shared(output_weight_bytes);
+    REQUIRE(gate_storage != nullptr && up_storage != nullptr && down_storage != nullptr);
+    TensorView gate = make_weight(width, hidden, gate_storage);
+    TensorView up = make_weight(width, hidden, up_storage);
+    TensorView down = make_weight(hidden, output, down_storage);
+    for (int32_t n : {1, 3}) {
+        std::vector<float> x(static_cast<size_t>(n * width));
+        for (float& v : x) v = rnd();
+        std::vector<float> g(static_cast<size_t>(n * hidden)), u(g.size()), reference(static_cast<size_t>(n * output));
+        const TensorView* pair[] = {&gate, &up};
+        float* products[] = {g.data(), u.data()};
+        REQUIRE(metal.matmul_group(pair, x.data(), products, n).is_ok());
+        for (size_t i = 0; i < g.size(); ++i) g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+        REQUIRE(metal.matmul(down, g.data(), reference.data(), n).is_ok());
+
+        std::vector<float> fused(reference.size());
+        REQUIRE(metal.gated_ffn_silu(gate, up, down, x.data(), fused.data(), n).is_ok());
+        std::vector<float> in_place = x;
+        REQUIRE(metal.gated_ffn_silu(gate, up, down, in_place.data(), in_place.data(), n).is_ok());
+        for (size_t i = 0; i < reference.size(); ++i) {
+            CHECK(std::fabs(fused[i] - reference[i]) < 2e-4f * (1.0f + std::fabs(reference[i])));
+            CHECK(fused[i] == in_place[i]);
+        }
+    }
+    metal.free_shared(gate_storage);
+    metal.free_shared(up_storage);
+    metal.free_shared(down_storage);
+}
+
 TEST_MAIN()

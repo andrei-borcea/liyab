@@ -50,7 +50,32 @@ class _LivingFlameState extends State<LivingFlame> with SingleTickerProviderStat
   void initState() {
     super.initState();
     _heat = widget.heat;
-    _ticker = createTicker(_tick)..start();
+    _ticker = createTicker(_tick);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncTicker();
+  }
+
+  @override
+  void didUpdateWidget(LivingFlame oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _heat = widget.heat;
+    _syncTicker();
+  }
+
+  void _syncTicker() {
+    final animate = widget.state != FlameState.resting && !MediaQuery.disableAnimationsOf(context);
+    if (animate && !_ticker.isActive) {
+      _last = Duration.zero;
+      _painted = Duration.zero;
+      _ticker.start();
+    } else if (!animate && _ticker.isActive) {
+      _ticker.stop();
+      _sparks.clear();
+    }
   }
 
   void _tick(Duration elapsed) {

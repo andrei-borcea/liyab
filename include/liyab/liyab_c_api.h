@@ -321,6 +321,18 @@ typedef struct liyab_memory_plan {
     int32_t requant_bits;        /* resident Q8_0 matrices converted at load (4 / 5); 0: none */
 } liyab_memory_plan;
 LIYAB_C_API liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out);
+/* Actual dense-weight layout after load. The engine and out must be non-null.
+ * Immutable for the engine's lifetime; safe during generation. File bytes
+ * include GGUF metadata and non-block tensors. Streamed bytes count the
+ * block ranges read through the bounded pipeline, not MoE expert I/O. */
+typedef struct liyab_weight_layout {
+    uint64_t file_bytes;
+    uint64_t streamed_bytes;
+    int32_t streamed_blocks;
+    int32_t total_blocks;
+    int32_t mmap_streaming; /* paging hint; may be true without a block pipeline */
+} liyab_weight_layout;
+LIYAB_C_API liyab_status liyab_engine_weight_layout(const liyab_engine* engine, liyab_weight_layout* out);
 /* The context length the engine was created with (resolved when the config asked for 0). */
 LIYAB_C_API int32_t liyab_engine_context_length(const liyab_engine* engine);
 
@@ -343,6 +355,20 @@ typedef struct liyab_engine_counters {
     uint64_t tokens_generated;   /* decoded tokens, all generations */
 } liyab_engine_counters;
 LIYAB_C_API liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_counters* out);
+/* System memory and the engine's thermal policy. Thread-safe during generation;
+ * keep engine alive for the call. Null engine returns a neutral power policy.
+ * out must be non-null. Unknown memory counters are zero. This reports policy,
+ * not confirmation that a backend has already changed its execution route. */
+typedef struct liyab_resource_snapshot {
+    uint64_t available_bytes;
+    uint64_t total_bytes;
+    float cpu_fraction;
+    float thermal_pressure;
+    float slowdown;
+    int32_t throttled;
+} liyab_resource_snapshot;
+LIYAB_C_API liyab_status liyab_get_resource_snapshot(const liyab_engine* engine, liyab_resource_snapshot* out);
+
 /* GGUF `general.architecture` values this build runs, comma-separated; same
  * buffer contract as liyab_engine_describe. */
 LIYAB_C_API size_t liyab_supported_architectures(char* buffer, size_t size);

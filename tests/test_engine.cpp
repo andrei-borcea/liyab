@@ -5489,7 +5489,14 @@ TEST_CASE("Engine routes to CPU when forced and matches the default route") {
 
 TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place mmap reads") {
     const std::vector<int32_t> prompt = {1, 270, 300, 5, 290};
-    for (const std::string& path : {mixed_model(), model_path("streamed_nas", test::nas_spec())}) {
+    test::TinyModelSpec dense_k;
+    dense_k.n_embd = 256;
+    dense_k.n_ff = 768;
+    dense_k.n_head = 8;
+    dense_k.attn_type = DType::Q5_K;
+    dense_k.ffn_type = dense_k.output_type = DType::Q4_K;
+    for (const std::string& path : {mixed_model(), model_path("streamed_nas", test::nas_spec()),
+                                  model_path("streamed_dense_k", dense_k)}) {
     EngineConfig baseline = engine_config(path);
     baseline.backend = BackendKind::Cpu;
     auto reference = Engine::create(baseline);
@@ -5504,12 +5511,20 @@ TEST_CASE("Triple-buffered block streaming produces the same tokens as in-place 
         auto streamed = Engine::create(config);
         REQUIRE(streamed.has_value());
         CHECK(streamed.value()->describe().find("triple-buffered") != std::string::npos);
+        const auto resident_layout = in_place.value()->weight_layout();
+        const auto streamed_layout = streamed.value()->weight_layout();
+        CHECK(resident_layout.file_bytes == streamed_layout.file_bytes);
+        CHECK(resident_layout.streamed_bytes == 0);
+        CHECK(resident_layout.streamed_blocks == 0);
+        CHECK(streamed_layout.streamed_bytes > 0);
+        CHECK(streamed_layout.streamed_blocks > 0);
+        CHECK(streamed_layout.total_blocks == resident_layout.total_blocks);
         GenerationStats stats;
-        // Streamed slots must use CPU projections: their addresses are
-        // reused and cannot key persistent GPU weight copies. Quantized GPU
-        // projections do not quantize activations as the CPU does, so an
-        // in-place GPU generation is not this path's numeric reference.
-        CHECK(run(*streamed.value(), prompt, greedy(20), &stats) == expected);
+        // Shared GPU allocations keep both routes on the same kernels;
+        // refilling a slot must not reuse stale weight contents. CPU and GPU
+        // activation rounding differ, so compare each backend to itself.
+        CHECK(run(*streamed.value(), prompt, greedy(20), &stats) ==
+              run(*in_place.value(), prompt, greedy(20)));
         CHECK(!expected.empty());
     }
     }
@@ -6065,6 +6080,14 @@ TEST_CASE("C API: create, generate, describe, errors") {
     CHECK(needed > sizeof buf);
     CHECK(std::strlen(buf) == sizeof buf - 1);
     CHECK(liyab_describe_device(nullptr, 0) > 0);
+    liyab_resource_snapshot resources{};
+    CHECK(liyab_get_resource_snapshot(nullptr, nullptr) == LIYAB_ERR_INVALID_ARGUMENT);
+    CHECK(liyab_get_resource_snapshot(nullptr, &resources) == LIYAB_OK);
+    CHECK(resources.cpu_fraction == 1.0f);
+    CHECK(resources.slowdown == 1.0f);
+    CHECK(liyab_get_resource_snapshot(engine, &resources) == LIYAB_OK);
+    CHECK(resources.cpu_fraction > 0.0f && resources.cpu_fraction <= 1.0f);
+    CHECK(resources.slowdown >= 1.0f);
     CHECK(std::string(liyab_version()) == LIYAB_VERSION_STRING);
     liyab_engine_destroy(engine);
     liyab_engine_destroy(nullptr);

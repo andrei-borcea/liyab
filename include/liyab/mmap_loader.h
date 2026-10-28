@@ -101,11 +101,17 @@ struct GgufValue {
 };
 
 struct LoaderOptions {
-    // nullopt: stream iff the file is larger than 80% of available memory.
+    // nullopt: stream iff the file exceeds available memory after the runtime
+    // reserve for context, activations and the host application.
     std::optional<bool> streaming;
     // > 0: cap on the memory the process may use (see usable_memory_bytes()).
     uint64_t memory_budget_bytes = 0;
 };
+
+// Bytes available for resident model weights after a 1 GiB runtime reserve.
+// `available` is already capped by any per-process budget. Returns zero when
+// the reserve cannot be met; callers then use bounded streaming.
+LIYAB_API uint64_t resident_weight_capacity_bytes(uint64_t available) noexcept;
 
 class LIYAB_API MmapLoader {
 public:

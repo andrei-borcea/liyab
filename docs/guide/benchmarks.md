@@ -22,6 +22,62 @@ Commands and source paths in examples are relative to the repository root.
 
 ## Measured results
 
+### M4 Pro dense 27B development check
+
+On 28 October 2026, Liyab decoded 16 greedy tokens from `Qwen3.8-27B-Uncensored-noMTP-Q4_K_M.gguf` on an
+M4 Pro with 48 GiB RAM. Both runs used Metal, the Performance profile, a 512-token context and the same 10-token
+prompt. These short runs show the cost of streaming; they do not establish sustained speed.
+
+| Weight plan | Decode | Peak RSS | Storage wait |
+| :--- | ---: | ---: | ---: |
+| 64/64 blocks resident | 4.17 tok/s | 15.7 GiB | 0 ms |
+| 13,000 MiB cap, block streaming | 2.54 tok/s | 12.0 GiB | 2,229 ms per run, prompt included |
+
+With resident weights, the 4.17 tok/s run spent 145 ms/token in dense FFNs, 65 ms/token in recurrent mixers,
+20 ms/token in attention and 9 ms/token in the LM head. The GGUF contains 15.41 GiB of weights. A 50 tok/s
+ordinary decode would need to read roughly 770 GiB/s of weights; [Apple quotes 273 GB/s for M4 Pro](https://www.apple.com/newsroom/2024/10/apple-introduces-m4-pro-and-m4-max/). Reaching that target needs fewer weight reads per accepted token, such as effective batched
+verification, as well as faster kernels. No 50 tok/s result has been measured.
+
+The next check used the same local GGUF and an 8-token prompt (`Explain why the sky is blue.`), with 16 greedy
+decode tokens, Metal, Performance and a 512-token context. We alternated the existing two-command-buffer FFN
+with a Metal path that keeps gate/up, SiLU and down in one command buffer. All weights stayed resident; both
+paths produced the same 16-token output text.
+
+| FFN path | Decode runs | Dense FFN time | Storage read |
+| :--- | ---: | ---: | ---: |
+| Separate gate/up, CPU SiLU, down | 4.438 / 4.433 tok/s | 137.1 / 137.8 ms/token | 0 bytes |
+| Metal gate/up, SiLU, down | 4.717 / 4.689 tok/s | 126.0 / 126.0 ms/token | 0 bytes |
+
+The new path applies only to bias-free, unclamped SiLU FFNs without LoRA or an experimental hook. Other FFNs
+use their existing projections. These short runs establish a local 5.7–6.4% decode gain over the paired control;
+they do not establish sustained speed or a cross-engine comparison.
+
+#### Execution design from the llama.cpp and Colibri comparison
+
+llama.cpp [tiles rows in its Metal matvec](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-metal/kernels/mul_mv.metal),
+[encodes graph operations into command buffers](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-metal/ggml-metal-context.m),
+and [fuses norms, SSM convolution and recurrent-cache writes](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-metal/ggml-metal-fusion.cpp).
+Colibri [keeps dense MoE weights in RAM and streams routed experts](https://github.com/uv-genai/colibri#the-idea);
+its native MTP verification can save weight reads when drafts are accepted, but cold expert-cache misses can
+erase that gain. Its GLM-5.2 MoE speed is not a baseline for this resident 27B dense model.
+
+Liyab's next execution work follows the measured costs:
+
+1. Tile Q4_K/Q5_K/Q6_K matvec across output rows. The first four-SIMD-group experiment kept one row per group
+   and slowed decode from 4.416 to 4.297 tok/s, so row tiling and activation reuse need their own A/B proof.
+2. Keep activations and recurrent state in GPU-owned segments across norm, projections, DeltaNet and residuals.
+   The CPU commits KV and recurrent snapshots only after a segment completes; failed operations fall back at
+   explicit boundaries. Adapters and speculative rollback must see the same state and output as the CPU route.
+   `liyab-compat` continues to own model semantics and tensor mapping, not this execution schedule.
+3. Add a multi-token matrix kernel that reuses each weight tile during verification. Current Metal matvec launches
+   one row per token and rereads weights for every draft, so batching alone cannot meet the 50 tok/s target.
+   The existing `DraftBudget` can select draft counts from measured accepted tokens per millisecond after that
+   kernel exists; this noMTP GGUF uses suffix/context drafts, whose acceptance depends on the text.
+
+Before enabling each path, check prefill and decode logits, greedy token IDs, batched sequences, LoRA updates,
+recurrent snapshots and rollback, plus peak memory. Compare tok/s and bytes read on the same prompt and model;
+keep the old path when the new one loses.
+
 The reference device is a **Xiaomi 25010PN30G**:
 * Snapdragon 8 Elite (SM8750), 15 GB RAM, UFS 4;
 * Adreno 830 GPU, Hexagon v79 NPU;

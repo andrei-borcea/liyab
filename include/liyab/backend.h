@@ -1,9 +1,10 @@
 // Liyab — compute backend interface.
 //
 // A backend executes the weight-bound matrix multiplications of a transformer
-// (QKV/O projections and the FFN). Attention softmax, norms and RoPE stay on
-// the CPU next to the KV cache. Weights are always read in place from the
-// memory-mapped model file; backends must not copy whole tensors.
+// (QKV/O projections and the FFN). A backend may also fuse a complete SiLU
+// FFN. Attention softmax, norms and RoPE stay on the CPU next to the KV cache.
+// Weights are read in place from the memory-mapped model file; backends must
+// not copy whole tensors.
 #ifndef LIYAB_BACKEND_H
 #define LIYAB_BACKEND_H
 
@@ -55,6 +56,18 @@ public:
                                 int32_t n) {
         for (size_t i = 0; i < ws.size(); ++i) LIYAB_RETURN_IF_ERROR(matmul(*ws[i], x, ys[i], n));
         return Status::ok();
+    }
+
+    // Optional fused SiLU FFN: y = down(silu(gate(x)) * up(x)). All three
+    // matrices use row-major f32 activations; `x` and `y` may alias.
+    // Biases, adapters and activation variants belong to the caller. Return
+    // Unsupported before writing `y` when this backend cannot run the whole
+    // operation; other errors abort the pass. Thread-compatible: one call at
+    // a time, as for matmul().
+    virtual Status gated_ffn_silu(const TensorView& gate, const TensorView& up, const TensorView& down,
+                                  const float* x, float* y, int32_t n) {
+        (void)gate; (void)up; (void)down; (void)x; (void)y; (void)n;
+        return Status(ErrorCode::Unsupported, "fused SiLU FFN is unavailable");
     }
 
     // One independent matmul of a batch: y[n][w.rows()] = x[n][w.cols()] · wᵀ.

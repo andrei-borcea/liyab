@@ -12,8 +12,9 @@ import 'downloads.dart';
 import 'hugging_face.dart';
 
 class ModelsPage extends StatelessWidget {
-  const ModelsPage({super.key, required this.app});
+  const ModelsPage({super.key, required this.app, this.onLoaded});
   final AppState app;
+  final VoidCallback? onLoaded;
 
   @override
   Widget build(BuildContext context) => DefaultTabController(
@@ -21,9 +22,9 @@ class ModelsPage extends StatelessWidget {
         child: Scaffold(
           appBar: AppBar(
             title: Text('Models', style: Theme.of(context).textTheme.titleLarge),
-            bottom: const TabBar(tabs: [Tab(text: 'On this phone'), Tab(text: 'Get models')]),
+            bottom: const TabBar(tabs: [Tab(text: 'Local library'), Tab(text: 'Get models')]),
           ),
-          body: TabBarView(children: [_LocalTab(app: app), _HubTab(app: app)]),
+          body: TabBarView(children: [_LocalTab(app: app, onLoaded: onLoaded), _HubTab(app: app)]),
         ),
       );
 }
@@ -32,8 +33,9 @@ class ModelsPage extends StatelessWidget {
 // On this phone
 
 class _LocalTab extends StatefulWidget {
-  const _LocalTab({required this.app});
+  const _LocalTab({required this.app, this.onLoaded});
   final AppState app;
+  final VoidCallback? onLoaded;
 
   @override
   State<_LocalTab> createState() => _LocalTabState();
@@ -45,7 +47,7 @@ class _LocalTabState extends State<_LocalTab> {
 
   AppState get app => widget.app;
 
-  void _refresh() => setState(() => _models = app.localModels());
+  void _refresh() => setState(() { _models = app.localModels(); });
 
   @override
   void initState() {
@@ -77,23 +79,30 @@ class _LocalTabState extends State<_LocalTab> {
       if (mounted) _snack('Choose a .gguf model file.');
       return;
     }
-    final name = path.split('/').last;
+    final name = File(path).uri.pathSegments.last;
     setState(() => _importing = name);
     try {
+      if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+        await ModelsStore.register(File(path));
+      } else {
       final dir = await ModelsStore.modelsDir();
+      if (await File('${dir.path}/$name').exists()) throw const FileSystemException('A model with this name already exists');
       try {
         await File(path).rename('${dir.path}/$name');
       } on FileSystemException {
         final tmp = await File(path).copy('${dir.path}/$name.importing');
         await tmp.rename('${dir.path}/$name');
       }
+      }
       if (mounted) _snack('$name is ready.');
+    } on FormatException catch (e) {
+      if (mounted) _snack(e.message);
     } on FileSystemException catch (e) {
       if (mounted) _snack('Could not import $name: ${e.message}');
     } finally {
-      await FilePicker.clearTemporaryFiles();
+      if (Platform.isAndroid || Platform.isIOS) await FilePicker.clearTemporaryFiles();
       if (mounted) setState(() => _importing = null);
-      _refresh();
+      if (mounted) _refresh();
     }
   }
 
@@ -103,20 +112,28 @@ class _LocalTabState extends State<_LocalTab> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('Delete this model?'),
-        content: Text('${m.name} (${formatBytes(m.bytes)}) will be removed from this phone.'),
+        title: Text(m.external ? 'Remove from library?' : 'Delete this model?'),
+        content: Text(m.external ? '${m.name} will stay in its original folder.' : '${m.name} (${formatBytes(m.bytes)}) will be deleted from this device.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Keep')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Delete')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: Text(m.external ? 'Remove' : 'Delete')),
         ],
       ),
     );
     if (ok != true) return;
     if (app.modelPath == m.file.path) await app.unload();
-    for (final part in modelParts(m.file)) {
-      if (part.existsSync()) part.deleteSync();
+    try {
+      if (m.external) {
+        await ModelsStore.forget(m.file);
+      } else {
+        for (final part in modelParts(m.file)) {
+          if (await part.exists()) await part.delete();
+        }
+      }
+    } on FileSystemException catch (e) {
+      if (mounted) _snack('Could not remove model: ${e.message}');
     }
-    _refresh();
+    if (mounted) _refresh();
   }
 
   @override
@@ -131,22 +148,28 @@ class _LocalTabState extends State<_LocalTab> {
           return RefreshIndicator(
             onRefresh: () async => _refresh(),
             child: ListView(padding: const EdgeInsets.fromLTRB(16, 12, 16, 32), children: [
+              if (snap.hasError) Text('Could not read the library: ${snap.error}'),
+              if (!snap.hasData && !snap.hasError) const LinearProgressIndicator(),
               if (snap.hasData && models.isEmpty)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 24),
-                  child: Text('No models on this phone yet. Get one from Hugging Face, or import a GGUF file.',
+                  child: Text('Your models, your device. Open a GGUF you already have, or download one from Hugging Face.',
                       style: theme.textTheme.bodyLarge),
                 ),
               for (final m in models)
                 _LocalModelCard(
                   model: m,
                   loaded: app.modelPath == m.file.path,
-                  busy: app.loading || app.moving != null,
+                  busy: app.loading || app.generating || app.moving != null,
                   moving: app.moving == m.name,
                   budgetMb: app.device.memoryBudgetMb,
                   onLoad: () {
                     app.load(m.file.path);
-                    Navigator.of(context).popUntil((r) => r.isFirst);
+                    if (widget.onLoaded != null) {
+                      widget.onLoaded!();
+                    } else {
+                      Navigator.of(context).popUntil((r) => r.isFirst);
+                    }
                   },
                   onMove: () async {
                     await app.moveToAppStorage(m);
@@ -160,7 +183,7 @@ class _LocalTabState extends State<_LocalTab> {
                 icon: _importing != null
                     ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.file_open_outlined),
-                label: Text(_importing != null ? 'Importing $_importing…' : 'Import a GGUF file'),
+                label: Text(_importing != null ? 'Importing $_importing…' : 'Open a local GGUF'),
               ),
             ]),
           );
@@ -190,9 +213,11 @@ class _LocalModelCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final streams = model.bytes > budgetMb * 1024 * 1024;
+    final streams = budgetMb > 0 && model.bytes > budgetMb * 1024 * 1024;
     final notes = [
       formatBytes(model.bytes),
+      if (!model.available) 'File missing: reconnect the drive or open it again',
+      if (model.external && model.available) 'Linked in place · no copy',
       if (streams) 'streams from storage',
       if (model.shared) 'shared folder: slower streaming',
     ];
@@ -218,11 +243,11 @@ class _LocalModelCard extends StatelessWidget {
                 child: Text('In use', style: TextStyle(color: theme.colorScheme.primary, fontWeight: FontWeight.w600)),
               )
             else
-              TextButton(onPressed: busy ? null : onLoad, child: const Text('Use')),
+              TextButton(onPressed: busy || !model.available ? null : onLoad, child: const Text('Use')),
             if (model.shared)
               TextButton(onPressed: busy || loaded ? null : onMove, child: const Text('Move to app storage')),
             const Spacer(),
-            IconButton(tooltip: 'Delete', onPressed: busy ? null : onDelete, icon: const Icon(Icons.delete_outline)),
+            IconButton(tooltip: model.external ? 'Remove from library' : 'Delete', onPressed: busy ? null : onDelete, icon: Icon(model.external ? Icons.link_off_rounded : Icons.delete_outline)),
           ]),
         ]),
       ),
@@ -272,7 +297,7 @@ class _HubTabState extends State<_HubTab> {
           fillColor: theme.colorScheme.surfaceContainerHighest,
           border: OutlineInputBorder(borderRadius: BorderRadius.circular(28), borderSide: BorderSide.none),
         ),
-        onSubmitted: (q) => setState(() => _results = HuggingFace.search(q.trim())),
+        onSubmitted: (q) => setState(() { _results = HuggingFace.search(q.trim()); }),
       ),
       const SizedBox(height: 8),
       Text('Only the search and the model files go to the network.', style: theme.textTheme.labelSmall),
@@ -321,7 +346,7 @@ class _DownloadCard extends StatelessWidget {
         '${formatBytes(d.done)} of ${formatBytes(d.totalBytes)}${d.speedMBps > 0 ? ', ${d.speedMBps.toStringAsFixed(1)} MB/s' : ''}',
       DownloadPhase.paused => 'Paused at ${formatBytes(d.done)} of ${formatBytes(d.totalBytes)}',
       DownloadPhase.checking => 'Checking the file',
-      DownloadPhase.done => 'Downloaded. Find it under On this phone.',
+      DownloadPhase.done => 'Downloaded. Find it in Local library.',
       DownloadPhase.failed => 'Stopped: ${d.error}',
     };
     return Card(

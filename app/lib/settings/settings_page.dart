@@ -1,4 +1,4 @@
-// Settings: the loaded model's generation settings, this phone's limits, and
+// Settings: the loaded model's generation settings, this device's limits, and
 // the permissions Liyab uses.
 import 'dart:io';
 
@@ -43,7 +43,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _checkTools();
-      setState(() => _assistant = _isAssistant());
+      setState(() { _assistant = _isAssistant(); });
     }
   }
 
@@ -167,19 +167,20 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
             decoration: const InputDecoration(labelText: 'System prompt', border: OutlineInputBorder()),
           ),
         ],
-        heading('This phone'),
-        SwitchListTile(
-          contentPadding: EdgeInsets.zero,
-          title: const Text('Run on the GPU'),
-          subtitle: const Text('Vulkan. The CPU is usually faster for mixture-of-experts models. Reloads the model.'),
-          value: app.device.useGpu,
-          onChanged: app.loading
-              ? null
-              : (v) {
-                  setState(() => app.device.useGpu = v);
-                  if (app.modelPath != null) app.load(app.modelPath!);
-                },
-        ),
+        heading('This device'),
+        Text('Execution backend', style: theme.textTheme.bodyLarge),
+        const SizedBox(height: 8),
+        SegmentedButton<String>(segments: const [
+          ButtonSegment(value: 'auto', label: Text('Automatic')),
+          ButtonSegment(value: 'cpu', label: Text('CPU')),
+          ButtonSegment(value: 'gpu', label: Text('GPU')),
+        ], selected: {app.device.executionBackend},
+          onSelectionChanged: app.loading || app.generating ? null : (value) {
+            setState(() { app.device.executionBackend = value.first; });
+            if (app.modelPath != null) app.load(app.modelPath!, keepChat: true);
+          }),
+        const SizedBox(height: 6),
+        Text('Automatic selects from available backends. Changes reload the model and keep your chat.', style: muted),
         const SizedBox(height: 8),
         Text('Speed or coolness'),
         const SizedBox(height: 8),
@@ -206,15 +207,23 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
         const SizedBox(height: 8),
         slider('Cool down above', app.device.thermalLimitC, 38, 60, 22, (v) => '${v.round()} °C',
             (v) => app.device.thermalLimitC = v.roundToDouble()),
-        slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048,
+        if (!Platform.isAndroid) SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Automatic memory budget'),
+          subtitle: const Text('Adapt to available RAM while leaving headroom for other apps. Changes apply between requests.'),
+          value: app.device.memoryBudgetMb == 0,
+          onChanged: (value) => _set(() => app.device.memoryBudgetMb = value ? 0 : 5120),
+        ),
+        if (app.device.memoryBudgetMb == 0 && app.resourceBudget.currentMb > 0)
+          Text('Current target ${(app.resourceBudget.currentMb / 1024).toStringAsFixed(1)} GiB. The scheduler samples every 5 seconds.', style: muted),
+        if (app.device.memoryBudgetMb != 0)
+          slider('Memory for the model', app.device.memoryBudgetMb.toDouble(), 2048,
             DeviceSettings.maxMemoryBudgetMb.toDouble(), (DeviceSettings.maxMemoryBudgetMb - 2048) ~/ 256,
             (v) => '${(v / 1024).toStringAsFixed(1)} GB', (v) => app.device.memoryBudgetMb = (v / 256).round() * 256),
-        Text(
-            '${Platform.isAndroid ? 'HyperOS and MIUI close apps that use more than 6 GB.' : 'At most 5 GB, whatever the RAM: larger models stream from the SSD.'}'
-            ' Both apply the next time the model loads.'
-            '${app.memory.recommendedBytes > 0 ? ' The loaded model runs well with about '
-                '${(app.memory.recommendedBytes / (1 << 30)).toStringAsFixed(1)} GB.' : ''}',
-            style: app.memory.tight ? muted?.copyWith(color: theme.colorScheme.error) : muted),
+        Text(Platform.isAndroid
+          ? 'Some Android systems close apps above 6 GB. Applies on reload.'
+          : 'Models exceeding the available budget stream from storage. This can slow dense models. Applies on reload.',
+          style: muted),
         const SizedBox(height: 12),
         slider(
             'Free memory when idle',
@@ -226,6 +235,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
             (v) => app.device.releaseAfterMinutes = _releaseChoices[v.round()]),
         Text('After this long in the background Liyab unloads the model; it loads again when you open Liyab.',
             style: muted),
+        if (Platform.isAndroid || Platform.isMacOS) ...[
         heading('Assistant'),
         FutureBuilder<bool>(
           future: _assistant,
@@ -247,13 +257,14 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                   : TextButton(
                       onPressed: () async {
                         await _device.invokeMethod<void>('openAssistantSettings');
-                        setState(() => _assistant = _isAssistant());
+                        setState(() { _assistant = _isAssistant(); });
                       },
                       child: const Text('Set up'),
                     ),
             );
           },
         ),
+        ],
         heading('What Liyab can read'),
         Text(
           app.toolDialect.name == 'none' && app.modelName.isNotEmpty
@@ -295,7 +306,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                   : TextButton(
                       onPressed: () async {
                         await app.downloads.ensureNotificationPermission();
-                        setState(() => _notifications = app.downloads.notificationPermission());
+                        setState(() { _notifications = app.downloads.notificationPermission(); });
                       },
                       child: const Text('Allow'),
                     ),
@@ -314,7 +325,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
           title: Text('Internet'),
           subtitle: Text('Only to search and download models from Hugging Face. Conversations never leave the phone.'),
         ),
-        heading('Apps on this phone'),
+        heading('Apps on this device'),
         ApiSection(app: app),
         heading('Experimental'),
         ExperimentalSection(app: app),

@@ -304,6 +304,34 @@ final class LiyabMemoryPlan extends Struct {
   external int requantBits;
 }
 
+final class LiyabWeightLayout extends Struct {
+  @Uint64()
+  external int fileBytes;
+  @Uint64()
+  external int streamedBytes;
+  @Int32()
+  external int streamedBlocks;
+  @Int32()
+  external int totalBlocks;
+  @Int32()
+  external int mmapStreaming;
+}
+
+final class LiyabResourceSnapshot extends Struct {
+  @Uint64()
+  external int availableBytes;
+  @Uint64()
+  external int totalBytes;
+  @Float()
+  external double cpuFraction;
+  @Float()
+  external double thermalPressure;
+  @Float()
+  external double slowdown;
+  @Int32()
+  external int throttled;
+}
+
 final class LiyabEngineCounters extends Struct {
   @Double()
   external double acceleratorBusyMs;
@@ -396,8 +424,11 @@ final class LiyabLib {
             'liyab_engine_context_length'),
         memoryPlan = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabMemoryPlan>),
             int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>)>('liyab_engine_memory_plan'),
+        weightLayout = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabWeightLayout>),
+            int Function(Pointer<Void>, Pointer<LiyabWeightLayout>)>('liyab_engine_weight_layout'),
         supportedArchitectures = lib.lookupFunction<Size Function(Pointer<Utf8>, Size), int Function(Pointer<Utf8>, int)>(
             'liyab_supported_architectures'),
+        getResourceSnapshot = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabResourceSnapshot>), int Function(Pointer<Void>, Pointer<LiyabResourceSnapshot>)>('liyab_get_resource_snapshot'),
         getCounters = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<LiyabEngineCounters>),
             int Function(Pointer<Void>, Pointer<LiyabEngineCounters>)>('liyab_engine_get_counters'),
         renderChat = lib.lookupFunction<Int64 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Size),
@@ -500,6 +531,8 @@ final class LiyabLib {
       ? DynamicLibrary.open(Platform.environment['LIYAB_LIBRARY']!)
       : Platform.isAndroid
           ? DynamicLibrary.open('libliyab.so')
+          : Platform.isWindows ? DynamicLibrary.open('liyab.dll')
+          : Platform.isLinux ? DynamicLibrary.open('libliyab.so')
           : DynamicLibrary.process());
 
   final Pointer<Utf8> Function() version;
@@ -524,6 +557,7 @@ final class LiyabLib {
   final int Function(Pointer<Utf8>, int) describeDevice;
   final int Function(Pointer<Void>, Pointer<Utf8>, int) prefill;
   final int Function(Pointer<Void>) resetContext;
+  final int Function(Pointer<Void>, Pointer<LiyabResourceSnapshot>) getResourceSnapshot;
   final int Function(Pointer<Void>, Pointer<LiyabEngineCounters>) getCounters;
   final int Function(Pointer<Utf8>, int) supportedArchitectures;
   final int Function(Pointer<Void>, Pointer<Utf8>) saveState;
@@ -531,6 +565,7 @@ final class LiyabLib {
   final int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>) loadState;
   final int Function(Pointer<Void>, Pointer<Uint64>) trimMemory;
   final int Function(Pointer<Void>, Pointer<LiyabMemoryPlan>) memoryPlan;
+  final int Function(Pointer<Void>, Pointer<LiyabWeightLayout>) weightLayout;
   final int Function(Pointer<Void>) contextLength;
   final int Function(Pointer<Void>, Pointer<Uint32>) warmMemory;
   final int Function(Pointer<Void>, Pointer<Utf8>) saveExpertProfile;

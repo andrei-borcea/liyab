@@ -49,7 +49,7 @@ class AppDrawer extends StatelessWidget {
         const NavigationDrawerDestination(icon: Icon(Icons.tune_rounded), label: Text('Settings')),
         Padding(
           padding: const EdgeInsets.fromLTRB(28, 24, 28, 16),
-          child: Text('Everything runs on this phone. Nothing you write leaves it.', style: theme.textTheme.labelSmall),
+          child: Text('Everything runs on this device. Nothing you write leaves it.', style: theme.textTheme.labelSmall),
         ),
       ],
     );

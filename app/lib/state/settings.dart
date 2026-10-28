@@ -211,9 +211,11 @@ class DeviceSettings {
   DeviceSettings(this._prefs);
   final SharedPreferences _prefs;
 
-  /// Run on the GPU (Vulkan) instead of the CPU.
-  bool get useGpu => _prefs.getBool('gpu') ?? false;
-  set useGpu(bool v) => _prefs.setBool('gpu', v);
+  /// Prefer GPU execution (Metal on macOS, Vulkan on Android).
+  String get executionBackend => _prefs.getString('execution_backend') ?? 'auto';
+  set executionBackend(String value) => _prefs.setString('execution_backend', value);
+  bool get useGpu => executionBackend != 'cpu';
+  set useGpu(bool value) => executionBackend = value ? 'gpu' : 'cpu';
 
   /// Skin / board temperature (°C) above which the engine throttles. 50 by
   /// default: on some phones the only "skin" sensor is a board thermistor that
@@ -221,15 +223,20 @@ class DeviceSettings {
   double get thermalLimitC => _prefs.getDouble('thermal_limit') ?? 50;
   set thermalLimitC(double v) => _prefs.setDouble('thermal_limit', v);
 
-  /// Memory (MiB) the engine may keep resident. On Android 5500 by default
-  /// because HyperOS / MIUI stop any app above 6 GiB of PSS, whatever RAM is
-  /// free. On a computer 5 GiB at most (maxMemoryBudgetMb), whatever its RAM (16, 24 GB
-  /// or more): the assistant stays a light app next to the user's work, and
-  /// larger models stream from the SSD.
-  int get memoryBudgetMb =>
-      (_prefs.getInt('memory_budget_mb') ?? (Platform.isAndroid ? 5500 : maxMemoryBudgetMb)).clamp(2048, maxMemoryBudgetMb);
-  set memoryBudgetMb(int v) => _prefs.setInt('memory_budget_mb', v);
-  static final int maxMemoryBudgetMb = Platform.isAndroid ? 12288 : 5120;
+  /// Resident memory cap in MiB. Desktop defaults to the engine's automatic
+  /// free-RAM budget (0); Android keeps its per-app safety default. Explicit
+  /// limits from previous versions remain in effect until changed in Settings.
+  int get memoryBudgetMb {
+    if (!Platform.isAndroid && (_prefs.getBool('automatic_memory') ?? true)) return 0;
+    final value = _prefs.getInt('memory_budget_mb') ?? 5500;
+    if (value == 0 && !Platform.isAndroid) return 0;
+    return value.clamp(2048, maxMemoryBudgetMb);
+  }
+  set memoryBudgetMb(int v) {
+    _prefs.setBool('automatic_memory', v == 0);
+    _prefs.setInt('memory_budget_mb', v);
+  }
+  static final int maxMemoryBudgetMb = Platform.isAndroid ? 12288 : 65536;
 
   /// Minutes Liyab stays in the background before it unloads the model to
   /// give its memory back (several GB for a large model); 0 keeps it loaded.

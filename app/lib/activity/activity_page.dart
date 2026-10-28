@@ -37,12 +37,10 @@ class ActivityPage extends StatelessWidget {
           return CustomScrollView(slivers: [
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-              sliver: SliverGrid.count(
-                crossAxisCount: 2,
-                mainAxisSpacing: 10,
-                crossAxisSpacing: 10,
-                childAspectRatio: 1.7,
-                children: [
+              sliver: SliverGrid(
+                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                  maxCrossAxisExtent: 340, mainAxisSpacing: 10, crossAxisSpacing: 10, mainAxisExtent: 150),
+                delegate: SliverChildListDelegate([
                   _Meter('Speed', s == null ? '—' : '${s.tokensPerSecond.toStringAsFixed(1)} tok/s',
                       history.map((e) => e.tokensPerSecond).toList(), Palette.ember),
                   _Meter(
@@ -52,6 +50,13 @@ class ActivityPage extends StatelessWidget {
                       Palette.flare),
                   _Meter('CPU', s == null ? '—' : '${s.cpuPercent.toStringAsFixed(0)} %',
                       history.map((e) => e.cpuPercent).toList(), Palette.gold),
+                  _Meter('GPU busy', s == null ? '—' : '${s.gpuPercent.toStringAsFixed(0)} %',
+                      history.map((e) => e.gpuPercent).toList(), Palette.core),
+                  _Meter('Available memory', app.resources == null ? '—' : '${(app.resources!.availableBytes / (1 << 30)).toStringAsFixed(1)} GiB',
+                      const [], Palette.core),
+                  _Meter('Model budget', app.device.memoryBudgetMb == 0
+                      ? 'Auto · ${(app.resourceBudget.currentMb / 1024).toStringAsFixed(1)} GiB'
+                      : '${(app.device.memoryBudgetMb / 1024).toStringAsFixed(1)} GiB', const [], Palette.ember),
                   _Meter('Storage reads', s == null ? '—' : '${s.flashMBps.toStringAsFixed(0)} MB/s',
                       history.map((e) => e.flashMBps).toList(), Palette.core),
                   _Meter(
@@ -63,7 +68,7 @@ class ActivityPage extends StatelessWidget {
                       Palette.flare),
                   _Meter('Energy', s?.joulesPerToken == null ? '—' : '${s!.joulesPerToken!.toStringAsFixed(2)} J/token',
                       history.map((e) => e.joulesPerToken ?? 0).toList(), Palette.ember),
-                ],
+                ]),
               ),
             ),
             SliverToBoxAdapter(
@@ -96,7 +101,9 @@ class ActivityPage extends StatelessWidget {
                       TextSpan(
                         text: l.engine ? l.text.substring(2) : l.text,
                         style: theme.textTheme.bodyMedium?.copyWith(
-                          fontSize: 13,
+                          fontSize: 12,
+                          fontFamily: 'monospace',
+                          fontFeatures: const [FontFeature.tabularFigures()],
                           color: warn
                               ? theme.colorScheme.error
                               : l.engine

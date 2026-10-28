@@ -2133,6 +2133,8 @@ struct Engine::Impl {
     }
 
     std::unique_ptr<TripleBufferLoader> weight_loader;
+    uint64_t streamed_block_bytes = 0;
+    int32_t streamed_blocks = 0;
     std::unique_ptr<SpeculativeDecoder> speculative;
     std::optional<Tokenizer> tokenizer;
     // The model's chat template (Engine::render_chat) and the special-token
@@ -2425,15 +2427,17 @@ struct Engine::Impl {
         if (largest == 0) return Status::ok(); // a stack of identity blocks has no block weights to stream
         int32_t streamed = c.n_layers;
         if (!all) {
-            const uint64_t available = usable_memory_bytes(
-                config.memory_budget_mb > 0 ? static_cast<uint64_t>(config.memory_budget_mb) << 20 : 0);
-            if (available == 0 || static_cast<double>(file.file_size()) <= 0.8 * static_cast<double>(available)) {
+            const int64_t budget_mb = std::max<int64_t>(config.memory_budget_mb, 0);
+            const int64_t reserve_mb = std::min(std::max<int64_t>(config.prefix_cache_mb, 0), budget_mb / 2);
+            const uint64_t available = usable_memory_bytes(static_cast<uint64_t>(budget_mb - reserve_mb) << 20);
+            const uint64_t capacity = resident_weight_capacity_bytes(available);
+            if (available == 0 || file.file_size() <= capacity) {
                 return Status::ok();  // fits: in-place reads from the page cache
             }
-            // Resident budget: free RAM minus the non-block weights, the 3
-            // pipeline slots and 1 GiB for KV cache, activations and the app.
-            const size_t fixed = file.file_size() - block_total + 3 * largest + (size_t{1} << 30);
-            const size_t budget = available > fixed ? static_cast<size_t>(available) - fixed : 0;
+            // The same runtime reserve used by MmapLoader is held back here;
+            // three slots must fit before any block can stay resident.
+            const size_t fixed = file.file_size() - block_total + 3 * largest;
+            const size_t budget = capacity > fixed ? static_cast<size_t>(capacity) - fixed : 0;
             const size_t average = std::max<size_t>(block_total / static_cast<size_t>(c.n_layers), 1);
             const auto resident = static_cast<int32_t>(std::min<size_t>(budget / average, static_cast<size_t>(c.n_layers)));
             streamed = c.n_layers - resident;
@@ -2452,6 +2456,8 @@ struct Engine::Impl {
         }
         if (ranges.empty()) return Status::ok();
         streamed = static_cast<int32_t>(ranges.size()); // empty NAS blocks do not count as streamed weights
+        uint64_t streamed_bytes = 0;
+        for (const auto& range : ranges) streamed_bytes += range.length;
         auto reader = DirectFile::open(file.file().path());
         if (!reader) return reader.status();
         direct_file = std::move(reader).value();
@@ -2517,6 +2523,8 @@ struct Engine::Impl {
         const size_t resident_bytes = target->mutable_file().keep_resident(
             [&](const TensorView& t) { return !in_ranges(t, true) && !in_ranges(t, false); });
         target->set_layer_source(weight_loader.get(), std::move(items), shared != nullptr);
+        streamed_block_bytes = streamed_bytes;
+        streamed_blocks = streamed;
         LIYAB_LOG_INFO("block streaming: %d of %d blocks streamed (%s direct reads, 3 x %.0f MiB slots%s), %.2f GiB "
                        "left in the mapping",
                        streamed, c.n_layers, direct_file->direct() ? "O_DIRECT" : "buffered",
@@ -2876,6 +2884,12 @@ Engine::MemoryPlan Engine::memory_plan() const {
             p.recommended_bytes, p.requant_bits};
 }
 
+Engine::WeightLayout Engine::weight_layout() const noexcept {
+    const MmapLoader& file = impl_->target->file();
+    return {file.file_size(), impl_->streamed_block_bytes, impl_->streamed_blocks,
+            impl_->target->config().n_layers, file.streaming()};
+}
+
 size_t Engine::trim_memory() {
     const std::lock_guard<std::mutex> model(impl_->model);  // not during another sequence's pass
     size_t released = 0;
@@ -2932,7 +2946,7 @@ std::string Engine::describe() const {
                   "Weights:    %s\n",
                   c.arch.c_str(), c.n_layers, c.n_embd, c.n_vocab,
                   static_cast<double>(impl_->target->file().file_size()) / (1024.0 * 1024.0 * 1024.0),
-                  impl_->target->file().streaming() ? "streaming" : "resident", impl_->target->context_length(),
+                  (impl_->weight_loader || impl_->target->file().streaming()) ? "streaming" : "resident", impl_->target->context_length(),
                   window.c_str(), std::string(dtype_traits(kv.dtype()).name).c_str(), kv.config().page_tokens,
                   static_cast<double>(KvCache::bytes_per_token(kv.config())) /
                       1024.0,
@@ -2942,9 +2956,30 @@ std::string Engine::describe() const {
                             .c_str()
                       : "mmap, read in place (zero-copy)");
     const Route route = impl_->normal_route();
-    std::string out = describe_device(impl_->device) + buf;
-    out += "Attention:  " + route.attention->description() + "\n";
-    out += "FFN:        " + route.ffn->description() + "\n";
+    std::string out = "=== Device ===\n" + describe_device(impl_->device) + "=== Model and memory ===\n" + buf;
+    char layout[128];
+    std::snprintf(layout, sizeof layout, "Dense blocks: %d/%d streamed (%.2f GiB read per pass)\n",
+                  impl_->streamed_blocks, c.n_layers,
+                  static_cast<double>(impl_->streamed_block_bytes) / (uint64_t{1} << 30));
+    out += layout;
+    out += "=== Execution ===\n";
+    out += "Attention route: " + route.attention->description() + "\n";
+    out += "FFN route:       " + route.ffn->description() + "\n";
+    if (route.ffn != route.cpu || route.attention != route.cpu) {
+        Backend* selected = route.ffn != route.cpu ? route.ffn : route.attention;
+        std::map<DType, size_t> fallback;
+        for (const TensorView& tensor : impl_->target->file().tensors()) {
+            if (tensor.n_dims >= 2 && tensor.name != "token_embd.weight" && !selected->supports(tensor.type))
+                fallback[tensor.type] += tensor.nbytes;
+        }
+        for (const auto& [type, bytes] : fallback) {
+            char line[192];
+            std::snprintf(line, sizeof line, "CPU fallback: %s matrix weights (%.2f GiB) unsupported by %s\n",
+                          std::string(dtype_traits(type).name).c_str(), static_cast<double>(bytes) / (1ull << 30),
+                          backend_kind_name(selected->kind()));
+            out += line;
+        }
+    }
     if (!impl_->key_scaling_warning.empty()) out += "Keys:       " + impl_->key_scaling_warning + "\n";
     if (c.hybrid()) {
         // Blocks by token mixer, in the order the kinds first appear (FFN-only blocks have none).

@@ -4739,6 +4739,17 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         return matmul(route, route.ffn, m, x, y, n);
     };
     const Layer& L = layers_[static_cast<size_t>(layer)];
+    // A bias-free SiLU FFN can keep gate/up activations on the accelerator
+    // until the down projection. Other variants need their CPU-side steps,
+    // adapter updates or experimental hook between projections.
+    if (route.ffn != route.cpu && hook == nullptr && !adapters_in_pass_ &&
+        plan.ffn != FfnKind::Ungated && !plan.fused_gate_up && !plan.dense_fused_gate_up &&
+        !plan.sparse_gate && plan.shared_swiglu_clamp == 0.0f && c.spec->ffn_activation == FfnActivation::SiLU &&
+        L.b_gate.empty() && L.b_up.empty() && L.b_down.empty()) {
+        Status fused = route.ffn->gated_ffn_silu(w[kGate], w[kUp], w[kDown], xb_.data(), xb_.data(), n);
+        if (fused.is_ok()) return fused;
+        if (fused.code() != ErrorCode::Unsupported) return fused;
+    }
     if (c.blocks[static_cast<size_t>(layer)].ffn == FfnKind::Ungated) {
         // down(act(up x + b_up)) + b_down
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Up, w[kUp], xb_.data(), hb_.data()));

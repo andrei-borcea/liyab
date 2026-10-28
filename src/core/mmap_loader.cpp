@@ -71,6 +71,11 @@ Status io_error(const std::string& what, const std::string& path) {
 
 }  // namespace
 
+uint64_t resident_weight_capacity_bytes(uint64_t available) noexcept {
+    constexpr uint64_t kRuntimeReserve = uint64_t{1} << 30;
+    return available > kRuntimeReserve ? available - kRuntimeReserve : 0;
+}
+
 // ---------------------------------------------------------------------------
 // MappedFile
 // ---------------------------------------------------------------------------
@@ -383,7 +388,7 @@ Result<std::unique_ptr<MmapLoader>> MmapLoader::open(const std::string& path, co
 
     const uint64_t available = usable_memory_bytes(options.memory_budget_bytes);
     loader->streaming_ = options.streaming.value_or(
-        available > 0 && static_cast<double>(loader->file_size()) > 0.8 * static_cast<double>(available));
+        available > 0 && loader->file_size() > resident_weight_capacity_bytes(available));
 
     for (const auto& f : loader->files_) {
         if (loader->streaming_) f->advise_sequential();

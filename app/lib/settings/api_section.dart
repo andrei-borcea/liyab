@@ -1,4 +1,4 @@
-// Settings, Apps on this phone: the local API (lib/api/local_api.dart), which
+// Settings, Apps on this device: the local API (lib/api/local_api.dart), which
 // lets other apps on the device use the loaded model through the OpenAI,
 // Anthropic or gRPC APIs, with a token.
 import 'package:flutter/material.dart';
@@ -35,8 +35,8 @@ class ApiSection extends StatelessWidget {
             subtitle: Text(
               app.apiError.isNotEmpty && on
                   ? app.apiError
-                  : 'Other apps on this phone can use the loaded model as an OpenAI, Anthropic or gRPC server, '
-                      'with the token below. Nothing outside the phone can connect.',
+                  : 'Other apps on this device can use the loaded model as an OpenAI, Anthropic or gRPC server, '
+                      'with the token below. Nothing outside the device can connect.',
               style: muted,
             ),
             value: on,

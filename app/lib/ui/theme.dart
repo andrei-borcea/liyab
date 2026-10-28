@@ -31,7 +31,7 @@ ThemeData liyabTheme(Brightness brightness) {
     brightness: brightness,
     primary: Palette.ember,
     onPrimary: Colors.white,
-    secondary: Palette.flare,
+    secondary: Palette.ember,
     onSecondary: Colors.white,
     tertiary: Palette.gold,
     onTertiary: Palette.dayText,
@@ -46,11 +46,24 @@ ThemeData liyabTheme(Brightness brightness) {
   final base = ThemeData(useMaterial3: true, colorScheme: scheme, fontFamily: bodyFont);
   return base.copyWith(
     scaffoldBackgroundColor: ground,
+    dividerColor: scheme.outline,
+    visualDensity: VisualDensity.compact,
+    tooltipTheme: const TooltipThemeData(waitDuration: Duration(milliseconds: 450)),
+    navigationDrawerTheme: NavigationDrawerThemeData(indicatorColor: scheme.primary.withValues(alpha: 0.12)),
+    filledButtonTheme: FilledButtonThemeData(style: FilledButton.styleFrom(
+      foregroundColor: const Color(0xFF23170F),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    )),
+    inputDecorationTheme: InputDecorationTheme(
+      filled: true, fillColor: scheme.surfaceContainerHighest,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: scheme.outline)),
+    ),
     textTheme: base.textTheme.copyWith(
       headlineMedium: TextStyle(fontFamily: displayFont, fontWeight: FontWeight.w700, fontSize: 28, color: text, letterSpacing: -0.4),
       titleLarge: TextStyle(fontFamily: displayFont, fontWeight: FontWeight.w600, fontSize: 20, color: text),
-      bodyLarge: TextStyle(fontSize: 16.5, height: 1.5, color: text),
-      bodyMedium: TextStyle(fontSize: 15, height: 1.45, color: text),
+      bodyLarge: TextStyle(fontSize: 15, height: 1.5, color: text),
+      bodyMedium: TextStyle(fontSize: 14, height: 1.45, color: text),
       labelSmall: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant, fontFeatures: const [FontFeature.tabularFigures()]),
     ),
     appBarTheme: AppBarTheme(backgroundColor: ground, foregroundColor: text, elevation: 0, scrolledUnderElevation: 0),

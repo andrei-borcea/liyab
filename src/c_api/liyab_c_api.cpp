@@ -464,6 +464,14 @@ liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_p
     return LIYAB_OK;
 }
 
+liyab_status liyab_engine_weight_layout(const liyab_engine* engine, liyab_weight_layout* out) {
+    if (engine == nullptr || out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    const liyab::Engine::WeightLayout layout = engine->engine->weight_layout();
+    *out = {layout.file_bytes, layout.streamed_bytes, layout.streamed_blocks,
+            layout.total_blocks, layout.mmap_streaming ? 1 : 0};
+    return LIYAB_OK;
+}
+
 liyab_status liyab_engine_warm_memory(liyab_engine* engine, uint32_t* out_queued) {
     if (engine == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
     try {
@@ -527,6 +535,18 @@ liyab_status liyab_engine_get_counters(const liyab_engine* engine, liyab_engine_
     } catch (...) {
         return LIYAB_ERR_INTERNAL;
     }
+}
+
+liyab_status liyab_get_resource_snapshot(const liyab_engine* engine, liyab_resource_snapshot* out) {
+    if (out == nullptr) return LIYAB_ERR_INVALID_ARGUMENT;
+    return guarded([&]() -> liyab_status {
+        // Cache hardware capacity, sample reclaimable memory and policy anew.
+        static const uint64_t total = liyab::detect_device().total_memory;
+        const liyab::PowerPolicy policy = engine != nullptr ? engine->engine->power().policy() : liyab::PowerPolicy{};
+        *out = {liyab::available_memory_bytes(), total, policy.thread_fraction,
+                policy.pressure, policy.slowdown, policy.throttled ? 1 : 0};
+        return LIYAB_OK;
+    });
 }
 
 size_t liyab_supported_architectures(char* buffer, size_t size) {

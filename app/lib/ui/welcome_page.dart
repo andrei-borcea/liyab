@@ -54,7 +54,7 @@ class _WelcomePageState extends State<WelcomePage> {
           Text("Let's ignite your silicon.", style: muted, textAlign: TextAlign.center),
           const SizedBox(height: 36),
           point(Icons.lock_outline_rounded, 'Private by design',
-              'The model runs on this phone. What you write and what it answers never leave it.'),
+              'The model runs on this device. What you write and what it answers never leave it.'),
           point(Icons.download_rounded, 'Bring your own model',
               'Download open models from Hugging Face, or import a GGUF file. Large ones stream from storage.'),
           point(Icons.notifications_none_rounded, 'One permission',

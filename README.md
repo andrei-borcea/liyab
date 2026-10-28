@@ -61,6 +61,8 @@ Temperature, context length and OS activity affect throughput. The [measurement 
 keeps the configurations, alternating A/B runs, single-run caveats and per-phase timings.
 Stage-1 phone validation remains deferred; these figures come from earlier device runs.
 
+**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M reached **4.69–4.72 tok/s** with all 64 blocks resident after Metal SiLU FFN fusion. An earlier 13,000 MiB cap run reached **2.54 tok/s** with block streaming. Both used 16-token decode and a 512-token context; prompts differed. [Conditions, A/B runs and phase times](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
+
 <a id="charts"></a>
 
 ### Decode speed
@@ -220,7 +222,7 @@ including expert output scales folded into weights, checked against generated up
 
 | Feature | Behavior | Details |
 | :--- | :--- | :--- |
-| Models larger than RAM | Streaming starts above 80% of available memory or the configured budget | [Dense / MoE streaming](docs/guide/memory-and-serving.md#models-larger-than-ram) |
+| Models larger than RAM | Dense weights stream when the GGUF exceeds available memory or the app budget after a 1 GiB runtime reserve; the desktop scheduler checks the actual block layout before growing its cap | [Dense / MoE streaming](docs/guide/memory-and-serving.md#models-larger-than-ram) |
 | Expert cache | LFU eviction, next-block router prediction, overlapping I/O and compute | [Memory planning and estimates](docs/guide/memory-and-serving.md#models-larger-than-ram) |
 | Conversations | Reuse prior tokens; restore saved contexts and shared prefixes; keep recurrent snapshots | [Context and persistence](docs/guide/memory-and-serving.md#context-memory-and-serving) |
 | Concurrent sequences | Per-request contexts and adapters; shared decoding passes | [Scheduling and cancellation](docs/guide/memory-and-serving.md#context-memory-and-serving) |

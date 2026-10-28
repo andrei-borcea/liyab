@@ -657,6 +657,19 @@ public:
         int32_t requant_bits = 0;         // resident Q8_0 matrices converted at load (4 / 5); 0: none
     };
     [[nodiscard]] MemoryPlan memory_plan() const;
+    // Actual dense-weight placement after load. File bytes include GGUF
+    // metadata and non-block tensors; streamed_bytes counts block ranges read
+    // through the 3-slot pipeline. mmap_streaming is a paging hint and can be
+    // true even when no block pipeline was attached (e.g. split GGUF).
+    // Immutable after load and safe to read while generation runs.
+    struct WeightLayout {
+        uint64_t file_bytes = 0;
+        uint64_t streamed_bytes = 0;
+        int32_t streamed_blocks = 0;
+        int32_t total_blocks = 0;
+        bool mmap_streaming = false;
+    };
+    [[nodiscard]] WeightLayout weight_layout() const noexcept;
     // The context length in positions (EngineConfig::context_length, resolved when 0).
     [[nodiscard]] int32_t context_length() const noexcept;
 

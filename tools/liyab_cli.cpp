@@ -143,12 +143,12 @@ std::string json_string(std::string_view s) {
 
 // The human-readable summary of one generation, on stderr.
 void print_stats(const liyab_generation_stats& stats) {
-    std::fprintf(stderr,
-                 "\nprompt %d tok (%d reused) in %.1f ms (TTFT %.1f ms) | %d tok in %.1f ms = %.2f tok/s | paced idle "
-                 "%.1f ms%s\n",
+    std::fprintf(stderr, "\n=== Generation ===\n"
+                         "prompt: %d tokens (%d reused), %.1f ms, TTFT %.1f ms\n"
+                         "decode: %d tokens, %.1f ms, %.2f tok/s, pacing %.1f ms%s\n",
                  stats.prompt_tokens, stats.cached_prefix_tokens, stats.prefill_ms, stats.ttft_ms,
                  stats.generated_tokens, stats.decode_ms, stats.tokens_per_second, stats.paced_idle_ms,
-                 stats.cancelled ? " | cancelled" : "");
+                 stats.cancelled ? ", cancelled" : "");
     if (stats.draft_tokens_proposed > 0) {
         std::fprintf(stderr, "speculative: %d/%d draft tokens accepted (%.0f%%)\n", stats.draft_tokens_accepted,
                      stats.draft_tokens_proposed, 100.0 * stats.draft_tokens_accepted / stats.draft_tokens_proposed);
@@ -158,10 +158,10 @@ void print_stats(const liyab_generation_stats& stats) {
         std::fprintf(stderr, "early exits: %d steps, %d blocks skipped\n", stats.early_exits,
                      stats.early_exit_layers_skipped);
     }
-    std::fprintf(stderr, "KV cache: %.1f MiB in use | peak RSS %.0f MiB\n",
+    std::fprintf(stderr, "memory: KV %.1f MiB, peak RSS %.0f MiB\n",
                  static_cast<double>(stats.kv_cache_bytes) / (1024.0 * 1024.0), peak_rss_mib());
     if (stats.weight_stalls > 0) {
-        std::fprintf(stderr, "weight stalls: %d (%.1f ms waiting for storage)\n", stats.weight_stalls,
+        std::fprintf(stderr, "storage: %d weight stalls, %.1f ms waiting\n", stats.weight_stalls,
                      stats.weight_wait_ms);
     }
     if (stats.ffn_blocks_skipped > 0) {
@@ -196,7 +196,7 @@ void print_stats(const liyab_generation_stats& stats) {
                                  stats.shared_expert_ms, stats.dense_ffn_ms, stats.lm_head_ms};
         const char* names[] = {"attention", "recurrent", "router", "experts", "shared expert", "dense FFN", "LM head"};
         double timed = 0.0;
-        std::fprintf(stderr, "decode ms/token:");
+        std::fprintf(stderr, "decode phases (ms/token):");
         for (size_t i = 0; i < sizeof phases / sizeof phases[0]; ++i) {
             timed += phases[i];
             if (phases[i] > 0.0) std::fprintf(stderr, " %s %.1f |", names[i], phases[i] * per);
@@ -209,7 +209,8 @@ void print_stats(const liyab_generation_stats& stats) {
 
 // One generation as a JSON line on stdout (--json): the stats scripts compare
 // across builds, the peak memory so far and the reply.
-void print_json_turn(int turn, const liyab_generation_stats& s, const std::string& text) {
+void print_json_turn(int turn, const liyab_generation_stats& s, const liyab_engine_counters& c,
+                     const std::string& text) {
     std::printf(
         "{\"turn\":%d,\"prompt_tokens\":%d,\"cached_prefix_tokens\":%d,\"prefill_ms\":%.3f,\"ttft_ms\":%.3f,"
         "\"generated_tokens\":%d,\"forced_tokens\":%d,\"decode_ms\":%.3f,\"tokens_per_second\":%.3f,"
@@ -218,6 +219,7 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const std::strin
         "\"expert_stall_ms\":%.3f,\"draft_tokens_proposed\":%d,\"draft_tokens_accepted\":%d,"
         "\"phases_ms\":{\"attention\":%.3f,\"delta_net\":%.3f,\"router\":%.3f,"
         "\"experts\":%.3f,\"shared_expert\":%.3f,\"dense_ffn\":%.3f,\"lm_head\":%.3f},\"peak_rss_mib\":%.1f,"
+        "\"accelerator_busy_ms_total\":%.3f,\"storage_bytes_read_total\":%llu,"
         "\"text\":%s}\n",
         turn, s.prompt_tokens, s.cached_prefix_tokens, s.prefill_ms, s.ttft_ms, s.generated_tokens, s.forced_tokens,
         s.decode_ms, s.tokens_per_second, s.paced_idle_ms, s.thermal_reroutes, s.cancelled ? "true" : "false",
@@ -225,6 +227,7 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const std::strin
         static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.draft_tokens_proposed,
         s.draft_tokens_accepted, s.attention_ms, s.delta_net_ms,
         s.router_ms, s.experts_ms, s.shared_expert_ms, s.dense_ffn_ms, s.lm_head_ms, peak_rss_mib(),
+        c.accelerator_busy_ms, static_cast<unsigned long long>(c.storage_bytes_read),
         json_string(text).c_str());
     std::fflush(stdout);
 }
@@ -238,7 +241,7 @@ void usage() {
                  "  -n N               max new tokens (default 128), per turn\n"
                  "  --then TEXT        a follow-up turn (repeatable): its prompt is the previous prompt, the\n"
                  "                     reply to it and TEXT, so the engine reuses its context as in a chat\n"
-                 "  --json             stdout: one JSON line after loading (load_ms, context, memory plan)\n"
+                 "  --json             stdout: one JSON line after loading (load_ms, context, memory and weight plans)\n"
                  "                     and one per turn (stats, peak RSS, reply) instead of the text\n"
                  "                     phases_ms.delta_net counts every recurrent mixer (legacy key)\n"
                  "  --temp T           temperature, 0 = greedy (default 0.8)\n"
@@ -464,10 +467,16 @@ int main(int argc, char** argv) {
     if (json) {
         liyab_memory_plan plan{};
         liyab_engine_memory_plan(g_engine, &plan);
+        liyab_weight_layout weights{};
+        liyab_engine_weight_layout(g_engine, &weights);
         std::printf("{\"load_ms\":%.3f,\"context_length\":%d,\"expert_cache_bytes\":%llu,\"requant_bits\":%d,"
-                    "\"peak_rss_mib\":%.1f}\n",
+                    "\"weight_file_bytes\":%llu,\"streamed_weight_bytes\":%llu,\"streamed_blocks\":%d,"
+                    "\"total_blocks\":%d,\"peak_rss_mib\":%.1f}\n",
                     load_ms, liyab_engine_context_length(g_engine),
-                    static_cast<unsigned long long>(plan.expert_cache_bytes), plan.requant_bits, peak_rss_mib());
+                    static_cast<unsigned long long>(plan.expert_cache_bytes), plan.requant_bits,
+                    static_cast<unsigned long long>(weights.file_bytes),
+                    static_cast<unsigned long long>(weights.streamed_bytes), weights.streamed_blocks,
+                    weights.total_blocks, peak_rss_mib());
         std::fflush(stdout);
     }
 
@@ -488,7 +497,11 @@ int main(int argc, char** argv) {
             break;
         }
         print_stats(stats);
-        if (json) print_json_turn(static_cast<int>(turn) + 1, stats, reply.text);
+        if (json) {
+            liyab_engine_counters counters{};
+            liyab_engine_get_counters(g_engine, &counters);
+            print_json_turn(static_cast<int>(turn) + 1, stats, counters, reply.text);
+        }
         if (stats.cancelled) break;
         if (turn < follow_ups.size()) turn_prompt += reply.text + follow_ups[turn];
     }

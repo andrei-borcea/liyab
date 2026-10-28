@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../state/app_state.dart';
 import '../ui/app_drawer.dart';
+import '../ui/liyab_mark.dart';
 import '../ui/ember_edge.dart';
 import '../ui/living_flame.dart';
 import '../ui/waking_up.dart';
@@ -12,8 +13,10 @@ import '../ui/theme.dart';
 import 'model_sheet.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.app, this.onCollapse});
+  const ChatScreen({super.key, required this.app, this.onCollapse, this.embedded = false, this.onModels});
   final AppState app;
+  final bool embedded;
+  final VoidCallback? onModels;
 
   /// Set when the chat fills the assistant sheet: shrinks it back to the sheet.
   final VoidCallback? onCollapse;
@@ -85,17 +88,18 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      drawer: AppDrawer(app: app),
+      drawer: widget.embedded ? null : AppDrawer(app: app),
       appBar: AppBar(
-        titleSpacing: 0,
+        automaticallyImplyLeading: !widget.embedded,
+        titleSpacing: 24,
         title: InkWell(
           borderRadius: BorderRadius.circular(12),
-          onTap: () => showModelSheet(context, app),
+          onTap: widget.onModels ?? () => showModelSheet(context, app),
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
             child: Row(
               children: [
-                LivingFlame(size: 34, state: _flameState, heat: _heat),
+                const LiyabMark(size: 30),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -103,7 +107,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     children: [
                       Text('Liyab', style: theme.textTheme.titleLarge),
                       Text(
-                        app.loading ? app.status : (app.modelName.isEmpty ? 'Choose a model' : app.modelName),
+                        app.loading ? app.status : (app.modelName.isEmpty ? 'Open your model library' : app.modelName),
                         style: theme.textTheme.labelSmall,
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -130,7 +134,9 @@ class _ChatScreenState extends State<ChatScreen> {
           const SizedBox(width: 4),
         ],
       ),
-      body: Column(
+      body: Center(child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 960),
+        child: Column(
         children: [
           Expanded(
             child: Stack(
@@ -139,7 +145,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: AnimatedSwitcher(
                     duration: const Duration(milliseconds: 350),
                     child: app.messages.isEmpty
-                        ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
+                        ? _EmptyChat(app: app, onModels: widget.onModels, onSuggestion: _send, flameState: _flameState, heat: _heat)
                         : ListView.builder(
                             key: const ValueKey('messages'),
                             controller: _scroll,
@@ -181,13 +187,14 @@ class _ChatScreenState extends State<ChatScreen> {
             heat: _heat,
           ),
         ],
-      ),
+      ))),
     );
   }
 }
 
 class _EmptyChat extends StatelessWidget {
-  const _EmptyChat({required this.app, required this.onSuggestion, required this.flameState, required this.heat});
+  const _EmptyChat({required this.app, required this.onSuggestion, required this.flameState, required this.heat, this.onModels});
+  final VoidCallback? onModels;
   final AppState app;
   final void Function(String) onSuggestion;
   final FlameState flameState;
@@ -210,16 +217,36 @@ class _EmptyChat extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            LivingFlame(size: 168, state: app.loading ? FlameState.thinking : flameState, heat: heat),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(28),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: theme.colorScheme.outline),
+                gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
+                  colors: [Palette.ember.withValues(alpha: 0.14), Palette.kilnRaised, Palette.kiln]),
+              ),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const LiyabMark(size: 64),
+                const SizedBox(height: 24),
+                Text('A little space to think.', style: theme.textTheme.headlineMedium?.copyWith(fontSize: 36)),
+                const SizedBox(height: 8),
+                Text('Your models. On your machine.', style: theme.textTheme.bodyLarge?.copyWith(color: Palette.smoke)),
+                const SizedBox(height: 24),
+                Row(children: [Icon(Icons.lock_outline, size: 14, color: Palette.ember),
+                  const SizedBox(width: 6), Text('LOCAL INFERENCE', style: theme.textTheme.labelSmall?.copyWith(letterSpacing: 1.4))]),
+              ]),
+            ),
+            const SizedBox(height: 28),
             const SizedBox(height: 8),
             Text(
-              ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'Choose a model to begin'),
+              ready ? 'What are we working on?' : (app.loading ? 'Waking up' : 'Choose a model to begin'),
               style: theme.textTheme.headlineMedium,
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 6),
             Text(
-              ready ? 'Runs on this phone. Nothing you write leaves it.' : app.status,
+              ready ? 'Ask a question, write something, or work through an idea.' : app.status,
               style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
               textAlign: TextAlign.center,
             ),
@@ -242,9 +269,9 @@ class _EmptyChat extends StatelessWidget {
               )
             else if (!app.loading)
               FilledButton.icon(
-                onPressed: () => showModelSheet(context, app),
+                onPressed: onModels ?? () => showModelSheet(context, app),
                 icon: const Icon(Icons.folder_open_rounded),
-                label: const Text('Choose a model'),
+                label: const Text('Open your model library'),
               ),
           ],
         ),
@@ -489,6 +516,10 @@ class _Composer extends StatelessWidget {
                   decoration: InputDecoration(
                     hintText: enabled ? 'Ask Liyab' : 'Load a model first',
                     border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
+                    disabledBorder: InputBorder.none,
+                    filled: false,
                     isDense: true,
                     contentPadding: const EdgeInsets.symmetric(vertical: 12),
                   ),

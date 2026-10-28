@@ -109,6 +109,13 @@ class MemoryPlan {
   bool get tight => expertBytes > 0 && expertCacheBytes < expertBytes * 0.10;
 }
 
+/// Dense GGUF placement reported by the engine after load.
+class WeightLayout {
+  const WeightLayout(this.fileBytes, this.streamedBytes, this.streamedBlocks, this.totalBlocks, this.mmapStreaming);
+  final int fileBytes, streamedBytes, streamedBlocks, totalBlocks;
+  final bool mmapStreaming;
+}
+
 /// What the engine reported about a loaded model.
 class LoadedModel {
   const LoadedModel(
@@ -116,6 +123,7 @@ class LoadedModel {
       required this.loadSeconds,
       required this.metadata,
       required this.memory,
+      required this.weights,
       required this.contextLength,
       this.pooling = LiyabPooling.none,
       this.embeddingSize = 0,
@@ -125,6 +133,7 @@ class LoadedModel {
   final String description;
   final double loadSeconds;
   final MemoryPlan memory;
+  final WeightLayout weights;
 
   /// The context length the engine chose (LoadOptions.contextLength 0: automatic).
   final int contextLength;
@@ -253,6 +262,13 @@ class EngineException implements Exception {
 }
 
 /// Cumulative engine counters (see liyab_engine_counters).
+class ResourceSnapshot {
+  const ResourceSnapshot(this.availableBytes, this.totalBytes, this.cpuFraction, this.thermalPressure, this.slowdown, this.throttled);
+  final int availableBytes, totalBytes;
+  final double cpuFraction, thermalPressure, slowdown;
+  final bool throttled;
+}
+
 class EngineCounters {
   const EngineCounters(this.acceleratorBusyMs, this.storageBytesRead, this.tokensGenerated);
   final double acceleratorBusyMs;
@@ -579,11 +595,14 @@ class EngineService {
     _engine = r[0] as int;
     await _openLanes(o.lanes, o.laneIdleClose);
     final plan = r[4] as List<Object?>;
+    final layout = r[10] as List<Object?>;
     return LoadedModel(
         description: r[1] as String,
         loadSeconds: r[2] as double,
         metadata: Map<String, String>.from(r[3] as Map),
         memory: MemoryPlan(plan[0] as int, plan[1] as int, plan[2] as int, plan[3] as int, plan[4] as int),
+        weights: WeightLayout(layout[0] as int, layout[1] as int, layout[2] as int,
+          layout[3] as int, layout[4] as bool),
         contextLength: r[5] as int,
         pooling: r[6] as int,
         embeddingSize: r[7] as int,
@@ -759,6 +778,17 @@ class EngineService {
   }
 
   /// Live counters, read directly (thread-safe in the C API); null without a model.
+  /// Policy/memory sample; the caller serializes this with load and unload.
+  ResourceSnapshot resourceSnapshot() {
+    final out = calloc<LiyabResourceSnapshot>();
+    try {
+      final status = LiyabLib.instance.getResourceSnapshot(Pointer<Void>.fromAddress(_engine), out);
+      if (status != LiyabStatus.ok) throw EngineException('Could not read resource policy');
+      return ResourceSnapshot(out.ref.availableBytes, out.ref.totalBytes, out.ref.cpuFraction,
+        out.ref.thermalPressure, out.ref.slowdown, out.ref.throttled != 0);
+    } finally { calloc.free(out); }
+  }
+
   EngineCounters? counters() {
     if (_engine == 0) return null;
     final out = calloc<LiyabEngineCounters>();
@@ -852,6 +882,8 @@ void _worker(SendPort replies) {
             }
             final plan = arena<LiyabMemoryPlan>();
             lib.memoryPlan(engine, plan);
+            final weights = arena<LiyabWeightLayout>();
+            if (lib.weightLayout(engine, weights) != LiyabStatus.ok) return fail('could not read weight layout');
             replies.send([
               'ok',
               id,
@@ -866,6 +898,8 @@ void _worker(SendPort replies) {
                 lib.embeddingSize(engine),
                 loadedAdapters,
                 adapterErrors,
+                [weights.ref.fileBytes, weights.ref.streamedBytes, weights.ref.streamedBlocks,
+                  weights.ref.totalBlocks, weights.ref.mmapStreaming != 0],
               ]
             ]);
           });

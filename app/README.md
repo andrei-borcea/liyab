@@ -8,6 +8,14 @@ See the [project README](../README.md#the-liyab-app) for app behavior, the [mode
 
 The app replays previous replies exactly to preserve the engine's context. It uses the model's author template when each new prompt continues the preceding prompt and reply. Recognized ChatML and Llama 3 vocabulary fallbacks preserve existing Qwen and Llama conversations. Zephyr is the legacy fallback only when a model has no author template.
 
+On desktop, Liyab samples free RAM every five seconds. It raises the memory cap only while weights stream or the
+expert cache can grow. Under sustained pressure, it reloads at a cap that frees weight memory. Liyab saves the
+active chat and context before reloading. You can set a fixed cap in Settings.
+
+In Activity, you see device, model, memory and execution logs. Generation logs separate prompt and decode speed,
+then report phase time in **ms/token**. CLI `--json` includes weight layout, cumulative GPU busy time and storage
+bytes read.
+
 A present incompatible template without a recognized fallback disables chat with an explicit error. The model stays loaded for raw-completion API requests or pooling. In particular, engine/CLI Harmony rendering does not yet establish Flutter Harmony replay support. Embedding models and rerankers use their pooling APIs and do not need a chat format.
 
 ## Build

@@ -22,6 +22,8 @@ import '../engine/engine_service.dart';
 import '../engine/liyab_ffi.dart';
 import '../models/downloads.dart';
 import 'device_monitor.dart';
+import 'chat_store.dart';
+import 'resource_scheduler.dart';
 import 'models_store.dart';
 import 'settings.dart';
 import 'typing_ahead.dart';
@@ -269,6 +271,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   @override
   void dispose() {
+    _resourceTimer?.cancel();
     _lifecycle.dispose();
     _parkRetry?.cancel();
     _releaseTimer?.cancel();
@@ -293,6 +296,82 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   final EngineService engine;
   final SharedPreferences prefs;
+  late final ChatStore chats;
+  String? activeChatId;
+  bool switchingChat = false;
+  Future<void> _chatWrites = Future.value();
+  final resourceBudget = ResourceBudget();
+  ResourceEvent? resourceEvent;
+  ResourceSnapshot? resources;
+  Timer? _resourceTimer;
+  int? _pendingBudget;
+  bool _checkingResources = false;
+  double _notifiedCpu = 1, _notifiedSlowdown = 1;
+  DateTime? _lastThermalNotice;
+
+  void _resourceNotice(String message, {bool degraded = true}) {
+    resourceEvent = ResourceEvent(message, degraded: degraded);
+    _log('Scheduler: $message');
+    notifyListeners();
+  }
+
+  Future<void> _checkResources() async {
+    if (_checkingResources || loading || moving != null || switchingChat || !engine.loaded) return;
+    _checkingResources = true;
+    try {
+      final sample = resources = engine.resourceSnapshot();
+      final now = DateTime.now();
+      if ((sample.cpuFraction - _notifiedCpu).abs() >= 0.10 ||
+          (sample.slowdown - _notifiedSlowdown).abs() >= 0.20) {
+        if (_lastThermalNotice == null || now.difference(_lastThermalNotice!) >= const Duration(seconds: 60)) {
+          _resourceNotice('Thermal policy: CPU share ${(_notifiedCpu * 100).round()}% → ${(sample.cpuFraction * 100).round()}%, '
+            'pacing ${_notifiedSlowdown.toStringAsFixed(1)}× → ${sample.slowdown.toStringAsFixed(1)}×. '
+            '${sample.thermalPressure > 0 ? 'Heat pressure ${(sample.thermalPressure * 100).round()}%.' : 'Thermal headroom recovered.'}',
+            degraded: sample.cpuFraction < _notifiedCpu || sample.slowdown > _notifiedSlowdown);
+          _notifiedCpu = sample.cpuFraction;
+          _notifiedSlowdown = sample.slowdown;
+          _lastThermalNotice = now;
+        }
+      }
+      if (!Platform.isAndroid && device.memoryBudgetMb == 0) {
+        // Re-evaluate a pending proposal as memory recovers; never act on an
+        // old low-memory sample after a long-running reply finishes.
+        _pendingBudget = resourceBudget.sample(sample.availableBytes, sample.totalBytes, now);
+        if (_pendingBudget != null && !_busy) {
+          final before = resourceBudget.currentMb;
+          final proposal = _pendingBudget!;
+          _pendingBudget = null;
+          final path = modelPath;
+          if (path != null) {
+            final next = resourceBudget.forLayout(proposal, fileBytes: weights.fileBytes,
+              blockStreaming: weights.streamedBlocks > 0, mmapStreaming: weights.mmapStreaming,
+              expertBytes: memory.expertBytes,
+              expertRoom: memory.expertBytes > memory.expertCacheBytes,
+              totalBytes: sample.totalBytes);
+            if (next == null) return;
+            await load(path, keepChat: true, budgetOverrideMb: next);
+            if (engine.loaded && modelPath == path && !status.startsWith('Failed')) {
+              resourceBudget.applied(next, now);
+              _resourceNotice('Model memory budget ${(before / 1024).toStringAsFixed(1)} → ${(next / 1024).toStringAsFixed(1)} GiB. '
+                '${next < before ? 'Sustained memory pressure' : 'Memory headroom recovered'} '
+                '(${(sample.availableBytes / (1 << 30)).toStringAsFixed(1)} GiB available). '
+                '${weights.streamedBlocks}/${weights.totalBlocks} blocks stream from storage; conversation kept.',
+                degraded: next < before);
+            } else {
+              _log('Budget change failed; restoring the previous model layout');
+              await load(path, keepChat: true, budgetOverrideMb: before);
+              resourceBudget.defer(now);
+              if (!engine.loaded) _resourceNotice('Model reload failed; open the model again to continue.');
+            }
+          }
+        }
+      }
+    } catch (error) {
+      resourceBudget.defer(DateTime.now());
+      _log('Resource adjustment: $error');
+    }
+    finally { _checkingResources = false; }
+  }
   final DeviceSettings device;
   final Downloads downloads;
   final Toolbox toolbox;
@@ -304,6 +383,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   String status = 'No model loaded';
   bool loading = false;
+  bool _reloadingWithContext = false;
   bool generating = false;
   String? modelPath;
   @override
@@ -322,6 +402,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// How the loaded model uses memory (expert streaming); zero for models that fit.
   MemoryPlan memory = const MemoryPlan(0, 0, 0, 0, 0);
+  WeightLayout weights = const WeightLayout(0, 0, 0, 0, false);
   final List<ChatMessage> messages = [];
 
   /// Name of the model being moved into app storage, if any.
@@ -346,6 +427,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
       ..logBufferEnable(256 * 1024);
     final state = AppState._(
         await EngineService.start(), await SharedPreferences.getInstance(), await Downloads.start());
+    state.chats = await ChatStore.open();
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      state._resourceTimer = Timer.periodic(const Duration(seconds: 5), (_) => unawaited(state._checkResources()));
+    }
     // An API request whose lane could not get a sequence (the expert cache could not spare its memory) runs on the
     // main lane: the engine's context is then not the chat's.
     state.engine.onLaneFallback = (lane, why) {
@@ -516,6 +601,8 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   Future<void> unload() async {
     if (loading || generating) return;
+    await _saveConversation();
+    activeChatId = null;
     _released = null;
     await engine.unload();
     _log('Unloaded $modelName');
@@ -532,34 +619,49 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// Loads `path`; `keepChat` keeps the conversation (a reload after an idle
   /// release). While a load runs, returns that load.
-  Future<void> load(String path, {bool keepChat = false}) {
+  Future<void> load(String path, {bool keepChat = false, int? budgetOverrideMb}) {
     if (loading) return _pendingLoad ?? Future.value();
-    return _pendingLoad = _load(path, keepChat: keepChat);
+    return _pendingLoad = _load(path, keepChat: keepChat, budgetOverrideMb: budgetOverrideMb);
   }
 
   Future<void>? _pendingLoad;
 
-  Future<void> _load(String path, {required bool keepChat}) async {
+  Future<void> _load(String path, {required bool keepChat, int? budgetOverrideMb}) async {
     _released = null;
     final name = File(path).uri.pathSegments.last;
+    _reloadingWithContext = keepChat && engine.loaded && modelPath == path;
     loading = true;
     status = 'Loading $name…';
-    if (!keepChat) {
-      messages.clear();
-      _historyStart = 0;
-    }
     notifyListeners();
     try {
+      // Set loading before saving: a new user turn must not race the context
+      // snapshot that will be restored after the engine is replaced.
+      if (_reloadingWithContext) await _saveConversation(withContext: true);
+      if (!keepChat) {
+        await _saveConversation();
+        activeChatId = null;
+        messages.clear();
+        _historyStart = 0;
+      }
       final gpu = device.useGpu;
+      var budgetMb = budgetOverrideMb ?? device.memoryBudgetMb;
+      if (!Platform.isAndroid && !Platform.isIOS && budgetMb == 0) {
+        if (resourceBudget.currentMb == 0) {
+          final sample = engine.resourceSnapshot();
+          resourceBudget.initial(sample.availableBytes, sample.totalBytes);
+        }
+        budgetMb = resourceBudget.currentMb;
+      }
       _prepared = null;
       final experimental = device.experimental;
       await _removeRetiredKvDedup();
       final model = await engine.load(LoadOptions(
         modelPath: path,
-        backend: gpu ? LiyabBackend.vulkan : LiyabBackend.cpu,
+        backend: device.executionBackend == 'auto' ? LiyabBackend.auto : !gpu ? LiyabBackend.cpu : Platform.isMacOS || Platform.isIOS
+            ? LiyabBackend.metal : Platform.isAndroid ? LiyabBackend.vulkan : LiyabBackend.auto,
         contextLength: ModelSettings.contextFor(prefs, name),
         skinThresholdC: device.thermalLimitC,
-        memoryBudgetMb: device.memoryBudgetMb,
+        memoryBudgetMb: budgetMb,
         powerProfile: device.powerProfile,
         // A context another conversation replaces (other apps through the local API, a chat left for a new one)
         // goes to storage, not RAM: it comes back in a fraction of a second when its conversation goes on, instead
@@ -604,6 +706,7 @@ class AppState extends ChangeNotifier implements ApiBackend {
       description = model.description;
       device.lastModel = path;
       memory = model.memory;
+      weights = model.weights;
       contextLength = model.contextLength;
       pooling = model.pooling;
       status = '$name · ${gpu ? 'GPU' : 'CPU'} · ready in ${model.loadSeconds.toStringAsFixed(1)} s';
@@ -616,11 +719,15 @@ class AppState extends ChangeNotifier implements ApiBackend {
       if (model.memory.requantBits > 0) {
         _log('Resident weights converted to ${model.memory.requantBits} bits to make room (memory was tight)');
       }
-      _log('Loaded $name in ${model.loadSeconds.toStringAsFixed(2)} s (${_template?.label ?? 'chat unavailable'}, tools: ${toolDialect.name})');
+      final loadSummary = '=== Model loaded in ${model.loadSeconds.toStringAsFixed(2)} s ===\n'
+          'Memory: ${(model.weights.fileBytes / (1 << 30)).toStringAsFixed(2)} GiB GGUF, '
+          '${model.weights.streamedBlocks}/${model.weights.totalBlocks} blocks streamed '
+          '(${(model.weights.streamedBytes / (1 << 30)).toStringAsFixed(2)} GiB/pass), '
+          'budget ${(budgetMb / 1024).toStringAsFixed(1)} GiB\n'
+          'Chat: ${_template?.label ?? 'unavailable'}, tools: ${toolDialect.name}\n'
+          '${description.trimRight()}';
+      _log(loadSummary);
       if (experimental.active.isNotEmpty) _log('Experimental: ${experimental.active.join(', ')}');
-      for (final line in description.split('\n')) {
-        _log('  $line');
-      }
       // A pooling model (embeddings, reranking) has no conversation to prepare or restore.
       _preparing = pooling != LiyabPooling.none || _template == null
           ? null
@@ -630,10 +737,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
       if (_template == null && pooling == LiyabPooling.none) status += ' · chat format unsupported';
       unawaited(_loadExpertProfile());
       if (!keepChat) _discardConversation();
-    } on EngineException catch (e) {
+    } on Object catch (e) {
       status = 'Failed to load $name: $e';
       _log('ERROR: $e');
     } finally {
+      _reloadingWithContext = false;
       loading = false;
       notifyListeners();
     }
@@ -713,10 +821,11 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<void>? _preparing;
 
   /// Where this model's conversation is kept: the engine's context and the messages.
-  Future<(String, String)> _conversationFiles() async {
+  Future<(String, String)> _conversationFiles([String? ownerModel]) async {
     final dir = Directory('${(await getApplicationSupportDirectory()).path}/states');
     if (!dir.existsSync()) dir.createSync(recursive: true);
-    return ('${dir.path}/$modelName.conversation.state', '${dir.path}/$modelName.conversation.json');
+    final name = ownerModel ?? modelName;
+    return ('${dir.path}/$name.conversation.state', '${dir.path}/$name.conversation.json');
   }
 
   /// Saves the conversation (removes it when there is none): the messages,
@@ -727,18 +836,38 @@ class AppState extends ChangeNotifier implements ApiBackend {
   /// older than the messages is still a prefix of the next prompt, so it only
   /// saves less work. Between generations only.
   Future<void> _saveConversation({bool withContext = false}) async {
-    final (state, chat) = await _conversationFiles();
-    if (messages.isEmpty) return _discardConversation();
-    await File(chat).writeAsString(
-        jsonEncode({'start': _historyStart, 'messages': [for (final m in messages) m.toJson()]}));
-    if (!withContext) return;
+    String? ownerId;
+    String? ownerModel;
+    if (messages.isNotEmpty && modelPath != null) {
+      final id = activeChatId ??= ChatStore.newId();
+      final path = modelPath!;
+      final name = modelName;
+      ownerId = id;
+      ownerModel = name;
+      final snapshot = [for (final message in messages) message.toJson()];
+      final start = _historyStart;
+      // Capture ownership before yielding: New chat may run before SQLite's
+      // worker finishes the preceding reply's save.
+      _chatWrites = _chatWrites.catchError((Object error) { _log('Chat archive: $error'); }).then((_) =>
+        chats.save(id: id, modelPath: path, modelName: name, messages: snapshot, historyStart: start));
+      await _chatWrites;
+      if (activeChatId == id) await prefs.setString('activeChat', id);
+    }
+    if (!withContext || messages.isEmpty) return;
+    if (ownerId == null || ownerModel == null || activeChatId != ownerId || modelName != ownerModel) return;
+    final (state, _) = await _conversationFiles(ownerModel);
     try {
       if (_chatContext) {
         await engine.saveState(state); // checked as the save is queued: nothing can come in between
       } else {
         // Another app's request replaced it: the copy the prefix cache set aside, written as kept. Without it a
         // restart would bring the chat back from an older save and process its last turns again.
-        await engine.saveState(state, continuing: await _turnHead());
+        final head = await _turnHead();
+        if (activeChatId != ownerId || modelName != ownerModel) return;
+        await engine.saveState(state, continuing: head);
+      }
+      if (activeChatId == ownerId && modelName == ownerModel) {
+        await prefs.setString('contextChat.$ownerModel', ownerId);
       }
     } on EngineException catch (e) {
       _log('Conversation context not saved: $e');
@@ -758,6 +887,19 @@ class AppState extends ChangeNotifier implements ApiBackend {
   Future<void> _restoreConversation() async {
     if (_template == null) return;
     final (state, chat) = await _conversationFiles();
+    if (messages.isEmpty) {
+      final selected = prefs.getString('activeChat');
+      if (selected == '') { await prepareSystemPrompt(); return; }
+      final saved = selected == null ? null : await chats.get(selected);
+      final matching = saved?.modelPath == modelPath ? saved :
+        (await chats.list(modelPath: modelPath)).firstOrNull;
+      if (matching != null) {
+        activeChatId = matching.id;
+        messages.addAll(matching.messages.map(ChatMessage.fromJson));
+        _historyStart = matching.historyStart;
+        notifyListeners();
+      }
+    }
     if (messages.isEmpty && File(chat).existsSync()) {
       try {
         final saved = jsonDecode(await File(chat).readAsString());
@@ -765,12 +907,14 @@ class AppState extends ChangeNotifier implements ApiBackend {
         final list = saved is Map ? saved['messages'] as List<Object?> : saved as List<Object?>;
         messages.addAll([for (final o in list) ChatMessage.fromJson(o as Map<String, Object?>)]);
         _historyStart = saved is Map ? (saved['start'] as num? ?? 0).toInt() : 0;
+        await _saveConversation();
+        await File(chat).rename('$chat.migrated');
         notifyListeners();
       } on Object catch (e) {
         _log('Saved conversation not readable ($e)');
       }
     }
-    if (messages.isNotEmpty && File(state).existsSync()) {
+    if (messages.isNotEmpty && File(state).existsSync() && prefs.getString('contextChat.$modelName') == activeChatId) {
       final watch = Stopwatch()..start();
       try {
         _chatContext = true;
@@ -1023,7 +1167,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
   }
 
   Future<void> send(String text) async {
-    if (generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
+    // A budget relayout saves the existing context before replacing the
+    // engine. Keep a new turn out of that snapshot, then enqueue it normally.
+    if (_reloadingWithContext) await _pendingLoad;
+    if (switchingChat || generating || text.trim().isEmpty || (!engine.loaded && _released == null && !loading)) return;
     final asked = Stopwatch()..start(); // the first token's latency (see _firstTokenBudgetMs)
     generating = true;
     _warmIfCold();
@@ -1162,16 +1309,18 @@ class AppState extends ChangeNotifier implements ApiBackend {
           if (latency != null && firstMs != null) _checkLatency(stats, firstMs, latency.$2);
           // One line per generation (a reply with tool calls has several), so the time of each step shows.
           final fresh = stats.promptTokens - stats.cachedPrefixTokens;
-          _log('Step ${message.steps.length + 1}: $fresh new prompt tokens (${stats.cachedPrefixTokens} reused), '
+          _log('perf: step ${message.steps.length + 1} | prompt $fresh new, ${stats.cachedPrefixTokens} reused | '
               'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s'
               '${firstMs != null && latency != null ? ' (${(firstMs / 1000).toStringAsFixed(2)} s after sending)' : ''}, '
-              '${stats.generatedTokens} tokens at '
+              'decode ${stats.generatedTokens} tokens at '
               '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s${_thinking == Thinking.on ? ', thinking' : ''}'
               '${stats.thermalReroutes > 0 ? ', ${stats.thermalReroutes} throttled steps' : ''}${stepCost(stats)}');
           if (stats.generatedTokens >= 16) {
-            final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5).map((e) => '${e.key} ${e.value.toStringAsFixed(1)}');
+            final phases = stats.phasesMs.entries.where((e) => e.value >= 0.5)
+                .map((e) => '${e.key == 'delta_net' ? 'recurrent' : e.key} ${(e.value / stats.generatedTokens).toStringAsFixed(1)}');
             final total = 1000 / (stats.tokensPerSecond > 0 ? stats.tokensPerSecond : 1);
-            _log('  decode ms/token: ${phases.join(' | ')} | total ${total.toStringAsFixed(0)}'
+            final timed = stats.phasesMs.values.fold<double>(0, (sum, value) => sum + value) / stats.generatedTokens;
+            _log('timing: ms/token | ${phases.join(' | ')} | other ${(total - timed).clamp(0, double.infinity).toStringAsFixed(1)} | total ${total.toStringAsFixed(1)}'
                 '${stats.expertHitRate > 0 ? '; experts ${(stats.expertHitRate * 100).round()}% cached, '
                     '${(stats.expertStallMs / stats.generatedTokens).toStringAsFixed(1)} ms/token waiting' : ''}');
           }
@@ -1232,6 +1381,23 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _toolsSettle = Timer(const Duration(seconds: 2), prepareSystemPrompt);
   }
 
+  /// Explicit desktop Quit: stop new API work and persist the current chat
+  /// after the in-flight reply finishes cancellation.
+  Future<void> prepareToQuit() async {
+    _resourceTimer?.cancel();
+    stop();
+    await _stopApi();
+    await _pendingLoad;
+    if (generating) {
+      final done = Completer<void>();
+      void settled() { if (!generating && !done.isCompleted) done.complete(); }
+      addListener(settled);
+      try { await done.future.timeout(const Duration(seconds: 30)); }
+      finally { removeListener(settled); }
+    }
+    await _saveConversation();
+  }
+
   void stop() => engine.cancel();
 
   /// Saves the power profile and applies it to the loaded model at once.
@@ -1243,7 +1409,10 @@ class AppState extends ChangeNotifier implements ApiBackend {
 
   /// Starts a new conversation (the engine keeps the system prompt's context).
   void newChat() {
-    if (generating) return;
+    if (generating || loading || switchingChat) return;
+    unawaited(_saveConversation());
+    activeChatId = null;
+    unawaited(prefs.setString('activeChat', ''));
     messages.clear();
     _drafted = '';
     _historyStart = 0;
@@ -1255,6 +1424,43 @@ class AppState extends ChangeNotifier implements ApiBackend {
     _prepared = null;
     _preparing = prepareSystemPrompt();
     notifyListeners();
+  }
+
+  /// Switch only between turns. Preserve the outgoing chat before changing
+  /// its model or replay history. The next prompt rebuilds the selected chat
+  /// through the engine's prefix cache, rather than borrowing another chat's KV.
+  Future<void> openChat(SavedChat entry) async {
+    if (generating || loading || switchingChat) return;
+    switchingChat = true;
+    notifyListeners();
+    try {
+      final chat = await chats.get(entry.id);
+      if (chat == null) throw const FormatException('This chat no longer exists.');
+      if (!await File(chat.modelPath).exists()) throw const FileSystemException('The model file is missing. Open it in Models first.');
+      await _saveConversation();
+      if (modelPath != chat.modelPath) {
+        await load(chat.modelPath);
+        if (modelPath != chat.modelPath) throw EngineException(status);
+      }
+      activeChatId = chat.id;
+      await prefs.setString('activeChat', chat.id);
+      messages..clear()..addAll(chat.messages.map(ChatMessage.fromJson));
+      _historyStart = chat.historyStart;
+      _typingAhead.cancel();
+      _draftNext = null;
+      _drafted = '';
+      _prepared = null;
+      _preparing = prepareSystemPrompt();
+    } finally {
+      switchingChat = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> deleteChat(String id) async {
+    await _chatWrites;
+    await chats.delete(id);
+    if (prefs.getString('activeChat') == id) await prefs.remove('activeChat');
   }
 
   Future<void> saveSettings() async {

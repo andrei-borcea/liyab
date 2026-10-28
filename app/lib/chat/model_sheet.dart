@@ -1,4 +1,4 @@
-// Choose and load a model stored on the phone; switch between CPU and GPU.
+// Choose and load a model stored on the device; switch between CPU and GPU.
 import 'package:flutter/material.dart';
 
 import '../models/models_page.dart';
@@ -41,9 +41,9 @@ class _ModelSheetState extends State<_ModelSheet> {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Run on the GPU'),
-            subtitle: const Text('Vulkan. The CPU is usually faster for mixture-of-experts models.'),
+            subtitle: const Text('Use the available GPU backend. The CPU can be faster for mixture-of-experts models.'),
             value: app.device.useGpu,
-            onChanged: app.loading
+            onChanged: app.loading || app.generating
                 ? null
                 : (v) {
                     app.device.useGpu = v;
@@ -60,7 +60,7 @@ class _ModelSheetState extends State<_ModelSheet> {
               if (models.isEmpty) {
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 16),
-                  child: Text('No models on this phone yet.', style: theme.textTheme.bodyMedium),
+                  child: Text('No models on this device yet.', style: theme.textTheme.bodyMedium),
                 );
               }
               return Column(children: [
@@ -88,10 +88,10 @@ class _ModelSheetState extends State<_ModelSheet> {
                                     ? null
                                     : () async {
                                         await app.moveToAppStorage(m);
-                                        if (mounted) setState(() => _models = app.localModels());
+                                        if (mounted) setState(() { _models = app.localModels(); });
                                       },
                               ),
-                    onTap: app.loading || app.moving == m.name
+                    onTap: app.loading || app.generating || app.moving == m.name
                         ? null
                         : () {
                             Navigator.pop(context);
