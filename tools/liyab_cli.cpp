@@ -178,6 +178,12 @@ void print_stats(const liyab_generation_stats& stats) {
                          std::max(1, stats.prompt_tokens + stats.generated_tokens),
                      stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
     }
+    if (stats.expert_page_cache_loads > 0) {
+        std::fprintf(stderr, "experts: %d loads copied from the page cache (%.1f per token)\n",
+                     stats.expert_page_cache_loads,
+                     static_cast<double>(stats.expert_page_cache_loads) /
+                         std::max(1, stats.prompt_tokens + stats.generated_tokens));
+    }
     if (stats.expert_predicted > 0) {
         std::fprintf(stderr,
                      "experts: prediction precision %.0f%% (%d of %d guesses chosen); wrong guesses: %d dropped "
@@ -216,7 +222,7 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const liyab_engi
         "\"generated_tokens\":%d,\"forced_tokens\":%d,\"decode_ms\":%.3f,\"tokens_per_second\":%.3f,"
         "\"paced_idle_ms\":%.3f,\"thermal_reroutes\":%d,\"cancelled\":%s,\"kv_cache_bytes\":%llu,"
         "\"expert_hits\":%d,\"expert_late\":%d,\"expert_misses\":%d,\"expert_bytes_read\":%llu,"
-        "\"expert_stall_ms\":%.3f,\"draft_tokens_proposed\":%d,\"draft_tokens_accepted\":%d,"
+        "\"expert_stall_ms\":%.3f,\"expert_page_cache_loads\":%d,\"draft_tokens_proposed\":%d,\"draft_tokens_accepted\":%d,"
         "\"phases_ms\":{\"attention\":%.3f,\"delta_net\":%.3f,\"router\":%.3f,"
         "\"experts\":%.3f,\"shared_expert\":%.3f,\"dense_ffn\":%.3f,\"lm_head\":%.3f},\"peak_rss_mib\":%.1f,"
         "\"accelerator_busy_ms_total\":%.3f,\"storage_bytes_read_total\":%llu,"
@@ -224,7 +230,8 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const liyab_engi
         turn, s.prompt_tokens, s.cached_prefix_tokens, s.prefill_ms, s.ttft_ms, s.generated_tokens, s.forced_tokens,
         s.decode_ms, s.tokens_per_second, s.paced_idle_ms, s.thermal_reroutes, s.cancelled ? "true" : "false",
         static_cast<unsigned long long>(s.kv_cache_bytes), s.expert_hits, s.expert_late, s.expert_misses,
-        static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.draft_tokens_proposed,
+        static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.expert_page_cache_loads,
+        s.draft_tokens_proposed,
         s.draft_tokens_accepted, s.attention_ms, s.delta_net_ms,
         s.router_ms, s.experts_ms, s.shared_expert_ms, s.dense_ffn_ms, s.lm_head_ms, peak_rss_mib(),
         c.accelerator_busy_ms, static_cast<unsigned long long>(c.storage_bytes_read),
@@ -304,7 +311,9 @@ void usage() {
                  "  --i8mm-tiles       Q4_K/Q5_K/Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles\n"
                  "                     (same bits; slower on the Snapdragon 8 Elite; needs i8mm)\n"
                  "  --prerouter-trace  MoE: log how well the expert predictor guesses the router (every 64\n"
-                 "                     tokens; measurement only; prints nothing when experts are resident)\n");
+                 "                     tokens; measurement only; prints nothing when experts are resident)\n"
+                 "  --page-cache-mode N  streamed MoE experts through the OS page cache: 0 off, 1 every read\n"
+                 "                     buffered, 2 buffered prefetches (slower on the Snapdragon 8 Elite)\n");
 }
 
 }  // namespace
@@ -401,6 +410,8 @@ int main(int argc, char** argv) {
             config.i8mm_tiles = 1;
         } else if (arg == "--prerouter-trace") {
             config.prerouter_trace = 1;
+        } else if (arg == "--page-cache-mode") {
+            config.page_cache_mode = std::atoi(next());
         } else if (arg == "--prune-heads") {
             config.head_pruning = 1;
             config.head_keep_ratio = static_cast<float>(std::atof(next()));

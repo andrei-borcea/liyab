@@ -263,6 +263,7 @@ struct GenerationStats {
     uint64_t expert_bytes_read = 0; // bytes read from storage for experts
     double expert_stall_ms = 0.0;   // time the forward pass waited for expert reads
     int32_t expert_unused = 0;      // experts read (prefetched) and evicted again without being used
+    int32_t expert_page_cache_loads = 0;  // experts copied from the OS page cache instead of read from storage (ExperimentalConfig::page_cache_mode)
     int32_t expert_dropped = 0;     // wrong guesses removed from the read queue before being read
     int32_t expert_skipped = 0;     // chosen experts skipped instead of waited for (EngineConfig::moe_skip_slow)
     int32_t forced_tokens = 0;      // tokens of forced continuations (ForceCallback), not in generated_tokens

@@ -42,6 +42,15 @@ struct ExperimentalConfig {
     // guess the experts the router picks, every 64 decode tokens, at INFO level. The output is unchanged. Needs a
     // mixture-of-experts model (else Unsupported); it prints nothing unless the experts stream from storage.
     bool prerouter_trace = false;
+    // Streamed MoE experts as a two-tier cache: the RAM cache, then the kernel page cache. 0 off (the default);
+    // 1 every expert read is buffered, so what the RAM cache evicts stays in the page cache and comes back at
+    // memory speed (and outside the process's PSS); 2 buffered prefetches, direct reads for experts the router
+    // already chose. The resident weights then move out of the file mapping into anonymous memory, which expert
+    // pages in the page cache would otherwise evict. Exact output. Measured slower on the Snapdragon 8 Elite
+    // (buffered misses are slower than direct ones and hold the I/O threads urgent reads wait for). Needs
+    // streamed experts (else it only warns); Unsupported on Windows. GenerationStats::expert_page_cache_loads
+    // counts the experts it served.
+    int32_t page_cache_mode = 0;
     // (KV dedup, the experimental persistent prefix KV cache, is retired: the
     // prefix cache's store keeps a shared prefix once, on storage across
     // processes, for every model, within its caps; see prefix_cache_dir.)

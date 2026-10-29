@@ -120,6 +120,7 @@ typedef struct liyab_engine_config {
     int32_t max_sequences;        /* sequences kept at once, the default one included (liyab_sequence_open); 1 (the default; 0 counts as 1): one conversation, as before. A ceiling: nothing is reserved at load, and a sequence takes its memory only while open (see liyab_sequence_open and EngineConfig) */
     int32_t i8mm_tiles;           /* nonzero: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles, the same bits as the default kernels (experimental build; ignored on CPUs without i8mm; slower on the Snapdragon 8 Elite for Q5_K / Q6_K) */
     int32_t prerouter_trace;      /* nonzero: log the precision of the streamed-expert predictor against the router every 64 decode tokens (experimental build; measurement only, the output is unchanged; MoE models only) */
+    int32_t page_cache_mode;      /* experimental build, streamed MoE experts: 0 off; 1 every expert read buffered, so evicted experts come back from the OS page cache; 2 buffered prefetches, direct reads for experts the router chose. Resident weights move to anonymous memory. Exact output; slower on the Snapdragon 8 Elite; liyab_generation_stats.expert_page_cache_loads counts the experts it served */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {
@@ -182,6 +183,7 @@ typedef struct liyab_generation_stats {
     int32_t segment_reused_tokens;     /* prompt positions whose KV came from stored segments */
     int32_t segment_recomputed_tokens; /* of them, processed again */
     double segment_ms;                 /* time it took (part of prefill_ms) */
+    int32_t expert_page_cache_loads;   /* experts copied from the OS page cache instead of read from storage (page_cache_mode) */
 } liyab_generation_stats;
 
 /*

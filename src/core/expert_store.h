@@ -56,6 +56,7 @@ public:
         uint64_t dropped = 0;        // wrong guesses removed from the queue before they were read
         uint64_t reads = 0;          // direct reads issued: one per matrix of a loaded expert
         uint64_t bytes_read = 0;
+        uint64_t page_cache_loads = 0;  // loads copied from the kernel page cache instead of read from storage
         double stall_ms = 0.0;       // compute time spent waiting for experts
     };
 
@@ -96,6 +97,16 @@ public:
     [[nodiscard]] bool ready(int32_t layer, int32_t expert) const;
     // Whether the forward pass now running covers several tokens (see `repack`).
     void set_batch(bool batch) noexcept { batch_.store(batch, std::memory_order_relaxed); }
+
+    // Experimental page-cache tier: experts the kernel still holds in its page cache are copied from there (at
+    // memory speed, and not counted in the process's PSS) instead of read from storage with direct I/O.
+    //   0  off (the default): every read is direct.
+    //   1  every read is buffered, so what the RAM cache evicts stays in the page cache to come back.
+    //   2  buffered reads for prefetches; experts the router already chose are read directly, for latency.
+    // Measured slower on the Snapdragon 8 Elite (buffered misses are slower than direct ones and hold the I/O
+    // threads urgent reads wait for). Call before the first prefetch; not thread-safe against reads in flight.
+    // Unsupported on Windows (no mincore).
+    [[nodiscard]] Status set_page_cache_mode(int32_t mode);
 
     // Halves every use counter (call once per generated token): old
     // popularity fades so the cache follows the conversation.
@@ -156,6 +167,8 @@ private:
         int32_t slot = -1;
         int32_t pins = 0;
         bool on_demand = false;  // queued after the router chose it (a miss, even if it arrives in time)
+        bool urgent = false;     // the router chose it: read it for latency, not to fill the page cache
+        bool all_cached = true;  // Loading: every matrix read so far came from the kernel page cache
         int8_t parts_left = 0;   // Loading: matrices not read yet
         bool part_failed = false;
         bool failed = false;     // the last read failed (reported to the waiting acquire())
@@ -202,6 +215,10 @@ private:
     // Drops or demotes block `layer`'s guesses that its router did not confirm.
     void settle_locked(int32_t layer);
 
+    // Whether every page of `seg` is in the kernel page cache (mincore on the model mapping, which never faults
+    // pages in). False where the platform cannot tell.
+    [[nodiscard]] bool in_page_cache(const Segment& seg) const;
+
     const MmapLoader* file_ = nullptr;
     std::vector<std::array<const TensorView*, 3>> experts_;
     int32_t n_expert_ = 0;
@@ -209,6 +226,8 @@ private:
     std::vector<int32_t> block_class_;  // per block: its size class, -1 without experts
     uint64_t expert_bytes_total_ = 0;
     std::vector<std::unique_ptr<DirectFile>> files_;  // one per file part
+    std::vector<std::unique_ptr<DirectFile>> buffered_;  // the same parts opened for page-cache reads (set_page_cache_mode)
+    std::atomic<int32_t> page_cache_mode_{0};
 
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;

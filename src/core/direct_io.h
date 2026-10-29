@@ -36,6 +36,11 @@ public:
 
     // `path` is UTF-8.
     static Result<std::unique_ptr<DirectFile>> open(const std::string& path);
+#if !defined(_WIN32)
+    // Ordinary buffered reads: through the page cache, with no read-ahead beyond the requested range. direct() is
+    // false. For ExpertStore's page-cache tier, which copies experts the kernel already holds.
+    static Result<std::unique_ptr<DirectFile>> open_buffered(const std::string& path);
+#endif
     ~DirectFile();
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;

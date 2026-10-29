@@ -201,6 +201,17 @@ Result<std::unique_ptr<DirectFile>> DirectFile::open(const std::string& path) {
     return f;
 }
 
+Result<std::unique_ptr<DirectFile>> DirectFile::open_buffered(const std::string& path) {
+    std::unique_ptr<DirectFile> f(new DirectFile());
+    f->path_ = path;
+    f->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (f->fd_ < 0) return Status(ErrorCode::IoError, "cannot open " + path + ": " + std::strerror(errno));
+#if defined(__linux__)
+    posix_fadvise(f->fd_, 0, 0, POSIX_FADV_RANDOM);  // experts are read at random: no read-ahead past the range
+#endif
+    return f;
+}
+
 DirectFile::~DirectFile() {
     if (fd_ >= 0) ::close(fd_);
 }

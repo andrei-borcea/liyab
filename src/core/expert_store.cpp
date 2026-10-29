@@ -9,6 +9,11 @@
 #include <cstring>
 #include <string>
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "core/log.h"
 #include "core/os.h"
 #include "core/quant.h"
@@ -195,6 +200,44 @@ ExpertStore::Segment ExpertStore::segment(int32_t key, int32_t matrix) const {
     return {t.shard, t.file_offset + static_cast<uint64_t>(key % n_expert_) * bytes, bytes};
 }
 
+Status ExpertStore::set_page_cache_mode(int32_t mode) {
+    if (mode < 0 || mode > 2) return Status(ErrorCode::InvalidArgument, "page_cache_mode is 0, 1 or 2");
+#if defined(_WIN32)
+    if (mode != 0) return Status(ErrorCode::Unsupported, "the page-cache tier needs mincore, which Windows lacks");
+#else
+    if (mode != 0 && buffered_.empty()) {
+        for (size_t i = 0; i < file_->shard_count(); ++i) {
+            auto part = DirectFile::open_buffered(file_->shard(i).path());
+            if (!part) return part.status();
+            buffered_.push_back(std::move(part).value());
+        }
+    }
+#endif
+    page_cache_mode_.store(mode, std::memory_order_relaxed);
+    return Status::ok();
+}
+
+bool ExpertStore::in_page_cache(const Segment& seg) const {
+#if defined(_WIN32)
+    (void)seg;
+    return false;
+#else
+#if defined(__APPLE__)
+    using Residency = char;
+#else
+    using Residency = unsigned char;
+#endif
+    static const auto page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    const uint64_t begin = seg.offset / page * page;
+    const size_t length = static_cast<size_t>(seg.offset + seg.bytes - begin);
+    thread_local std::vector<Residency> pages;
+    pages.resize((length + page - 1) / page);
+    auto* addr = const_cast<uint8_t*>(file_->shard(seg.shard).data()) + begin;
+    if (mincore(addr, length, pages.data()) != 0) return false;
+    return std::all_of(pages.begin(), pages.end(), [](Residency r) { return (r & 1) != 0; });
+#endif
+}
+
 void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int32_t m) {
     Entry& e = entries_[static_cast<size_t>(key)];
     const Segment seg = segment(key, m);
@@ -204,10 +247,16 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
     uint8_t* dst = arena_ + slot.offset + classes_[static_cast<size_t>(slot.size_class)].offsets[static_cast<size_t>(m)];
     e.repacked = repack_ && e.for_batch;
     const bool repack = e.repacked;
+    const bool urgent = e.urgent;
     lock.unlock();
+    // Page-cache tier (off by default): a matrix the kernel holds is copied from there; a miss is read buffered
+    // (so it stays cached) or directly, by mode.
+    const int32_t mode = page_cache_mode_.load(std::memory_order_relaxed);
+    const bool cached = mode != 0 && in_page_cache(seg);
+    const bool buffered = cached || mode == 1 || (mode == 2 && !urgent);
     // One read per matrix: smaller parts (tried: 2 and 4 per matrix) cost
     // the flash more than the extra concurrency saves.
-    Status status = files_[seg.shard]->read(begin, length, dst);
+    Status status = (buffered ? buffered_[seg.shard] : files_[seg.shard])->read(begin, length, dst);
     if (status.is_ok()) {
         const int32_t layer = key / n_expert_;
         const DType to = served_type(layer, m);
@@ -215,7 +264,8 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
         if (repack && to != t.type) repack_in_place(dst + (seg.offset - begin), seg.bytes, t.type, to, t.ne[1], t.ne[0]);
     }
     lock.lock();
-    stats_.bytes_read += length;
+    if (!cached) stats_.bytes_read += length;
+    e.all_cached = e.all_cached && cached;
     ++stats_.reads;
     if (!status.is_ok()) {
         LIYAB_LOG_ERROR("%s", status.to_string().c_str());
@@ -232,6 +282,7 @@ void ExpertStore::read_part(std::unique_lock<std::mutex>& lock, int32_t key, int
         e.untouched = true;
         e.last_use = clock_;
         ++stats_.loads;
+        if (e.all_cached) ++stats_.page_cache_loads;
     }
     ready_cv_.notify_all();
 }
@@ -296,6 +347,7 @@ void ExpertStore::io_loop() {
         if (slot < 0) return;
         e.slot = slot;
         e.part_failed = false;
+        e.all_cached = true;  // until a matrix is read from storage
         slots_[static_cast<size_t>(slot)].entry = key;
         // The first matrix is read here, the others (up and down, or down
         // after a fused [gate | up]) are handed to idle threads.
@@ -319,11 +371,13 @@ void ExpertStore::prefetch(int32_t layer, std::span<const int32_t> experts, bool
             if (e.state == State::Queued && !predicted) {  // needed now: move ahead of guesses
                 queue_.erase(std::remove(queue_.begin(), queue_.end(), key), queue_.end());
                 queue_.push_front(key);
+                e.urgent = true;
                 continue;
             }
             if (e.state != State::Empty) continue;
             e.state = State::Queued;
             e.on_demand = !predicted;
+            e.urgent = !predicted;
             e.guess = predicted;
             e.for_batch = batch_.load(std::memory_order_relaxed);
             if (predicted) {
@@ -373,6 +427,7 @@ Result<std::array<TensorView, 3>> ExpertStore::acquire(int32_t layer, int32_t ex
     }
     e.on_demand = false;
     if (e.state != State::Ready) {
+        e.urgent = true;  // a forward pass is waiting for it
         const auto t0 = std::chrono::steady_clock::now();
         if (e.state == State::Empty) {
             e.state = State::Queued;

@@ -88,6 +88,10 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
           '2x2 int8 matrix tiles, and keeps the repacked weight layouts off. Same replies. Slower than the default on '
           'the Snapdragon 8 Elite; needs an i8mm CPU.', _x.i8mmTiles, (v) => _x.i8mmTiles = v),
       Text('Mixture of experts', style: theme.textTheme.titleSmall),
+      choice('Expert page cache', 'Keeps experts the RAM cache evicts in the system\'s page cache, so they come back '
+          'at memory speed, and moves the resident weights to anonymous memory. Same replies. Slower on the '
+          'Snapdragon 8 Elite; for models whose experts stream from storage.', _x.pageCacheMode,
+          const [(0, 'Off'), (1, 'All reads'), (2, 'Prefetches only')], (v) => _x.pageCacheMode = v),
       slider('Expert mass (lossy below 1)', _x.expertMass, 0.5, 1.0, 10, (v) => v >= 1 ? 'All' : v.toStringAsFixed(2),
           (v) => _x.expertMass = v),
       choice('Experts per token', 'Fewer experts read less per token (lossy).', _x.maxExperts,

@@ -475,6 +475,56 @@ TEST_CASE("The prerouter trace leaves a streamed MoE's reply unchanged and logs 
     std::remove(path.c_str());
 }
 
+// The page-cache tier changes where expert bytes come from, never which bytes: every mode answers like the direct
+// reads. The model file was just written, so the kernel holds it and the tier has something to serve.
+TEST_CASE("The expert page-cache tier gives the direct reads' reply and counts the experts it served") {
+    test::TinyModelSpec spec;
+    spec.n_layers = 4;
+    spec.n_expert = 8;
+    spec.n_expert_used = 2;
+    spec.identical_experts = false;
+    const std::string path = temp_path("page_cache_moe.gguf");
+    test::write_tiny_model(path, spec);
+    std::string replies[3];
+    for (int32_t mode = 0; mode <= 2; ++mode) {
+        EngineConfig config;
+        config.model_path = path;
+        config.backend = BackendKind::Cpu;
+        config.thermal_polling = false;
+        config.power.target_tps = 10000.0;  // effectively unpaced
+        config.expert_cache_mb = 1;         // streamed experts
+        config.experimental.page_cache_mode = mode;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        SamplingParams p;
+        p.temperature = 0.0f;
+        p.max_tokens = 40;
+        auto stats = engine.value()->generate("hello world", p, [&](std::string_view piece, int32_t) {
+            replies[mode] += piece;
+            return true;
+        });
+        REQUIRE(stats.has_value());
+        CHECK(stats->generated_tokens == p.max_tokens);
+        CHECK(stats->expert_hits + stats->expert_late + stats->expert_misses > 0);  // the experts did stream
+        if (mode == 0) {
+            CHECK(stats->expert_page_cache_loads == 0);
+        } else {
+            CHECK(stats->expert_page_cache_loads > 0);
+        }
+    }
+    CHECK(replies[1] == replies[0]);
+    CHECK(replies[2] == replies[0]);
+
+    EngineConfig bad;
+    bad.model_path = path;
+    bad.backend = BackendKind::Cpu;
+    bad.thermal_polling = false;
+    bad.expert_cache_mb = 1;
+    bad.experimental.page_cache_mode = 3;
+    CHECK(!Engine::create(bad).has_value());
+    std::remove(path.c_str());
+}
+
 // A forced pass normally samples the next token from its last row; early
 // exit and EGLS run in decoding steps only, so with them the token after a
 // forced text keeps its own step (one pass more per forced text).

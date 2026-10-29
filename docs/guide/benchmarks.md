@@ -570,7 +570,9 @@ Facts measured while building Liyab that shaped the code, kept here because they
 * **More or smaller I/O requests.** 8 I/O threads instead of 4, or each matrix split into 2–4 reads, were slower.
   Small reads cost the flash more than the concurrency saves.
 * **The kernel page cache as a second expert cache.** Copies from it are fast, but buffered misses hold the I/O
-  threads that urgent reads wait for. Decode got slower in every A/B run.
+  threads that urgent reads wait for. Decode got slower in every A/B run (cold 7.04 → 4.83 tok/s with every read
+  buffered, 6.02 with buffered prefetches only), although flash reads fell from 283 to 180–215 MiB/token. Kept as the
+  opt-in `page_cache_mode` (see [Experimental](development.md#experimental-modules)).
 * **i8mm 2×2 tiles for the K-quants.** Two weight rows against two activation rows per SMMLA halves the
   multiply-adds, but the zips that build the tiles, the per-sub-block scale multiplies and the exact epilogue cost
   more: on the Snapdragon 8 Elite (2048×8192, 4 rows) Q4_K went 681 → 601–617 µs, Q5_K 683 → 863–895 µs and Q6_K

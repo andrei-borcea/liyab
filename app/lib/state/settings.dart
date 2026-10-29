@@ -132,6 +132,7 @@ class ExperimentalSettings {
   double eglsThreshold = 0.002;
   int tdss = 0; // 2:4 sparse FFN weights: 0 off, 1 while hot, 2 always
   bool i8mmTiles = false; // exact: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles
+  int pageCacheMode = 0; // exact: streamed MoE experts through the OS page cache: 0 off, 1 all reads, 2 prefetches
   bool prerouterTrace = false; // measurement only: logs how well streamed experts are guessed (MoE models)
   bool lookupDrafts = false; // speculative decoding from the conversation's own text
   bool suffixDrafts = true; // ... by suffix drafts (this and earlier conversations); false: context lookup
@@ -154,6 +155,7 @@ class ExperimentalSettings {
         'tdss': tdss,
         'i8mmTiles': i8mmTiles,
         'prerouterTrace': prerouterTrace,
+        'pageCacheMode': pageCacheMode,
         'lookupDrafts': lookupDrafts,
         'suffixDrafts': suffixDrafts,
         'draftTokens': draftTokens,
@@ -180,6 +182,7 @@ class ExperimentalSettings {
       ..tdss = i('tdss', d.tdss)
       ..i8mmTiles = b('i8mmTiles', d.i8mmTiles)
       ..prerouterTrace = b('prerouterTrace', d.prerouterTrace)
+      ..pageCacheMode = i('pageCacheMode', d.pageCacheMode)
       ..lookupDrafts = b('lookupDrafts', d.lookupDrafts)
       ..suffixDrafts = b('suffixDrafts', d.suffixDrafts)
       ..draftTokens = i('draftTokens', d.draftTokens)
@@ -202,6 +205,7 @@ class ExperimentalSettings {
       if (tdss != 0) 'TDSS ${tdss == 1 ? 'while hot' : 'always'}',
       if (i8mmTiles) 'i8mm tiles',
       if (prerouterTrace) 'prerouter trace',
+      if (pageCacheMode != 0) 'expert page cache ${pageCacheMode == 1 ? 'all reads' : 'prefetches'}',
       if (lookupDrafts) '${suffixDrafts ? 'suffix' : 'lookup'} drafts ($draftTokens)',
       if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
       if (maxExperts > 0) 'max $maxExperts experts',

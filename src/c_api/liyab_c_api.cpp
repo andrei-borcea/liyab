@@ -107,7 +107,8 @@ liyab_status finish_generation(const liyab::Result<liyab::GenerationStats>& resu
                                         s.ttft_stall_ms,
                                         s.segment_reused_tokens,
                                         s.segment_recomputed_tokens,
-                                        s.segment_ms};
+                                        s.segment_ms,
+                                        s.expert_page_cache_loads};
     }
     return LIYAB_OK;
 }
@@ -244,6 +245,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->max_sequences = d.max_sequences;
     config->i8mm_tiles = d.experimental.i8mm_tiles ? 1 : 0;
     config->prerouter_trace = d.experimental.prerouter_trace ? 1 : 0;
+    config->page_cache_mode = d.experimental.page_cache_mode;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -311,6 +313,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.draft_tree = config->draft_tree != 0;
         c.experimental.i8mm_tiles = config->i8mm_tiles != 0;
         c.experimental.prerouter_trace = config->prerouter_trace != 0;
+        c.experimental.page_cache_mode = config->page_cache_mode;
         c.max_sequences = std::max(config->max_sequences, 1);  // a zero-filled config: one sequence
 
         auto engine = liyab::Engine::create(c);
