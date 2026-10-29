@@ -32,6 +32,12 @@ struct ExperimentalConfig {
     float egls_threshold = 0.002f;        // skip a block's FFN when its entropy delta is below this
     bool tdss = false;                    // 2:4 sparse FFN weights while thermally throttled (lossy)
     bool tdss_force = false;              // use the sparse FFN even when cool (benchmarks)
+    // CPU matmuls of Q4_K / Q5_K / Q6_K weights over two or more activation rows (prefill, speculative
+    // verification) run as 2x2 SMMLA tiles (needs i8mm). Exact: the same bits as the dot-product kernels. Measured
+    // slower on the Snapdragon 8 Elite for Q5_K and Q6_K, so it stays opt-in; ignored on CPUs without i8mm.
+    // The tiles read the weights as stored, so this also keeps the i8mm repacked layouts (the default on such
+    // CPUs) off, whatever it costs the matmuls the tiles do not cover.
+    bool i8mm_tiles = false;
     // (KV dedup, the experimental persistent prefix KV cache, is retired: the
     // prefix cache's store keeps a shared prefix once, on storage across
     // processes, for every model, within its caps; see prefix_cache_dir.)

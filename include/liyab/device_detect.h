@@ -28,7 +28,7 @@ struct SocInfo {
 struct CpuFeatures {
     bool neon = false;
     bool dotprod = false;  // SDOT/UDOT (ARMv8.2), used by the Q4_0/Q8_0 kernels
-    bool i8mm = false;     // SMMLA (ARMv8.6 int8 matrix multiply): repacked Q4_K kernels
+    bool i8mm = false;     // SMMLA (ARMv8.6 int8 matrix multiply): repacked Q4_K kernels and the 2x2 tile kernels
     bool fp16 = false;
     bool avx2 = false;     // x86-64 AVX2: the "avx2" kernel set needs it with fma and f16c
     bool fma = false;      // x86-64 FMA3

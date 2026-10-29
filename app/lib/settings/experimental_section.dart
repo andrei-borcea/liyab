@@ -83,6 +83,10 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
         slider('Skip below', _x.eglsThreshold, 0.0005, 0.01, 19, (v) => v.toStringAsFixed(4), (v) => _x.eglsThreshold = v),
       choice('2:4 sparse FFN (TDSS)', 'Half the FFN weights. Slower on phones today (no sparse units); for tests.',
           _x.tdss, const [(0, 'Off'), (1, 'While hot'), (2, 'Always')], (v) => _x.tdss = v),
+      Text('Kernels (exact output)', style: theme.textTheme.titleSmall),
+      toggle('i8mm tile kernels', 'Runs Q4_K, Q5_K and Q6_K matmuls over several rows (prompt, speculative checks) as '
+          '2x2 int8 matrix tiles, and keeps the repacked weight layouts off. Same replies. Slower than the default on '
+          'the Snapdragon 8 Elite; needs an i8mm CPU.', _x.i8mmTiles, (v) => _x.i8mmTiles = v),
       Text('Mixture of experts', style: theme.textTheme.titleSmall),
       slider('Expert mass (lossy below 1)', _x.expertMass, 0.5, 1.0, 10, (v) => v >= 1 ? 'All' : v.toStringAsFixed(2),
           (v) => _x.expertMass = v),

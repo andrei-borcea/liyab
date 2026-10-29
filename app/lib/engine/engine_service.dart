@@ -1084,6 +1084,7 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   if (x.containsKey('egls')) c.egls = flag('egls');
   c.eglsThreshold = n('eglsThreshold') ?? c.eglsThreshold;
   c.tdss = i('tdss') ?? c.tdss;
+  if (x.containsKey('i8mmTiles')) c.i8mmTiles = flag('i8mmTiles');
   if (x.containsKey('lookupDrafts')) c.lookupDrafts = flag('lookupDrafts');
   if (x.containsKey('suffixDrafts')) c.suffixDrafts = flag('suffixDrafts'); // how lookup drafts: suffix or context lookup
   c.draftTokens = i('draftTokens') ?? c.draftTokens;

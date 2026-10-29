@@ -118,6 +118,7 @@ typedef struct liyab_engine_config {
     int64_t adapter_memory_mb;    /* LoRA adapters (liyab_engine_load_adapter): RAM at most for the loaded ones, in MiB, the least recently selected released first (mapped again when selected); default 256; 0: adapters off (a zero-filled config without liyab_engine_config_default) */
     int32_t draft_tree;           /* suffix drafts: nonzero (the default) verifies the likeliest nodes of the drafter's continuation tree, alternative branches included, in one pass; 0 only its best branch (a zero-filled config without liyab_engine_config_default); the same output either way (see EngineConfig) */
     int32_t max_sequences;        /* sequences kept at once, the default one included (liyab_sequence_open); 1 (the default; 0 counts as 1): one conversation, as before. A ceiling: nothing is reserved at load, and a sequence takes its memory only while open (see liyab_sequence_open and EngineConfig) */
+    int32_t i8mm_tiles;           /* nonzero: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles, the same bits as the default kernels (experimental build; ignored on CPUs without i8mm; slower on the Snapdragon 8 Elite for Q5_K / Q6_K) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

@@ -89,8 +89,10 @@ public:
     }
 };
 
-// Always available. `pool` must outlive the backend.
-LIYAB_API std::unique_ptr<Backend> make_cpu_backend(ThreadPool& pool);
+// Always available. `pool` must outlive the backend. `i8mm_tiles` runs Q4_K / Q5_K / Q6_K matmuls over two or more
+// activation rows as 2x2 SMMLA tiles (bit-identical to the default kernels) when the CPU has i8mm and the library
+// was built with the tile kernels; otherwise it has no effect.
+LIYAB_API std::unique_ptr<Backend> make_cpu_backend(ThreadPool& pool, bool i8mm_tiles = false);
 
 // Android / Linux GPU via Vulkan compute (weights repacked into GPU memory
 // on first use). Unsupported when not compiled in or without a device.

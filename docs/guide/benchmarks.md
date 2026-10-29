@@ -571,6 +571,11 @@ Facts measured while building Liyab that shaped the code, kept here because they
   Small reads cost the flash more than the concurrency saves.
 * **The kernel page cache as a second expert cache.** Copies from it are fast, but buffered misses hold the I/O
   threads that urgent reads wait for. Decode got slower in every A/B run.
+* **i8mm 2×2 tiles for the K-quants.** Two weight rows against two activation rows per SMMLA halves the
+  multiply-adds, but the zips that build the tiles, the per-sub-block scale multiplies and the exact epilogue cost
+  more: on the Snapdragon 8 Elite (2048×8192, 4 rows) Q4_K went 681 → 601–617 µs, Q5_K 683 → 863–895 µs and Q6_K
+  756 → 953–1019 µs. The replies are bit-identical, so it stays as the opt-in `i8mm_tiles` (see
+  [Experimental](development.md#experimental-modules)).
 * **Speculation on streamed MoE.** A verification pass reads the union of its tokens' experts: 1.55× the cost of
   one token for 2 tokens, 2.5× for 3.
 * **2:4 sparsity on phones.** There are no sparse tensor units, so index decoding costs more than the halved

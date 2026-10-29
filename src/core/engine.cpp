@@ -2674,7 +2674,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     }
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
-        config.experimental.tdss) {
+        config.experimental.tdss || config.experimental.i8mm_tiles) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
 #endif
@@ -2687,13 +2687,23 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
                    soc_vendor_name(impl->device.soc.vendor), impl->device.cpu.cores,
                    static_cast<double>(impl->device.available_memory) / (1024.0 * 1024.0 * 1024.0));
     impl->pool = std::make_unique<ThreadPool>(config.n_threads);
-    impl->cpu = make_cpu_backend(*impl->pool);
+    impl->cpu = make_cpu_backend(*impl->pool, config.experimental.i8mm_tiles);
+    if (config.experimental.i8mm_tiles) {
+        if (quant::i8mm_kernels_compiled() && impl->device.cpu.i8mm) {
+            LIYAB_LOG_INFO("i8mm 2x2 tile kernels on for Q4_K / Q5_K / Q6_K matmuls over several rows (weights not repacked)");
+        } else {
+            LIYAB_LOG_WARN("i8mm tile kernels requested but %s; using the dot-product kernels",
+                           quant::i8mm_kernels_compiled() ? "this CPU has no i8mm" : "this build has none");
+        }
+    }
     LIYAB_RETURN_IF_ERROR(impl->select_backends());
 
     // Prefill chunks and speculative verification batches share max_batch.
     const int32_t max_batch = std::max(64, config.draft_tokens + 1);
     // Repacked weights are for the CPU's i8mm kernels only: no GPU / NPU route.
-    const bool repack_cpu = !impl->gpu && !impl->npu && impl->device.cpu.i8mm && quant::repack_kernels_available();
+    // The 2x2 tile kernels run on the weights as stored, so asking for them keeps the repacked layouts off.
+    const bool repack_cpu = !impl->gpu && !impl->npu && impl->device.cpu.i8mm && quant::repack_kernels_available() &&
+                            !config.experimental.i8mm_tiles;
     auto target = load_model(config.model_path, config, max_batch, repack_cpu);
     if (!target) return target.status();
     impl->target = std::move(target).value();

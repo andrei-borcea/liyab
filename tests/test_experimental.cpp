@@ -328,6 +328,46 @@ TEST_CASE("Engine reports early exits and pruned steps") {
     CHECK(stats->head_pruned_steps > 0);
 }
 
+// The 2x2 SMMLA tiles are exact: a model with Q4_K / Q5_K weights answers the same with and without them, the
+// prompt's batched pass included (Q6_K has no test encoder here; test_engine checks its tiles against the dot
+// product). On a CPU without i8mm (or a build without the kernels) the flag changes nothing, so the check holds
+// there too.
+TEST_CASE("i8mm tile kernels leave the reply of K-quant models unchanged") {
+    for (const DType type : {DType::Q4_K, DType::Q5_K}) {
+        test::TinyModelSpec spec;
+        spec.n_embd = 256;  // K-quant rows are whole super-blocks of 256
+        spec.n_ff = 512;
+        spec.attn_type = type;
+        spec.ffn_type = type;
+        const std::string path = temp_path(std::string("i8mm_") + std::to_string(static_cast<int>(type)) + ".gguf");
+        test::write_tiny_model(path, spec);
+        std::string replies[2];
+        for (const bool tiles : {false, true}) {
+            EngineConfig config;
+            config.model_path = path;
+            config.backend = BackendKind::Cpu;
+            config.thermal_polling = false;
+            config.power.target_tps = 10000.0;  // effectively unpaced
+            config.experimental.i8mm_tiles = tiles;
+            auto engine = Engine::create(config);
+            REQUIRE(engine.has_value());
+            SamplingParams p;
+            p.temperature = 0.0f;
+            p.max_tokens = 12;
+            std::string& text = replies[tiles ? 1 : 0];
+            auto stats = engine.value()->generate("hello world, how are you today my friend", p,
+                                                  [&](std::string_view piece, int32_t) {
+                                                      text += piece;
+                                                      return true;
+                                                  });
+            REQUIRE(stats.has_value());
+            CHECK(stats->generated_tokens == p.max_tokens);
+        }
+        CHECK(replies[0] == replies[1]);
+        std::remove(path.c_str());
+    }
+}
+
 // A forced pass normally samples the next token from its last row; early
 // exit and EGLS run in decoding steps only, so with them the token after a
 // forced text keeps its own step (one pass more per forced text).

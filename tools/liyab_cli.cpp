@@ -300,7 +300,9 @@ void usage() {
                  "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
                  "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
                  "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
-                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n");
+                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n"
+                 "  --i8mm-tiles       Q4_K/Q5_K/Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles\n"
+                 "                     (same bits; slower on the Snapdragon 8 Elite; needs i8mm)\n");
 }
 
 }  // namespace
@@ -393,6 +395,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--tdss") {
             const std::string v = next();
             config.tdss = v == "always" ? 2 : 1;
+        } else if (arg == "--i8mm-tiles") {
+            config.i8mm_tiles = 1;
         } else if (arg == "--prune-heads") {
             config.head_pruning = 1;
             config.head_keep_ratio = static_cast<float>(std::atof(next()));

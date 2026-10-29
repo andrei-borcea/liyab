@@ -118,6 +118,8 @@ final class LiyabEngineConfig extends Struct {
   external int draftTree; // suffix drafts verified as a tree (nonzero, the default) or as their best branch
   @Int32()
   external int maxSequences; // sequences kept at once, the default one included (liyab_sequence_open); 1: one
+  @Int32()
+  external int i8mmTiles; // experimental: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles
 }
 
 /// liyab_adapter_info: one loaded LoRA adapter (liyab_engine_adapter_info).
