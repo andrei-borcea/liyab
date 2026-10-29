@@ -302,7 +302,9 @@ void usage() {
                  "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
                  "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n"
                  "  --i8mm-tiles       Q4_K/Q5_K/Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles\n"
-                 "                     (same bits; slower on the Snapdragon 8 Elite; needs i8mm)\n");
+                 "                     (same bits; slower on the Snapdragon 8 Elite; needs i8mm)\n"
+                 "  --prerouter-trace  MoE: log how well the expert predictor guesses the router (every 64\n"
+                 "                     tokens; measurement only; prints nothing when experts are resident)\n");
 }
 
 }  // namespace
@@ -397,6 +399,8 @@ int main(int argc, char** argv) {
             config.tdss = v == "always" ? 2 : 1;
         } else if (arg == "--i8mm-tiles") {
             config.i8mm_tiles = 1;
+        } else if (arg == "--prerouter-trace") {
+            config.prerouter_trace = 1;
         } else if (arg == "--prune-heads") {
             config.head_pruning = 1;
             config.head_keep_ratio = static_cast<float>(std::atof(next()));

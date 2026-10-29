@@ -44,6 +44,7 @@
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/tdss.h"
 #include "liyab/experimental/head_pruner.h"
+#include "liyab/experimental/prerouter_trace.h"
 #endif
 
 namespace liyab {
@@ -2227,6 +2228,7 @@ struct Engine::Impl {
     std::optional<experimental::HeadPruner> head_pruner;
     std::unique_ptr<experimental::Egls> egls;
     std::unique_ptr<experimental::Tdss> tdss;
+    std::unique_ptr<experimental::PrerouterTrace> prerouter;
 #endif
 
     // Experimental hooks for one forward pass given the current power policy.
@@ -2674,7 +2676,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     }
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
-        config.experimental.tdss || config.experimental.i8mm_tiles) {
+        config.experimental.tdss || config.experimental.i8mm_tiles || config.experimental.prerouter_trace) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
 #endif
@@ -2787,6 +2789,9 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
                        static_cast<double>(impl->tdss->sparse_bytes()) / (1024.0 * 1024.0),
                        static_cast<double>(impl->tdss->dense_bytes()) / (1024.0 * 1024.0));
     }
+    if (x.prerouter_trace && impl->target->config().n_expert <= 0) {
+        return Status(ErrorCode::Unsupported, "the prerouter trace measures expert prediction; this model has no experts");
+    }
     if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
     if (x.head_pruning) {
         if (impl->target->config().hybrid()) {
@@ -2803,6 +2808,15 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 
     impl->power = std::make_unique<PowerManager>(config.power);
     impl->open_store(config, repack_cpu);
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    if (x.prerouter_trace) {
+        impl->prerouter = std::make_unique<experimental::PrerouterTrace>();
+        impl->target->set_expert_observer(impl->prerouter.get());
+        if (impl->target->expert_store() == nullptr) {
+            LIYAB_LOG_WARN("prerouter trace: the experts are resident, so no prediction is made and nothing is logged");
+        }
+    }
+#endif
     impl->prepare_segment_reuse();
     impl->power->poll_once();
     if (config.thermal_polling) impl->power->start();

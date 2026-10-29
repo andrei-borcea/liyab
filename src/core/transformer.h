@@ -580,6 +580,13 @@ public:
     // a pass will never be rolled back (a plain decoding step) turn it off to
     // skip the state copies; positions processed meanwhile cannot be returned to.
     void set_checkpointing(bool on) noexcept { checkpointing_ = on; }
+
+    // Experimental measurement: `observer` (not owned; must outlive the transformer) sees the streamed-expert
+    // predictions and the router's choices of single-token decode steps. nullptr (the default) detaches it.
+    void set_expert_observer(ExpertPredictionObserver* observer) {
+        expert_observer_ = observer;
+        if (observer != nullptr) observer->begin(config_.n_layers, config_.n_expert, config_.n_expert_used);
+    }
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
@@ -1188,6 +1195,7 @@ private:
     };
     std::vector<Guess> guesses_;
     std::vector<double> rank_guessed_, rank_used_;  // decayed counts per rank
+    ExpertPredictionObserver* expert_observer_ = nullptr;  // set_expert_observer
     float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
     int32_t max_experts_ = 0;           // TransformerOptions::max_experts
     float skip_slow_ = 0.0f;            // TransformerOptions::skip_slow

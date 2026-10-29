@@ -319,6 +319,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | `--egls T` | Skip FFN below entropy delta `T`, e.g. `0.002` | +5–48% on TinyLlama | Early output divergence; needs training |
 | `--tdss hot\|always` | Use 2:4 magnitude-pruned FFNs | −54% decode on the phone | Slower without sparse units |
 | `--i8mm-tiles` | Run Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2×2 SMMLA tiles; keeps the repacked layouts off | Q4_K 681 → 601–617 µs, Q5_K 683 → 863–895 µs, Q6_K 756 → 953–1019 µs (2048×8192, 4 rows, Snapdragon 8 Elite, before the repacked layouts) | Exact (same bits); slower than the default except Q4_K; needs i8mm |
+| `--prerouter-trace` | Measure how well the streamed-expert predictor guesses the router's experts, next to a learned co-occurrence prior and repetition | Counts only: logs precision@k every 64 decode tokens; the output is unchanged | Measurement; MoE models whose experts stream from storage |
 | JIT unpacker | Emit AArch64 NEON row-unpack routines, W^X | +37% for a 4,096-element row | Component result; outside the hot path; unavailable on iOS |
 | io_uring loader | Direct reads through raw io_uring syscalls | No Android result | Android apps cannot call `io_uring_setup` |
 

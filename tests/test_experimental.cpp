@@ -28,6 +28,7 @@
 #include <optional>
 #include <vector>
 
+#include "core/log.h"
 #include "core/sampling.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
@@ -40,6 +41,7 @@
 #include "core/quant.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
+#include "liyab/experimental/prerouter_trace.h"
 #include "test_model.h"
 #include "test_util.h"
 
@@ -366,6 +368,111 @@ TEST_CASE("i8mm tile kernels leave the reply of K-quant models unchanged") {
         CHECK(replies[0] == replies[1]);
         std::remove(path.c_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prerouter study
+// ---------------------------------------------------------------------------
+namespace {
+// Feeds `tokens` decode tokens over two blocks: the router's logits are `logits` for both, the experts really run
+// are `really` in both.
+void feed_prerouter(experimental::PrerouterTrace& trace, int tokens, const std::vector<float>& logits,
+                    const std::vector<int32_t>& really) {
+    for (int t = 0; t < tokens; ++t) {
+        for (int32_t layer = 0; layer < 2; ++layer) {
+            trace.predicted(layer, logits);
+            trace.chosen(layer, really);
+        }
+    }
+}
+}  // namespace
+
+TEST_CASE("PrerouterTrace scores the router, the co-occurrence prior and repetition against the real choice") {
+    // A router that is right: experts {2, 3} on top, and {2, 3} run.
+    experimental::PrerouterTrace right(0);
+    right.begin(2, 6, 2);
+    feed_prerouter(right, 5, {0, 0, 1, 1, 0, 0}, {2, 3});
+    CHECK(right.tokens() == 4);  // a token ends when the block index starts over; the last one is still open
+    CHECK(right.guesses() == 5 * 2 * 2);
+    CHECK(right.precision(0) == 1.0);
+
+    // A router that is wrong: it favours {4, 5}, but {2, 3} run every token. The router scores nothing; a bonus of
+    // 2 for the experts a block ran for the previous token beats its margin of 1 from the second token on (the
+    // first has no previous token), and the learned co-occurrence of block 0's experts with block 1's lifts block 1.
+    experimental::PrerouterTrace wrong(0);
+    wrong.begin(2, 6, 2);
+    feed_prerouter(wrong, 5, {0, 0, 0, 0, 1, 1}, {2, 3});
+    CHECK(wrong.precision(0) == 0.0);                  // A router
+    CHECK(wrong.precision(5) == 16.0 / 20.0);          // C g=2: 4 tokens x 2 blocks x 2 experts of 20 guesses
+    CHECK(wrong.precision(3) > wrong.precision(0));    // B b=2: the prior learned from block 0 to block 1
+    CHECK(wrong.report().find("A router 0.0%") != std::string::npos);
+    CHECK(wrong.report().find("C g=2 80.0%") != std::string::npos);
+
+    // begin() starts over; a block that reports without a prediction scores nothing.
+    wrong.begin(2, 6, 2);
+    CHECK(wrong.guesses() == 0);
+    wrong.chosen(0, std::vector<int32_t>{2, 3});
+    CHECK(wrong.guesses() == 0);
+}
+
+namespace {
+std::vector<std::string>& prerouter_log() {
+    static std::vector<std::string> lines;
+    return lines;
+}
+void capture_prerouter_log(int, const char* message, void*) {
+    if (std::strstr(message, "prerouter:") != nullptr) prerouter_log().emplace_back(message);
+}
+}  // namespace
+
+// The trace only counts: a streamed mixture-of-experts model answers the same with it, and logs its precision.
+TEST_CASE("The prerouter trace leaves a streamed MoE's reply unchanged and logs its precision") {
+    test::TinyModelSpec spec;
+    spec.n_layers = 4;
+    spec.n_expert = 8;
+    spec.n_expert_used = 2;
+    spec.identical_experts = false;
+    const std::string path = temp_path("prerouter_moe.gguf");
+    test::write_tiny_model(path, spec);
+    std::string replies[2];
+    prerouter_log().clear();
+    log::set_sink(&capture_prerouter_log, nullptr);
+    log::set_level(log::Level::Info);
+    for (const bool trace : {false, true}) {
+        EngineConfig config;
+        config.model_path = path;
+        config.backend = BackendKind::Cpu;
+        config.thermal_polling = false;
+        config.power.target_tps = 10000.0;  // effectively unpaced
+        config.expert_cache_mb = 1;         // streamed experts: the engine predicts them
+        config.experimental.prerouter_trace = trace;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        SamplingParams p;
+        p.temperature = 0.0f;
+        p.max_tokens = 70;
+        std::string& text = replies[trace ? 1 : 0];
+        auto stats = engine.value()->generate("hello world", p, [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        REQUIRE(stats.has_value());
+        CHECK(stats->generated_tokens == p.max_tokens);
+    }
+    log::set_sink(nullptr, nullptr);
+    CHECK(replies[0] == replies[1]);
+    REQUIRE(!prerouter_log().empty());
+    CHECK(prerouter_log().front().find("precision@2:") != std::string::npos);
+
+    // A model without experts has nothing to measure.
+    EngineConfig dense;
+    dense.model_path = tiny_model();
+    dense.backend = BackendKind::Cpu;
+    dense.thermal_polling = false;
+    dense.experimental.prerouter_trace = true;
+    auto refused = Engine::create(dense);
+    CHECK(!refused.has_value());
+    std::remove(path.c_str());
 }
 
 // A forced pass normally samples the next token from its last row; early

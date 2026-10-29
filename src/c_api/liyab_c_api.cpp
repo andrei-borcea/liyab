@@ -243,6 +243,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->draft_tree = d.draft_tree ? 1 : 0;
     config->max_sequences = d.max_sequences;
     config->i8mm_tiles = d.experimental.i8mm_tiles ? 1 : 0;
+    config->prerouter_trace = d.experimental.prerouter_trace ? 1 : 0;
 }
 
 void liyab_sampling_params_default(liyab_sampling_params* params) {
@@ -309,6 +310,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.adapter_memory_mb = config->adapter_memory_mb;
         c.draft_tree = config->draft_tree != 0;
         c.experimental.i8mm_tiles = config->i8mm_tiles != 0;
+        c.experimental.prerouter_trace = config->prerouter_trace != 0;
         c.max_sequences = std::max(config->max_sequences, 1);  // a zero-filled config: one sequence
 
         auto engine = liyab::Engine::create(c);

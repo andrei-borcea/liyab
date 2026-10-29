@@ -4645,6 +4645,7 @@ void Transformer::predict_experts(int32_t layer, int32_t n, const Route& route) 
     std::vector<uint8_t> group_ok;
     for (size_t t = 0; t < un; ++t) {
         const float* logits = pred_logits_.data() + t * E;
+        if (expert_observer_ != nullptr && n == 1) expert_observer_->predicted(layer, {logits, E});
         if (biased_softmax) {
             const float mx = *std::max_element(logits, logits + E);
             float sum = 0.0f;
@@ -4942,6 +4943,7 @@ Status Transformer::moe_ffn(int32_t layer, const BlockWeights& w, int32_t n, con
     for (size_t e = 0; e < E; ++e) {
         if (!assigned[e].empty()) chosen.push_back(static_cast<int32_t>(e));
     }
+    if (expert_observer_ != nullptr && n == 1 && expert_store_ != nullptr) expert_observer_->chosen(layer, chosen);
     if (expert_store_ != nullptr) {
         if (predicted_layer_ == layer) {  // both lists are sorted
             predictions_.predicted += predicted_.size();

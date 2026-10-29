@@ -55,6 +55,21 @@ public:
     virtual bool ffn_matmul(int32_t layer, FfnProjection projection, const float* x, float* y, int32_t n) = 0;
 };
 
+// Watches the streamed-expert predictor against the router (measurement only: it never changes the output).
+// Called by Transformer for single-token decode steps of a mixture-of-experts model whose experts stream from
+// storage (the prediction exists only then), in block order within a token.
+class ExpertPredictionObserver {
+public:
+    virtual ~ExpertPredictionObserver() = default;
+    // When attached: the model's block count, experts per block and experts the router picks per token.
+    virtual void begin(int32_t n_layers, int32_t n_experts, int32_t experts_per_token) = 0;
+    // The router logits of block `layer` (n_experts floats), computed before that block runs from the residual
+    // stream of the block before it: what the predictor sees when it chooses experts to prefetch.
+    virtual void predicted(int32_t layer, std::span<const float> router_logits) = 0;
+    // The experts block `layer` really ran for the token, sorted. Follows predicted() for the same block.
+    virtual void chosen(int32_t layer, std::span<const int32_t> experts) = 0;
+};
+
 struct ForwardHooks {
     // Set: forward() checks it between blocks and returns Cancelled when it
     // is true; the pass is then abandoned (Transformer::abandon_pass).

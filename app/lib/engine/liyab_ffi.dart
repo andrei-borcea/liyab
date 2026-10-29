@@ -120,6 +120,8 @@ final class LiyabEngineConfig extends Struct {
   external int maxSequences; // sequences kept at once, the default one included (liyab_sequence_open); 1: one
   @Int32()
   external int i8mmTiles; // experimental: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles
+  @Int32()
+  external int prerouterTrace; // experimental, measurement only: expert-predictor precision logged every 64 tokens
 }
 
 /// liyab_adapter_info: one loaded LoRA adapter (liyab_engine_adapter_info).

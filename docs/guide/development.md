@@ -22,7 +22,7 @@ Commands and source paths in examples are relative to the repository root.
 
 These are built with `-DLIYAB_ENABLE_EXPERIMENTAL=ON` (`scripts/build_android.sh --experimental`; the app's build
 includes them, all off by default). Enable them through `EngineConfig::experimental`, the C config or `liyab-cli
---early-exit P --prune-heads R --egls T --tdss hot|always --i8mm-tiles`.
+--early-exit P --prune-heads R --egls T --tdss hot|always --i8mm-tiles --prerouter-trace`.
 
 | Module | What it does | Measured | Verdict |
 | :--- | :--- | :--- | :--- |
@@ -30,6 +30,7 @@ includes them, all off by default). Enable them through `EngineConfig::experimen
 | **Head pruning** | Ranks query heads by `Wo` column norm; while throttled, skips the least important heads' attention | 50% heads: +12% at 1,536 context | Lossy |
 | **EGLS** | Skips a block's FFN when the residual's entropy barely changes | TinyLlama: +5–48% | Output diverges early: not viable without a model trained for it |
 | **i8mm 2×2 tiles** (`i8mm_tiles`) | Q4_K / Q5_K / Q6_K CPU matmuls over two or more activation rows (prefill, speculative verification) as 2×2 SMMLA tiles: two weight rows against two activation rows, 32 multiply-adds per instruction. The integer sums and the float epilogue (`epilogue_k4`, `epilogue_scaled`) are the dot-product kernels', so replies are bit-identical. The tiles read the weights as stored, so the flag keeps the i8mm repacked layouts off | Snapdragon 8 Elite, 2048×8192 × 4 rows: Q4_K 681 → 601–617 µs, Q5_K 683 → 863–895 µs, Q6_K 756 → 953–1019 µs (measured before the repacked layouts existed) | Exact, but slower than the default except Q4_K: the zips that build the tiles, the per-sub-block scale multiplies and the exact epilogue cost more than the halved multiply-adds. Ignored without i8mm |
+| **Prerouter trace** (`prerouter_trace`) | Measures, on decode steps of a streamed mixture-of-experts model, the precision@k of the engine's guess of the next block's experts (its router run on the residual stream at hand) against the experts the router picked. Two corrections are scored next to it: a co-occurrence prior learned online (how often expert b of block l follows the experts of block l − 1) and the experts the block ran for the previous token. Seven candidates (`PrerouterTrace::candidates()`) are logged at INFO level every 64 tokens (stderr in `liyab-cli`, logcat on Android) | Counts only: it never changes which experts are prefetched or run, so replies are identical | A measurement for choosing a model-agnostic prerouter, not a feature. Needs experts that stream from storage (else it logs a warning and nothing more) and an MoE model (else `Unsupported`); sees single-token decode steps only |
 | **JIT unpacker** | Emits unrolled AArch64 NEON unpack routines at runtime (W^X) | +37% for a 4,096-element row | Row-sized routines only; not on the hot path; unavailable on iOS |
 | **TDSS (2:4 sparsity)** | While throttled, FFN switches to a 2:4 magnitude-pruned copy (`TBL` gather + `SDOT`) | −54% decode on the phone | Counterproductive without sparse units |
 | **io_uring loader** | `O_DIRECT` reads via raw io_uring syscalls | — | Android denies `io_uring_setup` to apps; kept for platforms that allow it |

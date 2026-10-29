@@ -38,6 +38,10 @@ struct ExperimentalConfig {
     // The tiles read the weights as stored, so this also keeps the i8mm repacked layouts (the default on such
     // CPUs) off, whatever it costs the matmuls the tiles do not cover.
     bool i8mm_tiles = false;
+    // Measurement only: logs how well the streamed-expert predictor (and two cheaper-to-learn corrections of it)
+    // guess the experts the router picks, every 64 decode tokens, at INFO level. The output is unchanged. Needs a
+    // mixture-of-experts model (else Unsupported); it prints nothing unless the experts stream from storage.
+    bool prerouter_trace = false;
     // (KV dedup, the experimental persistent prefix KV cache, is retired: the
     // prefix cache's store keeps a shared prefix once, on storage across
     // processes, for every model, within its caps; see prefix_cache_dir.)
