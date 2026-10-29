@@ -165,6 +165,43 @@ TEST_CASE("MmapLoader parses GGUF metadata and tensors without copying") {
     std::remove(path.c_str());
 }
 
+// A range relocated over a requantize()d tensor (read along, as when neighbouring weights are placed together) must
+// leave that tensor in its own memory: its bytes are no longer the file's, and pointing it back at them reads
+// repacked rows as plain ones.
+TEST_CASE("MmapLoader relocate moves plain tensors and leaves requantized ones in their own memory") {
+    const std::string path = temp_path("relocate.gguf");
+    test::write_tiny_model(path);
+    auto loader = MmapLoader::open(path);
+    REQUIRE(loader.has_value());
+    MmapLoader& m = *loader.value();
+    const TensorView* q = m.tensor("blk.0.attn_q.weight");
+    const TensorView* k = m.tensor("blk.0.attn_k.weight");
+    REQUIRE(q != nullptr);
+    REQUIRE(k != nullptr);
+    REQUIRE(q->type == DType::Q8_0);
+    REQUIRE(m.requantize([](const TensorView& t) { return std::string_view(t.name) == "blk.0.attn_q.weight"; },
+                         DType::Q8_0_R4).has_value());
+    REQUIRE(m.converted(*q));
+    const uint8_t* converted_data = q->data;
+
+    const auto begin = static_cast<size_t>(std::min(q->file_offset, k->file_offset));
+    const auto end = static_cast<size_t>(std::max(q->file_offset + q->nbytes, k->file_offset + k->nbytes));
+    std::vector<std::pair<void*, size_t>> regions;
+    auto moved = m.relocate({{begin, end}}, [&](size_t bytes) -> uint8_t* {
+        void* p = os::map_anonymous(bytes);
+        if (p != nullptr) regions.emplace_back(p, bytes);
+        return static_cast<uint8_t*>(p);
+    });
+    REQUIRE(moved.has_value());
+    CHECK(q->data == converted_data);       // untouched
+    CHECK(q->type == DType::Q8_0_R4);
+    const uint8_t* mapping = m.file().data();
+    CHECK((k->data < mapping || k->data >= mapping + m.file_size()));  // moved out of the mapping...
+    CHECK(std::memcmp(k->data, mapping + k->file_offset, k->nbytes) == 0);  // ...with the file's bytes
+    for (const auto& [p, bytes] : regions) os::unmap_anonymous(p, bytes);
+    std::remove(path.c_str());
+}
+
 TEST_CASE("MmapLoader rejects malformed files") {
     const std::string good = temp_path("good.gguf");
     test::write_tiny_model(good);

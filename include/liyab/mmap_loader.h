@@ -163,6 +163,7 @@ public:
     // points into that memory. Used to place weights in memory an
     // accelerator reads in place (Backend::allocate_shared). Returns the
     // bytes moved; on failure no tensor of the failing range was moved.
+    // Tensors converted by requantize() keep their own memory.
     Result<size_t> relocate(const std::vector<std::pair<size_t, size_t>>& ranges,
                             const std::function<uint8_t*(size_t bytes)>& allocate);
     // Converts every tensor for which `select` is true into `target`, into

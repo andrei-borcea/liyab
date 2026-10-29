@@ -642,7 +642,9 @@ Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>
             std::memcpy(dst, f.data() + aligned, std::min(length, f.size() - aligned));
         }
         for (TensorView& t : tensors_) {
-            if (t.shard == 0 && t.file_offset >= begin && t.file_offset + t.nbytes <= end) {
+            // A requantize()d tensor lives in memory of its own (its type and bytes are no longer the file's): a
+            // range read along over it must not point it back at the file's bytes.
+            if (t.shard == 0 && t.file_offset >= begin && t.file_offset + t.nbytes <= end && !converted(t)) {
                 t.data = dst + (t.file_offset - aligned);
             }
         }
