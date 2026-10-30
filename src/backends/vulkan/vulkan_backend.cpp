@@ -173,6 +173,24 @@ int pipeline_index(DType type) {
     return 0;
 }
 
+// Types the upload path (weights not in shared memory) repacks into one of its layouts: the same list as the switch
+// in VulkanBackend::upload(), which holds each layout's sizes. liyab-kernels checks this list and native_index()
+// against what the backend really runs.
+bool uploadable(DType type) {
+    switch (type) {
+        case DType::F32:
+        case DType::F16:
+        case DType::Q4_0:
+        case DType::Q4_1:
+        case DType::Q4_K:
+        case DType::Q8_0:
+        case DType::Q5_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct Params {
     uint32_t rows;
     uint32_t cols;
@@ -250,7 +268,11 @@ public:
     [[nodiscard]] std::string description() const override {
         return "vulkan (" + device_name_ + ", " + std::to_string(uploaded_bytes_ >> 20) + " MiB repacked weights)";
     }
-    [[nodiscard]] bool supports(DType) const noexcept override { return true; }
+    // A type runs on the GPU in at least one placement: repacked from ordinary memory (7 types), or read in place
+    // from shared memory by a native kernel (23). The rest runs on the CPU.
+    [[nodiscard]] bool supports(DType type) const noexcept override {
+        return uploadable(type) || native_index(type) >= 0;
+    }
     Status matmul(const TensorView& w, const float* x, float* y, int32_t n) override {
         const TensorView* ws[] = {&w};
         float* ys[] = {y};
