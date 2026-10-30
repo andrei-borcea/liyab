@@ -7,6 +7,7 @@ Commands and source paths in examples are relative to the repository root.
 ## On this page
 
 - [Measured results](#measured-results)
+- [Weight formats on the M4 Pro](#weight-formats-on-the-m4-pro-liyab-kernels)
 - [Qwen3.6-35B-A3B: a 22 GB MoE on a phone](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)
 - [A dense 27B larger than RAM](#a-dense-27b-larger-than-ram)
 - [Models that fit in RAM](#models-that-fit-in-ram)
@@ -21,6 +22,46 @@ Commands and source paths in examples are relative to the repository root.
 ---
 
 ## Measured results
+
+### Weight formats on the M4 Pro (liyab-kernels)
+
+`liyab-kernels` on 30 October 2026, Apple M4 Pro (10 performance cores, 273 GB/s quoted), 128 MiB weight matrices,
+the minimum of a short run per cell, so indicative, not a benchmark (`liyab-bench` is). GB/s of weights read by one
+activation row; Metal numbers are for weights in shared memory. The CPU is the NEON/dot-product kernel set.
+
+| Format | bits/weight | CPU GB/s | Metal GB/s |
+| :--- | ---: | ---: | ---: |
+| F32 | 32.00 | 241 | 198 |
+| F16 | 16.00 | 173 | 180 |
+| Q8_0 | 8.50 | 234 | 209 |
+| Q6_K | 6.56 | 241 | 143 |
+| Q5_K | 5.50 | 203 | 87 |
+| Q4_K | 4.50 | 248 | 78 |
+| Q4_0 | 4.50 | 219 | 208 |
+| Q4_1 | 5.00 | 114 | 205 |
+| Q5_0 / Q5_1 | 5.50 / 6.00 | 151 / 146 | CPU |
+| Q3_K / Q2_K | 3.44 / 2.62 | 101 / 95 | CPU |
+| IQ4_XS / IQ4_NL | 4.25 / 4.50 | 201 / 176 | CPU |
+| IQ3_S / IQ3_XXS / IQ2_S / IQ2_XS / IQ2_XXS | 3.44 / 3.06 / 2.56 / 2.31 / 2.06 | 45 / 63 / 49 / 62 / 57 | CPU |
+| IQ1_M / IQ1_S | 1.75 / 1.56 | 39 / 59 | CPU |
+| TQ2_0 / TQ1_0 | 2.06 / 1.69 | 178 / **6** | CPU |
+| MXFP4 / NVFP4 | 4.25 / 4.50 | 132 / **14** | CPU |
+| BF16 | 16.00 | 139 | CPU |
+
+* The CPU reads Q4_K at 248 GB/s, close to the memory ceiling, while the Metal Q4_K and Q5_K kernels reach 78 and
+  87 GB/s. The same GPU reads Q4_0 at 208 GB/s, so those two kernels, not the memory, set their rate. Q4_0, Q8_0 and
+  F16 on Metal are within 11% of the CPU.
+* TQ1_0 (6 GB/s) and NVFP4 (14 GB/s) have no vector kernel on ARM: they go through the generic decode-and-multiply
+  path. Most I-quants (IQ1 to IQ3) have NEON kernels but run at about a quarter of the K-quants' rate.
+* The cost per row of a 16-row call, relative to a one-row call: on Metal 1.1–1.2 for Q4_0 and Q4_1, 0.9 for Q4_K
+  and Q5_K, 0.65 for Q8_0 and Q6_K. It dispatches one threadgroup per output row and activation row, so each reads
+  the weights again; cache reuse saves up to a third and nothing for the 4-bit legacy formats, so prefill and
+  speculative verification gain little there. On the CPU, Q8_0, Q4_K, Q5_K, Q6_K and MXFP4 reach 0.35–0.65 (their
+  multi-row kernels decode each weight row once for all activation rows); the others stay near 1.
+* On x86-64 (a build run under Rosetta 2, so the absolute figures are translated and are not x86 speeds): Q2_K,
+  IQ2_XXS and TQ2_0 run at 2–4 GB/s with the AVX2 set and with the scalar set alike, so they have no AVX2 kernel;
+  Q4_K runs 3.3 times faster with AVX2 than scalar (44 against 13 GB/s). Q4_0 and Q8_0 ran faster scalar than with AVX2
+  (56 and 131 against 19 and 68 GB/s), which should be checked on a real x86 CPU before it is believed.
 
 ### M4 Pro dense 27B development check
 

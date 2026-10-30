@@ -36,7 +36,7 @@ ROSETTA_ADVERTISE_AVX=1 ctest --test-dir build-x86 --output-on-failure
 ```
 
 ```bash
-# Android (arm64-v8a): libliyab.so, liyab-cli and the tests in build/android/arm64-v8a
+# Android (arm64-v8a): libliyab.so, liyab-cli, liyab-kernels and the tests in build/android/arm64-v8a
 scripts/build_android.sh                     # --experimental, --abi, --api, --ndk, --no-vulkan, ... (see --help)
 
 # iOS: build/ios/Liyab.xcframework (device arm64 + simulator arm64/x86_64), importable from Swift as `Liyab`

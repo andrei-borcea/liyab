@@ -118,6 +118,7 @@ cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 
 ./build/liyab-cli --device
+./build/liyab-kernels      # which weight formats each backend runs on this host, and whether it runs them right
 ./build/liyab-cli -m model.gguf -p "Explain unified memory in one paragraph." -n 128
 ```
 

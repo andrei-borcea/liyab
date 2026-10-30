@@ -43,6 +43,43 @@ and removes the snapshot files it left there.
 
 ---
 
+## Kernel coverage and conformance
+
+The engine sends a matrix product to a backend, and a backend that answers `Unsupported` has that one product run on
+the CPU instead. `liyab-kernels` (and `test_kernels`, which enforces the same rules) shows what that means on a host
+by running it: for each of the 26 weight formats (every type `dtype_from_ggml` recognizes but `I32`; a format added
+there is checked without touching the check) and each backend, it builds random valid weights, multiplies them by
+activations and compares the result with `quant::dequantize_row` of the same bytes, accumulated in double precision.
+The code and its reasoning are in [`src/core/kernel_conformance.h`](../../src/core/kernel_conformance.h).
+
+* **Random valid weights, no format knowledge.** A block is redrawn until its decoded values are finite and their
+  largest magnitude lies in [0.05, 8], so scale fields never give NaN or values 10⁹ times the others.
+* **A tolerance of 1e-5 of Σ|w·x|.** The activations lie on the int8 grid the CPU quantizes to (multiples of 2⁻⁶,
+  one of them ±127·2⁻⁶ in every run of 32), so quantizing them loses nothing and only float rounding is left:
+  correct kernels deviate by ~5·10⁻⁸ (the tool prints the largest deviation seen). A wrong scale, sign or bit in any
+  block shows hundreds of times over; a result rounded through half precision (an fp16 accumulator) fails too.
+  A deliberate one-bit shift error in the scale decoding of the Metal Q4_K/Q5_K kernels was reported at 4,900–15,000×
+  the tolerance, and only in those two formats.
+* **Two placements.** Ordinary memory 32 bytes into a page (what a memory-mapped model is), and, where the backend
+  has `allocate_shared`, shared memory, filled and then refilled in place: a backend that keeps a copy of the old
+  contents is reported as wrong "after a refill".
+* **Shapes** with 1 and several blocks per row, row counts that are not tile multiples (37, 5, 8), and 1, 2, 5 and 33
+  activation rows.
+* **The claim.** `Backend::supports(type)` must be true exactly when the type ran in some placement and shape.
+* **Batching.** An n-row call, n one-row calls and a grouped call must give the same bits on the CPU backend
+  (speculative verification and concurrent sequences rely on it); other backends are only reported (`=` or `~`).
+* **Throughput** (unless `--no-timing`): GB/s of weights for one activation row and the per-row cost of a 16-row call
+  relative to it (about 1: the weights are read again for every row), on a 128 MiB matrix, in shared memory where
+  the backend has it. Indicative; `liyab-bench` gives stable CPU numbers.
+
+What it shows today (Apple M4 Pro, 29–30 October 2026): the CPU runs all 26 formats right and batch-invariant with
+the NEON, AVX2 (an x86-64 build under Rosetta 2) and scalar kernel sets. Metal claims 8 (F32, F16, Q4_0, Q4_1, Q8_0,
+Q4_K, Q5_K, Q6_K), runs them right in both placements, and the other 18 run on the CPU. Vulkan, from its source, runs
+7 types from ordinary memory (F32, F16, Q4_0, Q4_1, Q4_K, Q5_0, Q8_0) and 23 from shared memory; the check has not
+yet been run on a device. [Throughput by format](benchmarks.md#weight-formats-on-the-m4-pro-liyab-kernels).
+
+---
+
 ## Testing
 
 The tests depend on nothing beyond the compiler. They generate small GGUF models on the fly, so nothing needs to be
@@ -62,6 +99,7 @@ interpreter: `describe_model_registry`.
 | `test_kv_reuse` | KV reused away from its prefix: rows copied out of and into any positions bit for bit (values in keys too); keys moved to other positions equal to the keys computed there, within two rounding steps, for every RoPE variant (adjacent and half pairs, partial rotation, `rope_freqs` with linear scaling, YaRN, LongRoPE, Q/K norms after RoPE, windowed and global RoPE tables, latent attention's RoPE key) and every cache format, key scales included, with values, unrotated latents and moves by 0 keeping their bits; blocks run at scattered positions giving the rows and logits of a whole pass bit for bit (dense, windowed, latent attention, MoE); hybrid models and sliding-window caches refused; segments reused with every token recomputed giving a full prefill's rows and logits bit for bit for every criterion (dense, key-scaled, windowed, latent attention), stored in chunks of one, two and four pages and starting inside a page, a copy reused where it was computed needing none, a damaged copy processed instead; a segment's tokens the same wherever it appears, BOS outside it, malformed ranges refused; through the engine: segments kept and reused elsewhere, one longer than two of the store's chunks reused whole, a request that marks none getting a fresh context's reply (the reused rows processed again, set aside and saved only up to the first one, restored state included), refusals with their reasons (off, no prefix cache, a hybrid model, a target never met, read back from `cache_dir`) leaving marked prompts exact; the calibration in stages, stopped and resumed, keeping the smallest share whose bound, and every larger share's, is within its target (a question-guided criterion with a pass per question); in the background: the engine created at once, marked prompts processed as usual until the calibration ends, a call stopping it without `Busy` and finding its context as it left it, the result read back from `cache_dir`, an engine closed while it runs; the C API (`Busy` while calibrating) |
 | `test_sequences` | Several sequences: `forward_batch()` giving every sequence the bits `forward()` gives it alone, whatever the others in the pass do (prompts in passes, decoding, sequences joining later), on dense, gated, partial-RoPE, Q/K-normed and key-scaled models (Q8_0, F16, Q4_0 caches), windowed blocks (Gemma 2/3, Phi-3), hybrids with rollback checkpoints (and a rollback in a parked context after a shared pass), MoE in place and streamed (fused gate/up too), latent attention absorbed, expanded and automatic (forms mixed in one pass), LoRA adapters per sequence (dense, per-expert, shared expert); a cancelled pass returning every context to its start; what is refused. Through the engine: concurrent generations (greedy and seeded sampling) equal to each one's output alone on those models, with suffix drafts, under one grammar, with per-sequence adapters, one cancelled while the others go on, a background prompt stopped for the user's chat (its first token before the background prompt ends), a context one sequence set aside restored by another, the limits (`Busy`, `max_sequences`, a draft model); the C API. Sequence memory: with no sequence open, `max_sequences` 4 gives the memory plan, expert cache, requantization decision and greedy output of `max_sequences` 1 (dense, hybrid, hybrid MoE streamed, and a hybrid MoE whose tight cache requantizes); an open sequence takes its states out of the expert cache and closing gives them back (out of order too), plain models and in-place experts borrowing nothing; a cache at its minimum refusing the open (`OutOfMemory`, C API too) with nothing changed; the expert store lending and repaying slots while other threads acquire experts, each one's bytes the file's; sequences opened and closed while another decodes, its output unchanged |
 | `test_lora` | LoRA adapters: base model + adapter giving the logits of the model with the adapter merged into its weights (prefill and decoding), for dense blocks and the LM head, F32 / F16 / BF16 / Q8_0 adapter tensors, QKV bias, a mixture of experts' routed experts (split and fused gate/up), shared expert and router, hybrid DeltaNet blocks and latent attention's whole projections; no adapter giving the base bits back; malformed files and unsupported targets refused (half pairs, stray tensors, mismatched ranks, missing or misshapen matrices, token embeddings, activated LoRA, latent attention's per-head matrices); through the engine: adapters loaded, listed and selected per generation (the merged model's replies, the base model's without, a context continued only under the same adapter and scale), speculative decoding verifying with the adapter (tree passes under it giving every branch a linear pass's bits), the prefix cache and saved states keeping contexts apart by adapter (in RAM, on storage across engines), the memory cap releasing the least recently selected and mapping it again, refusals; the C API |
+| `test_kernels` | Every weight format the loader recognizes (all 26) on every backend of the host, against a reference decoded from the same bytes ([what is checked](#kernel-coverage-and-conformance)): the CPU backend right on every format and giving the same bits for any batch, Metal and Vulkan doing exactly what `supports()` says, shared regions refilled in place; and the check itself failing on a wrong answer, a refusal, an error, a missing write, a false claim, a batch-dependent result and a backend that keeps the old contents of a region |
 | `test_backends` | Per-matmul latency per backend, grouped submissions, batched CPU matmuls equal to one matmul per item, the final logit soft-cap giving the same bits on 1 and N threads (and its cost on a 256k vocabulary); the engine's own tanh within 1.32 ulp of the true one, odd, monotone and saturating, its results hashed to the same pinned value on every platform |
 | `test_experimental` | Experimental modules, plus throughput and I/O benchmarks (`LIYAB_BENCH=0` skips them) |
 | `describe_model_registry` | `tools/describe_model.py --self-test`: every row of the registry in `architecture.cpp` read and printed back as the file writes it, so the tool that proposes rows keeps the registry's format |
@@ -70,6 +108,10 @@ interpreter: `describe_model_registry`.
 
 Benchmarks and tools built with the tests:
 
+* `liyab-kernels`: which weight formats each backend runs on this host, and whether it runs them right
+  ([details below](#kernel-coverage-and-conformance)). Exit status 1 when anything is wrong, so a build for a new
+  host (Android, x86-64, Windows) can be gated on it. `--backend cpu|metal|vulkan`, `--only q4_k,iq2_xs`,
+  `--threads N`, `--no-timing`.
 * `liyab-bench`: CPU matvec throughput on a MoE's decode shapes, against the RAM read ceiling. It prints the kernel
   set first; on x86-64, `LIYAB_KERNELS=scalar` runs the same cases on the scalar kernels. `--prefill model.gguf`
   times a model's prefill instead: prompts of each `--tokens` length (synthetic token ids) in passes of `--batch`
@@ -491,7 +533,7 @@ src/backends/           cpu/ (its NEON and AVX2 kernels are in src/core/quant*),
                         qnn/ and neuropilot/ (runtime probes)
 src/experimental/       early exit, head pruning, EGLS, TDSS, JIT unpacker, io_uring loader
 src/c_api/              C ABI implementation
-tools/                  liyab-cli, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench, liyab-seq-bench,
+tools/                  liyab-cli, liyab-kernels, liyab-bench, liyab-kl, liyab-tok, liyab-experts, liyab-spec-bench, liyab-seq-bench,
                         liyab-embed, liyab-reuse, conform_reference.py, tokenizer_reference.py, chat_template_reference.py
                         and pooling_reference.py (Hugging Face references), describe_model.py and
                         reference_trace.py (registry rows established from the Hugging Face implementation and

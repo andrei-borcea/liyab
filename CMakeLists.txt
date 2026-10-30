@@ -124,6 +124,7 @@ add_library(liyab_core OBJECT
   src/core/quant_lowbit.cpp
   src/core/quant_repack.cpp
   src/core/quant_i8mm.cpp
+  src/core/kernel_conformance.cpp
   src/core/thread_pool.cpp
   src/core/os.cpp
   src/core/mmap_loader.cpp
@@ -382,6 +383,7 @@ if(LIYAB_BUILD_TESTS)
   list(APPEND _liyab_tests test_sequences)
   list(APPEND _liyab_tests test_ssm)
   list(APPEND _liyab_tests test_compression)
+  list(APPEND _liyab_tests test_kernels)
   if(LIYAB_ENABLE_EXPERIMENTAL)
     list(APPEND _liyab_tests test_experimental)
   endif()
@@ -397,6 +399,11 @@ if(LIYAB_BUILD_TESTS)
   add_executable(liyab-bench tools/liyab_bench.cpp)
   target_link_libraries(liyab-bench PRIVATE liyab_core liyab-compat)
   target_include_directories(liyab-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  # Which weight formats each backend runs on this host, and whether it runs them right (see
+  # src/core/kernel_conformance.h); built for Android too, to read a phone's coverage.
+  add_executable(liyab-kernels tools/liyab_kernels.cpp)
+  target_link_libraries(liyab-kernels PRIVATE liyab_core liyab-compat)
+  target_include_directories(liyab-kernels PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Quality cost of lossy options: KL / top-1 / perplexity against a saved reference.
   add_executable(liyab-kl tools/liyab_kl.cpp)
   target_link_libraries(liyab-kl PRIVATE liyab_core liyab-compat)

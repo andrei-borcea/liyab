@@ -24,10 +24,20 @@ public:
 
     [[nodiscard]] virtual BackendKind kind() const noexcept = 0;
     [[nodiscard]] virtual std::string description() const = 0;
+    // Whether this backend runs `weight_type` natively in at least one placement of the weights (Vulkan, for example,
+    // repacks some types from ordinary memory and reads others in place from shared memory). false: every matmul of
+    // that type answers Unsupported and the caller runs it on the CPU. The CPU backend runs every format. The claim
+    // is checked by running it: liyab-kernels prints the result, test_kernels enforces it.
     [[nodiscard]] virtual bool supports(DType weight_type) const noexcept = 0;
 
     // y[n][w.rows()] = x[n][w.cols()] · wᵀ  (row-major activations, f32).
     // `x` and `y` must not alias. Thread-compatible: one call at a time.
+    // Returns ErrorCode::Unsupported when this backend has no kernel for the tensor (its type, a width it cannot
+    // take, a size past a device limit): the caller then runs the product on the CPU, so `y` may have been written
+    // and must not be relied on. Any other error aborts the pass.
+    // A row's result should not depend on `n` or on the other rows of the call. The CPU backend guarantees the same
+    // bits for any n, and for matmul_group() against matmul() (speculative verification and concurrent sequences
+    // rely on it); liyab-kernels reports whether another backend does.
     virtual Status matmul(const TensorView& w, const float* x, float* y, int32_t n) = 0;
 
     // Unified memory (optional). Returns `bytes` of host memory that this

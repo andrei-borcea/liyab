@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds libliyab.so (+ liyab-cli and the unit tests) for Android with the NDK.
+# Builds libliyab.so (+ liyab-cli, liyab-kernels and the unit tests) for Android with the NDK.
 #
 #   scripts/build_android.sh [--abi arm64-v8a] [--api 28] [--build-type Release]
 #                            [--ndk PATH] [--no-vulkan] [--no-qnn] [--no-neuropilot]
 #                            [--no-tests] [--experimental] [--out DIR]
 #
-# Output: <out>/<abi>/libliyab.so, liyab-cli, liyab-bench, liyab-kl, test_* (default out: build/android)
+# Output: <out>/<abi>/libliyab.so, liyab-cli, liyab-kernels, liyab-bench, liyab-kl, test_* (default out: build/android)
 # NDK lookup order: --ndk, $ANDROID_NDK_HOME, $ANDROID_NDK_ROOT, newest NDK under
 # $ANDROID_HOME/ndk, $ANDROID_SDK_ROOT/ndk, ~/Library/Android/sdk/ndk, ~/Android/Sdk/ndk.
 # Build jobs: set CMAKE_BUILD_PARALLEL_LEVEL (for example, 4); unset uses the generator's default.
@@ -92,7 +92,8 @@ echo "==> Built:"
 ls -lh "$LIB" "$BUILD_DIR/liyab-cli" 2>/dev/null | awk '{print "    " $5 "  " $9}'
 cat <<EOF
 ==> Run on a device (USB debugging enabled):
-    adb push $BUILD_DIR/liyab-cli $BUILD_DIR/test_* /data/local/tmp/
+    adb push $BUILD_DIR/liyab-cli $BUILD_DIR/liyab-kernels $BUILD_DIR/test_* /data/local/tmp/
     adb shell 'cd /data/local/tmp && for t in test_*; do ./\$t || exit 1; done'
     adb shell /data/local/tmp/liyab-cli --device
+    adb shell /data/local/tmp/liyab-kernels          # which weight formats the phone's CPU and GPU run, and right
 EOF
