@@ -1,6 +1,6 @@
 // Liyab — fast dot kernels for the K-quants (Q2_K to Q6_K), TQ2_0,
 // the 256-value I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-// IQ3_S, IQ4_XS) against Q8_K activations, and IQ4_NL / MXFP4 against Q8_0.
+// IQ3_S, IQ4_XS) against Q8_K activations, and IQ4_NL / MXFP4 / Q1_0 against Q8_0.
 //
 // The AArch64 NEON kernels are adapted from llama.cpp (ggml),
 // ggml/src/ggml-cpu/arch/arm/quants.c (ggml_vec_dot_*_q8_K and friends):
@@ -1120,6 +1120,41 @@ void dot_mxfp4_rows_neon(const BlockMxfp4* w, const BlockQ8_0* const* x, int64_t
     for (int r = 0; r < NR; ++r) out[r] = sum[r];
 }
 
+// Lane j of 16 values takes byte j / 8 of their two bytes of bits (kQ1Repeat; plus 2g for group g of a block) and
+// tests bit j % 8 of it (kQ1Bit).
+alignas(16) constexpr uint8_t kQ1Repeat[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+alignas(16) constexpr uint8_t kQ1Bit[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+
+// Q1_0 against Q8_0. A 128-value block is the sign bits of four Q8_0 blocks, so each 16 values cost one table
+// lookup that repeats the right byte of bits across its 8 lanes, one bit test and one or-not (+1 where the bit is
+// set, -1 where not), then one dot-product instruction with the activations. Per Q8_0 block the exact integer sum
+// goes through the epilogue every Q8_0 kernel shares (quant.h), block after block like dot_q8_0_q8_0; four sums
+// are reduced and converted together (exact: far below 2^24).
+float dot_q1_0_neon(const BlockQ1_0* w, const BlockQ8_0* x, int64_t nb) noexcept {
+    const uint8x16_t bit = vld1q_u8(kQ1Bit);
+    const uint8x16_t one = vdupq_n_u8(1);
+    uint8x16_t repeat[8];
+    for (int g = 0; g < 8; ++g) repeat[g] = vaddq_u8(vld1q_u8(kQ1Repeat), vdupq_n_u8(static_cast<uint8_t>(2 * g)));
+    float acc = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8x16_t bits = vld1q_u8(w[i].qs);
+        const BlockQ8_0* a = x + 4 * i;
+        int32x4_t s[4];
+        for (int k = 0; k < 4; ++k) {
+            const int8x16_t lo = vreinterpretq_s8_u8(vornq_u8(one, vtstq_u8(vqtbl1q_u8(bits, repeat[2 * k]), bit)));
+            const int8x16_t hi = vreinterpretq_s8_u8(vornq_u8(one, vtstq_u8(vqtbl1q_u8(bits, repeat[2 * k + 1]), bit)));
+            s[k] = vdot(vdot(vdupq_n_s32(0), lo, vld1q_s8(a[k].qs)), hi, vld1q_s8(a[k].qs + 16));
+        }
+        const float32x4_t sums = vcvtq_f32_s32(vpaddq_s32(vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3])));
+        const float d = h2f(w[i].d);
+        acc = epilogue_scaled(acc, h2f(a[0].d), d, vgetq_lane_f32(sums, 0));
+        acc = epilogue_scaled(acc, h2f(a[1].d), d, vgetq_lane_f32(sums, 1));
+        acc = epilogue_scaled(acc, h2f(a[2].d), d, vgetq_lane_f32(sums, 2));
+        acc = epilogue_scaled(acc, h2f(a[3].d), d, vgetq_lane_f32(sums, 3));
+    }
+    return acc;
+}
+
 #endif  // LIYAB_LOWBIT_NEON
 
 }  // namespace
@@ -1301,6 +1336,17 @@ float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
                               [](const BlockMxfp4& b) { return e8m0_to_fp32_half(b.e); });
 #else
     return dot_ext_q8_0(DType::MXFP4, row, x, n);
+#endif
+}
+
+float dot_q1_0_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
+#if defined(LIYAB_LOWBIT_AVX2)
+    if (x86::avx2_enabled()) return x86::dot_q1_0_q8_0(row, x, n);
+#endif
+#if defined(LIYAB_LOWBIT_NEON)
+    return dot_q1_0_neon(static_cast<const BlockQ1_0*>(row), x, n / 128);
+#else
+    return dot_ext_q8_0(DType::Q1_0, row, x, n);
 #endif
 }
 

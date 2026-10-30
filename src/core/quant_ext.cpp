@@ -1,6 +1,6 @@
 // Liyab — extended GGML formats: Q2_K, Q3_K, the I-quants (IQ1_S/M,
-// IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS), ternary TQ1_0/TQ2_0, MXFP4, NVFP4 and
-// BF16.
+// IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS), ternary TQ1_0/TQ2_0, 1-bit Q1_0, MXFP4,
+// NVFP4 and BF16.
 //
 // Each quantized block is decoded into a common form,
 //     x[e] = scale16[e / 16] * q[e] + bias8[e / 8]     (q: int8)
@@ -79,6 +79,7 @@ bool is_extended(DType type) noexcept {
         case DType::Q2_K: case DType::Q3_K: case DType::IQ2_XXS: case DType::IQ2_XS: case DType::IQ2_S:
         case DType::IQ3_XXS: case DType::IQ3_S: case DType::IQ1_S: case DType::IQ1_M: case DType::IQ4_NL:
         case DType::IQ4_XS: case DType::TQ1_0: case DType::TQ2_0: case DType::MXFP4: case DType::NVFP4:
+        case DType::Q1_0:
             return true;
         default:
             return false;
@@ -274,6 +275,12 @@ bool unpack_ext_block(DType type, const uint8_t* b, ExtBlock& out) noexcept {
             }
             const float d = half_at(b + 64);
             for (int j = 0; j < 16; ++j) s16[j] = d;
+            return true;
+        }
+        case DType::Q1_0: {  // d qs[16], 128 values: the sign bit of each, least significant bit first
+            const float d = half_at(b);
+            for (int e = 0; e < 128; ++e) q[e] = static_cast<int8_t>(((b[2 + e / 8] >> (e % 8)) & 1) ? 1 : -1);
+            for (int j = 0; j < 8; ++j) s16[j] = d;
             return true;
         }
         case DType::MXFP4: {  // e8m0 exponent, qs[16], 32 values (doubled e2m1)

@@ -4,7 +4,8 @@
 The original quant_vectors.bin is unchanged. Only scale fields change; all
 integer codes/grids are preserved. Every block uses the same RMS target,
 0.5 / sqrt(width), before rounding scales to the format's representation.
-Independent gguf-py decoding supplies the new expected values.
+Independent decoding (gguf-py, or llama.cpp's libggml for Q1_0: tools/quant_reference.py) supplies the new
+expected values.
 """
 import argparse
 import math
@@ -14,6 +15,8 @@ from pathlib import Path
 import numpy as np
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType as T, quants
 
+from quant_reference import dequantize
+
 
 def scale_blocks(blocks, kind, factor):
     # These are encoding layouts, not format-dependent numerical targets.
@@ -21,7 +24,7 @@ def scale_blocks(blocks, kind, factor):
         T.Q4_0: (0,), T.Q4_1: (0, 2), T.Q5_0: (0,), T.Q5_1: (0, 2), T.Q8_0: (0,),
         T.Q2_K: (80, 82), T.Q3_K: (108,), T.Q4_K: (0, 2), T.Q5_K: (0, 2), T.Q6_K: (208,),
         T.IQ2_XXS: (0,), T.IQ2_XS: (0,), T.IQ2_S: (0,), T.IQ3_XXS: (0,), T.IQ3_S: (0,),
-        T.IQ1_S: (0,), T.IQ4_NL: (0,), T.IQ4_XS: (0,), T.TQ1_0: (52,), T.TQ2_0: (64,),
+        T.IQ1_S: (0,), T.IQ4_NL: (0,), T.IQ4_XS: (0,), T.TQ1_0: (52,), T.TQ2_0: (64,), T.Q1_0: (0,),
     }
     if kind in half_offsets:
         for at in half_offsets[kind]:
@@ -80,13 +83,13 @@ def main():
         # one factor per block, shared by every projection role. Per-block
         # conditioning prevents tiny source blocks underflowing when the
         # same fixture also contains much larger blocks (notably NVFP4).
-        decoded = quants.dequantize(encoded.reshape(-1), kind).reshape(-1)
+        decoded = dequantize(encoded.reshape(-1), kind).reshape(-1)
         np.testing.assert_array_equal(decoded, expected)
         rms = np.sqrt(np.mean(expected.reshape(n_blocks, size).astype(np.float64) ** 2, axis=1, keepdims=True))
         before = float(np.sqrt(np.mean(rms ** 2)))
         assert np.all(np.isfinite(rms)) and np.all(rms > 0)
         scale_blocks(encoded, kind, target / rms)
-        values = quants.dequantize(encoded.reshape(-1), kind).astype("<f4").reshape(-1)
+        values = dequantize(encoded.reshape(-1), kind).astype("<f4").reshape(-1)
         after = float(np.sqrt(np.mean(values.astype(np.float64) ** 2)))
         assert np.all(np.isfinite(values)) and after > 0
         output += struct.pack("<II", type_id, n_blocks) + encoded.tobytes() + values.tobytes()

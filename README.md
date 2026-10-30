@@ -28,7 +28,7 @@ Run models larger than RAM by streaming weights from storage. Keep chat, tools a
 
 | Use | Available |
 | :--- | :--- |
-| Inference | GGUF v2/v3, split files, 26 weight formats; dense, MoE, recurrent and latent/sparse attention paths |
+| Inference | GGUF v2/v3, split files, 27 weight formats; dense, MoE, recurrent and latent/sparse attention paths |
 | Models larger than RAM | Dense block streaming; bounded MoE expert cache with prefetch and direct I/O |
 | Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal, Vulkan |
 | Conversations | Context reuse, saved state, paged KV, prefix cache, cancellation and concurrent sequences |
@@ -177,7 +177,7 @@ gates, tiny checkpoints, smoke runs, failed controls and incomplete variants.
 | Format / metadata | Support |
 | :--- | :--- |
 | Model files | GGUF v2/v3; single file or split; open part 1 with the other parts beside it |
-| Weights | F32 / F16 / BF16, Q4–Q8, K-quants, I-quants, TQ1_0 / TQ2_0, MXFP4, NVFP4 |
+| Weights | F32 / F16 / BF16, Q1_0, Q4–Q8, K-quants, I-quants, TQ1_0 / TQ2_0, MXFP4, NVFP4 |
 | KV cache | F16, Q8_0, Q4_0, Q4_1; key scaling where measured channel ranges require it |
 | Tokenization | SentencePiece, byte-level BPE, raw unigram; source-specific pre-tokenizer rows |
 | Chat | GGUF Jinja templates; engine/CLI rendering covers more formats than Flutter replay |

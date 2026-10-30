@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "core/kernel_conformance.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
@@ -891,7 +892,7 @@ TEST_CASE("Mapped per-layer embeddings match independent decoded tables in every
         quant::quantize_row(type, f.expected.data(), f.blocks.data(), f.n);
         formats.push_back(std::move(f));
     }
-    REQUIRE(formats.size() == 26);
+    REQUIRE(formats.size() == conformance::weight_formats().size());
     ThreadPool pool(3);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -971,7 +972,7 @@ TEST_CASE("Mapped per-layer embeddings match independent decoded tables in every
             ++checked;
         }
     }
-    CHECK(checked == 104);
+    CHECK(checked == 4 * formats.size());  // four KV cache types
     std::printf("  %zu mapped PLE format/KV cases; maximum independent error %.9g, minimum table ablation %.9g\n",
                 checked, maximum_error, minimum_ablation);
 }

@@ -185,10 +185,11 @@ completion and pooling remain available. GPT-OSS Harmony currently has this Flut
   * Q4_0/Q4_1/Q5_0/Q5_1/Q8_0;
   * Q2_K…Q6_K (and the S/M/L mixes);
   * IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS;
-  * TQ1_0/TQ2_0, MXFP4, NVFP4.
+  * Q1_0 (one sign bit per weight, 128-value blocks), TQ1_0/TQ2_0, MXFP4, NVFP4.
 
   Decoders are ported from llama.cpp's gguf-py reference, and `test_engine` checks the encoded quantized formats bit-exactly against
-  `tests/data/quant_vectors.bin`. Repeated SSM projections use a separate
+  `tests/data/quant_vectors.bin` (for Q1_0, which gguf-py cannot decode yet, the expected values come from llama.cpp's own
+  libggml: `tools/quant_reference.py`). Repeated SSM projections use a separate
   `ssm_quant_vectors.bin` with uniformly conditioned scale fields; regenerate it with
   `python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin` (gguf 0.19.0, NumPy).
   The test writer refuses reader-only formats unless explicit encoded blocks are supplied.
@@ -197,6 +198,8 @@ completion and pooling remain available. GPT-OSS Harmony currently has this Flut
   * K-quants, TQ2_0 and I-quants use NEON kernels adapted from llama.cpp (`src/core/quant_lowbit.cpp`) against
     Q8_K activations, so a whole super-block accumulates in int32.
   * IQ4_NL and MXFP4 use table lookups.
+  * Q1_0 expands each byte of sign bits to +1/−1 in registers (NEON table lookup, AVX2 shuffle) and multiplies them by
+    the activations with the dot-product instructions.
   * With i8mm, resident Q4_K/Q5_K/Q6_K/Q8_0 matrices are rearranged losslessly at load into 8-row (4-row for Q8_0)
     interleaved layouts. One SMMLA then multiplies 8 weight rows by 4 activation rows.
   * Every kernel of a format ends each block the same way: exact integer sums, then the same fused multiply-adds in

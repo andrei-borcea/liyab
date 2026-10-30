@@ -53,6 +53,7 @@ bool dtype_from_ggml(uint32_t ggml_type, DType& out) noexcept {
         case 35: out = DType::TQ2_0; return true;
         case 39: out = DType::MXFP4; return true;
         case 40: out = DType::NVFP4; return true;
+        case 41: out = DType::Q1_0; return true;
         default: return false;
     }
 }
@@ -90,6 +91,7 @@ DTypeTraits dtype_traits(DType type) noexcept {
         case DType::TQ2_0: return {"tq2_0", 256, 66};
         case DType::MXFP4: return {"mxfp4", 32, 17};
         case DType::NVFP4: return {"nvfp4", 64, 36};
+        case DType::Q1_0: return {"q1_0", 128, 18};
     }
     return {"invalid", 1, 0};
 }

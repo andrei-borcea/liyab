@@ -535,7 +535,8 @@ Status MmapLoader::parse(uint32_t shard) {
             return Status(ErrorCode::Unsupported,
                           "tensor '" + name + "' uses " + std::string(ggml_type_name(raw[i].ggml_type)) +
                               ", which Liyab does not execute (supported: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, "
-                              "Q8_0, Q2_K..Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0, TQ2_0, MXFP4, NVFP4)");
+                              "Q8_0, Q2_K..Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0, TQ2_0, Q1_0, MXFP4, "
+                              "NVFP4)");
         }
         const DTypeTraits traits = dtype_traits(t.type);
         if (t.ne[0] % traits.block_size != 0) return invalid(path, "tensor '" + name + "' row is not a whole number of blocks");

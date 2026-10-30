@@ -74,11 +74,16 @@ struct BlockMxfp4 {
     uint8_t e;
     uint8_t qs[16];
 };
+struct BlockQ1_0 {
+    uint16_t d;       // fp16 scale
+    uint8_t qs[16];   // element j is +d when bit (j % 8) of qs[j / 8] is set, -d otherwise
+};
 static_assert(sizeof(BlockQ2K) == 84 && sizeof(BlockQ3K) == 110 && sizeof(BlockTQ2_0) == 66);
 static_assert(sizeof(BlockIq2Xxs) == 66 && sizeof(BlockIq2Xs) == 74 && sizeof(BlockIq2S) == 82);
 static_assert(sizeof(BlockIq3Xxs) == 98 && sizeof(BlockIq3S) == 110);
 static_assert(sizeof(BlockIq1S) == 50 && sizeof(BlockIq1M) == 56);
 static_assert(sizeof(BlockIq4Nl) == 18 && sizeof(BlockIq4Xs) == 136 && sizeof(BlockMxfp4) == 17);
+static_assert(sizeof(BlockQ1_0) == 18);
 
 }  // namespace liyab::quant
 

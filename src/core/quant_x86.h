@@ -64,6 +64,8 @@ void dot_q8_0_q8_0_rows(const BlockQ8_0* w, const BlockQ8_0* const* x, int32_t r
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 void dot_mxfp4_q8_0_rows(const void* row, const BlockQ8_0* const* x, int32_t rows, int64_t n, float* out) noexcept;
+// Q1_0 rows: the same bits as the NEON kernel (exact integer sums, the shared Q8_0 epilogue).
+float dot_q1_0_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 
 // Against Q8_K activations: the types for which has_q8_K_kernel() is true.
 bool has_q8_K_kernel(DType type) noexcept;

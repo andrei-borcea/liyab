@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Generates tests/data/quant_vectors.bin: random blocks of every GGML format
 Liyab decodes, with the values produced by llama.cpp's reference decoder
-(gguf-py). tests/test_engine.cpp checks Liyab's decoders against them.
+(gguf-py; for Q1_0, which gguf-py cannot decode yet, llama.cpp's libggml: see
+tools/quant_reference.py). tests/test_engine.cpp checks Liyab's decoders against
+them.
 
-    pip install gguf==0.19.0
+    pip install gguf==0.19.0 numpy
     python3 tools/gen_quant_vectors.py tests/data/quant_vectors.bin
+
+New formats go at the end of TYPES: the random blocks of the earlier ones are
+drawn first and stay the same.
 
 Layout: "LYQV" u32 version, u32 count, then per entry:
     u32 ggml_type, u32 n_blocks, block bytes, f32 expected[n_blocks * block_size]
@@ -13,7 +18,9 @@ import struct
 import sys
 
 import numpy as np
-from gguf import GGML_QUANT_SIZES, GGMLQuantizationType as T, quants
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType as T
+
+from quant_reference import dequantize
 
 rng = np.random.default_rng(1234)
 N_BLOCKS = 4
@@ -29,7 +36,7 @@ def blocks_for(t):
     for blk in b:
         d = f16(rng.uniform(0.002, 0.05))
         m = f16(rng.uniform(0.001, 0.02))
-        if t in (T.Q4_0, T.Q8_0, T.Q5_0, T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ1_S, T.IQ4_NL, T.IQ4_XS):
+        if t in (T.Q4_0, T.Q8_0, T.Q5_0, T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ1_S, T.IQ4_NL, T.IQ4_XS, T.Q1_0):
             blk[0:2] = d
         elif t in (T.Q4_1, T.Q5_1, T.Q4_K, T.Q5_K):
             blk[0:2], blk[2:4] = d, m
@@ -59,13 +66,13 @@ def blocks_for(t):
 
 TYPES = [T.BF16, T.Q4_0, T.Q4_1, T.Q5_0, T.Q5_1, T.Q8_0, T.Q2_K, T.Q3_K, T.Q4_K, T.Q5_K, T.Q6_K,
          T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ1_S, T.IQ1_M, T.IQ4_NL, T.IQ4_XS,
-         T.TQ1_0, T.TQ2_0, T.MXFP4, T.NVFP4]
+         T.TQ1_0, T.TQ2_0, T.MXFP4, T.NVFP4, T.Q1_0]
 
 with open(sys.argv[1], "wb") as out:
     out.write(b"LYQV" + struct.pack("<II", 1, len(TYPES)))
     for t in TYPES:
         b = blocks_for(t)
-        expected = quants.dequantize(b.reshape(-1), t).astype(np.float32).reshape(-1)
+        expected = dequantize(b.reshape(-1), t).astype(np.float32).reshape(-1)
         out.write(struct.pack("<II", int(t), N_BLOCKS))
         out.write(b.tobytes())
         out.write(expected.tobytes())

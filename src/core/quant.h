@@ -141,7 +141,7 @@ void block_sums(const BlockQ8_0* x, int32_t* xsums, int64_t n) noexcept;
 [[nodiscard]] constexpr bool is_k_quant(DType type) noexcept {
     return type == DType::Q4_K || type == DType::Q5_K || type == DType::Q6_K;
 }
-// Extended formats (quant_ext.cpp): Q2_K, Q3_K, I-quants, TQ1_0/TQ2_0, MXFP4, NVFP4.
+// Extended formats (quant_ext.cpp): Q2_K, Q3_K, I-quants, TQ1_0/TQ2_0, Q1_0, MXFP4, NVFP4.
 bool is_extended(DType type) noexcept;
 
 [[nodiscard]] inline bool is_block_quantized(DType type) noexcept {
@@ -223,6 +223,10 @@ bool dot_q8_K_2x2(DType type, const void* wa, const void* wb, const BlockQ8_K* x
 // (dispatched by dot_quantized). `n` is a multiple of 32.
 float dot_iq4_nl_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
+// The same for Q1_0 rows (`n` a multiple of 128): each Q8_0 block's exact integer sum goes through
+// epilogue_scaled, block after block, so the NEON and AVX2 kernels give the same bits; without either, the generic
+// decode path (dot_ext_q8_0) rounds differently.
+float dot_q1_0_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept;
 // Same result, bit for bit on each kernel set, for several activation rows.
 // NEON and AVX2 share each MXFP4 decode across up to four rows. Pure and
 // thread-safe; n must be a multiple of 32, x/out hold at least rows entries.

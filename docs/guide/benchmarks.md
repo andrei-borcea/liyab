@@ -45,12 +45,18 @@ activation row; Metal numbers are for weights in shared memory. The CPU is the N
 | IQ3_S / IQ3_XXS / IQ2_S / IQ2_XS / IQ2_XXS | 3.44 / 3.06 / 2.56 / 2.31 / 2.06 | 45 / 63 / 49 / 62 / 57 | CPU |
 | IQ1_M / IQ1_S | 1.75 / 1.56 | 39 / 59 | CPU |
 | TQ2_0 / TQ1_0 | 2.06 / 1.69 | 178 / **6** | CPU |
+| Q1_0 | 1.12 | 48 | CPU |
 | MXFP4 / NVFP4 | 4.25 / 4.50 | 132 / **14** | CPU |
 | BF16 | 16.00 | 139 | CPU |
 
 * The CPU reads Q4_K at 248 GB/s, close to the memory ceiling, while the Metal Q4_K and Q5_K kernels reach 78 and
   87 GB/s. The same GPU reads Q4_0 at 208 GB/s, so those two kernels, not the memory, set their rate. Q4_0, Q8_0 and
   F16 on Metal are within 11% of the CPU.
+* Q1_0 (31 October) reads 48 GB/s: its kernel is limited by expanding the sign bits to ±1 (a table lookup, a bit
+  test and an or-not per 16 weights), not by memory, and it has no multi-row variant yet (the cost of a 16-row call
+  per row is 1.1). Through the generic path it ran at 2.9 GB/s. On Bonsai-1.7B (every weight Q1_0, 231 MiB; F16
+  cache, Performance profile, 10 threads) the CPU decodes 137 tok/s and prefills 52 tokens in 272 ms. The Metal
+  backend does not run Q1_0 yet, so each of its matmuls falls back to the CPU and it gives the same figures.
 * TQ1_0 (6 GB/s) and NVFP4 (14 GB/s) have no vector kernel on ARM: they go through the generic decode-and-multiply
   path. Most I-quants (IQ1 to IQ3) have NEON kernels but run at about a quarter of the K-quants' rate.
 * The cost per row of a 16-row call, relative to a one-row call: on Metal 1.1–1.2 for Q4_0 and Q4_1, 0.9 for Q4_K
@@ -297,13 +303,16 @@ cases across 26 formats and four KV types. The final 72-pair performance compari
 [validation report](../model-coverage-stage1.md). These host results do not imply new on-device throughput
 or compatibility figures.
 
-All 26 supported reader formats decode bit-exactly like the GGUF reference decoder, and the tokenizers produce
+All 27 supported reader formats decode bit-exactly like llama.cpp's reference decoder, and the tokenizers produce
 the Hugging Face tokenizers' ids, special tokens, CJK and emoji included. Float models give logits within 0.0015 of the
 reference implementation in the earlier float checks. Per-checkpoint KL and argmax agreement are reported below;
 F16 KV rounding can change near-tied winners. On Qwen3.5 Q8_0 and Q4_K_M the top token matches
 at 98.9% of positions, and the remaining differences are the reference's own second choice. Streamed and in-place
 weights, the file's layouts and the repacked ones, batched and token-by-token prefill, any thread count, and
 speculative and plain greedy decoding all give bit-identical logits (tested for every format and KV cache type). On
+Bonsai-1.7B (Q1_0 throughout), five prompts of 96 greedy tokens give llama.cpp's text on the CPU and Metal backends
+for four; on the fifth llama.cpp's own CPU and GPU runs differ from each other at one character, and Liyab follows the
+GPU one with an F16 cache and the CPU one with Q8_0. On
 the phone, nine runs of the same chat on the 35B gave the same greedy replies, and the app gave the CLI's.
 
 The classic transformer extension passes 20 tiny cases across 16 families and nine full-checkpoint gates.
@@ -410,7 +419,7 @@ and omit learned sinks; they do not establish full DeepSeek-V4 support. Projecti
 route; compression, index scoring, attention, residual mixing and grouped output slices run on CPU (NEON,
 AVX2 and scalar). The F32 component fixture also routes projections through each available Metal/Vulkan
 backend and compares with the independent dense reference using the same error bound.
-Component projection tests cover all 26 storage formats and attention widths different
+Component projection tests cover all 27 storage formats and attention widths different
 from the residual width, using amplitude-balanced encoded block fixtures for formats without a writer.
 The Android regression runner includes `test_compression` when that executable is built.
 Raw rows remain allocated for the finite context, and auxiliary channels are reserved at

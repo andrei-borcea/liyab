@@ -504,6 +504,7 @@ void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept {
         case DType::Q2_K: case DType::Q3_K: case DType::IQ2_XXS: case DType::IQ2_XS: case DType::IQ2_S:
         case DType::IQ3_XXS: case DType::IQ3_S: case DType::IQ1_S: case DType::IQ1_M: case DType::IQ4_NL:
         case DType::IQ4_XS: case DType::TQ1_0: case DType::TQ2_0: case DType::MXFP4: case DType::NVFP4:
+        case DType::Q1_0:
             dequantize_ext_row(type, src, y, n);
             break;
         case DType::Q4_K:
@@ -877,6 +878,7 @@ float dot_quantized(DType type, const void* row, const BlockQ8_0* x, const int32
         case DType::Q6_K: return dot_k_q8_0(type, row, x, xsums, n);
         case DType::IQ4_NL: return dot_iq4_nl_q8_0(row, x, n);
         case DType::MXFP4: return dot_mxfp4_q8_0(row, x, n);
+        case DType::Q1_0: return dot_q1_0_q8_0(row, x, n);
         default: return is_extended(type) ? dot_ext_q8_0(type, row, x, n) : 0.0f;
     }
 }

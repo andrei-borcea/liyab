@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/compression.h"
+#include "core/kernel_conformance.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
@@ -472,7 +473,7 @@ TEST_CASE("Shared-KV quantized projections match independent dequantized computa
         CHECK(error < 0.03);
         ++checked;
     }
-    CHECK(checked == 26);
+    CHECK(checked == conformance::weight_formats().size());
     std::remove(path().c_str());
 }
 

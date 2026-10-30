@@ -135,6 +135,7 @@ enum class DType : uint32_t {
     TQ2_0 = 35,   // ternary, 2.06 bits/weight
     MXFP4 = 39,   // OCP microscaling FP4 (e2m1) with e8m0 scale per 32
     NVFP4 = 40,   // FP4 (e2m1) with ue4m3 scale per 16
+    Q1_0 = 41,    // 128-element blocks: fp16 scale + one sign bit per element (x = +d or -d), 1.125 bits/weight
     // Internal layouts (never in a GGUF file): weights rearranged at load for
     // the CPU's batched kernels. Same bytes per row as their source type, but
     // stored in groups of 8 (Q8_0_R4: 4) rows, so TensorView::row() does not

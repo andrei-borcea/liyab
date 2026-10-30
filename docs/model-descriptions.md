@@ -64,7 +64,7 @@ settings with metadata. A pure SSM trace reduces its residual width while
 preserving expansion and head/group divisibility, as does
 `tiny_checkpoint.py --width`. `test_ssm` checks scans
 against independent scalar equations and compares prefill, decode and
-rollback for all 26 projection formats and four KV cache types. Reader-only
+rollback for all 27 projection formats and four KV cache types. Reader-only
 formats use `ssm_quant_vectors.bin`, derived from the existing independent
 `quant_vectors.bin` blocks through an opt-in test-writer replacement. Every
 block uses the same RMS target, `0.5 / sqrt(256)`, before scale rounding;
@@ -1401,7 +1401,7 @@ against that trace. The component runner below supplies those dimensions directl
 does not substitute for that full-model description gate.
 
 `test_compression` independently recomputes whole windows and dense attention (including F16 main-cache
-rounding), exercises all 26 storage formats with attention and residual widths independent, and checks
+rounding), exercises all 27 storage formats with attention and residual widths independent, and checks
 decode splits, rollback and saved images in
 all four KV formats. Engine tests also cover branches, suffix drafts, prefix-store restart and sequences.
 The F32 whole-component reference also checks available Metal/Vulkan projection routes with and without
@@ -1446,7 +1446,7 @@ tool's scratch-only latent-epsilon row gives mean/max KL 0.00000 and top-1 100%.
 native F32 reference. This isolates the missing export facts; it is not a standard converter gate, and no
 name-based engine exception or global change to existing DeepSeek normalization is made.
 
-The merged recurrent-format test reuses `ssm_quant_vectors.bin` for all five mixer layouts (26 formats × five mixers × four KV types). Test-only head geometry aligns projection rows to the formats' 256-value blocks; all ordinary fixture defaults and random streams are preserved. Nonzero projection and carried-state ablations prevent zero weights or unused bindings from counting as coverage.
+The merged recurrent-format test reuses `ssm_quant_vectors.bin` for all five mixer layouts (27 formats × five mixers × four KV types). Test-only head geometry aligns projection rows to the formats' 256-value blocks; all ordinary fixture defaults and random streams are preserved. Nonzero projection and carried-state ablations prevent zero weights or unused bindings from counting as coverage.
 
 Mapped PLE validation varies only the token table's dtype. Independent `gguf-py` fixture values form an F32 table in a second otherwise identical graph, and a zero-table control verifies that the table contributes. All four KV types and rollback are covered; no new format encoder is introduced.
 

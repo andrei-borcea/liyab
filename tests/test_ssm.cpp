@@ -9,6 +9,7 @@
 #include <set>
 #include <vector>
 
+#include "core/kernel_conformance.h"
 #include "core/ssm_scan.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
@@ -170,7 +171,7 @@ TEST_CASE("Mamba random writable projections retain prefill, decode and rollback
 TEST_CASE("Nonzero encoded recurrent projections and states contribute across every format and KV type") {
     std::vector<test::QuantVector> vectors;
     REQUIRE(test::load_quant_vectors(vectors, "ssm_quant_vectors.bin"));
-    REQUIRE(vectors.size() == 24);
+    REQUIRE(vectors.size() + 2 == conformance::weight_formats().size());  // all but F32 / F16, written below
     // F32/F16 use the original random writer; all other formats use the
     // gguf-py fixture blocks with uniformly RMS-conditioned scale fields,
     // including reader-only formats. Integer codes are unchanged.
@@ -178,7 +179,7 @@ TEST_CASE("Nonzero encoded recurrent projections and states contribute across ev
     vectors.push_back({DType::F16, 0, {}, {}});
     std::set<DType> formats;
     for (const auto& v : vectors) REQUIRE(formats.insert(v.type).second);
-    REQUIRE(formats.size() == 26);
+    REQUIRE(formats.size() == conformance::weight_formats().size());
     ThreadPool pool(3);
     auto cpu = make_cpu_backend(pool);
     const Route route{cpu.get(), cpu.get(), cpu.get()};
@@ -317,7 +318,7 @@ TEST_CASE("Nonzero encoded recurrent projections and states contribute across ev
             }
         }
     }
-    CHECK(checked == 520);
+    CHECK(checked == 5 * 4 * formats.size());  // five mixers, four KV cache types
     std::printf("  %zu nonzero mixer/format/KV cases; minimum projection ablation %.9g, carried-state ablation %.9g, "
                 "scan energy %.9g; maximum logit error %.9g, state error %.9g\n", checked,
                 minimum_projection_delta, minimum_carried_delta, minimum_scan_energy,

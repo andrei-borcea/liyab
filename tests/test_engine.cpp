@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "core/draft_budget.h"
+#include "core/kernel_conformance.h"
 #include "core/moe_routing.h"
 #include "core/quant.h"
 #include "core/quant_blocks.h"
@@ -650,6 +651,46 @@ TEST_CASE("Every GGML format decodes exactly like llama.cpp's reference (tests/d
     CHECK(checked == static_cast<int>(vectors.size()));
 }
 
+// A Q1_0 block is 128 values and the kernels take it against four Q8_0 blocks, so rows of one block and of an odd
+// number of blocks matter, as do blocks whose bits are all set or all clear and activations at both ends of the
+// int8 range. The reference is the decoded weights against the decoded activations, so only float rounding of the
+// epilogue separates it from the kernel.
+TEST_CASE("Q1_0 dot equals the decoded weights against the quantized activations, for any row length") {
+    std::mt19937 rng(61);
+    std::uniform_real_distribution<float> uniform(-3.0f, 3.0f);
+    for (const int64_t blocks : {1, 2, 3, 5, 7, 40}) {
+        const int64_t n = blocks * 128;
+        std::vector<uint8_t> row(static_cast<size_t>(blocks) * 18);
+        for (auto& byte : row) byte = static_cast<uint8_t>(rng());
+        for (int64_t b = 0; b < blocks; ++b) {
+            const uint16_t scale = quant::fp32_to_fp16(0.01f + static_cast<float>(rng() % 1000) * 0.001f);
+            std::memcpy(row.data() + b * 18, &scale, 2);
+        }
+        std::memset(row.data() + 2, 0xFF, 16);                            // first block: every sign +
+        if (blocks > 1) std::memset(row.data() + 18 + 2, 0x00, 16);       // second: every sign -
+        std::vector<float> x(static_cast<size_t>(n));
+        for (float& v : x) v = uniform(rng);
+        for (int64_t k = 0; k < n / 32; ++k) {  // each Q8_0 block reaches +127 and -127
+            x[static_cast<size_t>(32 * k)] = 40.0f;
+            x[static_cast<size_t>(32 * k + 1)] = -40.0f;
+        }
+        std::vector<quant::BlockQ8_0> xq(static_cast<size_t>(n / 32));
+        quant::quantize_row_q8_0(x.data(), xq.data(), n);
+        std::vector<float> w(static_cast<size_t>(n)), xd(static_cast<size_t>(n));
+        quant::dequantize_row(DType::Q1_0, row.data(), w.data(), n);
+        quant::dequantize_row(DType::Q8_0, xq.data(), xd.data(), n);
+        double reference = 0.0, magnitude = 1e-6;
+        for (int64_t i = 0; i < n; ++i) {
+            reference += static_cast<double>(w[static_cast<size_t>(i)]) * xd[static_cast<size_t>(i)];
+            magnitude += std::fabs(static_cast<double>(w[static_cast<size_t>(i)]) * xd[static_cast<size_t>(i)]);
+        }
+        const float got = quant::dot_quantized(DType::Q1_0, row.data(), xq.data(), nullptr, n);
+        CHECK(std::fabs(got - reference) <= 1e-5 * magnitude);
+        // The generic decode path is the reference of every other format; it must agree here too.
+        CHECK(std::fabs(quant::dot_ext_q8_0(DType::Q1_0, row.data(), xq.data(), n) - reference) <= 1e-5 * magnitude);
+    }
+}
+
 TEST_CASE("Q8_K activation quantization matches llama.cpp's semantics") {
     std::mt19937 rng(41);
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -1065,7 +1106,7 @@ TEST_CASE("Every weight format: a row's result is the same bits whatever the bat
     const bool i8mm = quant::repack_kernels_available() && detect_cpu().i8mm;
     constexpr int64_t rows = 16;  // whole groups of every repacked layout (8 or 4 rows)
     constexpr int32_t batch = 6;  // single-row, 2-4-row and 4 + remainder kernels
-    // The 24 reference formats, and F32 / F16 rows written here.
+    // The reference formats (tests/data/quant_vectors.bin), and F32 / F16 rows written here.
     std::vector<std::pair<DType, std::vector<uint8_t>>> formats;
     for (const QuantVector& qv : vectors) {
         if (std::none_of(formats.begin(), formats.end(), [&](const auto& f) { return f.first == qv.type; })) {
@@ -1150,7 +1191,7 @@ TEST_CASE("Every weight format: a row's result is the same bits whatever the bat
         }
         ++checked;
     }
-    CHECK(checked == 26);
+    CHECK(checked == static_cast<int>(conformance::weight_formats().size()));  // every format the loader reads
 }
 
 TEST_CASE("Low-bit Q8_K kernels equal the dot of their dequantized operands (llama.cpp vectors)") {
@@ -2378,7 +2419,7 @@ TEST_CASE("Combined latent weight views preserve every GGML format's decoded key
         CHECK(split.bind(source, geometry, heads).code() == ErrorCode::Unsupported);
         ++checked;
     }
-    CHECK(checked == 26);
+    CHECK(checked == conformance::weight_formats().size());
 }
 
 // The expanded form (per-head keys and values expanded from the cached

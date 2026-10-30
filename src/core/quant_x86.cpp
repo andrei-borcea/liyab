@@ -540,6 +540,42 @@ LIYAB_AVX2 float dot_mxfp4_q8_0(const void* row, const BlockQ8_0* x, int64_t n) 
 }
 
 namespace {
+
+// The 32 sign bits of a Q1_0 block's sub-block -> +1 / -1 in the bytes: byte e takes bit e % 8 of byte e / 8 (as
+// q5_high_bits), +1 where the bit is set. A byte whose bit is clear compares equal to zero (0xFF = -1); the or
+// then gives -1 there and +1 elsewhere.
+LIYAB_AVX2 inline __m256i q1_signs(const uint8_t* bits4) noexcept {
+    uint32_t bits;
+    std::memcpy(&bits, bits4, 4);
+    const __m256i select = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  //
+                                            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i bit = _mm256_set1_epi64x(static_cast<int64_t>(0x8040201008040201ull));
+    const __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(static_cast<int>(bits)), select);
+    const __m256i clear = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bit), _mm256_setzero_si256());
+    return _mm256_or_si256(clear, _mm256_set1_epi8(1));
+}
+
+}  // namespace
+
+// Each Q8_0 block's exact integer sum, then the epilogue every Q8_0 kernel shares (quant.h), block after block; the
+// four sums of a 128-value block are reduced and converted together (exact, far below 2^24).
+LIYAB_AVX2 float dot_q1_0_q8_0(const void* row, const BlockQ8_0* x, int64_t n) noexcept {
+    const auto* w = static_cast<const BlockQ1_0*>(row);
+    const int64_t nb = n / 128;
+    float acc = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        const BlockQ8_0* a = x + 4 * i;
+        __m256i s[4];
+        for (int k = 0; k < 4; ++k) s[k] = dot_i8(q1_signs(w[i].qs + 4 * k), load256(a[k].qs));
+        alignas(16) float sums[4];
+        _mm_store_ps(sums, _mm_cvtepi32_ps(hsum4_i32(s[0], s[1], s[2], s[3])));
+        const float d = h2f(w[i].d);
+        for (int k = 0; k < 4; ++k) acc = epilogue_scaled(acc, h2f(a[k].d), d, sums[k]);
+    }
+    return acc;
+}
+
+namespace {
 template <int NR>
 LIYAB_AVX2 void dot_mxfp4_rows(const BlockMxfp4* w, const BlockQ8_0* const* x, int64_t nb, float* out) noexcept {
     const __m256i table = _mm256_broadcastsi128_si256(load128(kMxfp4Values));
