@@ -291,6 +291,11 @@ Benchmarks and tools built with the tests:
   the system library path: `tools/quant_reference.py`). A new format is appended to the end of the list, so the
   blocks of the earlier ones do not change. Tests that run every format take their count from the loader's format
   list (`conformance::weight_formats()`), so a format missing from the vectors fails them.
+* `tools/hf_survey.py fetch DIR` / `report DIR`: what Hugging Face publishes against what Liyab runs, from the public
+  API (no token): the most downloaded GGUF repositories by architecture, pipeline and quantization tag, and the
+  text-generation repositories by `quantization_config` and tensor dtype. Supported architectures are read from the
+  registry in `src/compat/architecture.cpp`, recognized tensor types from `src/core/types.cpp`, so the report
+  needs no maintenance when either changes.
 * `LIYAB_BENCH_ATTENTION=N test_engine`: attention cost at an *N*-token context.
 * `LIYAB_GOLDEN_UPDATE=1 test_golden`: records the logit hashes of the kernel set this build runs (CPU architecture and `scalar` / `neon` / `neon+dotprod` / `avx2`; on x86-64 run it once with `LIYAB_KERNELS=scalar` too), after a change meant to move outputs
   (say why in the commit). A platform with no hashes yet is skipped with a note.
@@ -545,6 +550,7 @@ tools/                  liyab-cli, liyab-kernels, liyab-bench, liyab-kl, liyab-t
                         reference_trace.py (registry rows established from the Hugging Face implementation and
                         verified),
                         gguf_vocab.py, gguf_fuse_experts.py, gguf_set_keys.py, expert_study.py (cold-expert study),
+                        hf_survey.py (formats and architectures Hugging Face publishes, against ours),
                         table/vector/test-case generators, benchmark and brand image generators
 tests/                  self-contained unit tests and benchmarks; device/: the phone regression run's
                         references and log (scripts/phone_regression.py)
