@@ -2360,6 +2360,38 @@ void Transformer::attention(const Layer& L, int32_t n, ThreadPool& pool, const u
     }
 }
 
+bool Transformer::attention_on_backend(const Layer& L, int32_t n, const Route& route, const uint8_t* head_mask) {
+    const ModelConfig& c = config_;
+    const BlockPlan& plan = c.blocks[static_cast<size_t>(&L - layers_.data())];
+    // Cheap exits first: this runs for every attention block of every pass, decoding steps included.
+    if (route.attention == nullptr || route.attention == route.cpu || n < 16 || segs_.size() != 1) return false;
+    const Segment& s = segs_.front();
+    if (s.expanded || s.first != 0 || s.n != n || head_mask != nullptr || L.window > 0 || !c.causal ||
+        !tree_depth_.empty() || !positions_.empty() || !index_positions_.empty() || !alibi_slopes_.empty() ||
+        opt(L.sinks) != nullptr || plan.value_dim != plan.head_dim || plan.n_head_kv <= 0 ||
+        plan.n_head % plan.n_head_kv != 0) {
+        return false;
+    }
+    // The engine's own sliding window drops the middle of the context: only a cache that still holds every position
+    // from 0 is the plain case.
+    const KvCache::Visible first = s.kv->visible(s.n_past), last = s.kv->visible(s.n_past + n - 1);
+    if (first.sink_end != 0 || first.first != 0 || last.sink_end != 0 || last.first != 0) return false;
+    const KvCache::RowView rows = s.kv->row_view(L.kv_slot);
+    Backend::AttentionJob job;
+    job.rows = &rows;
+    job.kv_type = s.kv->dtype();
+    job.head_dim = plan.head_dim;
+    job.n_head = plan.n_head;
+    job.n_head_kv = plan.n_head_kv;
+    job.n_past = s.n_past;
+    job.n = n;
+    job.scale = plan.attn_scale;
+    job.softcap = c.attn_softcap;
+    job.q = q_.data();
+    job.out = att_.data();
+    return route.attention->attention(job).is_ok();  // Unsupported: the CPU runs it
+}
+
 Status Transformer::matmul(const Route& route, Backend* backend, const TensorView& w, const float* x, float* y,
                            int32_t n) {
     if (adapters_in_pass_) {
@@ -3001,7 +3033,7 @@ Status Transformer::attention_mixer(int32_t layer, const BlockWeights& w, int32_
             store_kv(L, *s.kv, row_of(s, static_cast<int32_t>(t)), k, v);
         }
     }
-    attention(L, n, pool, head_mask);
+    if (!attention_on_backend(L, n, route, head_mask)) attention(L, n, pool, head_mask);
     if (head_gate) {
         for (size_t t = 0; t < un; ++t) {
             for (size_t h = 0; h < static_cast<size_t>(plan.n_head); ++h) {

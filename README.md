@@ -30,7 +30,7 @@ Run models larger than RAM by streaming weights from storage. Keep chat, tools a
 | :--- | :--- |
 | Inference | GGUF v2/v3, split files, 27 weight formats; dense, MoE, recurrent and latent/sparse attention paths |
 | Models larger than RAM | Dense block streaming; bounded MoE expert cache with prefetch and direct I/O |
-| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal (matrix kernels for prompts), Vulkan; CPU or GPU chosen by timing the first passes |
+| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal (matrix and attention kernels for prompts), Vulkan; CPU or GPU chosen by timing the first passes |
 | Conversations | Context reuse, saved state, paged KV, prefix cache, cancellation and concurrent sequences |
 | Generation | Sampling, speculative decoding, JSON/schema constraints and tool calls |
 | Pooling and adaptation | Embeddings, reranking and GGUF LoRA adapters |
@@ -358,7 +358,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | :--- | :--- |
 | Model coverage | Gemma 4 / DeepSeek-V4 text have synthetic conformance; trained quality, production exports and other stage-2 combinations remain unverified |
 | Export metadata | Some published tokenizer / template metadata needs a corrected copy |
-| GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompts reach 4–5 TFLOPS with attention still on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
+| GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompt blocks of 16 rows or more run their products at 4–5 TFLOPS and their attention on the GPU when the block is plain (one sequence, F16 or Q8_0 cache, 64/96/128/256 channels per head, no window, sinks or ALiBi), else on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
 | Vulkan | Per-token prefill matvec; resident tensors copied to GPU memory; MoE experts on CPU |
 | NPUs | Runtime detection and ranking; compute fallback |
 | Pooling | Decoder / bidirectional Gemma pooling paths; encoder-only models pending |

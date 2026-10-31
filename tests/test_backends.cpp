@@ -343,6 +343,16 @@ TEST_CASE("The route picker measures each class of pass once and keeps the faste
 
     RoutePicker short_blocks;  // 17 tokens is the shortest block measured; a pass in between is a step
     CHECK(short_blocks.next(RoutePicker::kMinBlockTokens) == Arm::Host);
+
+    // While a block class is measured the CPU takes a short slice of a chunk; the accelerator, and the CPU once the
+    // class is decided or for a step or a short block, take all of it.
+    RoutePicker probes;
+    CHECK(probes.limit(256, Arm::Host) == RoutePicker::kHostProbeTokens);
+    CHECK(probes.limit(256, Arm::Accelerator) == 256);
+    CHECK(probes.limit(RoutePicker::kHostProbeTokens, Arm::Host) == RoutePicker::kHostProbeTokens);
+    CHECK(probes.limit(1, Arm::Host) == 1);
+    CHECK(run_picker(probes, 256, 1.0, 5.0) == Arm::Host);  // decided: the CPU keeps the whole chunk
+    CHECK(probes.limit(256, Arm::Host) == 256);
 }
 
 TEST_CASE("Metal K-quants match dequantized float reference in refillable shared regions") {
@@ -471,6 +481,130 @@ TEST_CASE("Metal fused SiLU FFN matches separate K-quant projections and support
     metal.free_shared(gate_storage);
     metal.free_shared(up_storage);
     metal.free_shared(down_storage);
+}
+
+// Causal attention of a prompt block through the backend, against the same sum in double from the cache's own rows.
+TEST_CASE("Metal prompt-block attention matches a double-precision reference over F16 and Q8_0 caches") {
+    auto made = make_metal_backend();
+    if (!made) {
+        std::printf("  skipped: %s\n", made.status().to_string().c_str());
+        return;
+    }
+    auto& metal = *made.value();
+    uint32_t seed = 4242;
+    auto uniform = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(seed >> 8) / static_cast<float>(1 << 24) * 2.0f - 1.0f;
+    };
+    struct Shape {
+        int32_t head_dim, n_head, n_head_kv, n_past, n;
+        float softcap;
+    };
+    const Shape shapes[] = {{128, 6, 2, 37, 53, 0.0f},  {64, 4, 4, 0, 16, 0.0f},   {96, 6, 3, 100, 33, 0.0f},
+                            {256, 4, 2, 21, 40, 0.0f},  {128, 5, 1, 300, 64, 50.0f}};
+    for (const KvCacheType type : {KvCacheType::F16, KvCacheType::Q8_0}) {
+        for (const Shape& sh : shapes) {
+            KvCacheConfig config;
+            config.n_layers = 2;
+            config.n_head_kv = sh.n_head_kv;
+            config.head_dim = sh.head_dim;
+            config.type = type;
+            config.max_positions = 1024;
+            config.page_tokens = 16;
+            auto cache = KvCache::create(config);
+            REQUIRE(cache.has_value());
+            KvCache& kv = *cache.value();
+            const int32_t total = sh.n_past + sh.n;
+            REQUIRE(kv.reserve(total).is_ok());
+            const size_t kv_dim = static_cast<size_t>(sh.n_head_kv) * static_cast<size_t>(sh.head_dim);
+            std::vector<float> k(kv_dim), v(kv_dim);
+            for (int32_t pos = 0; pos < total; ++pos) {
+                for (float& x : k) x = uniform() * 2.0f;
+                for (float& x : v) x = uniform();
+                kv.store(1, pos, k.data(), v.data());
+            }
+            const size_t q_dim = static_cast<size_t>(sh.n_head) * static_cast<size_t>(sh.head_dim);
+            std::vector<float> q(static_cast<size_t>(sh.n) * q_dim), out(q.size(), -1.0f);
+            for (float& x : q) x = uniform();
+            const KvCache::RowView rows = kv.row_view(1);
+            Backend::AttentionJob job;
+            job.rows = &rows;
+            job.kv_type = kv.dtype();
+            job.head_dim = sh.head_dim;
+            job.n_head = sh.n_head;
+            job.n_head_kv = sh.n_head_kv;
+            job.n_past = sh.n_past;
+            job.n = sh.n;
+            job.scale = 1.0f / std::sqrt(static_cast<float>(sh.head_dim));
+            job.softcap = sh.softcap;
+            job.q = q.data();
+            job.out = out.data();
+            REQUIRE(metal.attention(job).is_ok());
+
+            const int32_t group = sh.n_head / sh.n_head_kv;
+            double worst = 0.0;
+            std::vector<float> krow(static_cast<size_t>(sh.head_dim)), vrow(krow.size());
+            for (int32_t t = 0; t < sh.n; ++t) {
+                const int32_t last = sh.n_past + t;
+                for (int32_t h = 0; h < sh.n_head; ++h) {
+                    const int32_t g = h / group;
+                    const float* qh = q.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * static_cast<size_t>(sh.head_dim);
+                    std::vector<double> score(static_cast<size_t>(last) + 1);
+                    double top = -1e300;
+                    for (int32_t p = 0; p <= last; ++p) {
+                        quant::dequantize_row(kv.dtype(), rows.k(p, g), krow.data(), sh.head_dim);
+                        double dot = 0.0;
+                        for (int32_t i = 0; i < sh.head_dim; ++i) dot += static_cast<double>(qh[i]) * krow[static_cast<size_t>(i)];
+                        dot *= job.scale;
+                        if (sh.softcap > 0.0f) dot = sh.softcap * std::tanh(dot / sh.softcap);
+                        score[static_cast<size_t>(p)] = dot;
+                        top = std::max(top, dot);
+                    }
+                    double sum = 0.0;
+                    std::vector<double> acc(static_cast<size_t>(sh.head_dim), 0.0);
+                    for (int32_t p = 0; p <= last; ++p) {
+                        const double w = std::exp(score[static_cast<size_t>(p)] - top);
+                        sum += w;
+                        quant::dequantize_row(kv.dtype(), rows.v(p, g), vrow.data(), sh.head_dim);
+                        for (int32_t i = 0; i < sh.head_dim; ++i) acc[static_cast<size_t>(i)] += w * vrow[static_cast<size_t>(i)];
+                    }
+                    const float* got = out.data() + static_cast<size_t>(t) * q_dim + static_cast<size_t>(h) * static_cast<size_t>(sh.head_dim);
+                    for (int32_t i = 0; i < sh.head_dim; ++i) {
+                        worst = std::max(worst, std::fabs(acc[static_cast<size_t>(i)] / sum - got[i]));
+                    }
+                }
+            }
+            // The values are on the half grid for F16 and within 2^-11 of it for Q8_0; scores and sums are float.
+            std::printf("  %s head_dim %d, %d heads / %d kv, %d + %d rows: max error %.2e\n",
+                        type == KvCacheType::F16 ? "f16" : "q8_0", sh.head_dim, sh.n_head, sh.n_head_kv, sh.n_past, sh.n, worst);
+            CHECK(worst < 2e-3);
+        }
+    }
+    // Shorter blocks and widths the kernels do not cover stay on the CPU.
+    KvCacheConfig config;
+    config.n_layers = 1;
+    config.n_head_kv = 1;
+    config.head_dim = 128;
+    config.type = KvCacheType::F16;
+    auto cache = KvCache::create(config);
+    REQUIRE(cache.has_value());
+    REQUIRE(cache.value()->reserve(20).is_ok());
+    const KvCache::RowView rows = cache.value()->row_view(0);
+    std::vector<float> q(16 * 128), out(q.size());
+    Backend::AttentionJob job;
+    job.rows = &rows;
+    job.kv_type = DType::F16;
+    job.head_dim = 128;
+    job.n_head = 1;
+    job.n_head_kv = 1;
+    job.n_past = 4;
+    job.n = 15;
+    job.q = q.data();
+    job.out = out.data();
+    CHECK(metal.attention(job).code() == ErrorCode::Unsupported);
+    job.n = 16;
+    job.head_dim = 80;
+    CHECK(metal.attention(job).code() == ErrorCode::Unsupported);
 }
 
 TEST_MAIN()

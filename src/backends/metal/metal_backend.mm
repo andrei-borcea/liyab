@@ -28,7 +28,6 @@
 namespace liyab {
 
 namespace {
-
 // One SIMD-group (32 lanes) per output element (Q1_0: per four rows); lanes
 // stride over blocks and reduce with simd_sum. Block reads use byte loads so
 // tensors need only the GGUF 32-byte alignment (Q1_0 reads 16-bit words: its
@@ -408,6 +407,158 @@ LIYAB_MM(mm_q5_k, DqK45<true>)
 LIYAB_MM(mm_q6_k, DqQ6_K)
 LIYAB_MM(mm_q1_0, DqQ1_0)
 
+// --- Attention over a prompt block (flash attention) ---
+//
+// One threadgroup per (query head, 32 query rows); each of its four simdgroups owns 8 rows and keeps their running
+// maximum, denominator and 8 x D output tile in registers while the keys and values pass in chunks of C positions
+// through threadgroup memory (shared by the four simdgroups, decoded once: half is exact for F16 caches and 2^-11 off
+// for Q8_0). The scores and the weighted sum are 8x8 matrix products; the softmax works on the elements each lane
+// holds of a product tile (thread_elements(): lane l holds row fm, columns fn and fn + 1, so the four lanes of a row
+// are l, l^1, l^8, l^9). The keys and values were copied by the host into [position][kv head][row] arrays.
+struct FAParams {
+    uint n, n_past, total, n_head, n_kv_head, row_bytes;
+    float scale, softcap;
+};
+
+struct KvF16 {
+    static void load32(device const uchar* row, uint b, threadgroup half* dst) {
+        device const half* h = reinterpret_cast<device const half*>(row) + b * 32;
+        for (uint i = 0; i < 32; ++i) dst[i] = h[i];
+    }
+};
+struct KvQ8 {
+    static void load32(device const uchar* row, uint b, threadgroup half* dst) {
+        device const uchar* blk = row + b * 34;
+        const float d = float(*reinterpret_cast<device const half*>(blk));
+        device const char* q = reinterpret_cast<device const char*>(blk + 2);
+        for (uint i = 0; i < 32; ++i) dst[i] = half(d * float(q[i]));
+    }
+};
+
+template <typename KV, uint D>
+inline void flash_attn(device const float* q, device const uchar* kbuf, device const uchar* vbuf, device float* out,
+                       constant FAParams& p, threadgroup half* shm, uint2 tg, uint tid, uint sgitg, uint lane) {
+    constexpr uint C = D > 128 ? 16 : 32;  // keys per chunk
+    constexpr uint DS = D + 8;              // tile row stride in halves: 8 rows of a fragment land in different banks
+    threadgroup half* sk = shm;
+    threadgroup half* sv = shm + C * DS;
+    threadgroup float* sp = reinterpret_cast<threadgroup float*>(shm + 2 * C * DS) + sgitg * 8 * C;  // this simdgroup's P
+
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4) + ((lane >> 1) & 3);
+    const uint fn = ((qid & 2) << 1) + ((lane & 1) << 1);
+    const uint h = tg.y, kvh = h / (p.n_head / p.n_kv_head);
+    const uint qd = p.n_head * D;
+    const uint t_base = tg.x * 32 + sgitg * 8;
+    const uint row = t_base + fm;
+    const uint pos = p.n_past + row;  // rows past n are padding: they read zeros and are never stored
+
+    simdgroup_float8x8 mq[D / 8], mo[D / 8];
+    for (uint i = 0; i < D / 8; ++i) {
+        simdgroup_load(mq[i], q + ulong(t_base) * qd + h * D + i * 8, qd);
+        mo[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = -INFINITY, l = 0.0f;
+    const uint last_row = min(tg.x * 32 + 31, p.n - 1);
+    const uint kend = p.n_past + last_row + 1;                                          // keys any row of the group sees
+    const uint sg_kend = t_base < p.n ? p.n_past + min(t_base + 7, p.n - 1) + 1 : 0;    // keys any row of this simdgroup sees
+
+    for (uint kc = 0; kc < kend; kc += C) {
+        for (uint b = tid; b < C * (D / 32); b += 128) {
+            const uint key = b / (D / 32), blk = b % (D / 32), idx = kc + key;
+            if (idx < p.total) {
+                const ulong at = (ulong(idx) * p.n_kv_head + kvh) * p.row_bytes;
+                KV::load32(kbuf + at, blk, sk + key * DS + blk * 32);
+                KV::load32(vbuf + at, blk, sv + key * DS + blk * 32);
+            } else {
+                for (uint i = 0; i < 32; ++i) {
+                    sk[key * DS + blk * 32 + i] = 0.0h;
+                    sv[key * DS + blk * 32 + i] = 0.0h;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (kc < sg_kend) {
+            simdgroup_float8x8 ms[C / 8];
+            for (uint c8 = 0; c8 < C / 8; ++c8) ms[c8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint d8 = 0; d8 < D / 8; ++d8) {
+                for (uint c8 = 0; c8 < C / 8; ++c8) {
+                    simdgroup_half8x8 mk;
+                    simdgroup_load(mk, sk + c8 * 8 * DS + d8 * 8, DS, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(ms[c8], mq[d8], mk, ms[c8]);
+                }
+            }
+            float s[C / 4];
+            float mnew = m;
+            for (uint c8 = 0; c8 < C / 8; ++c8) {
+                for (uint j = 0; j < 2; ++j) {
+                    const uint key = kc + c8 * 8 + fn + j;
+                    float v = ms[c8].thread_elements()[j] * p.scale;
+                    if (p.softcap > 0.0f) v = p.softcap * precise::tanh(v / p.softcap);
+                    v = (key <= pos && key < p.total) ? v : -INFINITY;
+                    s[c8 * 2 + j] = v;
+                    mnew = max(mnew, v);
+                }
+            }
+            mnew = max(mnew, simd_shuffle_xor(mnew, 1));
+            mnew = max(mnew, simd_shuffle_xor(mnew, 8));
+            const float alpha = m == -INFINITY ? 0.0f : exp(m - mnew);
+            l *= alpha;
+            for (uint c8 = 0; c8 < C / 8; ++c8) {
+                for (uint j = 0; j < 2; ++j) {
+                    const float v = s[c8 * 2 + j];
+                    const float w = v == -INFINITY ? 0.0f : exp(v - mnew);
+                    l += w;
+                    sp[fm * C + c8 * 8 + fn + j] = w;
+                }
+            }
+            m = mnew;
+            for (uint d8 = 0; d8 < D / 8; ++d8) {
+                mo[d8].thread_elements()[0] *= alpha;
+                mo[d8].thread_elements()[1] *= alpha;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint c8 = 0; c8 < C / 8; ++c8) {
+                simdgroup_float8x8 mp;
+                simdgroup_load(mp, sp + c8 * 8, C);
+                for (uint d8 = 0; d8 < D / 8; ++d8) {
+                    simdgroup_half8x8 mv;
+                    simdgroup_load(mv, sv + c8 * 8 * DS + d8 * 8, DS);
+                    simdgroup_multiply_accumulate(mo[d8], mp, mv, mo[d8]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    l += simd_shuffle_xor(l, 1);
+    l += simd_shuffle_xor(l, 8);
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    if (row < p.n) {
+        for (uint d8 = 0; d8 < D / 8; ++d8) {
+            device float* o = out + ulong(row) * qd + h * D + d8 * 8 + fn;
+            o[0] = mo[d8].thread_elements()[0] * inv;
+            o[1] = mo[d8].thread_elements()[1] * inv;
+        }
+    }
+}
+
+#define LIYAB_FA(NAME, KV, D)                                                                                      \
+    kernel void NAME(device const float* q [[buffer(0)]], device const uchar* kbuf [[buffer(1)]],                  \
+                     device const uchar* vbuf [[buffer(2)]], device float* out [[buffer(3)]],                      \
+                     constant FAParams& p [[buffer(4)]], threadgroup half* shm [[threadgroup(0)]],                \
+                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],        \
+                     uint sgitg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {    \
+        flash_attn<KV, D>(q, kbuf, vbuf, out, p, shm, tg, tid, sgitg, lane);                                        \
+    }
+LIYAB_FA(fa_f16_64, KvF16, 64)
+LIYAB_FA(fa_f16_96, KvF16, 96)
+LIYAB_FA(fa_f16_128, KvF16, 128)
+LIYAB_FA(fa_f16_256, KvF16, 256)
+LIYAB_FA(fa_q8_64, KvQ8, 64)
+LIYAB_FA(fa_q8_96, KvQ8, 96)
+LIYAB_FA(fa_q8_128, KvQ8, 128)
+LIYAB_FA(fa_q8_256, KvQ8, 256)
+
 // The gate/up products finish before this dispatch. Overwriting the gate
 // output keeps the activated intermediate on the GPU for the down product.
 kernel void gated_silu(device float* gate [[buffer(0)]], device const float* up [[buffer(1)]],
@@ -459,6 +610,17 @@ public:
                     return Status(ErrorCode::BackendError, std::string("cannot build Metal pipeline ") + mm_names[i]);
                 }
                 backend->mm_pipelines_[i] = pso;
+            }
+            const char* fa_names[] = {"fa_f16_64", "fa_f16_96", "fa_f16_128", "fa_f16_256",
+                                      "fa_q8_64",  "fa_q8_96",  "fa_q8_128",  "fa_q8_256"};
+            for (int i = 0; i < 8; ++i) {
+                id<MTLFunction> fn = [library newFunctionWithName:@(fa_names[i])];
+                id<MTLComputePipelineState> pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
+                if (pso == nil) {
+                    return Status(ErrorCode::BackendError, std::string("cannot build Metal pipeline ") + fa_names[i] +
+                                                               (error ? ": " + std::string(error.localizedDescription.UTF8String) : ""));
+                }
+                backend->fa_pipelines_[i] = pso;
             }
             if (backend->queue_ == nil) return Status(ErrorCode::BackendError, "cannot create Metal command queue");
             return std::unique_ptr<Backend>(std::move(backend));
@@ -531,6 +693,80 @@ public:
                 const size_t bytes = static_cast<size_t>(n) * static_cast<size_t>(ws[i]->rows()) * sizeof(float);
                 std::memcpy(ys[i], static_cast<const uint8_t*>(y_buf_.contents) + output_offsets[i], bytes);
             }
+        }
+        return Status::ok();
+    }
+
+    // Prompt-block attention (see Backend::attention). The cache's pages are heap memory the GPU cannot address as one
+    // array, so the layer's rows up to the block's last position are copied into shared buffers first: a position's
+    // K rows of all heads are contiguous in the cache, so that is two copies per position (a few MB per layer, against
+    // the seconds the block's products take).
+    Status attention(const AttentionJob& job) override {
+        constexpr int32_t kMinRows = 16;  // as kMatmulMinRows: shorter passes keep the CPU's position-only rounding
+        const int32_t d = job.head_dim;
+        const int32_t sizes[] = {64, 96, 128, 256};
+        int size_index = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (sizes[i] == d) size_index = i;
+        }
+        if (job.rows == nullptr || job.n < kMinRows || size_index < 0 || job.n_head_kv <= 0 ||
+            job.n_head % job.n_head_kv != 0 || (job.kv_type != DType::F16 && job.kv_type != DType::Q8_0)) {
+            return Status(ErrorCode::Unsupported, "this attention job runs on the CPU");
+        }
+        const auto n = static_cast<size_t>(job.n);
+        const auto total = static_cast<size_t>(job.n_past) + n;
+        const size_t row_bytes = dtype_row_bytes(job.kv_type, d);
+        const size_t position_bytes = static_cast<size_t>(job.n_head_kv) * row_bytes;
+        const size_t q_floats = static_cast<size_t>(job.n_head) * static_cast<size_t>(d);
+        const size_t padded_rows = (n + 31) / 32 * 32;  // the kernel reads whole 8-row fragments
+        @autoreleasepool {
+            if (!ensure(fa_q_, padded_rows * q_floats * sizeof(float)) || !ensure(fa_out_, n * q_floats * sizeof(float)) ||
+                !ensure(fa_k_, total * position_bytes) || !ensure(fa_v_, total * position_bytes)) {
+                return Status(ErrorCode::OutOfMemory, "cannot allocate Metal attention buffers");
+            }
+            std::memcpy(fa_q_.contents, job.q, n * q_floats * sizeof(float));
+            std::memset(static_cast<uint8_t*>(fa_q_.contents) + n * q_floats * sizeof(float), 0,
+                        (padded_rows - n) * q_floats * sizeof(float));
+            auto* k_dst = static_cast<uint8_t*>(fa_k_.contents);
+            auto* v_dst = static_cast<uint8_t*>(fa_v_.contents);
+            for (size_t p = 0; p < total; ++p) {
+                std::memcpy(k_dst + p * position_bytes, job.rows->k(static_cast<int32_t>(p), 0), position_bytes);
+                std::memcpy(v_dst + p * position_bytes, job.rows->v(static_cast<int32_t>(p), 0), position_bytes);
+            }
+            struct {
+                uint32_t n, n_past, total, n_head, n_kv_head, row_bytes;
+                float scale, softcap;
+            } params = {static_cast<uint32_t>(n),
+                        static_cast<uint32_t>(job.n_past),
+                        static_cast<uint32_t>(total),
+                        static_cast<uint32_t>(job.n_head),
+                        static_cast<uint32_t>(job.n_head_kv),
+                        static_cast<uint32_t>(row_bytes),
+                        job.scale,
+                        job.softcap};
+            const uint32_t chunk = d > 128 ? 16 : 32;
+            const size_t shared = (2 * chunk * (static_cast<size_t>(d) + 8)) * sizeof(uint16_t) + 4 * 8 * chunk * sizeof(float);
+            id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:fa_pipelines_[(job.kv_type == DType::Q8_0 ? 4 : 0) + size_index]];
+            [enc setBuffer:fa_q_ offset:0 atIndex:0];
+            [enc setBuffer:fa_k_ offset:0 atIndex:1];
+            [enc setBuffer:fa_v_ offset:0 atIndex:2];
+            [enc setBuffer:fa_out_ offset:0 atIndex:3];
+            [enc setBytes:&params length:sizeof params atIndex:4];
+            [enc setThreadgroupMemoryLength:shared atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((n + 31) / 32, static_cast<NSUInteger>(job.n_head), 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            if (cmd.status != MTLCommandBufferStatusCompleted) {
+                return Status(ErrorCode::BackendError, std::string("Metal command failed: ") +
+                                                           (cmd.error ? cmd.error.localizedDescription.UTF8String : "unknown error"));
+            }
+            const double gpu_seconds = cmd.GPUEndTime - cmd.GPUStartTime;
+            if (gpu_seconds > 0) busy_ns_.fetch_add(static_cast<uint64_t>(gpu_seconds * 1e9), std::memory_order_relaxed);
+            std::memcpy(job.out, fa_out_.contents, n * q_floats * sizeof(float));
         }
         return Status::ok();
     }
@@ -716,8 +952,10 @@ private:
     static constexpr int kPipelines = 10;
     id<MTLComputePipelineState> pipelines_[kPipelines] = {};
     id<MTLComputePipelineState> mm_pipelines_[9] = {};  // the batched kernels, in the order of pipeline(): f32 f16 q4_0 q8_0 q4_1 q4_k q5_k q6_k q1_0
+    id<MTLComputePipelineState> fa_pipelines_[8] = {};  // attention: f16 then q8_0, each for 64 96 128 256 channels
     id<MTLBuffer> x_buf_ = nil;
     id<MTLBuffer> y_buf_ = nil;
+    id<MTLBuffer> fa_q_ = nil, fa_k_ = nil, fa_v_ = nil, fa_out_ = nil;  // attention's activations and the copied cache
     std::atomic<uint64_t> busy_ns_{0};
     std::map<uintptr_t, id<MTLBuffer>> shared_;
     std::map<std::pair<const uint8_t*, size_t>, id<MTLBuffer>> weights_;  // key: (data, nbytes)

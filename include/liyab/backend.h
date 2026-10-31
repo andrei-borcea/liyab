@@ -2,7 +2,8 @@
 //
 // A backend executes the weight-bound matrix multiplications of a transformer
 // (QKV/O projections and the FFN). A backend may also fuse a complete SiLU
-// FFN. Attention softmax, norms and RoPE stay on the CPU next to the KV cache.
+// FFN and run the attention of a prompt block over the KV cache (attention()).
+// Norms, RoPE and the attention of a decoding step stay on the CPU next to the KV cache.
 // Weights are read in place from the memory-mapped model file; backends must
 // not copy whole tensors.
 #ifndef LIYAB_BACKEND_H
@@ -12,6 +13,7 @@
 #include <span>
 #include <string>
 
+#include "liyab/kv_cache.h"
 #include "liyab/types.h"
 
 namespace liyab {
@@ -78,6 +80,35 @@ public:
                                   const float* x, float* y, int32_t n) {
         (void)gate; (void)up; (void)down; (void)x; (void)y; (void)n;
         return Status(ErrorCode::Unsupported, "fused SiLU FFN is unavailable");
+    }
+
+    // Causal attention of a block of query rows over a layer's cached keys and values, for the prompt blocks an
+    // accelerator has the matrix units for. Query row t sits at position n_past + t and attends to every position
+    // [0, n_past + t] (its own included): no windows, sinks, masks, bias or head pruning, and values as wide as keys
+    // (the Transformer asks only for such blocks). out[t][h] = softmax(scale * q[t][h] . k[p]) . v[p] over those
+    // positions, with the scores squashed first as cap * tanh(score / cap) when softcap > 0. The block's own keys and
+    // values are in the cache already.
+    struct AttentionJob {
+        const KvCache::RowView* rows = nullptr;  // the layer's rows; positions [0, n_past + n) are mapped
+        DType kv_type = DType::F16;              // the cache's format: F16 or Q8_0 are what backends may support
+        int32_t head_dim = 0;
+        int32_t n_head = 0;     // query heads; a multiple of n_head_kv (grouped-query attention)
+        int32_t n_head_kv = 0;
+        int32_t n_past = 0;     // positions cached before the block's first row
+        int32_t n = 0;          // query rows
+        float scale = 1.0f;
+        float softcap = 0.0f;
+        const float* q = nullptr;  // [n][n_head * head_dim], row-major, already rotated and normalized
+        float* out = nullptr;      // [n][n_head * head_dim]; must not alias q
+    };
+    // Returns ErrorCode::Unsupported, before writing `out`, when this backend does not take the job (the default: it
+    // does not; Metal takes F16 and Q8_0 caches of 64, 96, 128 or 256 channels per head and blocks of at least 16
+    // rows). The caller then runs the CPU attention, whose rounding depends only on the position: a backend that
+    // answers must not be asked for decoding steps or speculative verification, which have to match decoding bit
+    // for bit. Thread-compatible: one call at a time.
+    virtual Status attention(const AttentionJob& job) {
+        (void)job;
+        return Status(ErrorCode::Unsupported, "attention is not available on this backend");
     }
 
     // One independent matmul of a batch: y[n][w.rows()] = x[n][w.cols()] · wᵀ.

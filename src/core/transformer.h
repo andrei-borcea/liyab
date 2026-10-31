@@ -1023,6 +1023,11 @@ private:
     // each head softmax denominator without a value contribution. Leaves each
     // token's heads in att_, value_dim channels per head.
     void attention(const Layer& layer, int32_t n, ThreadPool& pool, const uint8_t* head_mask);
+    // attention() for a prompt block through the attention backend (Backend::attention) when the block is the plain
+    // kind it takes: one causal sequence over a cache that keeps every position, no window, sinks, ALiBi, head
+    // pruning, tree or scattered positions, values as wide as keys. Returns whether att_ is written; false leaves
+    // the work to attention().
+    bool attention_on_backend(const Layer& layer, int32_t n, const Route& route, const uint8_t* head_mask);
     [[nodiscard]] KeyScalingShape key_scaling_shape() const;
     // Per-head Q/K norms of block `L` on one token's queries (n_head heads;
     // nullptr: none) and keys (n_head_kv heads; nullptr: none), where the block has them.

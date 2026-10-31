@@ -2327,6 +2327,10 @@ struct Engine::Impl {
         const RoutePicker::Arm arm = route_picker.next(tokens);
         return {arm == RoutePicker::Arm::Host ? draft_route() : normal_route(), arm, route_picker.measuring(tokens)};
     }
+    // How many of a chunk's `tokens` tokens the pass takes (see RoutePicker::kHostProbeTokens).
+    size_t chunk_limit(const Picked& picked, size_t tokens) const {
+        return picked.measure ? route_picker.limit(tokens, picked.arm) : tokens;
+    }
     // A finished pass of `tokens` tokens that produced `emitted` tokens (a block: the tokens it processed) in `ms`.
     void report_pass(const Picked& picked, size_t tokens, size_t emitted, double ms) {
         if (picked.measure && emitted > 0) route_picker.report(tokens, picked.arm, ms / static_cast<double>(emitted));
@@ -3841,7 +3845,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
         }
         const bool alone = s.alone();
         const size_t chunk = static_cast<size_t>(alone ? s.prefill_chunk() : s.shared_chunk());
-        const auto part = prefix.subspan(i, std::min(chunk, prefix.size() - i));
+        auto part = prefix.subspan(i, std::min(chunk, prefix.size() - i));
         if (alone) {
             const Hold hold(s, q);
             // A background sequence's pass may be stopped for foreground
@@ -3852,6 +3856,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             ForwardHooks hooks = prefill_hooks;
             if (stoppable) hooks.cancel = &s.preempt;
             const Impl::Picked picked = s.pick_route(prefill_policy, part.size());
+            part = part.first(s.chunk_limit(picked, part.size()));
             const auto t_chunk = Clock::now();
             if (auto r = s.target->forward(part, Transformer::Logits::None, picked.route, *s.pool, &hooks); !r) {
                 if (r.status().code() == ErrorCode::Cancelled && stoppable && s.target->abandon_pass().is_ok()) {
@@ -4441,7 +4446,7 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
     for (size_t i = reused; i < t.size();) {
         const bool alone = s.alone();
         const size_t chunk = static_cast<size_t>(alone ? s.prefill_chunk() : s.shared_chunk());
-        const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
+        std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
         if (alone) {
             const Hold hold(s, q);
             if (hybrid) s.target->snapshot_state();
@@ -4452,6 +4457,7 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
             ForwardHooks pass_hooks = hooks;
             if (stoppable) pass_hooks.cancel = &s.preempt;
             const Impl::Picked picked = s.pick_route(policy, part.size());
+            part = part.first(s.chunk_limit(picked, part.size()));
             const auto t_chunk = Clock::now();
             if (auto r = s.target->forward(part, Transformer::Logits::None, picked.route, *s.pool, &pass_hooks); !r) {
                 if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {

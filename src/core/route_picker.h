@@ -13,6 +13,8 @@
 // CPU's, since the CPU is the numerical reference and costs no heat. Until a class is decided, a block of fewer
 // than kMinBlockTokens tokens is too short to measure and runs on the accelerated route.
 //
+// A CPU pass that measures a block is cut to kHostProbeTokens tokens (limit()).
+//
 // The schedule advances when a pass is reported, not when a route is handed out: a pass that never reports
 // (cancelled, failed, served from a cache) costs nothing.
 //
@@ -34,6 +36,11 @@ public:
     static constexpr size_t kStepTokens = 16;
     static constexpr size_t kMinBlockTokens = 17;
     static constexpr double kMargin = 0.8;
+    // The CPU's time per token does not depend on how many tokens a pass has (it gives the same bits for any split
+    // too), and a block pass of 256 tokens costs it seconds on a large model: while a block class is measured, the
+    // CPU's passes take at most this many tokens of a chunk (the next pass takes the rest), the accelerator's whole
+    // chunks, which is the size it runs at once decided.
+    static constexpr size_t kHostProbeTokens = 32;
 
     // The route for a pass of `tokens` tokens; while the class is undecided, report() its time.
     Arm next(size_t tokens) const {
@@ -42,6 +49,11 @@ public:
         if (c.decided) return c.host ? Arm::Host : Arm::Accelerator;
         if (tokens < kMinBlockTokens && tokens > kStepTokens) return Arm::Accelerator;
         return kPlan[std::min(c.reported, kPlan.size() - 1)];
+    }
+
+    // How many of a chunk's `tokens` tokens a pass on `arm` takes: all of them, except a CPU pass that measures a block.
+    size_t limit(size_t tokens, Arm arm) const {
+        return arm == Arm::Host && tokens > kHostProbeTokens && measuring(tokens) ? kHostProbeTokens : tokens;
     }
 
     // Whether next() answers by measurement still (so the pass's time is wanted).
