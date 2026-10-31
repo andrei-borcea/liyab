@@ -151,6 +151,29 @@ The draft model's token table (`tokenizer.ggml.tokens`) must agree with the targ
 output width may differ (the 0.5B pads to 151,936 ids, the 14B to 152,064). The draft then drafts among the ids it has,
 and the target verifies every draft.
 
+### A 27B hybrid on the M4 Pro
+
+Qwen3.5-27B Q4_K_M (48 DeltaNet and 16 attention blocks; a model whose recurrent state must be checkpointed for a
+verification pass), CPU, `performance` profile, Q8_0 KV, greedy, 200-token replies, three alternated runs, `liyab-cli`.
+Plain decoding runs at 12–13 tok/s (the bandwidth ceiling `liyab-cli --doctor` prints is 16.7).
+
+* **Verification costs more here.** A 4-token pass costs 1.80 steps with the weights repacked for the CPU's i8mm
+  kernels (2.19 with the file's layout, which is what the repack rule used to leave a model this size with:
+  [when the repack happens](memory-and-serving.md#converted-weights-cache)). The automatic mode still turns the
+  drafts on (the limit is 2.5).
+* **Drafts from the text**, on a code-copy task: about 18.5 tok/s against about 10.7 plain (79–81% of drafts accepted).
+* **A draft model of the family** (Qwen3.5-0.8B Q8_0 or 2B Q4_K_M, whose 248,320-id token table matches): the draft
+  steps cost 5.1 and 7.9 ms against the 27B's 75.
+
+  | text | 0.8B, 3 drafts | 2B, 3 drafts | 4 drafts |
+  |---|---|---|---|
+  | an explanation | 14.4 tok/s (×1.18, 60% accepted) | 15.0 (×1.24, 68%) | no better than 3 (×1.11–1.19) |
+  | a short story | 11.7 (×1.00, 47%) | 11.4 (×0.97, 49%) | ×0.93–0.94 |
+
+  The gain is real but small on text that follows from its prompt and nil on free invention, where acceptance is under
+  half and the adaptive budget only limits the loss. Nothing chooses a draft model automatically: it is
+  `draft_model_path` (`--draft`).
+
 ### Host measurements: suffix drafts and context lookup
 
 Measured with `liyab-spec-bench` on an Apple M4 Pro with the CPU backend, 6 threads, greedy decoding and replies of up to
