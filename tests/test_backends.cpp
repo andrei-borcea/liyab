@@ -318,12 +318,13 @@ TEST_CASE("The route picker measures each class of pass once and keeps the faste
     using Arm = RoutePicker::Arm;
     RoutePicker picker;
     int passes = 0;
-    CHECK(picker.next(1) == Arm::Host);  // the schedule starts on the CPU
+    CHECK(picker.next(1) == Arm::Host);  // the schedule of steps starts on the CPU
     CHECK(run_picker(picker, 1, 10.0, 100.0, &passes) == Arm::Host);  // decoding: the CPU is faster
     CHECK(passes == 5);
-    CHECK(picker.next(64) == Arm::Host);  // a block is a class of its own, not yet decided
+    CHECK(picker.next(64) == Arm::Accelerator);  // a block is a class of its own, not yet decided; it starts on the GPU
     CHECK(picker.measuring(64));
-    CHECK(run_picker(picker, 64, 20.0, 5.0) == Arm::Accelerator);  // prompts: the accelerator is faster
+    CHECK(run_picker(picker, 64, 20.0, 5.0, &passes) == Arm::Accelerator);  // prompts: the accelerator is faster
+    CHECK(passes == 3);  // a block's CPU pass is costly: measured once
     CHECK(picker.next(1) == Arm::Host);  // the first decision stands
     CHECK(picker.next(8) == Arm::Host);  // a speculative verification pass is a step
     CHECK(!picker.measuring(1));
@@ -342,7 +343,7 @@ TEST_CASE("The route picker measures each class of pass once and keeps the faste
     CHECK(warm.next(1) == Arm::Accelerator);
 
     RoutePicker short_blocks;  // 17 tokens is the shortest block measured; a pass in between is a step
-    CHECK(short_blocks.next(RoutePicker::kMinBlockTokens) == Arm::Host);
+    CHECK(short_blocks.next(RoutePicker::kMinBlockTokens) == Arm::Accelerator);
 
     // While a block class is measured the CPU takes a short slice of a chunk; the accelerator, and the CPU once the
     // class is decided or for a step or a short block, take all of it.

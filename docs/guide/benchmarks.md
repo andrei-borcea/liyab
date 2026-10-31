@@ -80,27 +80,42 @@ about 2 GB of weights per token.
 | Model | Prompt: CPU / Metal / automatic (tok/s) | Decoding: CPU / Metal / automatic (tok/s) |
 | :--- | :--- | :--- |
 | Bonsai-1.7B Q1_0 (231 MiB) | 138 / 234 / n.m. | 135 / 45 / 114–135 |
-| Qwen2.5-Coder-14B Q5_K_M (9.8 GiB) | 38 / 106 / 96 | 17.5 / 7.8 / 12.0 |
-| Qwen3.8-27B Q4_K_M (15.4 GiB) | n.m. / n.m. / 34 | 12.7 / 4.3 / 10.7 |
+| Qwen2.5-Coder-14B Q5_K_M (9.8 GiB) | 38 / 164 / 154 | 17.5 / 7.8 / 12.0 |
+| Qwen3.8-27B Q4_K_M (15.4 GiB) | n.m. / n.m. / 56 | 12.7 / 4.3 / 10.7 |
 
-(n.m.: not measured; automatic decoding includes the first steps spent measuring; the 27B on the CPU alone keeps every
+(n.m.: not measured; Bonsai-1.7B was measured before the attention kernel and the later matrix-kernel changes, whose
+Metal prompt rate has not been measured since; automatic decoding includes the first steps spent measuring; the 27B's
+prompt is 445 tokens, so its automatic figure includes the measuring passes; the 27B on the CPU alone keeps every
 block resident since the repacked copies are only made when they fit, otherwise it streamed blocks at 1.6 tok/s.)
 
-* Metal's prompt rate comes from the matrix kernels (4–5 TFLOPS for every format; the 14B's prompt was 10 tok/s and
-  the 27B's 5.8 before them) and, since the prompt blocks' attention moved to the GPU, from a flash-attention kernel
-  (the 14B went from 77 to 106 tok/s on Metal; the text is the one the matrix kernels alone gave, the CPU's differing
-  at a near-tie token after about 50). Where the 14B's 14.6 s of GPU-backed prompt goes: the FFNs 8.1 s (3.9 TFLOPS),
-  the QKV and output products 2.6 s (3.7), attention 1.6 s (0.8), and about 2.3 s of the GPU waiting for the CPU's
-  norms, RoPE, cache writes and copies. A stand-alone F16 matrix kernel reaches 5.3 TFLOPS with tiles of 64×32, 64×64
-  or 128×32, half or float tiles and with or without double buffering, and 128-row tiles with 16 accumulators per
-  SIMD-group spill and fall to 0.5–4.5, so the products' structure is at what this GPU's matrix units give; the K-quant
-  decodes cost them the difference.
+* The 14B's Metal prompt rate went from 10 tok/s (a matrix-vector kernel per row) to 83 with the matrix kernels, then
+  to 164 with the changes below, each measured on the same 1,555-token prompt: the prompt blocks' attention on the GPU
+  (77 to 106), matrix tiles of 64 tokens with the fragment loops fully unrolled (106 to 125), the same unrolling in
+  the attention kernel (125 to 139), the CPU's RoPE computing each angle once instead of once per head and the norms of
+  a block running on every thread (139 to 146), a residency set for the weights (146 to 160), and concurrent
+  dispatches inside a command buffer (160 to 164). Where its 9.5 s go: about 8.8 s of GPU work (the FFNs 6.5 s, the
+  QKV and output products 2.1 s, attention 0.26 s) and the rest the GPU waiting for the CPU between commands.
+* Loops over matrix fragments must unroll completely. Left to the compiler, a 64-token tile ran at 0.6 TFLOPS instead
+  of 5, and the attention kernel at 0.85 instead of 5.0 (7.0 ms against 1.2 ms for 256 queries over 1,256 keys).
+  `liyab-kernels` shows 5.1–5.6 TFLOPS for F16, Q4_0, Q8_0 and the K-quants since.
+* A stand-alone F16 matrix kernel reaches 5.3 TFLOPS with tiles of 64×32, 64×64 or 128×32, half or float tiles, half
+  or float accumulators and with or without double buffering: that is what this GPU's matrix units give, and the
+  products sit at it. Tiles of 128×64 or more with 16 accumulators per SIMD-group fall to 0.5–4.5.
+* Without a residency set Metal makes every buffer a command binds resident again at each submission: a layer's FFN
+  waited 2.1 ms past its GPU time per call, the attention projections 0.7 ms, the attention kernel 0.2 ms. A set kept
+  on the queue (macOS 15 and later) took about a second off the 14B's prompt.
+* Running the products on the CPU and the GPU at once (the GPU taking 77% of a block's rows, the CPU the rest, both
+  finishing together) did not help here: 6.97 ms per token against 6.8 for the GPU alone, because the GPU slows by
+  about 20% per row while every CPU core is busy. It was not kept.
 * For reference, `llama-bench` (llama.cpp build 11669, every layer on the GPU) processes this 14B's prompt at 211 tok/s
   at 1,536 tokens on the same Mac, and its server log showed 259 tok/s over the first 2,048 and 157 averaged over
-  16,384: the prompt rate is the gap that remains, about 2×.
+  16,384: the prompt rate is the gap that remains, about 1.3×. Loading is not a gap: a warm start of this 14B takes
+  0.64 s from the command line (0.81 s for `llama-bench` including a one-token prompt); on the CPU alone it takes 2.3 s,
+  the time to repack the weights for the i8mm kernels.
 * Decoding is faster on the CPU than on Metal on this Mac for every model above, because Metal waits for the GPU at
   every product and its Q4_K/Q5_K kernels read 78–88 GB/s. Automatic routing therefore decodes on the CPU and
-  processes prompts on Metal.
+  processes prompts on Metal; it measures a prompt block's CPU pass on 32 tokens only (one pass), which cost this
+  prompt about 0.6 s.
 
 ### M4 Pro dense 27B development check
 

@@ -61,7 +61,7 @@ Temperature, context length and OS activity affect throughput. The [measurement 
 keeps the configurations, alternating A/B runs, single-run caveats and per-phase timings.
 Stage-1 phone validation remains deferred; these figures come from earlier device runs.
 
-**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M decodes **10.7–12.7 tok/s** and processes a 445-token prompt at 34 tok/s; Qwen2.5-Coder-14B Q5_K_M processes 1,555 tokens at 66–83 tok/s; the 1-bit Bonsai-1.7B decodes 114–135 tok/s. Decoding reads every weight once per token, so it is bound by memory bandwidth over model size (about 16 tok/s for the 27B on this Mac). [Per-backend table and conditions](docs/guide/benchmarks.md#prompts-and-decoding-on-the-m4-pro-by-backend-31-october-2026); [earlier 27B development check](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
+**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M decodes **10.7–12.7 tok/s** and processes a 445-token prompt at 56 tok/s; Qwen2.5-Coder-14B Q5_K_M processes 1,555 tokens at 154–164 tok/s; the 1-bit Bonsai-1.7B decodes 114–135 tok/s. Decoding reads every weight once per token, so it is bound by memory bandwidth over model size (about 16 tok/s for the 27B on this Mac). [Per-backend table and conditions](docs/guide/benchmarks.md#prompts-and-decoding-on-the-m4-pro-by-backend-31-october-2026); [earlier 27B development check](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
 
 <a id="charts"></a>
 
@@ -358,7 +358,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | :--- | :--- |
 | Model coverage | Gemma 4 / DeepSeek-V4 text have synthetic conformance; trained quality, production exports and other stage-2 combinations remain unverified |
 | Export metadata | Some published tokenizer / template metadata needs a corrected copy |
-| GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompt blocks of 16 rows or more run their products at 4–5 TFLOPS and their attention on the GPU when the block is plain (one sequence, F16 or Q8_0 cache, 64/96/128/256 channels per head, no window, sinks or ALiBi), else on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
+| GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompt blocks of 16 rows or more run their products at 5–5.6 TFLOPS and their attention on the GPU when the block is plain (one sequence, F16 or Q8_0 cache, 64/96/128/256 channels per head, no window, sinks or ALiBi), else on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
 | Vulkan | Per-token prefill matvec; resident tensors copied to GPU memory; MoE experts on CPU |
 | NPUs | Runtime detection and ranking; compute fallback |
 | Pooling | Decoder / bidirectional Gemma pooling paths; encoder-only models pending |

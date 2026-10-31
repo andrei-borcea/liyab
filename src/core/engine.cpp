@@ -2333,7 +2333,10 @@ struct Engine::Impl {
     }
     // A finished pass of `tokens` tokens that produced `emitted` tokens (a block: the tokens it processed) in `ms`.
     void report_pass(const Picked& picked, size_t tokens, size_t emitted, double ms) {
-        if (picked.measure && emitted > 0) route_picker.report(tokens, picked.arm, ms / static_cast<double>(emitted));
+        if (picked.measure && emitted > 0) {
+            route_picker.report(tokens, picked.arm, ms / static_cast<double>(emitted));
+            if (!route_picker.measuring(tokens)) LIYAB_LOG_INFO("automatic routing, %s", route_picker.summary(tokens).c_str());
+        }
     }
 
     // Key scales of a quantized KV cache (core/key_scaling.h): the ones kept

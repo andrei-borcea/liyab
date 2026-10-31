@@ -2019,12 +2019,21 @@ void Transformer::rope(float* vec, int32_t n_heads, size_t stride, int32_t pos, 
     const int32_t half = static_cast<int32_t>(table.inv_freq.size());
     const bool halves = layout == RopeLayout::Halves;
     const float p = static_cast<float>(pos) / table.scale;
+    // The angles depend on the position and the frequency only: one cos/sin per frequency, not per head (a 40-head
+    // query and 8 key heads took 48 times as many, the bulk of a prompt's CPU work between the GPU's products).
+    // The values are those the per-head loop computed, so the bits do not change.
+    thread_local std::vector<float> cos_sin;
+    cos_sin.resize(2 * static_cast<size_t>(half));
+    for (int32_t i = 0; i < half; ++i) {
+        const float theta = p * table.inv_freq[static_cast<size_t>(i)];
+        cos_sin[2 * static_cast<size_t>(i)] = std::cos(theta) * table.magnitude;  // x 1 keeps the bits
+        cos_sin[2 * static_cast<size_t>(i) + 1] = std::sin(theta) * table.magnitude;
+    }
     for (int32_t h = 0; h < n_heads; ++h) {
         float* x = vec + static_cast<size_t>(h) * stride;
         for (int32_t i = 0; i < half; ++i) {
-            const float theta = p * table.inv_freq[static_cast<size_t>(i)];
-            const float cs = std::cos(theta) * table.magnitude;  // x 1 keeps the bits
-            const float sn = std::sin(theta) * table.magnitude;
+            const float cs = cos_sin[2 * static_cast<size_t>(i)];
+            const float sn = cos_sin[2 * static_cast<size_t>(i) + 1];
             const int32_t a = halves ? i : 2 * i;
             const int32_t b = halves ? i + half : 2 * i + 1;
             const float x0 = x[a];
@@ -5460,10 +5469,20 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
 
     // --- token mixer (attention or a recurrent mixer) ---
     if (ffn_skip != nullptr) x_block_in_.assign(x_.begin(), x_.end());
-    for (size_t t = 0; t < un; ++t) {
+    // Rows are independent: a prompt block's norms run on every thread (the GPU idles while the CPU does them).
+    auto per_token = [&](auto&& body) {
+        if (un < 16) {
+            for (size_t t = 0; t < un; ++t) body(t);
+            return;
+        }
+        pool.parallel_for(static_cast<int64_t>(un), [&](int64_t begin, int64_t end) {
+            for (auto t = static_cast<size_t>(begin); t < static_cast<size_t>(end); ++t) body(t);
+        });
+    };
+    per_token([&](size_t t) {
         if (plan.norm_before_mixer) norm_row(x_.data() + t * d, opt(L.attn_norm), opt(L.attn_norm_b), xb_.data() + t * d, c.n_embd);
         else std::copy_n(x_.data() + t * d, d, xb_.data() + t * d);
-    }
+    });
     if (plan.laurel) {
         // Laurel's branch of the normalized input, before the mixer
         // overwrites it: x_n + norm(laurel_r · laurel_l · x_n).
@@ -5549,10 +5568,10 @@ Status Transformer::run_block(int32_t l, const BlockWeights& w, int32_t n, const
     if (plan.parallel) {
         std::copy_n(par_in_.data(), un * d, xb_.data());
     } else {
-        for (size_t t = 0; t < un; ++t) {
+        per_token([&](size_t t) {
             if (plan.norm_before_ffn) norm_row(x_.data() + t * d, opt(L.ffn_norm), opt(L.ffn_norm_b), xb_.data() + t * d, c.n_embd);
             else std::copy_n(x_.data() + t * d, d, xb_.data() + t * d);
-        }
+        });
     }
     if (plan.parallel_ffn) {
         {

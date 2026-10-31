@@ -446,21 +446,25 @@ Implemented features are described above. These are next, in order:
     0.25 ms each: small models decode faster on the CPU, and automatic routing sends them there;
   * its Q4_K and Q5_K matvec kernels read 78 and 88 GB/s, where the CPU's read 250 and the Q4_0 kernel 208: a dense
     Q4_K_M model decodes about three times slower on Metal than on the CPU of the same Mac;
-  * batches of 16 rows or more use matrix kernels that sit at 4–5 TFLOPS for every format, and whose sums are not the
-    matvec kernels' bits (verification batches of fewer rows keep the exact ones);
+  * batches of 16 rows or more use matrix kernels (tiles of 32 tokens, of 64 from 64 rows) that sit at 5–5.6
+    TFLOPS for every format, and whose sums are not the matvec kernels' bits (verification batches of fewer rows keep
+    the exact ones);
   * the attention of a prompt block (16 rows or more) runs on the GPU when it is the plain case: one causal sequence,
     an F16 or Q8_0 cache, 64, 96, 128 or 256 channels per head, no window, attention sinks, ALiBi, head pruning, tree
     or scattered positions (`Backend::attention`); the layer's rows are copied into shared buffers first, and the
-    kernel reaches only about 0.8 TFLOPS (1.6 s of a 14.6 s 1,555-token prompt on the 14B), so it is far from the
-    matrix kernels' rate. Other blocks, and every decoding step, keep the CPU attention, whose rounding depends on
-    the position only;
-  * norms, RoPE, the cache writes and the copies of activations still run on the CPU between the GPU's commands: the
-    GPU is idle for about 15% of a 14B prompt.
+    kernel reaches about 5 TFLOPS (0.26 s of a 9.5 s 1,555-token prompt on the 14B). Other blocks, and every
+    decoding step, keep the CPU attention, whose rounding depends on the position only;
+  * the GPU waits for the CPU's norms, RoPE and cache writes and for each command's submission between products: it
+    is busy about 90% of a 14B prompt (8.8 s of 9.7);
+  * the matrix and attention kernels' fragment loops are unrolled by pragma: left rolled, the compiler keeps the
+    accumulators in memory and they run 6–8 times slower.
 * **Kernels:** TQ1_0 and NVFP4 use a generic decode path on the CPU. Lattice I-quants are 2–3× slower than Q4_K. Only
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
 * **Automatic routing** measures the first passes of each class; a model that decodes in a few milliseconds spends
-  them mostly on the slower route (three of the first five steps), and nothing is kept between runs yet. The CPU's
-  measuring passes over a prompt take 32 tokens of a chunk, not all 256, which cost a 14B prompt 1.5 s instead of 12.
+  them mostly on the slower route (three of the first five steps), and nothing is kept between runs yet. A prompt
+  block is measured once on the CPU, on 32 tokens of a chunk, not all 256, which cost a 14B prompt 0.6 s instead of 12.
+  Engines that name no backend can give a different text for the same prompt when the routes they pick differ, since
+  the accelerator's sums differ from the CPU's in the last bits; the engine tests name the CPU for that reason.
 * **x86-64:**
   * the AVX2 kernels have been run only under Rosetta 2 on Apple silicon, not yet on an Intel or AMD CPU, and the
     `x86_64-*` golden hashes come from there (macOS libm); Linux x86-64 builds are not tested, nor is Windows (below);

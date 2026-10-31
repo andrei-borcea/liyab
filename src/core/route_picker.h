@@ -8,7 +8,9 @@
 // Two classes of pass are decided separately: a step (decoding, forced text, a speculative verification: at most
 // kStepTokens tokens, which one decision serves so that drafts are verified on the numerics of plain decoding) and a
 // block (a prompt or a prefill chunk). Per class the first passes alternate between the two routes, the first pass
-// of the accelerator being a warm-up that is not counted (it wraps the weights for the GPU); then the class is
+// of the accelerator being a warm-up that is not counted (it wraps the weights for the GPU); a step is measured
+// twice on each route (host, accelerator, host, accelerator, accelerator: a few tens of milliseconds), a block once
+// (accelerator, host, accelerator), since a block's CPU pass costs seconds on a large model. Then the class is
 // decided for the life of the picker: the accelerator only when its best time per token is below kMargin times the
 // CPU's, since the CPU is the numerical reference and costs no heat. Until a class is decided, a block of fewer
 // than kMinBlockTokens tokens is too short to measure and runs on the accelerated route.
@@ -25,8 +27,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <mutex>
+#include <string>
 
 namespace liyab {
 
@@ -48,12 +52,24 @@ public:
         const Class& c = classes_[index(tokens)];
         if (c.decided) return c.host ? Arm::Host : Arm::Accelerator;
         if (tokens < kMinBlockTokens && tokens > kStepTokens) return Arm::Accelerator;
-        return kPlan[std::min(c.reported, kPlan.size() - 1)];
+        return plan(index(tokens))[std::min(c.reported, plan_size(index(tokens)) - 1)];
     }
 
     // How many of a chunk's `tokens` tokens a pass on `arm` takes: all of them, except a CPU pass that measures a block.
     size_t limit(size_t tokens, Arm arm) const {
         return arm == Arm::Host && tokens > kHostProbeTokens && measuring(tokens) ? kHostProbeTokens : tokens;
+    }
+
+    // What the class of `tokens` measured and chose, once decided ("" before): for the log.
+    std::string summary(size_t tokens) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Class& c = classes_[index(tokens)];
+        if (!c.decided) return {};
+        char text[160];
+        std::snprintf(text, sizeof text, "%s: CPU %.2f ms/token, accelerator %.2f; chose %s",
+                      index(tokens) == 0 ? "steps" : "blocks", c.host_best, c.accelerator_best,
+                      c.host ? "the CPU" : "the accelerator");
+        return text;
     }
 
     // Whether next() answers by measurement still (so the pass's time is wanted).
@@ -73,7 +89,7 @@ public:
         }
         double& best = arm == Arm::Host ? c.host_best : c.accelerator_best;
         best = std::min(best, ms_per_token);
-        if (++c.reported >= kPlan.size()) {
+        if (++c.reported >= plan_size(index(tokens))) {
             c.host = !(c.accelerator_best < kMargin * c.host_best);
             c.decided = true;
         }
@@ -87,9 +103,13 @@ private:
         bool decided = false, host = false;
     };
     static size_t index(size_t tokens) { return tokens <= kStepTokens ? 0 : 1; }
-    // Host, accelerator (warm-up), host, accelerator, accelerator.
-    static constexpr std::array<Arm, 5> kPlan = {Arm::Host, Arm::Accelerator, Arm::Host, Arm::Accelerator,
-                                                 Arm::Accelerator};
+    // Steps: host, accelerator (warm-up), host, accelerator, accelerator. Blocks: accelerator (warm-up), host,
+    // accelerator.
+    static constexpr std::array<Arm, 5> kStepPlan = {Arm::Host, Arm::Accelerator, Arm::Host, Arm::Accelerator,
+                                                     Arm::Accelerator};
+    static constexpr std::array<Arm, 3> kBlockPlan = {Arm::Accelerator, Arm::Host, Arm::Accelerator};
+    static const Arm* plan(size_t cls) { return cls == 0 ? kStepPlan.data() : kBlockPlan.data(); }
+    static size_t plan_size(size_t cls) { return cls == 0 ? kStepPlan.size() : kBlockPlan.size(); }
     mutable std::mutex mutex_;
     std::array<Class, 2> classes_;
 };

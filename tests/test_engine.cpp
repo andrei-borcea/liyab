@@ -450,6 +450,9 @@ EngineConfig engine_config(const std::string& path) {
     c.n_threads = 4;
     c.thermal_polling = false;
     c.power.profile = PowerProfile::Performance;  // unpaced: keep tests fast
+    // The reference CPU: automatic routing decides by timing which passes an accelerator rounds, so two engines
+    // would not always give the same text, and these tests compare engines. Tests of the accelerators name them.
+    c.backend = BackendKind::Cpu;
     return c;
 }
 
@@ -4743,7 +4746,9 @@ TEST_CASE("The prefix cache keeps contexts on storage within its cap, for later 
         const std::string next = conversations[0] + replies[0] + " hello";
         GenerationStats st{};
         const std::string out = run(*cached.value(), next, &st);
-        auto fresh = Engine::create(engine_config(model_path("prefix_qwen35", spec)));
+        EngineConfig plain = engine_config(model_path("prefix_qwen35", spec));
+        plain.backend = BackendKind::Cpu;  // as `cached`: automatic routing would round some passes on the GPU
+        auto fresh = Engine::create(plain);
         REQUIRE(fresh.has_value() && fresh.value()->prefill(conversations[0], true).is_ok());
         CHECK(out == run(*fresh.value(), next, &held));
         CHECK(st.cached_prefix_tokens >= held.cached_prefix_tokens - 1);

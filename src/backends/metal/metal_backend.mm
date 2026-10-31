@@ -257,7 +257,7 @@ struct MMParams {
     uint n;
 };
 
-constant constexpr uint BM = 64, BN = 32, BK = 32;
+constant constexpr uint BM = 64, BK = 32;  // a threadgroup: 64 weight rows, a tile of tokens (32 or 64), steps of 32
 
 // Each format decodes 16 consecutive weights of a row, starting at the 16-aligned column k.
 struct DqF32 {
@@ -346,19 +346,22 @@ struct DqQ6_K {
 // block from 32 different banks (a row-major tile of 32 columns would put its 8 rows in the same bank).
 inline uint blocked(uint row, uint k) { return ((row >> 3) * (BK / 8) + (k >> 3)) * 64 + (row & 7) * 8 + (k & 7); }
 
-template <typename D>
+// BN tokens per threadgroup (32 or 64): the weights of a tile are decoded once and multiplied against all of them, so
+// with the K-quants, whose decode is a good part of the work, 64 amortizes it over twice the tokens. Four simdgroups
+// in a 2 x 2 grid, each (BM / 2) x (BN / 2) of the tile: 4 x BN / 16 matrix accumulators.
+template <typename D, uint BN>
 inline void mul_mm(device const uchar* w, device const float* x, device float* y, constant MMParams& p,
                    threadgroup float* shm, uint2 tg, uint tid, uint sgitg) {
+    constexpr uint FT = BN / 16;             // token fragments per simdgroup
     threadgroup float* sa = shm;             // BM x BK in 8x8 blocks (blocked()): weights
     threadgroup float* sb = shm + BM * BK;   // BN x BK, likewise: activations
     const uint r0 = tg.x * BM, t0 = tg.y * BN;
     const uint sg_r = sgitg & 1, sg_t = sgitg >> 1;
-    simdgroup_float8x8 mc[2][4];
-    for (uint i = 0; i < 2; ++i)
-        for (uint j = 0; j < 4; ++j) mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 mc[FT][4];
+    _Pragma("clang loop unroll(full)") for (uint i = 0; i < FT; ++i)
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     const uint lr = tid >> 1, lh = tid & 1;   // the weight row and 16-column half this thread decodes
-    const uint lt = tid >> 2, lp = tid & 3;   // the activation row and 8-column part it copies
-    const uint row = r0 + lr, token = t0 + lt;
+    const uint row = r0 + lr;
     device const uchar* wrow = w + ulong(row) * p.row_bytes;
     for (uint kb = 0; kb < p.cols; kb += BK) {
         float v[16];
@@ -368,21 +371,32 @@ inline void mul_mm(device const uchar* w, device const float* x, device float* y
             for (uint i = 0; i < 16; ++i) v[i] = 0.0f;
         }
         for (uint i = 0; i < 16; ++i) sa[blocked(lr, lh * 16 + i)] = v[i];
-        for (uint i = 0; i < 8; ++i) sb[blocked(lt, lp * 8 + i)] = token < p.n ? x[ulong(token) * p.cols + kb + lp * 8 + i] : 0.0f;
+        // BN x BK activations: 4 consecutive values per step, BN * BK / 4 steps over the 128 threads.
+        for (uint c = tid; c < BN * BK / 4; c += 128) {
+            const uint lt = c / (BK / 4), lq = c % (BK / 4);
+            const uint token = t0 + lt;
+            float4 a = float4(0.0f);
+            if (token < p.n) a = *reinterpret_cast<device const float4*>(x + ulong(token) * p.cols + kb + lq * 4);
+            threadgroup float* dst = sb + blocked(lt, lq * 4);
+            dst[0] = a.x;
+            dst[1] = a.y;
+            dst[2] = a.z;
+            dst[3] = a.w;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint k8 = 0; k8 < BK; k8 += 8) {
-            simdgroup_float8x8 ma[2], mb[4];
-            for (uint i = 0; i < 2; ++i) simdgroup_load(ma[i], sb + ((sg_t * 2 + i) * (BK / 8) + k8 / 8) * 64, 8);
-            for (uint j = 0; j < 4; ++j) simdgroup_load(mb[j], sa + ((sg_r * 4 + j) * (BK / 8) + k8 / 8) * 64, 8, ulong2(0, 0), true);
-            for (uint i = 0; i < 2; ++i)
-                for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(mc[i][j], ma[i], mb[j], mc[i][j]);
+        _Pragma("clang loop unroll(full)") for (uint k8 = 0; k8 < BK; k8 += 8) {
+            simdgroup_float8x8 ma[FT], mb[4];
+            _Pragma("clang loop unroll(full)") for (uint i = 0; i < FT; ++i) simdgroup_load(ma[i], sb + ((sg_t * FT + i) * (BK / 8) + k8 / 8) * 64, 8);
+            _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) simdgroup_load(mb[j], sa + ((sg_r * 4 + j) * (BK / 8) + k8 / 8) * 64, 8, ulong2(0, 0), true);
+            _Pragma("clang loop unroll(full)") for (uint i = 0; i < FT; ++i)
+                _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(mc[i][j], ma[i], mb[j], mc[i][j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     // The tile, activation-row major, through threadgroup memory so the edges are bounds-checked.
     threadgroup float* tile = shm;
-    for (uint i = 0; i < 2; ++i)
-        for (uint j = 0; j < 4; ++j) simdgroup_store(mc[i][j], tile + (sg_t * 16 + i * 8) * BM + sg_r * 32 + j * 8, BM);
+    _Pragma("clang loop unroll(full)") for (uint i = 0; i < FT; ++i)
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) simdgroup_store(mc[i][j], tile + (sg_t * FT * 8 + i * 8) * BM + sg_r * 32 + j * 8, BM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < BN * BM; e += 128) {
         const uint t = e / BM, r = e % BM;
@@ -395,7 +409,13 @@ inline void mul_mm(device const uchar* w, device const float* x, device float* y
                      device float* y [[buffer(2)]], constant MMParams& p [[buffer(3)]],                           \
                      threadgroup float* shm [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],       \
                      uint tid [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]]) {  \
-        mul_mm<DQ>(w, x, y, p, shm, tg, tid, sgitg);                                                             \
+        mul_mm<DQ, 32>(w, x, y, p, shm, tg, tid, sgitg);                                                         \
+    }                                                                                                            \
+    kernel void NAME##_64(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],              \
+                          device float* y [[buffer(2)]], constant MMParams& p [[buffer(3)]],                     \
+                          threadgroup float* shm [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], \
+                          uint tid [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]]) { \
+        mul_mm<DQ, 64>(w, x, y, p, shm, tg, tid, sgitg);                                                         \
     }
 LIYAB_MM(mm_f32, DqF32)
 LIYAB_MM(mm_f16, DqF16)
@@ -435,6 +455,8 @@ struct KvQ8 {
     }
 };
 
+// The loops over fragments unroll completely (as in mul_mm): rolled, the accumulators live in memory and the kernel
+// runs at a sixth of the speed (0.85 TFLOPS against 5).
 template <typename KV, uint D>
 inline void flash_attn(device const float* q, device const uchar* kbuf, device const uchar* vbuf, device float* out,
                        constant FAParams& p, threadgroup half* shm, uint2 tg, uint tid, uint sgitg, uint lane) {
@@ -454,7 +476,7 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
     const uint pos = p.n_past + row;  // rows past n are padding: they read zeros and are never stored
 
     simdgroup_float8x8 mq[D / 8], mo[D / 8];
-    for (uint i = 0; i < D / 8; ++i) {
+    _Pragma("clang loop unroll(full)") for (uint i = 0; i < D / 8; ++i) {
         simdgroup_load(mq[i], q + ulong(t_base) * qd + h * D + i * 8, qd);
         mo[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
@@ -480,9 +502,9 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (kc < sg_kend) {
             simdgroup_float8x8 ms[C / 8];
-            for (uint c8 = 0; c8 < C / 8; ++c8) ms[c8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            for (uint d8 = 0; d8 < D / 8; ++d8) {
-                for (uint c8 = 0; c8 < C / 8; ++c8) {
+            _Pragma("clang loop unroll(full)") for (uint c8 = 0; c8 < C / 8; ++c8) ms[c8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            _Pragma("clang loop unroll(full)") for (uint d8 = 0; d8 < D / 8; ++d8) {
+                _Pragma("clang loop unroll(full)") for (uint c8 = 0; c8 < C / 8; ++c8) {
                     simdgroup_half8x8 mk;
                     simdgroup_load(mk, sk + c8 * 8 * DS + d8 * 8, DS, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(ms[c8], mq[d8], mk, ms[c8]);
@@ -490,8 +512,8 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
             }
             float s[C / 4];
             float mnew = m;
-            for (uint c8 = 0; c8 < C / 8; ++c8) {
-                for (uint j = 0; j < 2; ++j) {
+            _Pragma("clang loop unroll(full)") for (uint c8 = 0; c8 < C / 8; ++c8) {
+                _Pragma("clang loop unroll(full)") for (uint j = 0; j < 2; ++j) {
                     const uint key = kc + c8 * 8 + fn + j;
                     float v = ms[c8].thread_elements()[j] * p.scale;
                     if (p.softcap > 0.0f) v = p.softcap * precise::tanh(v / p.softcap);
@@ -504,8 +526,8 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
             mnew = max(mnew, simd_shuffle_xor(mnew, 8));
             const float alpha = m == -INFINITY ? 0.0f : exp(m - mnew);
             l *= alpha;
-            for (uint c8 = 0; c8 < C / 8; ++c8) {
-                for (uint j = 0; j < 2; ++j) {
+            _Pragma("clang loop unroll(full)") for (uint c8 = 0; c8 < C / 8; ++c8) {
+                _Pragma("clang loop unroll(full)") for (uint j = 0; j < 2; ++j) {
                     const float v = s[c8 * 2 + j];
                     const float w = v == -INFINITY ? 0.0f : exp(v - mnew);
                     l += w;
@@ -513,15 +535,15 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
                 }
             }
             m = mnew;
-            for (uint d8 = 0; d8 < D / 8; ++d8) {
+            _Pragma("clang loop unroll(full)") for (uint d8 = 0; d8 < D / 8; ++d8) {
                 mo[d8].thread_elements()[0] *= alpha;
                 mo[d8].thread_elements()[1] *= alpha;
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint c8 = 0; c8 < C / 8; ++c8) {
+            _Pragma("clang loop unroll(full)") for (uint c8 = 0; c8 < C / 8; ++c8) {
                 simdgroup_float8x8 mp;
                 simdgroup_load(mp, sp + c8 * 8, C);
-                for (uint d8 = 0; d8 < D / 8; ++d8) {
+                _Pragma("clang loop unroll(full)") for (uint d8 = 0; d8 < D / 8; ++d8) {
                     simdgroup_half8x8 mv;
                     simdgroup_load(mv, sv + c8 * 8 * DS + d8 * 8, DS);
                     simdgroup_multiply_accumulate(mo[d8], mp, mv, mo[d8]);
@@ -534,7 +556,7 @@ inline void flash_attn(device const float* q, device const uchar* kbuf, device c
     l += simd_shuffle_xor(l, 8);
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     if (row < p.n) {
-        for (uint d8 = 0; d8 < D / 8; ++d8) {
+        _Pragma("clang loop unroll(full)") for (uint d8 = 0; d8 < D / 8; ++d8) {
             device float* o = out + ulong(row) * qd + h * D + d8 * 8 + fn;
             o[0] = mo[d8].thread_elements()[0] * inv;
             o[1] = mo[d8].thread_elements()[1] * inv;
@@ -604,12 +626,16 @@ public:
             }
             const char* mm_names[] = {"mm_f32", "mm_f16", "mm_q4_0", "mm_q8_0", "mm_q4_1", "mm_q4_k", "mm_q5_k", "mm_q6_k", "mm_q1_0"};
             for (int i = 0; i < 9; ++i) {
-                id<MTLFunction> fn = [library newFunctionWithName:@(mm_names[i])];
-                id<MTLComputePipelineState> pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
-                if (pso == nil) {
-                    return Status(ErrorCode::BackendError, std::string("cannot build Metal pipeline ") + mm_names[i]);
+                for (int wide = 0; wide < 2; ++wide) {
+                    const std::string name = std::string(mm_names[i]) + (wide ? "_64" : "");
+                    id<MTLFunction> fn = [library newFunctionWithName:@(name.c_str())];
+                    id<MTLComputePipelineState> pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
+                    if (pso == nil) {
+                        return Status(ErrorCode::BackendError, "cannot build Metal pipeline " + name +
+                                                                   (error ? ": " + std::string(error.localizedDescription.UTF8String) : ""));
+                    }
+                    backend->mm_pipelines_[i][wide] = pso;
                 }
-                backend->mm_pipelines_[i] = pso;
             }
             const char* fa_names[] = {"fa_f16_64", "fa_f16_96", "fa_f16_128", "fa_f16_256",
                                       "fa_q8_64",  "fa_q8_96",  "fa_q8_128",  "fa_q8_256"};
@@ -623,6 +649,7 @@ public:
                 backend->fa_pipelines_[i] = pso;
             }
             if (backend->queue_ == nil) return Status(ErrorCode::BackendError, "cannot create Metal command queue");
+            backend->make_residency_set();
             return std::unique_ptr<Backend>(std::move(backend));
         }
     }
@@ -674,7 +701,9 @@ public:
                 return Status(ErrorCode::OutOfMemory, "cannot allocate Metal activation buffers");
             std::memcpy(x_buf_.contents, x, input_bytes);
             id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            // The products read one input and write disjoint outputs: a concurrent encoder lets the GPU start the
+            // next while the last threadgroups of the previous drain, instead of idling at the end of each.
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             [enc setBuffer:x_buf_ offset:0 atIndex:1];
             for (size_t i = 0; i < ws.size(); ++i) {
                 const TensorView& w = *ws[i];
@@ -683,6 +712,7 @@ public:
                 dispatch_matvec(enc, w, n);
             }
             [enc endEncoding];
+            commit_residency();
             [cmd commit];
             [cmd waitUntilCompleted];
             if (cmd.status != MTLCommandBufferStatusCompleted) return Status(ErrorCode::BackendError,
@@ -758,6 +788,7 @@ public:
             [enc dispatchThreadgroups:MTLSizeMake((n + 31) / 32, static_cast<NSUInteger>(job.n_head), 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             [enc endEncoding];
+            commit_residency();
             [cmd commit];
             [cmd waitUntilCompleted];
             if (cmd.status != MTLCommandBufferStatusCompleted) {
@@ -804,13 +835,15 @@ public:
             std::memcpy(x_buf_.contents, x, input_bytes);
 
             id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            // Gate and up are independent (concurrent); the activation waits for both, the down product for it.
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             const TensorView* weights[] = {&gate, &up, &down};
             id<MTLBuffer> buffers[] = {gate_w, up_w, down_w};
             const NSUInteger offsets[] = {gate_offset, up_offset, down_offset};
             const NSUInteger output_offsets[] = {0, hidden_bytes, 2 * hidden_bytes};
             for (int i = 0; i < 3; ++i) {
                 if (i == 2) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                     const uint32_t count = static_cast<uint32_t>(hidden_bytes / sizeof(float));
                     [enc setComputePipelineState:pipelines_[8]];
                     [enc setBuffer:y_buf_ offset:0 atIndex:0];
@@ -818,6 +851,7 @@ public:
                     [enc setBytes:&count length:sizeof count atIndex:2];
                     [enc dispatchThreadgroups:MTLSizeMake((count + 255) / 256, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
                 const TensorView& w = *weights[i];
                 [enc setBuffer:buffers[i] offset:offsets[i] atIndex:0];
@@ -826,6 +860,7 @@ public:
                 dispatch_matvec(enc, w, n);
             }
             [enc endEncoding];
+            commit_residency();
             [cmd commit];
             [cmd waitUntilCompleted];
             if (cmd.status != MTLCommandBufferStatusCompleted) return Status(ErrorCode::BackendError,
@@ -846,9 +881,15 @@ public:
         auto* data = static_cast<uint8_t*>(buffer.contents);
         if (data == nullptr || reinterpret_cast<uintptr_t>(data) % page != 0) return nullptr;
         shared_.emplace(reinterpret_cast<uintptr_t>(data), buffer);
+        keep_resident(buffer);
         return data;
     }
-    void free_shared(uint8_t* data) noexcept override { shared_.erase(reinterpret_cast<uintptr_t>(data)); }
+    void free_shared(uint8_t* data) noexcept override {
+        const auto it = shared_.find(reinterpret_cast<uintptr_t>(data));
+        if (it == shared_.end()) return;
+        release_resident(it->second);
+        shared_.erase(it);
+    }
     [[nodiscard]] double busy_ms() const noexcept override {
         return static_cast<double>(busy_ns_.load(std::memory_order_relaxed)) / 1e6;
     }
@@ -875,6 +916,7 @@ private:
     // Batches of at least this many activation rows use the matrix kernels (and are then not bit-identical to the
     // matvec ones, see mul_mm): longer than a speculative verification pass, so those stay exact.
     static constexpr int32_t kMatmulMinRows = 16;
+    static constexpr int32_t kWideTileRows = 64;  // from here on the matrix kernels take 64 tokens per tile
 
     int mm_index(DType type) const {
         switch (type) {
@@ -897,10 +939,13 @@ private:
         if (n >= kMatmulMinRows && w.cols() % 32 == 0) {
             const uint32_t params[4] = {static_cast<uint32_t>(w.rows()), static_cast<uint32_t>(w.cols()),
                                         static_cast<uint32_t>(w.row_bytes()), static_cast<uint32_t>(n)};
-            [enc setComputePipelineState:mm_pipelines_[mm_index(w.type)]];
+            // Tiles of 64 tokens once there are enough to fill them, else of 32.
+            const bool wide = n >= kWideTileRows;
+            const NSUInteger tokens = wide ? 64 : 32;
+            [enc setComputePipelineState:mm_pipelines_[mm_index(w.type)][wide ? 1 : 0]];
             [enc setBytes:params length:sizeof params atIndex:3];
-            [enc setThreadgroupMemoryLength:(64 * 32 + 32 * 32) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((static_cast<NSUInteger>(w.rows()) + 63) / 64, (static_cast<NSUInteger>(n) + 31) / 32, 1)
+            [enc setThreadgroupMemoryLength:(64 * 32 + tokens * 32) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((static_cast<NSUInteger>(w.rows()) + 63) / 64, (static_cast<NSUInteger>(n) + tokens - 1) / tokens, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             return;
         }
@@ -910,6 +955,46 @@ private:
         const NSUInteger rows_per_group = w.type == DType::Q1_0 ? 4 : 1;
         const NSUInteger groups = (static_cast<NSUInteger>(w.rows()) + rows_per_group - 1) / rows_per_group;
         [enc dispatchThreadgroups:MTLSizeMake(groups, static_cast<NSUInteger>(n), 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+
+    // Without a residency set Metal makes every buffer a command references resident again at each submission,
+    // work that grows with the bytes bound: a layer's FFN (three 36 MB weight matrices) waited 2.1 ms past its GPU
+    // time per call, a 14B prompt's attention projections 0.7 ms, a layer's attention kernel (small buffers) 0.2 ms.
+    // The weights and the shared regions are added to one set attached to the queue, committed before a submission
+    // that follows an addition, and stay resident while the backend lives. macOS 15 and later; earlier systems and
+    // a refusal simply keep the old behavior.
+    void make_residency_set() {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
+            descriptor.initialCapacity = 1024;
+            NSError* error = nil;
+            id<MTLResidencySet> set = [device_ newResidencySetWithDescriptor:descriptor error:&error];
+            if (set != nil) {
+                [queue_ addResidencySet:set];
+                residency_ = set;
+            }
+        }
+    }
+    void keep_resident(id<MTLBuffer> buffer) {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            if (residency_ == nil) return;
+            [static_cast<id<MTLResidencySet>>(residency_) addAllocation:buffer];
+            residency_dirty_ = true;
+        }
+    }
+    void release_resident(id<MTLBuffer> buffer) {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            if (residency_ == nil) return;
+            [static_cast<id<MTLResidencySet>>(residency_) removeAllocation:buffer];
+            residency_dirty_ = true;
+        }
+    }
+    void commit_residency() {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            if (residency_ == nil || !residency_dirty_) return;
+            [static_cast<id<MTLResidencySet>>(residency_) commit];
+            residency_dirty_ = false;
+        }
     }
 
     bool ensure(id<MTLBuffer> __strong& buffer, size_t bytes) {
@@ -943,7 +1028,10 @@ private:
                                                           length:end - begin
                                                          options:MTLResourceStorageModeShared
                                                      deallocator:nil];
-        if (buffer != nil) weights_.emplace(std::make_pair(w.data, w.nbytes), buffer);
+        if (buffer != nil) {
+            weights_.emplace(std::make_pair(w.data, w.nbytes), buffer);
+            keep_resident(buffer);
+        }
         return buffer;
     }
 
@@ -951,8 +1039,10 @@ private:
     id<MTLCommandQueue> queue_ = nil;
     static constexpr int kPipelines = 10;
     id<MTLComputePipelineState> pipelines_[kPipelines] = {};
-    id<MTLComputePipelineState> mm_pipelines_[9] = {};  // the batched kernels, in the order of pipeline(): f32 f16 q4_0 q8_0 q4_1 q4_k q5_k q6_k q1_0
+    id<MTLComputePipelineState> mm_pipelines_[9][2] = {};  // the batched kernels, in the order of pipeline(): f32 f16 q4_0 q8_0 q4_1 q4_k q5_k q6_k q1_0; tiles of 32 and of 64 tokens
     id<MTLComputePipelineState> fa_pipelines_[8] = {};  // attention: f16 then q8_0, each for 64 96 128 256 channels
+    id residency_ = nil;  // an id<MTLResidencySet>, macOS 15+; see make_residency_set()
+    bool residency_dirty_ = false;
     id<MTLBuffer> x_buf_ = nil;
     id<MTLBuffer> y_buf_ = nil;
     id<MTLBuffer> fa_q_ = nil, fa_k_ = nil, fa_v_ = nil, fa_out_ = nil;  // attention's activations and the copied cache
