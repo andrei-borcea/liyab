@@ -925,18 +925,37 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
             DType from, to;
             int64_t rows, cols;  // required multiples
         };
-        for (const Repack& r : {Repack{DType::Q4_K, DType::Q4_K_R8, 8, quant::kSuperBlock},
-                                Repack{DType::Q5_K, DType::Q5_K_R8, 8, quant::kSuperBlock},
-                                Repack{DType::Q6_K, DType::Q6_K_R8, 8, quant::kSuperBlock},
-                                Repack{DType::Q8_0, DType::Q8_0_R4, 4, quant::kBlock}}) {
-            auto repacked = model->file_->requantize(
-                [&](const TensorView& t) {
-                    return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
-                           t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
-                           !t.name.ends_with(".attn_output_a.weight") &&
-                           !model->file_->converted(t);
-                },
-                r.to);
+        const Repack repacks[] = {Repack{DType::Q4_K, DType::Q4_K_R8, 8, quant::kSuperBlock},
+                                  Repack{DType::Q5_K, DType::Q5_K_R8, 8, quant::kSuperBlock},
+                                  Repack{DType::Q6_K, DType::Q6_K_R8, 8, quant::kSuperBlock},
+                                  Repack{DType::Q8_0, DType::Q8_0_R4, 4, quant::kBlock}};
+        auto selected = [&](const TensorView& t, const Repack& r) {
+            return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
+                   t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
+                   !t.name.ends_with(".attn_output_a.weight") && !model->file_->converted(t);
+        };
+        // The copies take memory of their own next to the mapped file. When they do not fit, the file's layout
+        // (the same bits, about 14% slower per row) keeps every block resident, which beats streaming blocks
+        // from storage: a 27B Q4_K_M decodes at 12.7 tok/s that way against 1.6 with repacked copies and a
+        // streamed tail on a 48 GiB Mac.
+        size_t copies = 0;
+        for (const TensorView& t : model->file_->tensors()) {
+            for (const Repack& r : repacks) {
+                if (selected(t, r)) copies += t.nbytes;
+            }
+        }
+        const uint64_t available = usable_memory_bytes(options.memory_budget_bytes);
+        constexpr uint64_t kHeadroom = uint64_t{4} << 30;  // left for the system and other applications
+        if (available != 0 && model->file_->file_size() + copies + kHeadroom > available) {
+            LIYAB_LOG_INFO("repacked weights skipped: %.2f GiB of copies next to %.2f GiB of weights exceed the %.2f GiB "
+                           "available",
+                           static_cast<double>(copies) / (1024.0 * 1024.0 * 1024.0),
+                           static_cast<double>(model->file_->file_size()) / (1024.0 * 1024.0 * 1024.0),
+                           static_cast<double>(available) / (1024.0 * 1024.0 * 1024.0));
+            return model;
+        }
+        for (const Repack& r : repacks) {
+            auto repacked = model->file_->requantize([&](const TensorView& t) { return selected(t, r); }, r.to);
             if (!repacked) return repacked.status();
         }
     }

@@ -874,7 +874,11 @@ uint64_t available_memory_bytes() noexcept {
         KERN_SUCCESS) {
         return 0;
     }
-    const uint64_t pages = static_cast<uint64_t>(vm.free_count) + vm.inactive_count + vm.purgeable_count;
+    // Like Linux's MemAvailable: free memory plus what the system gives back on demand, which is the file cache
+    // (every file-backed page, active or not: the pages of the model this process is about to map, cached by an
+    // earlier run, count as room for it, not against it) and inactive anonymous pages (compressed on demand).
+    const uint64_t reclaimable = std::max<uint64_t>(vm.inactive_count, vm.external_page_count);
+    const uint64_t pages = static_cast<uint64_t>(vm.free_count) + reclaimable + vm.purgeable_count;
     return pages * static_cast<uint64_t>(vm_page_size);
 #elif defined(__linux__)
     std::FILE* f = std::fopen("/proc/meminfo", "r");
