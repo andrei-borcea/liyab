@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/chat_template.h"
+#include "core/host_profile.h"
 #include "core/kv_store.h"
 #include "core/log.h"
 #include "liyab/liyab.h"
@@ -574,6 +575,22 @@ size_t liyab_describe_device(char* buffer, size_t size) {
     } catch (...) {
         return copy_out("", buffer, size);
     }
+}
+
+int64_t liyab_describe_model_fit(const char* model_path, const char* cache_dir, int32_t n_threads, char* buffer,
+                                 size_t size) {
+    if (model_path == nullptr) {
+        fail(LIYAB_ERR_INVALID_ARGUMENT, "null model path");
+        return -1;
+    }
+    int64_t length = -1;
+    const liyab_status status = guarded([&] {
+        auto fit = liyab::fit_model_file(model_path, cache_dir == nullptr ? "" : cache_dir, n_threads);
+        if (!fit) return fail(fit.status());
+        length = static_cast<int64_t>(copy_out(fit->text, buffer, size));
+        return LIYAB_OK;
+    });
+    return status == LIYAB_OK ? length : -1;
 }
 
 int64_t liyab_engine_render_chat(const liyab_engine* engine, const char* request_json, char* buffer, size_t size) {

@@ -203,7 +203,8 @@ struct EngineConfig {
     // (README, KV cache), a few KB per model, at most 16 models, least
     // recently used out first, and what reading and decoding prefix-cache
     // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16), the latent-attention form ratio
-    // (latent-*.bin), what a verification pass costs (verify-*.bin) and, with automatic routing, which route each
+    // (latent-*.bin), what a verification pass costs (verify-*.bin), the read speeds the model-fit report timed
+    // (host-*.bin: liyab_describe_model_fit, `liyab-cli --doctor`; one per host and thread count, at most 4) and, with automatic routing, which route each
     // class of passes took (route-*.bin, 64 bytes; a later run adopts it without the probe passes; each of these
     // kinds is 16 files at most). With converted_weights_mb, also the
     // weights converted at load (weights-*.bin, each about a model's size: capped in bytes, not in files).

@@ -242,6 +242,10 @@ void print_json_turn(int turn, const liyab_generation_stats& s, const liyab_engi
 void usage() {
     std::fprintf(stderr,
                  "usage: liyab-cli --device\n"
+                 "       liyab-cli --doctor -m MODEL.gguf [--cache-dir DIR] [--threads N]\n"
+                 "                     how the model will run on this device, without loading it: memory fit and\n"
+                 "                     the decode rate each backend's measured read speeds allow at most (timed\n"
+                 "                     once per format, kept in --cache-dir)\n"
                  "       liyab-cli -m MODEL.gguf -p PROMPT [options]\n"
                  "options:\n"
                  "  --tokenize         print the prompt's token ids and exit\n"
@@ -347,6 +351,7 @@ int main(int argc, char** argv) {
     std::string prompt;
     std::vector<std::string> follow_ups;  // --then
     bool device_only = false;
+    bool doctor = false;
     bool tokenize_only = false;
     bool json = false;
     bool prefix_stats = false;  // --prefix-stats
@@ -363,6 +368,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--device") device_only = true;
+        else if (arg == "--doctor") doctor = true;
         else if (arg == "--tokenize") tokenize_only = true;
         else if (arg == "-m" || arg == "--model") config.model_path = next();
         else if (arg == "-p" || arg == "--prompt") prompt = next();
@@ -465,6 +471,24 @@ int main(int argc, char** argv) {
     if (device_only) {
         std::string text(liyab_describe_device(nullptr, 0) + 1, '\0');
         liyab_describe_device(text.data(), text.size());
+        std::printf("%s", text.c_str());
+        return 0;
+    }
+    if (doctor) {
+        if (config.model_path == nullptr) {
+            usage();
+            return 2;
+        }
+        std::string text(16384, '\0');  // a report is about 1 KB; asked again, with room, only if it is not
+        int64_t need = liyab_describe_model_fit(config.model_path, config.cache_dir, config.n_threads, text.data(), text.size());
+        if (need >= 0 && static_cast<size_t>(need) >= text.size()) {
+            text.assign(static_cast<size_t>(need) + 1, '\0');
+            need = liyab_describe_model_fit(config.model_path, config.cache_dir, config.n_threads, text.data(), text.size());
+        }
+        if (need < 0) {
+            std::fprintf(stderr, "error: %s\n", liyab_last_error());
+            return 1;
+        }
         std::printf("%s", text.c_str());
         return 0;
     }

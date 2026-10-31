@@ -281,6 +281,19 @@ LIYAB_C_API size_t liyab_engine_describe(const liyab_engine* engine, char* buffe
 LIYAB_C_API int64_t liyab_engine_metadata(const liyab_engine* engine, const char* key, char* buffer, size_t size);
 /* Same as liyab_engine_describe for the device only; no engine required. */
 LIYAB_C_API size_t liyab_describe_device(char* buffer, size_t size);
+/*
+ * How the model file `model_path` will run on this device, without loading it: its weights by format, whether
+ * they fit in the memory available for weights (else the engine streams layers from storage), and per backend the
+ * most tokens per second decoding can reach, from the read speeds of the backend's own kernels on the formats the
+ * model holds. The report is text (as `liyab-cli --doctor` prints it), copied into `buffer` (truncated to `size`).
+ * The speeds are timed on first use (a few seconds) and kept in `cache_dir` ("host-*.bin", one small file per
+ * host and thread count, at most 4), so later calls for any model time only the formats not yet seen; without a
+ * `cache_dir` (NULL or "") they are timed on every call. The ceiling is an upper bound (about 80% of it is
+ * reached on an M4 Pro), not a forecast. `n_threads` 0: all the cores the engine would use. Returns the length
+ * the full text needs, excluding NUL, or -1 on error (liyab_last_error()): a missing or invalid model file.
+ */
+LIYAB_C_API int64_t liyab_describe_model_fit(const char* model_path, const char* cache_dir, int32_t n_threads,
+                                              char* buffer, size_t size);
 /* Processes `text` into the context without generating, so a later generate
  * whose prompt starts with it skips that work (e.g. a chat's system prompt,
  * prepared right after loading). generate reuses the context whenever its

@@ -6422,6 +6422,26 @@ TEST_CASE("C API: create, generate, describe, errors") {
     CHECK(needed > sizeof buf);
     CHECK(std::strlen(buf) == sizeof buf - 1);
     CHECK(liyab_describe_device(nullptr, 0) > 0);
+    // The model-fit report: needs a model file, sizes like the other describe calls, and keeps the host's timings
+    // in the cache directory it is given.
+    CHECK(liyab_describe_model_fit(nullptr, nullptr, 0, nullptr, 0) == -1);
+    CHECK(liyab_describe_model_fit("/nonexistent/model.gguf", nullptr, 0, nullptr, 0) == -1);
+    {
+        const std::string fit_dir = mixed_model() + ".fit";
+        std::filesystem::remove_all(fit_dir);
+        const int64_t fit_size = liyab_describe_model_fit(mixed_model().c_str(), fit_dir.c_str(), 2, nullptr, 0);
+        REQUIRE(fit_size > 0);
+        std::string report(static_cast<size_t>(fit_size) + 1, '\0');
+        CHECK(liyab_describe_model_fit(mixed_model().c_str(), fit_dir.c_str(), 2, report.data(), report.size()) == fit_size);
+        CHECK(report.find("decode ceiling, cpu") != std::string::npos);
+        CHECK(report.find("memory: fits") != std::string::npos);
+        size_t kept = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(fit_dir)) {
+            kept += entry.path().filename().string().starts_with("host-");
+        }
+        CHECK(kept == 1);
+        std::filesystem::remove_all(fit_dir);
+    }
     liyab_resource_snapshot resources{};
     CHECK(liyab_get_resource_snapshot(nullptr, nullptr) == LIYAB_ERR_INVALID_ARGUMENT);
     CHECK(liyab_get_resource_snapshot(nullptr, &resources) == LIYAB_OK);

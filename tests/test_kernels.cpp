@@ -6,15 +6,19 @@
 // liyab-kernels prints the same check as a table, with throughput.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "core/host_profile.h"
 #include "core/kernel_conformance.h"
 #include "core/model_bytes.h"
+#include "core/model_fit.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/backend.h"
@@ -283,6 +287,79 @@ TEST_CASE("A token's read bytes follow the tensor table: no embedding rows when 
     bytes_of(moe, &all, &embd, &experts);
     CHECK(total(all) == all.weight_bytes - embd);
     std::remove(path.c_str());
+}
+
+TEST_CASE("The decode ceiling follows the bytes a token reads and the speeds measured; a refused format runs at the CPU's") {
+    ModelBytes model;
+    model.architecture = "llama";
+    model.file_bytes = uint64_t{4} << 30;
+    model.blocks = 8;
+    model.weight_bytes = 4.0e9;
+    model.per_token = {{DType::Q4_K, 3.0e9}, {DType::Q6_K, 1.0e9}};  // 4 GB per token
+    DeviceInfo device;
+    device.available_memory = uint64_t{16} << 30;
+    const std::vector<DType> timed = {DType::Q4_K, DType::Q6_K};
+    const BackendSpeed cpu{BackendKind::Cpu, "cpu", [](DType type) { return type == DType::Q4_K ? 200.0 : 100.0; }};
+    const BackendSpeed gpu{BackendKind::Metal, "gpu", [](DType type) { return type == DType::Q4_K ? 400.0 : 0.0; }};
+    const BackendSpeed blind{BackendKind::Vulkan, "blind", [](DType) { return 0.0; }};
+    ModelFit fit = describe_model_fit("m.gguf", model, device, {cpu, gpu, blind}, timed);
+    REQUIRE(fit.ceiling.size() == 3);
+    CHECK(std::fabs(fit.ceiling[0] - 1.0 / (3.0e9 / 200e9 + 1.0e9 / 100e9)) < 1e-9);  // 1 / (15 ms + 10 ms) = 40
+    CHECK(std::fabs(fit.ceiling[1] - 1.0 / (3.0e9 / 400e9 + 1.0e9 / 100e9)) < 1e-9);  // Q6_K refused: at the CPU's speed
+    CHECK(fit.ceiling[2] == fit.ceiling[0]);  // a backend that runs nothing: all of it at the CPU's speed
+    CHECK(fit.text.find("memory: fits") != std::string::npos);
+    CHECK(fit.text.find("cpu 100.0") != std::string::npos);  // the refusal is shown as the CPU's figure
+
+    // A format with no timing leaves the ceiling unknown; a format left out of `timed` is said to be left out.
+    const BackendSpeed no_cpu_q6{BackendKind::Cpu, "cpu", [](DType type) { return type == DType::Q4_K ? 200.0 : 0.0; }};
+    fit = describe_model_fit("m.gguf", model, device, {no_cpu_q6}, timed);
+    CHECK(fit.ceiling[0] == 0.0);
+    CHECK(fit.text.find("unknown") != std::string::npos);
+    fit = describe_model_fit("m.gguf", model, device, {cpu}, {DType::Q4_K});
+    CHECK(fit.text.find("left out of the ceilings") != std::string::npos);
+    CHECK(std::fabs(fit.ceiling[0] - 200e9 / 3.0e9) < 1e-9);
+
+    device.available_memory = uint64_t{2} << 30;  // 4 GiB of weights do not fit
+    fit = describe_model_fit("m.gguf", model, device, {cpu}, timed);
+    CHECK(fit.text.find("streams layers from storage") != std::string::npos);
+}
+
+TEST_CASE("The formats worth timing are the ones a token reads in numbers; the host profile keeps what was timed") {
+    ModelBytes model;
+    model.per_token = {{DType::Q4_K, 9.0e9}, {DType::Q6_K, 0.97e9}, {DType::F32, 0.003e9}};
+    const std::vector<DType> formats = formats_to_time(model);
+    CHECK(formats == (std::vector<DType>{DType::Q4_K, DType::Q6_K}));  // 0.03% of the bytes: not worth a timing
+
+    const std::string dir = test::temp_dir() + "/liyab_host_profile_" + std::to_string(test::process_id());
+    std::filesystem::remove_all(dir);
+    DeviceInfo device;
+    device.soc.name = "test soc";
+    device.total_memory = uint64_t{8} << 30;
+    device.backend_order = {BackendKind::Cpu};
+    {
+        HostProfile profile(device, 4, dir);
+        CHECK(!profile.speed(BackendKind::Cpu, DType::Q4_K).has_value());
+        CHECK(!profile.knows(BackendKind::Cpu));
+        profile.set(BackendKind::Cpu, DType::Q4_K, 120.0f);
+        profile.set(BackendKind::Cpu, DType::Q6_K, 0.0f);  // timed, not run
+        profile.set(BackendKind::Cpu, DType::Q4_K, 130.0f);  // timed again: replaced
+        profile.save();
+    }
+    {
+        HostProfile again(device, 4, dir);
+        CHECK(again.knows(BackendKind::Cpu));
+        CHECK(!again.knows(BackendKind::Metal));
+        REQUIRE(again.speed(BackendKind::Cpu, DType::Q4_K).has_value());
+        CHECK(*again.speed(BackendKind::Cpu, DType::Q4_K) == 130.0f);
+        REQUIRE(again.speed(BackendKind::Cpu, DType::Q6_K).has_value());
+        CHECK(*again.speed(BackendKind::Cpu, DType::Q6_K) == 0.0f);
+        // Another thread count or memory size is another host: its speeds are not these.
+        CHECK(!HostProfile(device, 8, dir).speed(BackendKind::Cpu, DType::Q4_K).has_value());
+        DeviceInfo bigger = device;
+        bigger.total_memory = uint64_t{16} << 30;
+        CHECK(!HostProfile(bigger, 4, dir).speed(BackendKind::Cpu, DType::Q4_K).has_value());
+    }
+    std::filesystem::remove_all(dir);
 }
 
 TEST_MAIN()

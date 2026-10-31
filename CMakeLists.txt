@@ -129,6 +129,8 @@ add_library(liyab_core OBJECT
   src/core/os.cpp
   src/core/mmap_loader.cpp
   src/core/converted_cache.cpp
+  src/core/model_fit.cpp
+  src/core/host_profile.cpp
   src/core/device_detect.cpp
   src/core/power_manager.cpp
   src/core/kv_cache.cpp

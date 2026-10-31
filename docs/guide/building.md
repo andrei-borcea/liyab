@@ -33,6 +33,7 @@ ROSETTA_ADVERTISE_AVX=1 ctest --test-dir build-x86 --output-on-failure
 # Run a model
 ./build/liyab-cli -m model.gguf -p "Explain unified memory in one paragraph." -n 128
 ./build/liyab-cli --device                                 # what Liyab sees: SoC, accelerators, backend ranking
+./build/liyab-cli --doctor -m model.gguf                   # will the model fit here, and how fast can it decode at most
 ```
 
 ```bash

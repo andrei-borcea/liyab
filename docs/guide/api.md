@@ -136,6 +136,7 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 | `liyab_engine_set_power_profile` | Change the power profile at once, even mid-generation |
 | `liyab_engine_get_counters` | Live counters for monitoring UIs (thread-safe) |
 | `liyab_engine_metadata` / `_describe` / `liyab_describe_device` | GGUF metadata (e.g. recommended sampling), engine and device descriptions |
+| `liyab_describe_model_fit` | How a model file will run on this device without loading it: memory fit and the decode rate each backend's measured read speeds allow at most (timed once per format, kept in `cache_dir`) |
 | `liyab_supported_architectures` | Architectures this build runs |
 | `liyab_engine_render_chat` / `_chat_format` | The model's chat template applied to a conversation (JSON); its layout of turns and whether it is prefix-stable |
 | `liyab_engine_embed` / `_rerank` | Pooling models: one vector per text; one relevance score per document of a query |
@@ -255,6 +256,7 @@ final class LiyabEngine {
 
 ```bash
 liyab-cli --device                                          # SoC, accelerators, backend ranking
+liyab-cli --doctor -m model.gguf --cache-dir DIR            # memory fit and decode ceiling per backend for that model
 liyab-cli -m model.gguf -p "Once upon a time" -n 128 --temp 0.8
 liyab-cli -m moe.gguf -p "..." --memory-budget 5500         # stay within a per-app memory limit
 liyab-cli -m moe.gguf -p "..." --expert-cache 3000          # MoE: experts through a 3000 MiB cache (-1 auto)

@@ -118,6 +118,7 @@ cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 
 ./build/liyab-cli --device
+./build/liyab-cli --doctor -m model.gguf --cache-dir ~/.cache/liyab   # will it fit, and the decode rate this device allows at most
 ./build/liyab-kernels      # which weight formats each backend runs on this host, and whether it runs them right
 ./build/liyab-kernels --model model.gguf   # ... and what a model's formats allow here: memory fit, decode ceiling per backend
 ./build/liyab-cli -m model.gguf -p "Explain unified memory in one paragraph." -n 128
