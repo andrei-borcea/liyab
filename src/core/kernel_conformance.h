@@ -78,6 +78,7 @@ struct Cell {
     bool exact = true;       // batch cells: n-row call, n one-row calls and a grouped call gave the same bits
     double gb_per_s = 0.0;   // decode cells, when timed: weight bytes read per second, in GB/s
     double batch_cost = 0.0; // batch cells, when timed: time per activation row of a 16-row call / time of a 1-row call
+    double tflops = 0.0;     // batch cells, when timed: multiply-add throughput of a 256-row call, in TFLOPS (2 per weight and row)
     std::string detail;      // the first refusal or failure message, or the first shape that disagreed
 };
 

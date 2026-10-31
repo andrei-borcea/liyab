@@ -351,9 +351,10 @@ double best_seconds(F&& call) {
 
 // Throughput of a one-row call and per-row cost of a 16-row call on a matrix of about `timing_bytes`. The matrix
 // repeats a tile of 32 random valid rows: the kernels cost the same on any bytes (liyab-bench's assumption too).
-bool measure(Backend& backend, DType type, Residency where, size_t timing_bytes, double& gb_per_s, double& batch_cost) {
+bool measure(Backend& backend, DType type, Residency where, size_t timing_bytes, double& gb_per_s, double& batch_cost,
+             double& tflops) {
     constexpr int64_t kCols = 4096, kTile = 32;
-    constexpr int32_t kBatch = 16;
+    constexpr int32_t kBatch = 16, kLarge = 256;
     const size_t row_bytes = dtype_row_bytes(type, kCols);
     const int64_t rows = std::max<int64_t>(kTile, static_cast<int64_t>(timing_bytes / row_bytes));
     Placement placement(backend, where, row_bytes * static_cast<size_t>(rows), /*keep_heap=*/false);
@@ -366,8 +367,8 @@ bool measure(Backend& backend, DType type, Residency where, size_t timing_bytes,
                     placement.data() + static_cast<size_t>(r % kTile) * row_bytes, row_bytes);
     }
     const TensorView w = view_of(type, rows, kCols, placement.data());
-    std::vector<float> x(static_cast<size_t>(kBatch * kCols)), y(static_cast<size_t>(kBatch * rows));
-    fill_activations(x.data(), kBatch, kCols, rng);
+    std::vector<float> x(static_cast<size_t>(kLarge * kCols)), y(static_cast<size_t>(kLarge * rows));
+    fill_activations(x.data(), kLarge, kCols, rng);
     if (!backend.matmul(w, x.data(), y.data(), 1).is_ok() || !backend.matmul(w, x.data(), y.data(), kBatch).is_ok()) {
         return false;
     }
@@ -376,6 +377,12 @@ bool measure(Backend& backend, DType type, Residency where, size_t timing_bytes,
     if (!(one > 0.0) || !std::isfinite(one) || !std::isfinite(many)) return false;
     gb_per_s = static_cast<double>(w.nbytes) / one / 1e9;
     batch_cost = many / kBatch / one;
+    if (backend.matmul(w, x.data(), y.data(), kLarge).is_ok()) {
+        const double large = best_seconds([&] { (void)backend.matmul(w, x.data(), y.data(), kLarge); });
+        if (large > 0.0 && std::isfinite(large)) {
+            tflops = 2.0 * static_cast<double>(rows) * kCols * kLarge / large / 1e12;
+        }
+    }
     return true;
 }
 
@@ -435,7 +442,7 @@ BackendReport check_backend(Backend& backend, const Options& options) {
             placement.batch = run_kind(backend, type, where, kBatchShapes, std::size(kBatchShapes), 2);
             if (options.timing && where == timed && ran(placement.decode) && ran(placement.batch)) {
                 measure(backend, type, where, options.timing_bytes, placement.decode.gb_per_s,
-                        placement.batch.batch_cost);
+                        placement.batch.batch_cost, placement.batch.tflops);
             }
             format.placements.push_back(std::move(placement));
         }

@@ -343,11 +343,15 @@ struct DqQ6_K {
     }
 };
 
+// A tile of rows x BK values is stored as 8x8 blocks of 64 consecutive floats, so that a simdgroup_load reads one
+// block from 32 different banks (a row-major tile of 32 columns would put its 8 rows in the same bank).
+inline uint blocked(uint row, uint k) { return ((row >> 3) * (BK / 8) + (k >> 3)) * 64 + (row & 7) * 8 + (k & 7); }
+
 template <typename D>
 inline void mul_mm(device const uchar* w, device const float* x, device float* y, constant MMParams& p,
                    threadgroup float* shm, uint2 tg, uint tid, uint sgitg) {
-    threadgroup float* sa = shm;             // BM x BK, row-major: weights
-    threadgroup float* sb = shm + BM * BK;   // BN x BK, row-major: activations
+    threadgroup float* sa = shm;             // BM x BK in 8x8 blocks (blocked()): weights
+    threadgroup float* sb = shm + BM * BK;   // BN x BK, likewise: activations
     const uint r0 = tg.x * BM, t0 = tg.y * BN;
     const uint sg_r = sgitg & 1, sg_t = sgitg >> 1;
     simdgroup_float8x8 mc[2][4];
@@ -364,13 +368,13 @@ inline void mul_mm(device const uchar* w, device const float* x, device float* y
         } else {
             for (uint i = 0; i < 16; ++i) v[i] = 0.0f;
         }
-        for (uint i = 0; i < 16; ++i) sa[lr * BK + lh * 16 + i] = v[i];
-        for (uint i = 0; i < 8; ++i) sb[lt * BK + lp * 8 + i] = token < p.n ? x[ulong(token) * p.cols + kb + lp * 8 + i] : 0.0f;
+        for (uint i = 0; i < 16; ++i) sa[blocked(lr, lh * 16 + i)] = v[i];
+        for (uint i = 0; i < 8; ++i) sb[blocked(lt, lp * 8 + i)] = token < p.n ? x[ulong(token) * p.cols + kb + lp * 8 + i] : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint k8 = 0; k8 < BK; k8 += 8) {
             simdgroup_float8x8 ma[2], mb[4];
-            for (uint i = 0; i < 2; ++i) simdgroup_load(ma[i], sb + (sg_t * 16 + i * 8) * BK + k8, BK);
-            for (uint j = 0; j < 4; ++j) simdgroup_load(mb[j], sa + (sg_r * 32 + j * 8) * BK + k8, BK, ulong2(0, 0), true);
+            for (uint i = 0; i < 2; ++i) simdgroup_load(ma[i], sb + ((sg_t * 2 + i) * (BK / 8) + k8 / 8) * 64, 8);
+            for (uint j = 0; j < 4; ++j) simdgroup_load(mb[j], sa + ((sg_r * 4 + j) * (BK / 8) + k8 / 8) * 64, 8, ulong2(0, 0), true);
             for (uint i = 0; i < 2; ++i)
                 for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(mc[i][j], ma[i], mb[j], mc[i][j]);
         }

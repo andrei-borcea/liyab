@@ -63,7 +63,7 @@ std::string batch_text(const Cell& cell) {
         case Verdict::Ok:
         case Verdict::Partial:
             return std::string(verdict_name(cell.verdict)) + (cell.batch_cost > 0 ? " x" + number("%.2f", cell.batch_cost) : "") +
-                   (cell.exact ? " =" : " ~");
+                   (cell.exact ? " =" : " ~") + (cell.tflops > 0 ? " " + number("%.1f", cell.tflops) + "T" : "");
         case Verdict::Wrong: return "WRONG " + number("%.3g", cell.worst) + "x";
         default: return verdict_name(cell.verdict);
     }

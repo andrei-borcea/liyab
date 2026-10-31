@@ -2784,7 +2784,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     impl->auto_route = !config.backend && (impl->gpu || impl->npu);
 
     // Prefill chunks and speculative verification batches share max_batch.
-    const int32_t max_batch = std::max(64, config.draft_tokens + 1);
+    const int32_t max_batch = std::max(256, config.draft_tokens + 1);
     // Repacked weights are for the CPU's i8mm kernels only: no GPU / NPU route.
     // The 2x2 tile kernels run on the weights as stored, so asking for them keeps the repacked layouts off.
     const bool repack_cpu = !impl->gpu && !impl->npu && impl->device.cpu.i8mm && quant::repack_kernels_available() &&
