@@ -724,6 +724,387 @@ LIYAB_AVX2 void dot_q6_k(const void* row, const BlockQ8_K* const* y, int64_t nb,
     for (int r = 0; r < NR; ++r) out[r] = sum[r];
 }
 
+// Q3_K: 2 low bits per value in qs and a high bit in hmask; the value is the low bits minus 4 when the high bit
+// is clear. With the high bit as +4 the byte u = value + 4 lies in [0, 7], which VPMADDUBSW takes as its
+// unsigned operand; the 4 is taken out again through the activation sums, 4 * sum(scale * activation sum).
+// A 32-byte vector of qs holds 32 values (a 2-bit plane of one half): 16 per scale.
+template <int NR>
+LIYAB_AVX2 void dot_q3_k(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    static_assert(NR >= 1 && NR <= 4);
+    const auto* x = static_cast<const BlockQ3K*>(row);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i four = _mm256_set1_epi8(4);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        // 16 six-bit scales: low nibbles from bytes 0-7, high 2 bits from bytes 8-11, minus 32.
+        uint32_t aux[3], utmp[4];
+        std::memcpy(aux, x[i].scales, 12);
+        utmp[3] = ((aux[1] >> 4) & kKMask2) | (((aux[2] >> 6) & kKMask3) << 4);
+        utmp[2] = ((aux[0] >> 4) & kKMask2) | (((aux[2] >> 4) & kKMask3) << 4);
+        utmp[1] = (aux[1] & kKMask2) | (((aux[2] >> 2) & kKMask3) << 4);
+        utmp[0] = (aux[0] & kKMask2) | (((aux[2] >> 0) & kKMask3) << 4);
+        alignas(16) int8_t sc[16];
+        std::memcpy(sc, utmp, 16);
+        for (int k = 0; k < 16; ++k) sc[k] = static_cast<int8_t>(sc[k] - 32);
+        const __m256i sc16 = _mm256_cvtepi8_epi16(load128(sc));
+        const __m256i hm = load256(x[i].hmask);
+        __m256i acc[NR];
+        int32_t offset[NR];
+        for (int r = 0; r < NR; ++r) {
+            acc[r] = _mm256_setzero_si256();
+            offset[r] = 4 * hsum_i32(_mm256_madd_epi16(load256(y[r][i].bsums), sc16));
+        }
+        for (int h = 0; h < 2; ++h) {  // 128 values: 4 planes of 32; the high bits are bit 4h + j of hmask
+            const __m256i q = load256(x[i].qs + 32 * h);
+            for (int j = 0; j < 4; ++j) {
+                const __m256i bit = _mm256_set1_epi8(static_cast<char>(1 << (4 * h + j)));
+                const __m256i low = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j)), m3);
+                const __m256i high = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hm, bit), bit), four);
+                const __m256i u = _mm256_or_si256(low, high);
+                const __m256i s = combine(_mm_set1_epi16(sc[8 * h + 2 * j]), _mm_set1_epi16(sc[8 * h + 2 * j + 1]));
+                for (int r = 0; r < NR; ++r) {
+                    const __m256i q8 = load256(y[r][i].qs + 128 * h + 32 * j);
+                    acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(_mm256_maddubs_epi16(u, q8), s));
+                }
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] = epilogue_scaled(sum[r], y[r][i].d, d, static_cast<float>(hsum_i32(acc[r]) - offset[r]));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+// Q2_K: 2 bits per value, a 4-bit scale and a 4-bit minimum per 16 values; the minimums go through the
+// activation sums as in Q4_K (epilogue_k4).
+template <int NR>
+LIYAB_AVX2 void dot_q2_k(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    static_assert(NR >= 1 && NR <= 4);
+    const auto* x = static_cast<const BlockQ2K*>(row);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        const __m128i packed = load128(x[i].scales);
+        alignas(16) uint8_t sc[16];
+        _mm_store_si128(reinterpret_cast<__m128i*>(sc), _mm_and_si128(packed, m4));
+        const __m256i mins16 = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(packed, 4), m4));
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int h = 0; h < 2; ++h) {
+            const __m256i q = load256(x[i].qs + 32 * h);
+            for (int j = 0; j < 4; ++j) {
+                const __m256i v = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j)), m3);
+                const __m256i s = combine(_mm_set1_epi16(sc[8 * h + 2 * j]), _mm_set1_epi16(sc[8 * h + 2 * j + 1]));
+                for (int r = 0; r < NR; ++r) {
+                    const __m256i q8 = load256(y[r][i].qs + 128 * h + 32 * j);
+                    acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(_mm256_maddubs_epi16(v, q8), s));
+                }
+            }
+        }
+        const float d = h2f(x[i].d);
+        const float dmin = h2f(x[i].dmin);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] = epilogue_k4(sum[r], y[r][i].d, d, dmin, hsum_i32(acc[r]), k4_min_sum(mins16, y[r][i].bsums));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+// --- I-quants against Q8_K activations ---------------------------------------------------
+//
+// The values of a grid format are unsigned magnitudes (at most 62) looked up by index, and the signs come apart:
+// VPMADDUBSW takes the unsigned grid bytes against the activations with the sign applied to them (VPSIGNB), and a
+// pair of products stays far below 2^15. One 32-value step is then a lookup of 4 (8-byte grids) or 8 (4-byte grids)
+// entries, a sign expansion and one VPMADDUBSW per activation row; the sums are exact integers, scaled once per
+// super-block like the NEON kernels (which these follow, also in the constant factor each format carries).
+
+// 32 +1 / -1 bytes from four 8-bit sign masks (the low byte of `masks` covers values 0-7): bit j of a mask set
+// means value 8g + j is negative. The masks are 7-bit sign indices through kKSigns in the XXS / XS formats and
+// stored bytes in the S formats.
+LIYAB_AVX2 inline __m256i expand_signs(uint32_t masks) noexcept {
+    alignas(32) static constexpr uint8_t kSpread[32] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                                        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+    alignas(32) static constexpr uint8_t kBits[32] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+                                                      1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const __m256i bits = load256(kBits);
+    const __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(static_cast<int>(masks)), load256(kSpread));
+    return _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(bytes, bits), bits), _mm256_set1_epi8(1));
+}
+
+inline uint32_t load_u32(const void* p) noexcept {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+inline int64_t load_i64(const void* p) noexcept {
+    int64_t v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+// The four 7-bit sign indices of `w` (bits 0-27) as four mask bytes.
+inline uint32_t sign_masks7(uint32_t w) noexcept {
+    return static_cast<uint32_t>(kKSigns[w & 127]) | (static_cast<uint32_t>(kKSigns[(w >> 7) & 127]) << 8) |
+           (static_cast<uint32_t>(kKSigns[(w >> 14) & 127]) << 16) | (static_cast<uint32_t>(kKSigns[(w >> 21) & 127]) << 24);
+}
+
+// grid (unsigned magnitudes) . (activations with the signs applied): 16 int16 sums of pairs.
+LIYAB_AVX2 inline __m256i grid_dot(__m256i grid, __m256i signs, __m256i q8) noexcept {
+    return _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8, signs));
+}
+
+// Each of the formats below: `step(ib32, scale-or-scale-vector)` produces the 32-value group's grid and signs; the
+// rows loop is shared.
+template <int NR>
+LIYAB_AVX2 void dot_iq2_xxs(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq2Xxs*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 32 values: 4 grid index bytes, then 4 x 7-bit signs + a 4-bit scale
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(x[i].qs) + 8 * ib;
+            const uint32_t a = load_u32(p), w = load_u32(p + 4);
+            const __m256i grid = _mm256_set_epi64x(load_i64(kIq2xxsGrid[(a >> 24) & 255]), load_i64(kIq2xxsGrid[(a >> 16) & 255]),
+                                                   load_i64(kIq2xxsGrid[(a >> 8) & 255]), load_i64(kIq2xxsGrid[a & 255]));
+            const __m256i signs = expand_signs(sign_masks7(w));
+            const __m256i scale = _mm256_set1_epi16(static_cast<int16_t>(2 * (w >> 28) + 1));
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot(grid, signs, load256(y[r][i].qs + 32 * ib)), scale));
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) sum[r] += d * y[r][i].d * static_cast<float>(hsum_i32(acc[r]));
+    }
+    for (int r = 0; r < NR; ++r) out[r] = 0.125f * sum[r];
+}
+
+// IQ2_XS and IQ2_S: two 4-bit scales per 32 values (one per 16), as 2s + 1.
+LIYAB_AVX2 inline __m256i scale_pair(uint8_t packed) noexcept {
+    return combine(_mm_set1_epi16(static_cast<int16_t>(2 * (packed & 15) + 1)),
+                   _mm_set1_epi16(static_cast<int16_t>(2 * (packed >> 4) + 1)));
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq2_xs(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq2Xs*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 4 uint16: 9-bit grid index, 7-bit sign index
+            const uint16_t* q = x[i].qs + 4 * ib;
+            const __m256i grid = _mm256_set_epi64x(load_i64(kIq2xsGrid[q[3] & 511]), load_i64(kIq2xsGrid[q[2] & 511]),
+                                                   load_i64(kIq2xsGrid[q[1] & 511]), load_i64(kIq2xsGrid[q[0] & 511]));
+            const uint32_t masks = static_cast<uint32_t>(kKSigns[q[0] >> 9]) | (static_cast<uint32_t>(kKSigns[q[1] >> 9]) << 8) |
+                                   (static_cast<uint32_t>(kKSigns[q[2] >> 9]) << 16) | (static_cast<uint32_t>(kKSigns[q[3] >> 9]) << 24);
+            const __m256i signs = expand_signs(masks);
+            const __m256i scale = scale_pair(x[i].scales[ib]);
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot(grid, signs, load256(y[r][i].qs + 32 * ib)), scale));
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) sum[r] += d * y[r][i].d * static_cast<float>(hsum_i32(acc[r]));
+    }
+    for (int r = 0; r < NR; ++r) out[r] = 0.125f * sum[r];
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq2_s(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq2S*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 4 grid indices: 8 bits in qs, 2 more in qh; 4 stored sign bytes
+            const uint8_t* q = x[i].qs + 4 * ib;
+            const uint32_t h = x[i].qh[ib];
+            const __m256i grid = _mm256_set_epi64x(load_i64(kIq2sGrid[q[3] | ((h << 2) & 0x300)]), load_i64(kIq2sGrid[q[2] | ((h << 4) & 0x300)]),
+                                                   load_i64(kIq2sGrid[q[1] | ((h << 6) & 0x300)]), load_i64(kIq2sGrid[q[0] | ((h << 8) & 0x300)]));
+            const __m256i signs = expand_signs(load_u32(x[i].qs + 32 + 4 * ib));
+            const __m256i scale = scale_pair(x[i].scales[ib]);
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot(grid, signs, load256(y[r][i].qs + 32 * ib)), scale));
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) sum[r] += d * y[r][i].d * static_cast<float>(hsum_i32(acc[r]));
+    }
+    for (int r = 0; r < NR; ++r) out[r] = 0.125f * sum[r];
+}
+
+LIYAB_AVX2 inline __m256i grid4(const uint8_t (*grid)[4], const uint32_t* idx) noexcept {
+    return _mm256_set_epi32(static_cast<int>(load_u32(grid[idx[7]])), static_cast<int>(load_u32(grid[idx[6]])),
+                            static_cast<int>(load_u32(grid[idx[5]])), static_cast<int>(load_u32(grid[idx[4]])),
+                            static_cast<int>(load_u32(grid[idx[3]])), static_cast<int>(load_u32(grid[idx[2]])),
+                            static_cast<int>(load_u32(grid[idx[1]])), static_cast<int>(load_u32(grid[idx[0]])));
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq3_xxs(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq3Xxs*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 8 grid index bytes (4 values each); a word of 4 x 7-bit signs + a 4-bit scale
+            uint32_t idx[8];
+            for (int k = 0; k < 8; ++k) idx[k] = x[i].qs[8 * ib + k];
+            const uint32_t w = load_u32(x[i].qs + 64 + 4 * ib);
+            const __m256i grid = grid4(kIq3xxsGrid, idx);
+            const __m256i signs = expand_signs(sign_masks7(w));
+            const __m256i scale = _mm256_set1_epi16(static_cast<int16_t>(2 * (w >> 28) + 1));
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot(grid, signs, load256(y[r][i].qs + 32 * ib)), scale));
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) sum[r] += d * y[r][i].d * static_cast<float>(hsum_i32(acc[r]));
+    }
+    for (int r = 0; r < NR; ++r) out[r] = 0.25f * sum[r];
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq3_s(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq3S*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 8 grid indices: 8 bits in qs, the 9th in bit k of qh[ib]; 4 stored sign bytes
+            uint32_t idx[8];
+            const uint32_t h = x[i].qh[ib];
+            for (int k = 0; k < 8; ++k) idx[k] = x[i].qs[8 * ib + k] | (((h >> k) & 1) << 8);
+            const __m256i grid = grid4(kIq3sGrid, idx);
+            const __m256i signs = expand_signs(load_u32(x[i].signs + 4 * ib));
+            const int nibble = (x[i].scales[ib / 2] >> (4 * (ib & 1))) & 15;
+            const __m256i scale = _mm256_set1_epi16(static_cast<int16_t>(2 * nibble + 1));
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot(grid, signs, load256(y[r][i].qs + 32 * ib)), scale));
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) sum[r] += d * y[r][i].d * static_cast<float>(hsum_i32(acc[r]));
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+// IQ1_S / IQ1_M: grid values in {-1, 0, +1} (signed, so |grid| against the activations with the grid's sign), a
+// 3-bit scale (2s + 1) per 32 (S) or 16 (M) values, and a delta of +-1/8 added to every value of a group, which
+// comes out of the dot product as +-1/8 times the group's activation sum.
+constexpr float kIq1Delta = 0.125f;
+
+LIYAB_AVX2 inline __m256i grid_dot_signed(__m256i grid, __m256i q8) noexcept {
+    return _mm256_maddubs_epi16(_mm256_sign_epi8(grid, grid), _mm256_sign_epi8(q8, grid));
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq1_s(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq1S*>(row);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        int32_t delta[NR];
+        for (int r = 0; r < NR; ++r) {
+            acc[r] = _mm256_setzero_si256();
+            delta[r] = 0;
+        }
+        for (int ib = 0; ib < 8; ++ib) {  // qh[ib]: 4 x 3 index bits, a 3-bit scale (bits 12-14), the delta's sign (bit 15)
+            const uint32_t h = x[i].qh[ib];
+            const uint8_t* q = x[i].qs + 4 * ib;
+            const __m256i grid = _mm256_set_epi64x(load_i64(kIq1sGrid[q[3] | (((h >> 9) & 7) << 8)]), load_i64(kIq1sGrid[q[2] | (((h >> 6) & 7) << 8)]),
+                                                   load_i64(kIq1sGrid[q[1] | (((h >> 3) & 7) << 8)]), load_i64(kIq1sGrid[q[0] | ((h & 7) << 8)]));
+            const int ls = static_cast<int>(2 * ((h >> 12) & 7) + 1);
+            const __m256i scale = _mm256_set1_epi16(static_cast<int16_t>(ls));
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot_signed(grid, load256(y[r][i].qs + 32 * ib)), scale));
+                delta[r] += (h & 0x8000 ? -ls : ls) * (y[r][i].bsums[2 * ib] + y[r][i].bsums[2 * ib + 1]);
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] += y[r][i].d * d * (static_cast<float>(hsum_i32(acc[r])) + kIq1Delta * static_cast<float>(delta[r]));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+template <int NR>
+LIYAB_AVX2 void dot_iq1_m(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockIq1M*>(row);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        uint16_t words[4];
+        std::memcpy(words, x[i].scales, 8);
+        // The fp16 super-block scale is spread over the top nibbles of the four scale words.
+        const uint16_t dh = static_cast<uint16_t>((words[0] >> 12) | ((words[1] >> 8) & 0x00f0) | ((words[2] >> 4) & 0x0f00) |
+                                                  (words[3] & 0xf000));
+        __m256i acc[NR], delta[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = delta[r] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {  // 4 groups of 8: 11-bit indices (qs + 3 bits of qh), 3-bit scales per 16 values
+            const uint8_t* q = x[i].qs + 4 * ib;
+            const uint8_t* h = x[i].qh + 2 * ib;  // a nibble per group: 3 index bits and the delta's sign (bit 3)
+            const uint32_t i0 = q[0] | ((h[0] & 7u) << 8), i1 = q[1] | (((h[0] >> 4) & 7u) << 8);
+            const uint32_t i2 = q[2] | ((h[1] & 7u) << 8), i3 = q[3] | (((h[1] >> 4) & 7u) << 8);
+            const __m256i grid = _mm256_set_epi64x(load_i64(kIq1sGrid[i3]), load_i64(kIq1sGrid[i2]), load_i64(kIq1sGrid[i1]),
+                                                   load_i64(kIq1sGrid[i0]));
+            const int shift = 6 * (ib & 1);  // two 3-bit scales per 32 values, four per word
+            const int s0 = static_cast<int>(2 * ((words[ib / 2] >> shift) & 7) + 1);
+            const int s1 = static_cast<int>(2 * ((words[ib / 2] >> (shift + 3)) & 7) + 1);
+            const __m256i scale = combine(_mm_set1_epi16(static_cast<int16_t>(s0)), _mm_set1_epi16(static_cast<int16_t>(s1)));
+            // The delta term: a group's activation sum (four per 8 values below) times its sign and its scale.
+            const int g0 = (h[0] & 8) ? -s0 : s0, g1 = (h[0] & 0x80) ? -s0 : s0;
+            const int g2 = (h[1] & 8) ? -s1 : s1, g3 = (h[1] & 0x80) ? -s1 : s1;
+            const __m256i signed_scale = _mm256_set_epi32(g3, g3, g2, g2, g1, g1, g0, g0);
+            for (int r = 0; r < NR; ++r) {
+                const __m256i q8 = load256(y[r][i].qs + 32 * ib);
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(grid_dot_signed(grid, q8), scale));
+                const __m256i quad_sums = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, q8), ones16);
+                delta[r] = _mm256_add_epi32(delta[r], _mm256_mullo_epi32(quad_sums, signed_scale));
+            }
+        }
+        const float d = h2f(dh);
+        for (int r = 0; r < NR; ++r) {
+            sum[r] += y[r][i].d * d * (static_cast<float>(hsum_i32(acc[r])) + kIq1Delta * static_cast<float>(hsum_i32(delta[r])));
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
+// TQ2_0: 2 bits per value, stored as value + 1 in {0, 1, 2} in the layout of Q2_K's planes; the 1 comes out through
+// the activation sums.
+template <int NR>
+LIYAB_AVX2 void dot_tq2_0(const void* row, const BlockQ8_K* const* y, int64_t nb, float* out) noexcept {
+    const auto* x = static_cast<const BlockTQ2_0*>(row);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    float sum[NR] = {};
+    for (int64_t i = 0; i < nb; ++i) {
+        __m256i acc[NR];
+        for (int r = 0; r < NR; ++r) acc[r] = _mm256_setzero_si256();
+        for (int h = 0; h < 2; ++h) {
+            const __m256i q = load256(x[i].qs + 32 * h);
+            for (int j = 0; j < 4; ++j) {
+                const __m256i v = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j)), m3);
+                for (int r = 0; r < NR; ++r) {
+                    const __m256i q8 = load256(y[r][i].qs + 128 * h + 32 * j);
+                    acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(_mm256_maddubs_epi16(v, q8), ones16));
+                }
+            }
+        }
+        const float d = h2f(x[i].d);
+        for (int r = 0; r < NR; ++r) {
+            const int32_t total = hsum_i32(acc[r]) - hsum_i32(_mm256_madd_epi16(load256(y[r][i].bsums), ones16));
+            sum[r] += d * y[r][i].d * static_cast<float>(total);
+        }
+    }
+    for (int r = 0; r < NR; ++r) out[r] = sum[r];
+}
+
 // IQ4_XS: 8 sub-blocks of 32 values per super-block, 4-bit indices into the
 // IQ4_NL codebook, a signed 6-bit scale each (minus 32).
 LIYAB_AVX2 float dot_iq4_xs(const BlockIq4Xs* x, const BlockQ8_K* y, int64_t nb) noexcept {
@@ -748,13 +1129,30 @@ LIYAB_AVX2 float dot_iq4_xs(const BlockIq4Xs* x, const BlockQ8_K* y, int64_t nb)
 }  // namespace
 
 bool has_q8_K_kernel(DType type) noexcept {
-    return type == DType::Q4_K || type == DType::Q5_K || type == DType::Q6_K || type == DType::IQ4_XS;
+    switch (type) {
+        case DType::Q2_K: case DType::Q3_K: case DType::Q4_K: case DType::Q5_K: case DType::Q6_K: case DType::IQ4_XS:
+        case DType::IQ2_XXS: case DType::IQ2_XS: case DType::IQ2_S: case DType::IQ3_XXS: case DType::IQ3_S:
+        case DType::IQ1_S: case DType::IQ1_M: case DType::TQ2_0:
+            return true;
+        default:
+            return false;
+    }
 }
 
 LIYAB_AVX2 float dot_q8_K(DType type, const void* row, const BlockQ8_K* x, int64_t n) noexcept {
     const int64_t nb = n / kSuperBlock;
     float out = 0.0f;
     switch (type) {
+        case DType::Q2_K: dot_q2_k<1>(row, &x, nb, &out); break;
+        case DType::Q3_K: dot_q3_k<1>(row, &x, nb, &out); break;
+        case DType::IQ2_XXS: dot_iq2_xxs<1>(row, &x, nb, &out); break;
+        case DType::IQ2_XS: dot_iq2_xs<1>(row, &x, nb, &out); break;
+        case DType::IQ2_S: dot_iq2_s<1>(row, &x, nb, &out); break;
+        case DType::IQ3_XXS: dot_iq3_xxs<1>(row, &x, nb, &out); break;
+        case DType::IQ3_S: dot_iq3_s<1>(row, &x, nb, &out); break;
+        case DType::IQ1_S: dot_iq1_s<1>(row, &x, nb, &out); break;
+        case DType::IQ1_M: dot_iq1_m<1>(row, &x, nb, &out); break;
+        case DType::TQ2_0: dot_tq2_0<1>(row, &x, nb, &out); break;
         case DType::Q4_K: dot_q45_k<1, false>(row, &x, nb, &out); break;
         case DType::Q5_K: dot_q45_k<1, true>(row, &x, nb, &out); break;
         case DType::Q6_K: dot_q6_k<1>(row, &x, nb, &out); break;
@@ -763,6 +1161,19 @@ LIYAB_AVX2 float dot_q8_K(DType type, const void* row, const BlockQ8_K* x, int64
     }
     return out;
 }
+
+namespace {
+// Runs `kernel(std::integral_constant<int, NR>)` for NR = count (1 to 4) activation rows.
+template <class F>
+LIYAB_AVX2 void with_rows(int32_t count, F&& kernel) noexcept {
+    switch (count) {
+        case 4: kernel(std::integral_constant<int, 4>{}); break;
+        case 3: kernel(std::integral_constant<int, 3>{}); break;
+        case 2: kernel(std::integral_constant<int, 2>{}); break;
+        default: kernel(std::integral_constant<int, 1>{}); break;
+    }
+}
+}  // namespace
 
 LIYAB_AVX2 void dot_q8_K_rows(DType type, const void* row, const BlockQ8_K* const* x, int32_t rows, int64_t n,
                               float* out) noexcept {
@@ -773,30 +1184,19 @@ LIYAB_AVX2 void dot_q8_K_rows(DType type, const void* row, const BlockQ8_K* cons
         const BlockQ8_K* const* y = x + r;
         float* o = out + r;
         switch (type) {
-            case DType::Q4_K:
-                switch (count) {
-                    case 4: dot_q45_k<4, false>(row, y, nb, o); break;
-                    case 3: dot_q45_k<3, false>(row, y, nb, o); break;
-                    case 2: dot_q45_k<2, false>(row, y, nb, o); break;
-                    default: dot_q45_k<1, false>(row, y, nb, o); break;
-                }
-                break;
-            case DType::Q5_K:
-                switch (count) {
-                    case 4: dot_q45_k<4, true>(row, y, nb, o); break;
-                    case 3: dot_q45_k<3, true>(row, y, nb, o); break;
-                    case 2: dot_q45_k<2, true>(row, y, nb, o); break;
-                    default: dot_q45_k<1, true>(row, y, nb, o); break;
-                }
-                break;
-            case DType::Q6_K:
-                switch (count) {
-                    case 4: dot_q6_k<4>(row, y, nb, o); break;
-                    case 3: dot_q6_k<3>(row, y, nb, o); break;
-                    case 2: dot_q6_k<2>(row, y, nb, o); break;
-                    default: dot_q6_k<1>(row, y, nb, o); break;
-                }
-                break;
+            case DType::Q2_K: with_rows(count, [&](auto nr) { dot_q2_k<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::Q3_K: with_rows(count, [&](auto nr) { dot_q3_k<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::Q4_K: with_rows(count, [&](auto nr) { dot_q45_k<decltype(nr)::value, false>(row, y, nb, o); }); break;
+            case DType::Q5_K: with_rows(count, [&](auto nr) { dot_q45_k<decltype(nr)::value, true>(row, y, nb, o); }); break;
+            case DType::Q6_K: with_rows(count, [&](auto nr) { dot_q6_k<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ2_XXS: with_rows(count, [&](auto nr) { dot_iq2_xxs<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ2_XS: with_rows(count, [&](auto nr) { dot_iq2_xs<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ2_S: with_rows(count, [&](auto nr) { dot_iq2_s<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ3_XXS: with_rows(count, [&](auto nr) { dot_iq3_xxs<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ3_S: with_rows(count, [&](auto nr) { dot_iq3_s<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ1_S: with_rows(count, [&](auto nr) { dot_iq1_s<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::IQ1_M: with_rows(count, [&](auto nr) { dot_iq1_m<decltype(nr)::value>(row, y, nb, o); }); break;
+            case DType::TQ2_0: with_rows(count, [&](auto nr) { dot_tq2_0<decltype(nr)::value>(row, y, nb, o); }); break;
             default:
                 for (int32_t k = 0; k < count; ++k) o[k] = dot_q8_K(type, row, y[k], n);
                 break;

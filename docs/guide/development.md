@@ -491,8 +491,10 @@ Implemented features are described above. These are next, in order:
     and F32 but 1.5–2.5× slower on Q8_0, Q4_0 and Q6_K, whose scalar loops the compiler vectorizes with SSE2.
     Decoding there (4 threads, best of 3) went from 7.5 to 14.6 tok/s on Qwen3-0.6B BF16 and from 21 to 24 on
     Qwen2.5-0.5B F16, and stayed at 33 on its Q8_0, with the same greedy text;
-  * Q2_K, Q3_K, TQ1_0/TQ2_0, NVFP4 and the lattice I-quants (IQ1–IQ3) have no AVX2 kernel and use the generic
-    decode path; there are no AVX-VNNI, AVX-512 or repacked layouts, and CPUs without AVX2 run scalar kernels;
+  * TQ1_0 and NVFP4 have no AVX2 kernel (nor a NEON one) and use the generic decode path; every other format has
+    one (Q2_K, Q3_K, TQ2_0 and the IQ1–IQ3 grid formats against Q8_K activations, shared across up to four rows).
+    There are no AVX-VNNI, AVX-512 or repacked layouts, and CPUs without AVX2 run scalar kernels. An x86-64 build under
+    Rosetta runs AVX2 only with `ROSETTA_ADVERTISE_AVX=1`; without it CPUID reports none and the scalar set runs;
   * the transformer's element-wise loops (norms, softmax, RoPE) are plain C++ left to the compiler, and the DeltaNet
     recurrence has a NEON path but no x86 one.
 * **Windows:**

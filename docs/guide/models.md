@@ -194,8 +194,8 @@ completion and pooling remain available. GPT-OSS Harmony currently has this Flut
   `python tools/gen_ssm_quant_vectors.py --out tests/data/ssm_quant_vectors.bin` (gguf 0.19.0, NumPy).
   The test writer refuses reader-only formats unless explicit encoded blocks are supplied.
 * **Where each format runs:** the CPU runs all 27 (fast NEON kernels for all but TQ1_0 and NVFP4, which use the generic
-  decode path; AVX2 kernels for Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, Q1_0 and the float
-  formats). Metal runs F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K and Q1_0, with matrix kernels for batches of 16 rows
+  decode path; AVX2 kernels for all the others: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K to Q6_K, TQ2_0, IQ1_S, IQ1_M,
+  IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4, Q1_0 and the float formats). Metal runs F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K and Q1_0, with matrix kernels for batches of 16 rows
   or more; Vulkan runs 23 formats from GPU-shared memory and 7 from ordinary memory. Anything else goes to the CPU
   product by product. `liyab-kernels` prints this for the host and checks each result against the decoded weights.
 * **Kernels:**

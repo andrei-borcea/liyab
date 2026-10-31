@@ -65,9 +65,12 @@ activation row; Metal numbers are for weights in shared memory. The CPU is the N
   the weights again; cache reuse saves up to a third and nothing for the 4-bit legacy formats, so prefill and
   speculative verification gain little there. On the CPU, Q8_0, Q4_K, Q5_K, Q6_K and MXFP4 reach 0.35–0.65 (their
   multi-row kernels decode each weight row once for all activation rows); the others stay near 1.
-* On x86-64 (a build run under Rosetta 2, so the absolute figures are translated and are not x86 speeds): Q2_K,
-  IQ2_XXS and TQ2_0 run at 2–4 GB/s with the AVX2 set and with the scalar set alike, so they have no AVX2 kernel;
-  Q4_K runs 3.3 times faster with AVX2 than scalar (44 against 13 GB/s). Q4_0 and Q8_0 ran faster scalar than with AVX2
+* On x86-64 (a build run under Rosetta 2 with `ROSETTA_ADVERTISE_AVX=1`, so the absolute figures are translated and
+  are not x86 speeds), one decoded row, GB/s, scalar set then AVX2 set: Q3_K 3.3 → 16.4, Q2_K 3.4 → 23.3, TQ2_0 2.4 →
+  23.3, IQ2_XXS 4.1 → 7.2, IQ2_XS 4.2 → 8.2, IQ2_S 3.8 → 5.8, IQ3_XXS 8.0 → 11.4, IQ3_S 6.3 → 10.2, IQ1_S 4.9 → 8.4,
+  IQ1_M 5.1 → 5.6; their batch cost per row falls from about 1 to 0.4–0.9 (each weight block is decoded once for up
+  to four rows). The grid formats gain least, since each 32 values cost 4 or 8 table loads. Q4_K runs 3.3 times faster
+  with AVX2 than scalar (44 against 13 GB/s). Q4_0 and Q8_0 ran faster scalar than with AVX2
   (56 and 131 against 19 and 68 GB/s), which should be checked on a real x86 CPU before it is believed.
 
 ### Prompts and decoding on the M4 Pro, by backend (31 October 2026)
