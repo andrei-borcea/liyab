@@ -26,6 +26,7 @@
 #include "core/grammar.h"
 #include "core/log.h"
 #include "core/quant.h"
+#include "core/route_picker.h"
 #include "core/sampling.h"
 #include "core/thread_pool.h"
 #include "core/tokenizer.h"
@@ -2006,7 +2007,11 @@ struct Engine::Impl {
         }
         const PowerPolicy policy = power->policy();
         apply_policy(policy);
-        const Route route = policy.throttled ? throttled_route() : normal_route();
+        size_t pass_tokens = 0;
+        for (const PassRequest* r : chosen) pass_tokens += r->tokens.size();
+        const Picked picked = pick_route(policy, pass_tokens);
+        const Route& route = picked.route;
+        const auto t_pass = Clock::now();
         double slept = 0.0;
         if (std::any_of(chosen.begin(), chosen.end(), [](const PassRequest* r) { return r->small(); })) {
             // Duty cycling per pass: each sequence in it gets a token per slot.
@@ -2032,6 +2037,7 @@ struct Engine::Impl {
             r.exit_layer = target->last_exit_layer();
             r.paced_ms = slept;
             if (out) {
+                report_pass(picked, pass_tokens, r.small() ? 1 : pass_tokens, ms_since(t_pass));
                 r.rows.assign(out->begin(), out->end());
                 r.status = Status::ok();
             } else {
@@ -2055,6 +2061,7 @@ struct Engine::Impl {
         if (can_stop) hooks.cancel = &preempt;
         std::vector<std::span<const float>> out;
         status = target->forward_batch(items, route, *pool, out, &hooks);
+        if (status.is_ok()) report_pass(picked, pass_tokens, pass_tokens, ms_since(t_pass));
         for (size_t i = 0; i < chosen.size(); ++i) {
             PassRequest& r = *chosen[i];
             r.sequences = static_cast<int32_t>(chosen.size());
@@ -2303,6 +2310,27 @@ struct Engine::Impl {
         return {target_backend, target_backend, cpu.get()};
     }
     [[nodiscard]] Route draft_route() const { return {cpu.get(), cpu.get(), cpu.get()}; }
+
+    // Automatic routing (no backend named, an accelerator present): each class of pass runs on the accelerated
+    // route or on the CPU alone, whichever timing shows faster (core/route_picker.h). A named backend is honoured.
+    bool auto_route = false;
+    RoutePicker route_picker;
+    struct Picked {
+        Route route;
+        RoutePicker::Arm arm = RoutePicker::Arm::Accelerator;
+        bool measure = false;  // report_pass() this pass
+    };
+    // The route of a pass of `tokens` tokens under `policy`.
+    Picked pick_route(const PowerPolicy& policy, size_t tokens) const {
+        if (policy.throttled) return {throttled_route(), RoutePicker::Arm::Accelerator, false};
+        if (!auto_route) return {normal_route(), RoutePicker::Arm::Accelerator, false};
+        const RoutePicker::Arm arm = route_picker.next(tokens);
+        return {arm == RoutePicker::Arm::Host ? draft_route() : normal_route(), arm, route_picker.measuring(tokens)};
+    }
+    // A finished pass of `tokens` tokens that produced `emitted` tokens (a block: the tokens it processed) in `ms`.
+    void report_pass(const Picked& picked, size_t tokens, size_t emitted, double ms) {
+        if (picked.measure && emitted > 0) route_picker.report(tokens, picked.arm, ms / static_cast<double>(emitted));
+    }
 
     // Key scales of a quantized KV cache (core/key_scaling.h): the ones kept
     // in config.cache_dir for this model, else measured on the CPU, so they
@@ -2753,6 +2781,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         }
     }
     LIYAB_RETURN_IF_ERROR(impl->select_backends());
+    impl->auto_route = !config.backend && (impl->gpu || impl->npu);
 
     // Prefill chunks and speculative verification batches share max_batch.
     const int32_t max_batch = std::max(64, config.draft_tokens + 1);
@@ -3056,6 +3085,13 @@ std::string Engine::describe() const {
     out += "=== Execution ===\n";
     out += "Attention route: " + route.attention->description() + "\n";
     out += "FFN route:       " + route.ffn->description() + "\n";
+    if (impl_->auto_route) {
+        auto word = [&](size_t tokens) {
+            if (impl_->route_picker.measuring(tokens)) return "being measured";
+            return impl_->route_picker.next(tokens) == RoutePicker::Arm::Host ? "the CPU" : "the accelerator";
+        };
+        out += std::string("Automatic routing: decoding on ") + word(1) + ", prompts on " + word(RoutePicker::kMinBlockTokens) + "\n";
+    }
     if (route.ffn != route.cpu || route.attention != route.cpu) {
         Backend* selected = route.ffn != route.cpu ? route.ffn : route.attention;
         std::map<DType, size_t> fallback;
@@ -3815,7 +3851,9 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             const Stoppable stop(s, q, stoppable, /*prefill_call=*/false);
             ForwardHooks hooks = prefill_hooks;
             if (stoppable) hooks.cancel = &s.preempt;
-            if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &hooks); !r) {
+            const Impl::Picked picked = s.pick_route(prefill_policy, part.size());
+            const auto t_chunk = Clock::now();
+            if (auto r = s.target->forward(part, Transformer::Logits::None, picked.route, *s.pool, &hooks); !r) {
                 if (r.status().code() == ErrorCode::Cancelled && stoppable && s.target->abandon_pass().is_ok()) {
                     s.count_stop();
                     continue;  // stopped: the same tokens again, now with the others
@@ -3823,6 +3861,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
                 s.clear_context(q);
                 return r.status();
             }
+            s.report_pass(picked, part.size(), part.size(), ms_since(t_chunk));
             if (s.draft) {
                 if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
                     s.clear_context(q);
@@ -4116,7 +4155,10 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
         }
         const PowerPolicy policy = s.power->policy();
         s.apply_policy(policy);
-        const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
+        const Impl::Picked picked = s.pick_route(policy, 1);
+        const Route& route = picked.route;
+        const auto t_step = Clock::now();
+        bool stepped_here = false;  // this iteration ran the model itself (not in a pass shared with other sequences)
 
         std::vector<int32_t> next;
         if (presampled) {
@@ -4128,6 +4170,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             if (s.speculative && !span) {
                 if (policy.throttled) ++stats.thermal_reroutes;
                 const int32_t proposed = s.speculative->proposed(), accepted = s.speculative->accepted();
+                stepped_here = true;
                 auto r = s.speculative->step(last, q.context, sampler, route, s.draft_route(), *s.pool);
                 stats.draft_tokens_proposed += s.speculative->proposed() - proposed;
                 stats.draft_tokens_accepted += s.speculative->accepted() - accepted;
@@ -4148,6 +4191,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
                 if (policy.throttled) ++stats.thermal_reroutes;
                 const ForwardHooks hooks = s.speculative ? ForwardHooks{} : s.hooks(policy, true);
                 if (s.speculative) s.target->set_checkpointing(false);
+                stepped_here = true;
                 auto logits = s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route,
                                                 *s.pool, &hooks);
                 if (!logits) {
@@ -4204,6 +4248,7 @@ Result<GenerationStats> Engine::Impl::generate(Seq& q, std::span<const int32_t> 
             pass_paced_ms = r.paced_ms;
         }
 
+        if (stepped_here) s.report_pass(picked, 1, next.size(), ms_since(t_step));
         if (stats.ttft_ms == 0.0) {
             stats.ttft_ms = ms_since(t_prefill);
             if (const ExpertStore* store = s.target->expert_store()) {
@@ -4406,7 +4451,9 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
             const Stoppable stop(s, q, stoppable, /*prefill_call=*/true);
             ForwardHooks pass_hooks = hooks;
             if (stoppable) pass_hooks.cancel = &s.preempt;
-            if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &pass_hooks); !r) {
+            const Impl::Picked picked = s.pick_route(policy, part.size());
+            const auto t_chunk = Clock::now();
+            if (auto r = s.target->forward(part, Transformer::Logits::None, picked.route, *s.pool, &pass_hooks); !r) {
                 if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {
                     if (q.cancel_prefill.load(std::memory_order_relaxed)) {
                         return Status(ErrorCode::Cancelled, "prefill cancelled");
@@ -4417,6 +4464,7 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
                 s.clear_context(q);
                 return r.status();
             }
+            s.report_pass(picked, part.size(), part.size(), ms_since(t_chunk));
         } else {
             if (q.cancel_prefill.load(std::memory_order_relaxed)) return Status(ErrorCode::Cancelled, "prefill cancelled");
             if (hybrid) {  // the state an abandoned pass returns to

@@ -29,9 +29,10 @@ namespace liyab {
 
 namespace {
 
-// One SIMD-group (32 lanes) per output element; lanes stride over blocks and
-// reduce with simd_sum. Block reads use byte loads so tensors need only the
-// GGUF 32-byte alignment.
+// One SIMD-group (32 lanes) per output element (Q1_0: per four rows); lanes
+// stride over blocks and reduce with simd_sum. Block reads use byte loads so
+// tensors need only the GGUF 32-byte alignment (Q1_0 reads 16-bit words: its
+// blocks are 18 bytes, so every address is even).
 constexpr const char* kKernelSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
@@ -201,6 +202,208 @@ kernel void matvec_f32(device const uchar* w [[buffer(0)]], device const float* 
     if (lane == 0) y[ulong(t) * p.rows + row] = sum;
 }
 
+// Q1_0: 128 values per 18-byte block, an fp16 scale and one sign bit per value (bit j % 8 of byte j / 8 set: +d,
+// clear: -d). A simdgroup computes kQ1Rows consecutive rows for one activation row, so the 32 activations a lane
+// multiplies are loaded once and used for every row: the signs are 1/32 of the bytes of the activations they
+// select, so a kernel that loaded them again for each row would be bound by those loads, not by the weights.
+// Lane l takes the quarter (l % 4) of blocks l / 4, l / 4 + 8, ... : eight blocks per step, whatever the row
+// width, and consecutive lanes read consecutive bytes. Each row's sum is the same whatever the rows around it
+// or the other activation rows, so the result does not depend on the batch.
+constant constexpr uint kQ1Rows = 4;
+
+kernel void matvec_q1_0(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],
+                        device float* y [[buffer(2)]], constant Params& p [[buffer(3)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tg.x * kQ1Rows, t = tg.y;
+    const uint quarter = lane & 3;
+    device const float* xr = x + ulong(t) * p.cols;
+    float sum[kQ1Rows] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane >> 2; b < p.cols / 128; b += 8) {
+        device const float4* xv = (device const float4*)(xr + b * 128 + quarter * 32);
+        float4 xs[8];
+        for (uint i = 0; i < 8; ++i) xs[i] = xv[i];
+        for (uint r = 0; r < kQ1Rows; ++r) {
+            if (row0 + r >= p.rows) break;
+            device const uchar* blk = w + ulong(row0 + r) * p.row_bytes + b * 18;
+            device const ushort* signs = (device const ushort*)(blk + 2 + quarter * 4);
+            const uint bits = uint(signs[0]) | (uint(signs[1]) << 16);
+            float s = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                const uint nibble = bits >> (4 * i);
+                s += select(-xs[i].x, xs[i].x, (nibble & 1) != 0) + select(-xs[i].y, xs[i].y, (nibble & 2) != 0) +
+                     select(-xs[i].z, xs[i].z, (nibble & 4) != 0) + select(-xs[i].w, xs[i].w, (nibble & 8) != 0);
+            }
+            sum[r] += load_half(blk) * s;
+        }
+    }
+    for (uint r = 0; r < kQ1Rows; ++r) {
+        const float total = simd_sum(sum[r]);
+        if (lane == 0 && row0 + r < p.rows) y[ulong(t) * p.rows + row0 + r] = total;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Batched products (several activation rows, e.g. prefill): out[t][r] = sum_k x[t][k] * w[r][k] as 8x8 matrix
+// multiply-accumulates. A threadgroup of four simdgroups computes a tile of 64 weight rows x 32 activation rows,
+// walking k in steps of 32: each thread decodes 16 weights of one row into threadgroup memory as floats and
+// copies 8 activations, then each simdgroup multiplies its 32 x 16 quarter of the tile. The weights are read once
+// per 32 activation rows instead of once per row, and decoded to float (not half) so the result stays within float
+// rounding of the matvec kernels' (about 1e-7 of the sum of |w*x|); it is not their exact bits, which is why
+// batches shorter than kMatmulMinRows keep using the matvec kernels.
+// ---------------------------------------------------------------------------------------------------------------
+struct MMParams {
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    uint n;
+};
+
+constant constexpr uint BM = 64, BN = 32, BK = 32;
+
+// Each format decodes 16 consecutive weights of a row, starting at the 16-aligned column k.
+struct DqF32 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const float* p = (device const float*)(row) + k;
+        for (uint i = 0; i < 16; ++i) o[i] = p[i];
+    }
+};
+struct DqF16 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        for (uint i = 0; i < 16; ++i) o[i] = load_half(row + 2 * (k + i));
+    }
+};
+struct DqQ4_0 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 32) * 18;
+        const float d = load_half(b);
+        const bool hi = (k % 32) >= 16;
+        for (uint i = 0; i < 16; ++i) {
+            const uint q = b[2 + i];
+            o[i] = d * float(int(hi ? (q >> 4) : (q & 15)) - 8);
+        }
+    }
+};
+struct DqQ4_1 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 32) * 20;
+        const float d = load_half(b), m = load_half(b + 2);
+        const bool hi = (k % 32) >= 16;
+        for (uint i = 0; i < 16; ++i) {
+            const uint q = b[4 + i];
+            o[i] = d * float(hi ? (q >> 4) : (q & 15)) + m;
+        }
+    }
+};
+struct DqQ8_0 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 32) * 34;
+        const float d = load_half(b);
+        device const char* qs = (device const char*)(b + 2 + (k % 32));
+        for (uint i = 0; i < 16; ++i) o[i] = d * float(qs[i]);
+    }
+};
+struct DqQ1_0 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 128) * 18;
+        const float d = load_half(b);
+        const uint e = k % 128;
+        for (uint i = 0; i < 16; ++i) o[i] = ((b[2 + (e + i) / 8] >> ((e + i) % 8)) & 1) ? d : -d;
+    }
+};
+template <bool Fifth>
+struct DqK45 {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 256) * (Fifth ? 176 : 144);
+        const uint e = k % 256, c = e / 64, off = e % 64, j0 = off % 32;
+        const bool hi = off >= 32;
+        const uint sub = 2 * c + (hi ? 1 : 0);
+        const float d = load_half(b), dm = load_half(b + 2);
+        const uint2 sm = scale_min_k(sub, b + 4);
+        for (uint i = 0; i < 16; ++i) {
+            const uint packed = b[(Fifth ? 48 : 16) + c * 32 + j0 + i];
+            uint q = hi ? (packed >> 4) : (packed & 15);
+            if (Fifth) q |= ((uint(b[16 + j0 + i]) >> sub) & 1) << 4;
+            o[i] = d * sm.x * float(q) - dm * sm.y;
+        }
+    }
+};
+struct DqQ6_K {
+    static void load16(device const uchar* row, uint k, thread float* o) {
+        device const uchar* b = row + (k / 256) * 210;
+        const uint e = k % 256, h = e / 128, part = (e % 128) / 32, lane0 = e % 32;
+        const float d = load_half(b + 208);
+        device const char* scales = (device const char*)(b + 192);
+        for (uint i = 0; i < 16; ++i) {
+            const uint lane = lane0 + i;
+            const uint a = b[h * 64 + (part & 1) * 32 + lane];
+            const uint high = b[128 + h * 32 + lane];
+            const uint q = ((part < 2) ? (a & 15) : (a >> 4)) | (((high >> (2 * part)) & 3) << 4);
+            o[i] = d * float(scales[h * 8 + lane / 16 + part * 2]) * float(int(q) - 32);
+        }
+    }
+};
+
+template <typename D>
+inline void mul_mm(device const uchar* w, device const float* x, device float* y, constant MMParams& p,
+                   threadgroup float* shm, uint2 tg, uint tid, uint sgitg) {
+    threadgroup float* sa = shm;             // BM x BK, row-major: weights
+    threadgroup float* sb = shm + BM * BK;   // BN x BK, row-major: activations
+    const uint r0 = tg.x * BM, t0 = tg.y * BN;
+    const uint sg_r = sgitg & 1, sg_t = sgitg >> 1;
+    simdgroup_float8x8 mc[2][4];
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 4; ++j) mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint lr = tid >> 1, lh = tid & 1;   // the weight row and 16-column half this thread decodes
+    const uint lt = tid >> 2, lp = tid & 3;   // the activation row and 8-column part it copies
+    const uint row = r0 + lr, token = t0 + lt;
+    device const uchar* wrow = w + ulong(row) * p.row_bytes;
+    for (uint kb = 0; kb < p.cols; kb += BK) {
+        float v[16];
+        if (row < p.rows) {
+            D::load16(wrow, kb + lh * 16, v);
+        } else {
+            for (uint i = 0; i < 16; ++i) v[i] = 0.0f;
+        }
+        for (uint i = 0; i < 16; ++i) sa[lr * BK + lh * 16 + i] = v[i];
+        for (uint i = 0; i < 8; ++i) sb[lt * BK + lp * 8 + i] = token < p.n ? x[ulong(token) * p.cols + kb + lp * 8 + i] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k8 = 0; k8 < BK; k8 += 8) {
+            simdgroup_float8x8 ma[2], mb[4];
+            for (uint i = 0; i < 2; ++i) simdgroup_load(ma[i], sb + (sg_t * 16 + i * 8) * BK + k8, BK);
+            for (uint j = 0; j < 4; ++j) simdgroup_load(mb[j], sa + (sg_r * 32 + j * 8) * BK + k8, BK, ulong2(0, 0), true);
+            for (uint i = 0; i < 2; ++i)
+                for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(mc[i][j], ma[i], mb[j], mc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The tile, activation-row major, through threadgroup memory so the edges are bounds-checked.
+    threadgroup float* tile = shm;
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 4; ++j) simdgroup_store(mc[i][j], tile + (sg_t * 16 + i * 8) * BM + sg_r * 32 + j * 8, BM);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < BN * BM; e += 128) {
+        const uint t = e / BM, r = e % BM;
+        if (t0 + t < p.n && r0 + r < p.rows) y[ulong(t0 + t) * p.rows + r0 + r] = tile[e];
+    }
+}
+
+#define LIYAB_MM(NAME, DQ)                                                                                         \
+    kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],                    \
+                     device float* y [[buffer(2)]], constant MMParams& p [[buffer(3)]],                           \
+                     threadgroup float* shm [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],       \
+                     uint tid [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]]) {  \
+        mul_mm<DQ>(w, x, y, p, shm, tg, tid, sgitg);                                                             \
+    }
+LIYAB_MM(mm_f32, DqF32)
+LIYAB_MM(mm_f16, DqF16)
+LIYAB_MM(mm_q4_0, DqQ4_0)
+LIYAB_MM(mm_q4_1, DqQ4_1)
+LIYAB_MM(mm_q8_0, DqQ8_0)
+LIYAB_MM(mm_q4_k, DqK45<false>)
+LIYAB_MM(mm_q5_k, DqK45<true>)
+LIYAB_MM(mm_q6_k, DqQ6_K)
+LIYAB_MM(mm_q1_0, DqQ1_0)
+
 // The gate/up products finish before this dispatch. Overwriting the gate
 // output keeps the activated intermediate on the GPU for the down product.
 kernel void gated_silu(device float* gate [[buffer(0)]], device const float* up [[buffer(1)]],
@@ -235,14 +438,23 @@ public:
             auto backend = std::unique_ptr<MetalBackend>(new MetalBackend());
             backend->device_ = device;
             backend->queue_ = [device newCommandQueue];
-            const char* names[] = {"matvec_f32", "matvec_f16", "matvec_q4_0", "matvec_q8_0", "matvec_q4_1", "matvec_q4_k", "matvec_q5_k", "matvec_q6_k", "gated_silu"};
-            for (int i = 0; i < 9; ++i) {
+            const char* names[] = {"matvec_f32", "matvec_f16", "matvec_q4_0", "matvec_q8_0", "matvec_q4_1", "matvec_q4_k", "matvec_q5_k", "matvec_q6_k", "gated_silu", "matvec_q1_0"};
+            for (int i = 0; i < kPipelines; ++i) {
                 id<MTLFunction> fn = [library newFunctionWithName:@(names[i])];
                 id<MTLComputePipelineState> pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
                 if (pso == nil) {
                     return Status(ErrorCode::BackendError, std::string("cannot build Metal pipeline ") + names[i]);
                 }
                 backend->pipelines_[i] = pso;
+            }
+            const char* mm_names[] = {"mm_f32", "mm_f16", "mm_q4_0", "mm_q8_0", "mm_q4_1", "mm_q4_k", "mm_q5_k", "mm_q6_k", "mm_q1_0"};
+            for (int i = 0; i < 9; ++i) {
+                id<MTLFunction> fn = [library newFunctionWithName:@(mm_names[i])];
+                id<MTLComputePipelineState> pso = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
+                if (pso == nil) {
+                    return Status(ErrorCode::BackendError, std::string("cannot build Metal pipeline ") + mm_names[i]);
+                }
+                backend->mm_pipelines_[i] = pso;
             }
             if (backend->queue_ == nil) return Status(ErrorCode::BackendError, "cannot create Metal command queue");
             return std::unique_ptr<Backend>(std::move(backend));
@@ -255,7 +467,8 @@ public:
     }
     [[nodiscard]] bool supports(DType type) const noexcept override {
         return type == DType::F32 || type == DType::F16 || type == DType::Q4_0 || type == DType::Q4_1 ||
-               type == DType::Q8_0 || type == DType::Q4_K || type == DType::Q5_K || type == DType::Q6_K;
+               type == DType::Q8_0 || type == DType::Q4_K || type == DType::Q5_K || type == DType::Q6_K ||
+               type == DType::Q1_0;
     }
 
     Status matmul(const TensorView& w, const float* x, float* y, int32_t n) override {
@@ -299,14 +512,9 @@ public:
             [enc setBuffer:x_buf_ offset:0 atIndex:1];
             for (size_t i = 0; i < ws.size(); ++i) {
                 const TensorView& w = *ws[i];
-                const Params params{static_cast<uint32_t>(w.rows()), static_cast<uint32_t>(w.cols()),
-                                    static_cast<uint32_t>(w.row_bytes())};
-                [enc setComputePipelineState:pipeline(w.type)];
                 [enc setBuffer:weights[i] offset:offsets[i] atIndex:0];
                 [enc setBuffer:y_buf_ offset:output_offsets[i] atIndex:2];
-                [enc setBytes:&params length:sizeof params atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(w.rows()), static_cast<NSUInteger>(n), 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                dispatch_matvec(enc, w, n);
             }
             [enc endEncoding];
             [cmd commit];
@@ -372,15 +580,10 @@ public:
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 }
                 const TensorView& w = *weights[i];
-                const Params params{static_cast<uint32_t>(w.rows()), static_cast<uint32_t>(w.cols()),
-                                    static_cast<uint32_t>(w.row_bytes())};
-                [enc setComputePipelineState:pipeline(w.type)];
                 [enc setBuffer:buffers[i] offset:offsets[i] atIndex:0];
                 [enc setBuffer:i == 2 ? y_buf_ : x_buf_ offset:0 atIndex:1];
                 [enc setBuffer:y_buf_ offset:output_offsets[i] atIndex:2];
-                [enc setBytes:&params length:sizeof params atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(w.rows()), static_cast<NSUInteger>(n), 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                dispatch_matvec(enc, w, n);
             }
             [enc endEncoding];
             [cmd commit];
@@ -423,9 +626,50 @@ private:
             case DType::Q4_K: return pipelines_[5];
             case DType::Q5_K: return pipelines_[6];
             case DType::Q6_K: return pipelines_[7];
+            case DType::Q1_0: return pipelines_[9];
             default: break;
         }
         return pipelines_[0];
+    }
+
+    // Batches of at least this many activation rows use the matrix kernels (and are then not bit-identical to the
+    // matvec ones, see mul_mm): longer than a speculative verification pass, so those stay exact.
+    static constexpr int32_t kMatmulMinRows = 16;
+
+    int mm_index(DType type) const {
+        switch (type) {
+            case DType::F32: return 0;
+            case DType::F16: return 1;
+            case DType::Q4_0: return 2;
+            case DType::Q8_0: return 3;
+            case DType::Q4_1: return 4;
+            case DType::Q4_K: return 5;
+            case DType::Q5_K: return 6;
+            case DType::Q6_K: return 7;
+            case DType::Q1_0: return 8;
+            default: return 0;
+        }
+    }
+
+    // The matrix kernel for n >= kMatmulMinRows activation rows over whole 32-column steps, else the matvec one.
+    // The weights are already bound at index 0, activations at 1, outputs at 2.
+    void dispatch_matvec(id<MTLComputeCommandEncoder> enc, const TensorView& w, int32_t n) {
+        if (n >= kMatmulMinRows && w.cols() % 32 == 0) {
+            const uint32_t params[4] = {static_cast<uint32_t>(w.rows()), static_cast<uint32_t>(w.cols()),
+                                        static_cast<uint32_t>(w.row_bytes()), static_cast<uint32_t>(n)};
+            [enc setComputePipelineState:mm_pipelines_[mm_index(w.type)]];
+            [enc setBytes:params length:sizeof params atIndex:3];
+            [enc setThreadgroupMemoryLength:(64 * 32 + 32 * 32) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((static_cast<NSUInteger>(w.rows()) + 63) / 64, (static_cast<NSUInteger>(n) + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
+        const Params params{static_cast<uint32_t>(w.rows()), static_cast<uint32_t>(w.cols()), static_cast<uint32_t>(w.row_bytes())};
+        [enc setComputePipelineState:pipeline(w.type)];
+        [enc setBytes:&params length:sizeof params atIndex:3];
+        const NSUInteger rows_per_group = w.type == DType::Q1_0 ? 4 : 1;
+        const NSUInteger groups = (static_cast<NSUInteger>(w.rows()) + rows_per_group - 1) / rows_per_group;
+        [enc dispatchThreadgroups:MTLSizeMake(groups, static_cast<NSUInteger>(n), 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
 
     bool ensure(id<MTLBuffer> __strong& buffer, size_t bytes) {
@@ -465,7 +709,9 @@ private:
 
     id<MTLDevice> device_ = nil;
     id<MTLCommandQueue> queue_ = nil;
-    id<MTLComputePipelineState> pipelines_[9] = {nil, nil, nil, nil, nil, nil, nil, nil, nil};
+    static constexpr int kPipelines = 10;
+    id<MTLComputePipelineState> pipelines_[kPipelines] = {};
+    id<MTLComputePipelineState> mm_pipelines_[9] = {};  // the batched kernels, in the order of pipeline(): f32 f16 q4_0 q8_0 q4_1 q4_k q5_k q6_k q1_0
     id<MTLBuffer> x_buf_ = nil;
     id<MTLBuffer> y_buf_ = nil;
     std::atomic<uint64_t> busy_ns_{0};

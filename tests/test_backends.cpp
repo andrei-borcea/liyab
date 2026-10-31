@@ -17,6 +17,7 @@
 
 #include "core/portable_math.h"
 #include "core/quant.h"
+#include "core/route_picker.h"
 #include "core/thread_pool.h"
 #include "core/transformer.h"
 #include "liyab/backend.h"
@@ -298,6 +299,50 @@ TEST_CASE("Final logit soft-cap: same bits for 1 and N threads, and its cost per
     const double tn = best(many);
     std::printf("  final soft-cap, 256000 logits: %.3f ms on 1 thread, %.3f ms on %d threads\n", t1, tn,
                 many.max_threads());
+}
+
+// Runs the picker's whole schedule for a class of passes of `tokens` tokens with the given times per token.
+static RoutePicker::Arm run_picker(RoutePicker& picker, size_t tokens, double host_ms, double accelerator_ms,
+                                   int* passes = nullptr) {
+    int count = 0;
+    while (picker.measuring(tokens) && count < 20) {
+        const RoutePicker::Arm arm = picker.next(tokens);
+        picker.report(tokens, arm, arm == RoutePicker::Arm::Host ? host_ms : accelerator_ms);
+        ++count;
+    }
+    if (passes != nullptr) *passes = count;
+    return picker.next(tokens);
+}
+
+TEST_CASE("The route picker measures each class of pass once and keeps the faster route") {
+    using Arm = RoutePicker::Arm;
+    RoutePicker picker;
+    int passes = 0;
+    CHECK(picker.next(1) == Arm::Host);  // the schedule starts on the CPU
+    CHECK(run_picker(picker, 1, 10.0, 100.0, &passes) == Arm::Host);  // decoding: the CPU is faster
+    CHECK(passes == 5);
+    CHECK(picker.next(64) == Arm::Host);  // a block is a class of its own, not yet decided
+    CHECK(picker.measuring(64));
+    CHECK(run_picker(picker, 64, 20.0, 5.0) == Arm::Accelerator);  // prompts: the accelerator is faster
+    CHECK(picker.next(1) == Arm::Host);  // the first decision stands
+    CHECK(picker.next(8) == Arm::Host);  // a speculative verification pass is a step
+    CHECK(!picker.measuring(1));
+
+    RoutePicker close;  // within the margin the CPU, the numerical reference, keeps the work
+    CHECK(run_picker(close, 1, 10.0, 9.0) == Arm::Host);
+    RoutePicker clear;
+    CHECK(run_picker(clear, 1, 10.0, 7.9) == Arm::Accelerator);
+
+    RoutePicker warm;  // the accelerator's first pass wraps the weights and is not counted
+    for (int i = 0; i < 5; ++i) {
+        const Arm arm = warm.next(1);
+        const bool first_accelerator = arm == Arm::Accelerator && i == 1;
+        warm.report(1, arm, arm == Arm::Host ? 10.0 : (first_accelerator ? 1000.0 : 2.0));
+    }
+    CHECK(warm.next(1) == Arm::Accelerator);
+
+    RoutePicker short_blocks;  // 17 tokens is the shortest block measured; a pass in between is a step
+    CHECK(short_blocks.next(RoutePicker::kMinBlockTokens) == Arm::Host);
 }
 
 TEST_CASE("Metal K-quants match dequantized float reference in refillable shared regions") {
