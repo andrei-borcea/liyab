@@ -11,10 +11,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <fstream>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "core/measured_cache.h"
 #include "core/portable_math.h"
 #include "core/quant.h"
 #include "core/route_picker.h"
@@ -354,6 +358,97 @@ TEST_CASE("The route picker measures each class of pass once and keeps the faste
     CHECK(probes.limit(1, Arm::Host) == 1);
     CHECK(run_picker(probes, 256, 1.0, 5.0) == Arm::Host);  // decided: the CPU keeps the whole chunk
     CHECK(probes.limit(256, Arm::Host) == 256);
+}
+
+TEST_CASE("A route decision is kept only when clear, and a later picker adopts it without measuring") {
+    using Arm = RoutePicker::Arm;
+    RoutePicker measured;
+    REQUIRE(run_picker(measured, 1, 10.0, 100.0) == Arm::Host);       // steps: the CPU by a wide margin
+    REQUIRE(run_picker(measured, 64, 20.0, 5.0) == Arm::Accelerator);  // blocks: the accelerator
+    const RoutePicker::Snapshot kept = measured.snapshot();
+    CHECK(kept.classes[0].decided == 1);
+    CHECK(kept.classes[1].decided == 1);
+
+    RoutePicker later;
+    REQUIRE(later.restore(kept));
+    CHECK(!later.measuring(1));
+    CHECK(!later.measuring(64));
+    CHECK(later.next(1) == Arm::Host);
+    CHECK(later.next(8) == Arm::Host);
+    CHECK(later.next(64) == Arm::Accelerator);
+    CHECK(later.summary(64).find("kept from an earlier run") != std::string::npos);
+    later.report(1, Arm::Accelerator, 0.001);  // a decided class ignores reports
+    CHECK(later.next(1) == Arm::Host);
+
+    // The CPU by a small margin (the accelerator within 1.25x of it) is not kept: it is measured again.
+    RoutePicker close;
+    REQUIRE(run_picker(close, 1, 10.0, 9.0) == Arm::Host);
+    CHECK(close.snapshot().classes[0].decided == 0);
+    RoutePicker unmeasured;
+    CHECK(!unmeasured.restore(close.snapshot()));
+    CHECK(unmeasured.measuring(1));
+    // An accelerator that wins is always clear (it must beat the CPU by kMargin).
+    RoutePicker fast;
+    REQUIRE(run_picker(fast, 1, 10.0, 7.9) == Arm::Accelerator);
+    CHECK(fast.snapshot().classes[0].decided == 1);
+
+    // A snapshot with times that are not positive numbers is ignored, and a class already being measured keeps going.
+    RoutePicker::Snapshot damaged = kept;
+    damaged.classes[0].host_best = std::nan("");
+    damaged.classes[1].accelerator_best = 0.0;
+    RoutePicker refused;
+    CHECK(!refused.restore(damaged));
+    RoutePicker started;
+    started.report(1, started.next(1), 10.0);
+    CHECK(started.restore(kept));  // the blocks only: the class under way is not replaced
+    CHECK(started.measuring(1));
+    CHECK(!started.measuring(64));
+}
+
+TEST_CASE("Measured values are kept per id in a bounded directory, read back, and ignored when damaged") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "liyab_measured_cache_test";
+    std::filesystem::remove_all(dir);
+    const std::string path = dir.string();
+    const auto any = [](double) { return true; };
+    const MeasuredCache<double> cache("probe", "LYTS", 1, 2, "test");
+
+    CHECK(!cache.find(path, 1, any));  // no directory yet
+    cache.keep(path, 1, 1.5);
+    REQUIRE(cache.find(path, 1, any));
+    CHECK(*cache.find(path, 1, any) == 1.5);
+    CHECK(!cache.find(path, 2, any));  // another id
+    CHECK(!cache.find(path, 1, [](double v) { return v > 2.0; }));  // out of range
+
+    const MeasuredCache<double> newer("probe", "LYTS", 2, 2, "test");  // another version of the payload's meaning
+    CHECK(!newer.find(path, 1, any));
+    const MeasuredCache<double> other("probe", "LYTX", 1, 2, "test");  // another magic
+    CHECK(!other.find(path, 1, any));
+
+    // At most max_files files of the prefix stay, the least recently used out first; other prefixes are not touched.
+    { std::ofstream(dir / "other-0000000000000001.bin") << "x"; }
+    cache.keep(path, 2, 2.5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    REQUIRE(cache.find(path, 1, any));  // a read makes id 1 the most recent
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    cache.keep(path, 3, 3.5);
+    CHECK(cache.find(path, 1, any));
+    CHECK(!cache.find(path, 2, any));
+    CHECK(cache.find(path, 3, any));
+    CHECK(std::filesystem::exists(dir / "other-0000000000000001.bin"));
+
+    {
+        std::ofstream damaged(dir / "probe-0000000000000003.bin", std::ios::binary | std::ios::trunc);
+        damaged << "damaged";
+    }
+    CHECK(!cache.find(path, 3, any));
+
+    // Without a directory the value lives in memory for the process.
+    const MeasuredCache<double> memory("probe", "LYTS", 1, 2, "test");
+    CHECK(!memory.find("", 9, any));
+    memory.keep("", 9, 4.5);
+    REQUIRE(memory.find("", 9, any));
+    CHECK(*memory.find("", 9, any) == 4.5);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("Metal K-quants match dequantized float reference in refillable shared regions") {

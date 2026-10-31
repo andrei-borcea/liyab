@@ -20,12 +20,19 @@
 // The schedule advances when a pass is reported, not when a route is handed out: a pass that never reports
 // (cancelled, failed, served from a cache) costs nothing.
 //
+// A decision can be kept and adopted by a later picker for the same model and device (snapshot(), restore()), which
+// then measures nothing: the first prompt of a run no longer pays for the CPU's probe pass. Only a clear decision is
+// kept (kClear): one the CPU won by a small margin is measured again, since a pass timed while the device was busy
+// could have swung it.
+//
 // Thread-safe.
 #ifndef LIYAB_CORE_ROUTE_PICKER_H
 #define LIYAB_CORE_ROUTE_PICKER_H
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstddef>
 #include <cstdio>
 #include <limits>
@@ -46,6 +53,18 @@ public:
     // chunks, which is the size it runs at once decided.
     static constexpr size_t kHostProbeTokens = 32;
 
+    // A route is clear when the faster one takes less than 1 / kClear of the other's time per token.
+    static constexpr double kClear = 1.25;
+
+    // The decisions in a form that can be kept: trivially copyable, no padding.
+    struct Snapshot {
+        struct Decision {
+            double host_best, accelerator_best;
+            uint32_t decided, host;
+        };
+        std::array<Decision, 2> classes{};
+    };
+
     // The route for a pass of `tokens` tokens; while the class is undecided, report() its time.
     Arm next(size_t tokens) const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -65,11 +84,44 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const Class& c = classes_[index(tokens)];
         if (!c.decided) return {};
-        char text[160];
+        char text[200];
         std::snprintf(text, sizeof text, "%s: CPU %.2f ms/token, accelerator %.2f; chose %s",
                       index(tokens) == 0 ? "steps" : "blocks", c.host_best, c.accelerator_best,
                       c.host ? "the CPU" : "the accelerator");
-        return text;
+        return c.restored ? std::string(text) + " (kept from an earlier run)" : std::string(text);
+    }
+
+    // The classes decided so far whose decision is clear (the others read as undecided).
+    Snapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Snapshot out;
+        for (size_t i = 0; i < classes_.size(); ++i) {
+            const Class& c = classes_[i];
+            const bool clear = c.decided && (!c.host || c.accelerator_best >= kClear * c.host_best);
+            out.classes[i] = {c.host_best, c.accelerator_best, clear ? 1u : 0u, c.host ? 1u : 0u};
+        }
+        return out;
+    }
+
+    // Adopts the decided classes of `kept` that this picker has not decided or started to measure, and ignores
+    // the ones whose times are not positive numbers. Returns whether any was adopted.
+    bool restore(const Snapshot& kept) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool any = false;
+        for (size_t i = 0; i < classes_.size(); ++i) {
+            const Snapshot::Decision& d = kept.classes[i];
+            Class& c = classes_[i];
+            if (d.decided != 1 || c.decided || c.reported > 0 || !(d.host_best > 0.0) || !(d.accelerator_best > 0.0) ||
+                !std::isfinite(d.host_best) || !std::isfinite(d.accelerator_best)) {
+                continue;
+            }
+            c.host_best = d.host_best;
+            c.accelerator_best = d.accelerator_best;
+            c.host = d.host != 0;
+            c.decided = c.restored = true;
+            any = true;
+        }
+        return any;
     }
 
     // Whether next() answers by measurement still (so the pass's time is wanted).
@@ -100,7 +152,7 @@ private:
         size_t reported = 0, accelerator_reported = 0;
         double host_best = std::numeric_limits<double>::infinity();
         double accelerator_best = std::numeric_limits<double>::infinity();
-        bool decided = false, host = false;
+        bool decided = false, host = false, restored = false;
     };
     static size_t index(size_t tokens) { return tokens <= kStepTokens ? 0 : 1; }
     // Steps: host, accelerator (warm-up), host, accelerator, accelerator. Blocks: accelerator (warm-up), host,

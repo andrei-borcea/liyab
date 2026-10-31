@@ -202,7 +202,10 @@ struct EngineConfig {
     // (created if missing): today the key scales of a quantized KV cache
     // (README, KV cache), a few KB per model, at most 16 models, least
     // recently used out first, and what reading and decoding prefix-cache
-    // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16). With converted_weights_mb, also the
+    // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16), the latent-attention form ratio
+    // (latent-*.bin), what a verification pass costs (verify-*.bin) and, with automatic routing, which route each
+    // class of passes took (route-*.bin, 64 bytes; a later run adopts it without the probe passes; each of these
+    // kinds is 16 files at most). With converted_weights_mb, also the
     // weights converted at load (weights-*.bin, each about a model's size: capped in bytes, not in files).
     // Empty: measured again at every load (on the
     // reference phone 0.27 s for a 4B model, 1.4 s for a 35B MoE whose experts

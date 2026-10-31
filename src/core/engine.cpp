@@ -26,6 +26,7 @@
 #include "core/grammar.h"
 #include "core/log.h"
 #include "core/quant.h"
+#include "core/measured_cache.h"
 #include "core/route_picker.h"
 #include "core/sampling.h"
 #include "core/thread_pool.h"
@@ -158,16 +159,15 @@ void keep_key_scales(const std::string& dir, uint64_t id, std::span<const float>
     for (size_t i = 0; i + kKeptKeyScales < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
 }
 
-// Latent attention's form ratio (LatentFormChooser) kept in
-// EngineConfig::cache_dir, one file per model: "latent-<id>.bin" = magic,
-// kLatentRatioVersion, id, ratio. The id covers what the measurement depends
-// on: the model file, the KV cache format and the kernel set (the device is
-// the one the directory is on). Measured again when missing or damaged.
-// Without a cache_dir a ratio measured in this process is kept in memory, so
-// every engine of the process takes the same forms.
-constexpr char kLatentRatioMagic[4] = {'L', 'Y', 'L', 'F'};
+// Latent attention's form ratio (LatentFormChooser), one file per model in EngineConfig::cache_dir
+// (core/measured_cache.h). The id covers what the measurement depends on: the model file, the KV cache format and the
+// kernel set (the device is the one the directory is on).
 constexpr uint32_t kLatentRatioVersion = 1;
-constexpr size_t kKeptLatentRatios = 16;  // files in cache_dir at most, least recently used out first
+
+const MeasuredCache<float>& latent_ratios() {
+    static const MeasuredCache<float> cache("latent", "LYLF", kLatentRatioVersion, 16, "latent attention");
+    return cache;
+}
 
 uint64_t latent_ratio_id(const Transformer& model) {
     const uint64_t parts[] = {model.file_fingerprint(), kLatentRatioVersion,
@@ -176,145 +176,24 @@ uint64_t latent_ratio_id(const Transformer& model) {
     return xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
 }
 
-std::string latent_ratio_path(const std::string& dir, uint64_t id) {
-    char name[40];
-    std::snprintf(name, sizeof name, "latent-%016llx.bin", static_cast<unsigned long long>(id));
-    return os::path_utf8(os::utf8_path(dir) / name);
-}
-
-std::optional<float> read_latent_ratio(const std::string& path, uint64_t id) {
-    std::ifstream in(os::utf8_path(path), std::ios::binary);
-    char magic[4] = {};
-    uint32_t version = 0;
-    uint64_t stored_id = 0;
-    float ratio = 0.0f;
-    in.read(magic, sizeof magic);
-    in.read(reinterpret_cast<char*>(&version), sizeof version);
-    in.read(reinterpret_cast<char*>(&stored_id), sizeof stored_id);
-    in.read(reinterpret_cast<char*>(&ratio), sizeof ratio);
-    if (!in || std::memcmp(magic, kLatentRatioMagic, sizeof magic) != 0 || version != kLatentRatioVersion ||
-        stored_id != id || !(ratio >= LatentFormChooser::kMinRatio && ratio <= LatentFormChooser::kMaxRatio)) {
-        return std::nullopt;
-    }
-    return ratio;
-}
-
-// Writes the ratio (temporary file, then renamed) and keeps the directory to
-// its kKeptLatentRatios most recently used ratio files. Failures only cost a
-// new measurement at the next load: logged, not returned.
-void keep_latent_ratio(const std::string& dir, uint64_t id, float ratio) {
-    std::error_code ec;
-    std::filesystem::create_directories(os::utf8_path(dir), ec);
-    const std::string path = latent_ratio_path(dir, id);
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
-        out.write(kLatentRatioMagic, sizeof kLatentRatioMagic);
-        out.write(reinterpret_cast<const char*>(&kLatentRatioVersion), sizeof kLatentRatioVersion);
-        out.write(reinterpret_cast<const char*>(&id), sizeof id);
-        out.write(reinterpret_cast<const char*>(&ratio), sizeof ratio);
-        if (!out) {
-            LIYAB_LOG_WARN("latent attention: cannot write %s", tmp.c_str());
-            std::filesystem::remove(os::utf8_path(tmp), ec);
-            return;
-        }
-    }
-    std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
-    if (ec) {
-        LIYAB_LOG_WARN("latent attention: cannot keep the form ratio in %s: %s", dir.c_str(), ec.message().c_str());
-        return;
-    }
-    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
-    std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
-    for (; !ec && it != end; it.increment(ec)) {
-        const std::string name = os::path_utf8(it->path().filename());
-        if (name.starts_with("latent-") && name.ends_with(".bin")) {
-            std::error_code ignored;
-            kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
-        }
-    }
-    if (kept.size() <= kKeptLatentRatios) return;
-    std::sort(kept.begin(), kept.end());  // oldest first
-    for (size_t i = 0; i + kKeptLatentRatios < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
-}
-
-// What a verification pass costs (Engine's EngineConfig::lookup_drafts = Auto), in plain steps, kept in cache_dir
-// like the latent ratio: "verify-<id>.bin" = magic, version, id, ratio, 16 files at most, least recently used out
-// first. The id covers what the timing depends on: the model file, the KV cache format, the kernel set, the route
-// decoding takes, the threads and the drafts per pass. Models are told apart by their file's identity
-// (Transformer::file_fingerprint()), so a model is measured once per device and setting, whatever it is called.
-constexpr char kVerifyRatioMagic[4] = {'L', 'Y', 'V', 'R'};
+// What a verification pass costs (Engine's EngineConfig::lookup_drafts = Auto), in plain steps. The id covers what
+// the timing depends on: the model file, the KV cache format, the kernel set, the route decoding takes, the threads
+// and the drafts per pass. Models are told apart by their file's identity (Transformer::file_fingerprint()), so a
+// model is measured once per device and setting, whatever it is called.
 constexpr uint32_t kVerifyRatioVersion = 1;
-constexpr size_t kKeptVerifyRatios = 16;
 
-std::string verify_ratio_path(const std::string& dir, uint64_t id) {
-    char name[40];
-    std::snprintf(name, sizeof name, "verify-%016llx.bin", static_cast<unsigned long long>(id));
-    return os::path_utf8(os::utf8_path(dir) / name);
+const MeasuredCache<double>& verify_ratios() {
+    static const MeasuredCache<double> cache("verify", "LYVR", kVerifyRatioVersion, 16, "lookup drafts");
+    return cache;
 }
 
-std::optional<double> read_verify_ratio(const std::string& path, uint64_t id) {
-    std::ifstream in(os::utf8_path(path), std::ios::binary);
-    char magic[4] = {};
-    uint32_t version = 0;
-    uint64_t stored_id = 0;
-    double ratio = 0.0;
-    in.read(magic, sizeof magic);
-    in.read(reinterpret_cast<char*>(&version), sizeof version);
-    in.read(reinterpret_cast<char*>(&stored_id), sizeof stored_id);
-    in.read(reinterpret_cast<char*>(&ratio), sizeof ratio);
-    if (!in || std::memcmp(magic, kVerifyRatioMagic, sizeof magic) != 0 || version != kVerifyRatioVersion ||
-        stored_id != id || !(ratio > 0.0 && ratio < 1000.0)) {
-        return std::nullopt;
-    }
-    return ratio;
-}
+// Which route each class of passes takes under automatic routing (core/route_picker.h): the id covers what the times
+// depend on, as for the verification ratio, and which accelerators the engine found.
+constexpr uint32_t kRouteVersion = 1;
 
-void keep_verify_ratio(const std::string& dir, uint64_t id, double ratio) {
-    std::error_code ec;
-    std::filesystem::create_directories(os::utf8_path(dir), ec);
-    const std::string path = verify_ratio_path(dir, id);
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
-        out.write(kVerifyRatioMagic, sizeof kVerifyRatioMagic);
-        out.write(reinterpret_cast<const char*>(&kVerifyRatioVersion), sizeof kVerifyRatioVersion);
-        out.write(reinterpret_cast<const char*>(&id), sizeof id);
-        out.write(reinterpret_cast<const char*>(&ratio), sizeof ratio);
-        if (!out) {
-            LIYAB_LOG_WARN("lookup drafts: cannot write %s", tmp.c_str());
-            std::filesystem::remove(os::utf8_path(tmp), ec);
-            return;
-        }
-    }
-    std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
-    if (ec) return;
-    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
-    std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
-    for (; !ec && it != end; it.increment(ec)) {
-        const std::string name = os::path_utf8(it->path().filename());
-        if (name.starts_with("verify-") && name.ends_with(".bin")) {
-            std::error_code ignored;
-            kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
-        }
-    }
-    if (kept.size() <= kKeptVerifyRatios) return;
-    std::sort(kept.begin(), kept.end());  // oldest first
-    for (size_t i = 0; i + kKeptVerifyRatios < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
-}
-
-// Ratios measured in this process for engines without a cache_dir, by id.
-std::mutex verify_ratios_mutex;
-std::map<uint64_t, double>& verify_ratios() {
-    static std::map<uint64_t, double> ratios;
-    return ratios;
-}
-
-// Ratios measured in this process for models without a cache_dir, by id.
-std::mutex latent_ratios_mutex;
-std::map<uint64_t, float>& latent_ratios() {
-    static std::map<uint64_t, float> ratios;
-    return ratios;
+const MeasuredCache<RoutePicker::Snapshot>& route_decisions() {
+    static const MeasuredCache<RoutePicker::Snapshot> cache("route", "LYRT", kRouteVersion, 16, "automatic routing");
+    return cache;
 }
 
 // Length of the longest prefix of `s` that ends on a UTF-8 character
@@ -2403,6 +2282,7 @@ struct Engine::Impl {
     // route or on the CPU alone, whichever timing shows faster (core/route_picker.h). A named backend is honoured.
     bool auto_route = false;
     RoutePicker route_picker;
+    uint64_t route_id = 0;  // the key of route_picker's decisions in cache_dir (set with auto_route)
     struct Picked {
         Route route;
         RoutePicker::Arm arm = RoutePicker::Arm::Accelerator;
@@ -2423,6 +2303,23 @@ struct Engine::Impl {
     void report_pass(const Picked& picked, size_t tokens, size_t emitted, double ms) {
         if (picked.measure && emitted > 0) {
             route_picker.report(tokens, picked.arm, ms / static_cast<double>(emitted));
+            if (!route_picker.measuring(tokens)) {
+                LIYAB_LOG_INFO("automatic routing, %s", route_picker.summary(tokens).c_str());
+                route_decisions().keep(config.cache_dir, route_id, route_picker.snapshot());
+            }
+        }
+    }
+
+    // Adopts the decisions an earlier run kept for this model on this device (RoutePicker::restore).
+    void restore_route_decisions() {
+        const uint64_t parts[] = {target->file_fingerprint(), kRouteVersion,
+                                  static_cast<uint64_t>(target->kv_cache().dtype()),
+                                  static_cast<uint64_t>(pool->max_threads()), gpu ? 1u : 0u, npu ? 1u : 0u};
+        const std::string_view isa = quant::kernel_isa();
+        route_id = xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+        const auto kept = route_decisions().find(config.cache_dir, route_id, [](const RoutePicker::Snapshot&) { return true; });
+        if (!kept || !route_picker.restore(*kept)) return;
+        for (const size_t tokens : {size_t{1}, RoutePicker::kMinBlockTokens}) {
             if (!route_picker.measuring(tokens)) LIYAB_LOG_INFO("automatic routing, %s", route_picker.summary(tokens).c_str());
         }
     }
@@ -2476,31 +2373,17 @@ struct Engine::Impl {
     Status prepare_latent_form(Transformer& model) {
         if (model.config().mla.kv_rank == 0 || model.latent_form() != LatentForm::Auto) return Status::ok();
         const uint64_t id = latent_ratio_id(model);
-        if (!config.cache_dir.empty()) {
-            const std::string path = latent_ratio_path(config.cache_dir, id);
-            if (const auto kept = read_latent_ratio(path, id); kept && model.set_latent_ratio(*kept).is_ok()) {
-                std::error_code ignored;
-                std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(),
-                                                 ignored);
-                LIYAB_LOG_INFO("latent attention: form ratio %.3f (%s)", static_cast<double>(*kept), path.c_str());
-                return Status::ok();
-            }
-        } else {
-            std::lock_guard<std::mutex> lock(latent_ratios_mutex);
-            if (const auto it = latent_ratios().find(id); it != latent_ratios().end()) {
-                return model.set_latent_ratio(it->second);
-            }
+        const auto in_range = [](float r) { return r >= LatentFormChooser::kMinRatio && r <= LatentFormChooser::kMaxRatio; };
+        if (const auto kept = latent_ratios().find(config.cache_dir, id, in_range);
+            kept && model.set_latent_ratio(*kept).is_ok()) {
+            LIYAB_LOG_INFO("latent attention: form ratio %.3f (kept)", static_cast<double>(*kept));
+            return Status::ok();
         }
         const auto start = Clock::now();
         auto ratio = model.calibrate_latent_form(draft_route(), *pool);
         if (!ratio) return ratio.status();
         LIYAB_LOG_INFO("latent attention: form ratio measured in %.0f ms", ms_since(start));
-        if (!config.cache_dir.empty()) {
-            keep_latent_ratio(config.cache_dir, id, *ratio);
-        } else {
-            std::lock_guard<std::mutex> lock(latent_ratios_mutex);
-            latent_ratios().emplace(id, *ratio);
-        }
+        latent_ratios().keep(config.cache_dir, id, *ratio);
         return Status::ok();
     }
 
@@ -2533,19 +2416,7 @@ struct Engine::Impl {
                                   static_cast<uint64_t>(pool->max_threads()), static_cast<uint64_t>(k)};
         const std::string_view isa = quant::kernel_isa();
         const uint64_t id = xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
-        std::optional<double> ratio;
-        if (!config.cache_dir.empty()) {
-            const std::string path = verify_ratio_path(config.cache_dir, id);
-            ratio = read_verify_ratio(path, id);
-            if (ratio) {
-                std::error_code ignored;
-                std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(),
-                                                 ignored);
-            }
-        } else {
-            std::lock_guard<std::mutex> lock(verify_ratios_mutex);
-            if (const auto it = verify_ratios().find(id); it != verify_ratios().end()) ratio = it->second;
-        }
+        std::optional<double> ratio = verify_ratios().find(config.cache_dir, id, [](double r) { return r > 0.0 && r < 1000.0; });
         lookup_info.from_cache = ratio.has_value();
         if (!ratio) {
             target->set_rollback_window(k + 1);
@@ -2559,12 +2430,7 @@ struct Engine::Impl {
             ratio = *measured;
             LIYAB_LOG_INFO("lookup drafts: a pass of %d tokens costs %.2f steps (measured in %.0f ms)", k + 1, *ratio,
                            ms_since(start));
-            if (!config.cache_dir.empty()) {
-                keep_verify_ratio(config.cache_dir, id, *ratio);
-            } else {
-                std::lock_guard<std::mutex> lock(verify_ratios_mutex);
-                verify_ratios().emplace(id, *ratio);
-            }
+            verify_ratios().keep(config.cache_dir, id, *ratio);
         }
         lookup_info.verify_ratio = *ratio;
         if (*ratio > EngineConfig::kLookupMaxVerifyRatio) {
@@ -3000,6 +2866,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     auto target = load_model(config.model_path, config, max_batch, repack_cpu);
     if (!target) return target.status();
     impl->target = std::move(target).value();
+    if (impl->auto_route) impl->restore_route_decisions();
     {
         // The default sequence: its context is the transformer's live one.
         auto q = std::make_unique<Impl::Seq>();
