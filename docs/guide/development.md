@@ -68,13 +68,13 @@ The code and its reasoning are in [`src/core/kernel_conformance.h`](../../src/co
 * **The claim.** `Backend::supports(type)` must be true exactly when the type ran in some placement and shape.
 * **Batching.** An n-row call, n one-row calls and a grouped call must give the same bits on the CPU backend
   (speculative verification and concurrent sequences rely on it); other backends are only reported (`=` or `~`).
-* **Throughput** (unless `--no-timing`): GB/s of weights for one activation row and the per-row cost of a 16-row call
-  relative to it (about 1: the weights are read again for every row), on a 128 MiB matrix, in shared memory where
-  the backend has it. Indicative; `liyab-bench` gives stable CPU numbers.
+* **Throughput** (unless `--no-timing`): GB/s of weights for one activation row, the per-row cost of a 16-row call
+  relative to it (about 1: the weights are read again for every row) and the multiply-add rate of a 256-row call in
+  TFLOPS, on a 128 MiB matrix, in shared memory where the backend has it. Indicative; `liyab-bench` gives stable CPU numbers.
 
 What it shows today (Apple M4 Pro, 29–31 October 2026): the CPU runs all 27 formats right and batch-invariant with
-the NEON, AVX2 (an x86-64 build under Rosetta 2) and scalar kernel sets. Metal claims 8 (F32, F16, Q4_0, Q4_1, Q8_0,
-Q4_K, Q5_K, Q6_K), runs them right in both placements, and the other 19 run on the CPU. Vulkan, from its source, runs
+the NEON, AVX2 (an x86-64 build under Rosetta 2) and scalar kernel sets. Metal claims 9 (F32, F16, Q4_0, Q4_1, Q8_0,
+Q4_K, Q5_K, Q6_K, Q1_0), runs them right in both placements, and the other 18 run on the CPU. Vulkan, from its source, runs
 7 types from ordinary memory (F32, F16, Q4_0, Q4_1, Q4_K, Q5_0, Q8_0) and 23 from shared memory; the check has not
 yet been run on a device. [Throughput by format](benchmarks.md#weight-formats-on-the-m4-pro-liyab-kernels).
 
@@ -441,9 +441,19 @@ Implemented features are described above. These are next, in order:
   * batched prefill runs the matvec kernel once per token (no tiled GEMM yet);
   * models that fit in RAM are copied into GPU memory;
   * MoE experts always run on the CPU.
-* **Metal** submits one command buffer per matmul.
+* **Metal:**
+  * submits one command buffer per matmul (or per group, or per fused FFN) and waits for it, which costs about
+    0.25 ms each: small models decode faster on the CPU, and automatic routing sends them there;
+  * its Q4_K and Q5_K matvec kernels read 78 and 88 GB/s, where the CPU's read 250 and the Q4_0 kernel 208: a dense
+    Q4_K_M model decodes about three times slower on Metal than on the CPU of the same Mac;
+  * batches of 16 rows or more use matrix kernels that sit at 4–5 TFLOPS for every format, and whose sums are not the
+    matvec kernels' bits (verification batches of fewer rows keep the exact ones);
+  * attention, norms and the KV cache of a prompt still run on the CPU between the products (about a quarter of a
+    14B prompt's time at 500 tokens, more as the context grows).
 * **Kernels:** TQ1_0 and NVFP4 use a generic decode path on the CPU. Lattice I-quants are 2–3× slower than Q4_K. Only
   Q4_K/Q5_K/Q6_K/Q8_0 have i8mm layouts.
+* **Automatic routing** measures the first passes of each class; a model that decodes in a few milliseconds spends
+  them mostly on the slower route (three of the first five steps), and nothing is kept between runs yet.
 * **x86-64:**
   * the AVX2 kernels have been run only under Rosetta 2 on Apple silicon, not yet on an Intel or AMD CPU, and the
     `x86_64-*` golden hashes come from there (macOS libm); Linux x86-64 builds are not tested, nor is Windows (below);

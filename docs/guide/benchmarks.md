@@ -69,6 +69,34 @@ activation row; Metal numbers are for weights in shared memory. The CPU is the N
   Q4_K runs 3.3 times faster with AVX2 than scalar (44 against 13 GB/s). Q4_0 and Q8_0 ran faster scalar than with AVX2
   (56 and 131 against 19 and 68 GB/s), which should be checked on a real x86 CPU before it is believed.
 
+### Prompts and decoding on the M4 Pro, by backend (31 October 2026)
+
+`liyab-cli --kv f16 --profile performance`, greedy, Apple M4 Pro (48 GiB, 273 GB/s quoted), weights resident. The
+prompt is a repeated English sentence of 1,555 tokens (the 27B: 445 tokens); the first passes of the automatic runs
+are the ones its routing measures. Decoding reads every weight once per token, so its ceiling is the bandwidth over
+the model's size: 273 GB/s over 15.4 GiB is about 16 tok/s for the 27B, and the 100–150 tok/s of a small model need
+about 2 GB of weights per token.
+
+| Model | Prompt: CPU / Metal / automatic (tok/s) | Decoding: CPU / Metal / automatic (tok/s) |
+| :--- | :--- | :--- |
+| Bonsai-1.7B Q1_0 (231 MiB) | 138 / 234 / n.m. | 135 / 45 / 114–135 |
+| Qwen2.5-Coder-14B Q5_K_M (9.8 GiB) | 38 / 83 / 66 | 17.5 / 7.8 / 12.0 |
+| Qwen3.8-27B Q4_K_M (15.4 GiB) | n.m. / n.m. / 34 | 12.7 / 4.3 / 10.7 |
+
+(n.m.: not measured; automatic decoding includes the first steps spent measuring; the 27B on the CPU alone keeps every
+block resident since the repacked copies are only made when they fit, otherwise it streamed blocks at 1.6 tok/s.)
+
+* Metal's prompt rate comes from the matrix kernels (4–5 TFLOPS for every format; the 14B's prompt was 10 tok/s and
+  the 27B's 5.8 before them) and is limited by them: the GPU is busy about 75% of the time at 500 tokens, the rest
+  is attention, norms and the cache on the CPU between products. Without the decode of the weights the kernel is
+  only 18% faster, and half-precision tiles, 64-row tiles and a bank-conflict-free tile layout measured no better.
+* For reference, llama.cpp's server with every layer on the GPU processed this 14B's first 2,048 prompt tokens at
+  259 tok/s and reached 157 tok/s averaged over 16,384 (a log from the same machine): the prompt rate is the gap that
+  remains, about 3×.
+* Decoding is faster on the CPU than on Metal on this Mac for every model above, because Metal waits for the GPU at
+  every product and its Q4_K/Q5_K kernels read 78–88 GB/s. Automatic routing therefore decodes on the CPU and
+  processes prompts on Metal.
+
 ### M4 Pro dense 27B development check
 
 On 28 October 2026, Liyab decoded 16 greedy tokens from `Qwen3.8-27B-Uncensored-noMTP-Q4_K_M.gguf` on an

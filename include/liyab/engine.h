@@ -214,7 +214,11 @@ struct EngineConfig {
     // draft model. Either way draft_tokens is the most drafts per step, and
     // hybrid models keep draft_tokens + 1 recurrent-state checkpoints.
     bool suffix_drafts = true;
-    std::optional<BackendKind> backend;  // force one backend; default: device ranking
+    // Force one backend (always used, with the CPU for what it does not run). Unset: the device's ranking, and
+    // with an accelerator present each class of pass (decoding and drafts' verification; prompts) runs on the
+    // accelerated route or on the CPU alone, whichever timing of the first passes shows faster by a margin
+    // (core/route_picker.h; describe() reports it). The two give results within float rounding of each other.
+    std::optional<BackendKind> backend;
     std::optional<bool> streaming;       // force mmap streaming mode; default: by RAM
     PowerConfig power;                   // profile, thermal thresholds, pacing
     bool thermal_polling = true;         // background thermal sampling thread (while prefilling or generating)

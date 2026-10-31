@@ -30,7 +30,7 @@ Run models larger than RAM by streaming weights from storage. Keep chat, tools a
 | :--- | :--- |
 | Inference | GGUF v2/v3, split files, 27 weight formats; dense, MoE, recurrent and latent/sparse attention paths |
 | Models larger than RAM | Dense block streaming; bounded MoE expert cache with prefetch and direct I/O |
-| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal, Vulkan |
+| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal (matrix kernels for prompts), Vulkan; CPU or GPU chosen by timing the first passes |
 | Conversations | Context reuse, saved state, paged KV, prefix cache, cancellation and concurrent sequences |
 | Generation | Sampling, speculative decoding, JSON/schema constraints and tool calls |
 | Pooling and adaptation | Embeddings, reranking and GGUF LoRA adapters |
@@ -61,7 +61,7 @@ Temperature, context length and OS activity affect throughput. The [measurement 
 keeps the configurations, alternating A/B runs, single-run caveats and per-phase timings.
 Stage-1 phone validation remains deferred; these figures come from earlier device runs.
 
-**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M reached **4.69–4.72 tok/s** with all 64 blocks resident after Metal SiLU FFN fusion. An earlier 13,000 MiB cap run reached **2.54 tok/s** with block streaming. Both used 16-token decode and a 512-token context; prompts differed. [Conditions, A/B runs and phase times](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
+**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M decodes **10.7–12.7 tok/s** and processes a 445-token prompt at 34 tok/s; Qwen2.5-Coder-14B Q5_K_M processes 1,555 tokens at 66–83 tok/s; the 1-bit Bonsai-1.7B decodes 114–135 tok/s. Decoding reads every weight once per token, so it is bound by memory bandwidth over model size (about 16 tok/s for the 27B on this Mac). [Per-backend table and conditions](docs/guide/benchmarks.md#prompts-and-decoding-on-the-m4-pro-by-backend-31-october-2026); [earlier 27B development check](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
 
 <a id="charts"></a>
 
@@ -178,6 +178,7 @@ gates, tiny checkpoints, smoke runs, failed controls and incomplete variants.
 | :--- | :--- |
 | Model files | GGUF v2/v3; single file or split; open part 1 with the other parts beside it |
 | Weights | F32 / F16 / BF16, Q1_0, Q4–Q8, K-quants, I-quants, TQ1_0 / TQ2_0, MXFP4, NVFP4 |
+| Where weights run | CPU: all 27 formats (NEON; AVX2 and scalar on x86-64). Metal: F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, Q1_0. Vulkan: 23 formats from GPU-shared memory, 7 from ordinary memory. What a GPU does not run goes to the CPU product by product; `liyab-kernels` prints the table for the host and checks every result |
 | KV cache | F16, Q8_0, Q4_0, Q4_1; key scaling where measured channel ranges require it |
 | Tokenization | SentencePiece, byte-level BPE, raw unigram; source-specific pre-tokenizer rows |
 | Chat | GGUF Jinja templates; engine/CLI rendering covers more formats than Flutter replay |
@@ -357,7 +358,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | :--- | :--- |
 | Model coverage | Gemma 4 / DeepSeek-V4 text have synthetic conformance; trained quality, production exports and other stage-2 combinations remain unverified |
 | Export metadata | Some published tokenizer / template metadata needs a corrected copy |
-| GPU behavior | Thermal CPU rerouting can change rounding; BF16 Metal matrix work falls back to CPU |
+| GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompts reach 4–5 TFLOPS with attention still on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
 | Vulkan | Per-token prefill matvec; resident tensors copied to GPU memory; MoE experts on CPU |
 | NPUs | Runtime detection and ranking; compute fallback |
 | Pooling | Decoder / bidirectional Gemma pooling paths; encoder-only models pending |
