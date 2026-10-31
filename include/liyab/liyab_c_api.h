@@ -121,6 +121,7 @@ typedef struct liyab_engine_config {
     int32_t i8mm_tiles;           /* nonzero: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles, the same bits as the default kernels (experimental build; ignored on CPUs without i8mm; slower on the Snapdragon 8 Elite for Q5_K / Q6_K) */
     int32_t prerouter_trace;      /* nonzero: log the precision of the streamed-expert predictor against the router every 64 decode tokens (experimental build; measurement only, the output is unchanged; MoE models only) */
     int32_t page_cache_mode;      /* experimental build, streamed MoE experts: 0 off; 1 every expert read buffered, so evicted experts come back from the OS page cache; 2 buffered prefetches, direct reads for experts the router chose. Resident weights move to anonymous memory. Exact output; slower on the Snapdragon 8 Elite; liyab_generation_stats.expert_page_cache_loads counts the experts it served */
+    int64_t converted_weights_mb; /* with cache_dir: MiB at most of the weights converted at load (requant_bits on a model without experts, the CPU repack) kept there as files and mapped by later loads instead of converting again; the least recently used go first; 0 (default): off (see EngineConfig) */
 } liyab_engine_config;
 
 typedef struct liyab_sampling_params {

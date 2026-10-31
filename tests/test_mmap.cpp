@@ -6,12 +6,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <random>
 #include <thread>
 #include <vector>
 
+#include "core/converted_cache.h"
 #include "liyab/mmap_loader.h"
 #include "liyab/triple_buffer_loader.h"
 #include "test_model.h"
@@ -200,6 +202,119 @@ TEST_CASE("MmapLoader relocate moves plain tensors and leaves requantized ones i
     CHECK(std::memcmp(k->data, mapping + k->file_offset, k->nbytes) == 0);  // ...with the file's bytes
     for (const auto& [p, bytes] : regions) os::unmap_anonymous(p, bytes);
     std::remove(path.c_str());
+}
+
+// Converted tensors written to a file and mapped by a later loader: same bytes and types, no anonymous copy, and
+// nothing changes when the file is for another id, damaged, truncated or missing.
+TEST_CASE("MmapLoader keeps converted tensors in a file and maps them back, or refuses without changing anything") {
+    const std::string path = temp_path("converted_src.gguf");
+    const std::string kept = temp_path("converted.bin");
+    test::write_tiny_model(path);
+    const char* names[] = {"blk.0.attn_q.weight", "blk.1.attn_k.weight"};
+    std::vector<std::vector<uint8_t>> bytes;
+    {
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        MmapLoader& m = *loader.value();
+        CHECK(m.converted_bytes() == 0);
+        REQUIRE(m.requantize([&](const TensorView& t) { return t.name == names[0] || t.name == names[1]; },
+                             DType::Q8_0_R4).has_value());
+        for (const char* n : names) bytes.emplace_back(m.tensor(n)->data, m.tensor(n)->data + m.tensor(n)->nbytes);
+        CHECK(m.converted_bytes() == bytes[0].size() + bytes[1].size());
+        REQUIRE(m.save_converted(kept, 7).is_ok());
+    }
+    auto original = [&](MmapLoader& m) {
+        for (const char* n : names) CHECK(m.tensor(n)->type == DType::Q8_0);
+        CHECK(m.converted_bytes() == 0);
+    };
+    {  // the bytes come back, from the file
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        MmapLoader& m = *loader.value();
+        auto restored = m.restore_converted(kept, 7);
+        REQUIRE(restored.has_value());
+        CHECK(restored.value() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            const TensorView* t = m.tensor(names[i]);
+            CHECK(t->type == DType::Q8_0_R4);
+            CHECK(m.converted(*t));
+            CHECK(t->nbytes == bytes[i].size());
+            CHECK(std::memcmp(t->data, bytes[i].data(), bytes[i].size()) == 0);
+            CHECK(reinterpret_cast<uintptr_t>(t->data) % 4096 == 0);
+        }
+        CHECK(!m.restore_converted(kept, 7).has_value());  // already converted
+    }
+    {  // another id
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        CHECK(!loader.value()->restore_converted(kept, 8).has_value());
+        original(*loader.value());
+    }
+    {  // missing file
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        CHECK(!loader.value()->restore_converted(kept + ".missing", 7).has_value());
+        original(*loader.value());
+    }
+    const std::vector<uint8_t> good = read_bytes(kept);
+    auto refuses = [&](std::vector<uint8_t> data, const char* what) {
+        write_bytes(kept, data);
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        const bool refused = !loader.value()->restore_converted(kept, 7).has_value();
+        if (!refused) std::printf("  accepted a damaged converted-weights file: %s\n", what);
+        CHECK(refused);
+        original(*loader.value());
+    };
+    refuses(std::vector<uint8_t>(good.begin(), good.begin() + 10), "truncated header");
+    refuses(std::vector<uint8_t>(good.begin(), good.begin() + good.size() - 100), "truncated data");
+    std::vector<uint8_t> magic = good;
+    magic[0] = 'X';
+    refuses(magic, "bad magic");
+    std::vector<uint8_t> size = good;  // the first entry's nbytes (header 24 bytes, name 96, type 8) is off by one
+    size[24 + 96 + 8] ^= 1;
+    refuses(size, "an entry whose size is not its tensor's");
+    std::vector<uint8_t> type = good;  // the first entry's type: not one a conversion makes
+    type[24 + 96] = 0;
+    refuses(type, "an entry of another type");
+    std::vector<uint8_t> name = good;  // the first entry's name: not in the model
+    name[24] = 'z';
+    refuses(name, "an entry for a tensor the model lacks");
+    std::remove(kept.c_str());
+    std::remove(path.c_str());
+}
+
+// The cache directory: a byte cap with the least recently used file out first, and no other file touched.
+TEST_CASE("Converted-weights cache evicts the least recently used files to fit its cap") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(test::temp_dir()) / ("liyab_cw_" + std::to_string(test::process_id()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto make = [&](const char* name, size_t bytes, std::chrono::hours age) {
+        std::ofstream(dir / name, std::ios::binary) << std::string(bytes, 'x');
+        fs::last_write_time(dir / name, fs::file_time_type::clock::now() - age);
+    };
+    make("weights-0000000000000001.bin", 1000, std::chrono::hours(5));  // oldest
+    make("weights-0000000000000002.bin", 1000, std::chrono::hours(3));
+    make("weights-0000000000000003.bin", 1000, std::chrono::hours(1));
+    make("weights-0000000000000009.bin.tmp", 500, std::chrono::hours(3));  // a writer that died
+    make("weights-000000000000000a.bin.tmp", 500, std::chrono::hours(0));  // a writer at work
+    make("keys-0000000000000001.bin", 100, std::chrono::hours(9));         // someone else's file
+    const std::string d = dir.string();
+    CHECK(!converted_cache::make_room(d, 4000, 3500));  // larger than the cap: refused, nothing removed
+    CHECK(fs::exists(dir / "weights-0000000000000001.bin"));
+    CHECK(converted_cache::make_room(d, 1000, 3500));  // 3000 + 1000 > 3500: the oldest goes
+    CHECK(!fs::exists(dir / "weights-0000000000000001.bin"));
+    CHECK(fs::exists(dir / "weights-0000000000000002.bin"));
+    CHECK(!fs::exists(dir / "weights-0000000000000009.bin.tmp"));
+    CHECK(fs::exists(dir / "weights-000000000000000a.bin.tmp"));
+    CHECK(fs::exists(dir / "keys-0000000000000001.bin"));
+    converted_cache::touch((dir / "weights-0000000000000002.bin").string());  // a hit: now the most recent
+    CHECK(converted_cache::make_room(d, 2000, 3500));  // 2000 + 2000 > 3500: number 3 goes, not number 2
+    CHECK(fs::exists(dir / "weights-0000000000000002.bin"));
+    CHECK(!fs::exists(dir / "weights-0000000000000003.bin"));
+    CHECK(converted_cache::path(d, 0xabc) == (dir / "weights-0000000000000abc.bin").string());
+    fs::remove_all(dir);
 }
 
 TEST_CASE("MmapLoader rejects malformed files") {

@@ -135,6 +135,10 @@ Quality is measured with `liyab-kl` against the lossless path over two 511-token
 conversion, which runs at every load (it tries 4 scale candidates per sub-block instead of the reference's 20 and
 15: 14 s instead of 41 s, with a mean KL 10–20% above the reference search's 0.0078 / 0.0058).
 
+With `--cache-dir` and `--converted-cache` the conversion is paid once: the next load maps the converted weights
+and takes 0.43 s (see [the cache](memory-and-serving.md#converted-weights-cache)). Lowered matrices are also repacked
+for the i8mm kernels, which leaves decoding at 24 tok/s and takes a 16-token prompt's prefill from 399 to 318 ms.
+
 Which matrices to convert was measured one role at a time (Q5_K → Q4_K, reference search, text 1):
 
 | Role | Saved | Mean KL | KL per GiB saved |

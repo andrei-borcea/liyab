@@ -121,6 +121,13 @@ struct EngineConfig {
     // would otherwise hold under 10% of the experts (Q5_K if that frees enough
     // memory, else Q4_K); see Engine::memory_plan().
     int32_t requant_bits = 0;
+    // MiB of cache_dir the engine may fill with the weights it converts at load (requant_bits on a model without
+    // experts, and the CPU's repack into the i8mm layouts): the first load writes them as a file of about the
+    // model's size, later loads of the same model map it instead of converting again (a 14B lowered with
+    // requant_bits 4: 14 s of conversion becomes 0.4 s; repacked only: 2.3 s becomes under 0.5 s). The directory
+    // keeps at most this many MiB of them, least recently used out first (enforced when a file is written); a file
+    // larger than the cap, or a volume left under 1 GiB free, is not written. 0 (default): off. Needs cache_dir; models with experts are not cached.
+    int64_t converted_weights_mb = 0;
     // MoE: per token, run only the fewest top-ranked experts of the top-k
     // whose router probabilities cover this fraction of the top-k's total
     // (e.g. 0.9), renormalized over the kept ones. Lossy, opt-in: fewer
@@ -193,7 +200,9 @@ struct EngineConfig {
     // (created if missing): today the key scales of a quantized KV cache
     // (README, KV cache), a few KB per model, at most 16 models, least
     // recently used out first, and what reading and decoding prefix-cache
-    // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16). Empty: measured again at every load (on the
+    // chunks cost on this device (kv-costs-*.bin, 24 bytes each, at most 16). With converted_weights_mb, also the
+    // weights converted at load (weights-*.bin, each about a model's size: capped in bytes, not in files).
+    // Empty: measured again at every load (on the
     // reference phone 0.27 s for a 4B model, 1.4 s for a 35B MoE whose experts
     // stream, 7.4 s for a dense 27B larger than RAM).
     std::string cache_dir;

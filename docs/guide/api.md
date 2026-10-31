@@ -158,7 +158,8 @@ No C++ exception crosses the ABI. Errors return a `liyab_status`, with the messa
 * the memory budget, expert cache, `requant_bits`, context length, and the prefix cache in RAM (`prefix_cache_mb`)
   and on storage (`prefix_cache_dir`, `prefix_cache_disk_mb`);
 * `cache_dir`, where what is measured once per model is kept (the KV cache's key scales, latent attention's
-  form ratio, segment reuse's calibration);
+  form ratio, segment reuse's calibration), and, with `converted_weights_mb`, the weights converted at load (see
+  [memory and serving](memory-and-serving.md#converted-weights-cache));
 * segment reuse (`segment_reuse`, its target `segment_reuse_max_kl`);
 * the memory cap of loaded LoRA adapters (`adapter_memory_mb`);
 * the sequences kept at once (`max_sequences`, 1 by default; a ceiling: a sequence takes its memory when opened);
@@ -271,6 +272,7 @@ liyab-cli -m model.gguf -p "..." --prefix-cache-disk 1024 ~/.cache/liyab/ctx --p
 liyab-cli -m model.gguf -p "..." --profile low_power        # performance | balanced | low_power
 liyab-cli -m model.gguf -p "..." --window 1024 --sinks 8 --kv q4_1
 liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab   # keep the key scales: measured on the first run only
+liyab-cli -m model.gguf -p "..." --cache-dir ~/.cache/liyab --converted-cache 20000   # also keep the weights converted at load (20 GB at most): later loads map them
 liyab-cli -m model.gguf -p "$TURN1" --then "$TURN2"           # a follow-up turn that reuses the context, as a chat does
 liyab-cli -m model.gguf -p "..." --json                     # load line: memory/weight layout; turn lines: stats, GPU/I/O counters, peak RSS, reply
 liyab-cli -m model.gguf -p "..." --lora adapter.gguf --lora-scale 0.5  # a LoRA adapter applied to every turn

@@ -3587,6 +3587,102 @@ TEST_CASE("requant_bits lowers the feed-forward and query / output matrices of a
     CHECK(load_transformer(path, invalid) == nullptr);
 }
 
+TEST_CASE("Converted weights are kept in the cache directory and mapped by the next load, giving the same bits") {
+    namespace fs = std::filesystem;
+    // The engine repacks only where the CPU has the i8mm kernels; so does this test (x86: lowered matrices only).
+    const bool repack = quant::repack_kernels_available();
+    const DType lowered = repack ? DType::Q4_K_R8 : DType::Q4_K;
+    test::TinyModelSpec spec;  // Q8_0 attention, Q5_K feed-forward: lowered to Q4_K, then repacked
+    spec.n_layers = 2;
+    spec.n_embd = 256;
+    spec.n_ff = 256;
+    spec.ffn_type = DType::Q5_K;
+    const std::string& path = model_path("converted_cache", spec);
+    const fs::path dir = fs::path(test::temp_dir()) / ("liyab_cwe_" + std::to_string(test::process_id()));
+    fs::remove_all(dir);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 24; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto options = [&](int32_t bits, uint64_t cap) {
+        TransformerOptions o;
+        o.requant_bits = bits;
+        o.repack_cpu = repack;
+        o.converted_cache_dir = dir.string();
+        o.converted_cache_bytes = cap;
+        return o;
+    };
+    auto files = [&] {
+        size_t n = 0;
+        std::error_code ec;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) n += it->path().extension() == ".bin";
+        return n;
+    };
+    auto logits_of = [&](Transformer& model) -> std::vector<float> {
+        auto out = model.forward(tokens, Transformer::Logits::All, route, pool);
+        return out ? std::vector<float>(out->begin(), out->end()) : std::vector<float>();
+    };
+    auto from_file = [&](const Transformer& model, const char* name) {
+        const TensorView* t = model.file().tensor(name);
+        const uint8_t* mapped = model.file().file().data();
+        return model.file().converted(*t) && !(t->data >= mapped && t->data < mapped + model.file().file_size());
+    };
+    // Too small a cap: converted as usual, nothing written.
+    {
+        auto model = load_transformer(path, options(4, 1000));
+        REQUIRE(model != nullptr);
+        CHECK(files() == 0);
+    }
+    std::vector<float> first, second;
+    {
+        auto model = load_transformer(path, options(4, uint64_t{1} << 30));
+        REQUIRE(model != nullptr);
+        CHECK(files() == 1);
+        CHECK(model->file().tensor("blk.0.ffn_gate.weight")->type == lowered);  // lowered, then repacked
+        first = logits_of(*model);
+    }
+    {
+        auto model = load_transformer(path, options(4, uint64_t{1} << 30));
+        REQUIRE(model != nullptr);
+        CHECK(files() == 1);
+        CHECK(model->file().tensor("blk.0.ffn_gate.weight")->type == lowered);
+        CHECK(model->file().tensor("blk.0.attn_q.weight")->type == lowered);
+        CHECK(from_file(*model, "blk.1.ffn_down.weight"));
+        CHECK(model->memory_plan().requant_bits == 4);
+        second = logits_of(*model);
+    }
+    REQUIRE(!first.empty());
+    CHECK(first == second);  // the cached bytes are the converted ones
+    // Another recipe is another file: requant_bits 5 makes its own.
+    {
+        auto model = load_transformer(path, options(5, uint64_t{1} << 30));
+        REQUIRE(model != nullptr);
+        CHECK(files() == 2);
+    }
+    // The repack alone is a third, under a cap that holds two of them in all: the directory stays within it, and
+    // the file kept is the one the next load maps.
+    if (repack) {
+        uint64_t total = 0;
+        for (const auto& entry : fs::directory_iterator(dir)) total += entry.file_size();
+        {
+            auto model = load_transformer(path, options(0, total));
+            REQUIRE(model != nullptr);
+            CHECK(files() >= 1);  // how many older ones go depends on the sizes
+            uint64_t now = 0;
+            for (const auto& entry : fs::directory_iterator(dir)) now += entry.file_size();
+            CHECK(now <= total);
+        }
+        {
+            auto model = load_transformer(path, options(0, total));
+            REQUIRE(model != nullptr);
+            CHECK(model->file().tensor("blk.0.ffn_gate.weight")->type == DType::Q5_K_R8);
+            CHECK(from_file(*model, "blk.0.ffn_gate.weight"));
+        }
+    }
+    fs::remove_all(dir);
+}
+
 TEST_CASE("Transformer with mixed Q4_0/Q8_0 weights and Q8_0 KV stays close to the reference") {
     auto model = load_transformer(mixed_model());
     REQUIRE(model != nullptr);

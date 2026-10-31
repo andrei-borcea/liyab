@@ -178,6 +178,11 @@ struct TransformerOptions {
     // Q6_K_R8 / Q8_0_R4) for the CPU's i8mm kernels (set only when the CPU
     // computes every block; lossless).
     bool repack_cpu = false;
+    // The conversions load makes (requant_bits on a model without experts, the repack above) are kept as files in
+    // this directory, at most converted_cache_bytes of them in all, least recently used out first; a later load
+    // of the same model and recipe maps them instead of converting again. Empty or 0: not kept.
+    std::string converted_cache_dir;
+    uint64_t converted_cache_bytes = 0;
     // Latent attention (DeepSeek-V2/V3 and models converted alike): the
     // form passes attend in. Ignored by other models.
     LatentForm latent_form = LatentForm::Auto;

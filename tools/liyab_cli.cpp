@@ -304,6 +304,9 @@ void usage() {
                  "  --cache-dir DIR    keep what is measured once per model in DIR (the key scales of a\n"
                  "                     quantized KV cache, what reading and decoding prefix-cache chunks\n"
                  "                     cost), so later runs skip it (default: measured each run)\n"
+                 "  --converted-cache MB  with --cache-dir: keep the weights converted at load (--requant on\n"
+                 "                     a dense model, the CPU repack) as files there, MB in all, least recently\n"
+                 "                     used out first; later runs map them instead of converting (default: off)\n"
                  "  --threads N        worker threads (default: performance cores, minus one\n"
                  "                     when every core is a performance core)\n"
                  "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
@@ -399,6 +402,7 @@ int main(int argc, char** argv) {
             config.prefix_cache_lossy = 1;
         }
         else if (arg == "--cache-dir") config.cache_dir = next();
+        else if (arg == "--converted-cache") config.converted_weights_mb = std::atoll(next());
         else if (arg == "--threads") config.n_threads = std::atoi(next());
         else if (arg == "--early-exit") {
             config.early_exit = 1;

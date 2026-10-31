@@ -10,6 +10,7 @@
 #include <ostream>
 #include <random>
 
+#include "core/converted_cache.h"
 #include "core/log.h"
 #include "core/moe_routing.h"
 #include "core/portable_math.h"
@@ -34,6 +35,10 @@
 namespace liyab {
 
 namespace {
+
+// Bump when the roles lowered, the quantizer or a repacked layout changes: cached conversions made by an older
+// recipe are then never matched (they age out of the cache).
+constexpr uint64_t kConvertedRecipeVersion = 1;
 
 // The factor RMSNorm multiplies x by before its weight: 1 / sqrt(mean(x^2) + eps).
 float rms_scale(const float* x, int32_t n, float eps) {
@@ -925,7 +930,15 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
     // (Transformer::attach_expert_store); a model streamed from storage in blocks keeps the file's bytes.
     const bool has_experts = std::any_of(model->file_->tensors().begin(), model->file_->tensors().end(),
                                          [](const TensorView& t) { return t.name.ends_with("_exps.weight"); });
-    if ((options.requant_bits == 4 || options.requant_bits == 5) && !has_experts && !model->file_->streaming()) {
+    if (options.requant_bits != 0 && options.requant_bits != -1 && options.requant_bits != 4 &&
+        options.requant_bits != 5) {
+        return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
+    }
+    const bool lowering = (options.requant_bits == 4 || options.requant_bits == 5) && !has_experts &&
+                          !model->file_->streaming();
+    const bool repacking = options.repack_cpu && !model->file_->streaming();
+    auto convert_weights = [&]() -> Status {
+    if (lowering) {
         const DType target = options.requant_bits == 4 ? DType::Q4_K : DType::Q5_K;
         auto lowerable = [&](const TensorView& t) {
             constexpr std::string_view roles[] = {".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight",
@@ -943,16 +956,13 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                            target == DType::Q4_K ? "Q4_K" : "Q5_K",
                            static_cast<double>(lowered.value()) / (1024.0 * 1024.0 * 1024.0));
         }
-    } else if (options.requant_bits != 0 && options.requant_bits != -1 && options.requant_bits != 4 &&
-               options.requant_bits != 5) {
-        return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
     }
     // CPU-only models: the resident Q4_K / Q5_K / Q6_K / Q8_0 matrices in the
     // layout of the i8mm batched kernels (a lossless rearrangement, same
     // size). With expert streaming that is every matrix but the experts (3-D,
     // read from storage in the file's layout); a model under the layer
     // streaming window keeps the file's layout throughout.
-    if (options.repack_cpu && !model->file_->streaming()) {
+    if (repacking) {
         struct Repack {
             DType from, to;
             int64_t rows, cols;  // required multiples
@@ -964,7 +974,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         auto selected = [&](const TensorView& t, const Repack& r) {
             return t.type == r.from && t.n_dims == 2 && t.rows() % r.rows == 0 && t.cols() % r.cols == 0 &&
                    t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
-                   !t.name.ends_with(".attn_output_a.weight") && !model->file_->converted(t);
+                   !t.name.ends_with(".attn_output_a.weight");
         };
         // The copies take memory of their own next to the mapped file. When they do not fit, the file's layout
         // (the same bits, about 14% slower per row) keeps every block resident, which beats streaming blocks
@@ -973,7 +983,7 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
         size_t copies = 0;
         for (const TensorView& t : model->file_->tensors()) {
             for (const Repack& r : repacks) {
-                if (selected(t, r)) copies += t.nbytes;
+                if (selected(t, r) && !model->file_->converted(t)) copies += t.nbytes;  // a lowered copy is replaced
             }
         }
         const uint64_t available = usable_memory_bytes(options.memory_budget_bytes);
@@ -984,11 +994,52 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                            static_cast<double>(copies) / (1024.0 * 1024.0 * 1024.0),
                            static_cast<double>(model->file_->file_size()) / (1024.0 * 1024.0 * 1024.0),
                            static_cast<double>(available) / (1024.0 * 1024.0 * 1024.0));
-            return model;
+            return Status::ok();
         }
         for (const Repack& r : repacks) {
             auto repacked = model->file_->requantize([&](const TensorView& t) { return selected(t, r); }, r.to);
             if (!repacked) return repacked.status();
+        }
+    }
+    return Status::ok();
+    };
+
+    // What the conversions make is kept in EngineConfig::cache_dir (converted_weights_mb), as the final bytes: a
+    // later load maps them instead of converting again (a lowered 14B: 14 s of conversion; repacked only: 2.3 s).
+    // The key covers the model, the recipe and the kernel set (the repacked layouts follow it).
+    std::string cache_file;
+    uint64_t cache_id = 0;
+    if ((lowering || repacking) && !has_experts && !options.converted_cache_dir.empty() &&
+        options.converted_cache_bytes > 0) {
+        const std::string_view isa = quant::kernel_isa();
+        const uint64_t parts[] = {model->file_fingerprint(), kConvertedRecipeVersion,
+                                  static_cast<uint64_t>(lowering ? options.requant_bits : 0),
+                                  static_cast<uint64_t>(repacking)};
+        cache_id = xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+        cache_file = converted_cache::path(options.converted_cache_dir, cache_id);
+        if (auto restored = model->file_->restore_converted(cache_file, cache_id)) {
+            converted_cache::touch(cache_file);
+            if (lowering) model->memory_plan_.requant_bits = options.requant_bits;
+            LIYAB_LOG_INFO("converted weights: %zu matrices mapped from %s", restored.value(), cache_file.c_str());
+            return model;
+        }
+    }
+    LIYAB_RETURN_IF_ERROR(convert_weights());
+    if (!cache_file.empty() && model->file_->converted_bytes() > 0) {
+        const uint64_t need = model->file_->converted_bytes() + (model->file_->tensors().size() + 2) * 4096;
+        if (converted_cache::make_room(options.converted_cache_dir, need, options.converted_cache_bytes)) {
+            const auto start = std::chrono::steady_clock::now();
+            const Status saved = model->file_->save_converted(cache_file, cache_id);
+            if (saved.is_ok()) {
+                LIYAB_LOG_INFO("converted weights: %.2f GiB kept in %s (%.1f s)",
+                               static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0), cache_file.c_str(),
+                               std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            } else {
+                LIYAB_LOG_WARN("converted weights: %s", saved.message().c_str());
+            }
+        } else {
+            LIYAB_LOG_INFO("converted weights: not kept (over the %.2f GiB cap, or the volume is nearly full)",
+                           static_cast<double>(options.converted_cache_bytes) / (1024.0 * 1024.0 * 1024.0));
         }
     }
     return model;

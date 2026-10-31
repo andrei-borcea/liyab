@@ -277,6 +277,8 @@ Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const E
     options.memory_budget_bytes = loader_options.memory_budget_bytes;
     options.reserve_bytes = static_cast<size_t>(reserve_mb) << 20;
     options.requant_bits = config.requant_bits;
+    options.converted_cache_dir = config.cache_dir;
+    options.converted_cache_bytes = static_cast<uint64_t>(std::max<int64_t>(config.converted_weights_mb, 0)) << 20;
     options.expert_mass = config.moe_expert_mass;
     options.max_experts = config.moe_max_experts;
     options.skip_slow = config.moe_skip_slow;

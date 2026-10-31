@@ -12,7 +12,10 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <random>
 
 #include "core/direct_io.h"
 #include "core/log.h"
@@ -730,6 +733,13 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
         if (t.data >= files_[t.shard]->data() && t.data < files_[t.shard]->data() + files_[t.shard]->size()) {
             files_[t.shard]->advise_dontneed(t.file_offset, t.nbytes);
         }
+        // A tensor converted before (lowered, now repacked) gives back the copy this one replaces.
+        const auto previous = std::find_if(converted_.begin(), converted_.end(),
+                                           [&](const auto& region) { return region.first == t.data; });
+        if (previous != converted_.end()) {
+            os::unmap_anonymous(previous->first, previous->second);
+            converted_.erase(previous);
+        }
         saved += t.nbytes - bytes;
         t.type = target;
         t.data = dst;
@@ -739,10 +749,157 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
 }
 
 bool MmapLoader::converted(const TensorView& t) const noexcept {
-    return std::any_of(converted_.begin(), converted_.end(), [&](const auto& region) {
-        const auto* begin = static_cast<const uint8_t*>(region.first);
-        return t.data >= begin && t.data < begin + region.second;
-    });
+    return std::any_of(converted_.begin(), converted_.end(),
+                       [&](const auto& region) {
+                           const auto* begin = static_cast<const uint8_t*>(region.first);
+                           return t.data >= begin && t.data < begin + region.second;
+                       }) ||
+           std::any_of(restored_.begin(), restored_.end(), [&](const auto& file) {
+               return t.data >= file->data() && t.data < file->data() + file->size();
+           });
+}
+
+size_t MmapLoader::converted_bytes() const noexcept {
+    size_t bytes = 0;
+    for (const TensorView& t : tensors_) {
+        if (converted(t)) bytes += t.nbytes;
+    }
+    return bytes;
+}
+
+namespace {
+// Converted-weights file: Header, `count` Entry records, then each tensor's bytes at its entry's offset (page
+// aligned, so the mapped bytes are as aligned as the anonymous copies they stand for).
+constexpr char kConvertedMagic[4] = {'L', 'Y', 'C', 'W'};
+constexpr uint32_t kConvertedVersion = 1;
+constexpr size_t kConvertedAlign = 4096;
+constexpr size_t kConvertedNameBytes = 96;  // GGUF names are at most 64 bytes; room for longer ones
+
+struct ConvertedHeader {
+    char magic[4];
+    uint32_t version;
+    uint64_t id;
+    uint64_t count;
+};
+struct ConvertedEntry {
+    char name[kConvertedNameBytes];
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t nbytes;
+    uint64_t offset;
+};
+
+// The types requantize() produces; anything else in a file is damage.
+bool is_converted_type(uint32_t type) noexcept {
+    switch (static_cast<DType>(type)) {
+        case DType::Q4_K: case DType::Q5_K: case DType::Q4_K_R8: case DType::Q5_K_R8: case DType::Q6_K_R8:
+        case DType::Q8_0_R4: return true;
+        default: return false;
+    }
+}
+
+size_t align_up(size_t n) noexcept { return (n + kConvertedAlign - 1) / kConvertedAlign * kConvertedAlign; }
+}  // namespace
+
+Status MmapLoader::save_converted(const std::string& path, uint64_t id) const {
+    std::vector<const TensorView*> held;
+    for (const TensorView& t : tensors_) {
+        if (!converted(t)) continue;
+        if (t.name.size() >= kConvertedNameBytes) return Status(ErrorCode::InvalidArgument, "tensor name too long");
+        held.push_back(&t);
+    }
+    std::vector<ConvertedEntry> entries(held.size());
+    size_t offset = align_up(sizeof(ConvertedHeader) + entries.size() * sizeof(ConvertedEntry));
+    for (size_t i = 0; i < held.size(); ++i) {
+        ConvertedEntry& e = entries[i];
+        std::memset(&e, 0, sizeof e);
+        std::memcpy(e.name, held[i]->name.data(), held[i]->name.size());
+        e.type = static_cast<uint32_t>(held[i]->type);
+        e.nbytes = held[i]->nbytes;
+        e.offset = offset;
+        offset = align_up(offset + held[i]->nbytes);
+    }
+    const ConvertedHeader header{{kConvertedMagic[0], kConvertedMagic[1], kConvertedMagic[2], kConvertedMagic[3]},
+                                 kConvertedVersion, id, held.size()};
+    // Its own temporary name: two processes converting the same model at once must not write one file.
+    char unique[24];
+    std::snprintf(unique, sizeof unique, ".%08x.tmp", std::random_device{}());
+    const std::string tmp = path + unique;
+    std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
+    const std::vector<char> zeros(kConvertedAlign, 0);
+    size_t written = 0;
+    auto put = [&](const void* data, size_t bytes) {
+        out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        written += bytes;
+        return static_cast<bool>(out);
+    };
+    auto pad_to = [&](size_t target) {
+        while (written < target) {
+            if (!put(zeros.data(), std::min(zeros.size(), target - written))) return false;
+        }
+        return true;
+    };
+    bool ok = put(&header, sizeof header) && put(entries.data(), entries.size() * sizeof(ConvertedEntry));
+    for (size_t i = 0; ok && i < held.size(); ++i) {
+        ok = pad_to(entries[i].offset) && put(held[i]->data, held[i]->nbytes);
+    }
+    out.close();
+    std::error_code ec;
+    if (ok && !out.fail()) std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
+    if (!ok || out.fail() || ec) {
+        std::filesystem::remove(os::utf8_path(tmp), ec);
+        return Status(ErrorCode::IoError, "cannot write " + path);
+    }
+    return Status::ok();
+}
+
+Result<size_t> MmapLoader::restore_converted(const std::string& path, uint64_t id) {
+    auto mapped = MappedFile::open(path);
+    if (!mapped) return mapped.status();
+    const MappedFile& file = *mapped.value();
+    auto damaged = [&](const char* why) { return Status(ErrorCode::InvalidModel, path + ": " + why); };
+    ConvertedHeader header{};
+    if (file.size() < sizeof header) return damaged("truncated");
+    std::memcpy(&header, file.data(), sizeof header);
+    if (std::memcmp(header.magic, kConvertedMagic, sizeof header.magic) != 0 || header.version != kConvertedVersion) {
+        return damaged("not a converted-weights file of this version");
+    }
+    if (header.id != id) return damaged("made for another model or recipe");
+    if (header.count > tensors_.size() ||
+        file.size() < sizeof header + header.count * sizeof(ConvertedEntry)) {
+        return damaged("bad table");
+    }
+    // Validate every entry before touching a tensor.
+    struct Pick { TensorView* tensor; DType type; size_t nbytes; size_t offset; };
+    std::vector<Pick> picks;
+    for (uint64_t i = 0; i < header.count; ++i) {
+        ConvertedEntry e{};
+        std::memcpy(&e, file.data() + sizeof header + i * sizeof e, sizeof e);
+        e.name[kConvertedNameBytes - 1] = '\0';
+        auto it = tensor_index_.find(std::string_view(e.name));
+        if (it == tensor_index_.end()) return damaged("a tensor the model does not have");
+        TensorView& t = tensors_[it->second];
+        if (converted(t)) return Status(ErrorCode::InvalidArgument, "tensor already converted: " + std::string(t.name));
+        if (!is_converted_type(e.type)) return damaged("unknown tensor type");
+        TensorView as = t;
+        as.type = static_cast<DType>(e.type);
+        if (t.n_dims != 2 || as.row_bytes() * static_cast<size_t>(t.rows()) != e.nbytes || e.offset % kConvertedAlign != 0 ||
+            e.offset > file.size() || e.nbytes > file.size() - e.offset) {
+            return damaged("a tensor differs from the model's");
+        }
+        picks.push_back({&t, as.type, static_cast<size_t>(e.nbytes), static_cast<size_t>(e.offset)});
+    }
+    for (const Pick& p : picks) {
+        if (p.tensor->data >= files_[p.tensor->shard]->data() &&
+            p.tensor->data < files_[p.tensor->shard]->data() + files_[p.tensor->shard]->size()) {
+            files_[p.tensor->shard]->advise_dontneed(p.tensor->file_offset, p.tensor->nbytes);
+        }
+        p.tensor->type = p.type;
+        p.tensor->data = file.data() + p.offset;
+        p.tensor->nbytes = p.nbytes;
+    }
+    restored_.push_back(std::move(mapped).value());
+    return picks.size();
 }
 
 size_t MmapLoader::keep_resident(const std::function<bool(const TensorView&)>& resident) {

@@ -117,6 +117,28 @@ expert-store correctness failure was observed, and these measurements do not est
 
 ---
 
+### Converted weights cache
+
+At load the CPU path rearranges Q4_K / Q5_K / Q6_K / Q8_0 matrices into the layouts of its i8mm kernels (2.3 s for a
+14B Q5_K_M with the file in the page cache, 6 s when it is not), and `requant_bits` 4 / 5 on a model without experts
+converts them to a smaller quantization first (14 s more). With `cache_dir` and `converted_weights_mb` (`--cache-dir`
+and `--converted-cache` in `liyab-cli`) the engine keeps the result as a file, `weights-<id>.bin`, of about the
+model's size; the next load of the same model, `requant_bits` and kernel set maps it instead of converting. The
+14B Q5_K_M loaded in 0.43 s with `requant_bits = 4` (7.6 GiB file; the first load took 17 s, 5 of them writing) and in
+0.44 s repacked only (9.3 GiB file), with the same tokens as the converting load.
+
+* **Bounded.** `converted_weights_mb` is a byte cap on all the `weights-*.bin` of the directory, enforced when a file
+  is written: the least recently used ones (a load that maps a file counts as a use) are removed until the new one
+  fits. A file larger than the cap, or one that would leave the volume under 1 GiB free, is not written: the load
+  converts as usual. Leftovers of a writer that died (`*.tmp` over an hour old) are removed too. The other files of
+  `cache_dir` are never touched.
+* **Safe to share and to lose.** A file is written to a temporary name and renamed, and starts with the model's
+  identity (file, `requant_bits`, repack, kernel set, recipe version); a file for something else, damaged or
+  truncated is ignored and the load converts and writes it again. Mapped pages are file-backed, so the system can
+  drop them under memory pressure, as it does the model file's.
+* **Scope.** Models without experts, loaded whole (not streamed in blocks). Off by default: it costs the disk space
+  of a second copy of the model.
+
 ## Context, memory and serving
 
 A phone serves one user, but that user switches conversations, types, leaves the app and comes back. Liyab treats
