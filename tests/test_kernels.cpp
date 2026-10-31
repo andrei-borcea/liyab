@@ -14,9 +14,12 @@
 #include <vector>
 
 #include "core/kernel_conformance.h"
+#include "core/model_bytes.h"
 #include "core/quant.h"
 #include "core/thread_pool.h"
 #include "liyab/backend.h"
+#include "liyab/mmap_loader.h"
+#include "test_model.h"
 #include "test_util.h"
 
 using namespace liyab;
@@ -230,6 +233,56 @@ TEST_CASE("Timing reports a throughput and a batch cost, and stays off by defaul
     const PlacementReport& placement = timed.formats.front().placements.front();
     CHECK(placement.decode.gb_per_s > 0.0);
     CHECK(placement.batch.batch_cost > 0.0);
+}
+
+TEST_CASE("A token's read bytes follow the tensor table: no embedding rows when a head exists, the router's share of the experts") {
+    const std::string path = test::temp_dir() + "/liyab_model_bytes_" + std::to_string(test::process_id()) + ".gguf";
+    auto bytes_of = [&](const test::TinyModelSpec& spec, ModelBytes* out, double* embd, double* experts) {
+        test::write_tiny_model(path, spec);
+        auto loader = MmapLoader::open(path);
+        REQUIRE(loader.has_value());
+        *out = read_model_bytes(*loader.value());
+        *embd = *experts = 0.0;
+        for (const TensorView& t : loader.value()->tensors()) {
+            if (t.name == "token_embd.weight") *embd = static_cast<double>(t.nbytes);
+            if (t.name.find("_exps") != std::string_view::npos) *experts += static_cast<double>(t.nbytes);
+        }
+    };
+    auto total = [](const ModelBytes& m) {
+        double sum = 0.0;
+        for (const auto& entry : m.per_token) sum += entry.second;
+        return sum;
+    };
+    ModelBytes dense;
+    double embd = 0.0, experts = 0.0;
+    test::TinyModelSpec spec;
+    bytes_of(spec, &dense, &embd, &experts);
+    CHECK(dense.architecture == "llama");
+    CHECK(dense.blocks == spec.n_layers);
+    CHECK(embd > 0.0);
+    CHECK(total(dense) == dense.weight_bytes - embd);  // a separate head: a token reads one embedding row, not the table
+    CHECK(dense.per_token.size() >= 2);
+    CHECK(std::is_sorted(dense.per_token.begin(), dense.per_token.end(),
+                         [](const auto& a, const auto& b) { return a.second > b.second; }));
+
+    spec.tied_output = true;  // the embedding table is the head: all of it is read
+    ModelBytes tied;
+    bytes_of(spec, &tied, &embd, &experts);
+    CHECK(total(tied) == tied.weight_bytes);
+
+    test::TinyModelSpec moe;
+    moe.arch = "qwen3moe";
+    moe.n_expert = 4;
+    moe.n_expert_used = 2;
+    ModelBytes some;
+    bytes_of(moe, &some, &embd, &experts);
+    CHECK(experts > 0.0);
+    CHECK(total(some) == some.weight_bytes - embd - experts * 0.5);  // 2 of 4 experts per token
+    moe.n_expert_used = 4;
+    ModelBytes all;
+    bytes_of(moe, &all, &embd, &experts);
+    CHECK(total(all) == all.weight_bytes - embd);
+    std::remove(path.c_str());
 }
 
 TEST_MAIN()
