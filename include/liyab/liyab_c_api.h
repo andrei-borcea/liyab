@@ -93,7 +93,7 @@ typedef struct liyab_engine_config {
     int32_t triple_buffer_loading; /* nonzero: stream blocks through 3 rotating buffers */
     int64_t expert_cache_mb;      /* MoE: -1 auto (default), 0 never stream experts, > 0 cache size in MiB */
     int64_t memory_budget_mb;     /* > 0: cap on resident memory in MiB (e.g. per-app OS limits); 0: free RAM only */
-    int32_t requant_bits;         /* MoE expert streaming: resident Q8_0 matrices -> Q4_K (4) / Q5_K (5) at load (lossy); 0 off, -1 only when memory is tight */
+    int32_t requant_bits;         /* matrices -> Q4_K (4) / Q5_K (5) at load (lossy): MoE expert streaming converts the resident Q8_0 ones, other models their feed-forward and query / output matrices (Q5_K/Q6_K/Q8_0); 0 off, -1 only when MoE memory is tight */
     float moe_expert_mass;        /* MoE: run the fewest top experts covering this router mass (lossy, e.g. 0.9); >= 1 all (default 1) */
     int32_t moe_max_experts;      /* MoE: at most this many experts per token (lossy); 0: the model's top-k */
     /* Experimental (build with LIYAB_ENABLE_EXPERIMENTAL=ON, else LIYAB_ERR_UNSUPPORTED). */
@@ -322,7 +322,7 @@ typedef struct liyab_memory_plan {
     uint64_t expert_bytes;       /* routed experts read from storage */
     uint64_t expert_cache_bytes; /* RAM caching experts now: the plan's, minus what open sequences borrowed (liyab_sequence_open) */
     uint64_t recommended_bytes;  /* memory budget at which most expert uses would come from RAM */
-    int32_t requant_bits;        /* resident Q8_0 matrices converted at load (4 / 5); 0: none */
+    int32_t requant_bits;        /* matrices converted to Q4_K / Q5_K at load (4 / 5); 0: none */
 } liyab_memory_plan;
 LIYAB_C_API liyab_status liyab_engine_memory_plan(const liyab_engine* engine, liyab_memory_plan* out);
 /* Actual dense-weight layout after load. The engine and out must be non-null.

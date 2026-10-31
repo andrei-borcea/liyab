@@ -231,7 +231,7 @@ including expert output scales folded into weights, checked against generated up
 | Speculation | Draft models, context lookup, suffix trees and rollback | [Accuracy and speed measurements](docs/guide/inference-features.md#speculative-decoding) |
 | Heat and power | Performance / Balanced / Low Power profiles, thermal pacing and guards | [Profiles and device behavior](docs/guide/inference-features.md#heat-and-power) |
 
-Lossy options include expert skipping, explicit requantization, segment reuse and 4-bit prefix storage.
+Lossy options include expert skipping, requantization at load (for a dense model its feed-forward and query / output matrices go to Q4_K: a 14B Q5_K_M decodes 27% faster on a Mac's CPU), segment reuse and 4-bit prefix storage.
 Their [quality measurements](docs/guide/memory-and-serving.md) remain separate from lossless execution.
 
 <a id="embeddings-and-reranking"></a>

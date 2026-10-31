@@ -108,7 +108,8 @@ Neither run skipped slow experts. The larger cache reduced read bytes by 25.5% a
 expert-store correctness failure was observed, and these measurements do not establish full GLM-5 throughput.
 
 * **Optional lossy trade-offs**, all measured with `liyab-kl` (see [results](benchmarks.md#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)):
-  * `requant_bits` 4/5: fewer resident bytes;
+  * `requant_bits` 4/5: fewer resident bytes (MoE), or fewer bytes read per token (dense models: see
+    [the 14B measurement](benchmarks.md#fewer-bytes-per-token-requant-4-on-a-dense-model));
   * `moe_expert_mass`: run only the top experts covering a share of the router weight;
   * `moe_max_experts`: cap the experts per token;
   * `moe_skip_slow`: skip a light expert that is not in RAM yet instead of waiting for it (replies then depend on

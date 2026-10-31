@@ -915,6 +915,38 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                                      : "",
                        m.conv_kernel, static_cast<double>(model->recurrent_state_bytes()) / (1024.0 * 1024.0));
     }
+    // Lossy, opt-in (requant_bits 4 / 5) for models without experts: the matrices that hold most of the bytes
+    // decoding reads per token, lowered to Q4_K / Q5_K before anything reads them (and before the repack below,
+    // which then repacks the lowered copies). Decoding reads every weight once per token, so fewer bytes are
+    // proportionally faster tokens: 14B Q5_K_M with all five lowered to Q4_K went from 18.1 to 23.9 tok/s on a
+    // 48 GiB M4 Pro, at a mean KL of 0.008 against the original (perplexity +1.3%). Only these roles: per GiB saved
+    // the feed-forward and the query / output projections cost 0.006-0.012 KL, keys and values 0.04 (they are
+    // small), the output head 0.014; embeddings are lookups, not reads. MoE models take the expert-streaming path
+    // (Transformer::attach_expert_store); a model streamed from storage in blocks keeps the file's bytes.
+    const bool has_experts = std::any_of(model->file_->tensors().begin(), model->file_->tensors().end(),
+                                         [](const TensorView& t) { return t.name.ends_with("_exps.weight"); });
+    if ((options.requant_bits == 4 || options.requant_bits == 5) && !has_experts && !model->file_->streaming()) {
+        const DType target = options.requant_bits == 4 ? DType::Q4_K : DType::Q5_K;
+        auto lowerable = [&](const TensorView& t) {
+            constexpr std::string_view roles[] = {".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight",
+                                                  ".attn_q.weight", ".attn_output.weight"};
+            const bool role = std::any_of(std::begin(roles), std::end(roles),
+                                          [&](std::string_view r) { return t.name.ends_with(r); });
+            const bool wider = t.type == DType::Q8_0 || t.type == DType::Q6_K || (target == DType::Q4_K && t.type == DType::Q5_K);
+            return role && wider && t.n_dims == 2 && t.cols() % quant::kSuperBlock == 0;
+        };
+        auto lowered = model->file_->requantize(lowerable, target);
+        if (!lowered) return lowered.status();
+        if (lowered.value() > 0) {
+            model->memory_plan_.requant_bits = options.requant_bits;
+            LIYAB_LOG_INFO("weights lowered to %s at load: %.2f GiB fewer bytes per token",
+                           target == DType::Q4_K ? "Q4_K" : "Q5_K",
+                           static_cast<double>(lowered.value()) / (1024.0 * 1024.0 * 1024.0));
+        }
+    } else if (options.requant_bits != 0 && options.requant_bits != -1 && options.requant_bits != 4 &&
+               options.requant_bits != 5) {
+        return Status(ErrorCode::InvalidArgument, "requant_bits must be -1, 0, 4 or 5");
+    }
     // CPU-only models: the resident Q4_K / Q5_K / Q6_K / Q8_0 matrices in the
     // layout of the i8mm batched kernels (a lossless rearrangement, same
     // size). With expert streaming that is every matrix but the experts (3-D,

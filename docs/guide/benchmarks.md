@@ -8,6 +8,7 @@ Commands and source paths in examples are relative to the repository root.
 
 - [Measured results](#measured-results)
 - [Weight formats on the M4 Pro](#weight-formats-on-the-m4-pro-liyab-kernels)
+- [Fewer bytes per token: `--requant 4` on a dense model](#fewer-bytes-per-token-requant-4-on-a-dense-model)
 - [Qwen3.6-35B-A3B: a 22 GB MoE on a phone](#qwen36-35b-a3b-a-22-gb-moe-on-a-phone)
 - [A dense 27B larger than RAM](#a-dense-27b-larger-than-ram)
 - [Models that fit in RAM](#models-that-fit-in-ram)
@@ -116,6 +117,41 @@ block resident since the repacked copies are only made when they fit, otherwise 
   every product and its Q4_K/Q5_K kernels read 78–88 GB/s. Automatic routing therefore decodes on the CPU and
   processes prompts on Metal; it measures a prompt block's CPU pass on 32 tokens only (one pass), which cost this
   prompt about 0.6 s.
+
+### Fewer bytes per token: `--requant 4` on a dense model
+
+Decoding reads every weight once per token, so on this Mac (about 245 GB/s readable by the CPU) a 14B Q5_K_M at
+19–20 tok/s is already near the read ceiling; the remaining lever is fewer bytes. `--requant 4` (`requant_bits = 4`)
+converts, at load, the Q5_K / Q6_K / Q8_0 matrices of the feed-forward blocks (gate, up, down) and of the attention
+query and output projections to Q4_K. `Qwen2.5-Coder-14B-Instruct-abliterated-Q5_K_M`, CPU, F16 KV, Performance
+profile, greedy, 96 tokens:
+
+| | Decode | Load | Mean KL / perplexity (text 1) | Mean KL / perplexity (text 2) | Top-1 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| file as is | 18.9–19.0 tok/s | 2.3 s | — / 4.970 | — / 2.572 | — |
+| `--requant 4` | 24.1 tok/s | 13.6 s | 0.0085 / 5.038 | 0.0070 / 2.603 | 96.5% / 95.9% |
+
+Quality is measured with `liyab-kl` against the lossless path over two 511-token texts. The load time is the
+conversion, which runs at every load (it tries 4 scale candidates per sub-block instead of the reference's 20 and
+15: 14 s instead of 41 s, with a mean KL 10–20% above the reference search's 0.0078 / 0.0058).
+
+Which matrices to convert was measured one role at a time (Q5_K → Q4_K, reference search, text 1):
+
+| Role | Saved | Mean KL | KL per GiB saved |
+| :--- | ---: | ---: | ---: |
+| `ffn_down` | 0.61 GiB | 0.0035 | 0.0057 |
+| `ffn_gate` | 0.40 GiB | 0.0025 | 0.0062 |
+| `ffn_up` | 0.40 GiB | 0.0027 | 0.0069 |
+| `attn_q` | 0.15 GiB | 0.0012 | 0.0080 |
+| `attn_output` | 0.15 GiB | 0.0018 | 0.012 |
+| output head | 0.19 GiB | 0.0027 | 0.014 |
+| `attn_v` | 0.04 GiB | 0.0019 | 0.047 |
+| `attn_k` | 0.03 GiB | 0.0011 | 0.038 |
+
+The first five are converted. Keys, values and the output head save little for what they cost, and the embeddings
+are looked up, not read. `--requant 5` converts only the Q6_K and Q8_0 matrices of those roles, which a Q5_K_M file
+has few of. The option is for a Q5_K, Q6_K or Q8_0 file whose owner wants the speed of a smaller quantization without
+downloading another file.
 
 ### M4 Pro dense 27B development check
 

@@ -3518,14 +3518,71 @@ TEST_CASE("Expert streaming with requant_bits converts the resident Q8_0 matrice
     };
     const double e4 = relative_rms(run(4, DType::Q4_K));
     const double e5 = relative_rms(run(5, DType::Q5_K));
-    // A random two-block model amplifies the weight error (measured 0.43 and
-    // 0.26); the real model's quality is measured on its own outputs.
+    // A random two-block model amplifies the weight error (measured 0.45 and
+    // 0.22); the real model's quality is measured on its own outputs.
     std::printf("  logits relative RMS error: Q4_K %.4f, Q5_K %.4f\n", e4, e5);
     CHECK(e4 > 0.0);
     CHECK(e4 < 1.0);
     CHECK(e5 < e4);
     TransformerOptions invalid;
     invalid.expert_cache_bytes = 1;
+    invalid.requant_bits = 3;
+    CHECK(load_transformer(path, invalid) == nullptr);
+}
+
+TEST_CASE("requant_bits lowers the feed-forward and query / output matrices of a dense model and stays close") {
+    test::TinyModelSpec spec;  // Q8_0 attention and output head, Q5_K feed-forward, 256 columns everywhere
+    spec.n_layers = 2;
+    spec.n_embd = 256;
+    spec.n_ff = 256;
+    spec.ffn_type = DType::Q5_K;
+    const std::string& path = model_path("dense_lowering", spec);
+    ThreadPool pool(4);
+    auto cpu = make_cpu_backend(pool);
+    const Route route{cpu.get(), cpu.get(), cpu.get()};
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 24; ++i) tokens.push_back(3 + (i * 37) % 250);
+    auto type_of = [](const Transformer& m, const char* name) { return m.file().tensor(name)->type; };
+    // Logits of the whole prompt (empty if loading or the pass failed); checks which matrices were converted.
+    auto run = [&](int32_t bits, DType ffn, DType attn) -> std::vector<float> {
+        TransformerOptions options;
+        options.requant_bits = bits;
+        auto model = load_transformer(path, options);
+        if (model == nullptr) return {};
+        for (const char* name : {"blk.0.ffn_gate.weight", "blk.1.ffn_up.weight", "blk.1.ffn_down.weight"}) {
+            CHECK(type_of(*model, name) == ffn);
+        }
+        for (const char* name : {"blk.0.attn_q.weight", "blk.1.attn_output.weight"}) CHECK(type_of(*model, name) == attn);
+        // Keys, values, the output head and the embeddings cost more quality per byte saved: untouched.
+        CHECK(type_of(*model, "blk.0.attn_k.weight") == DType::Q8_0);
+        CHECK(type_of(*model, "blk.1.attn_v.weight") == DType::Q8_0);
+        CHECK(type_of(*model, "output.weight") == DType::Q8_0);
+        CHECK(type_of(*model, "token_embd.weight") == DType::F16);
+        CHECK(model->memory_plan().requant_bits == bits);
+        auto logits = model->forward(tokens, Transformer::Logits::All, route, pool);
+        if (!logits) return {};
+        return std::vector<float>(logits->begin(), logits->end());
+    };
+    const std::vector<float> exact = run(0, DType::Q5_K, DType::Q8_0);
+    REQUIRE(!exact.empty());
+    auto relative_rms = [&](const std::vector<float>& v) {
+        if (v.size() != exact.size()) return 1e9;
+        double err = 0, power = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            err += (static_cast<double>(v[i]) - exact[i]) * (static_cast<double>(v[i]) - exact[i]);
+            power += static_cast<double>(exact[i]) * exact[i];
+        }
+        return std::sqrt(err / power);
+    };
+    // 4: Q5_K -> Q4_K and Q8_0 -> Q4_K. 5: Q8_0 -> Q5_K; the Q5_K feed-forward is not wider than its target.
+    const double e4 = relative_rms(run(4, DType::Q4_K, DType::Q4_K));
+    const double e5 = relative_rms(run(5, DType::Q5_K, DType::Q5_K));
+    std::printf("  logits relative RMS error: Q4_K %.4f, Q5_K %.4f\n", e4, e5);
+    CHECK(e4 > 0.0);
+    CHECK(e4 < 1.0);
+    CHECK(e5 > 0.0);
+    CHECK(e5 < e4);
+    TransformerOptions invalid;
     invalid.requant_bits = 3;
     CHECK(load_transformer(path, invalid) == nullptr);
 }

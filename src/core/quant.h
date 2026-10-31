@@ -108,10 +108,15 @@ void quantize_row_q4_1(const float* x, BlockQ4_1* y, int64_t n) noexcept;
 // few scales).
 // `n` must be a multiple of kSuperBlock. Slow (a weighted search per
 // sub-block): meant for converting weights at load, not for activations.
-void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n) noexcept;
-void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n) noexcept;
-// Writes a row of `type` from floats into `dst`.
-void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept;
+// `search_steps` is the number of scale candidates tried per sub-block after
+// the plain min/max fit: 0 is the reference's (20 for Q4_K, 15 for Q5_K,
+// blocks identical to llama.cpp's); fewer is proportionally faster at a
+// slightly higher error (requantize() uses 4: the load of a 14B model drops
+// from 33 s to 6 s, its mean KL against the original moves by under 20%).
+void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n, int search_steps = 0) noexcept;
+void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n, int search_steps = 0) noexcept;
+// Writes a row of `type` from floats into `dst` (`search_steps`: Q4_K / Q5_K only, see above).
+void quantize_row(DType type, const float* x, void* dst, int64_t n, int search_steps = 0) noexcept;
 void dequantize_row(DType type, const void* src, float* y, int64_t n) noexcept;
 
 // Dot product of one weight row with an activation row. For quantized weights

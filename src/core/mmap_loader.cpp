@@ -655,6 +655,14 @@ Result<size_t> MmapLoader::relocate(const std::vector<std::pair<size_t, size_t>>
     return moved;
 }
 
+namespace {
+// Scale candidates the Q4_K / Q5_K quantizer tries per sub-block when weights are converted at load (the reference
+// tries 20 / 15): 14B Q5_K_M -> Q4_K took 33 s with 20 and 6 s with 4 on a 10-core Mac, and the mean KL against
+// the original rose by 10-20% (0.0078 -> 0.0085 and 0.0058 -> 0.0070 over two 511-token texts), a cost beside the
+// lowering's own.
+constexpr int kRequantSearchSteps = 4;
+}  // namespace
+
 Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&)>& select, DType target) {
     // Repacked layouts: their source type and rows per group.
     DType source = DType::Q8_0;
@@ -673,7 +681,11 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
     size_t saved = 0;
     for (TensorView& t : tensors_) {
         if (!select(t)) continue;
-        if (t.type != source || (group != 0 && t.rows() % group != 0) || t.cols() % col_multiple != 0) {
+        // A repack needs exactly its source type; a conversion to Q4_K / Q5_K takes any type wider than the target.
+        const bool wider =
+            t.type == DType::Q8_0 || t.type == DType::Q6_K || (target == DType::Q4_K && t.type == DType::Q5_K);
+        const bool source_ok = group != 0 ? t.type == source : wider;
+        if (!source_ok || (group != 0 && t.rows() % group != 0) || t.cols() % col_multiple != 0) {
             return Status(ErrorCode::InvalidArgument, "cannot requantize " + std::string(t.name));
         }
         TensorView out = t;
@@ -708,8 +720,8 @@ Result<size_t> MmapLoader::requantize(const std::function<bool(const TensorView&
             workers.emplace_back([&, w] {
                 std::vector<float> row(static_cast<size_t>(t.cols()));
                 for (size_t r = rows * w / n_threads; r < rows * (w + 1) / n_threads; ++r) {
-                    quant::dequantize_row(DType::Q8_0, t.data + r * row_in, row.data(), t.cols());
-                    quant::quantize_row(target, row.data(), dst + r * row_out, t.cols());
+                    quant::dequantize_row(t.type, t.data + r * row_in, row.data(), t.cols());
+                    quant::quantize_row(target, row.data(), dst + r * row_out, t.cols(), kRequantSearchSteps);
                 }
             });
         }

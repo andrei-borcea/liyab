@@ -102,13 +102,24 @@ struct EngineConfig {
     // decisions use min(free RAM, budget). Set it on platforms with per-app
     // caps the OS counters do not show (HyperOS stops apps above 6 GiB PSS).
     int64_t memory_budget_mb = 0;
-    // With expert streaming (MoE): convert the resident Q8_0 matrices
-    // (attention / recurrent projections, shared experts) to Q4_K (4) or Q5_K
-    // (5) at load. Lossy, opt-in: fewer bytes read per token, and the memory
-    // saved goes to the expert cache. Converted on every core at load;
-    // ignored when experts are not streamed. 0: off. -1: automatic, only when
-    // the expert cache would otherwise hold under 10% of the experts (Q5_K if
-    // that frees enough memory, else Q4_K); see Engine::memory_plan().
+    // Lossy, opt-in: convert resident matrices to Q4_K (4) or Q5_K (5) at
+    // load, so each token reads fewer bytes. Converted on every core at load.
+    //  * With expert streaming (MoE): the resident Q8_0 matrices (attention /
+    //    recurrent projections, shared experts); the memory saved goes to the
+    //    expert cache. Ignored when experts are not streamed.
+    //  * Models without experts: the Q8_0 / Q6_K matrices (and, for 4, Q5_K)
+    //    of the feed-forward blocks (gate, up, down) and of the attention
+    //    query and output projections, the roles that cost least quality per
+    //    byte saved; keys, values, the output head and the embeddings keep
+    //    their bytes. Qwen2.5-Coder-14B Q5_K_M with 4 decodes 27% faster on
+    //    a Mac's CPU (19.0 -> 24.1 tok/s) at a mean KL of 0.007-0.009
+    //    against the file's own weights (perplexity +1.3%), and loads in 14 s
+    //    instead of 2.3 s (the conversion runs at every load); with 5 only
+    //    the Q6_K / Q8_0 matrices change, which is little on a K-quant file.
+    //    Ignored by models streamed from storage in blocks.
+    // 0: off. -1: automatic, MoE expert streaming only, when the expert cache
+    // would otherwise hold under 10% of the experts (Q5_K if that frees enough
+    // memory, else Q4_K); see Engine::memory_plan().
     int32_t requant_bits = 0;
     // MoE: per token, run only the fewest top-ranked experts of the top-k
     // whose router probabilities cover this fraction of the top-k's total
@@ -677,7 +688,7 @@ public:
         uint64_t expert_bytes = 0;        // routed experts read from storage
         uint64_t expert_cache_bytes = 0;  // RAM caching experts now: the load's plan minus what open sequences borrowed
         uint64_t recommended_bytes = 0;   // memory budget at which most expert uses would come from RAM
-        int32_t requant_bits = 0;         // resident Q8_0 matrices converted at load (4 / 5); 0: none
+        int32_t requant_bits = 0;         // matrices converted to Q4_K / Q5_K at load (4 / 5); 0: none
     };
     [[nodiscard]] MemoryPlan memory_plan() const;
     // Actual dense-weight placement after load. File bytes include GGUF

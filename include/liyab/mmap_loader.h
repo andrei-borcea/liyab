@@ -168,8 +168,10 @@ public:
                             const std::function<uint8_t*(size_t bytes)>& allocate);
     // Converts every tensor for which `select` is true into `target`, into
     // anonymous memory the loader owns, and drops their mapped pages:
-    //  * DType::Q4_K or Q5_K from Q8_0 matrices with a multiple of 256
-    //    columns (lossy: fewer bytes read per token; uses every core);
+    //  * DType::Q4_K or Q5_K from Q8_0, Q6_K or Q5_K matrices (any type
+    //    wider than the target) with a multiple of 256 columns (lossy:
+    //    fewer bytes read per token; uses every core; the quantizer tries
+    //    4 scale candidates per sub-block, see quant::quantize_row_q4_K);
     //  * DType::Q4_K_R8 / Q5_K_R8 / Q6_K_R8 from Q4_K / Q5_K / Q6_K matrices
     //    with a multiple of 8 rows and of 256 columns, or DType::Q8_0_R4
     //    from Q8_0 matrices with a multiple of 4 rows (lossless

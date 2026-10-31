@@ -136,7 +136,7 @@ void quantize_row_q4_1(const float* x, BlockQ4_1* y, int64_t n) noexcept {
     }
 }
 
-void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept {
+void quantize_row(DType type, const float* x, void* dst, int64_t n, int search_steps) noexcept {
     switch (type) {
         case DType::F32:
             std::memcpy(dst, x, static_cast<size_t>(n) * sizeof(float));
@@ -162,10 +162,10 @@ void quantize_row(DType type, const float* x, void* dst, int64_t n) noexcept {
             quantize_row_q4_1(x, static_cast<BlockQ4_1*>(dst), n);
             break;
         case DType::Q4_K:
-            quantize_row_q4_K(x, static_cast<BlockQ4_K*>(dst), n);
+            quantize_row_q4_K(x, static_cast<BlockQ4_K*>(dst), n, search_steps);
             break;
         case DType::Q5_K:
-            quantize_row_q5_K(x, static_cast<BlockQ5_K*>(dst), n);
+            quantize_row_q5_K(x, static_cast<BlockQ5_K*>(dst), n, search_steps);
             break;
         default:
             break;  // weight-only formats are never produced at runtime; callers do not request them
@@ -311,11 +311,11 @@ void quantize_k_super_block(const float* x, int nmax, float rmin, int nstep, uin
 
 }  // namespace
 
-void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n) noexcept {
+void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n, int search_steps) noexcept {
     uint8_t L[kSuperBlock];
     for (int64_t b = 0; b < n / kSuperBlock; ++b, x += kSuperBlock) {
         BlockQ4_K& blk = y[b];
-        quantize_k_super_block(x, 15, -1.0f, 20, blk.d, blk.dmin, blk.scales, L);
+        quantize_k_super_block(x, 15, -1.0f, search_steps > 0 ? search_steps : 20, blk.d, blk.dmin, blk.scales, L);
         uint8_t* q = blk.qs;
         for (int j = 0; j < kSuperBlock; j += 64, q += 32) {
             for (int l = 0; l < 32; ++l) q[l] = static_cast<uint8_t>(L[j + l] | (L[j + l + 32] << 4));
@@ -323,11 +323,11 @@ void quantize_row_q4_K(const float* x, BlockQ4_K* y, int64_t n) noexcept {
     }
 }
 
-void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n) noexcept {
+void quantize_row_q5_K(const float* x, BlockQ5_K* y, int64_t n, int search_steps) noexcept {
     uint8_t L[kSuperBlock];
     for (int64_t b = 0; b < n / kSuperBlock; ++b, x += kSuperBlock) {
         BlockQ5_K& blk = y[b];
-        quantize_k_super_block(x, 31, -0.5f, 15, blk.d, blk.dmin, blk.scales, L);
+        quantize_k_super_block(x, 31, -0.5f, search_steps > 0 ? search_steps : 15, blk.d, blk.dmin, blk.scales, L);
         std::fill_n(blk.qh, 32, uint8_t{0});
         uint8_t* ql = blk.qs;
         uint8_t m1 = 1, m2 = 2;

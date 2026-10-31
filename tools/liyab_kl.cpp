@@ -50,7 +50,7 @@
 //
 // Uses internal headers: built with the tests (LIYAB_BUILD_TESTS), on the CPU
 // backend, with the engine's expert streaming (--memory-budget and
-// --expert-cache like liyab-cli; --requant applies only when experts stream).
+// --expert-cache like liyab-cli; --requant applies to dense models always, to MoE only when experts stream).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
