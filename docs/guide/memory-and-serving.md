@@ -136,6 +136,13 @@ model's size; the next load of the same model, `requant_bits` and kernel set map
   identity (file, `requant_bits`, repack, kernel set, recipe version); a file for something else, damaged or
   truncated is ignored and the load converts and writes it again. Mapped pages are file-backed, so the system can
   drop them under memory pressure, as it does the model file's.
+* **When the repack happens.** Each copy replaces its tensor (the repacked layouts have the original's size, and the
+  tensor's mapped pages are dropped as soon as its copy exists), so the weights stay about the file's size: the CPU
+  repack runs when the file, the largest tensor and 4 GiB of headroom fit in the available memory, and the layer
+  streaming decision, taken afterwards, counts only the bytes still read through the mapping. A 27B Q4_K_M (15.4 GiB)
+  on a 48 GiB Mac with 24 GiB available is repacked (it was skipped, as if the copies were extra): a 4-token
+  verification pass then costs 1.80 steps instead of 2.19, which is what speculative decoding pays for its
+  mistakes. Loading took 25 s with the file cold in the page cache (peak RSS 23.4 GiB while it converts).
 * **Scope.** Models without experts, loaded whole (not streamed in blocks). Off by default: it costs the disk space
   of a second copy of the model.
 

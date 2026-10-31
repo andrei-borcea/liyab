@@ -2567,7 +2567,11 @@ struct Engine::Impl {
             const int64_t reserve_mb = std::min(std::max<int64_t>(config.prefix_cache_mb, 0), budget_mb / 2);
             const uint64_t available = usable_memory_bytes(static_cast<uint64_t>(budget_mb - reserve_mb) << 20);
             const uint64_t capacity = resident_weight_capacity_bytes(available);
-            if (available == 0 || file.file_size() <= capacity) {
+            // `available` is read now, after the conversions of load (repacked or lowered copies, in memory of
+            // their own, taken out of it) while the originals they replaced have been dropped from the page cache:
+            // only the bytes still read through the mapping are left to fit.
+            const size_t mapped = file.file_size() - std::min(file.file_size(), file.converted_bytes());
+            if (available == 0 || mapped <= capacity) {
                 return Status::ok();  // fits: in-place reads from the page cache
             }
             // The same runtime reserve used by MmapLoader is held back here;

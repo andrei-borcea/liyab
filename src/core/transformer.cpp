@@ -976,23 +976,23 @@ Result<std::unique_ptr<Transformer>> Transformer::load(std::unique_ptr<MmapLoade
                    t.name != "token_embd.weight" && !t.name.ends_with(".attn_kv_b.weight") &&
                    !t.name.ends_with(".attn_output_a.weight");
         };
-        // The copies take memory of their own next to the mapped file. When they do not fit, the file's layout
-        // (the same bits, about 14% slower per row) keeps every block resident, which beats streaming blocks
-        // from storage: a 27B Q4_K_M decodes at 12.7 tok/s that way against 1.6 with repacked copies and a
-        // streamed tail on a 48 GiB Mac.
-        size_t copies = 0;
+        // A copy replaces its tensor: requantize() drops the tensor's mapped pages as soon as the copy exists, and a
+        // repacked tensor has its original's size, so the weights stay about the file's size throughout (the
+        // largest tensor's copy is the most that is held twice). What does not fit is the file itself, in which
+        // case the model streams and keeps the file's layout.
+        size_t largest = 0;
         for (const TensorView& t : model->file_->tensors()) {
             for (const Repack& r : repacks) {
-                if (selected(t, r) && !model->file_->converted(t)) copies += t.nbytes;  // a lowered copy is replaced
+                if (selected(t, r) && !model->file_->converted(t)) largest = std::max(largest, t.nbytes);
             }
         }
         const uint64_t available = usable_memory_bytes(options.memory_budget_bytes);
         constexpr uint64_t kHeadroom = uint64_t{4} << 30;  // left for the system and other applications
-        if (available != 0 && model->file_->file_size() + copies + kHeadroom > available) {
-            LIYAB_LOG_INFO("repacked weights skipped: %.2f GiB of copies next to %.2f GiB of weights exceed the %.2f GiB "
+        if (available != 0 && model->file_->file_size() + largest + kHeadroom > available) {
+            LIYAB_LOG_INFO("repacked weights skipped: %.2f GiB of weights next to a %.2f GiB headroom exceed the %.2f GiB "
                            "available",
-                           static_cast<double>(copies) / (1024.0 * 1024.0 * 1024.0),
                            static_cast<double>(model->file_->file_size()) / (1024.0 * 1024.0 * 1024.0),
+                           static_cast<double>(kHeadroom + largest) / (1024.0 * 1024.0 * 1024.0),
                            static_cast<double>(available) / (1024.0 * 1024.0 * 1024.0));
             return Status::ok();
         }
