@@ -4,7 +4,7 @@
 //
 //   liyab-spec-bench -m model.gguf [--modes plain,lookup,suffix,suffix:8,suffix:8:linear]
 //                    [--tasks code,summary,tool,chat,again] [-n 512] [--repeat R]
-//                    [--threads N] [--backend cpu|metal|auto]
+//                    [--threads N] [--backend cpu|metal|auto] [--requant 4|5]
 //
 // A mode is plain, lookup, suffix or self (the target as its own draft
 // model: every draft accepted, a check of batched verification), optionally
@@ -215,7 +215,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: liyab-spec-bench -m MODEL.gguf [--modes plain,lookup,suffix,suffix:8:linear] [-n 512]\n"
                  "                        [--tasks code,summary,tool,chat,again] [--repeat R] [--threads N]\n"
-                 "                        [--backend cpu|metal|auto]\n");
+                 "                        [--backend cpu|metal|auto] [--requant 4|5]\n");
 }
 
 }  // namespace
@@ -244,6 +244,7 @@ int main(int argc, char** argv) {
         else if (arg == "-n") max_tokens = std::atoi(next().c_str());
         else if (arg == "--repeat") repeats = std::max(1, std::atoi(next().c_str()));
         else if (arg == "--threads") base.n_threads = std::atoi(next().c_str());
+        else if (arg == "--requant") base.requant_bits = std::atoi(next().c_str());
         else if (arg == "--backend") {
             const std::string b = next();
             if (b == "auto") base.backend.reset();

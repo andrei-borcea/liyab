@@ -66,7 +66,9 @@ enum class LatentAttentionForm : int32_t {
 
 struct EngineConfig {
     std::string model_path;           // GGUF file (F32/F16/Q8_0/Q4_0/Q4_1 tensors)
-    std::string draft_model_path;     // optional: enables speculative decoding
+    // optional: enables speculative decoding. The draft's token table (tokenizer.ggml.tokens) must agree with the
+    // target's over the ids both have; either may be padded further (Qwen2.5-Coder 0.5B: 151,936 ids, 14B: 152,064).
+    std::string draft_model_path;
     int32_t n_threads = 0;            // 0: performance cores, minus one when there is no efficiency cluster
     // 0: automatic: what 256 MiB of KV cache holds (4096..32768), at most the
     // training context; windowed attention blocks count for their window only.

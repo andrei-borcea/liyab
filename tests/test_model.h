@@ -251,6 +251,9 @@ struct TinyModelSpec {
     int32_t space_prefix = -1;
     // Optional ignored metadata before the tokenizer, to test large headers.
     size_t tokenizer_padding = 0;
+    // Extra "[PADn]" entries after the vocabulary, with their embedding / output rows: a family's models pad the
+    // table to different widths (Qwen2.5-Coder 0.5B: 151,936 ids, 14B: 152,064).
+    int32_t vocab_padding = 0;
     // Optional MoE projection biases and learned attention sink logits. A separate
     // generator supplies these tensors so existing synthetic cases keep their bits.
     bool router_bias = false;

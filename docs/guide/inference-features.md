@@ -112,6 +112,29 @@ continuations, and one pass verifies them together:
   experts stream from flash, because a pass reads the union of its tokens' experts. That is why it is off by
   default.
 
+### A 14B on the M4 Pro, with weights lowered and a draft model
+
+Qwen2.5-Coder-14B Q5_K_M, CPU, 10 threads, Q8_0 KV, greedy, replies of 160–192 tokens, every reply identical to plain
+decoding's. `liyab-spec-bench` for the drafts without a model (context lookup, 3 drafts), `--requant 4` for the
+lowered weights ([the measurement](benchmarks.md#fewer-bytes-per-token-requant-4-on-a-dense-model)):
+
+| | Code edit | Summary | Free chat | Tool chat again |
+|---|---|---|---|---|
+| plain decoding | 19.1 tok/s | 18.7 | 19.3 | 18.3 |
+| context lookup | 35.5 (1.86×, 98% accepted) | 18.3 (0.98×) | 19.7 (1.02×) | 18.3 (1.00×) |
+| suffix drafts | 33.7 (1.77×) | 18.9 (1.01×) | 20.4 (1.06×) | 22.1 (1.21×) |
+| plain, weights lowered (`--requant 4`) | 21.8 | | 21.5 | |
+| lookup, weights lowered | 42.9 (2.2× the plain file's rate) | | 23.2 | |
+
+A draft *model* (Qwen2.5-Coder 0.5B Q8_0, 3 drafts, lowered 14B, `liyab-cli`) on free chat went from 24.1 to
+28.4 tok/s (62% of drafts accepted), and from 18.4 to 18.2 on a summary (37% accepted): the draft's own cost cancels
+the gain wherever acceptance is under about half. Text that repeats earlier text is what speculation speeds up; free
+text gains at most a fifth.
+
+The draft model's token table (`tokenizer.ggml.tokens`) must agree with the target's over the ids both have; the
+output width may differ (the 0.5B pads to 151,936 ids, the 14B to 152,064). The draft then drafts among the ids it has,
+and the target verifies every draft.
+
 ### Host measurements: suffix drafts and context lookup
 
 Measured with `liyab-spec-bench` on an Apple M4 Pro with the CPU backend, 6 threads, greedy decoding and replies of up to

@@ -73,7 +73,10 @@ Result<std::vector<int32_t>> SpeculativeDecoder::step(int32_t last, std::span<co
             auto logits = draft_->forward(std::span<const int32_t>(&cur, 1), Transformer::Logits::Last, draft_route, pool);
             if (!logits) return logits.status();
             auto& q = q_[static_cast<size_t>(i)];
-            sampler.probabilities(*logits, q);
+            // A draft with a differently padded output (the same token table, more or fewer rows after it) drafts
+            // among the ids both have; q is then as long as the target's distributions.
+            sampler.probabilities(logits->first(static_cast<size_t>(std::min(draft_->config().n_vocab, n_vocab))), q);
+            q.resize(static_cast<size_t>(n_vocab), 0.0f);
             cur = sampler.greedy() ? Sampler::argmax(q) : sampler.sample(q);
             verify.push_back(cur);
         }

@@ -62,6 +62,19 @@ double ms_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+// Whether a draft's token ids mean what the target's do: the token tables (tokenizer.ggml.tokens) agree over the
+// ids both have. Models of one family pad the table and the output differently (Qwen2.5-Coder: 151,936 rows at
+// 0.5B, 152,064 at 14B, for 151,665 real tokens), and the ids past the real ones never occur. The target verifies
+// every draft, so ids only one model has cost nothing but acceptance. Without a table in both, the widths decide.
+bool same_token_table(const Transformer& a, const Transformer& b) {
+    const GgufValue* ta = a.file().metadata("tokenizer.ggml.tokens");
+    const GgufValue* tb = b.file().metadata("tokenizer.ggml.tokens");
+    if (ta == nullptr || tb == nullptr) return a.config().n_vocab == b.config().n_vocab;
+    const size_t shared = std::min(ta->strings.size(), tb->strings.size());
+    return shared > 0 && std::equal(ta->strings.begin(), ta->strings.begin() + static_cast<std::ptrdiff_t>(shared),
+                                    tb->strings.begin());
+}
+
 // Key scales kept in EngineConfig::cache_dir, one file per model:
 // "keys-<id>.bin" = magic, kKeyScalingVersion, id, count, factors. The id
 // covers what the factors depend on: the model file, the rule's version, the
@@ -2853,7 +2866,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
     if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
         auto draft = load_model(config.draft_model_path, config, max_batch, repack_cpu);
         if (!draft) return draft.status();
-        if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
+        if (!same_token_table(*impl->target, *draft.value())) {
             return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
         }
         // Rejected drafts are rolled back; recurrent (DeltaNet or compression) states need a

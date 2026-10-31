@@ -407,7 +407,8 @@ std::vector<TinyModelSpec> recurrent_model_specs() {
 }
 
 void write_tiny_model(const std::string& path, const TinyModelSpec& s) {
-    const std::vector<std::string> vocab = tiny_vocab();
+    std::vector<std::string> vocab = tiny_vocab();
+    for (int32_t i = 0; i < s.vocab_padding; ++i) vocab.push_back("[PAD" + std::to_string(i) + "]");
     const auto n_vocab = static_cast<int64_t>(vocab.size());
     std::vector<float> scores;
     std::vector<int32_t> types;

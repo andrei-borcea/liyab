@@ -5857,6 +5857,37 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
     }
 }
 
+TEST_CASE("A draft model padded to another width than the target still speculates, with the target's tokens") {
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    for (const int32_t pad : {5, -5}) {  // the draft wider than the target, then narrower
+        test::TinyModelSpec target, draft;
+        (pad > 0 ? draft : target).vocab_padding = 5;
+        draft.seed = 99;
+        draft.n_layers = 1;
+        EngineConfig plain = engine_config(model_path(pad > 0 ? "pad_target_a" : "pad_target_b", target));
+        plain.backend = BackendKind::Cpu;
+        auto base_engine = Engine::create(plain);
+        REQUIRE(base_engine.has_value());
+        const auto expected = run(*base_engine.value(), prompt, greedy(24));
+        REQUIRE(!expected.empty());
+        EngineConfig drafted = plain;
+        drafted.draft_model_path = model_path(pad > 0 ? "pad_draft_a" : "pad_draft_b", draft);
+        drafted.draft_tokens = 3;
+        drafted.adaptive_drafts = false;
+        auto engine = Engine::create(drafted);
+        REQUIRE(engine.has_value());
+        GenerationStats stats;
+        CHECK(run(*engine.value(), prompt, greedy(24), &stats) == expected);
+        CHECK(stats.draft_tokens_proposed > 0);
+        SamplingParams sampled;  // the draft's distributions are padded or cut to the target's width
+        sampled.temperature = 0.8f;
+        sampled.seed = 5;
+        sampled.max_tokens = 24;
+        CHECK(!run(*engine.value(), prompt, sampled).empty());  // a random model may end early on its stop token
+    }
+}
+
 TEST_CASE("Adaptive draft counts keep greedy output identical") {
     std::vector<int32_t> prompt = {1};
     for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});

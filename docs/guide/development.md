@@ -164,7 +164,8 @@ Benchmarks and tools built with the tests:
   plain one (`--repeat R`: medians of R runs, and the best run, the least disturbed on a shared host). A mode
   `lookup:K:fixed` or `suffix:K:fixed` verifies every draft on offer, so its acceptance and tokens per pass do not
   depend on timing; `suffix:K:linear` verifies only the suffix drafter's best branch instead of its tree;
-  `self:K` uses the target as its own draft model, every draft accepted (a check of batched verification). A
+  `self:K` uses the target as its own draft model, every draft accepted (a check of batched verification).
+  `--requant 4|5` converts the weights at load as `liyab-cli` does. A
   reply that differs from the plain one is printed where it differs.
 
   ```bash
