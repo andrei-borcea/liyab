@@ -179,7 +179,8 @@ if(LIYAB_ENABLE_EXPERIMENTAL)
     src/experimental/tdss.cpp
     src/experimental/head_pruner.cpp
     src/experimental/io_uring_loader.cpp
-    src/experimental/prerouter_trace.cpp)
+    src/experimental/prerouter_trace.cpp
+    src/experimental/neuron_trace.cpp)
   target_compile_definitions(liyab_core PUBLIC LIYAB_ENABLE_EXPERIMENTAL=1)
 endif()
 if(LIYAB_USE_METAL)

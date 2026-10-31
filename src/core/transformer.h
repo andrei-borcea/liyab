@@ -592,6 +592,12 @@ public:
         expert_observer_ = observer;
         if (observer != nullptr) observer->begin(config_.n_layers, config_.n_expert, config_.n_expert_used);
     }
+    // Experimental measurement: `observer` (not owned; must outlive the transformer) sees the vector the down
+    // projection of every dense FFN reads on single-token decode steps. nullptr (the default) detaches it.
+    void set_ffn_observer(FfnActivationObserver* observer) {
+        ffn_observer_ = observer;
+        if (observer != nullptr) observer->begin(config_.n_layers);
+    }
     [[nodiscard]] KvCache& mutable_kv_cache() noexcept { return *kv_; }
     void reset() noexcept;
 
@@ -1206,6 +1212,7 @@ private:
     std::vector<Guess> guesses_;
     std::vector<double> rank_guessed_, rank_used_;  // decayed counts per rank
     ExpertPredictionObserver* expert_observer_ = nullptr;  // set_expert_observer
+    FfnActivationObserver* ffn_observer_ = nullptr;        // set_ffn_observer
     float expert_mass_ = 1.0f;          // TransformerOptions::expert_mass
     int32_t max_experts_ = 0;           // TransformerOptions::max_experts
     float skip_slow_ = 0.0f;            // TransformerOptions::skip_slow

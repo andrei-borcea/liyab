@@ -42,6 +42,14 @@ struct ExperimentalConfig {
     // guess the experts the router picks, every 64 decode tokens, at INFO level. The output is unchanged. Needs a
     // mixture-of-experts model (else Unsupported); it prints nothing unless the experts stream from storage.
     bool prerouter_trace = false;
+    // Measurement only: logs, every 64 decode tokens at INFO level, how many of a dense FFN's neurons carry 90% /
+    // 99% of the energy the down projection reads, how much the sets of consecutive tokens overlap (Jaccard index,
+    // and the share of a token's energy the previous token's set carries), and how much a ranking of the neurons
+    // by how often they were active (on the first 64 tokens) carries afterwards: what a sparse FFN reusing the
+    // previous token's neurons, or one with its neurons permuted into a hot range, could rely on. The output is
+    // unchanged; decoding is slower while it is on. Dense FFNs of single-token steps only (a model with none logs
+    // nothing).
+    bool neuron_trace = false;
     // Streamed MoE experts as a two-tier cache: the RAM cache, then the kernel page cache. 0 off (the default);
     // 1 every expert read is buffered, so what the RAM cache evicts stays in the page cache and comes back at
     // memory speed (and outside the process's PSS); 2 buffered prefetches, direct reads for experts the router

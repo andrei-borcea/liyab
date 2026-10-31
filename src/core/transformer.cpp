@@ -4883,10 +4883,16 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         return matmul(route, route.ffn, m, x, y, n);
     };
     const Layer& L = layers_[static_cast<size_t>(layer)];
+    // Experimental: the observer sees the vector the down projection reads.
+    auto observe = [&] {
+        if (ffn_observer_ != nullptr && n == 1) {
+            ffn_observer_->activations(layer, {hb_.data(), static_cast<size_t>(plan.n_ff)});
+        }
+    };
     // A bias-free SiLU FFN can keep gate/up activations on the accelerator
     // until the down projection. Other variants need their CPU-side steps,
     // adapter updates or experimental hook between projections.
-    if (route.ffn != route.cpu && hook == nullptr && !adapters_in_pass_ &&
+    if (route.ffn != route.cpu && hook == nullptr && ffn_observer_ == nullptr && !adapters_in_pass_ &&
         plan.ffn != FfnKind::Ungated && !plan.fused_gate_up && !plan.dense_fused_gate_up &&
         !plan.sparse_gate && plan.shared_swiglu_clamp == 0.0f && c.spec->ffn_activation == FfnActivation::SiLU &&
         L.b_gate.empty() && L.b_up.empty() && L.b_down.empty()) {
@@ -4900,6 +4906,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         add_bias(L.b_up, hb_.data(), static_cast<size_t>(n));
         ungated_activation(c.spec->ffn_activation, c.xielu.empty() ? nullptr : &c.xielu[static_cast<size_t>(layer)],
                            hb_.data(), rows);
+        observe();
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
         add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
         return Status::ok();
@@ -4916,6 +4923,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
             for (size_t i = 0; i < L.b_up.size(); ++i) gate_up[ff + i] += L.b_up[i];
             gated_activation(c.spec->ffn_activation, gate_up, gate_up + ff, hb_.data() + t * ff, ff, plan.shared_swiglu_clamp);
         }
+        observe();
         LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
         add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
         return Status::ok();
@@ -4946,6 +4954,7 @@ Status Transformer::dense_ffn(int32_t layer, const BlockWeights& w, int32_t n, c
         }
     }
     gated_activation(c.spec->ffn_activation, hb_.data(), hb2_.data(), hb_.data(), rows, plan.shared_swiglu_clamp);
+    observe();
     LIYAB_RETURN_IF_ERROR(project(FfnProjection::Down, w[kDown], hb_.data(), xb_.data()));
     add_bias(L.b_down, xb_.data(), static_cast<size_t>(n));
     return Status::ok();

@@ -246,6 +246,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->max_sequences = d.max_sequences;
     config->i8mm_tiles = d.experimental.i8mm_tiles ? 1 : 0;
     config->prerouter_trace = d.experimental.prerouter_trace ? 1 : 0;
+    config->neuron_trace = d.experimental.neuron_trace ? 1 : 0;
     config->page_cache_mode = d.experimental.page_cache_mode;
     config->converted_weights_mb = d.converted_weights_mb;
 }
@@ -317,6 +318,7 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.draft_tree = config->draft_tree != 0;
         c.experimental.i8mm_tiles = config->i8mm_tiles != 0;
         c.experimental.prerouter_trace = config->prerouter_trace != 0;
+        c.experimental.neuron_trace = config->neuron_trace != 0;
         c.experimental.page_cache_mode = config->page_cache_mode;
         c.converted_weights_mb = config->converted_weights_mb;
         c.max_sequences = std::max(config->max_sequences, 1);  // a zero-filled config: one sequence

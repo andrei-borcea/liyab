@@ -70,6 +70,17 @@ public:
     virtual void chosen(int32_t layer, std::span<const int32_t> experts) = 0;
 };
 
+// Watches the vector a dense FFN's down projection reads (measurement only: it never changes the output).
+class FfnActivationObserver {
+public:
+    virtual ~FfnActivationObserver() = default;
+    // When attached: the model's block count.
+    virtual void begin(int32_t n_layers) = 0;
+    // act(gate x) * up x of block `layer`'s dense FFN for one decode token (n_ff floats), just before the down
+    // projection. Single-token steps only, in block order within a token; blocks without a dense FFN are skipped.
+    virtual void activations(int32_t layer, std::span<const float> hidden) = 0;
+};
+
 struct ForwardHooks {
     // Set: forward() checks it between blocks and returns Cancelled when it
     // is true; the pass is then abandoned (Transformer::abandon_pass).

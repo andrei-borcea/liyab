@@ -41,6 +41,7 @@
 #include "core/quant.h"
 #include "liyab/experimental/head_pruner.h"
 #include "liyab/experimental/io_uring_loader.h"
+#include "liyab/experimental/neuron_trace.h"
 #include "liyab/experimental/prerouter_trace.h"
 #include "test_model.h"
 #include "test_util.h"
@@ -473,6 +474,106 @@ TEST_CASE("The prerouter trace leaves a streamed MoE's reply unchanged and logs 
     auto refused = Engine::create(dense);
     CHECK(!refused.has_value());
     std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// FFN neuron study
+// ---------------------------------------------------------------------------
+namespace {
+// One decode token over two blocks: the dense FFN vector of both is `h`.
+void feed_neurons(experimental::NeuronTrace& trace, const std::vector<float>& h) {
+    for (int32_t layer = 0; layer < 2; ++layer) trace.activations(layer, h);
+}
+// n values, `active` of them 10 (the first ones from `first`), the rest 0.01.
+std::vector<float> neuron_vector(size_t n, size_t first, size_t active) {
+    std::vector<float> h(n, 0.01f);
+    for (size_t i = 0; i < active; ++i) h[(first + i) % n] = 10.0f;
+    return h;
+}
+}  // namespace
+
+TEST_CASE("NeuronTrace measures the density of the active set, its persistence and the hot neurons") {
+    constexpr size_t n = 200;
+    // Always the same 20 neurons: a tenth of the neurons carry the energy, token after token.
+    experimental::NeuronTrace same(0, 8);
+    same.begin(2);
+    for (int t = 0; t < 40; ++t) feed_neurons(same, neuron_vector(n, 0, 20));
+    experimental::NeuronTrace::Summary s = same.summary();
+    CHECK(s.tokens == 39);  // a token ends when the block index starts over; the last one is still open
+    CHECK(s.observations == 80);
+    CHECK(std::fabs(s.density[0] - 0.10) < 1e-9);
+    CHECK(std::fabs(s.jaccard[0] - 1.0) < 1e-9);
+    CHECK(s.recall[0] > 0.999);
+    // The ranking learned on 8 tokens puts them first: the top 10% carries (nearly) all the energy afterwards.
+    CHECK(s.hot_observations > 0);
+    CHECK(s.hot_recall[0] > 0.999);
+    CHECK(s.hot_recall[2] > s.hot_recall[0] - 1e-12);
+
+    // Alternating between two disjoint sets of 20: the sets never overlap, the previous set carries only the
+    // floor's energy, and the ranking (trained on both) still carries them in its top 25%.
+    experimental::NeuronTrace alternating(0, 8);
+    alternating.begin(2);
+    for (int t = 0; t < 40; ++t) feed_neurons(alternating, neuron_vector(n, t % 2 == 0 ? 0 : 100, 20));
+    s = alternating.summary();
+    CHECK(std::fabs(s.density[0] - 0.10) < 1e-9);
+    CHECK(s.jaccard[0] < 1e-9);
+    CHECK(s.recall[0] < 0.01);
+    CHECK(s.hot_recall[1] > 0.999);
+    // The top 25% (50 neurons: the 40 trained on, 10 more) already holds the previous set, so the union adds nothing.
+    CHECK(std::fabs(s.union_density - 0.25) < 1e-9);
+    CHECK(s.union_recall > 0.999);
+
+    // A vector of zeros counts nothing; begin() starts over; the report names what it measured.
+    experimental::NeuronTrace zeros(0, 8);
+    zeros.begin(2);
+    feed_neurons(zeros, std::vector<float>(n, 0.0f));
+    CHECK(zeros.summary().observations == 0);
+    same.begin(2);
+    CHECK(same.summary().observations == 0);
+    CHECK(alternating.report().find("jaccard") != std::string::npos);
+}
+
+namespace {
+std::vector<std::string>& neuron_log() {
+    static std::vector<std::string> lines;
+    return lines;
+}
+void capture_neuron_log(int, const char* message, void*) {
+    if (std::strstr(message, "neuron trace:") != nullptr) neuron_log().emplace_back(message);
+}
+}  // namespace
+
+// The trace only counts: the reply is the same with it on, and it logs what it saw.
+TEST_CASE("The neuron trace leaves a dense model's reply unchanged and logs its measurements") {
+    std::string replies[2];
+    neuron_log().clear();
+    log::set_sink(&capture_neuron_log, nullptr);
+    log::set_level(log::Level::Info);
+    for (const bool trace : {false, true}) {
+        EngineConfig config;
+        config.model_path = tiny_model();
+        config.backend = BackendKind::Cpu;
+        config.thermal_polling = false;
+        config.power.target_tps = 10000.0;
+        config.lookup_drafts = EngineConfig::LookupDrafts::Off;
+        config.experimental.neuron_trace = trace;
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        SamplingParams p;
+        p.temperature = 0.0f;
+        p.max_tokens = 70;
+        std::string& text = replies[trace ? 1 : 0];
+        auto stats = engine.value()->generate("hello world", p, [&](std::string_view piece, int32_t) {
+            text += piece;
+            return true;
+        });
+        REQUIRE(stats.has_value());
+        CHECK(stats->generated_tokens == p.max_tokens);
+    }
+    log::set_sink(nullptr, nullptr);
+    CHECK(replies[0] == replies[1]);
+    REQUIRE(!neuron_log().empty());
+    CHECK(neuron_log().front().find("density") != std::string::npos);
 }
 
 // The page-cache tier changes where expert bytes come from, never which bytes: every mode answers like the direct

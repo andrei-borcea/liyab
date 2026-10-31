@@ -326,6 +326,9 @@ void usage() {
                  "                     (same bits; slower on the Snapdragon 8 Elite; needs i8mm)\n"
                  "  --prerouter-trace  MoE: log how well the expert predictor guesses the router (every 64\n"
                  "                     tokens; measurement only; prints nothing when experts are resident)\n"
+                 "  --neuron-trace     log how many of a dense FFN's neurons carry 90%%/99%% of the energy its down\n"
+                 "                     projection reads and how much consecutive tokens' sets overlap (every 64\n"
+                 "                     tokens; measurement only, decoding is slower)\n"
                  "  --page-cache-mode N  streamed MoE experts through the OS page cache: 0 off, 1 every read\n"
                  "                     buffered, 2 buffered prefetches (slower on the Snapdragon 8 Elite)\n");
 }
@@ -431,6 +434,8 @@ int main(int argc, char** argv) {
             config.i8mm_tiles = 1;
         } else if (arg == "--prerouter-trace") {
             config.prerouter_trace = 1;
+        } else if (arg == "--neuron-trace") {
+            config.neuron_trace = 1;
         } else if (arg == "--page-cache-mode") {
             config.page_cache_mode = std::atoi(next());
         } else if (arg == "--prune-heads") {

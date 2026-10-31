@@ -50,6 +50,7 @@
 #include "liyab/experimental/egls.h"
 #include "liyab/experimental/tdss.h"
 #include "liyab/experimental/head_pruner.h"
+#include "liyab/experimental/neuron_trace.h"
 #include "liyab/experimental/prerouter_trace.h"
 #endif
 
@@ -2233,6 +2234,7 @@ struct Engine::Impl {
     std::unique_ptr<experimental::Egls> egls;
     std::unique_ptr<experimental::Tdss> tdss;
     std::unique_ptr<experimental::PrerouterTrace> prerouter;
+    std::unique_ptr<experimental::NeuronTrace> neuron_trace;
 #endif
 
     // Experimental hooks for one forward pass given the current power policy.
@@ -2832,6 +2834,7 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 #if !defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
         config.experimental.tdss || config.experimental.i8mm_tiles || config.experimental.prerouter_trace ||
+        config.experimental.neuron_trace ||
         config.experimental.page_cache_mode != 0) {
         return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
     }
@@ -2988,6 +2991,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         if (impl->target->expert_store() == nullptr) {
             LIYAB_LOG_WARN("prerouter trace: the experts are resident, so no prediction is made and nothing is logged");
         }
+    }
+    if (x.neuron_trace) {
+        impl->neuron_trace = std::make_unique<experimental::NeuronTrace>();
+        impl->target->set_ffn_observer(impl->neuron_trace.get());
     }
 #endif
     impl->prepare_segment_reuse();
