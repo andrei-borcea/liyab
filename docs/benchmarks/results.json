@@ -217,5 +217,116 @@
     ]
    }
   }
+ },
+ "m4_decode": {
+  "title": "Mac decode speed: what each option adds",
+  "device": "Apple M4 Pro (10 performance cores), 48 GiB, macOS; liyab-cli, CPU backend, greedy, 'performance' profile. Draft runs: a code-copy task, plain-file weights.",
+  "series": [
+   "plain file",
+   "--requant 4",
+   "text drafts (code-copy task)"
+  ],
+  "models": {
+   "Qwen2.5-Coder-14B Q5_K_M": [
+    19.0,
+    24.1,
+    29.1
+   ],
+   "Qwen3.8-27B Q4_K_M": [
+    13.3,
+    13.8,
+    16.5
+   ]
+  },
+  "notes": "--requant 4 lowers the feed-forward and query/output matrices to Q4_K at load (lossy, KL 0.007-0.0085 on the 14B). Text drafts: 14B 18.9 -> 29.1, 27B 12.5 -> 16.5 on the same task; free text gains nothing. 14B code edit with drafts and --requant 4: 42.9."
+ },
+ "m4_prefill": {
+  "title": "Mac prompt processing: CPU alone and the GPU's matrix kernels",
+  "device": "Apple M4 Pro (10 performance cores), 48 GiB, macOS; liyab-cli, CPU backend, greedy, a 1,400-token prompt, first pass after load.",
+  "series": [
+   "CPU only",
+   "Metal (matrix kernels)"
+  ],
+  "models": {
+   "Qwen2.5-Coder-14B Q5_K_M": [
+    40.9,
+    160.0
+   ],
+   "Qwen3.8-27B Q4_K_M": [
+    19.5,
+    88.6
+   ]
+  },
+  "notes": "Automatic routing picks Metal for prompts and the CPU for decoding; its decision is kept in cache_dir (14B: 143 tok/s on the first run, 158-163 after)."
+ },
+ "m4_load": {
+  "title": "Load time with the converted-weights cache",
+  "device": "Apple M4 Pro, 48 GiB; Qwen2.5-Coder-14B Q5_K_M, file in the page cache; --cache-dir with --converted-cache.",
+  "series": [
+   "converting at load",
+   "mapping the cache"
+  ],
+  "models": {
+   "--requant 4 (lowered + repacked)": [
+    17.0,
+    0.43
+   ],
+   "repacked only": [
+    2.3,
+    0.44
+   ]
+  },
+  "notes": "Same tokens as the converting load."
+ },
+ "x86_avx2": {
+  "title": "x86-64 kernels added: scalar set vs AVX2 set (GB/s of weights, one row)",
+  "device": "x86-64 build run under Rosetta 2 on an Apple M4 Pro (translated: relative figures, not x86 speeds).",
+  "series": [
+   "scalar",
+   "AVX2"
+  ],
+  "formats": {
+   "Q3_K": [
+    3.3,
+    16.4
+   ],
+   "Q2_K": [
+    3.4,
+    23.3
+   ],
+   "TQ2_0": [
+    2.4,
+    23.3
+   ],
+   "IQ2_XXS": [
+    4.1,
+    7.2
+   ],
+   "IQ2_XS": [
+    4.2,
+    8.2
+   ],
+   "IQ2_S": [
+    3.8,
+    5.8
+   ],
+   "IQ3_XXS": [
+    8.0,
+    11.4
+   ],
+   "IQ3_S": [
+    6.3,
+    10.2
+   ],
+   "IQ1_S": [
+    4.9,
+    8.4
+   ],
+   "IQ1_M": [
+    5.1,
+    5.6
+   ]
+  },
+  "notes": "Every kernel is checked against the decoded weights by liyab-kernels; the whole x86 suite passes 16/16 with AVX2 advertised (ROSETTA_ADVERTISE_AVX=1)."
  }
 }

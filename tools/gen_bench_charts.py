@@ -199,6 +199,19 @@ def main():
     ram = d["in_ram"]
     grouped_hbar_chart(ram["title"], "Higher is better; n/a: not measured.", list(ram["models"]), ram["series"],
                        list(ram["models"].values()), "tokens / s", os.path.join(OUT, "in_ram_decode.svg"))
+
+    # The Mac and x86 charts carry their own device line.
+    for key, sub, unit, name in (("m4_decode", "Higher is better.", "tokens / s", "m4_decode.svg"),
+                                 ("m4_prefill", "Higher is better.", "tokens / s", "m4_prefill.svg"),
+                                 ("m4_load", "Lower is better.", "seconds", "m4_load.svg")):
+        m4 = d[key]
+        DEVICE = "Measured on " + m4["device"]
+        grouped_hbar_chart(m4["title"], sub, list(m4["models"]), m4["series"], list(m4["models"].values()), unit,
+                           os.path.join(OUT, name), width=880)
+    x86 = d["x86_avx2"]
+    DEVICE = "Measured on " + x86["device"]
+    grouped_hbar_chart(x86["title"], "Higher is better.", list(x86["formats"]), x86["series"],
+                       list(x86["formats"].values()), "GB/s", os.path.join(OUT, "x86_avx2_kernels.svg"), width=880)
     print("wrote", ", ".join(sorted(p for p in os.listdir(OUT) if p.endswith(".svg"))))
 
 

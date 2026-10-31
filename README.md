@@ -30,7 +30,8 @@ Run models larger than RAM by streaming weights from storage. Keep chat, tools a
 | :--- | :--- |
 | Inference | GGUF v2/v3, split files, 27 weight formats; dense, MoE, recurrent and latent/sparse attention paths |
 | Models larger than RAM | Dense block streaming; bounded MoE expert cache with prefetch and direct I/O |
-| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 with scalar fallback, Metal (matrix and attention kernels for prompts), Vulkan; CPU or GPU chosen by timing the first passes |
+| Compute | ARM64 NEON / SDOT / i8mm, x86 AVX2 for 25 of the 27 formats with scalar fallback, Metal (matrix and attention kernels for prompts), Vulkan; CPU or GPU chosen by timing the first passes, and the choice kept per model and device |
+| Self-configuration | Timed routing, timed speculation (drafts from the text switched on per model), a cache of weights converted at load, and `liyab-cli --doctor`, which says whether a model fits and how fast this device can decode it at most |
 | Conversations | Context reuse, saved state, paged KV, prefix cache, cancellation and concurrent sequences |
 | Generation | Sampling, speculative decoding, JSON/schema constraints and tool calls |
 | Pooling and adaptation | Embeddings, reranking and GGUF LoRA adapters |
@@ -50,7 +51,34 @@ Run models larger than RAM by streaming weights from storage. Keep chat, tools a
 
 ## 📊 Speed and measurements
 
-Historical measurements on a **Snapdragon 8 Elite**, UFS 4, HyperOS with a **6 GiB per-app limit**:
+### Apple M4 Pro, 48 GiB
+
+Single machine, `liyab-cli`, greedy decoding, `performance` profile, a 1,400-token prompt for the prompt figures; runs
+vary by about ±10%. Decoding reads every weight once per token, so it is bound by memory bandwidth: `--doctor` prints
+the ceiling this Mac allows for a model (24.5 tok/s for the 14B, 16.7 for the 27B) and the engine reaches about 80% of it.
+
+| Model | Prompt | Decode | With options |
+| :--- | ---: | ---: | :--- |
+| Qwen2.5-Coder-14B Q5_K_M | **160 tok/s** on Metal (41 CPU only) | **19.0 tok/s** | **24.1** with `--requant 4` (lossy: KL 0.007–0.0085); **29.1** on a code-copy task and **35.5** on a code edit with drafts from the text (default; the same replies); **42.9** on the edit with both |
+| Qwen3.8-27B Q4_K_M (hybrid) | **88.6 tok/s** on Metal (19.5 CPU only) | **13.3 tok/s** (12.0 with `balanced`) | 13.8 with `--requant 4` (most of it is already Q4_K); **16.5** on a code-copy task with drafts from the text |
+| Bonsai-1.7B (1-bit) | | 114–135 tok/s | |
+
+Drafts from the text pay on text that repeats earlier text (code edits, copies, tool output) and not on free text; the
+engine decides per model with a timed verification pass and backs off at run time. A draft *model* helps less on the
+27B (×1.18–1.24 on an explanation, ×1.0 on a story; [measurements](docs/guide/benchmarks.md#what-did-not-pay-off-so-you-dont-have-to-try)).
+[Per-backend table and conditions](docs/guide/benchmarks.md#prompts-and-decoding-on-the-m4-pro-by-backend-31-october-2026) ·
+[`--requant 4` and its quality cost](docs/guide/benchmarks.md#fewer-bytes-per-token-requant-4-on-a-dense-model) ·
+[experiments that did not pay off](docs/guide/benchmarks.md#what-did-not-pay-off-so-you-dont-have-to-try).
+
+![Mac decode speed: what each option adds](docs/benchmarks/m4_decode.svg)
+
+![Mac prompt processing: CPU alone and the GPU's matrix kernels](docs/benchmarks/m4_prefill.svg)
+
+![Load time with the converted-weights cache](docs/benchmarks/m4_load.svg)
+
+### Phone (historical)
+
+Measurements on a **Snapdragon 8 Elite**, UFS 4, HyperOS with a **6 GiB per-app limit**:
 
 | Model | Command line | App | Conditions |
 | :--- | ---: | ---: | :--- |
@@ -59,22 +87,23 @@ Historical measurements on a **Snapdragon 8 Elite**, UFS 4, HyperOS with a **6 G
 
 Temperature, context length and OS activity affect throughput. The [measurement guide](docs/guide/benchmarks.md)
 keeps the configurations, alternating A/B runs, single-run caveats and per-phase timings.
-Stage-1 phone validation remains deferred; these figures come from earlier device runs.
-
-**M4 Pro, 48 GiB RAM:** Qwen3.8-27B Q4_K_M decodes **10.7–12.7 tok/s** and processes a 445-token prompt at 56 tok/s; Qwen2.5-Coder-14B Q5_K_M processes 1,555 tokens at 154–164 tok/s; the 1-bit Bonsai-1.7B decodes 114–135 tok/s. Decoding reads every weight once per token, so it is bound by memory bandwidth over model size (about 16 tok/s for the 27B on this Mac). [Per-backend table and conditions](docs/guide/benchmarks.md#prompts-and-decoding-on-the-m4-pro-by-backend-31-october-2026); [earlier 27B development check](docs/guide/benchmarks.md#m4-pro-dense-27b-development-check).
+Phone validation of the Mac-side work (routing, drafts, new kernels) is still to do; these figures come from earlier
+device runs.
 
 <a id="charts"></a>
 
-### Decode speed
+### Phone: decode speed of the MoE by engine version
 
 ![Qwen3.6-35B-A3B decode speed by engine version](docs/benchmarks/moe_35b_decode.svg)
 
-### Models that fit in RAM
+### Phone: models that fit in RAM
 
 ![Decode speed of models that fit in RAM, CPU vs GPU](docs/benchmarks/in_ram_decode.svg)
 
 <details>
-<summary>More charts: phase timings, dense 27B, flash reads and kernels</summary>
+<summary>More charts: phase timings, dense 27B, flash reads and kernels, x86 kernels</summary>
+
+![x86-64 kernels added: scalar set against AVX2 set](docs/benchmarks/x86_avx2_kernels.svg)
 
 ![Qwen3.6-35B-A3B decode time per token by phase](docs/benchmarks/moe_35b_phases.svg)
 
@@ -200,7 +229,7 @@ including expert output scales folded into weights, checked against generated up
 | Android ARM64 | ✅ CPU, Vulkan; QNN / NeuroPilot runtime probes | ✅ Flutter app; NPU compute falls back; stage-1 phone checks deferred |
 | macOS Apple silicon | ✅ CPU, Metal | ✅ Flutter app and Option-Space bar |
 | iOS | ✅ Engine framework | 🟡 Flutter app awaits its first build |
-| x86-64 | AVX2 / FMA / F16C with scalar fallback | 🟡 Rosetta correctness checks; native Intel/AMD timings unmeasured |
+| x86-64 | AVX2 / FMA / F16C kernels for 25 of 27 formats (TQ1_0 and NVFP4 use the generic path), scalar fallback | 🟡 Rosetta correctness checks (AVX2 needs `ROSETTA_ADVERTISE_AVX=1`, else the scalar set runs); native Intel/AMD timings unmeasured |
 | Linux | Host build path | 🟡 Native Linux validation and desktop app remain pending |
 | Windows x64 | Win32 engine / CLI port, MSVC or clang-cl | 🟡 Uncompiled on Windows; CPU backend; desktop app pending |
 
@@ -233,7 +262,9 @@ including expert output scales folded into weights, checked against generated up
 | Speculation | Draft models; drafts from the text, switched on per model by a timed verification pass; suffix trees and rollback | [Accuracy and speed measurements](docs/guide/inference-features.md#speculative-decoding) |
 | Heat and power | Performance / Balanced / Low Power profiles, thermal pacing and guards | [Profiles and device behavior](docs/guide/inference-features.md#heat-and-power) |
 
-Lossy options include expert skipping, requantization at load (for a dense model its feed-forward and query / output matrices go to Q4_K: a 14B Q5_K_M decodes 27% faster on a Mac's CPU; the converted weights can be kept in a size-capped cache directory, so later loads take 0.4 s instead of 14 s), segment reuse and 4-bit prefix storage.
+The engine measures what depends on the device and the model, once, and keeps it in `cache_dir` (a few KB per model, each kind capped at 16 files, least recently used out first): which route each class of pass takes, whether drafting from the text pays (a timed 4-token verification pass), the key scales of a quantized KV cache, latent attention's form ratio, and the read speeds `liyab-cli --doctor` turns into a memory-fit report and a decode ceiling per backend. `converted_weights_mb` also keeps the weights converted at load as capped files.
+
+Lossy options include expert skipping, requantization at load (for a dense model its feed-forward and query / output matrices go to Q4_K: a 14B Q5_K_M decodes 27% faster on a Mac's CPU, and with the converted-weights cache later loads take 0.4 s instead of 17 s), segment reuse and 4-bit prefix storage.
 Their [quality measurements](docs/guide/memory-and-serving.md) remain separate from lossless execution.
 
 <a id="embeddings-and-reranking"></a>
@@ -324,6 +355,7 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | `--tdss hot\|always` | Use 2:4 magnitude-pruned FFNs | −54% decode on the phone | Slower without sparse units |
 | `--i8mm-tiles` | Run Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2×2 SMMLA tiles; keeps the repacked layouts off | Q4_K 681 → 601–617 µs, Q5_K 683 → 863–895 µs, Q6_K 756 → 953–1019 µs (2048×8192, 4 rows, Snapdragon 8 Elite, before the repacked layouts) | Exact (same bits); slower than the default except Q4_K; needs i8mm |
 | `--page-cache-mode N` | Streamed MoE experts as a two-tier cache: RAM, then the OS page cache (1: every read buffered; 2: buffered prefetches, direct reads for experts already chosen); resident weights move to anonymous memory | Qwen3.6-35B-A3B on the phone: flash reads 283 → 180–215 MiB/token, but cold decode 7.04 → 4.83 (mode 1) / 6.02 (mode 2) tok/s, warm 6.98 → 5.16 / 6.23 | Exact (same bits); slower; MoE models whose experts stream from storage; not on Windows |
+| `--neuron-trace` | Measure how many of a dense FFN's neurons carry the energy its down projection reads, how much consecutive tokens' sets overlap and what a ranking by frequency carries | Counts only: logs every 64 decode tokens (`LIYAB_LOG=info`). Qwen2.5-Coder-14B Q5_K_M: 15% of the neurons carry 90% of the energy, Jaccard 0.22 between tokens | Measurement; it showed that reusing the previous token's neurons or reordering them does not pay on this model |
 | `--prerouter-trace` | Measure how well the streamed-expert predictor guesses the router's experts, next to a learned co-occurrence prior and repetition | Counts only: logs precision@k every 64 decode tokens; the output is unchanged | Measurement; MoE models whose experts stream from storage |
 | JIT unpacker | Emit AArch64 NEON row-unpack routines, W^X | +37% for a 4,096-element row | Component result; outside the hot path; unavailable on iOS |
 | io_uring loader | Direct reads through raw io_uring syscalls | No Android result | Android apps cannot call `io_uring_setup` |
@@ -340,7 +372,8 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 
 | Stage-1 integration check | Result |
 | :--- | :--- |
-| Native ARM64 / Rosetta scalar / Rosetta AVX2 | 16/16 tests on each target |
+| Native ARM64 / Rosetta scalar / Rosetta AVX2 | 16/16 tests on each target (re-run with the AVX2 kernels added; 17/17 with the experimental modules) |
+| Kernel conformance (`liyab-kernels`, `test_kernels`) | All 27 formats on every backend of the host against the decoded weights; the CPU gives the same bits for any batch |
 | Golden logits | 138 cases × 3 platforms = 414 pins; original pins unchanged |
 | Merged tiny conformance | 66/66 recipes, including one 39-input embedding case |
 | Recurrent quantization proofs | 520 cases: 26 formats × 5 mixers × 4 KV types |
@@ -360,6 +393,8 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | :--- | :--- |
 | Model coverage | Gemma 4 / DeepSeek-V4 text have synthetic conformance; trained quality, production exports and other stage-2 combinations remain unverified |
 | Export metadata | Some published tokenizer / template metadata needs a corrected copy |
+| Speculation | Drafts from the text pay on repeating text only; a draft model of the 27B's family gave ×1.18–1.24 on an explanation and nothing on a story |
+| Measurements | The Mac figures are one M4 Pro, ±10% between runs; the phone, Vulkan and a native x86 CPU have not been re-measured with the routing, drafts and kernels added since |
 | GPU behavior | Metal runs 9 of 27 weight formats (the rest, BF16 included, run on the CPU); its Q4_K/Q5_K decode kernels read 78–88 GB/s, so automatic routing decodes on the CPU; prompt blocks of 16 rows or more run their products at 5–5.6 TFLOPS and their attention on the GPU when the block is plain (one sequence, F16 or Q8_0 cache, 64/96/128/256 channels per head, no window, sinks or ALiBi), else on the CPU; thermal CPU rerouting and the CPU/GPU choice change rounding |
 | Vulkan | Per-token prefill matvec; resident tensors copied to GPU memory; MoE experts on CPU |
 | NPUs | Runtime detection and ranking; compute fallback |
@@ -377,8 +412,8 @@ Build with `-DLIYAB_ENABLE_EXPERIMENTAL=ON`. The app build includes these module
 | Track | Planned work |
 | :--- | :--- |
 | Model coverage | Stage-2 compositions, starting with Flint; unsupported converters; later multimodal input |
-| Compute | Fewer CPU/GPU synchronizations, operation fusion, CPU/GPU overlap, GPU LoRA |
-| Serving | Multi-row float kernels, sequence page sharing, draft-guided expert prefetch |
+| Compute | Phone, Vulkan and native x86 validation of the new routing and kernels; Metal Q4_K/Q5_K decode kernels (78–88 GB/s against the CPU's 250); operation fusion, GPU LoRA |
+| Serving | Multi-row float kernels, sequence page sharing, draft-guided expert prefetch, repack of large dense models whose weights fit (27B) |
 | Assistant | Voice, confirmed actions, local memory / retrieval, small-and-large model tiers |
 | Platforms | Native build validation, desktop ports, iOS app, NPU kernels and localization |
 

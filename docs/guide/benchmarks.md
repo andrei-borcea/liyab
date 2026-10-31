@@ -728,5 +728,26 @@ Facts measured while building Liyab that shaped the code, kept here because they
   replaced, KL 0.069 against 0.0095 for Q3_K ([study](../research/cold-experts.md)).
 * **Repacking every streamed expert on read.** It added ~0.1–0.2 ms to each decode miss (−6% decode), so only
   experts read for batched passes are repacked.
+* **A per-layer GPU graph for prompts.** The 14B's 1,400-token prompt takes 8.7 s on Metal, 41 TFLOP at 4.7 TFLOPS
+  against the 5.3 the matrix units plateau at: a graph with no gaps at all could win 10%.
+* **CPU and GPU together on one pass.** Unified memory shares the bandwidth, and the CPU's batched kernels add about
+  a fifth of the GPU's throughput at most (`liyab-kernels`: 0.9–1.3 TFLOPS against 5.1–5.6).
+* **Reusing the previous token's FFN neurons.** [`--neuron-trace`](development.md#experimental-modules) on the 14B
+  Q5_K_M: 15% of the neurons carry 90% of the energy the down projection reads, but consecutive tokens' sets overlap
+  at a Jaccard index of 0.22 and the previous set carries 52% of the next token's energy; a ranking learned on 64
+  tokens carries 39% / 56% / 75% in its top 10 / 25 / 50%. Neither reuse nor a permutation into a hot range holds,
+  and the active set is known only after gate and up are computed.
+* **Skipping layers to draft** (self-speculation). With the 14B's 1.84-step verification pass and a draft step costing
+  half or a quarter of a step, 3 drafts break even only when over 90% are accepted (speed-up 1.03 and 1.33 at
+  α = 0.9; 0.88 and 1.14 at 0.8), which a model not trained for it does not reach. Worked from the measured costs;
+  not built.
+* **Reading fewer bits of a Q5_K on confident tokens.** Its fifth bit is the most significant one and lives in its own
+  plane (`qh`): leaving it out is a wrong value, not a coarser one, and a layout that allowed it would save at most
+  18% of the bytes on those tokens, against the 27% `--requant 4` saves on all of them with scales fitted for 4 bits.
+* **A draft model for the 27B.** Qwen3.5-0.8B (Q8_0) and 2B (Q4_K_M) pair with the Qwen3.8-27B (same 248,320-id token
+  table; their steps cost 5.1 and 7.9 ms against its 75). Three alternated runs, 200 tokens, 3 drafts: an explanation
+  went from 12.2 to 14.4 (×1.18, 60% accepted) and 15.0 tok/s (×1.24, 68%); a short story from 11.8 to 11.7 (×1.00,
+  47%) and 11.4 (×0.97, 49%); 4 drafts were no better. The 27B's 4-token verification pass costs 2.2 steps, which is
+  what the drafts pay for their mistakes.
 
 ---
