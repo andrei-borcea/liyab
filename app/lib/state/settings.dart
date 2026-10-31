@@ -134,7 +134,7 @@ class ExperimentalSettings {
   bool i8mmTiles = false; // exact: Q4_K / Q5_K / Q6_K CPU matmuls over several rows as 2x2 SMMLA tiles
   int pageCacheMode = 0; // exact: streamed MoE experts through the OS page cache: 0 off, 1 all reads, 2 prefetches
   bool prerouterTrace = false; // measurement only: logs how well streamed experts are guessed (MoE models)
-  bool lookupDrafts = false; // speculative decoding from the conversation's own text
+  int lookupMode = 2; // speculative decoding from the conversation's own text: 0 off, 1 always, 2 automatic (per model: a timed verification pass)
   bool suffixDrafts = true; // ... by suffix drafts (this and earlier conversations); false: context lookup
   int draftTokens = 3;
   double expertMass = 1.0; // MoE: fewest top experts covering this router mass
@@ -156,7 +156,7 @@ class ExperimentalSettings {
         'i8mmTiles': i8mmTiles,
         'prerouterTrace': prerouterTrace,
         'pageCacheMode': pageCacheMode,
-        'lookupDrafts': lookupDrafts,
+        'lookupMode': lookupMode,
         'suffixDrafts': suffixDrafts,
         'draftTokens': draftTokens,
         'expertMass': expertMass,
@@ -183,7 +183,7 @@ class ExperimentalSettings {
       ..i8mmTiles = b('i8mmTiles', d.i8mmTiles)
       ..prerouterTrace = b('prerouterTrace', d.prerouterTrace)
       ..pageCacheMode = i('pageCacheMode', d.pageCacheMode)
-      ..lookupDrafts = b('lookupDrafts', d.lookupDrafts)
+      ..lookupMode = i('lookupMode', d.lookupMode)  // the earlier on/off 'lookupDrafts' is not read: off was the default
       ..suffixDrafts = b('suffixDrafts', d.suffixDrafts)
       ..draftTokens = i('draftTokens', d.draftTokens)
       ..expertMass = n('expertMass', d.expertMass)
@@ -206,7 +206,8 @@ class ExperimentalSettings {
       if (i8mmTiles) 'i8mm tiles',
       if (prerouterTrace) 'prerouter trace',
       if (pageCacheMode != 0) 'expert page cache ${pageCacheMode == 1 ? 'all reads' : 'prefetches'}',
-      if (lookupDrafts) '${suffixDrafts ? 'suffix' : 'lookup'} drafts ($draftTokens)',
+      if (lookupMode == 1) '${suffixDrafts ? 'suffix' : 'lookup'} drafts ($draftTokens), always',
+      if (lookupMode == 0) 'no text drafts',
       if (expertMass < 1) 'expert mass ${expertMass.toStringAsFixed(2)}',
       if (maxExperts > 0) 'max $maxExperts experts',
       if (skipSlow > 0) 'skip slow experts below ${(skipSlow * 100).round()}%',

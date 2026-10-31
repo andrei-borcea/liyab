@@ -883,7 +883,7 @@ TEST_CASE("Engine sequences: speculative drafts run alone, shared steps keep eve
     for (const bool hybrid : {false, true}) {
         EngineConfig config =
             engine_config(hybrid ? model_path("engine_hybrid", hybrid_spec()) : model_path("engine_llama", {}), 3);
-        config.lookup_drafts = true;  // suffix drafts, tree verification
+        config.lookup_drafts = EngineConfig::LookupDrafts::On;  // suffix drafts, tree verification
         std::vector<Job> jobs = four_jobs();
         jobs.resize(3);
         CHECK(check_together(hybrid ? "drafts hybrid" : "drafts", config, jobs));
@@ -1330,7 +1330,7 @@ TEST_CASE("Sequence memory: with no sequence open, max_sequences changes nothing
             EngineConfig config = engine_config(path, sequences);
             config.expert_cache_mb = m.expert_cache_mb;
             config.requant_bits = -1;  // automatic: the decision a reservation at load used to flip
-            config.lookup_drafts = true;
+            config.lookup_drafts = EngineConfig::LookupDrafts::On;
             auto engine = Engine::create(config);
             REQUIRE(engine.has_value());
             plans[i] = engine.value()->memory_plan();

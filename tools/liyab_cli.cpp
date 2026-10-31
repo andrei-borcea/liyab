@@ -258,7 +258,11 @@ void usage() {
                  "  --lora-scale S     its scale: s = S * alpha / rank per matrix (default 1)\n"
                  "  --draft PATH       draft model for speculative decoding\n"
                  "  --draft-tokens K   tokens per speculative step (default 3)\n"
-                 "  --lookup           speculative decoding without a draft model: drafts from the text\n"
+                 "  (default: drafts from the text where the model verifies 4 tokens for little more\n"
+                 "                     than one step's cost: timed once per model and device, kept with\n"
+                 "                     --cache-dir; see --lookup and --no-lookup)\n"
+                 "  --no-lookup        never draft from the text (default: automatic)\n"
+                 "  --lookup           speculative decoding without a draft model, always: drafts from the text\n"
                  "                     itself, by the suffix drafter (this and earlier conversations,\n"
                  "                     confidence-sized drafts)\n"
                  "  --suffix           the same, explicitly\n"
@@ -374,8 +378,12 @@ int main(int argc, char** argv) {
         else if (arg == "--lora") lora_path = next();
         else if (arg == "--lora-scale") lora_scale = static_cast<float>(std::atof(next()));
         else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
-        else if (arg == "--lookup") config.lookup_drafts = true;
-        else if (arg == "--suffix") config.lookup_drafts = config.suffix_drafts = 1;
+        else if (arg == "--lookup") config.lookup_drafts = 1;
+        else if (arg == "--no-lookup") config.lookup_drafts = 0;
+        else if (arg == "--suffix") {
+            config.lookup_drafts = 1;
+            config.suffix_drafts = 1;
+        }
         else if (arg == "--linear-drafts") config.draft_tree = 0;
         else if (arg == "--context-lookup") {
             config.lookup_drafts = 1;

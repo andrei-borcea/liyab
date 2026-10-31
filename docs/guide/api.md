@@ -259,7 +259,8 @@ liyab-cli -m model.gguf -p "Once upon a time" -n 128 --temp 0.8
 liyab-cli -m moe.gguf -p "..." --memory-budget 5500         # stay within a per-app memory limit
 liyab-cli -m moe.gguf -p "..." --expert-cache 3000          # MoE: experts through a 3000 MiB cache (-1 auto)
 liyab-cli -m moe.gguf -p "..." --expert-mass 0.9            # lossy: top experts covering 90% of router weight
-liyab-cli -m model.gguf -p "..." --lookup                   # speculative decoding from the text itself (suffix drafts)
+liyab-cli -m model.gguf -p "..." --lookup                   # always draft from the text (the default is automatic: only where a timed verification pass is cheap)
+liyab-cli -m model.gguf -p "..." --no-lookup                # never draft from the text
 liyab-cli -m model.gguf -p "..." --context-lookup           # ... by context lookup instead
 liyab-cli -m model.gguf -p "..." --lookup --linear-drafts   # suffix drafts' best branch only, not their tree
 liyab-cli -m model.gguf -p "..." --draft draft.gguf         # speculative decoding with a draft model

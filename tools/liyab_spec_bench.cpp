@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
             const size_t m = rep % 2 == 0 ? i : modes.size() - 1 - i;
             const Mode& mode = modes[m];
             EngineConfig config = base;
-            config.lookup_drafts = mode.lookup || mode.suffix;
+            config.lookup_drafts = mode.lookup || mode.suffix ? EngineConfig::LookupDrafts::On : EngineConfig::LookupDrafts::Off;
             config.suffix_drafts = mode.suffix;
             if (mode.draft_tokens > 0) config.draft_tokens = mode.draft_tokens;
             config.adaptive_drafts = !mode.fixed;

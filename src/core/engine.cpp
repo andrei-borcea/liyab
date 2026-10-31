@@ -238,6 +238,78 @@ void keep_latent_ratio(const std::string& dir, uint64_t id, float ratio) {
     for (size_t i = 0; i + kKeptLatentRatios < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
 }
 
+// What a verification pass costs (Engine's EngineConfig::lookup_drafts = Auto), in plain steps, kept in cache_dir
+// like the latent ratio: "verify-<id>.bin" = magic, version, id, ratio, 16 files at most, least recently used out
+// first. The id covers what the timing depends on: the model file, the KV cache format, the kernel set, the route
+// decoding takes, the threads and the drafts per pass. Models are told apart by their file's identity
+// (Transformer::file_fingerprint()), so a model is measured once per device and setting, whatever it is called.
+constexpr char kVerifyRatioMagic[4] = {'L', 'Y', 'V', 'R'};
+constexpr uint32_t kVerifyRatioVersion = 1;
+constexpr size_t kKeptVerifyRatios = 16;
+
+std::string verify_ratio_path(const std::string& dir, uint64_t id) {
+    char name[40];
+    std::snprintf(name, sizeof name, "verify-%016llx.bin", static_cast<unsigned long long>(id));
+    return os::path_utf8(os::utf8_path(dir) / name);
+}
+
+std::optional<double> read_verify_ratio(const std::string& path, uint64_t id) {
+    std::ifstream in(os::utf8_path(path), std::ios::binary);
+    char magic[4] = {};
+    uint32_t version = 0;
+    uint64_t stored_id = 0;
+    double ratio = 0.0;
+    in.read(magic, sizeof magic);
+    in.read(reinterpret_cast<char*>(&version), sizeof version);
+    in.read(reinterpret_cast<char*>(&stored_id), sizeof stored_id);
+    in.read(reinterpret_cast<char*>(&ratio), sizeof ratio);
+    if (!in || std::memcmp(magic, kVerifyRatioMagic, sizeof magic) != 0 || version != kVerifyRatioVersion ||
+        stored_id != id || !(ratio > 0.0 && ratio < 1000.0)) {
+        return std::nullopt;
+    }
+    return ratio;
+}
+
+void keep_verify_ratio(const std::string& dir, uint64_t id, double ratio) {
+    std::error_code ec;
+    std::filesystem::create_directories(os::utf8_path(dir), ec);
+    const std::string path = verify_ratio_path(dir, id);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(os::utf8_path(tmp), std::ios::binary | std::ios::trunc);
+        out.write(kVerifyRatioMagic, sizeof kVerifyRatioMagic);
+        out.write(reinterpret_cast<const char*>(&kVerifyRatioVersion), sizeof kVerifyRatioVersion);
+        out.write(reinterpret_cast<const char*>(&id), sizeof id);
+        out.write(reinterpret_cast<const char*>(&ratio), sizeof ratio);
+        if (!out) {
+            LIYAB_LOG_WARN("lookup drafts: cannot write %s", tmp.c_str());
+            std::filesystem::remove(os::utf8_path(tmp), ec);
+            return;
+        }
+    }
+    std::filesystem::rename(os::utf8_path(tmp), os::utf8_path(path), ec);
+    if (ec) return;
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> kept;
+    std::filesystem::directory_iterator it(os::utf8_path(dir), ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const std::string name = os::path_utf8(it->path().filename());
+        if (name.starts_with("verify-") && name.ends_with(".bin")) {
+            std::error_code ignored;
+            kept.emplace_back(std::filesystem::last_write_time(it->path(), ignored), it->path());
+        }
+    }
+    if (kept.size() <= kKeptVerifyRatios) return;
+    std::sort(kept.begin(), kept.end());  // oldest first
+    for (size_t i = 0; i + kKeptVerifyRatios < kept.size(); ++i) std::filesystem::remove(kept[i].second, ec);
+}
+
+// Ratios measured in this process for engines without a cache_dir, by id.
+std::mutex verify_ratios_mutex;
+std::map<uint64_t, double>& verify_ratios() {
+    static std::map<uint64_t, double> ratios;
+    return ratios;
+}
+
 // Ratios measured in this process for models without a cache_dir, by id.
 std::mutex latent_ratios_mutex;
 std::map<uint64_t, float>& latent_ratios() {
@@ -2189,6 +2261,7 @@ struct Engine::Impl {
     uint64_t streamed_block_bytes = 0;
     int32_t streamed_blocks = 0;
     std::unique_ptr<SpeculativeDecoder> speculative;
+    Engine::LookupDraftsInfo lookup_info;  // drafts from the text (EngineConfig::lookup_drafts)
     std::optional<Tokenizer> tokenizer;
     // The model's chat template (Engine::render_chat) and the special-token
     // variables it renders with; empty when the model has none or it does
@@ -2429,6 +2502,119 @@ struct Engine::Impl {
             latent_ratios().emplace(id, *ratio);
         }
         return Status::ok();
+    }
+
+    // EngineConfig::lookup_drafts = Auto: time a plain decoding step against a verification pass of draft_tokens + 1
+    // tokens (with the recurrent checkpoints a rollback needs), and draft from the text where the pass costs at most
+    // kLookupMaxVerifyRatio steps. The pass is what a draft step spends on a wrong guess, so its price, not the
+    // architecture's name, says whether guessing pays: ~1.3-1.7 steps on a dense model in RAM, several on one
+    // whose experts stream from storage (not timed: a pass reads the union of its tokens' experts).
+    Status enable_auto_lookup() {
+        lookup_info = {};
+        if (target->expert_store() != nullptr) {
+            LIYAB_LOG_INFO("lookup drafts: off (the experts stream from storage; a verification pass reads their union)");
+            return Status::ok();
+        }
+        if (declares_pooling(target->file())) return Status::ok();  // embeds, does not generate
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+        // A speculative step runs without the decoding hooks the user asked for (early exit, EGLS, head pruning,
+        // TDSS: lossy, experimental): automatic drafting never silently replaces them.
+        if (early_exit || egls || head_pruner || tdss) {
+            LIYAB_LOG_INFO("lookup drafts: off (an experimental decoding feature is on)");
+            return Status::ok();
+        }
+#endif
+        const int32_t k = config.draft_tokens;
+        // Decoding runs on the CPU when the engine picks the route itself, else on the configured one.
+        const Route route = auto_route ? draft_route() : normal_route();
+        const uint64_t parts[] = {target->file_fingerprint(), kVerifyRatioVersion,
+                                  static_cast<uint64_t>(target->kv_cache().dtype()),
+                                  static_cast<uint64_t>(auto_route ? -1 : static_cast<int>(config.backend.value_or(BackendKind::Cpu))),
+                                  static_cast<uint64_t>(pool->max_threads()), static_cast<uint64_t>(k)};
+        const std::string_view isa = quant::kernel_isa();
+        const uint64_t id = xxhash64(isa.data(), isa.size(), xxhash64(parts, sizeof parts));
+        std::optional<double> ratio;
+        if (!config.cache_dir.empty()) {
+            const std::string path = verify_ratio_path(config.cache_dir, id);
+            ratio = read_verify_ratio(path, id);
+            if (ratio) {
+                std::error_code ignored;
+                std::filesystem::last_write_time(os::utf8_path(path), std::filesystem::file_time_type::clock::now(),
+                                                 ignored);
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(verify_ratios_mutex);
+            if (const auto it = verify_ratios().find(id); it != verify_ratios().end()) ratio = it->second;
+        }
+        lookup_info.from_cache = ratio.has_value();
+        if (!ratio) {
+            target->set_rollback_window(k + 1);
+            const auto start = Clock::now();
+            auto measured = measure_verify_ratio(route, k);
+            target->reset();
+            if (!measured) {
+                target->set_rollback_window(0);
+                return measured.status();
+            }
+            ratio = *measured;
+            LIYAB_LOG_INFO("lookup drafts: a pass of %d tokens costs %.2f steps (measured in %.0f ms)", k + 1, *ratio,
+                           ms_since(start));
+            if (!config.cache_dir.empty()) {
+                keep_verify_ratio(config.cache_dir, id, *ratio);
+            } else {
+                std::lock_guard<std::mutex> lock(verify_ratios_mutex);
+                verify_ratios().emplace(id, *ratio);
+            }
+        }
+        lookup_info.verify_ratio = *ratio;
+        if (*ratio > EngineConfig::kLookupMaxVerifyRatio) {
+            target->set_rollback_window(0);
+            LIYAB_LOG_INFO("lookup drafts: off (a pass of %d tokens costs %.2f steps, over %.1f)", k + 1, *ratio,
+                           EngineConfig::kLookupMaxVerifyRatio);
+            return Status::ok();
+        }
+        start_text_drafts();
+        LIYAB_LOG_INFO("lookup drafts: on (a pass of %d tokens costs %.2f steps)", k + 1, *ratio);
+        return Status::ok();
+    }
+
+    // Best of a few plain steps and a few verification passes, after one of each to warm the weights.
+    Result<double> measure_verify_ratio(const Route& route, int32_t k) {
+        constexpr int kRepeats = 3;
+        std::vector<int32_t> tokens;
+        for (int32_t i = 0; i <= k; ++i) tokens.push_back(1 + i % 7);  // ids every vocabulary has; the text is irrelevant
+        double one = INFINITY, many = INFINITY;
+        for (int r = 0; r <= kRepeats; ++r) {
+            target->reset();
+            auto start = Clock::now();
+            target->set_checkpointing(false);
+            auto a = target->forward(std::span<const int32_t>(tokens.data(), 1), Transformer::Logits::Last, route, *pool);
+            if (!a) return a.status();
+            const double t1 = ms_since(start);
+            target->reset();
+            start = Clock::now();
+            target->set_checkpointing(true);
+            auto b = target->forward(tokens, Transformer::Logits::All, route, *pool);
+            if (!b) return b.status();
+            const double tk = ms_since(start);
+            if (r > 0) {  // the first round warms the pages and the caches
+                one = std::min(one, t1);
+                many = std::min(many, tk);
+            }
+        }
+        target->set_checkpointing(true);
+        return one > 0.0 ? many / one : 1.0;
+    }
+
+    // Draft from the text: context lookup or the suffix drafter, per the configuration.
+    void start_text_drafts() {
+        target->set_rollback_window(config.draft_tokens + 1);
+        speculative = std::make_unique<SpeculativeDecoder>(
+            *target, config.draft_tokens,
+            config.suffix_drafts ? SpeculativeDecoder::TextDrafts::Suffix : SpeculativeDecoder::TextDrafts::Lookup);
+        speculative->set_adaptive(config.adaptive_drafts);
+        speculative->set_tree(config.draft_tree);
+        lookup_info.active = true;
     }
 
     Status select_backends() {
@@ -2877,13 +3063,10 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
         LIYAB_RETURN_IF_ERROR(impl->prepare_key_scales(*impl->draft));  // same vocabulary: the target's tokenizer
         LIYAB_RETURN_IF_ERROR(impl->prepare_latent_form(*impl->draft));
         impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
-    } else if (config.lookup_drafts && config.draft_tokens > 0) {
-        impl->target->set_rollback_window(config.draft_tokens + 1);
-        impl->speculative = std::make_unique<SpeculativeDecoder>(
-            *impl->target, config.draft_tokens,
-            config.suffix_drafts ? SpeculativeDecoder::TextDrafts::Suffix : SpeculativeDecoder::TextDrafts::Lookup);
+    } else if (config.lookup_drafts == EngineConfig::LookupDrafts::On && config.draft_tokens > 0) {
+        impl->start_text_drafts();
     }
-    if (impl->speculative) {
+    if (impl->speculative && !impl->lookup_info.active) {  // a draft model
         impl->speculative->set_adaptive(config.adaptive_drafts);
         impl->speculative->set_tree(config.draft_tree);
     }
@@ -2926,6 +3109,11 @@ Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
 
     impl->power = std::make_unique<PowerManager>(config.power);
     impl->open_store(config, repack_cpu);
+    // Auto waits for the expert store: whether experts stream decides it.
+    if (!impl->speculative && config.draft_model_path.empty() && config.draft_tokens > 0 &&
+        config.lookup_drafts == EngineConfig::LookupDrafts::Auto) {
+        LIYAB_RETURN_IF_ERROR(impl->enable_auto_lookup());
+    }
 #if defined(LIYAB_ENABLE_EXPERIMENTAL)
     if (x.prerouter_trace) {
         impl->prerouter = std::make_unique<experimental::PrerouterTrace>();
@@ -4517,6 +4705,8 @@ Status Engine::Impl::prefill_on(Seq& q, std::string_view text, std::span<const P
     s.remember_text(q, t, text);
     return Status::ok();
 }
+
+Engine::LookupDraftsInfo Engine::lookup_drafts() const noexcept { return impl_->lookup_info; }
 
 bool Engine::has_chat_template() const noexcept { return impl_->chat_template.has_value(); }
 

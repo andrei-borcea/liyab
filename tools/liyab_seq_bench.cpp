@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
             if (b == "cpu") config.backend = liyab::BackendKind::Cpu;
             if (b == "metal") config.backend = liyab::BackendKind::Metal;
         } else if (a == "--lookup") {
-            config.lookup_drafts = true;
+            config.lookup_drafts = EngineConfig::LookupDrafts::On;
         } else if (a == "--kv") {
             const std::string k = next();
             config.kv_cache_type = k == "f16" ? liyab::KvCacheType::F16 : liyab::KvCacheType::Q8_0;

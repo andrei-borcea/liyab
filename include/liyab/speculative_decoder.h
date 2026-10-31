@@ -61,8 +61,9 @@
 // branch or a tree. A tree that is a single branch runs as a linear pass.
 //
 // This is an engine component: Engine wires it up when
-// EngineConfig::draft_model_path is set, or EngineConfig::lookup_drafts
-// (suffix drafts or context lookup, by EngineConfig::suffix_drafts).
+// EngineConfig::draft_model_path is set, or EngineConfig::lookup_drafts is On
+// or Auto and the model passes its timed verification test (suffix drafts or
+// context lookup, by EngineConfig::suffix_drafts).
 #ifndef LIYAB_SPECULATIVE_DECODER_H
 #define LIYAB_SPECULATIVE_DECODER_H
 

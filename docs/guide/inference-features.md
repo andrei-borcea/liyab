@@ -52,7 +52,23 @@ happens.
 ## Speculative decoding
 
 A small draft model proposes *k* tokens, or, with `lookup_drafts`, the text itself does, with no extra weights and
-for any model. Two drafters:
+for any model. `lookup_drafts` is **automatic** by default: the engine decides for each model and device whether it
+pays.
+
+* **How a model is recognized.** At load the engine times one plain decoding step and one verification pass of
+  *k* + 1 tokens (with the recurrent checkpoints a rollback needs), best of three after a warm-up, and keeps their
+  ratio. Drafting is on where a pass costs at most 2.5 steps. The ratio is the price of a wrong guess, so it
+  separates models without a list of names: a dense 14B in RAM measured 1.84 steps in 0.54 s, and a MoE whose
+  experts stream from storage is switched off without a timing, since a pass reads the union of its tokens' experts.
+  The measurement is kept in `cache_dir` as `verify-<id>.bin` (16 files at most, least recently used out first), keyed
+  by the model file's identity, the KV format, the kernel set, the route decoding takes, the threads and *k*; without
+  a `cache_dir` it is kept for the process. `Engine::lookup_drafts()` reports the decision and the ratio.
+  It also stays off while an experimental decoding feature (early exit, EGLS, head pruning, TDSS) is on, because a
+  speculative step runs without those hooks. `EngineConfig::LookupDrafts::On` / `Off` (`--lookup`, `--no-lookup`)
+  skip the measurement. Where it is on, the
+  learned draft count (below) still backs off to plain steps on text that repeats nothing.
+
+Two drafters:
 
 * **Suffix drafts** (the default, `suffix_drafts`): the longest suffix of the conversation (2…32 tokens) that
   occurred before, in this conversation or in earlier ones of the same engine, and how its occurrences continue:
@@ -109,8 +125,8 @@ continuations, and one pass verifies them together:
   median of its last 8 steps). Counts are tried upwards, one more draft at a time.
 * **When it pays.** It pays on dense models with i8mm tiles, where 4 rows cost ~1.7× one row. Qwen3-4B on the
   phone went from 11.2 to 12.6 tok/s on a code edit, with 65% of drafts accepted. It does not pay on a MoE whose
-  experts stream from flash, because a pass reads the union of its tokens' experts. That is why it is off by
-  default.
+  experts stream from flash, because a pass reads the union of its tokens' experts. That is what the automatic
+  mode measures, and why it leaves such models off.
 
 ### A 14B on the M4 Pro, with weights lowered and a draft model
 

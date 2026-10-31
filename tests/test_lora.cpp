@@ -749,7 +749,7 @@ TEST_CASE("engine adapters: speculative decoding verifies with the adapter") {
     const EngineFiles f;
     auto merged = Engine::create(adapter_engine_config(f.merged_a));
     EngineConfig spec = adapter_engine_config(f.base);
-    spec.lookup_drafts = true;
+    spec.lookup_drafts = EngineConfig::LookupDrafts::On;
     spec.draft_tokens = 3;
     spec.adaptive_drafts = false;
     auto engine = Engine::create(spec);

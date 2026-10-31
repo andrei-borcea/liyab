@@ -1087,7 +1087,7 @@ void _applyExperimental(LiyabEngineConfig c, Map<String, Object?> x, Arena arena
   if (x.containsKey('i8mmTiles')) c.i8mmTiles = flag('i8mmTiles');
   if (x.containsKey('prerouterTrace')) c.prerouterTrace = flag('prerouterTrace');
   c.pageCacheMode = i('pageCacheMode') ?? c.pageCacheMode;
-  if (x.containsKey('lookupDrafts')) c.lookupDrafts = flag('lookupDrafts');
+  c.lookupDrafts = i('lookupMode') ?? c.lookupDrafts; // 0 off, 1 always, 2 automatic (the engine's default)
   if (x.containsKey('suffixDrafts')) c.suffixDrafts = flag('suffixDrafts'); // how lookup drafts: suffix or context lookup
   c.draftTokens = i('draftTokens') ?? c.draftTokens;
   c.moeExpertMass = n('expertMass') ?? c.moeExpertMass;

@@ -215,8 +215,22 @@ struct EngineConfig {
     // itself, by the suffix drafter or by context lookup (suffix_drafts).
     // Same output distribution, no extra weights, any model; pays off when
     // the text repeats earlier text and on models that verify k tokens for
-    // about the cost of one (dense models in RAM).
-    bool lookup_drafts = false;
+    // about the cost of one (dense models in RAM). Auto (the default) decides
+    // per model and device: the engine times a plain step and a verification
+    // pass of draft_tokens + 1 tokens once (about 0.3 s on a 14B; kept in
+    // cache_dir under the model's identity, in memory for the process
+    // without one), and drafts only where the pass costs at most
+    // kLookupMaxVerifyRatio times the step: dense models in RAM, not MoE
+    // models whose experts stream from storage, whose pass reads the union
+    // of its tokens' experts. Which models that is follows from the
+    // measurement, not from a list. Engine::lookup_drafts() reports the
+    // outcome. On / Off skip the measurement.
+    enum class LookupDrafts : int32_t { Off = 0, On = 1, Auto = 2 };
+    LookupDrafts lookup_drafts = LookupDrafts::Auto;
+    // Auto drafts only where a pass of draft_tokens + 1 tokens costs at most this many plain steps. With the 3
+    // drafts of the default, 2.5 steps still pays when about 2 of 3 drafts are accepted (code edits: 3.4 tokens per
+    // pass); the learned draft count (adaptive_drafts) then backs off on text that repeats nothing.
+    static constexpr double kLookupMaxVerifyRatio = 2.5;
     // Learn on the device how many drafts per step pay off (0..draft_tokens;
     // see SpeculativeDecoder). false: always draft_tokens, which keeps sampled
     // output reproducible for a fixed seed.
@@ -232,7 +246,7 @@ struct EngineConfig {
     // tokens (~2 MiB) in at most 64 sequences, least recently used out first.
     // Sampled output is the same tokens as plain decoding draws from the seed
     // (CPU backend), adaptive or not. false: context lookup
-    // (SpeculativeDecoder::lookup). No effect without lookup_drafts or with a
+    // (SpeculativeDecoder::lookup). No effect with lookup_drafts Off or with a
     // draft model. Either way draft_tokens is the most drafts per step, and
     // hybrid models keep draft_tokens + 1 recurrent-state checkpoints.
     bool suffix_drafts = true;
@@ -769,6 +783,14 @@ public:
     // numbers in decimal, booleans as "true"/"false"), e.g. the publisher's
     // recommended "general.sampling.temp". nullopt when absent or an array.
     [[nodiscard]] std::optional<std::string> model_metadata(std::string_view key) const;
+
+    // ---- Drafts from the text (EngineConfig::lookup_drafts) -------------------
+    struct LookupDraftsInfo {
+        bool active = false;          // the engine drafts from the text
+        double verify_ratio = 0.0;    // Auto: cost of a pass of draft_tokens + 1 tokens in plain steps; 0: not measured
+        bool from_cache = false;      // Auto: the measurement was read from cache_dir (or an earlier engine of the process)
+    };
+    [[nodiscard]] LookupDraftsInfo lookup_drafts() const noexcept;
 
     // ---- Chat template (the model's tokenizer.chat_template) ----------------
     // Rendered by Liyab's own Jinja interpreter (core/chat_template.h), as

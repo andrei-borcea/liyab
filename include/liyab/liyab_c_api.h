@@ -82,7 +82,7 @@ typedef struct liyab_engine_config {
     int32_t sliding_window;       /* 0: full attention */
     int32_t kv_sink_tokens;       /* attention sinks kept with a sliding window (default 8) */
     int32_t draft_tokens;         /* tokens proposed per speculative step */
-    int32_t lookup_drafts;        /* nonzero, no draft model: draft from the text itself (suffix drafts or context lookup, see suffix_drafts) */
+    int32_t lookup_drafts;        /* no draft model, drafts from the text itself (suffix drafts or context lookup, see suffix_drafts): 0 off, 1 on, 2 (the default of liyab_engine_config_default) auto: the engine times a verification pass once per model and device, kept in cache_dir, and drafts only where it costs at most 2.5 plain steps (dense models in RAM; not MoE models whose experts stream); a zero-filled config is off */
     int32_t adaptive_drafts;      /* nonzero (default): learn how many drafts per step pay off; 0: always draft_tokens */
     liyab_kv_cache_type kv_cache_type;
     liyab_backend backend;

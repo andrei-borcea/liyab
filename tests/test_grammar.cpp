@@ -677,7 +677,7 @@ TEST_CASE("constrained generation: forced text and constrained spans, any decodi
         const std::string& path = tiny_model(hybrid);
         EngineConfig plain = config_for(path);
         EngineConfig lookup = plain;
-        lookup.lookup_drafts = true;
+        lookup.lookup_drafts = EngineConfig::LookupDrafts::On;
         lookup.adaptive_drafts = false;
         EngineConfig drafted = plain;
         drafted.draft_model_path = path;

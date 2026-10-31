@@ -209,7 +209,7 @@ void liyab_engine_config_default(liyab_engine_config* config) {
     config->sliding_window = d.sliding_window;
     config->kv_sink_tokens = d.kv_sink_tokens;
     config->draft_tokens = d.draft_tokens;
-    config->lookup_drafts = d.lookup_drafts ? 1 : 0;
+    config->lookup_drafts = static_cast<int32_t>(d.lookup_drafts);
     config->adaptive_drafts = d.adaptive_drafts ? 1 : 0;
     config->suffix_drafts = d.suffix_drafts ? 1 : 0;
     config->kv_cache_type = static_cast<liyab_kv_cache_type>(d.kv_cache_type);
@@ -275,7 +275,9 @@ liyab_status liyab_engine_create(const liyab_engine_config* config, liyab_engine
         c.sliding_window = config->sliding_window;
         c.kv_sink_tokens = config->kv_sink_tokens;
         c.draft_tokens = config->draft_tokens;
-        c.lookup_drafts = config->lookup_drafts != 0;
+        c.lookup_drafts = config->lookup_drafts == 0   ? liyab::EngineConfig::LookupDrafts::Off
+                          : config->lookup_drafts == 1 ? liyab::EngineConfig::LookupDrafts::On
+                                                       : liyab::EngineConfig::LookupDrafts::Auto;
         c.adaptive_drafts = config->adaptive_drafts != 0;
         c.suffix_drafts = config->suffix_drafts != 0;
         c.kv_cache_type = static_cast<liyab::KvCacheType>(config->kv_cache_type);

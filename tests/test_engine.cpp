@@ -453,6 +453,9 @@ EngineConfig engine_config(const std::string& path) {
     // The reference CPU: automatic routing decides by timing which passes an accelerator rounds, so two engines
     // would not always give the same text, and these tests compare engines. Tests of the accelerators name them.
     c.backend = BackendKind::Cpu;
+    // Off: automatic drafting times a verification pass at load and keeps it in cache_dir, which tests of the
+    // engine's files and of plain decoding do not expect; tests of drafting name it.
+    c.lookup_drafts = EngineConfig::LookupDrafts::Off;
     return c;
 }
 
@@ -4557,11 +4560,11 @@ TEST_CASE("Forced continuations share their pass with the next token: one pass l
         REQUIRE(ref.forced_tokens > 0);
 
         EngineConfig lookup = plain;
-        lookup.lookup_drafts = true;
+        lookup.lookup_drafts = EngineConfig::LookupDrafts::On;
         lookup.suffix_drafts = false;     // context lookup
         lookup.adaptive_drafts = false;  // every step drafts
         EngineConfig drafted = lookup;
-        drafted.lookup_drafts = false;
+        drafted.lookup_drafts = EngineConfig::LookupDrafts::Off;
         drafted.draft_model_path = path;  // the target itself: every draft accepted, steps of 4 tokens
         EngineConfig suffix = lookup;
         suffix.suffix_drafts = true;
@@ -5842,7 +5845,7 @@ TEST_CASE("Context-lookup speculative decoding reproduces plain greedy output, a
         REQUIRE(!expected.empty());
 
         EngineConfig lookup = plain;
-        lookup.lookup_drafts = true;
+        lookup.lookup_drafts = EngineConfig::LookupDrafts::On;
         lookup.suffix_drafts = false;  // context lookup
         lookup.draft_tokens = 3;
         lookup.adaptive_drafts = false;  // exercise every draft, not the learned count
@@ -5888,6 +5891,104 @@ TEST_CASE("A draft model padded to another width than the target still speculate
     }
 }
 
+TEST_CASE("Automatic text drafts are decided per model by a timed verification pass, kept in cache_dir") {
+    namespace fs = std::filesystem;
+    std::vector<int32_t> prompt = {1};
+    for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
+    const std::string dir = temp_path("verify_cache");
+    fs::remove_all(dir);
+    test::TinyModelSpec spec_a, spec_b;
+    spec_b.seed = 7;
+    spec_b.n_layers = 3;  // another file: another identity
+    EngineConfig config = engine_config(model_path("auto_lookup_a", spec_a));
+    config.lookup_drafts = EngineConfig::LookupDrafts::Auto;
+    config.cache_dir = dir;
+    auto count_files = [&] {
+        size_t n = 0;
+        std::error_code ec;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            n += it->path().filename().string().starts_with("verify-");
+        }
+        return n;
+    };
+    // The reference: no drafting.
+    EngineConfig off = config;
+    off.lookup_drafts = EngineConfig::LookupDrafts::Off;
+    off.cache_dir.clear();
+    auto off_engine = Engine::create(off);
+    REQUIRE(off_engine.has_value());
+    CHECK(!off_engine.value()->lookup_drafts().active);
+    CHECK(off_engine.value()->lookup_drafts().verify_ratio == 0.0);  // Off does not measure
+    const auto expected = run(*off_engine.value(), prompt, greedy(32));
+    REQUIRE(!expected.empty());
+
+    double ratio = 0.0;
+    bool active = false;
+    {
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        const auto info = engine.value()->lookup_drafts();
+        CHECK(info.verify_ratio > 0.0);
+        CHECK(!info.from_cache);
+        CHECK(info.active == (info.verify_ratio <= EngineConfig::kLookupMaxVerifyRatio));
+        CHECK(count_files() == 1);
+        CHECK(run(*engine.value(), prompt, greedy(32)) == expected);  // drafting is exact
+        ratio = info.verify_ratio;
+        active = info.active;
+    }
+    {  // the next engine of the model reads it: the same ratio and decision, no new file
+        auto engine = Engine::create(config);
+        REQUIRE(engine.has_value());
+        const auto info = engine.value()->lookup_drafts();
+        CHECK(info.from_cache);
+        CHECK(info.verify_ratio == ratio);
+        CHECK(info.active == active);
+        CHECK(count_files() == 1);
+    }
+    {  // another model is another measurement
+        EngineConfig other = config;
+        other.model_path = model_path("auto_lookup_b", spec_b);
+        auto engine = Engine::create(other);
+        REQUIRE(engine.has_value());
+        CHECK(!engine.value()->lookup_drafts().from_cache);
+        CHECK(count_files() == 2);
+    }
+    {  // another setting of the same model too (drafts per pass)
+        EngineConfig other = config;
+        other.draft_tokens = 5;
+        auto engine = Engine::create(other);
+        REQUIRE(engine.has_value());
+        CHECK(!engine.value()->lookup_drafts().from_cache);
+    }
+    {  // On skips the measurement
+        EngineConfig on = config;
+        on.lookup_drafts = EngineConfig::LookupDrafts::On;
+        on.cache_dir.clear();
+        auto engine = Engine::create(on);
+        REQUIRE(engine.has_value());
+        CHECK(engine.value()->lookup_drafts().active);
+        CHECK(engine.value()->lookup_drafts().verify_ratio == 0.0);
+    }
+    {  // Streamed experts: off without timing a pass (a pass reads the union of its tokens' experts)
+        test::TinyModelSpec moe;
+        moe.arch = "qwen3moe";
+        moe.n_layers = 2;
+        moe.n_embd = 256;
+        moe.n_expert = 8;
+        moe.n_expert_used = 2;
+        moe.identical_experts = false;
+        EngineConfig streamed = config;
+        streamed.model_path = model_path("auto_lookup_moe", moe);
+        streamed.expert_cache_mb = 1;
+        auto engine = Engine::create(streamed);
+        REQUIRE(engine.has_value());
+        CHECK(!engine.value()->lookup_drafts().active);
+        CHECK(engine.value()->lookup_drafts().verify_ratio == 0.0);
+        CHECK(count_files() == 3);  // no file for it
+    }
+    fs::remove_all(dir);
+}
+
 TEST_CASE("Adaptive draft counts keep greedy output identical") {
     std::vector<int32_t> prompt = {1};
     for (int r = 0; r < 4; ++r) prompt.insert(prompt.end(), {270, 300, 5, 290, 77, 310});
@@ -5897,7 +5998,7 @@ TEST_CASE("Adaptive draft counts keep greedy output identical") {
     REQUIRE(base_engine.has_value());
     const auto expected = run(*base_engine.value(), prompt, greedy(48));
     EngineConfig adaptive = plain;
-    adaptive.lookup_drafts = true;
+    adaptive.lookup_drafts = EngineConfig::LookupDrafts::On;
     adaptive.suffix_drafts = false;  // context lookup with the learned count
     adaptive.draft_tokens = 4;  // adaptive_drafts is the default
     auto engine = Engine::create(adaptive);
@@ -6099,7 +6200,7 @@ TEST_CASE("Suffix-draft speculative decoding: greedy and seeded sampling give pl
         for (const bool adaptive : {false, true}) {
             for (const int32_t k : {3, 6, -6}) {  // -6: 6 drafts, the best branch only (no tree)
                 EngineConfig suffix = plain;
-                suffix.lookup_drafts = true;  // suffix drafts: the default drafter
+                suffix.lookup_drafts = EngineConfig::LookupDrafts::On;  // suffix drafts: the default drafter
                 suffix.draft_tokens = std::abs(k);
                 suffix.draft_tree = k > 0;
                 suffix.adaptive_drafts = adaptive;
@@ -6146,7 +6247,7 @@ TEST_CASE("A speculative turn that stops partway through a step leaves the conte
         EngineConfig plain = engine_config(path);
         plain.backend = BackendKind::Cpu;
         EngineConfig suffix = plain;
-        suffix.lookup_drafts = true;
+        suffix.lookup_drafts = EngineConfig::LookupDrafts::On;
         suffix.draft_tokens = 6;
         suffix.adaptive_drafts = false;
         for (int32_t n = 3; n <= 11; ++n) {
@@ -7085,7 +7186,7 @@ TEST_CASE("New recurrent models reuse bounded prefix images across engines and v
             CHECK((*later)->prefix_cache_stats().restores > 0);
         }
         std::filesystem::remove_all(dir);
-        fresh_config.lookup_drafts = true;
+        fresh_config.lookup_drafts = EngineConfig::LookupDrafts::On;
         fresh_config.draft_tokens = 4;
         fresh_config.adaptive_drafts = false;
         auto drafted = Engine::create(fresh_config);

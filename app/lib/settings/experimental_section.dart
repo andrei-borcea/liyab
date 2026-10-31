@@ -107,13 +107,16 @@ class _ExperimentalSectionState extends State<ExperimentalSection> {
           'against two cheaper corrections of it (every 64 tokens, in logcat). Same replies. Needs a model whose '
           'experts stream from storage.', _x.prerouterTrace, (v) => _x.prerouterTrace = v),
       Text('Decoding', style: theme.textTheme.titleSmall),
-      toggle('Lookup speculative decoding', 'Drafts tokens from the conversation\'s own text and verifies them in one '
-          'pass. Exact output. The lossy features above do not apply with it.', _x.lookupDrafts, (v) => _x.lookupDrafts = v),
-      if (_x.lookupDrafts)
+      choice('Speculative decoding from the text', 'Drafts tokens from the conversation\'s own text and verifies them in '
+          'one pass. Exact output. Automatic: the engine times a verification pass once per model and switches '
+          'drafting on only where it is cheap (not for MoE models whose experts stream from storage). The lossy '
+          'features above do not apply with it.', _x.lookupMode, const [(2, 'Automatic'), (1, 'Always'), (0, 'Off')],
+          (v) => _x.lookupMode = v),
+      if (_x.lookupMode != 0)
         toggle('Suffix drafts', 'Drafts from earlier conversations too, sized per step by how likely they are to '
             'be accepted (up to 2 MiB of earlier text in memory). Off: context lookup.', _x.suffixDrafts,
             (v) => _x.suffixDrafts = v),
-      if (_x.lookupDrafts)
+      if (_x.lookupMode != 0)
         slider('Tokens per draft', _x.draftTokens.toDouble(), 1, 7, 6, (v) => '${v.round()}', (v) => _x.draftTokens = v.round()),
       choice('KV cache', 'Smaller caches hold longer contexts, with some loss. A change re-prepares the system prompt.',
           _x.kvCacheType, const [(1, 'Q8_0'), (0, 'F16'), (2, 'Q4_0'), (3, 'Q4_1')], (v) => _x.kvCacheType = v),

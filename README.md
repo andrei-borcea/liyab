@@ -228,7 +228,7 @@ including expert output scales folded into weights, checked against generated up
 | Expert cache | LFU eviction, next-block router prediction, overlapping I/O and compute | [Memory planning and estimates](docs/guide/memory-and-serving.md#models-larger-than-ram) |
 | Conversations | Reuse prior tokens; restore saved contexts and shared prefixes; keep recurrent snapshots | [Context and persistence](docs/guide/memory-and-serving.md#context-memory-and-serving) |
 | Concurrent sequences | Per-request contexts and adapters; shared decoding passes | [Scheduling and cancellation](docs/guide/memory-and-serving.md#context-memory-and-serving) |
-| Speculation | Draft models, context lookup, suffix trees and rollback | [Accuracy and speed measurements](docs/guide/inference-features.md#speculative-decoding) |
+| Speculation | Draft models; drafts from the text, switched on per model by a timed verification pass; suffix trees and rollback | [Accuracy and speed measurements](docs/guide/inference-features.md#speculative-decoding) |
 | Heat and power | Performance / Balanced / Low Power profiles, thermal pacing and guards | [Profiles and device behavior](docs/guide/inference-features.md#heat-and-power) |
 
 Lossy options include expert skipping, requantization at load (for a dense model its feed-forward and query / output matrices go to Q4_K: a 14B Q5_K_M decodes 27% faster on a Mac's CPU; the converted weights can be kept in a size-capped cache directory, so later loads take 0.4 s instead of 14 s), segment reuse and 4-bit prefix storage.
